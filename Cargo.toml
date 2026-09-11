@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+maplibre_native = "0.9"
+gpui = "0.2"
+image = "0.25"
