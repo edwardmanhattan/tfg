@@ -1,12 +1,12 @@
-//! egui command-center shell, live edition.
+//! egui command-center shell, live edition over a persistent map scene.
 //!
-//! A background thread polls the [`FileReplay`] mock every [`POLL_SECS`]
-//! (the v0 cadence) and ships each round over a channel to the UI thread,
-//! which ingests it into the [`Registry`]. Markers glide previous -> latest
-//! by wall-clock fraction of the poll interval (`Registry::blend`); the map
-//! frame itself stays static (overlay approach, ADR-0001) and repaints run
-//! at ~10 Hz. Follow highlights only; re-centering needs continuous
-//! re-render (deferred).
+//! - A background poll thread feeds mock fixes into the [`Registry`] at the
+//!   v0 cadence; markers glide by wall-clock fraction (`Registry::blend`).
+//! - A background map thread owns one persistent [`LiveMap`]: recenter is a
+//!   camera update + a few pumped frames (milliseconds), and follow-tracking
+//!   is now just repeated camera updates, not pipeline rebuilds.
+//! - Frames arrive as raw RGBA into versioned egui textures; overlay
+//!   markers/trails/roster are immediate-mode (ADR-0001/0002).
 //!
 //! Run: `scripts/run-egui-window.sh`
 
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use tfg::backend::{FileReplay, PollSource};
 use tfg::geo::track::{Fix, Registry, TrailBound};
-use tfg::map_render::{project_mercator, render_static_png};
+use tfg::map_render::{LiveMap, project_mercator};
 
 const MAP_W: f64 = 800.0;
 const MAP_H: f64 = 600.0;
@@ -26,6 +26,8 @@ const ZOOM: f64 = 11.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// v0 poll cadence, in seconds.
 const POLL_SECS: f64 = 2.0;
+/// Pumped frames per recenter on the hot scene.
+const RECENTER_PUMP: u32 = 6;
 
 struct ShipMarker {
     id: String,
@@ -36,16 +38,15 @@ struct ShipMarker {
 }
 
 struct ShipApp {
-    map_png: Vec<u8>,
-    /// Bumped every map swap: egui caches images by URI.
+    map_tex: Option<egui::TextureHandle>,
     map_version: u64,
     /// Viewport center shared by projection and (on swap) the frame.
     center: (f64, f64),
     registry: Registry,
     poll_rx: Receiver<Vec<Fix>>,
-    recenter_tx: Sender<(u64, (f64, f64), Vec<u8>)>,
-    recenter_rx: Receiver<(u64, (f64, f64), Vec<u8>)>,
-    recenter_seq: u64,
+    map_req_tx: Sender<(u64, (f64, f64))>,
+    map_resp_rx: Receiver<(u64, (f64, f64), Vec<u8>)>,
+    map_seq: u64,
     recentering: Option<String>,
     last_poll: Instant,
     hidden: HashSet<String>,
@@ -99,13 +100,29 @@ impl ShipApp {
             })
             .collect()
     }
-    /// Apply a finished background re-render (last-writer-wins by generation).
-    fn drain_recenter(&mut self) {
-        for (seq, center, png) in self.recenter_rx.try_iter() {
-            if seq == self.recenter_seq {
-                self.map_png = png;
-                self.center = center;
+
+    /// Apply finished map frames (last-writer-wins by sequence).
+    fn drain_map(&mut self, ctx: &egui::Context) {
+        for (seq, center, rgba) in self.map_resp_rx.try_iter() {
+            if seq == self.map_seq {
+                let img = if LiveMap::is_premultiplied() {
+                    egui::ColorImage::from_rgba_premultiplied(
+                        [MAP_W as usize, MAP_H as usize],
+                        &rgba,
+                    )
+                } else {
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [MAP_W as usize, MAP_H as usize],
+                        &rgba,
+                    )
+                };
+                self.map_tex = Some(ctx.load_texture(
+                    format!("map-{}", self.map_version),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                ));
                 self.map_version += 1;
+                self.center = center;
                 if self.recentering.is_some() {
                     eprintln!("recentered");
                 }
@@ -114,26 +131,19 @@ impl ShipApp {
         }
     }
 
-    /// Start a background map re-render centered on `at` for `ship`.
-    fn start_recenter(&mut self, ship: &str, at: (f64, f64)) {
-        self.recenter_seq += 1;
-        let seq = self.recenter_seq;
+    /// Ask the map thread for a frame centered on `at` for `ship`.
+    fn request_frame(&mut self, ship: &str, at: (f64, f64)) {
+        self.map_seq += 1;
         self.recentering = Some(ship.to_string());
-        let tx = self.recenter_tx.clone();
         eprintln!("recentering on {ship}…");
-        std::thread::spawn(move || {
-            let png = render_static_png(at, ZOOM, MAP_W as u32, MAP_H as u32, STYLE);
-            std::fs::write("target/map_spike.png", &png).unwrap_or(());
-            let _ = tx.send((seq, at, png));
-        });
+        let _ = self.map_req_tx.send((self.map_seq, at));
     }
 }
 
 impl eframe::App for ShipApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_recenter();
+        self.drain_map(ui.ctx());
         let markers = self.markers();
-        // Overlay glide needs continuous repaints; the map frame is static.
         ui.ctx().request_repaint_after(Duration::from_millis(100));
 
         egui::Panel::left("roster").show(ui, |ui| {
@@ -181,7 +191,7 @@ impl eframe::App for ShipApp {
                 self.following = None;
             }
             if let Some((ship, at)) = follow_req {
-                self.start_recenter(&ship, at);
+                self.request_frame(&ship, at);
             }
             if let Some(ship) = self.recentering.clone() {
                 ui.label(format!("centering on {ship}…"));
@@ -189,51 +199,52 @@ impl eframe::App for ShipApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let uri = format!("bytes://map-{}.png", self.map_version);
-            let img = egui::Image::from_bytes(uri, self.map_png.clone())
-                .fit_to_exact_size(egui::vec2(MAP_W as f32, MAP_H as f32));
-            let response = ui.add(img);
-            let rect = response.rect;
-            let painter = ui.painter_at(rect);
-            for m in &markers {
-                if self.hidden.contains(&m.id) {
-                    continue;
-                }
-                let color = if m.stale { egui::Color32::GRAY } else { Self::ship_color(&m.id) };
-                if self.show_trail {
-                    for (tx, ty) in &m.trail {
-                        painter.circle_filled(
-                            rect.min + egui::vec2(*tx as f32, *ty as f32),
-                            2.0,
-                            color.linear_multiply(0.55),
-                        );
-                    }
-                }
-                let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
-                painter.circle_filled(c, 8.0, color);
-                painter.circle_stroke(c, 8.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
-                if Some(&m.id) == self.following.as_ref() {
-                    painter.circle_stroke(c, 12.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
-                }
-                painter.text(
-                    c + egui::vec2(10.0, -10.0),
-                    egui::Align2::LEFT_TOP,
-                    &m.id,
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::BLACK,
+            if let Some(tex) = &self.map_tex {
+                let response = ui.add(
+                    egui::Image::new(tex).fit_to_exact_size(egui::vec2(MAP_W as f32, MAP_H as f32)),
                 );
+                let rect = response.rect;
+                let painter = ui.painter_at(rect);
+                for m in &markers {
+                    if self.hidden.contains(&m.id) {
+                        continue;
+                    }
+                    let color = if m.stale { egui::Color32::GRAY } else { Self::ship_color(&m.id) };
+                    if self.show_trail {
+                        for (tx, ty) in &m.trail {
+                            painter.circle_filled(
+                                rect.min + egui::vec2(*tx as f32, *ty as f32),
+                                2.0,
+                                color.linear_multiply(0.55),
+                            );
+                        }
+                    }
+                    let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
+                    painter.circle_filled(c, 8.0, color);
+                    painter.circle_stroke(c, 8.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                    if Some(&m.id) == self.following.as_ref() {
+                        painter.circle_stroke(c, 12.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
+                    }
+                    painter.text(
+                        c + egui::vec2(10.0, -10.0),
+                        egui::Align2::LEFT_TOP,
+                        &m.id,
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::BLACK,
+                    );
+                }
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label("loading map scene…");
+                });
             }
         });
     }
 }
 
 fn main() -> eframe::Result<()> {
-    // Map frame is still rendered once at startup (static harbor).
-    let png = render_static_png(CENTER, ZOOM, MAP_W as u32, MAP_H as u32, STYLE);
-    std::fs::write("target/map_spike.png", &png).unwrap();
-
     // Poll thread owns the replay; the UI owns the registry.
-    let (tx, rx) = mpsc::channel();
+    let (poll_tx, poll_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let fixture = format!("{}/tests/fixtures/tracks.json", env!("CARGO_MANIFEST_DIR"));
         let mut replay = match FileReplay::from_file(&fixture) {
@@ -246,7 +257,7 @@ fn main() -> eframe::Result<()> {
         loop {
             match replay.poll() {
                 Ok(fixes) => {
-                    if tx.send(fixes).is_err() {
+                    if poll_tx.send(fixes).is_err() {
                         return; // UI gone
                     }
                 }
@@ -256,7 +267,23 @@ fn main() -> eframe::Result<()> {
         }
     });
 
-    let (recenter_tx, recenter_rx) = mpsc::channel();
+    // Map thread owns the persistent scene; frames come back by channel.
+    let (map_req_tx, map_req_rx) = mpsc::channel::<(u64, (f64, f64))>();
+    let (map_resp_tx, map_resp_rx) = mpsc::channel::<(u64, (f64, f64), Vec<u8>)>();
+    std::thread::spawn(move || {
+        let mut scene = LiveMap::new(CENTER, ZOOM, MAP_W as u32, MAP_H as u32, STYLE);
+        for (seq, at) in map_req_rx {
+            scene.set_center(at, ZOOM);
+            scene.pump(RECENTER_PUMP);
+            let rgba = scene.frame_rgba();
+            if map_resp_tx.send((seq, at, rgba)).is_err() {
+                return; // UI gone
+            }
+        }
+    });
+    // Initial frame so the window never opens empty-handed for long.
+    map_req_tx.send((0, CENTER)).expect("map thread alive");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 640.0]),
         ..Default::default()
@@ -268,14 +295,14 @@ fn main() -> eframe::Result<()> {
             // Required once: without image loaders, from_bytes fails.
             egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(ShipApp {
-                map_png: png,
+                map_tex: None,
                 map_version: 0,
                 center: CENTER,
                 registry: Registry::new(TrailBound::default()),
-                poll_rx: rx,
-                recenter_tx,
-                recenter_rx,
-                recenter_seq: 0,
+                poll_rx,
+                map_req_tx,
+                map_resp_rx,
+                map_seq: 0,
                 recentering: None,
                 last_poll: Instant::now(),
                 hidden: HashSet::new(),
