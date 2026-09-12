@@ -1,4 +1,4 @@
-//! Shared map plumbing for the prototype shells (GPUI + egui).
+//! Shared map plumbing for the egui shell (GPUI shell removed, see ADR-0002).
 //!
 //! - [`render_static_png`]: one maplibre static frame to PNG bytes. Pumps a
 //!   fixed number of frames and returns the LAST one (idle callbacks don't
