@@ -11,7 +11,7 @@ use image::{ImageBuffer, Rgba};
 fn main() {
     let t0 = std::time::Instant::now();
     let mut map = tfg::map_render::LiveMap::new(
-        (53.5413, 9.9842),
+        (-6.108, 106.910),
         11.0,
         800,
         600,

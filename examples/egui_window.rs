@@ -24,7 +24,7 @@ use tfg::map_render::{LiveMap, project_mercator};
 
 const MAP_W: f64 = 800.0;
 const MAP_H: f64 = 600.0;
-const CENTER: (f64, f64) = (53.5413, 9.9842);
+const CENTER: (f64, f64) = (-6.108, 106.910);
 const ZOOM: f64 = 11.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// v0 poll cadence, in seconds.
