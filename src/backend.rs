@@ -23,6 +23,16 @@ struct Fixture {
     frames: Vec<Vec<serde_json::Value>>,
 }
 
+/// Parse one poll round from wire JSON values (flat lat/lon per fix).
+fn parse_frame(raw_frame: Vec<serde_json::Value>) -> Result<Vec<Fix>, String> {
+    let mut frame = Vec::with_capacity(raw_frame.len());
+    for raw in raw_frame {
+        let text = serde_json::to_string(&raw).map_err(|e| e.to_string())?;
+        frame.push(Fix::from_wire_json(&text)?);
+    }
+    Ok(frame)
+}
+
 /// Replays fixture frames in order, looping forever.
 pub struct FileReplay {
     frames: Vec<Vec<Fix>>,
@@ -35,16 +45,9 @@ impl FileReplay {
         let fixture: Fixture = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         let mut frames = Vec::with_capacity(fixture.frames.len());
         for (i, raw_frame) in fixture.frames.iter().enumerate() {
-            let mut frame = Vec::with_capacity(raw_frame.len());
-            for raw in raw_frame {
-                let wire: serde_json::Value = raw.clone();
-                let text = serde_json::to_string(&wire).map_err(|e| e.to_string())?;
-                frame.push(
-                    Fix::from_wire_json(&text)
-                        .map_err(|e| format!("frame {i}: {e}"))?,
-                );
-            }
-            frames.push(frame);
+            frames.push(
+                parse_frame(raw_frame.clone()).map_err(|e| format!("frame {i}: {e}"))?,
+            );
         }
         if frames.is_empty() {
             return Err("fixture has no frames".into());
@@ -65,23 +68,58 @@ impl PollSource for FileReplay {
     }
 }
 
-/// Real HTTP backend (`GET /v0/positions`). Unwired until the backend exists.
+/// Real HTTP backend: `GET {base_url}/v0/positions` returning a JSON array
+/// of wire fixes. Against `examples/mock_backend.rs` today, the real
+/// backend tomorrow: same contract, different URL.
 pub struct HttpPoll {
-    pub base_url: String,
+    base_url: String,
+    client: reqwest::blocking::Client,
+}
+
+impl HttpPoll {
+    pub fn new(base_url: &str) -> Result<Self, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), client })
+    }
 }
 
 impl PollSource for HttpPoll {
     fn poll(&mut self) -> Result<Vec<Fix>, String> {
-        Err(format!(
-            "HTTP backend not wired yet (base {}) — use FileReplay",
-            self.base_url
-        ))
+        let url = format!("{}/v0/positions", self.base_url);
+        let fixes: Vec<serde_json::Value> = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| e.to_string())?
+            .json()
+            .map_err(|e| e.to_string())?;
+        parse_frame(fixes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_poll_fetches_mock_backend() {
+        let body = r#"[{"ship_id":"a","lat":53.5,"lon":9.9,"ts":"2026-09-12T00:00:00Z"}]"#;
+        let server = tiny_http::Server::http("127.0.0.1:18080").expect("bind test port");
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests().take(1) {
+                assert_eq!(rq.url(), "/v0/positions");
+                let _ = rq.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        let mut src = HttpPoll::new("http://127.0.0.1:18080").expect("client builds");
+        let fixes = src.poll().expect("poll succeeds");
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].ship_id, "a");
+        assert_eq!(fixes[0].position.latitude, 53.5);
+    }
 
     #[test]
     fn replay_serves_frames_in_order_and_loops() {

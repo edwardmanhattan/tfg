@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use tfg::backend::{FileReplay, PollSource};
+use tfg::backend::{FileReplay, HttpPoll, PollSource};
 use tfg::geo::track::{Fix, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
@@ -285,21 +285,37 @@ impl eframe::App for ShipApp {
 }
 
 fn main() -> eframe::Result<()> {
-    // Poll thread owns the replay; the UI owns the registry.
+    // Poll thread owns the backend source; the UI owns the registry.
+    // TFG_BACKEND_URL=http://host:port selects HTTP, else file replay.
     let shutdown = std::sync::Arc::new(AtomicBool::new(false));
     let (poll_tx, poll_rx) = mpsc::channel();
     let poll_shutdown = shutdown.clone();
     let poll_handle = std::thread::spawn(move || {
         let fixture = format!("{}/tests/fixtures/tracks.json", env!("CARGO_MANIFEST_DIR"));
-        let mut replay = match FileReplay::from_file(&fixture) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("fixture failed to load: {e}");
-                return;
+        let mut source: Box<dyn PollSource> = match std::env::var("TFG_BACKEND_URL") {
+            Ok(url) => {
+                eprintln!("backend: HTTP {url}");
+                match HttpPoll::new(&url) {
+                    Ok(h) => Box::new(h),
+                    Err(e) => {
+                        eprintln!("http backend failed to start: {e}");
+                        return;
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!("backend: file replay");
+                match FileReplay::from_file(&fixture) {
+                    Ok(r) => Box::new(r),
+                    Err(e) => {
+                        eprintln!("fixture failed to load: {e}");
+                        return;
+                    }
+                }
             }
         };
         loop {
-            match replay.poll() {
+            match source.poll() {
                 Ok(fixes) => {
                     if poll_tx.send(fixes).is_err() {
                         return; // UI gone
