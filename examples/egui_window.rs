@@ -1,17 +1,22 @@
-//! egui command-center shell at parity with the GPUI `map_window`.
+//! egui command-center shell, live edition.
 //!
-//! Same fixture driving the same `Registry`, same openfreemap harbor frame,
-//! same projection, same roster shape (show/hide, follow highlight, trail
-//! toggle, stale badges). Markers + trails are immediate-mode painter
-//! circles over the map image — the overlay approach, egui edition.
+//! A background thread polls the [`FileReplay`] mock every [`POLL_SECS`]
+//! (the v0 cadence) and ships each round over a channel to the UI thread,
+//! which ingests it into the [`Registry`]. Markers glide previous -> latest
+//! by wall-clock fraction of the poll interval (`Registry::blend`); the map
+//! frame itself stays static (overlay approach, ADR-0001) and repaints run
+//! at ~10 Hz. Follow highlights only; re-centering needs continuous
+//! re-render (deferred).
 //!
 //! Run: `scripts/run-egui-window.sh`
 
 use std::collections::HashSet;
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tfg::backend::{FileReplay, PollSource};
-use tfg::geo::track::{Registry, TrailBound};
+use tfg::geo::track::{Fix, Registry, TrailBound};
 use tfg::map_render::{project_mercator, render_static_png};
 
 const MAP_W: f64 = 800.0;
@@ -19,6 +24,8 @@ const MAP_H: f64 = 600.0;
 const CENTER: (f64, f64) = (53.5413, 9.9842);
 const ZOOM: f64 = 11.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
+/// v0 poll cadence, in seconds.
+const POLL_SECS: f64 = 2.0;
 
 struct ShipMarker {
     id: String,
@@ -30,7 +37,9 @@ struct ShipMarker {
 
 struct ShipApp {
     map_png: Vec<u8>,
-    markers: Vec<ShipMarker>,
+    registry: Registry,
+    poll_rx: Receiver<Vec<Fix>>,
+    last_poll: Instant,
     hidden: HashSet<String>,
     following: Option<String>,
     show_trail: bool,
@@ -44,17 +53,58 @@ impl ShipApp {
             _ => egui::Color32::from_rgb(0x16, 0xa3, 0x4a),
         }
     }
+
+    /// Drain pending poll rounds, then derive marker geometry for this frame.
+    fn markers(&mut self) -> Vec<ShipMarker> {
+        let mut rounds = 0;
+        for fixes in self.poll_rx.try_iter() {
+            rounds += 1;
+            self.registry.poll(fixes);
+        }
+        if rounds > 0 {
+            self.last_poll = Instant::now();
+            let ships = self.registry.ships();
+            eprintln!(
+                "poll: {} ship(s){}",
+                ships.len(),
+                ships
+                    .iter()
+                    .filter(|s| s.stale)
+                    .map(|s| format!(" [stale: {}]", s.ship_id))
+                    .collect::<String>()
+            );
+        }
+        let frac = (self.last_poll.elapsed().as_secs_f64() / POLL_SECS).clamp(0.0, 1.0);
+        self.registry
+            .ships()
+            .iter()
+            .map(|s| {
+                let pos = self.registry.blend(&s.ship_id, frac).unwrap_or(s.latest.position);
+                let (x, y) = project_mercator(pos.latitude, pos.longitude, CENTER, ZOOM, MAP_W, MAP_H);
+                let trail = s
+                    .trail
+                    .iter()
+                    .map(|p| project_mercator(p.latitude, p.longitude, CENTER, ZOOM, MAP_W, MAP_H))
+                    .collect();
+                ShipMarker { id: s.ship_id.clone(), x, y, stale: s.stale, trail }
+            })
+            .collect()
+    }
 }
 
 impl eframe::App for ShipApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let markers = self.markers();
+        // Overlay glide needs continuous repaints; the map frame is static.
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
+
         egui::Panel::left("roster").show(ui, |ui| {
             ui.heading("Command center");
-            ui.label(format!("{} ships — click a name to follow", self.markers.len()));
+            ui.label(format!("{} ships — click a name to follow", markers.len()));
             ui.separator();
             ui.checkbox(&mut self.show_trail, "trails");
             ui.separator();
-            for m in &self.markers {
+            for m in &markers {
                 ui.horizontal(|ui| {
                     let mut shown = !self.hidden.contains(&m.id);
                     if ui.checkbox(&mut shown, "").changed() {
@@ -89,7 +139,7 @@ impl eframe::App for ShipApp {
             let response = ui.add(img);
             let rect = response.rect;
             let painter = ui.painter_at(rect);
-            for m in &self.markers {
+            for m in &markers {
                 if self.hidden.contains(&m.id) {
                     continue;
                 }
@@ -122,36 +172,33 @@ impl eframe::App for ShipApp {
 }
 
 fn main() -> eframe::Result<()> {
-    // Same deterministic startup as the GPUI shell.
-    let fixture = format!("{}/tests/fixtures/tracks.json", env!("CARGO_MANIFEST_DIR"));
-    let mut replay = FileReplay::from_file(&fixture).expect("fixture loads");
-    let mut registry = Registry::new(TrailBound::default());
-    for _ in 0..replay.frame_count() {
-        registry.poll(replay.poll().expect("replay polls"));
-    }
-    let now = registry.ships().iter().map(|s| s.latest.epoch_secs()).max().unwrap_or(0);
-    let markers: Vec<ShipMarker> = registry
-        .ships()
-        .iter()
-        .map(|s| {
-            let pos = registry.displayed_position(&s.ship_id, now).unwrap_or(s.latest.position);
-            let (x, y) = project_mercator(pos.latitude, pos.longitude, CENTER, ZOOM, MAP_W, MAP_H);
-            let trail = s
-                .trail
-                .iter()
-                .map(|p| project_mercator(p.latitude, p.longitude, CENTER, ZOOM, MAP_W, MAP_H))
-                .collect();
-            ShipMarker { id: s.ship_id.clone(), x, y, stale: s.stale, trail }
-        })
-        .collect();
-    println!(
-        "registry: {} ships, ostsee stale={}",
-        markers.len(),
-        markers.iter().find(|m| m.id == "ostsee").map(|m| m.stale).unwrap_or(false)
-    );
-
+    // Map frame is still rendered once at startup (static harbor).
     let png = render_static_png(CENTER, ZOOM, MAP_W as u32, MAP_H as u32, STYLE);
     std::fs::write("target/map_spike.png", &png).unwrap();
+
+    // Poll thread owns the replay; the UI owns the registry.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let fixture = format!("{}/tests/fixtures/tracks.json", env!("CARGO_MANIFEST_DIR"));
+        let mut replay = match FileReplay::from_file(&fixture) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("fixture failed to load: {e}");
+                return;
+            }
+        };
+        loop {
+            match replay.poll() {
+                Ok(fixes) => {
+                    if tx.send(fixes).is_err() {
+                        return; // UI gone
+                    }
+                }
+                Err(e) => eprintln!("poll failed (ships keep misses): {e}"),
+            }
+            std::thread::sleep(Duration::from_secs_f64(POLL_SECS));
+        }
+    });
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 640.0]),
@@ -161,12 +208,13 @@ fn main() -> eframe::Result<()> {
         "tfg command center (egui)",
         options,
         Box::new(|cc| {
-            // Required once: without image loaders, from_bytes fails
-            // and points at egui::load docs.
+            // Required once: without image loaders, from_bytes fails.
             egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(ShipApp {
                 map_png: png,
-                markers,
+                registry: Registry::new(TrailBound::default()),
+                poll_rx: rx,
+                last_poll: Instant::now(),
                 hidden: HashSet::new(),
                 following: None,
                 show_trail: true,

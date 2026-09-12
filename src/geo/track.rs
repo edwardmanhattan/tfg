@@ -174,16 +174,26 @@ impl Registry {
     pub fn displayed_position(&self, ship_id: &str, now_epoch: i64) -> Option<GeoPosition> {
         let s = self.ships.get(ship_id)?;
         let prev = s.previous.as_ref().unwrap_or(&s.latest);
-        if prev.position.distance_m(&s.latest.position) < JITTER_GUARD_M {
-            return Some(prev.position);
-        }
         let t0 = prev.epoch_secs();
         let t1 = s.latest.epoch_secs();
         if t1 <= t0 {
             return Some(s.latest.position);
         }
-        let t = (now_epoch - t0) as f64 / (t1 - t0) as f64;
-        Some(prev.position.lerp(&s.latest.position, t))
+        let frac = (now_epoch - t0) as f64 / (t1 - t0) as f64;
+        self.blend(ship_id, frac)
+    }
+
+    /// Blend previous -> latest by explicit fraction in [0, 1] (clamped).
+    /// Wall-clock driven: the UI maps elapsed-since-poll onto the poll
+    /// interval, so markers glide between fixes instead of jumping.
+    /// Holds on sub-guard jumps; unknown ships yield None.
+    pub fn blend(&self, ship_id: &str, frac: f64) -> Option<GeoPosition> {
+        let s = self.ships.get(ship_id)?;
+        let prev = s.previous.as_ref().unwrap_or(&s.latest);
+        if prev.position.distance_m(&s.latest.position) < JITTER_GUARD_M {
+            return Some(prev.position);
+        }
+        Some(prev.position.lerp(&s.latest.position, frac))
     }
 }
 
@@ -253,6 +263,30 @@ mod tests {
         r.poll(vec![fix("jit", 53.50001, 9.90001, "2026-09-12T00:00:10Z")]);
         let held = r.displayed_position("jit", 1789171205).unwrap();
         assert_eq!(held.latitude, 53.5);
+    }
+
+    #[test]
+    fn blend_interpolates_by_fraction_holds_jitter_and_misses_unknown() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![fix("big", 53.0, 9.0, "2026-09-12T00:00:00Z")]);
+        r.poll(vec![fix("big", 54.0, 10.0, "2026-09-12T00:00:10Z")]);
+        assert_eq!(
+            r.blend("big", 0.0).unwrap(),
+            GeoPosition { latitude: 53.0, longitude: 9.0 }
+        );
+        let mid = r.blend("big", 0.5).unwrap();
+        assert!((mid.latitude - 53.5).abs() < 1e-9);
+        assert_eq!(
+            r.blend("big", 1.0).unwrap(),
+            GeoPosition { latitude: 54.0, longitude: 10.0 }
+        );
+        assert_eq!(r.blend("ghost", 0.5), None);
+        // Single fix (no previous): holds latest at any fraction.
+        r.poll(vec![fix("solo", 53.5, 9.9, "2026-09-12T00:00:00Z")]);
+        assert_eq!(
+            r.blend("solo", 0.3).unwrap(),
+            GeoPosition { latitude: 53.5, longitude: 9.9 }
+        );
     }
 
     #[test]
