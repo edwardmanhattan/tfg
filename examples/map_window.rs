@@ -5,26 +5,23 @@
 //! - Markers + trails are GPUI overlay divs positioned by a hand-rolled
 //!   WebMercator projection of `displayed_position`. PROTOTYPE CAVEAT: this
 //!   duplicates projection (maplibre owns truth per the geo decision);
-//!   production markers move into maplibre layers. Overlay keeps this
-//!   ticket about UI shape, not layer plumbing.
+//!   per ADR-0001 overlays are the sanctioned home (own renderer later).
+//!   Overlay keeps this ticket about UI shape, not layer plumbing.
 //! - Roster: per-ship show/hide, click-to-follow (highlight only;
 //!   re-centering needs continuous re-render), trail toggle, stale badges.
 //!
 //! Run: `scripts/run-map-window.sh`
 
 use std::collections::HashSet;
-use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use gpui::{
     App, Application, Bounds, ClickEvent, Context, Image, ImageFormat, IntoElement, Render,
     Window, WindowBounds, WindowOptions, div, img, prelude::*, px, rgb, size,
 };
-use maplibre_native::{CameraUpdate, ImageRendererBuilder, LatLng};
 use tfg::backend::{FileReplay, PollSource};
 use tfg::geo::track::{Registry, TrailBound};
+use tfg::map_render::{project_mercator, render_static_png};
 
 const PANEL_BG: u32 = 0x1f2937;
 const ROW_HOVER_BG: u32 = 0x374151;
@@ -35,63 +32,6 @@ const MAP_H: f64 = 600.0;
 const CENTER_LAT: f64 = 53.5413;
 const CENTER_LON: f64 = 9.9842;
 const ZOOM: f64 = 11.0;
-
-/// Render one static harbor frame to PNG bytes (openfreemap liberty).
-/// Pumps a fixed number of frames and returns the LAST one (idle callbacks
-/// don't fire for Static).
-fn render_map_png(center: (f64, f64)) -> Vec<u8> {
-    let mut renderer = ImageRendererBuilder::new()
-        .with_size(NonZeroU32::new(MAP_W as u32).unwrap(), NonZeroU32::new(MAP_H as u32).unwrap())
-        .build_static_renderer();
-    let failed = Arc::new(AtomicBool::new(false));
-    let observer = renderer.map_observer();
-    observer.set_did_fail_loading_map_callback({
-        let failed = failed.clone();
-        move |e| {
-            eprintln!("map failed to load: {}", e.message);
-            failed.store(true, Ordering::SeqCst);
-        }
-    });
-    renderer.load_style_from_url(&"https://tiles.openfreemap.org/styles/liberty".parse().unwrap());
-    let camera = CameraUpdate::new()
-        .center(LatLng { lat: center.0, lng: center.1 })
-        .zoom(ZOOM);
-    let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    let mut last = None;
-    for _ in 1..=40 {
-        if failed.load(Ordering::SeqCst) {
-            panic!("map failed to load");
-        }
-        match renderer.render_static(&camera) {
-            Ok(image) => last = Some(image),
-            Err(e) => eprintln!("render attempt failed (still loading?): {e:?}"),
-        }
-        if std::time::Instant::now() > deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    let image = last.expect("no frame rendered at all");
-    let buf = image.as_image();
-    let mut png = Vec::new();
-    buf.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
-    png
-}
-
-/// WebMercator (slippy) projection of lat/lon to window pixels, given the
-/// viewport center. Prototype-only duplication (see module docs).
-fn project(lat: f64, lon: f64, center: (f64, f64)) -> (f64, f64) {
-    fn world(lat: f64, lon: f64) -> (f64, f64) {
-        let scale = 256.0 * 2f64.powf(ZOOM);
-        let x = (lon + 180.0) / 360.0 * scale;
-        let s = (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln();
-        let y = (1.0 - s / std::f64::consts::PI) / 2.0 * scale;
-        (x, y)
-    }
-    let (x, y) = world(lat, lon);
-    let (cx, cy) = world(center.0, center.1);
-    (x - cx + MAP_W / 2.0, y - cy + MAP_H / 2.0)
-}
 
 struct ShipMarker {
     id: String,
@@ -282,11 +222,11 @@ fn main() {
         .iter()
         .map(|s| {
             let pos = registry.displayed_position(&s.ship_id, now).unwrap_or(s.latest.position);
-            let (x, y) = project(pos.latitude, pos.longitude, (CENTER_LAT, CENTER_LON));
+            let (x, y) = project_mercator(pos.latitude, pos.longitude, (CENTER_LAT, CENTER_LON), ZOOM, MAP_W, MAP_H);
             let trail = s
                 .trail
                 .iter()
-                .map(|p| project(p.latitude, p.longitude, (CENTER_LAT, CENTER_LON)))
+                .map(|p| project_mercator(p.latitude, p.longitude, (CENTER_LAT, CENTER_LON), ZOOM, MAP_W, MAP_H))
                 .collect();
             ShipMarker { id: s.ship_id.clone(), x, y, stale: s.stale, trail }
         })
@@ -298,7 +238,7 @@ fn main() {
     );
 
     // Map image + GPUI window (same composition as the spike).
-    let png = render_map_png((CENTER_LAT, CENTER_LON));
+    let png = render_static_png((CENTER_LAT, CENTER_LON), ZOOM, MAP_W as u32, MAP_H as u32, "https://tiles.openfreemap.org/styles/liberty");
     std::fs::write("target/map_spike.png", &png).unwrap();
     let map = Arc::new(Image::from_bytes(ImageFormat::Png, png));
 
