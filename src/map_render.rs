@@ -10,6 +10,8 @@
 //! NOTE: on systems with libuv >= 1.51 the precompiled core aborts without
 //! an older libuv preloaded (see scripts/build-libuv-workaround.sh).
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +20,11 @@ use std::time::Duration;
 use maplibre_native::{CameraUpdate, ImageRendererBuilder, LatLng};
 
 /// Render one static frame of `style_url` to PNG bytes.
+/// Pumps frames until pixels converge (3 identical in a row past a 6-frame
+/// minimum, 25 max, 150 ms apart) and returns the LAST one. Idle callbacks
+/// don't fire for Static renderers, and early frames are background-only
+/// while tiles stream in. Tiles persist in a temp-dir ambient cache, so
+/// repeat renders skip the network.
 pub fn render_static_png(
     center: (f64, f64),
     zoom: f64,
@@ -27,6 +34,11 @@ pub fn render_static_png(
 ) -> Vec<u8> {
     let mut renderer = ImageRendererBuilder::new()
         .with_size(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
+        .with_resource_options(
+            maplibre_native::ResourceOptions::default()
+                .with_cache_path(std::env::temp_dir().join("tfg-maplibre-cache"))
+                .with_maximum_cache_size(256 * 1024 * 1024),
+        )
         .build_static_renderer();
     let failed = Arc::new(AtomicBool::new(false));
     let observer = renderer.map_observer();
@@ -43,18 +55,29 @@ pub fn render_static_png(
         .zoom(zoom);
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     let mut last = None;
-    for _ in 1..=40 {
+    let (mut stable, mut prev_hash) = (0u32, 0u64);
+    for frame in 1..=25 {
         if failed.load(Ordering::SeqCst) {
             panic!("map failed to load");
         }
         match renderer.render_static(&camera) {
-            Ok(image) => last = Some(image),
+            Ok(image) => {
+                let mut h = DefaultHasher::new();
+                image.as_image().as_raw().hash(&mut h);
+                let hash = h.finish();
+                stable = if hash == prev_hash { stable + 1 } else { 0 };
+                prev_hash = hash;
+                last = Some(image);
+                if frame >= 6 && stable >= 3 {
+                    break; // pixels converged: tiles are in
+                }
+            }
             Err(e) => eprintln!("render attempt failed (still loading?): {e:?}"),
         }
         if std::time::Instant::now() > deadline {
             break;
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(150));
     }
     let image = last.expect("no frame rendered at all");
     let buf = image.as_image();
