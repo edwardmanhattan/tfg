@@ -24,10 +24,31 @@ use maplibre_native::{
 /// Pixel layout of [`LiveMap::frame_rgba`]. Flip if the map renders washed.
 const PREMULTIPLIED: bool = true;
 
+/// Repo-committed seed cache (written by `examples/seed_cache.rs`).
+/// Never opened writable by the app: runs copy it to [`runtime_cache_path`]
+/// first, so everyday map use never dirties the working tree.
+pub fn seed_cache_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/tiles-cache.seed.sqlite")
+}
+
+/// Writable runtime copy of the tile cache. Restored from the seed when
+/// missing (fresh clone, `cargo clean`), then refreshed by use.
+pub fn runtime_cache_path() -> PathBuf {
+    let runtime =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tfg-tiles-cache.sqlite");
+    if !runtime.is_file() {
+        if let Some(parent) = runtime.parent() {
+            std::fs::create_dir_all(parent).expect("target dir writable");
+        }
+        std::fs::copy(seed_cache_path(), &runtime).expect("seed cache present; run seed_cache");
+    }
+    runtime
+}
+
 /// Repo-committed ambient tile cache (seeded by `examples/seed_cache.rs`).
 /// The app boots from this without network; misses re-fetch and refresh it.
 pub fn repo_cache_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/tiles-cache.sqlite")
+    runtime_cache_path()
 }
 
 /// A persistent map scene: build once, re-render for the process lifetime.
