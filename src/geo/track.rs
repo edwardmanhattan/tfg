@@ -81,6 +81,16 @@ impl Default for TrailBound {
 /// Jumps smaller than this hold position (GPS jitter guard).
 pub const JITTER_GUARD_M: f64 = 8.0;
 
+/// Followed-ship displacement from viewport center that earns a tracking
+/// re-render. Hysteresis against refetch storms while chasing.
+pub const TRACK_MIN_MOVE_M: f64 = 150.0;
+
+/// Whether follow-tracking should request a new frame for a ship at
+/// `ship` while the viewport sits on `center`.
+pub fn should_track(center: GeoPosition, ship: GeoPosition) -> bool {
+    center.distance_m(&ship) >= TRACK_MIN_MOVE_M
+}
+
 /// Missed polls before a ship is flagged stale.
 pub const STALE_AFTER_MISSED: u32 = 3;
 
@@ -287,6 +297,15 @@ mod tests {
             r.blend("solo", 0.3).unwrap(),
             GeoPosition { latitude: 53.5, longitude: 9.9 }
         );
+    }
+
+    #[test]
+    fn tracking_fires_beyond_threshold_holds_inside() {
+        let center = GeoPosition { latitude: 53.5413, longitude: 9.9842 };
+        let near = GeoPosition { latitude: 53.5414, longitude: 9.9843 };
+        let far = GeoPosition { latitude: 53.55, longitude: 10.0 };
+        assert!(!should_track(center, near));
+        assert!(should_track(center, far));
     }
 
     #[test]

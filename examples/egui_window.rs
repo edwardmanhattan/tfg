@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tfg::backend::{FileReplay, PollSource};
-use tfg::geo::track::{Fix, Registry, TrailBound};
+use tfg::geo::track::{Fix, Registry, TrailBound, should_track};
+use tfg::geo::GeoPosition;
 use tfg::map_render::{LiveMap, project_mercator};
 
 const MAP_W: f64 = 800.0;
@@ -216,6 +217,22 @@ impl eframe::App for ShipApp {
             }
             if let Some((ship, at)) = follow_req {
                 self.request_frame(&ship, at);
+            }
+            // Follow-tracking: chase the followed ship when it drifts from
+            // center. Gated on no re-render in flight, so frames can't pile.
+            if self.recentering.is_none() {
+                if let Some(id) = self.following.clone() {
+                    if let Some(s) = self.registry.ships().iter().find(|s| s.ship_id == id) {
+                        let ship_pos = s.latest.position;
+                        let center = GeoPosition {
+                            latitude: self.center.0,
+                            longitude: self.center.1,
+                        };
+                        if should_track(center, ship_pos) {
+                            self.request_frame(&id, (ship_pos.latitude, ship_pos.longitude));
+                        }
+                    }
+                }
             }
             if let Some(ship) = self.recentering.clone() {
                 ui.label(format!("centering on {ship}…"));
