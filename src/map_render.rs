@@ -12,6 +12,7 @@
 //! an older libuv preloaded (see scripts/build-libuv-workaround.sh).
 
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -23,6 +24,12 @@ use maplibre_native::{
 /// Pixel layout of [`LiveMap::frame_rgba`]. Flip if the map renders washed.
 const PREMULTIPLIED: bool = true;
 
+/// Repo-committed ambient tile cache (seeded by `examples/seed_cache.rs`).
+/// The app boots from this without network; misses re-fetch and refresh it.
+pub fn repo_cache_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/tiles-cache.sqlite")
+}
+
 /// A persistent map scene: build once, re-render for the process lifetime.
 pub struct LiveMap {
     renderer: ImageRenderer<Continuous>,
@@ -32,12 +39,19 @@ pub struct LiveMap {
 
 impl LiveMap {
     /// Build the scene and pump until the style is loaded.
-    pub fn new(center: (f64, f64), zoom: f64, w: u32, h: u32, style_url: &str) -> Self {
+    pub fn new(
+        center: (f64, f64),
+        zoom: f64,
+        w: u32,
+        h: u32,
+        style_url: &str,
+        cache_path: PathBuf,
+    ) -> Self {
         let mut renderer = ImageRendererBuilder::new()
             .with_size(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
             .with_resource_options(
                 ResourceOptions::default()
-                    .with_cache_path(std::env::temp_dir().join("tfg-maplibre-cache"))
+                .with_cache_path(cache_path)
                     .with_maximum_cache_size(256 * 1024 * 1024),
             )
             .build_continuous_renderer();

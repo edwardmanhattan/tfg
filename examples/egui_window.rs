@@ -20,7 +20,8 @@ use eframe::egui;
 use tfg::backend::{FileReplay, PollSource};
 use tfg::geo::track::{Fix, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
-use tfg::map_render::{LiveMap, project_mercator};
+use tfg::map_render::LiveMap;
+use tfg::map_render::project_mercator;
 
 const MAP_W: f64 = 800.0;
 const MAP_H: f64 = 600.0;
@@ -321,7 +322,7 @@ fn main() -> eframe::Result<()> {
     let (map_req_tx, map_req_rx) = mpsc::channel::<(u64, (f64, f64))>();
     let (map_resp_tx, map_resp_rx) = mpsc::channel::<(u64, (f64, f64), Vec<u8>)>();
     let map_handle = std::thread::spawn(move || {
-        let mut scene = LiveMap::new(CENTER, ZOOM, MAP_W as u32, MAP_H as u32, STYLE);
+        let mut scene = LiveMap::new(CENTER, ZOOM, MAP_W as u32, MAP_H as u32, STYLE, tfg::map_render::repo_cache_path());
         while let Ok((seq, at)) = map_req_rx.recv() {
             scene.set_center(at, ZOOM);
             scene.pump(RECENTER_PUMP);

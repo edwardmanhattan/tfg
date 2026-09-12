@@ -16,6 +16,7 @@ fn main() {
         800,
         600,
         "https://tiles.openfreemap.org/styles/liberty",
+        tfg::map_render::repo_cache_path(),
     );
     println!("scene ready in {:.1}s", t0.elapsed().as_secs_f64());
     map.pump(10);
