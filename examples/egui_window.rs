@@ -160,7 +160,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "tfg command center (egui)",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
+            // Required once: without image loaders, from_bytes fails
+            // and points at egui::load docs.
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(ShipApp {
                 map_png: png,
                 markers,
