@@ -1,0 +1,27 @@
+{
+  "frames": [
+    [
+      {"ship_id": "nordwind", "lat": 53.5413, "lon": 9.9842, "ts": "2026-09-12T00:00:00Z", "heading_deg": 90.0, "speed_kn": 8.5},
+      {"ship_id": "ostsee", "lat": 53.5200, "lon": 9.9500, "ts": "2026-09-12T00:00:00Z", "heading_deg": 45.0, "speed_kn": 12.0}
+    ],
+    [
+      {"ship_id": "nordwind", "lat": 53.5415, "lon": 9.9850, "ts": "2026-09-12T00:00:02Z", "heading_deg": 90.0, "speed_kn": 8.5},
+      {"ship_id": "ostsee", "lat": 53.5204, "lon": 9.9506, "ts": "2026-09-12T00:00:02Z", "heading_deg": 45.0, "speed_kn": 12.0}
+    ],
+    [
+      {"ship_id": "nordwind", "lat": 53.5417, "lon": 9.9858, "ts": "2026-09-12T00:00:04Z", "heading_deg": 90.0, "speed_kn": 8.5},
+      {"ship_id": "ostsee", "lat": 53.5208, "lon": 9.9512, "ts": "2026-09-12T00:00:04Z", "heading_deg": 45.0, "speed_kn": 12.0}
+    ],
+    [
+      {"ship_id": "nordwind", "lat": 53.5419, "lon": 9.9866, "ts": "2026-09-12T00:00:06Z", "heading_deg": 90.0, "speed_kn": 8.5}
+    ],
+    [
+      {"ship_id": "nordwind", "lat": 53.5421, "lon": 9.9874, "ts": "2026-09-12T00:00:08Z", "heading_deg": 90.0, "speed_kn": 8.5},
+      {"ship_id": "ostsee", "lat": 53.5216, "lon": 9.9524, "ts": "2026-09-12T00:00:08Z", "heading_deg": 45.0, "speed_kn": 12.0}
+    ],
+    [
+      {"ship_id": "nordwind", "lat": 53.5423, "lon": 9.9882, "ts": "2026-09-12T00:00:10Z", "heading_deg": 90.0, "speed_kn": 8.5},
+      {"ship_id": "ostsee", "lat": 53.5220, "lon": 9.9530, "ts": "2026-09-12T00:00:10Z", "heading_deg": 45.0, "speed_kn": 12.0}
+    ]
+  ]
+}
