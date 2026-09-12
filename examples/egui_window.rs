@@ -11,7 +11,9 @@
 //! Run: `scripts/run-egui-window.sh`
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -44,10 +46,13 @@ struct ShipApp {
     center: (f64, f64),
     registry: Registry,
     poll_rx: Receiver<Vec<Fix>>,
-    map_req_tx: Sender<(u64, (f64, f64))>,
+    map_req_tx: Option<Sender<(u64, (f64, f64))>>,
     map_resp_rx: Receiver<(u64, (f64, f64), Vec<u8>)>,
     map_seq: u64,
     recentering: Option<String>,
+    shutdown: std::sync::Arc<AtomicBool>,
+    poll_handle: Option<JoinHandle<()>>,
+    map_handle: Option<JoinHandle<()>>,
     last_poll: Instant,
     hidden: HashSet<String>,
     following: Option<String>,
@@ -133,14 +138,33 @@ impl ShipApp {
 
     /// Ask the map thread for a frame centered on `at` for `ship`.
     fn request_frame(&mut self, ship: &str, at: (f64, f64)) {
+        let Some(tx) = self.map_req_tx.clone() else {
+            return; // shutting down
+        };
         self.map_seq += 1;
         self.recentering = Some(ship.to_string());
         eprintln!("recentering on {ship}…");
-        let _ = self.map_req_tx.send((self.map_seq, at));
+        let _ = tx.send((self.map_seq, at));
     }
 }
 
 impl eframe::App for ShipApp {
+    /// Ordered teardown: stop the poll source, close the map request
+    /// channel so the map thread drops its scene on its OWN thread, then
+    /// join both before eframe tears down GL. Lets background threads run
+    /// past this point and the native map core frees out from under them
+    /// (the `double free` on close).
+    fn on_exit(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.map_req_tx.take();
+        if let Some(h) = self.map_handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.poll_handle.take() {
+            let _ = h.join();
+        }
+        eprintln!("shutdown: threads joined");
+    }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_map(ui.ctx());
         let markers = self.markers();
@@ -244,8 +268,10 @@ impl eframe::App for ShipApp {
 
 fn main() -> eframe::Result<()> {
     // Poll thread owns the replay; the UI owns the registry.
+    let shutdown = std::sync::Arc::new(AtomicBool::new(false));
     let (poll_tx, poll_rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let poll_shutdown = shutdown.clone();
+    let poll_handle = std::thread::spawn(move || {
         let fixture = format!("{}/tests/fixtures/tracks.json", env!("CARGO_MANIFEST_DIR"));
         let mut replay = match FileReplay::from_file(&fixture) {
             Ok(r) => r,
@@ -263,21 +289,28 @@ fn main() -> eframe::Result<()> {
                 }
                 Err(e) => eprintln!("poll failed (ships keep misses): {e}"),
             }
-            std::thread::sleep(Duration::from_secs_f64(POLL_SECS));
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(100));
+                if poll_shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
         }
     });
 
     // Map thread owns the persistent scene; frames come back by channel.
+    // It exits when the UI drops its request sender, dropping the scene
+    // on this thread (see on_exit) instead of racing process teardown.
     let (map_req_tx, map_req_rx) = mpsc::channel::<(u64, (f64, f64))>();
     let (map_resp_tx, map_resp_rx) = mpsc::channel::<(u64, (f64, f64), Vec<u8>)>();
-    std::thread::spawn(move || {
+    let map_handle = std::thread::spawn(move || {
         let mut scene = LiveMap::new(CENTER, ZOOM, MAP_W as u32, MAP_H as u32, STYLE);
-        for (seq, at) in map_req_rx {
+        while let Ok((seq, at)) = map_req_rx.recv() {
             scene.set_center(at, ZOOM);
             scene.pump(RECENTER_PUMP);
             let rgba = scene.frame_rgba();
             if map_resp_tx.send((seq, at, rgba)).is_err() {
-                return; // UI gone
+                break; // UI gone
             }
         }
     });
@@ -300,10 +333,13 @@ fn main() -> eframe::Result<()> {
                 center: CENTER,
                 registry: Registry::new(TrailBound::default()),
                 poll_rx,
-                map_req_tx,
+                map_req_tx: Some(map_req_tx),
                 map_resp_rx,
                 map_seq: 0,
                 recentering: None,
+                shutdown,
+                poll_handle: Some(poll_handle),
+                map_handle: Some(map_handle),
                 last_poll: Instant::now(),
                 hidden: HashSet::new(),
                 following: None,
