@@ -11,7 +11,7 @@
 //! Run: `scripts/run-egui-window.sh`
 
 use std::collections::HashSet;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -37,8 +37,16 @@ struct ShipMarker {
 
 struct ShipApp {
     map_png: Vec<u8>,
+    /// Bumped every map swap: egui caches images by URI.
+    map_version: u64,
+    /// Viewport center shared by projection and (on swap) the frame.
+    center: (f64, f64),
     registry: Registry,
     poll_rx: Receiver<Vec<Fix>>,
+    recenter_tx: Sender<(u64, (f64, f64), Vec<u8>)>,
+    recenter_rx: Receiver<(u64, (f64, f64), Vec<u8>)>,
+    recenter_seq: u64,
+    recentering: Option<String>,
     last_poll: Instant,
     hidden: HashSet<String>,
     following: Option<String>,
@@ -75,25 +83,55 @@ impl ShipApp {
             );
         }
         let frac = (self.last_poll.elapsed().as_secs_f64() / POLL_SECS).clamp(0.0, 1.0);
+        let center = self.center;
         self.registry
             .ships()
             .iter()
             .map(|s| {
                 let pos = self.registry.blend(&s.ship_id, frac).unwrap_or(s.latest.position);
-                let (x, y) = project_mercator(pos.latitude, pos.longitude, CENTER, ZOOM, MAP_W, MAP_H);
+                let (x, y) = project_mercator(pos.latitude, pos.longitude, center, ZOOM, MAP_W, MAP_H);
                 let trail = s
                     .trail
                     .iter()
-                    .map(|p| project_mercator(p.latitude, p.longitude, CENTER, ZOOM, MAP_W, MAP_H))
+                    .map(|p| project_mercator(p.latitude, p.longitude, center, ZOOM, MAP_W, MAP_H))
                     .collect();
                 ShipMarker { id: s.ship_id.clone(), x, y, stale: s.stale, trail }
             })
             .collect()
     }
+    /// Apply a finished background re-render (last-writer-wins by generation).
+    fn drain_recenter(&mut self) {
+        for (seq, center, png) in self.recenter_rx.try_iter() {
+            if seq == self.recenter_seq {
+                self.map_png = png;
+                self.center = center;
+                self.map_version += 1;
+                if self.recentering.is_some() {
+                    eprintln!("recentered");
+                }
+                self.recentering = None;
+            }
+        }
+    }
+
+    /// Start a background map re-render centered on `at` for `ship`.
+    fn start_recenter(&mut self, ship: &str, at: (f64, f64)) {
+        self.recenter_seq += 1;
+        let seq = self.recenter_seq;
+        self.recentering = Some(ship.to_string());
+        let tx = self.recenter_tx.clone();
+        eprintln!("recentering on {ship}…");
+        std::thread::spawn(move || {
+            let png = render_static_png(at, ZOOM, MAP_W as u32, MAP_H as u32, STYLE);
+            std::fs::write("target/map_spike.png", &png).unwrap_or(());
+            let _ = tx.send((seq, at, png));
+        });
+    }
 }
 
 impl eframe::App for ShipApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.drain_recenter();
         let markers = self.markers();
         // Overlay glide needs continuous repaints; the map frame is static.
         ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -104,6 +142,7 @@ impl eframe::App for ShipApp {
             ui.separator();
             ui.checkbox(&mut self.show_trail, "trails");
             ui.separator();
+            let mut follow_req: Option<(String, (f64, f64))> = None;
             for m in &markers {
                 ui.horizontal(|ui| {
                     let mut shown = !self.hidden.contains(&m.id);
@@ -125,16 +164,33 @@ impl eframe::App for ShipApp {
                     if ui.selectable_value(&mut self.following, Some(m.id.clone()), label).clicked()
                     {
                         eprintln!("follow {:?}", self.following);
+                        if self.following.as_deref() == Some(&m.id) {
+                            if let Some(s) =
+                                self.registry.ships().iter().find(|s| s.ship_id == m.id)
+                            {
+                                follow_req = Some((
+                                    m.id.clone(),
+                                    (s.latest.position.latitude, s.latest.position.longitude),
+                                ));
+                            }
+                        }
                     }
                 });
             }
             if ui.small_button("unfollow").clicked() {
                 self.following = None;
             }
+            if let Some((ship, at)) = follow_req {
+                self.start_recenter(&ship, at);
+            }
+            if let Some(ship) = self.recentering.clone() {
+                ui.label(format!("centering on {ship}…"));
+            }
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let img = egui::Image::from_bytes("bytes://map.png", self.map_png.clone())
+            let uri = format!("bytes://map-{}.png", self.map_version);
+            let img = egui::Image::from_bytes(uri, self.map_png.clone())
                 .fit_to_exact_size(egui::vec2(MAP_W as f32, MAP_H as f32));
             let response = ui.add(img);
             let rect = response.rect;
@@ -200,6 +256,7 @@ fn main() -> eframe::Result<()> {
         }
     });
 
+    let (recenter_tx, recenter_rx) = mpsc::channel();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 640.0]),
         ..Default::default()
@@ -212,8 +269,14 @@ fn main() -> eframe::Result<()> {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(ShipApp {
                 map_png: png,
+                map_version: 0,
+                center: CENTER,
                 registry: Registry::new(TrailBound::default()),
                 poll_rx: rx,
+                recenter_tx,
+                recenter_rx,
+                recenter_seq: 0,
+                recentering: None,
                 last_poll: Instant::now(),
                 hidden: HashSet::new(),
                 following: None,
