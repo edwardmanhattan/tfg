@@ -1,6 +1,3 @@
-mod backend;
-mod geo;
-
 fn main() {
-    println!("Hello, world!");
+    println!("tfg: presentation-mode ship map client (see examples/)");
 }
