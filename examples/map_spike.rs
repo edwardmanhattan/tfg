@@ -2,9 +2,6 @@
 //!
 //! No UI, no backend, no ships — proves the continuous renderer path that
 //! all shells run. Uses [`tfg::map_render::LiveMap`].
-//!
-//! NOTE: needs the libuv workaround on systems with libuv >= 1.51, e.g.
-//! `LD_PRELOAD=<repo>/target/libuv-1.44.2/build/libuv.so.1`.
 
 use image::{ImageBuffer, Rgba};
 

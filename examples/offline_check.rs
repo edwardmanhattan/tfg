@@ -4,7 +4,7 @@
 //! can only come from the repo-committed ambient cache. A full map here
 //! proves the app boots offline. Saves `target/offline-check.png`.
 //!
-//! `MLN_PRECOMPILE=1 LD_PRELOAD=<libuv> cargo run --example offline_check`
+//! `cargo run --example offline_check`
 
 use image::{ImageBuffer, Rgba};
 use maplibre_native::{

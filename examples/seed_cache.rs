@@ -4,9 +4,7 @@
 //! app boots with full tiles and no network. Run with network when the
 //! theater moves or tile versions roll:
 //!
-//! `MLN_PRECOMPILE=1 LD_PRELOAD=<libuv> cargo run --example seed_cache`
-//!
-//! NOTE: same libuv workaround as everything maplibre-shaped.
+//! `cargo run --example seed_cache`
 
 use tfg::map_render::{LiveMap, seed_cache_path};
 

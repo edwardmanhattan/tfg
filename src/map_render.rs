@@ -7,9 +7,6 @@
 //!
 //! [`project_mercator`]: WebMercator projection for overlay markers
 //! (prototype duplication of the map engine's projection, ADR-0001).
-//!
-//! NOTE: on systems with libuv >= 1.51 the precompiled core aborts without
-//! an older libuv preloaded (see scripts/build-libuv-workaround.sh).
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;

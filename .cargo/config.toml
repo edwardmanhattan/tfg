@@ -1,6 +1,0 @@
-# Spike decision (see prototype/single-window-spike): dev builds use the
-# precompiled MapLibre Native core. From-source builds (the default) clone
-# the full native repo in the build script — slow and flaky.
-# Explicit `MLN_PRECOMPILE=1 cargo ...` overrides this when needed.
-[env]
-MLN_PRECOMPILE = "1"
