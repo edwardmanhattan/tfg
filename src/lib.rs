@@ -6,3 +6,4 @@
 pub mod backend;
 pub mod geo;
 pub mod map_render;
+pub mod overlay;

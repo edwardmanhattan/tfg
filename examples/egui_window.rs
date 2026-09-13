@@ -10,7 +10,7 @@
 //!
 //! Run: `scripts/run-egui-window.sh`
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
@@ -22,6 +22,7 @@ use tfg::geo::track::{Fix, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
 use tfg::map_render::project_mercator;
+use tfg::overlay::hit_test;
 
 const MAP_W: f64 = 800.0;
 const MAP_H: f64 = 600.0;
@@ -59,6 +60,11 @@ struct ShipApp {
     hidden: HashSet<String>,
     following: Option<String>,
     show_trail: bool,
+    selected: Option<String>,
+    /// Wall-clock last-seen + fix counts per ship (inspector readout;
+    /// stamped as poll rounds arrive, so the geo model stays time-free).
+    last_seen: HashMap<String, Instant>,
+    fix_count: HashMap<String, usize>,
 }
 
 impl ShipApp {
@@ -75,6 +81,10 @@ impl ShipApp {
         let mut rounds = 0;
         for fixes in self.poll_rx.try_iter() {
             rounds += 1;
+            for f in &fixes {
+                self.last_seen.insert(f.ship_id.clone(), Instant::now());
+                *self.fix_count.entry(f.ship_id.clone()).or_insert(0) += 1;
+            }
             self.registry.poll(fixes);
         }
         if rounds > 0 {
@@ -200,6 +210,7 @@ impl eframe::App for ShipApp {
                     if ui.selectable_value(&mut self.following, Some(m.id.clone()), label).clicked()
                     {
                         eprintln!("follow {:?}", self.following);
+                        self.selected = Some(m.id.clone());
                         if self.following.as_deref() == Some(&m.id) {
                             if let Some(s) =
                                 self.registry.ships().iter().find(|s| s.ship_id == m.id)
@@ -215,6 +226,52 @@ impl eframe::App for ShipApp {
             }
             if ui.small_button("unfollow").clicked() {
                 self.following = None;
+            }
+            ui.separator();
+            // Inspector: live readout for the selected ship.
+            ui.heading("Inspector");
+            let mut close_inspector = false;
+            let mut follow_selected: Option<(String, (f64, f64))> = None;
+            match self.selected.clone().and_then(|id| {
+                self.registry.ships().iter().find(|s| s.ship_id == id).map(|s| (id, s.latest.clone(), s.stale, s.trail.len()))
+            }) {
+                Some((id, fix, stale, trail_len)) => {
+                    ui.label(format!("ship: {id}{}", if stale { " (stale)" } else { "" }));
+                    ui.label(format!(
+                        "pos: {:.6} {:.6}",
+                        fix.position.latitude, fix.position.longitude
+                    ));
+                    ui.label(format!(
+                        "hdg/spd: {} / {}",
+                        fix.heading_deg.map(|h| format!("{h:.0}°")).as_deref().unwrap_or("—"),
+                        fix.speed_kn.map(|s| format!("{s:.0} kn")).as_deref().unwrap_or("—")
+                    ));
+                    let age = self.last_seen.get(&id).map(|t| t.elapsed().as_secs()).unwrap_or(999);
+                    let n = self.fix_count.get(&id).copied().unwrap_or(0);
+                    ui.label(format!("last update: {age}s ago · {n} fixes · trail {trail_len}"));
+                    ui.label(format!("wire ts: {}", fix.ts));
+                    ui.horizontal(|ui| {
+                        if ui.small_button("follow").clicked() {
+                            follow_selected = Some((
+                                id.clone(),
+                                (fix.position.latitude, fix.position.longitude),
+                            ));
+                        }
+                        if ui.small_button("close").clicked() {
+                            close_inspector = true;
+                        }
+                    });
+                }
+                None => {
+                    ui.label("click a ship on the map or roster");
+                }
+            }
+            if close_inspector {
+                self.selected = None;
+            }
+            if let Some((ship, at)) = follow_selected {
+                self.following = Some(ship.clone());
+                self.request_frame(&ship, at);
             }
             if let Some((ship, at)) = follow_req {
                 self.request_frame(&ship, at);
@@ -246,6 +303,22 @@ impl eframe::App for ShipApp {
                     egui::Image::new(tex).fit_to_exact_size(egui::vec2(MAP_W as f32, MAP_H as f32)),
                 );
                 let rect = response.rect;
+                // Map click: select the nearest visible marker (12px).
+                if response.clicked() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let px = (pos.x - rect.min.x) as f64;
+                        let py = (pos.y - rect.min.y) as f64;
+                        let visible: Vec<(String, f64, f64)> = markers
+                            .iter()
+                            .filter(|m| !self.hidden.contains(&m.id))
+                            .map(|m| (m.id.clone(), m.x, m.y))
+                            .collect();
+                        if let Some(id) = hit_test(&visible, px, py, 12.0) {
+                            eprintln!("select {id}");
+                            self.selected = Some(id);
+                        }
+                    }
+                }
                 let painter = ui.painter_at(rect);
                 for m in &markers {
                     if self.hidden.contains(&m.id) {
@@ -266,6 +339,13 @@ impl eframe::App for ShipApp {
                     painter.circle_stroke(c, 8.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
                     if Some(&m.id) == self.following.as_ref() {
                         painter.circle_stroke(c, 12.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
+                    }
+                    if Some(&m.id) == self.selected.as_ref() {
+                        painter.circle_stroke(
+                            c,
+                            12.0,
+                            egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE),
+                        );
                     }
                     painter.text(
                         c + egui::vec2(10.0, -10.0),
@@ -378,6 +458,9 @@ fn main() -> eframe::Result<()> {
                 hidden: HashSet::new(),
                 following: None,
                 show_trail: true,
+                selected: None,
+                last_seen: HashMap::new(),
+                fix_count: HashMap::new(),
             }))
         }),
     )
