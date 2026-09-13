@@ -1,22 +1,32 @@
-//! Mock v0 backend: serves fixture frames over HTTP, one per poll.
+//! Mock v0 backend: serves scenario frames over HTTP, one per poll.
 //!
 //! `GET /v0/positions` returns the next frame as a JSON array of wire
 //! fixes, advancing round-robin (mirrors the real backend's poll
 //! semantics against canned data). Anything else is 404.
 //!
-//! Run: `cargo run --example mock_backend`
+//! Scenarios (dev tool):
+//! - default (no args): the presentation loop (`tests/fixtures/tracks.json`)
+//! - `surge`: 5 ships converging (traffic-surge demo)
+//! - `ghost`: a ship that vanishes after 2 frames (stale demo)
+//! - `dark`: backend alive, nothing reporting (all-stale demo)
+//!
+//! Run: `cargo run --example mock_backend -- [scenario]`
 //! Then: `TFG_BACKEND_URL=http://127.0.0.1:3000 scripts/run-egui-window.sh`
 
 use std::sync::{Arc, Mutex};
 
 fn main() {
-    let text =
-        std::fs::read_to_string("tests/fixtures/tracks.json").expect("fixture present");
+    let scenario = std::env::args().nth(1);
+    let path = match scenario.as_deref() {
+        None => "tests/fixtures/tracks.json".to_string(),
+        Some(name) => format!("scenarios/{name}.json"),
+    };
+    let text = std::fs::read_to_string(&path).expect("scenario present");
     let fixture: serde_json::Value = serde_json::from_str(&text).expect("fixture parses");
     let frames = fixture["frames"].as_array().expect("frames array").clone();
     let state = Arc::new(Mutex::new(0usize));
     let n = frames.len();
-    println!("mock v0 backend: {n} frames on http://127.0.0.1:3000/v0/positions");
+    println!("mock v0 backend [{path}]: {n} frames on http://127.0.0.1:3000/v0/positions");
 
     let server = tiny_http::Server::http("127.0.0.1:3000").expect("bind 3000");
     for rq in server.incoming_requests() {
