@@ -30,7 +30,16 @@ fn main() {
             *cursor += 1;
             i
         };
-        let body = serde_json::to_string(&frames[i]).expect("frame serializes");
+        let mut frame = frames[i].clone();
+        // Receipt stamp: the replay loops, so canned `ts` rewinds every
+        // cycle; a live backend emits fresh timestamps (see backend.rs).
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        if let Some(arr) = frame.as_array_mut() {
+            for fix in arr {
+                fix["ts"] = serde_json::Value::String(now.clone());
+            }
+        }
+        let body = serde_json::to_string(&frame).expect("frame serializes");
         eprintln!("served frame {i} ({} ship(s))", frames[i].as_array().map(|a| a.len()).unwrap_or(0));
         let _ = rq.respond(
             tiny_http::Response::from_string(body)

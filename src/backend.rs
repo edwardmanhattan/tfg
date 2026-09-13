@@ -23,6 +23,18 @@ struct Fixture {
     frames: Vec<Vec<serde_json::Value>>,
 }
 
+/// Stamp one poll round with receipt time (UTC, millis).
+///
+/// Replays loop canned frames, so wire `ts` rewinds every cycle and the
+/// registry (rightly) drops it as out-of-order. A live backend emits fresh
+/// timestamps; the replay sources model that by stamping on serve.
+fn stamp_now(frame: &mut [Fix]) {
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    for fix in frame {
+        fix.ts = now.clone();
+    }
+}
+
 /// Parse one poll round from wire JSON values (flat lat/lon per fix).
 fn parse_frame(raw_frame: Vec<serde_json::Value>) -> Result<Vec<Fix>, String> {
     let mut frame = Vec::with_capacity(raw_frame.len());
@@ -62,8 +74,9 @@ impl FileReplay {
 
 impl PollSource for FileReplay {
     fn poll(&mut self) -> Result<Vec<Fix>, String> {
-        let frame = self.frames[self.cursor % self.frames.len()].clone();
+        let mut frame = self.frames[self.cursor % self.frames.len()].clone();
         self.cursor += 1;
+        stamp_now(&mut frame);
         Ok(frame)
     }
 }
@@ -119,6 +132,41 @@ mod tests {
         assert_eq!(fixes.len(), 1);
         assert_eq!(fixes[0].ship_id, "a");
         assert_eq!(fixes[0].position.latitude, 53.5);
+    }
+
+    #[test]
+    fn replay_loop_stays_fresh_past_wrap() {
+        use crate::geo::track::Registry;
+        let mut src =
+            FileReplay::from_file("tests/fixtures/tracks.json").expect("fixture loads");
+        let mut reg = Registry::default();
+        let n = src.frame_count();
+        for _ in 0..n {
+            let frame = src.poll().unwrap();
+            reg.poll(frame);
+        }
+        let before = reg
+            .ships()
+            .iter()
+            .find(|s| s.ship_id == "nordwind")
+            .expect("nordwind tracked")
+            .latest
+            .ts
+            .clone();
+        // Wrap: frame 0 re-served. Without receipt stamping the registry
+        // would drop it as out-of-order and freeze the inspector.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let frame = src.poll().unwrap();
+        reg.poll(frame);
+        let after = reg
+            .ships()
+            .iter()
+            .find(|s| s.ship_id == "nordwind")
+            .expect("nordwind tracked")
+            .latest
+            .ts
+            .clone();
+        assert!(after > before, "wrapped frame accepted: {after} > {before}");
     }
 
     #[test]
