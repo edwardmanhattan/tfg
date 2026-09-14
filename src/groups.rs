@@ -185,6 +185,78 @@ impl Groups {
     }
 }
 
+/// One desktop scope (slice iv, grill #25): everything views all, actions
+/// gate on the scope's unit set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    pub id: String,
+    pub label: String,
+    pub units: Vec<String>,
+}
+
+impl Groups {
+    /// A user's desktop scopes: directly commanded units (helm counts as
+    /// a unit scope), commanded Satgas, commanded Gugus. Empty for the
+    /// seat-less (observers get the merged view-only desktop instead).
+    pub fn scopes_for(
+        &self,
+        user: &str,
+        unit_commander: &HashMap<String, String>,
+        helm: &HashMap<String, String>,
+    ) -> Vec<Scope> {
+        let mut scopes: Vec<Scope> = Vec::new();
+        let mut unit_scoped: HashSet<String> = HashSet::new();
+        for (u, c) in unit_commander.iter().chain(helm.iter()) {
+            if c.as_str() == user && unit_scoped.insert(u.clone()) {
+                scopes.push(Scope { id: format!("unit:{u}"), label: u.clone(), units: vec![u.clone()] });
+            }
+        }
+        for s in &self.satgas {
+            if s.commander.as_deref() == Some(user) {
+                scopes.push(Scope {
+                    id: format!("satgas:{}", s.id),
+                    label: s.name.clone(),
+                    units: s.units.clone(),
+                });
+            }
+        }
+        for g in &self.gugus {
+            if g.commander.as_deref() == Some(user) {
+                scopes.push(Scope { id: format!("gugus:{}", g.id), label: g.name.clone(), units: self.gugus_units(&g.id) });
+            }
+        }
+        scopes
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn scopes_cover_command_and_helm() {
+        let mut g = Groups::default();
+        g.add_satgas("s1".into(), "Satgas A".into(), vec!["u1".into(), "u2".into()], Some("ani".into())).unwrap();
+        g.add_gugus("g1".into(), "Gugus X".into(), vec!["s1".into()], Some("caca".into())).unwrap();
+        let mut seats = HashMap::new();
+        seats.insert("u2".into(), "budi".into());
+        let mut helm = HashMap::new();
+        helm.insert("u3".into(), "budi".into());
+        let scopes = g.scopes_for("ani", &seats, &helm);
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].id, "satgas:s1");
+        assert_eq!(scopes[0].units, vec!["u1".to_string(), "u2".to_string()]);
+        let scopes = g.scopes_for("caca", &seats, &helm);
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].id, "gugus:g1");
+        // budi commands u2 and helms u3: two unit scopes.
+        let scopes = g.scopes_for("budi", &seats, &helm);
+        assert_eq!(scopes.len(), 2);
+        assert!(scopes.iter().all(|s| s.id.starts_with("unit:")));
+        assert!(g.scopes_for("nobody", &seats, &helm).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
