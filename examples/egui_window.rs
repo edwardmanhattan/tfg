@@ -217,7 +217,10 @@ impl ShipApp {
                 }
             }
         }
-        for evt in self.sim_evt_rx.try_iter() {
+        // Drain events first (same borrow rule as the sim command drain):
+        // the channel iterator borrows self, feed() needs it mutably.
+        let evts: Vec<SimEvent> = self.sim_evt_rx.try_iter().collect();
+        for evt in evts {
             match evt {
                 SimEvent::Orders(views) => {
                     for v in views {
@@ -569,7 +572,7 @@ impl eframe::App for ShipApp {
 
         // Toolbar (islands grill, #27): island toggles + the clock block.
         // The dock is dead; every flow below is a floating island.
-        egui::TopBottomPanel::top("toolbar").show(ui.ctx(), |ui| {
+        egui::Panel::top("toolbar").show(ui.ctx(), |ui| {
             ui.horizontal(|ui| {
                 ui.toggle_value(&mut self.show_session, "Session");
                 ui.toggle_value(&mut self.show_roster, "Roster");
