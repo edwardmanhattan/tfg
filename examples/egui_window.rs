@@ -572,7 +572,7 @@ impl eframe::App for ShipApp {
 
         // Toolbar (islands grill, #27): island toggles + the clock block.
         // The dock is dead; every flow below is a floating island.
-        egui::Panel::top("toolbar").show(ui.ctx(), |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.toggle_value(&mut self.show_session, "Session");
                 ui.toggle_value(&mut self.show_roster, "Roster");
