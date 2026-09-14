@@ -93,3 +93,7 @@ _Avoid_: squadron, fleet
 **Gugus**:
 A group of Satgas under one commander.
 _Avoid_: flotilla
+
+**Log**:
+The append-only action journal of a session: one entry per action or event, replayable from genesis and retraceable per game minute. Entries name a commander seat as actor; fixes are cited by sequence, never duplicated.
+_Avoid_: track (that's the position record, see Track)
