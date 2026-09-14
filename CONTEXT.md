@@ -106,6 +106,14 @@ _Avoid_: slot, position
 The seat that drives one unit: the only binding that makes a unit playable.
 _Avoid_: driver, pilot
 
+**Zone**:
+The rendered area of a group (Satgas, Gugus): a live hull around member positions plus a fixed ground padding, in the level color. Collapses to a flag when zoomed out.
+_Avoid_: area (that's organizer-drawn, a different feature), region
+
+**Flag**:
+A collapsed group marker at the member centroid: group name plus member count. Clicking it zooms in to reveal the zone.
+_Avoid_: pin, icon
+
 **Log**:
 The append-only action journal of a session: one entry per action or event, replayable from genesis and retraceable per game minute. Entries name a commander seat as actor; fixes are cited by sequence, never duplicated.
 _Avoid_: track (that's the position record, see Track)
