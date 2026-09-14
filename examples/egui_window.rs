@@ -42,6 +42,65 @@ const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Full windows UI lands with the organizer flow; the ratio is the load-
 /// bearing part (clock.rs derives everything else from it).
 const SESSION_RATIO: f64 = 24.0;
+
+/// UI state machine (state-machine grill, #26): phase gates authority,
+/// the arm flag gates the engine. Orders flow only in Live + armed.
+/// Panels read this; `start()` / `end()` / `reset()` are the only writers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Setup,
+    Live,
+    Closed,
+}
+
+/// Setup pointer tool. Placement unmounts with Setup (reinforcements
+/// are fog); waypoint arming is a separate Live draft (`placing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupTool {
+    Select,
+    Place,
+}
+
+struct UiMode {
+    phase: Phase,
+    armed: Arc<AtomicBool>,
+    tool: SetupTool,
+}
+
+impl UiMode {
+    /// Booting into Setup IS the lobby (no Idle state).
+    fn new(armed: Arc<AtomicBool>) -> Self {
+        Self { phase: Phase::Setup, armed, tool: SetupTool::Select }
+    }
+
+    /// Orders flow here and only here.
+    fn live(&self) -> bool {
+        self.phase == Phase::Live && self.armed.load(Ordering::SeqCst)
+    }
+
+    /// Motion, trails, and orders panes belong to Live (any arm).
+    fn in_live(&self) -> bool {
+        self.phase == Phase::Live
+    }
+
+    fn start(&mut self) {
+        self.phase = Phase::Live;
+        self.armed.store(true, Ordering::SeqCst);
+        self.tool = SetupTool::Select;
+    }
+
+    fn end(&mut self) {
+        self.phase = Phase::Closed;
+        self.armed.store(false, Ordering::SeqCst);
+        self.tool = SetupTool::Select;
+    }
+
+    fn reset(&mut self) {
+        self.phase = Phase::Setup;
+        self.armed.store(false, Ordering::SeqCst);
+        self.tool = SetupTool::Select;
+    }
+}
 /// v0 poll cadence, in seconds.
 const POLL_SECS: f64 = 2.0;
 /// Pumped frames per recenter on the hot scene.
@@ -74,15 +133,18 @@ struct ShipApp {
     hidden: HashSet<String>,
     following: Option<String>,
     show_trail: bool,
-    /// Session flow: arm flag shared with the poll thread (simulation
-    /// mode joins the sim; presentation mode is wire-only and frozen).
-    sim_armed: Arc<AtomicBool>,
-    /// Session stub: live flag + default windows stamped at start.
-    session_live: bool,
+    /// The UI state machine (state-machine grill, #26): the only flow
+    /// state panels may read. Replaces session_live / placing_unit.
+    mode: UiMode,
+    /// Session stub: default windows stamped at start.
     session_windows: Option<(String, String, String, String)>,
-    /// Click-placement (session flow): arm, then click the map to stand
-    /// up a catalog unit, owned immediately.
-    placing_unit: bool,
+    /// Per-session journal path (rotated on Start) + frozen transcript
+    /// for the Closed state (the file is the export).
+    session_log_path: std::path::PathBuf,
+    session_seq: usize,
+    transcript: Vec<String>,
+    /// Click-placement counter (session flow): stood-up units arrive
+    /// owned immediately.
     unit_seq: usize,
     selected: Option<String>,
     /// Wall-clock last-seen + fix counts per ship (inspector readout;
@@ -305,62 +367,103 @@ impl eframe::App for ShipApp {
 
         egui::Panel::left("roster").show(ui, |ui| {
             ui.heading("Command center");
-            // Session flow (prototype): mode toggle, session stub with
-            // default windows, and click-placement of catalog units.
-            let mut armed = self.sim_armed.load(Ordering::SeqCst);
-            if ui.checkbox(&mut armed, "simulation mode").changed() {
-                self.sim_armed.store(armed, Ordering::SeqCst);
+            // State-machine panel (state-machine grill, #26): the phase
+            // decides what is visible; start()/end()/reset() below are
+            // the only writers of UiMode.
+            let phase = self.mode.phase;
+            let mut armed = self.mode.armed.load(Ordering::SeqCst);
+            ui.label(format!(
+                "phase: {phase:?}{}",
+                if armed { " · armed" } else { " · presentation" }
+            ));
+            if phase != Phase::Closed
+                && ui.checkbox(&mut armed, "simulation mode (engine)").changed()
+            {
+                self.mode.armed.store(armed, Ordering::SeqCst);
                 eprintln!("{}", if armed { "sim armed" } else { "presentation only" });
             }
-            if !self.session_live {
-                if ui.small_button("start session (prototype)").clicked() {
-                    // Thin stub (Q2): default windows, local player as
-                    // organizer, clock at session pace.
-                    let real_start = Utc::now();
-                    let fmt = "%Y-%m-%d %H:%M UTC";
-                    self.session_windows = Some((
-                        real_start.format(fmt).to_string(),
-                        (real_start + chrono::Duration::hours(7)).format(fmt).to_string(),
-                        real_start.format(fmt).to_string(),
-                        (real_start + chrono::Duration::days(7)).format(fmt).to_string(),
-                    ));
-                    self.session_live = true;
-                    self.sim_armed.store(true, Ordering::SeqCst);
-                    if let Some(tx) = &self.sim_cmd_tx {
-                        let _ = tx.send(SimCommand::SetClockRatio { ratio: SESSION_RATIO });
+            match phase {
+                Phase::Setup => {
+                    if ui.small_button("start session (prototype)").clicked() {
+                        // Thin stub: default windows, local player as
+                        // organizer, fresh per-session journal, 24:1 clock.
+                        let real_start = Utc::now();
+                        let fmt = "%Y-%m-%d %H:%M UTC";
+                        self.session_windows = Some((
+                            real_start.format(fmt).to_string(),
+                            (real_start + chrono::Duration::hours(7)).format(fmt).to_string(),
+                            real_start.format(fmt).to_string(),
+                            (real_start + chrono::Duration::days(7)).format(fmt).to_string(),
+                        ));
+                        self.session_seq += 1;
+                        let path = std::path::PathBuf::from(format!(
+                            "{}/target/tfg-session-log-{}.jsonl",
+                            env!("CARGO_MANIFEST_DIR"),
+                            self.session_seq
+                        ));
+                        if let Some(tx) = &self.sim_cmd_tx {
+                            let _ = tx.send(SimCommand::RotateJournal { path: path.clone() });
+                            let _ = tx.send(SimCommand::SetClockRatio { ratio: SESSION_RATIO });
+                        }
+                        self.session_log_path = path;
+                        self.mode.start();
+                        eprintln!("session live at {SESSION_RATIO}x");
                     }
-                    eprintln!("session live at {SESSION_RATIO}x");
+                    let ships = self.catalog.ship_classes();
+                    let names: Vec<&str> = ships.iter().map(|c| c.name.as_str()).collect();
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_label("place")
+                            .selected_text(
+                                names.get(self.selected_class).copied().unwrap_or("—"),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (i, name) in names.iter().enumerate() {
+                                    ui.selectable_value(&mut self.selected_class, i, *name);
+                                }
+                            });
+                        let placing = self.mode.tool == SetupTool::Place;
+                        if ui.small_button(if placing { "click map…" } else { "place unit" }).clicked() {
+                            self.mode.tool = if placing { SetupTool::Select } else { SetupTool::Place };
+                            self.placing = false;
+                        }
+                    });
                 }
-            } else {
-                if let Some((rs, re, gs, ge)) = &self.session_windows {
-                    ui.label(format!("real {rs} → {re}"));
-                    ui.label(format!("game {gs} → {ge} ({SESSION_RATIO}x)"));
+                Phase::Live => {
+                    if let Some((rs, re, gs, ge)) = &self.session_windows {
+                        ui.label(format!("real {rs} → {re}"));
+                        ui.label(format!("game {gs} → {ge} ({SESSION_RATIO}x)"));
+                    }
+                    if ui.small_button("end session").clicked() {
+                        self.mode.end();
+                        // Closed shows the frozen transcript: the file is
+                        // the export, this is just its tail.
+                        if let Ok(text) = std::fs::read_to_string(&self.session_log_path) {
+                            let lines: Vec<String> =
+                                text.lines().map(|s| s.to_string()).collect();
+                            let n = lines.len();
+                            self.transcript =
+                                lines.into_iter().skip(n.saturating_sub(200)).collect();
+                        }
+                        eprintln!("session ended");
+                    }
                 }
-                if ui.small_button("end session").clicked() {
-                    self.session_live = false;
-                    self.sim_armed.store(false, Ordering::SeqCst);
-                    self.placing_unit = false;
-                    eprintln!("session ended");
-                }
-            }
-            if armed {
-                let ships = self.catalog.ship_classes();
-                let names: Vec<&str> = ships.iter().map(|c| c.name.as_str()).collect();
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_label("place")
-                        .selected_text(
-                            names.get(self.selected_class).copied().unwrap_or("—"),
-                        )
-                        .show_ui(ui, |ui| {
-                            for (i, name) in names.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_class, i, *name);
+                Phase::Closed => {
+                    ui.label(format!(
+                        "log: {}",
+                        self.session_log_path.display()
+                    ));
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for line in &self.transcript {
+                                ui.monospace(line);
                             }
                         });
-                    if ui.small_button(if self.placing_unit { "click map…" } else { "place unit" }).clicked() {
-                        self.placing_unit = !self.placing_unit;
-                        self.placing = false;
+                    if ui.small_button("new setup").clicked() {
+                        self.mode.reset();
+                        eprintln!("back to setup");
                     }
-                });
+                }
             }
             ui.separator();
             // Clock block: real + derived game time, humane format
@@ -387,7 +490,11 @@ impl eframe::App for ShipApp {
             });
             ui.label(format!("{} ships — click a name to follow", markers.len()));
             ui.separator();
-            ui.checkbox(&mut self.show_trail, "trails");
+            // State machine: trails belong to Live (nothing moves in
+            // Setup; Closed is frozen under its transcript).
+            if self.mode.in_live() {
+                ui.checkbox(&mut self.show_trail, "trails");
+            }
             ui.separator();
             let mut follow_req: Option<(String, (f64, f64))> = None;
             for m in &markers {
@@ -482,7 +589,9 @@ impl eframe::App for ShipApp {
             // Orders (prototype sim loop): take control, place waypoint,
             // commit speed order; sim advances the ship, inspector shows it.
             ui.heading("Orders");
-            if let Some(id) = self.selected.clone() {
+            // State machine: orders flow in Live + armed only; the whole
+            // branch (single orders, group muster, take-control) hides.
+            if let Some(id) = self.mode.live().then(|| self.selected.clone()).flatten() {
                 if self.controlled.contains(&id) {
                     if let Some(v) = self.order_views.get(&id) {
                         let state = match v.state {
@@ -663,8 +772,10 @@ impl eframe::App for ShipApp {
                         }
                     }
                 }
-            } else {
+            } else if self.mode.live() {
                 ui.label("select a ship first");
+            } else {
+                ui.label("orders flow in Live + simulation mode");
             }
             if let Some((ship, at)) = follow_req {
                 self.request_frame(&ship, at);
@@ -704,7 +815,7 @@ impl eframe::App for ShipApp {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let px = (pos.x - rect.min.x) as f64;
                         let py = (pos.y - rect.min.y) as f64;
-                        if self.placing_unit {
+                        if self.mode.tool == SetupTool::Place && self.mode.phase == Phase::Setup {
                             let (la, lo) = unproject_mercator(
                                 px, py, self.center, ZOOM, MAP_W, MAP_H,
                             );
@@ -728,7 +839,7 @@ impl eframe::App for ShipApp {
                             // the take-control, no second step.
                             self.controlled.insert(id.clone());
                             self.selected = Some(id);
-                            self.placing_unit = false;
+                            self.mode.tool = SetupTool::Select;
                         } else if self.placing {
                             let (la, lo) = unproject_mercator(
                                 px, py, self.center, ZOOM, MAP_W, MAP_H,
@@ -754,7 +865,7 @@ impl eframe::App for ShipApp {
                         continue;
                     }
                     let color = if m.stale { egui::Color32::GRAY } else { Self::ship_color(&m.id) };
-                    if self.show_trail {
+                    if self.show_trail && self.mode.in_live() {
                         for (tx, ty) in &m.trail {
                             painter.circle_filled(
                                 rect.min + egui::vec2(*tx as f32, *ty as f32),
@@ -957,10 +1068,11 @@ fn main() -> eframe::Result<()> {
                 hidden: HashSet::new(),
                 following: None,
                 show_trail: true,
-                sim_armed: sim_armed.clone(),
-                session_live: false,
+                mode: UiMode::new(sim_armed.clone()),
                 session_windows: None,
-                placing_unit: false,
+                session_log_path: tfg::log::Journal::prototype_path(),
+                session_seq: 0,
+                transcript: Vec::new(),
                 unit_seq: 1,
                 selected: None,
                 last_seen: HashMap::new(),

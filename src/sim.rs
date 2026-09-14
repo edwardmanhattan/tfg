@@ -7,6 +7,7 @@
 //! wire fixes for sim-owned ships.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -65,6 +66,9 @@ pub enum SimCommand {
     /// Registry-stamped seq after ingest, so journal entries can cite
     /// fix seqs. Reuses the command channel; no new plumbing.
     FixAck { ship_id: String, seq: u64 },
+    /// Rotate the journal to a fresh per-session file (state-machine
+    /// grill, #26): Start opens a new file, the old one stays on disk.
+    RotateJournal { path: PathBuf },
 }
 
 /// Read view of one owned ship for the orders UI.
@@ -365,6 +369,14 @@ impl SimSource {
                 SimCommand::FixAck { ship_id, seq } => {
                     let slot = self.last_seq.entry(ship_id).or_insert(seq);
                     *slot = (*slot).max(seq);
+                }
+                SimCommand::RotateJournal { path } => {
+                    self.journal = Journal::open(path).unwrap_or_else(|e| {
+                        eprintln!("journal rotation failed: {e}");
+                        Journal::disabled()
+                    });
+                    self.last_seq.clear();
+                    self.last_marker_min = 0;
                 }
             }
         }
@@ -1004,5 +1016,43 @@ mod tests {
         assert_eq!(marker["payload"]["fix_seqs"]["t"], 3);
         assert_eq!(marker["payload"]["fix_seqs"]["u"], 5);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rotate_journal_starts_a_fresh_file() {
+        let dir = std::env::temp_dir();
+        let first = dir.join("tfg-log-test-rotate-1.jsonl");
+        let second = dir.join("tfg-log-test-rotate-2.jsonl");
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let mut sim =
+            SimSource::new_with_journal(cmd_rx, evt_tx, Journal::open(first.clone()).unwrap());
+        cmd_tx.send(SimCommand::TakeControl {
+            ship_id: "t".into(),
+            pos: ship_at(-5.92, 106.92),
+            class_id: "container".into(),
+        }).unwrap();
+        sim.poll_round(0.0).unwrap();
+        cmd_tx.send(SimCommand::RotateJournal { path: second.clone() }).unwrap();
+        sim.poll_round(0.0).unwrap();
+        // One marker each would need a minute; instead check the files:
+        // the first holds pre-rotation entries (none: no events yet),
+        // so force an entry post-rotation via a refused order on land.
+        cmd_tx.send(SimCommand::SetOrder {
+            ship_id: "t".into(),
+            waypoint: ship_at(-6.5, 107.0), // inland Java (proven land)
+            speed_kn: 10.0,
+        }).unwrap();
+        sim.poll_round(0.0).unwrap();
+        drop(sim);
+        let first_lines = journal_lines(&first);
+        let second_lines = journal_lines(&second);
+        assert!(first_lines.is_empty(), "nothing journaled before rotation");
+        assert!(
+            second_lines.iter().any(|e| e["kind"] == "OrderRefused"),
+            "post-rotation entries land in the new file"
+        );
+        std::fs::remove_file(&first).ok();
+        std::fs::remove_file(&second).ok();
     }
 }
