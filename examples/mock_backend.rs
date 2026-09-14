@@ -18,7 +18,8 @@
 //! Anything else is 404.
 //!
 //! Scenarios (dev tool):
-//! - default (no args): the presentation loop (`tests/fixtures/tracks.json`)
+//! - default (no args): clear canvas (`scenarios/empty.json`) — no ships
+//!   until the organizer places them or a scenario is named.
 //! - `surge`: 5 ships converging (traffic-surge demo)
 //! - `ghost`: a ship that vanishes after 2 frames (stale demo)
 //! - `dark`: backend alive, nothing reporting (all-stale demo)
@@ -40,7 +41,7 @@ fn json_response(status: u16, value: &serde_json::Value) -> tiny_http::Response<
 fn main() {
     let scenario = std::env::args().nth(1);
     let path = match scenario.as_deref() {
-        None => "tests/fixtures/tracks.json".to_string(),
+        None => "scenarios/empty.json".to_string(),
         Some(name) => format!("scenarios/{name}.json"),
     };
     let text = std::fs::read_to_string(&path).expect("scenario present");
