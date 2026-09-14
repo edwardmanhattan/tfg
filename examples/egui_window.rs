@@ -393,19 +393,30 @@ impl eframe::App for ShipApp {
                         }
                     }
                     // Taxonomy readout (grill #18) + class-capped speed.
-                    ui.label(format!(
-                        "{} · {} · max {:.0} kn",
-                        v.class_id,
-                        v.type_label,
-                        v.max_speed_kn
-                    ));
-                    self.order_speed = self.order_speed.min(v.max_speed_kn);
-                    ui.add(
-                        egui::DragValue::new(&mut self.order_speed)
-                            .speed(1.0)
-                            .range(0.0..=v.max_speed_kn as f64)
-                            .suffix(" kn"),
-                    );
+                    if let Some((class_id, type_label, max_speed)) = self
+                        .order_views
+                        .get(&id)
+                        .map(|v| (v.class_id.clone(), v.type_label.clone(), v.max_speed_kn))
+                    {
+                        ui.label(format!(
+                            "{} · {} · max {:.0} kn",
+                            class_id, type_label, max_speed
+                        ));
+                        self.order_speed = self.order_speed.min(max_speed);
+                        ui.add(
+                            egui::DragValue::new(&mut self.order_speed)
+                                .speed(1.0)
+                                .range(0.0..=max_speed as f64)
+                                .suffix(" kn"),
+                        );
+                    } else {
+                        ui.label("waiting for sim…");
+                        ui.add(
+                            egui::DragValue::new(&mut self.order_speed)
+                                .speed(1.0)
+                                .suffix(" kn"),
+                        );
+                    }
                     if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
                         self.placing = !self.placing;
                     }
