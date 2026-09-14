@@ -8,7 +8,7 @@
 
 use std::fs;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::geo::track::Fix;
 
@@ -119,6 +119,75 @@ impl PollSource for HttpPoll {
     }
 }
 
+/// Invite record (slice v, grill #30): a code binding a roster user to a
+/// seat label. Issued locally by the organizer (source of truth) and
+/// mirrored to the mock backend when connected; redemption over the
+/// network is a later slice — the mock validates codes today.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Invite {
+    pub code: String,
+    pub user: String,
+    pub seat: String,
+    pub redeemed: bool,
+}
+
+/// Identity endpoints against the mock (later real) backend: issue, list,
+/// redeem. Same contract style as [`HttpPoll`]: base URL + blocking client.
+pub struct InviteClient {
+    base_url: String,
+    client: reqwest::blocking::Client,
+}
+
+impl InviteClient {
+    pub fn new(base_url: &str) -> Result<Self, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), client })
+    }
+
+    /// Mirror a locally issued record: the mock honors the client code
+    /// when unused and mints `TFG-XXXX` otherwise.
+    pub fn issue(&self, user: &str, seat: &str, code: &str) -> Result<Invite, String> {
+        self.client
+            .post(&format!("{}/v0/invites", self.base_url))
+            .json(&serde_json::json!({"user": user, "seat": seat, "code": code}))
+            .send()
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json()
+            .map_err(|e| e.to_string())
+    }
+
+    /// All records the backend holds.
+    pub fn list(&self) -> Result<Vec<Invite>, String> {
+        self.client
+            .get(&format!("{}/v0/invites", self.base_url))
+            .send()
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Validate a code (the future login path): marks it redeemed.
+    /// Unknown codes fail loud via the backend's 404.
+    pub fn redeem(&self, code: &str) -> Result<Invite, String> {
+        self.client
+            .post(&format!("{}/v0/invites/redeem", self.base_url))
+            .json(&serde_json::json!({"code": code}))
+            .send()
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json()
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +207,67 @@ mod tests {
         assert_eq!(fixes.len(), 1);
         assert_eq!(fixes[0].ship_id, "a");
         assert_eq!(fixes[0].position.latitude, 53.5);
+    }
+
+    #[test]
+    fn invite_round_trip_against_stub() {
+        // Stub speaks the mock identity contract: client codes honored,
+        // list mirrors the store, redeem flips the flag, unknowns 404.
+        let server = tiny_http::Server::http("127.0.0.1:18081").expect("bind test port");
+        std::thread::spawn(move || {
+            let mut store: Vec<Invite> = Vec::new();
+            for mut rq in server.incoming_requests().take(4) {
+                let post = matches!(rq.method(), tiny_http::Method::Post);
+                let url = rq.url().to_string();
+                if !post && url == "/v0/invites" {
+                    let body = serde_json::to_string(&store).expect("serializes");
+                    let _ = rq.respond(tiny_http::Response::from_string(body));
+                } else if post && url == "/v0/invites" {
+                    let mut text = String::new();
+                    use std::io::Read;
+                    rq.as_reader().read_to_string(&mut text).expect("body reads");
+                    let v: serde_json::Value = serde_json::from_str(&text).expect("json body");
+                    let rec = Invite {
+                        code: v["code"].as_str().unwrap_or("TFG-0000").to_string(),
+                        user: v["user"].as_str().unwrap_or("").to_string(),
+                        seat: v["seat"].as_str().unwrap_or("").to_string(),
+                        redeemed: false,
+                    };
+                    store.push(rec.clone());
+                    let _ = rq.respond(tiny_http::Response::from_string(
+                        serde_json::to_string(&rec).expect("serializes"),
+                    ));
+                } else if post && url == "/v0/invites/redeem" {
+                    let mut text = String::new();
+                    use std::io::Read;
+                    rq.as_reader().read_to_string(&mut text).expect("body reads");
+                    let v: serde_json::Value = serde_json::from_str(&text).expect("json body");
+                    let code = v["code"].as_str().unwrap_or("");
+                    match store.iter_mut().find(|r| r.code == code) {
+                        Some(rec) => {
+                            rec.redeemed = true;
+                            let _ = rq.respond(tiny_http::Response::from_string(
+                                serde_json::to_string(rec).expect("serializes"),
+                            ));
+                        }
+                        None => {
+                            let _ = rq.respond(tiny_http::Response::empty(404));
+                        }
+                    }
+                } else {
+                    let _ = rq.respond(tiny_http::Response::empty(404));
+                }
+            }
+        });
+        let client = InviteClient::new("http://127.0.0.1:18081").expect("client builds");
+        let rec = client.issue("ani", "helm kri-a", "TFG-0007").expect("issue succeeds");
+        assert_eq!(rec.code, "TFG-0007");
+        assert!(!rec.redeemed);
+        let all = client.list().expect("list succeeds");
+        assert_eq!(all.len(), 1);
+        let done = client.redeem("TFG-0007").expect("redeem succeeds");
+        assert!(done.redeemed);
+        assert!(client.redeem("TFG-9999").is_err(), "unknown code fails loud");
     }
 
     #[test]
