@@ -2272,7 +2272,7 @@ fn main() -> eframe::Result<()> {
     let sim_armed = Arc::new(AtomicBool::new(false));
     let poll_armed = sim_armed.clone();
     let poll_handle = std::thread::spawn(move || {
-        let fixture = format!("{}/tests/fixtures/tracks.json", env!("CARGO_MANIFEST_DIR"));
+        let fixture = format!("{}/scenarios/empty.json", env!("CARGO_MANIFEST_DIR"));
         let wire: Box<dyn PollSource> = match std::env::var("TFG_BACKEND_URL") {
             Ok(url) => {
                 eprintln!("backend: HTTP {url}");
@@ -2286,7 +2286,7 @@ fn main() -> eframe::Result<()> {
             }
             Err(_) => {
                 // TFG_SCENARIO=name replays scenarios/{name}.json (e.g.
-                // `empty` for the setup canvas); default is the dev loop.
+                // `surge` for the traffic demo); default is the clear canvas.
                 let fixture = match std::env::var("TFG_SCENARIO") {
                     Ok(name) => {
                         eprintln!("backend: scenario {name}");
