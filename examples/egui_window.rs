@@ -759,7 +759,18 @@ fn main() -> eframe::Result<()> {
                 }
             }
         };
-        let mut source = MergeSource::new(wire, SimSource::new(sim_cmd_rx, sim_evt_tx));
+        let mut source = MergeSource::new(
+            wire,
+            SimSource::new_with_journal(
+                sim_cmd_rx,
+                sim_evt_tx,
+                tfg::log::Journal::open(tfg::log::Journal::prototype_path())
+                    .unwrap_or_else(|e| {
+                        eprintln!("session log disabled: {e}");
+                        tfg::log::Journal::disabled()
+                    }),
+            ),
+        );
         loop {
             match source.poll() {
                 Ok(fixes) => {
