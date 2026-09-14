@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use tfg::backend::{FileReplay, HttpPoll, PollSource};
 use tfg::catalog::{Catalog, Category};
 use tfg::fleet::Fleet;
@@ -188,6 +188,20 @@ struct ShipApp {
     fleet_query: String,
     fleet_pick: Option<String>,
     placed_fleet: HashSet<String>,
+    /// Setup slice (ii): WIB-entered windows, local roster, seat drafts.
+    /// Times are entered in WIB and stored as UTC; the roster names assignees.
+    time_real_start: String,
+    time_real_end: String,
+    time_game_start: String,
+    time_game_end: String,
+    roster: Vec<String>,
+    roster_input: String,
+    /// Helm per placed unit (unit_id -> user). Commander seats for
+    /// Satgas/Gugus wait for groups (slice iii); unit commanders draft here.
+    helm: HashMap<String, String>,
+    unit_commander: HashMap<String, String>,
+    /// Ratio derived from the entered windows (replaces the 24x stub).
+    session_ratio: f64,
     /// Game clock readout from the sim (ADR-0004: game time is derived
     /// and reported per round; the UI never computes it itself).
     game_elapsed_secs: Option<u64>,
@@ -196,6 +210,24 @@ struct ShipApp {
     /// Real + derived game clock readings, humane format, per round.
     real_ts: Option<String>,
     game_ts: Option<String>,
+}
+
+/// Parse WIB "YYYY-MM-DD HH:MM" entry into UTC (slice ii): storage is
+/// always UTC; the +7 offset lives only in this parser.
+fn parse_wib(s: &str) -> Option<chrono::DateTime<Utc>> {
+    let naive = chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M").ok()?;
+    chrono::FixedOffset::east_opt(7 * 3600)?
+        .from_local_datetime(&naive)
+        .single()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+type Windows = (chrono::DateTime<Utc>, chrono::DateTime<Utc>, chrono::DateTime<Utc>, chrono::DateTime<Utc>);
+
+/// All four window entries parse and both spans run forward.
+fn parse_windows(rs: &str, re: &str, gs: &str, ge: &str) -> Option<Windows> {
+    let (rs, re, gs, ge) = (parse_wib(rs)?, parse_wib(re)?, parse_wib(gs)?, parse_wib(ge)?);
+    (re > rs && ge > gs).then_some((rs, re, gs, ge))
 }
 
 impl ShipApp {
@@ -368,14 +400,26 @@ impl ShipApp {
     /// Start action shared by the Session island and the wizard:
     /// default windows, fresh per-session journal, 24:1 clock, armed.
     fn start_session(&mut self) {
-        let real_start = Utc::now();
+        // Windows were validated in the Session island; re-parse defensively.
+        let Some((rs, re, gs, ge)) = parse_windows(
+            &self.time_real_start,
+            &self.time_real_end,
+            &self.time_game_start,
+            &self.time_game_end,
+        ) else {
+            self.feed("start refused: fix the time windows".to_string());
+            return;
+        };
         let fmt = "%Y-%m-%d %H:%M UTC";
         self.session_windows = Some((
-            real_start.format(fmt).to_string(),
-            (real_start + chrono::Duration::hours(7)).format(fmt).to_string(),
-            real_start.format(fmt).to_string(),
-            (real_start + chrono::Duration::days(7)).format(fmt).to_string(),
+            rs.format(fmt).to_string(),
+            re.format(fmt).to_string(),
+            gs.format(fmt).to_string(),
+            ge.format(fmt).to_string(),
         ));
+        // Ratio derived from windows (grill #23): game span over real span.
+        let ratio = (ge - gs).num_seconds() as f64 / (re - rs).num_seconds() as f64;
+        self.session_ratio = ratio;
         self.session_seq += 1;
         let path = std::path::PathBuf::from(format!(
             "{}/target/tfg-session-log-{}.jsonl",
@@ -384,7 +428,7 @@ impl ShipApp {
         ));
         if let Some(tx) = &self.sim_cmd_tx {
             let _ = tx.send(SimCommand::RotateJournal { path: path.clone() });
-            let _ = tx.send(SimCommand::SetClockRatio { ratio: SESSION_RATIO });
+            let _ = tx.send(SimCommand::SetClockRatio { ratio });
         }
         self.session_log_path = path;
         self.mode.start();
@@ -396,7 +440,7 @@ impl ShipApp {
         self.show_orders = true;
         self.show_log = true;
         self.show_fleet = false;
-        eprintln!("session live at {SESSION_RATIO}x");
+        eprintln!("session live at {ratio:.1}x");
     }
 
     /// End action: disarm into Closed and freeze the transcript tail.
@@ -429,21 +473,148 @@ impl ShipApp {
         }
         match phase {
             Phase::Setup => {
-                if ui.small_button("start session (prototype)").clicked() {
-                    self.start_session();
+                ui.heading("Time windows (WIB)");
+                ui.horizontal(|ui| {
+                    ui.label("real:");
+                    ui.text_edit_singleline(&mut self.time_real_start);
+                    ui.label("→");
+                    ui.text_edit_singleline(&mut self.time_real_end);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("game:");
+                    ui.text_edit_singleline(&mut self.time_game_start);
+                    ui.label("→");
+                    ui.text_edit_singleline(&mut self.time_game_end);
+                });
+                let windows = parse_windows(
+                    &self.time_real_start,
+                    &self.time_real_end,
+                    &self.time_game_start,
+                    &self.time_game_end,
+                );
+                let windows_ok = windows.is_some();
+                match windows {
+                    Some((rs, re, gs, ge)) => {
+                        let ratio = (ge - gs).num_seconds() as f64 / (re - rs).num_seconds() as f64;
+                        ui.label(format!("ratio {ratio:.1}x · stored {}", rs.format("%Y-%m-%d %H:%M UTC")));
+                    }
+                    None => {
+                        ui.label("Windows must be YYYY-MM-DD HH:MM with end after start.");
+                    }
+                }
+                ui.separator();
+                ui.heading("Players");
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.roster_input);
+                    if ui.small_button("add").clicked() {
+                        let name = self.roster_input.trim().to_string();
+                        if !name.is_empty() && !self.roster.contains(&name) {
+                            self.roster.push(name);
+                            self.roster_input.clear();
+                        }
+                    }
+                });
+                // Pre-collect: rows mutate seat maps while the roster
+                // borrow would still be live (E0502 pattern).
+                let roster: Vec<String> = self.roster.clone();
+                for name in &roster {
+                    ui.horizontal(|ui| {
+                        ui.label(name);
+                        if ui.small_button("remove").clicked() {
+                            self.roster.retain(|n| n != name);
+                            self.helm.retain(|_, v| v != name);
+                            self.unit_commander.retain(|_, v| v != name);
+                        }
+                    });
+                }
+                ui.separator();
+                ui.heading("Seats");
+                let mut units: Vec<(String, String)> = self
+                    .placed_fleet
+                    .iter()
+                    .map(|id| {
+                        let label = self
+                            .fleet
+                            .get(id)
+                            .map(|u| format!("{} ({})", u.name, u.hull))
+                            .unwrap_or_else(|| id.clone());
+                        (id.clone(), label)
+                    })
+                    .collect();
+                units.sort();
+                for (uid, label) in &units {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        let helm_cur = self.helm.get(uid).cloned();
+                        egui::ComboBox::from_id_salt(format!("helm-{uid}"))
+                            .selected_text(helm_cur.as_deref().unwrap_or("helm: —"))
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(helm_cur.is_none(), "—").clicked() {
+                                    self.helm.remove(uid);
+                                }
+                                for name in &roster {
+                                    if ui
+                                        .selectable_label(helm_cur.as_deref() == Some(name.as_str()), name)
+                                        .clicked()
+                                    {
+                                        self.helm.insert(uid.clone(), name.clone());
+                                    }
+                                }
+                            });
+                        let cmdr_cur = self.unit_commander.get(uid).cloned();
+                        egui::ComboBox::from_id_salt(format!("cmdr-{uid}"))
+                            .selected_text(cmdr_cur.as_deref().unwrap_or("commander: —"))
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(cmdr_cur.is_none(), "—").clicked() {
+                                    self.unit_commander.remove(uid);
+                                }
+                                for name in &roster {
+                                    if ui
+                                        .selectable_label(cmdr_cur.as_deref() == Some(name.as_str()), name)
+                                        .clicked()
+                                    {
+                                        self.unit_commander.insert(uid.clone(), name.clone());
+                                    }
+                                }
+                            });
+                    });
+                }
+                ui.separator();
+                // Warn-not-block go-live (grill #23): gaps are listed,
+                // only unparseable windows refuse to start. Unhelmed units
+                // stay playable: the organizer commands all.
+                let mut warnings = Vec::new();
+                if units.is_empty() {
+                    warnings.push("no units placed".to_string());
+                }
+                if roster.is_empty() {
+                    warnings.push("roster is empty".to_string());
+                }
+                for (uid, label) in &units {
+                    if !self.helm.contains_key(uid) {
+                        warnings.push(format!("{label}: no helm (organizer retains command)"));
+                    }
+                }
+                for w in &warnings {
+                    ui.label(egui::RichText::new(format!("⚠ {w}")).color(egui::Color32::YELLOW));
                 }
                 ui.horizontal(|ui| {
                     if ui.small_button("open fleet picker").clicked() {
                         self.show_fleet = true;
                     }
-                    ui.label(format!("placed: {} unit(s)", self.placed_fleet.len()));
+                    ui.label(format!("placed: {} unit(s) · {} player(s)", units.len(), roster.len()));
                 });
-                ui.label("Placement is by hand: pick a hull in the Fleet island, then click the map.");
+                if ui
+                    .add_enabled(windows_ok, egui::Button::new("start session (prototype)"))
+                    .clicked()
+                {
+                    self.start_session();
+                }
             }
             Phase::Live => {
                 if let Some((rs, re, gs, ge)) = &self.session_windows {
                     ui.label(format!("real {rs} → {re}"));
-                    ui.label(format!("game {gs} → {ge} ({SESSION_RATIO}x)"));
+                    ui.label(format!("game {gs} → {ge} ({:.1}x)", self.session_ratio));
                 }
                 if ui.small_button("end session").clicked() {
                     self.end_session();
@@ -455,6 +626,8 @@ impl ShipApp {
                     self.mode.reset();
                     self.placed_fleet.clear();
                     self.fleet_pick = None;
+                    self.helm.clear();
+                    self.unit_commander.clear();
                     eprintln!("back to setup");
                 }
             }
@@ -669,8 +842,9 @@ impl ShipApp {
             _ => {
                 let placed = self.placed_fleet.len();
                 ui.label(format!(
-                    "Review: {placed} placed, {} owned.",
-                    self.controlled.len()
+                    "Review: {placed} placed, {} owned, {} players.",
+                    self.controlled.len(),
+                    self.roster.len()
                 ));
                 ui.label("Gaps are fine: unowned units sail as traffic.");
                 ui.horizontal(|ui| {
@@ -1425,6 +1599,15 @@ fn main() -> eframe::Result<()> {
                 fleet_query: String::new(),
                 fleet_pick: None,
                 placed_fleet: HashSet::new(),
+                time_real_start: (Utc::now() + chrono::Duration::hours(7)).format("%Y-%m-%d %H:%M").to_string(),
+                time_real_end: (Utc::now() + chrono::Duration::hours(14)).format("%Y-%m-%d %H:%M").to_string(),
+                time_game_start: "2026-11-01 00:00".to_string(),
+                time_game_end: "2026-11-07 00:00".to_string(),
+                roster: Vec::new(),
+                roster_input: String::new(),
+                helm: HashMap::new(),
+                unit_commander: HashMap::new(),
+                session_ratio: SESSION_RATIO,
                 game_elapsed_secs: None,
                 game_ratio: 1.0,
                 game_paused: false,
