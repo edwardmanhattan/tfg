@@ -34,6 +34,9 @@ pub struct Fix {
     pub heading_deg: Option<f32>,
     pub speed_kn: Option<f32>,
     pub source: FixSource,
+    /// Ingest sequence stamped by the Registry (Log grill, #20): total
+    /// ingest order, gaps where out-of-order fixes were dropped.
+    pub seq: u64,
 }
 
 /// Wire shape of a fix: flat lat/lon (serde) -> [`Fix`].
@@ -56,6 +59,7 @@ impl From<WireFix> for Fix {
             heading_deg: w.heading_deg,
             speed_kn: w.speed_kn,
             source: FixSource::Wire,
+            seq: 0,
         }
     }
 }
@@ -129,18 +133,25 @@ pub struct ShipView {
 pub struct Registry {
     ships: HashMap<String, ShipState>,
     bound: TrailBound,
+    next_seq: u64,
 }
 
 impl Registry {
     pub fn new(bound: TrailBound) -> Self {
-        Self { ships: HashMap::new(), bound }
+        Self { ships: HashMap::new(), bound, next_seq: 0 }
     }
 
     /// Ingest one poll round. Unknown ids appear as new pending ships;
     /// ships with no fix this round accumulate `missed` and go stale at 3.
-    pub fn poll(&mut self, fixes: Vec<Fix>) {
+    /// Returns the accepted fixes as (ship, seq) pairs for ingest acks
+    /// (Log grill, #20); dropped out-of-order fixes consume seqs silently.
+    pub fn poll(&mut self, fixes: Vec<Fix>) -> Vec<(String, u64)> {
         let mut seen = std::collections::HashSet::new();
-        for fix in fixes {
+        let mut acked = Vec::with_capacity(fixes.len());
+        for mut fix in fixes {
+            fix.seq = self.next_seq;
+            self.next_seq += 1;
+            let pair = (fix.ship_id.clone(), fix.seq);
             seen.insert(fix.ship_id.clone());
             match self.ships.get_mut(&fix.ship_id) {
                 Some(s) => {
@@ -154,6 +165,7 @@ impl Registry {
                     }
                     s.missed = 0;
                     s.stale = false;
+                    acked.push(pair);
                 }
                 None => {
                     let mut track = VecDeque::new();
@@ -162,6 +174,7 @@ impl Registry {
                         fix.ship_id.clone(),
                         ShipState { latest: fix, previous: None, track, missed: 0, stale: false },
                     );
+                    acked.push(pair);
                 }
             }
         }
@@ -173,6 +186,7 @@ impl Registry {
                 }
             }
         }
+        acked
     }
 
     pub fn ships(&self) -> Vec<ShipView> {
@@ -235,6 +249,7 @@ mod tests {
             heading_deg: None,
             speed_kn: None,
             source: FixSource::Wire,
+            seq: 0,
         }
     }
 
@@ -248,6 +263,20 @@ mod tests {
         assert_eq!(ships.len(), 1);
         assert_eq!(ships[0].latest.position.latitude, 53.5);
         assert_eq!(ships[0].trail.len(), 1);
+    }
+
+    #[test]
+    fn ingest_stamps_total_order_seq() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![
+            fix("a", 53.5, 9.9, "2026-09-12T00:00:02Z"),
+            fix("b", 53.5, 9.9, "2026-09-12T00:00:02Z"),
+        ]);
+        r.poll(vec![fix("a", 53.6, 9.9, "2026-09-12T00:00:04Z")]);
+        let ships = r.ships();
+        let seq = |id: &str| ships.iter().find(|s| s.ship_id == id).unwrap().latest.seq;
+        assert_eq!(seq("a"), 2);
+        assert_eq!(seq("b"), 1);
     }
 
     #[test]

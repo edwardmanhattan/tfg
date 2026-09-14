@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use tfg::backend::{FileReplay, HttpPoll, PollSource};
 use tfg::catalog::Catalog;
+use tfg::command::{Authority, Grant, GrantDenial, Leg, MoveCommand, Verb};
 use tfg::geo::track::{Fix, FixSource, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
@@ -26,7 +27,8 @@ use tfg::map_render::{project_mercator, unproject_mercator};
 use tfg::overlay::hit_test;
 use tfg::land::Land;
 use tfg::sim::{
-    MergeSource, OrderRefusal, OrderState, OrderView, SimCommand, SimEvent, SimSource,
+    CommandRefusal, MergeSource, OrderRefusal, OrderState, OrderView, SimCommand, SimEvent,
+    SimSource,
 };
 
 const MAP_W: f64 = 800.0;
@@ -115,7 +117,14 @@ impl ShipApp {
                 self.last_seen.insert(f.ship_id.clone(), Instant::now());
                 *self.fix_count.entry(f.ship_id.clone()).or_insert(0) += 1;
             }
-            self.registry.poll(fixes);
+            let acked = self.registry.poll(fixes);
+            // Ingest acks (Log grill, #20): report stamped seqs back to
+            // the sim AFTER ingest, so journal entries can cite fix seqs.
+            if let Some(tx) = &self.sim_cmd_tx {
+                for (ship_id, seq) in acked {
+                    let _ = tx.send(SimCommand::FixAck { ship_id, seq });
+                }
+            }
         }
         for evt in self.sim_evt_rx.try_iter() {
             match evt {
@@ -141,6 +150,29 @@ impl ShipApp {
                     };
                     eprintln!("order refused ({ship_id}): {why}");
                     self.order_warning = Some(format!("{ship_id}: {why}"));
+                }
+                SimEvent::CommandRefused { ship_id, reason } => {
+                    let why = match reason {
+                        CommandRefusal::LowerAuthority { held_rank, by_rank } => format!(
+                            "overruled by higher authority (held {held_rank}, by {by_rank})"
+                        ),
+                        CommandRefusal::Grant(GrantDenial::Expired) => {
+                            "command expired".to_string()
+                        }
+                        CommandRefusal::Grant(GrantDenial::OutsideScope) => {
+                            "ship outside command scope".to_string()
+                        }
+                        CommandRefusal::Grant(GrantDenial::VerbDenied) => {
+                            "verb not granted".to_string()
+                        }
+                    };
+                    eprintln!("command refused ({ship_id}): {why}");
+                    self.order_warning = Some(format!("{ship_id}: {why}"));
+                }
+                SimEvent::CommandOverridden { ship_id, prev_rank, by_rank } => {
+                    eprintln!("overridden ({ship_id}): {prev_rank} -> {by_rank}");
+                    self.order_warning =
+                        Some(format!("{ship_id}: overridden by higher authority"));
                 }
                 SimEvent::ShipBlocked { ship_id } => {
                     eprintln!("blocked at coast: {ship_id}");
@@ -454,6 +486,61 @@ impl eframe::App for ShipApp {
                             self.placing = false;
                         }
                     }
+                    // Group order (precedence core): one muster waypoint
+                    // fanned out to every controlled ship, each leg capped
+                    // by its class max. The local player acts as organizer
+                    // until seats land (setup grill, #23).
+                    let mut controlled: Vec<String> =
+                        self.controlled.iter().cloned().collect();
+                    controlled.sort();
+                    if controlled.len() > 1
+                        && ui
+                            .add_enabled(
+                                can_commit,
+                                egui::Button::new(format!("order all ({})", controlled.len())),
+                            )
+                            .clicked()
+                    {
+                        self.order_warning = None;
+                        if let Some((la, lo)) = self.pending_waypoint {
+                            if let Some(tx) = &self.sim_cmd_tx {
+                                let waypoint = GeoPosition { latitude: la, longitude: lo };
+                                let legs: Vec<Leg> = controlled
+                                    .iter()
+                                    .map(|ship| {
+                                        let max = self
+                                            .order_views
+                                            .get(ship)
+                                            .map(|v| v.max_speed_kn)
+                                            .unwrap_or(self.order_speed);
+                                        Leg {
+                                            ship_id: ship.clone(),
+                                            waypoint,
+                                            speed_kn: self.order_speed.min(max),
+                                        }
+                                    })
+                                    .collect();
+                                let _ = tx.send(SimCommand::OrderMove {
+                                    command: MoveCommand {
+                                        legs,
+                                        default_speed_kn: Some(self.order_speed),
+                                        authority: Authority::ORGANIZER,
+                                        grant: Grant {
+                                            units: controlled.clone(),
+                                            expires_game_secs: u64::MAX,
+                                            verbs: vec![Verb::Move],
+                                        },
+                                    },
+                                });
+                                eprintln!(
+                                    "order all {} -> ({la:.4}, {lo:.4})",
+                                    controlled.join(",")
+                                );
+                            }
+                            self.pending_waypoint = None;
+                            self.placing = false;
+                        }
+                    }
                     ui.horizontal(|ui| {
                         if ui.small_button("cancel").clicked() {
                             if let Some(tx) = &self.sim_cmd_tx {
@@ -679,7 +766,18 @@ fn main() -> eframe::Result<()> {
                 }
             }
         };
-        let mut source = MergeSource::new(wire, SimSource::new(sim_cmd_rx, sim_evt_tx));
+        let mut source = MergeSource::new(
+            wire,
+            SimSource::new_with_journal(
+                sim_cmd_rx,
+                sim_evt_tx,
+                tfg::log::Journal::open(tfg::log::Journal::prototype_path())
+                    .unwrap_or_else(|e| {
+                        eprintln!("session log disabled: {e}");
+                        tfg::log::Journal::disabled()
+                    }),
+            ),
+        );
         loop {
             match source.poll() {
                 Ok(fixes) => {

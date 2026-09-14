@@ -13,6 +13,8 @@ use std::time::Instant;
 use crate::backend::{PollSource, now_ts};
 use crate::catalog::{Catalog, Class};
 use crate::clock::GameClock;
+use crate::command::{Authority, GrantDenial, MoveCommand, Verb};
+use crate::log::{Journal, LogKind};
 use crate::geo::coordinates::GeoPosition;
 use crate::geo::track::{Fix, FixSource};
 use crate::land::Land;
@@ -48,8 +50,16 @@ pub enum SimCommand {
     Release { ship_id: String },
     SetOrder { ship_id: String, waypoint: GeoPosition, speed_kn: f32 },
     CancelOrder { ship_id: String },
+    /// Multi-unit move (precedence grill, #19): fanned out to per-ship
+    /// orders under grant + authority checks. The sim never sees commands
+    /// except through this variant.
+    OrderMove { command: MoveCommand },
     /// Pause is a full hold: motion + game time freeze, wall clock runs on.
     SetPaused { paused: bool },
+    /// Ingest ack (Log grill, #20): the UI reports back each fix's
+    /// Registry-stamped seq after ingest, so journal entries can cite
+    /// fix seqs. Reuses the command channel; no new plumbing.
+    FixAck { ship_id: String, seq: u64 },
 }
 
 /// Read view of one owned ship for the orders UI.
@@ -78,6 +88,16 @@ pub enum OrderRefusal {
     LandBetween,
 }
 
+/// UI <- sim: why an OrderMove leg was refused (precedence grill, #19).
+/// Loud by design: refusals are Log entries, never silent drops.
+#[derive(Debug, Clone)]
+pub enum CommandRefusal {
+    /// Issuer ranks below the ship's current holder.
+    LowerAuthority { held_rank: u8, by_rank: u8 },
+    /// The grant itself fails: expired, out of scope, or verb denied.
+    Grant(GrantDenial),
+}
+
 /// Sim -> UI, drained per frame.
 #[derive(Debug, Clone)]
 pub enum SimEvent {
@@ -85,6 +105,12 @@ pub enum SimEvent {
     Arrival { ship_id: String },
     /// A SetOrder was rejected (land waypoint / land between).
     OrderRefused { ship_id: String, reason: OrderRefusal },
+    /// An OrderMove leg was refused (precedence grill, #19): lower
+    /// authority or a failing grant. The future Log's entry kind.
+    CommandRefused { ship_id: String, reason: CommandRefusal },
+    /// A higher authority took a ship from its holder (reassertion).
+    /// Loud by design: the detach is recorded, never silent.
+    CommandOverridden { ship_id: String, prev_rank: u8, by_rank: u8 },
     /// An en-route ship stopped at the coast (order kept, state Blocked).
     ShipBlocked { ship_id: String },
     /// Game-clock readout, sent every round (ADR-0004: game_ts is derived
@@ -101,6 +127,9 @@ struct SimShip {
     order: Option<Order>,
     /// Catalog class backing this unit (grill #18): holds its abilities.
     class: Class,
+    /// Who currently holds the ship (precedence grill, #19): only an
+    /// equal or higher authority may overwrite its order.
+    held_by: Authority,
 }
 
 pub struct SimSource {
@@ -111,10 +140,26 @@ pub struct SimSource {
     last_tick: Option<Instant>,
     land: Option<Land>,
     catalog: Catalog,
+    /// Append-only action journal (Log grill, #20): the sim is the
+    /// single writer; every command outcome lands here as well as on
+    /// the event channel.
+    journal: Journal,
+    last_marker_min: u64,
+    /// Latest acked ingest seq per ship (Log grill, #20): what journal
+    /// entries cite. Updated by FixAck; read when events journal.
+    last_seq: HashMap<String, u64>,
 }
 
 impl SimSource {
     pub fn new(cmd_rx: Receiver<SimCommand>, evt_tx: Sender<SimEvent>) -> Self {
+        Self::new_with_journal(cmd_rx, evt_tx, Journal::disabled())
+    }
+
+    pub fn new_with_journal(
+        cmd_rx: Receiver<SimCommand>,
+        evt_tx: Sender<SimEvent>,
+        journal: Journal,
+    ) -> Self {
         // Land data is optional: if the asset is missing the sim still
         // runs (no collision), so a broken checkout never blocks dev.
         let land = match Land::from_default_asset() {
@@ -127,15 +172,62 @@ impl SimSource {
         // Taxonomy is required (grill #18): the catalog defines what a
         // unit IS; without it take-control cannot work.
         let catalog = Catalog::from_default_asset().expect("catalog asset valid");
-        Self { ships: HashMap::new(), cmd_rx, evt_tx, clock: GameClock::default(), last_tick: None, land, catalog }
+        Self {
+            ships: HashMap::new(),
+            cmd_rx,
+            evt_tx,
+            clock: GameClock::default(),
+            last_tick: None,
+            land,
+            catalog,
+            journal,
+            last_marker_min: 0,
+            last_seq: HashMap::new(),
+        }
     }
 
     pub fn owned_ids(&self) -> Vec<String> {
         self.ships.keys().cloned().collect()
     }
 
+    /// Shared commit path (ticket #22 + grill #18): land rejection, then
+    /// class-capped order install. Returns a land refusal, if any.
+    fn apply_leg(
+        &mut self,
+        ship_id: &str,
+        waypoint: GeoPosition,
+        speed_kn: f32,
+    ) -> Option<OrderRefusal> {
+        let refusal = self.land.as_ref().and_then(|land| {
+            if !land.is_water(&waypoint) {
+                Some(OrderRefusal::LandWaypoint)
+            } else if let Some(s) = self.ships.get(ship_id) {
+                (!land.path_is_water(&s.pos, &waypoint)).then_some(OrderRefusal::LandBetween)
+            } else {
+                None
+            }
+        });
+        if refusal.is_some() {
+            return refusal;
+        }
+        if let Some(s) = self.ships.get_mut(ship_id) {
+            // Class caps the order (grill #18): abilities live on the
+            // class; orders cannot exceed capability.
+            let max = Catalog::stat(&s.class, "speed_kn", f64::MAX) as f32;
+            s.order = Some(Order {
+                waypoint,
+                speed_kn: speed_kn.min(max),
+                state: OrderState::EnRoute,
+            });
+        }
+        None
+    }
+
     fn drain_commands(&mut self) {
-        for cmd in self.cmd_rx.try_iter() {
+        // Drain first: the channel iterator borrows self, which would
+        // forbid the mutable borrows the command arms need below.
+        let cmds: Vec<SimCommand> = self.cmd_rx.try_iter().collect();
+        for cmd in cmds {
             match cmd {
                 SimCommand::TakeControl { ship_id, pos, class_id } => {
                     // Class chosen at takeover (grill #18); unknown ids
@@ -152,38 +244,106 @@ impl SimSource {
                         heading_deg: 0.0,
                         order: None,
                         class,
+                        held_by: Authority::UNIT,
                     });
                 }
                 SimCommand::Release { ship_id } => {
                     self.ships.remove(&ship_id);
                 }
                 SimCommand::SetOrder { ship_id, waypoint, speed_kn } => {
-                    // Reject at commit (ticket #22): land waypoint, or a
-                    // straight path that crosses land.
-                    let refusal = self.land.as_ref().and_then(|land| {
-                        if !land.is_water(&waypoint) {
-                            Some(OrderRefusal::LandWaypoint)
-                        } else if let Some(s) = self.ships.get(&ship_id) {
-                            (!land.path_is_water(&s.pos, &waypoint))
-                                .then_some(OrderRefusal::LandBetween)
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(reason) = refusal {
+                    if let Some(reason) = self.apply_leg(&ship_id, waypoint, speed_kn) {
                         let _ = self.evt_tx.send(SimEvent::OrderRefused {
                             ship_id: ship_id.clone(),
-                            reason,
+                            reason: reason.clone(),
                         });
-                    } else if let Some(s) = self.ships.get_mut(&ship_id) {
-                        // Class caps the order (grill #18): abilities live
-                        // on the class; orders cannot exceed capability.
-                        let max = Catalog::stat(&s.class, "speed_kn", f64::MAX) as f32;
-                        s.order = Some(Order {
-                            waypoint,
-                            speed_kn: speed_kn.min(max),
-                            state: OrderState::EnRoute,
-                        });
+                        self.journal.append(
+                            self.clock.game_now_ts(),
+                            "sim",
+                            LogKind::OrderRefused,
+                            serde_json::json!({"ship": ship_id, "reason": format!("{reason:?}")}),
+                        );
+                    }
+                }
+                SimCommand::OrderMove { command } => {
+                    let now = self.clock.game_elapsed_secs();
+                    let game_ts = self.clock.game_now_ts();
+                    let actor = format!("authority:{}", command.authority.rank());
+                    self.journal.append(
+                        game_ts.clone(),
+                        actor.clone(),
+                        LogKind::Command,
+                        serde_json::json!({
+                            "ships": command.fan_out().iter().map(|l| l.ship_id.clone()).collect::<Vec<_>>(),
+                        }),
+                    );
+                    for leg in command.fan_out() {
+                        let id = leg.ship_id.clone();
+                        if let Err(denial) =
+                            command.grant.covers(&id, Verb::Move, now)
+                        {
+                            let reason = CommandRefusal::Grant(denial);
+                            let _ = self.evt_tx.send(SimEvent::CommandRefused {
+                                ship_id: id.clone(),
+                                reason: reason.clone(),
+                            });
+                            self.journal.append(
+                                game_ts.clone(),
+                                actor.clone(),
+                                LogKind::CommandRefused,
+                                serde_json::json!({"ship": id, "reason": format!("{reason:?}")}),
+                            );
+                            continue;
+                        }
+                        let held =
+                            self.ships.get(&id).map(|s| s.held_by).unwrap_or(Authority::UNIT);
+                        if command.authority < held {
+                            let reason = CommandRefusal::LowerAuthority {
+                                held_rank: held.rank(),
+                                by_rank: command.authority.rank(),
+                            };
+                            let _ = self.evt_tx.send(SimEvent::CommandRefused {
+                                ship_id: id.clone(),
+                                reason: reason.clone(),
+                            });
+                            self.journal.append(
+                                game_ts.clone(),
+                                actor.clone(),
+                                LogKind::CommandRefused,
+                                serde_json::json!({"ship": id, "reason": format!("{reason:?}")}),
+                            );
+                            continue;
+                        }
+                        if let Some(reason) =
+                            self.apply_leg(&id, leg.waypoint, leg.speed_kn)
+                        {
+                            let _ = self.evt_tx.send(SimEvent::OrderRefused {
+                                ship_id: id.clone(),
+                                reason: reason.clone(),
+                            });
+                            self.journal.append(
+                                game_ts.clone(),
+                                actor.clone(),
+                                LogKind::OrderRefused,
+                                serde_json::json!({"ship": id, "reason": format!("{reason:?}")}),
+                            );
+                            continue;
+                        }
+                        if command.authority > held {
+                            let _ = self.evt_tx.send(SimEvent::CommandOverridden {
+                                ship_id: id.clone(),
+                                prev_rank: held.rank(),
+                                by_rank: command.authority.rank(),
+                            });
+                            self.journal.append(
+                                game_ts.clone(),
+                                actor.clone(),
+                                LogKind::CommandOverridden,
+                                serde_json::json!({"ship": id, "prev_rank": held.rank(), "by_rank": command.authority.rank()}),
+                            );
+                        }
+                        if let Some(s) = self.ships.get_mut(&id) {
+                            s.held_by = command.authority;
+                        }
                     }
                 }
                 SimCommand::CancelOrder { ship_id } => {
@@ -193,6 +353,10 @@ impl SimSource {
                 }
                 SimCommand::SetPaused { paused } => {
                     self.clock.set_paused(paused);
+                }
+                SimCommand::FixAck { ship_id, seq } => {
+                    let slot = self.last_seq.entry(ship_id).or_insert(seq);
+                    *slot = (*slot).max(seq);
                 }
             }
         }
@@ -308,6 +472,9 @@ impl SimSource {
                     .map(|o| o.speed_kn)
                     .or(Some(Catalog::stat(&s.class, "speed_kn", 0.0) as f32)),
                 source: FixSource::Sim,
+                // Ingest sequence is stamped by the Registry (Log grill,
+                // #20); the sim only fills the placeholder.
+                seq: 0,
             });
         }
         let views = self.views();
@@ -323,10 +490,39 @@ impl SimSource {
             paused: self.clock.paused(),
         });
         for ship_id in arrivals {
-            let _ = self.evt_tx.send(SimEvent::Arrival { ship_id });
+            let _ = self.evt_tx.send(SimEvent::Arrival { ship_id: ship_id.clone() });
+            let fix_seq = self.last_seq.get(&ship_id).copied();
+            self.journal.append(
+                self.clock.game_now_ts(),
+                "sim",
+                LogKind::Arrival,
+                serde_json::json!({"ship": ship_id, "fix_seq": fix_seq}),
+            );
         }
         for ship_id in blocked {
-            let _ = self.evt_tx.send(SimEvent::ShipBlocked { ship_id });
+            let _ = self.evt_tx.send(SimEvent::ShipBlocked { ship_id: ship_id.clone() });
+            let fix_seq = self.last_seq.get(&ship_id).copied();
+            self.journal.append(
+                self.clock.game_now_ts(),
+                "sim",
+                LogKind::ShipBlocked,
+                serde_json::json!({"ship": ship_id, "fix_seq": fix_seq}),
+            );
+        }
+        // Game-minute markers (Log grill, #20): derived from the game
+        // clock, so pause accrues none. Each marker snapshots the latest
+        // acked fix seq per ship: replay positions recoverable by seq.
+        let minute = self.clock.game_elapsed_secs() / 60;
+        if minute > self.last_marker_min {
+            self.last_marker_min = minute;
+            let fix_seqs: HashMap<String, u64> =
+                self.last_seq.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            self.journal.append(
+                self.clock.game_now_ts(),
+                "sim",
+                LogKind::Marker,
+                serde_json::json!({"minute": minute, "fix_seqs": fix_seqs}),
+            );
         }
         Ok(fixes)
     }
@@ -363,6 +559,7 @@ impl PollSource for MergeSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::Leg;
     use std::sync::mpsc;
 
     fn harness() -> (SimSource, Receiver<SimEvent>, Sender<SimCommand>) {
@@ -623,5 +820,169 @@ mod tests {
         let nord: Vec<&Fix> = round.iter().filter(|f| f.ship_id == "nordwind").collect();
         assert_eq!(nord.len(), 1, "exactly one nordwind fix per round");
         assert_eq!(nord[0].source, FixSource::Sim);
+    }
+
+    fn move_cmd(auth: Authority, lat: f64, lon: f64, expires: u64) -> SimCommand {
+        SimCommand::OrderMove {
+            command: MoveCommand {
+                legs: vec![Leg {
+                    ship_id: "t".into(),
+                    waypoint: ship_at(lat, lon),
+                    speed_kn: 10.0,
+                }],
+                default_speed_kn: None,
+                authority: auth,
+                grant: Grant {
+                    units: vec!["t".into()],
+                    expires_game_secs: expires,
+                    verbs: vec![Verb::Move],
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn order_move_applies_then_higher_overrides_loudly() {
+        let (mut sim, evt_rx, cmd) = harness();
+        cmd.send(SimCommand::TakeControl {
+            ship_id: "t".into(),
+            pos: ship_at(-5.92, 106.92),
+            class_id: "container".into(),
+        })
+        .unwrap();
+        cmd.send(move_cmd(Authority::UNIT, -5.92, 106.95, u64::MAX)).unwrap();
+        sim.poll_round(0.0).unwrap();
+        let wp = sim.views()[0].waypoint.unwrap();
+        assert!((wp.longitude - 106.95).abs() < 1e-9, "unit-level move lands");
+        let _ = evt_rx.try_iter().collect::<Vec<_>>();
+        // Higher authority overwrites + records the override.
+        cmd.send(move_cmd(Authority::SATGAS, -5.92, 106.96, u64::MAX)).unwrap();
+        sim.poll_round(0.0).unwrap();
+        let wp = sim.views()[0].waypoint.unwrap();
+        assert!((wp.longitude - 106.96).abs() < 1e-9, "satgas overwrites");
+        assert!(
+            evt_rx.try_iter().any(|e| matches!(
+                e,
+                SimEvent::CommandOverridden { prev_rank: 0, by_rank: 1, .. }
+            )),
+            "override is loud"
+        );
+        // Lower authority is refused loudly; the order stands.
+        cmd.send(move_cmd(Authority::UNIT, -5.92, 106.95, u64::MAX)).unwrap();
+        sim.poll_round(0.0).unwrap();
+        let wp = sim.views()[0].waypoint.unwrap();
+        assert!((wp.longitude - 106.96).abs() < 1e-9, "refused move changes nothing");
+        assert!(
+            evt_rx.try_iter().any(|e| matches!(
+                e,
+                SimEvent::CommandRefused {
+                    reason: CommandRefusal::LowerAuthority { .. },
+                    ..
+                }
+            )),
+            "refusal is loud"
+        );
+    }
+
+    #[test]
+    fn order_move_honors_grant_bounds() {
+        let (mut sim, evt_rx, cmd) = harness();
+        cmd.send(SimCommand::TakeControl {
+            ship_id: "t".into(),
+            pos: ship_at(-5.92, 106.92),
+            class_id: "container".into(),
+        })
+        .unwrap();
+        // Expired grant (game clock starts at 0, expiry 0 is past).
+        cmd.send(move_cmd(Authority::ORGANIZER, -5.92, 106.95, 0)).unwrap();
+        sim.poll_round(0.0).unwrap();
+        assert!(sim.views()[0].waypoint.is_none(), "expired grant applies nothing");
+        assert!(
+            evt_rx.try_iter().any(|e| matches!(
+                e,
+                SimEvent::CommandRefused {
+                    reason: CommandRefusal::Grant(GrantDenial::Expired),
+                    ..
+                }
+            )),
+            "expiry is loud"
+        );
+    }
+
+    fn journal_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let text = std::fs::read_to_string(path).unwrap();
+        text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    #[test]
+    fn arrival_cites_last_acked_fix_seq() {
+        let path = std::env::temp_dir().join("tfg-log-test-arrival.jsonl");
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let journal = Journal::open(path.clone()).unwrap();
+        let mut sim = SimSource::new_with_journal(cmd_rx, evt_tx, journal);
+        let start = ship_at(-5.92, 106.92);
+        cmd_tx
+            .send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "container".into() })
+            .unwrap();
+        cmd_tx
+            .send(SimCommand::SetOrder {
+                ship_id: "t".into(),
+                waypoint: ship_at(-5.92, 106.955),
+                speed_kn: 120.0,
+            })
+            .unwrap();
+        sim.poll_round(SIM_TICK_SECS).unwrap();
+        // Ingest ack lands before arrival: the citation trails reality
+        // by one round, exactly as the live UI feeds it.
+        cmd_tx.send(SimCommand::FixAck { ship_id: "t".into(), seq: 7 }).unwrap();
+        let mut arrived = false;
+        for _ in 0..200 {
+            sim.poll_round(SIM_TICK_SECS).unwrap();
+            if evt_rx.try_iter().any(|e| matches!(e, SimEvent::Arrival { .. })) {
+                arrived = true;
+                break;
+            }
+        }
+        assert!(arrived, "ship arrives");
+        drop(sim);
+        let arrival = journal_lines(&path)
+            .into_iter()
+            .find(|e| e["kind"] == "Arrival")
+            .expect("arrival journaled");
+        assert_eq!(arrival["payload"]["fix_seq"], 7);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn minute_marker_snapshots_acked_seqs() {
+        let path = std::env::temp_dir().join("tfg-log-test-marker.jsonl");
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let journal = Journal::open(path.clone()).unwrap();
+        let mut sim = SimSource::new_with_journal(cmd_rx, evt_tx, journal);
+        cmd_tx
+            .send(SimCommand::TakeControl {
+                ship_id: "t".into(),
+                pos: ship_at(-5.92, 106.92),
+                class_id: "container".into(),
+            })
+            .unwrap();
+        cmd_tx.send(SimCommand::FixAck { ship_id: "t".into(), seq: 3 }).unwrap();
+        cmd_tx.send(SimCommand::FixAck { ship_id: "u".into(), seq: 5 }).unwrap();
+        // 35 two-second game ticks cross minute one (the first stamps
+        // the start and moves nothing).
+        for _ in 0..35 {
+            sim.poll_round(SIM_TICK_SECS).unwrap();
+        }
+        drop(sim);
+        let marker = journal_lines(&path)
+            .into_iter()
+            .find(|e| e["kind"] == "Marker")
+            .expect("marker journaled");
+        assert_eq!(marker["payload"]["minute"], 1);
+        assert_eq!(marker["payload"]["fix_seqs"]["t"], 3);
+        assert_eq!(marker["payload"]["fix_seqs"]["u"], 5);
+        std::fs::remove_file(&path).ok();
     }
 }

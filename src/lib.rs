@@ -6,8 +6,10 @@
 pub mod backend;
 pub mod catalog;
 pub mod clock;
+pub mod command;
 pub mod geo;
 pub mod land;
+pub mod log;
 pub mod map_render;
 pub mod overlay;
 pub mod sim;
