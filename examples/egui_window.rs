@@ -398,7 +398,9 @@ impl eframe::App for ShipApp {
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(tex) = &self.map_tex {
                 let response = ui.add(
-                    egui::Image::new(tex).fit_to_exact_size(egui::vec2(MAP_W as f32, MAP_H as f32)),
+                    egui::Image::new(tex)
+                        .fit_to_exact_size(egui::vec2(MAP_W as f32, MAP_H as f32))
+                        .sense(egui::Sense::click()),
                 );
                 let rect = response.rect;
                 // Map click: place a pending waypoint when arming, else
