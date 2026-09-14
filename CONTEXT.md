@@ -49,3 +49,23 @@ _Avoid_: sim time, virtual time, compressed time
 **Pause**:
 A full hold of game time: motion, game_now, and the log clock freeze while the real wall clock runs on. Enforced tick-wise by the sim; session datetimes are never edited.
 _Avoid_: freeze (that is the effect, not the verb), stop
+
+**Category**:
+What a unit is in the world (Ship, Plane, Tank, Port). Determines which stat keys exist — the schema, not the values.
+_Avoid_: kind, sort, domain
+
+**Class**:
+The stat values (abilities) for a family of units: a tanker's 16 kn vs a destroyer's 30 kn. All types under a class behave identically in the sim.
+_Avoid_: dev-type (collapsed — was a fuzzy duplicate), model
+
+**Type**:
+The player-facing designation of a unit (`Type 052D`, `Arleigh Burke`). Flavor only: identification, no mechanics; many types map to one Class.
+_Avoid_: variant, mark
+
+**Unit**:
+A catalog entry: taxonomy (Category/Class/Type) plus the class stat row. What a unit IS, defined once.
+_Avoid_: blueprint, template
+
+**GameUnit**:
+An in-game instance referencing a Unit: position, state, order. What a unit IS DOING in one session.
+_Avoid_: unit instance (redundant in context), entity

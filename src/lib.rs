@@ -4,6 +4,7 @@
 //! - [`backend`]: v0 poll contract: `PollSource`, file replay, HTTP stub.
 
 pub mod backend;
+pub mod catalog;
 pub mod clock;
 pub mod geo;
 pub mod land;
