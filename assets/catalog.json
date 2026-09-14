@@ -1,35 +1,735 @@
 {
   "version": 1,
+  "_generated": "scripts/fleet_import.py from Aset Kapal TNI AL.xlsx (Aktif, Sept 2026)",
   "categories": {
     "ship": {
-      "required_stats": ["speed_kn"],
-      "optional_stats": ["capacity_t"]
+      "required_stats": [
+        "speed_kn"
+      ],
+      "optional_stats": [
+        "cruise_kn",
+        "range_nm",
+        "endurance_days",
+        "crew",
+        "disp_full_t",
+        "loa_m"
+      ]
     },
-    "plane": { "required_stats": [], "optional_stats": [] },
-    "tank": { "required_stats": [], "optional_stats": [] },
-    "port": { "required_stats": [], "optional_stats": [] }
+    "plane": {
+      "required_stats": [],
+      "optional_stats": []
+    },
+    "tank": {
+      "required_stats": [],
+      "optional_stats": []
+    },
+    "port": {
+      "required_stats": [],
+      "optional_stats": []
+    }
   },
   "classes": [
     {
-      "id": "tanker",
+      "id": "cakra-type-209-1300",
       "category": "ship",
-      "name": "Tanker",
-      "stats": { "speed_kn": 16.0, "capacity_t": 300000.0 },
-      "types": ["Very Large Crude Carrier", "Suezmax"]
+      "name": "Cakra / Type 209-1300",
+      "stats": {
+        "speed_kn": 11.0,
+        "cruise_kn": 10.0,
+        "range_nm": 11300.0,
+        "endurance_days": 50.0,
+        "crew": 33.0,
+        "disp_full_t": 1390.0,
+        "loa_m": 59.5
+      },
+      "types": [
+        "Kapal selam serang diesel-elektrik"
+      ]
     },
     {
-      "id": "destroyer",
+      "id": "nagapasa-dsme-209-1400",
       "category": "ship",
-      "name": "Destroyer",
-      "stats": { "speed_kn": 30.0 },
-      "types": ["Type 052D", "Arleigh Burke"]
+      "name": "Nagapasa / DSME 209-1400",
+      "stats": {
+        "speed_kn": 11.0,
+        "cruise_kn": 10.0,
+        "range_nm": 10000.0,
+        "endurance_days": 50.0,
+        "crew": 40.0,
+        "disp_full_t": 1600.0,
+        "loa_m": 61.3
+      },
+      "types": [
+        "Kapal selam serang diesel-elektrik"
+      ]
     },
     {
-      "id": "container",
+      "id": "ahmad-yani-van-speijk",
       "category": "ship",
-      "name": "Container",
-      "stats": { "speed_kn": 20.0, "capacity_t": 150000.0 },
-      "types": ["Neo-Panamax"]
+      "name": "Ahmad Yani / Van Speijk",
+      "stats": {
+        "speed_kn": 28.5,
+        "cruise_kn": 12.0,
+        "range_nm": 4500.0,
+        "endurance_days": 30.0,
+        "crew": 180.0,
+        "disp_full_t": 2835.0,
+        "loa_m": 113.4
+      },
+      "types": [
+        "Frigat serbaguna / ASW",
+        "Frigat serbaguna"
+      ]
+    },
+    {
+      "id": "martadinata-sigma-10514-pkr",
+      "category": "ship",
+      "name": "Martadinata / SIGMA 10514 PKR",
+      "stats": {
+        "speed_kn": 28.0,
+        "cruise_kn": 14.0,
+        "range_nm": 5000.0,
+        "endurance_days": 30.0,
+        "crew": 120.0,
+        "disp_full_t": 2365.0,
+        "loa_m": 105.11
+      },
+      "types": [
+        "Frigat multirole stealth"
+      ]
+    },
+    {
+      "id": "bung-tomo-meko-200",
+      "category": "ship",
+      "name": "Bung Tomo / Meko 200",
+      "stats": {
+        "speed_kn": 30.0,
+        "cruise_kn": 12.0,
+        "range_nm": 5000.0,
+        "endurance_days": 30.0,
+        "crew": 103.0,
+        "disp_full_t": 1940.0,
+        "loa_m": 89.9
+      },
+      "types": [
+        "Frigat ringan / korvet berat",
+        "Frigat ringan"
+      ]
+    },
+    {
+      "id": "fatahillah",
+      "category": "ship",
+      "name": "Fatahillah",
+      "stats": {
+        "speed_kn": 30.0,
+        "cruise_kn": 16.0,
+        "range_nm": 4250.0,
+        "endurance_days": 30.0,
+        "crew": 89.0,
+        "disp_full_t": 1450.0,
+        "loa_m": 83.85
+      },
+      "types": [
+        "Korvet/frigat ringan ASW"
+      ]
+    },
+    {
+      "id": "diponegoro-sigma-9113",
+      "category": "ship",
+      "name": "Diponegoro / SIGMA 9113",
+      "stats": {
+        "speed_kn": 28.0,
+        "cruise_kn": 14.0,
+        "range_nm": 4800.0,
+        "endurance_days": 30.0,
+        "crew": 80.0,
+        "disp_full_t": 1692.0,
+        "loa_m": 90.71
+      },
+      "types": [
+        "Korvet misil"
+      ]
+    },
+    {
+      "id": "pattimura-parchim-i",
+      "category": "ship",
+      "name": "Pattimura / Parchim I",
+      "stats": {
+        "speed_kn": 24.5,
+        "cruise_kn": 14.0,
+        "range_nm": 2100.0,
+        "endurance_days": 14.0,
+        "crew": 62.0,
+        "disp_full_t": 935.0,
+        "loa_m": 72.5
+      },
+      "types": [
+        "Korvet ASW pesisir"
+      ]
+    },
+    {
+      "id": "bung-karno",
+      "category": "ship",
+      "name": "Bung Karno",
+      "stats": {
+        "speed_kn": 24.0,
+        "cruise_kn": 16.0,
+        "range_nm": 3000.0,
+        "endurance_days": 30.0,
+        "crew": 55.0,
+        "disp_full_t": 850.0,
+        "loa_m": 73.0
+      },
+      "types": [
+        "Korvet VVIP Kepresidenan"
+      ]
+    },
+    {
+      "id": "bung-hatta-opv-80m",
+      "category": "ship",
+      "name": "Bung Hatta / OPV 80m",
+      "stats": {
+        "speed_kn": 24.0,
+        "cruise_kn": 15.0,
+        "range_nm": 4000.0,
+        "endurance_days": 30.0,
+        "crew": 70.0,
+        "disp_full_t": 1400.0,
+        "loa_m": 80.0
+      },
+      "types": [
+        "OPV / korvet patroli ZEE"
+      ]
+    },
+    {
+      "id": "clurit-kcr-40",
+      "category": "ship",
+      "name": "Clurit / KCR-40",
+      "stats": {
+        "speed_kn": 30.0,
+        "cruise_kn": 20.0,
+        "range_nm": 2400.0,
+        "endurance_days": 7.0,
+        "crew": 35.0,
+        "disp_full_t": 250.0,
+        "loa_m": 44.0
+      },
+      "types": [
+        "Kapal cepat rudal 40m"
+      ]
+    },
+    {
+      "id": "sampari-kcr-60",
+      "category": "ship",
+      "name": "Sampari / KCR-60",
+      "stats": {
+        "speed_kn": 28.0,
+        "cruise_kn": 20.0,
+        "range_nm": 2400.0,
+        "endurance_days": 9.0,
+        "crew": 55.0,
+        "disp_full_t": 500.0,
+        "loa_m": 59.8
+      },
+      "types": [
+        "Kapal cepat rudal 60m"
+      ]
+    },
+    {
+      "id": "mandau-psm-mk-iii",
+      "category": "ship",
+      "name": "Mandau / PSM Mk-III",
+      "stats": {
+        "speed_kn": 33.0,
+        "cruise_kn": 16.0,
+        "range_nm": 2000.0,
+        "endurance_days": 7.0,
+        "crew": 42.0,
+        "disp_full_t": 290.0,
+        "loa_m": 53.6
+      },
+      "types": [
+        "Kapal cepat rudal/torpedo"
+      ]
+    },
+    {
+      "id": "singa-albatros-pb-57",
+      "category": "ship",
+      "name": "Singa / Albatros PB-57",
+      "stats": {
+        "speed_kn": 30.0,
+        "cruise_kn": 16.0,
+        "range_nm": 2500.0,
+        "endurance_days": 7.0,
+        "crew": 45.0,
+        "disp_full_t": 447.0,
+        "loa_m": 58.1
+      },
+      "types": [
+        "Kapal patroli cepat torpedo"
+      ]
+    },
+    {
+      "id": "golok-klewang-trimaran",
+      "category": "ship",
+      "name": "Golok / Klewang Trimaran",
+      "stats": {
+        "speed_kn": 28.0,
+        "cruise_kn": 16.0,
+        "range_nm": 2000.0,
+        "endurance_days": 7.0,
+        "crew": 16.0,
+        "disp_full_t": 245.0,
+        "loa_m": 62.5
+      },
+      "types": [
+        "KCR stealth trimaran komposit"
+      ]
+    },
+    {
+      "id": "pari-pc-40",
+      "category": "ship",
+      "name": "Pari / PC-40",
+      "stats": {
+        "speed_kn": 24.0,
+        "cruise_kn": 15.0,
+        "range_nm": 1800.0,
+        "endurance_days": 7.0,
+        "crew": 35.0,
+        "disp_full_t": 220.0,
+        "loa_m": 45.5
+      },
+      "types": [
+        "Kapal patroli cepat 40m"
+      ]
+    },
+    {
+      "id": "pandrong-fpb-57-nav-ii",
+      "category": "ship",
+      "name": "Pandrong / FPB-57 Nav II",
+      "stats": {
+        "speed_kn": 30.0,
+        "cruise_kn": 16.0,
+        "range_nm": 2500.0,
+        "endurance_days": 7.0,
+        "crew": 45.0,
+        "disp_full_t": 447.0,
+        "loa_m": 58.1
+      },
+      "types": [
+        "Kapal patroli cepat"
+      ]
+    },
+    {
+      "id": "sibarau-attack",
+      "category": "ship",
+      "name": "Sibarau / Attack",
+      "stats": {
+        "speed_kn": 24.0,
+        "cruise_kn": 12.0,
+        "range_nm": 2000.0,
+        "endurance_days": 7.0,
+        "crew": 19.0,
+        "disp_full_t": 100.0,
+        "loa_m": 32.5
+      },
+      "types": [
+        "Patroli pesisir"
+      ]
+    },
+    {
+      "id": "dorang-pc-60",
+      "category": "ship",
+      "name": "Dorang / PC-60",
+      "stats": {
+        "speed_kn": 24.0,
+        "cruise_kn": 15.0,
+        "range_nm": 2800.0,
+        "endurance_days": 14.0,
+        "crew": 55.0,
+        "disp_full_t": 520.0,
+        "loa_m": 60.0
+      },
+      "types": [
+        "Kapal patroli 60m ZEE"
+      ]
+    },
+    {
+      "id": "pulau-rengat-tripartite",
+      "category": "ship",
+      "name": "Pulau Rengat / Tripartite",
+      "stats": {
+        "speed_kn": 15.0,
+        "cruise_kn": 12.0,
+        "range_nm": 3000.0,
+        "endurance_days": 14.0,
+        "crew": 55.0,
+        "disp_full_t": 705.0,
+        "loa_m": 51.5
+      },
+      "types": [
+        "Kapal buru ranjau (minehunter)",
+        "Kapal buru ranjau"
+      ]
+    },
+    {
+      "id": "makassar-lpd",
+      "category": "ship",
+      "name": "Makassar / LPD",
+      "stats": {
+        "speed_kn": 16.0,
+        "cruise_kn": 12.0,
+        "range_nm": 10000.0,
+        "endurance_days": 30.0,
+        "crew": 126.0,
+        "disp_full_t": 11300.0,
+        "loa_m": 125.0
+      },
+      "types": [
+        "LPD angkut tank/pasukan + heli",
+        "LPD",
+        "LPD + komando"
+      ]
+    },
+    {
+      "id": "makassar-lpd-rs",
+      "category": "ship",
+      "name": "Makassar / LPD RS",
+      "stats": {
+        "speed_kn": 16.0,
+        "cruise_kn": 12.0,
+        "range_nm": 10000.0,
+        "endurance_days": 30.0,
+        "crew": 126.0,
+        "disp_full_t": 11000.0,
+        "loa_m": 124.0
+      },
+      "types": [
+        "LPD + rumah sakit bantu"
+      ]
+    },
+    {
+      "id": "makassar-lph-rs",
+      "category": "ship",
+      "name": "Makassar / LPH RS",
+      "stats": {
+        "speed_kn": 15.0,
+        "cruise_kn": 12.0,
+        "range_nm": 10000.0,
+        "endurance_days": 30.0,
+        "crew": 126.0,
+        "disp_full_t": 11300.0,
+        "loa_m": 122.0
+      },
+      "types": [
+        "LPH komando + rumah sakit"
+      ]
+    },
+    {
+      "id": "teluk-bintuni-at-117m",
+      "category": "ship",
+      "name": "Teluk Bintuni / AT-117M",
+      "stats": {
+        "speed_kn": 16.0,
+        "cruise_kn": 12.0,
+        "range_nm": 7200.0,
+        "endurance_days": 20.0,
+        "crew": 120.0,
+        "disp_full_t": 2300.0,
+        "loa_m": 120.0
+      },
+      "types": [
+        "LST angkut tank 120m"
+      ]
+    },
+    {
+      "id": "frosch-hoyerswerda",
+      "category": "ship",
+      "name": "Frosch / Hoyerswerda",
+      "stats": {
+        "speed_kn": 18.0,
+        "cruise_kn": 12.0,
+        "range_nm": 5000.0,
+        "endurance_days": 14.0,
+        "crew": 46.0,
+        "disp_full_t": 1950.0,
+        "loa_m": 90.7
+      },
+      "types": [
+        "LST sedang"
+      ]
+    },
+    {
+      "id": "teluk-semangka-lst-542",
+      "category": "ship",
+      "name": "Teluk Semangka / LST-542",
+      "stats": {
+        "speed_kn": 12.0,
+        "cruise_kn": 9.0,
+        "range_nm": 8000.0,
+        "endurance_days": 20.0,
+        "crew": 100.0,
+        "disp_full_t": 4080.0,
+        "loa_m": 100.0
+      },
+      "types": [
+        "LST berat ex-US"
+      ]
+    },
+    {
+      "id": "tarakan",
+      "category": "ship",
+      "name": "Tarakan",
+      "stats": {
+        "speed_kn": 18.0,
+        "cruise_kn": 13.0,
+        "range_nm": 8000.0,
+        "endurance_days": 30.0,
+        "crew": 80.0,
+        "disp_full_t": 5500.0,
+        "loa_m": 122.4
+      },
+      "types": [
+        "Tanker minyak/air (BCM)"
+      ]
+    },
+    {
+      "id": "bontang-rover",
+      "category": "ship",
+      "name": "Bontang / Rover",
+      "stats": {
+        "speed_kn": 18.0,
+        "cruise_kn": 13.0,
+        "range_nm": 8000.0,
+        "endurance_days": 30.0,
+        "crew": 80.0,
+        "disp_full_t": 5800.0,
+        "loa_m": 122.4
+      },
+      "types": [
+        "Tanker armada"
+      ]
+    },
+    {
+      "id": "sungai-gerong",
+      "category": "ship",
+      "name": "Sungai Gerong",
+      "stats": {
+        "speed_kn": 13.0,
+        "cruise_kn": 10.0,
+        "range_nm": 4000.0,
+        "endurance_days": 14.0,
+        "crew": 40.0,
+        "disp_full_t": 2000.0,
+        "loa_m": 60.0
+      },
+      "types": [
+        "Tanker kecil"
+      ]
+    },
+    {
+      "id": "arun",
+      "category": "ship",
+      "name": "Arun",
+      "stats": {
+        "speed_kn": 13.0,
+        "cruise_kn": 10.0,
+        "range_nm": 4000.0,
+        "endurance_days": 14.0,
+        "crew": 40.0,
+        "disp_full_t": 2000.0,
+        "loa_m": 60.0
+      },
+      "types": [
+        "Tanker kecil"
+      ]
+    },
+    {
+      "id": "sorong",
+      "category": "ship",
+      "name": "Sorong",
+      "stats": {
+        "speed_kn": 16.0,
+        "cruise_kn": 12.0,
+        "range_nm": 7000.0,
+        "endurance_days": 30.0,
+        "crew": 70.0,
+        "disp_full_t": 6000.0,
+        "loa_m": 105.0
+      },
+      "types": [
+        "Tanker armada"
+      ]
+    },
+    {
+      "id": "rigel",
+      "category": "ship",
+      "name": "Rigel",
+      "stats": {
+        "speed_kn": 15.0,
+        "cruise_kn": 12.0,
+        "range_nm": 4400.0,
+        "endurance_days": 20.0,
+        "crew": 40.0,
+        "disp_full_t": 560.0,
+        "loa_m": 60.1
+      },
+      "types": [
+        "Kapal survei hidro-oseanografi"
+      ]
+    },
+    {
+      "id": "dewa-kembar",
+      "category": "ship",
+      "name": "Dewa Kembar",
+      "stats": {
+        "speed_kn": 14.0,
+        "cruise_kn": 11.0,
+        "range_nm": 5000.0,
+        "endurance_days": 20.0,
+        "crew": 50.0,
+        "disp_full_t": 1400.0,
+        "loa_m": 66.0
+      },
+      "types": [
+        "Kapal survei / bantu hidro"
+      ]
+    },
+    {
+      "id": "fani-bho-105m",
+      "category": "ship",
+      "name": "Fani / BHO 105m",
+      "stats": {
+        "speed_kn": 16.0,
+        "cruise_kn": 12.0,
+        "range_nm": 6000.0,
+        "endurance_days": 30.0,
+        "crew": 60.0,
+        "disp_full_t": 2100.0,
+        "loa_m": 75.2
+      },
+      "types": [
+        "Kapal survei oseanografi modern"
+      ]
+    },
+    {
+      "id": "wahidin-sudirohusodo",
+      "category": "ship",
+      "name": "Wahidin Sudirohusodo",
+      "stats": {
+        "speed_kn": 18.0,
+        "cruise_kn": 14.0,
+        "range_nm": 10000.0,
+        "endurance_days": 30.0,
+        "crew": 120.0,
+        "disp_full_t": 7290.0,
+        "loa_m": 124.0
+      },
+      "types": [
+        "Kapal rumah sakit (BRS)"
+      ]
+    },
+    {
+      "id": "dewaruci-barque",
+      "category": "ship",
+      "name": "Dewaruci (Barque)",
+      "stats": {
+        "speed_kn": 10.0,
+        "cruise_kn": 6.0,
+        "range_nm": 9000.0,
+        "endurance_days": 60.0,
+        "crew": 75.0,
+        "disp_full_t": 847.0,
+        "loa_m": 58.3
+      },
+      "types": [
+        "Kapal latih layar tiang tinggi"
+      ]
+    },
+    {
+      "id": "bima-suci-barque",
+      "category": "ship",
+      "name": "Bima Suci (Barque)",
+      "stats": {
+        "speed_kn": 12.0,
+        "cruise_kn": 8.0,
+        "range_nm": 10000.0,
+        "endurance_days": 90.0,
+        "crew": 120.0,
+        "disp_full_t": 1896.0,
+        "loa_m": 111.2
+      },
+      "types": [
+        "Kapal latih layar tiang tinggi"
+      ]
+    },
+    {
+      "id": "multatuli",
+      "category": "ship",
+      "name": "Multatuli",
+      "stats": {
+        "speed_kn": 16.0,
+        "cruise_kn": 12.0,
+        "range_nm": 6000.0,
+        "endurance_days": 30.0,
+        "crew": 130.0,
+        "disp_full_t": 3220.0,
+        "loa_m": 91.0
+      },
+      "types": [
+        "Kapal komando + bantu ranjau"
+      ]
+    },
+    {
+      "id": "tanjung-kambani",
+      "category": "ship",
+      "name": "Tanjung Kambani",
+      "stats": {
+        "speed_kn": 15.0,
+        "cruise_kn": 12.0,
+        "range_nm": 6000.0,
+        "endurance_days": 20.0,
+        "crew": 80.0,
+        "disp_full_t": 3000.0,
+        "loa_m": 90.0
+      },
+      "types": [
+        "Kapal angkut pasukan/logistik"
+      ]
+    },
+    {
+      "id": "tanjung-nusanive",
+      "category": "ship",
+      "name": "Tanjung Nusanive",
+      "stats": {
+        "speed_kn": 15.0,
+        "cruise_kn": 12.0,
+        "range_nm": 6000.0,
+        "endurance_days": 20.0,
+        "crew": 80.0,
+        "disp_full_t": 3000.0,
+        "loa_m": 90.0
+      },
+      "types": [
+        "Kapal angkut pasukan/logistik"
+      ]
+    },
+    {
+      "id": "soputan-atf",
+      "category": "ship",
+      "name": "Soputan (ATF)",
+      "stats": {
+        "speed_kn": 13.0,
+        "cruise_kn": 10.0,
+        "range_nm": 5000.0,
+        "endurance_days": 20.0,
+        "crew": 30.0,
+        "disp_full_t": 1000.0,
+        "loa_m": 40.0
+      },
+      "types": [
+        "Tug samudera (ATF)"
+      ]
     }
   ]
 }

@@ -7,6 +7,7 @@ pub mod backend;
 pub mod catalog;
 pub mod clock;
 pub mod command;
+pub mod fleet;
 pub mod geo;
 pub mod land;
 pub mod log;
