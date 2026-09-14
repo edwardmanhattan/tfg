@@ -566,8 +566,18 @@ impl ShipApp {
             }
         });
         let pick_placed = self.fleet_pick.as_ref().map_or(false, |id| self.placed_fleet.contains(id));
+        // The sim is not polled while disarmed, so a TakeControl sent
+        // with the engine off would sit in the queue invisibly. Gate
+        // arming placement on the engine, with a one-click arm here.
+        let armed = self.mode.armed.load(Ordering::SeqCst);
         if self.mode.phase != Phase::Setup {
             ui.label("Placement is Setup-only.");
+        } else if !armed {
+            ui.label("Engine is presentation-only: placed hulls stay invisible until it runs.");
+            if ui.small_button("arm engine").clicked() {
+                self.mode.armed.store(true, Ordering::SeqCst);
+                eprintln!("sim armed");
+            }
         } else if pick_placed {
             ui.label("Already placed — pick another hull.");
         } else if let Some(id) = self.fleet_pick.clone() {
@@ -1114,7 +1124,10 @@ impl eframe::App for ShipApp {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let px = (pos.x - rect.min.x) as f64;
                         let py = (pos.y - rect.min.y) as f64;
-                        if self.mode.tool == SetupTool::Place && self.mode.phase == Phase::Setup {
+                        if self.mode.tool == SetupTool::Place
+                            && self.mode.phase == Phase::Setup
+                            && self.mode.armed.load(Ordering::SeqCst)
+                        {
                             let (la, lo) = unproject_mercator(
                                 px, py, self.center, ZOOM, MAP_W, MAP_H,
                             );
