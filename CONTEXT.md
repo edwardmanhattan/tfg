@@ -118,6 +118,22 @@ _Avoid_: pin, icon
 One scope's command view: the four panes (map, roster, inspector, orders) with action panes filtered to the scope's jurisdiction. Multi-scope players switch between desktops; organizer and observers get a single merged one.
 _Avoid_: window (that's the OS frame, not the scope view), screen
 
+**Setup**:
+The session phase for windows, roster, placements, and seats. Nothing moves, nothing is ordered; booting into Setup is the lobby.
+_Avoid_: lobby (that's Setup with defaults), staging
+
+**Live**:
+The session phase where the game runs under per-seat authority. Orders flow only when armed as well as live.
+_Avoid_: running (that's the engine, see Mode)
+
+**Closed**:
+The session phase after End: frozen map plus journal transcript, read-only. Never rewound; reopening starts a new Setup.
+_Avoid_: finished (that's the file, not the phase), archive
+
+**Mode**:
+The engine switch: simulation (the sim ticks) or presentation (wire-only, owned ships frozen). Orthogonal to phase.
+_Avoid_: state (that's the phase axis)
+
 **Log**:
 The append-only action journal of a session: one entry per action or event, replayable from genesis and retraceable per game minute. Entries name a commander seat as actor; fixes are cited by sequence, never duplicated.
 _Avoid_: track (that's the position record, see Track)
