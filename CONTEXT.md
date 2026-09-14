@@ -134,6 +134,14 @@ _Avoid_: finished (that's the file, not the phase), archive
 The engine switch: simulation (the sim ticks) or presentation (wire-only, owned ships frozen). Orthogonal to phase.
 _Avoid_: state (that's the phase axis)
 
+**Island**:
+One floating panel (Session, Roster, Inspector, Orders, Log) over the fullscreen map. Closable and reopenable; replaces dock menus.
+_Avoid_: dock, pane, window (that's the OS frame)
+
+**Wizard**:
+The stepped onboarding (Welcome → Session → Fleet → Review → Live) that IS the Setup phase: a centered island, skippable, dismissed on going Live.
+_Avoid_: tour, guide
+
 **Log**:
 The append-only action journal of a session: one entry per action or event, replayable from genesis and retraceable per game minute. Entries name a commander seat as actor; fixes are cited by sequence, never duplicated.
 _Avoid_: track (that's the position record, see Track)
