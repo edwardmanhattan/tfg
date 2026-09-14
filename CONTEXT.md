@@ -106,6 +106,14 @@ _Avoid_: slot, position
 The seat that drives one unit: the only binding that makes a unit playable.
 _Avoid_: driver, pilot
 
+**Roster**:
+The organizer-kept list of named users available to a session: the source of players and seat holders. Local only until a networked backend exists.
+_Avoid_: crew, manifest
+
+**Invite**:
+An organizer-issued code binding a named roster entry to a session seat. Generated locally (mock backend in dev); redemption over the network is a later slice.
+_Avoid_: invitation (that's the message, not the code), token
+
 **Zone**:
 The rendered area of a group (Satgas, Gugus): a live hull around member positions plus a fixed ground padding, in the level color. Collapses to a flag when zoomed out.
 _Avoid_: area (that's organizer-drawn, a different feature), region
