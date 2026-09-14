@@ -94,6 +94,18 @@ _Avoid_: squadron, fleet
 A group of Satgas under one commander.
 _Avoid_: flotilla
 
+**Session**:
+One organized play instance: time windows, players, units with placements, groups with commanders. Runs setup → live → closed.
+_Avoid_: game (that's the model, not the instance), mission
+
+**Seat**:
+One command slot in a session: helm of a unit, or commander of a unit, Satgas, or Gugus. Users are bound to seats; one user may hold several.
+_Avoid_: slot, position
+
+**Helm**:
+The seat that drives one unit: the only binding that makes a unit playable.
+_Avoid_: driver, pilot
+
 **Log**:
 The append-only action journal of a session: one entry per action or event, replayable from genesis and retraceable per game minute. Entries name a commander seat as actor; fixes are cited by sequence, never duplicated.
 _Avoid_: track (that's the position record, see Track)
