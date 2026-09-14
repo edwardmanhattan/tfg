@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use chrono::{TimeZone, Utc};
-use tfg::backend::{FileReplay, HttpPoll, PollSource};
+use tfg::backend::{FileReplay, HttpPoll, Invite, InviteClient, PollSource};
 use tfg::catalog::{Catalog, Category};
 use tfg::fleet::Fleet;
 use tfg::groups::Groups;
@@ -296,6 +296,11 @@ struct ShipApp {
     /// Satgas/Gugus wait for groups (slice iii); unit commanders draft here.
     helm: HashMap<String, String>,
     unit_commander: HashMap<String, String>,
+    /// Invites (slice v): local records (source of truth) mirrored to the
+    /// mock backend when connected.
+    invites: Vec<Invite>,
+    invite_seq: usize,
+    invite_status: String,
     /// Ratio derived from the entered windows (replaces the 24x stub).
     session_ratio: f64,
     /// Map zoom (slice iii): feeds the map thread per request; the
@@ -519,6 +524,98 @@ impl ShipApp {
         self.zoom = (self.zoom + delta).clamp(3.0, 18.0);
         eprintln!("zoom {:.0}", self.zoom);
         self.refresh_map();
+    }
+
+    /// Display name for a placed unit: fleet name + hull, or the raw id.
+    fn unit_label(&self, id: &str) -> String {
+        self.fleet
+            .get(id)
+            .map(|u| format!("{} ({})", u.name, u.hull))
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// Seat labels for one roster user: helm, unit command, group command.
+    fn seat_labels(&self, user: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (u, h) in &self.helm {
+            if h == user {
+                out.push(format!("helm {}", self.unit_label(u)));
+            }
+        }
+        for (u, c) in &self.unit_commander {
+            if c == user {
+                out.push(format!("cmdr {}", self.unit_label(u)));
+            }
+        }
+        for s in self.groups.satgas_list() {
+            if s.commander.as_deref() == Some(user) {
+                out.push(format!("cmdr {}", s.name));
+            }
+        }
+        for g in self.groups.gugus_list() {
+            if g.commander.as_deref() == Some(user) {
+                out.push(format!("cmdr {}", g.name));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Backend base URL when the mock/real backend is connected (same env
+    /// as the poll source).
+    fn backend_base() -> Option<String> {
+        std::env::var("TFG_BACKEND_URL").ok()
+    }
+
+    /// Push every local invite record to the mock (client codes win).
+    fn sync_invites(&mut self) {
+        let Some(base) = Self::backend_base() else {
+            self.invite_status = "no backend connected".to_string();
+            return;
+        };
+        let client = match InviteClient::new(&base) {
+            Ok(c) => c,
+            Err(e) => {
+                self.invite_status = format!("mock unreachable: {e}");
+                return;
+            }
+        };
+        let mut n = 0;
+        for inv in &self.invites {
+            match client.issue(&inv.user, &inv.seat, &inv.code) {
+                Ok(_) => {
+                    n += 1;
+                }
+                Err(e) => {
+                    self.invite_status = format!("sync stopped at {}: {e}", inv.code);
+                    return;
+                }
+            }
+        }
+        self.invite_status = format!("synced {n} invite(s) to mock");
+    }
+
+    /// Pull the mock list; local redeemed flags follow by code.
+    fn refresh_invites(&mut self) {
+        let Some(base) = Self::backend_base() else {
+            self.invite_status = "no backend connected".to_string();
+            return;
+        };
+        match InviteClient::new(&base).and_then(|c| c.list()) {
+            Ok(remote) => {
+                let mut n = 0;
+                for inv in &mut self.invites {
+                    if !inv.redeemed && remote.iter().any(|r| r.code == inv.code && r.redeemed) {
+                        inv.redeemed = true;
+                        n += 1;
+                    }
+                }
+                self.invite_status = format!("refreshed from mock ({n} redeemed)");
+            }
+            Err(e) => {
+                self.invite_status = format!("mock unreachable: {e}");
+            }
+        }
     }
 
     /// Stash the current draft under the current desktop.
@@ -823,6 +920,76 @@ impl ShipApp {
                     });
                 }
                 ui.separator();
+                ui.separator();
+                ui.heading("Invites");
+                ui.label("Codes bind players to seats. Local records rule; the mock mirrors when connected.");
+                for name in &roster {
+                    ui.horizontal(|ui| {
+                        let seats = self.seat_labels(name);
+                        ui.label(format!(
+                            "{} — {}",
+                            name,
+                            if seats.is_empty() { "no seat".to_string() } else { seats.join(", ") }
+                        ));
+                        if let Some(code) = self
+                            .invites
+                            .iter()
+                            .find(|i| i.user == *name && !i.redeemed)
+                            .map(|i| i.code.clone())
+                        {
+                            ui.label(format!("code: {code}"));
+                            if ui.small_button("redeem").clicked() {
+                                if let Some(inv) = self.invites.iter_mut().find(|i| i.code == code) {
+                                    inv.redeemed = true;
+                                }
+                                if let Some(base) = Self::backend_base() {
+                                    match InviteClient::new(&base).and_then(|c| c.redeem(&code)) {
+                                        Ok(_) => {
+                                            self.invite_status = format!("redeemed {code} (mock mirrored)");
+                                        }
+                                        Err(e) => {
+                                            self.invite_status = format!("redeemed {code} locally; mock: {e}");
+                                        }
+                                    }
+                                } else {
+                                    self.invite_status = format!("redeemed {code} locally");
+                                }
+                            }
+                        } else if ui.small_button("issue code").clicked() {
+                            let code = format!("TFG-{:04}", self.invite_seq);
+                            self.invite_seq += 1;
+                            let seat = seats.join(", ");
+                            self.invites.push(Invite {
+                                code: code.clone(),
+                                user: name.clone(),
+                                seat: seat.clone(),
+                                redeemed: false,
+                            });
+                            if let Some(base) = Self::backend_base() {
+                                match InviteClient::new(&base).and_then(|c| c.issue(name, &seat, &code)) {
+                                    Ok(rec) => {
+                                        self.invite_status = format!("issued {} (mock mirrored)", rec.code);
+                                    }
+                                    Err(e) => {
+                                        self.invite_status = format!("issued {code} locally; mock: {e}");
+                                    }
+                                }
+                            } else {
+                                self.invite_status = format!("issued {code} locally (no backend)");
+                            }
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.small_button("sync to mock").clicked() {
+                        self.sync_invites();
+                    }
+                    if ui.small_button("refresh from mock").clicked() {
+                        self.refresh_invites();
+                    }
+                    ui.label(&self.invite_status);
+                });
+                ui.separator();
                 // Warn-not-block go-live (grill #23): gaps are listed,
                 // only unparseable windows refuse to start. Unhelmed units
                 // stay playable: the organizer commands all.
@@ -879,6 +1046,9 @@ impl ShipApp {
                     self.satgas_members.clear();
                     self.gugus_members.clear();
                     self.group_error = None;
+                    self.invites.clear();
+                    self.invite_seq = 1;
+                    self.invite_status = "local records".to_string();
                     eprintln!("back to setup");
                 }
             }
@@ -2257,6 +2427,9 @@ fn main() -> eframe::Result<()> {
                 roster_input: String::new(),
                 helm: HashMap::new(),
                 unit_commander: HashMap::new(),
+                invites: Vec::new(),
+                invite_seq: 1,
+                invite_status: "local records".to_string(),
                 session_ratio: SESSION_RATIO,
                 zoom: ZOOM,
                 groups: Groups::default(),
