@@ -1896,13 +1896,11 @@ impl eframe::App for ShipApp {
                                 .map(|l| l.is_water(&GeoPosition { latitude: la, longitude: lo }))
                                 .unwrap_or(true)
                         });
-                    if let Some((la, lo)) = self.pending_waypoint {
-                        if !can_commit {
-                            ui.label(
-                                egui::RichText::new("⚠ waypoint on land")
-                                    .color(egui::Color32::YELLOW),
-                            );
-                        }
+                    if self.pending_waypoint.is_some() && !can_commit {
+                        ui.label(
+                            egui::RichText::new("⚠ waypoint on land")
+                                .color(egui::Color32::YELLOW),
+                        );
                     }
                     if let Some(w) = &self.order_warning {
                         ui.label(egui::RichText::new(format!("⚠ {w}")).color(egui::Color32::YELLOW));
@@ -2342,7 +2340,7 @@ fn main() -> eframe::Result<()> {
     // Map thread owns the persistent scene; frames come back by channel.
     // It exits when the UI drops its request sender, dropping the scene
     // on this thread (see on_exit) instead of racing process teardown.
-    let (map_req_tx, map_req_rx) = mpsc::channel::<(u64, (f64, f64), f64)>>();
+    let (map_req_tx, map_req_rx) = mpsc::channel::<(u64, (f64, f64), f64)>();
     let (map_resp_tx, map_resp_rx) = mpsc::channel::<(u64, (f64, f64), Vec<u8>)>();
     let map_handle = std::thread::spawn(move || {
         let mut scene = LiveMap::new(CENTER, ZOOM, MAP_W as u32, MAP_H as u32, STYLE, tfg::map_render::repo_cache_path());
