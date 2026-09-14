@@ -22,6 +22,7 @@ use chrono::{TimeZone, Utc};
 use tfg::backend::{FileReplay, HttpPoll, PollSource};
 use tfg::catalog::{Catalog, Category};
 use tfg::fleet::Fleet;
+use tfg::groups::Groups;
 use tfg::command::{Authority, Grant, GrantDenial, Leg, MoveCommand, Verb};
 use tfg::geo::track::{Fix, FixSource, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
@@ -38,6 +39,11 @@ const MAP_W: f64 = 800.0;
 const MAP_H: f64 = 600.0;
 const CENTER: (f64, f64) = (-6.108, 106.910);
 const ZOOM: f64 = 11.0;
+/// Zone/flag threshold (grill #24, slice iii): zones at or above this
+/// zoom, centroid flags below. Zoom controls feed the map thread.
+const ZONE_ZOOM: f64 = 11.0;
+/// Fixed ground padding around live hulls, in screen px (grill #24).
+const ZONE_PAD_PX: f64 = 26.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Session stub pace (session flow): 7 real hours play 7 game days.
 /// Full windows UI lands with the organizer flow; the ratio is the load-
@@ -116,6 +122,81 @@ struct ShipMarker {
     trail: Vec<(f64, f64)>,
 }
 
+/// Zone polygon for one group, in screen px (slice iii, grill #24).
+struct ZoneGeom {
+    pts: Vec<(f32, f32)>,
+    fill: egui::Color32,
+    stroke: egui::Color32,
+}
+
+/// Collapsed group flag: centroid screen point + lat/lon for click-to-expand.
+struct FlagGeom {
+    x: f32,
+    y: f32,
+    lat: f64,
+    lon: f64,
+    label: String,
+    group: String,
+    color: egui::Color32,
+}
+
+/// Monotone-chain convex hull over screen points (grill #24: live hulls).
+fn convex_hull(mut pts: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    if pts.len() <= 1 {
+        return pts;
+    }
+    pts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let cross = |o: (f64, f64), a: (f64, f64), b: (f64, f64)| {
+        (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
+    };
+    let mut lower: Vec<(f64, f64)> = Vec::new();
+    for &p in &pts {
+        while lower.len() >= 2
+            && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 0.0
+        {
+            lower.pop();
+        }
+        lower.push(p);
+    }
+    let mut upper: Vec<(f64, f64)> = Vec::new();
+    for &p in pts.iter().rev() {
+        while upper.len() >= 2
+            && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 0.0
+        {
+            upper.pop();
+        }
+        upper.push(p);
+    }
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
+}
+
+/// Fixed ground padding (grill #24): push hull points outward from the
+/// centroid by PAD px.
+fn pad_hull(pts: &[(f64, f64)], pad: f64) -> Vec<(f64, f64)> {
+    if pts.is_empty() {
+        return Vec::new();
+    }
+    let n = pts.len() as f64;
+    let (cx, cy) = (
+        pts.iter().map(|p| p.0).sum::<f64>() / n,
+        pts.iter().map(|p| p.1).sum::<f64>() / n,
+    );
+    pts.iter()
+        .map(|&(x, y)| {
+            let (dx, dy) = (x - cx, y - cy);
+            let d = (dx * dx + dy * dy).sqrt();
+            if d < 1e-6 {
+                (x, y)
+            } else {
+                (x + dx / d * pad, y + dy / d * pad)
+            }
+        })
+        .collect()
+}
+
 struct ShipApp {
     map_tex: Option<egui::TextureHandle>,
     map_version: u64,
@@ -123,7 +204,7 @@ struct ShipApp {
     center: (f64, f64),
     registry: Registry,
     poll_rx: Receiver<Vec<Fix>>,
-    map_req_tx: Option<Sender<(u64, (f64, f64))>>,
+    map_req_tx: Option<Sender<(u64, (f64, f64), f64)>>,
     map_resp_rx: Receiver<(u64, (f64, f64), Vec<u8>)>,
     map_seq: u64,
     recentering: Option<String>,
@@ -202,6 +283,20 @@ struct ShipApp {
     unit_commander: HashMap<String, String>,
     /// Ratio derived from the entered windows (replaces the 24x stub).
     session_ratio: f64,
+    /// Map zoom (slice iii): feeds the map thread per request; the
+    /// zone/flag threshold reads it per frame.
+    zoom: f64,
+    /// Session groups (slice iii): Satgas/Gugus hierarchy + drafts.
+    groups: Groups,
+    show_groups: bool,
+    group_seq: usize,
+    satgas_name: String,
+    satgas_commander: Option<String>,
+    satgas_members: HashSet<String>,
+    gugus_name: String,
+    gugus_commander: Option<String>,
+    gugus_members: HashSet<String>,
+    group_error: Option<String>,
     /// Game clock readout from the sim (ADR-0004: game time is derived
     /// and reported per round; the UI never computes it itself).
     game_elapsed_secs: Option<u64>,
@@ -336,11 +431,11 @@ impl ShipApp {
             .iter()
             .map(|s| {
                 let pos = self.registry.blend(&s.ship_id, frac).unwrap_or(s.latest.position);
-                let (x, y) = project_mercator(pos.latitude, pos.longitude, center, ZOOM, MAP_W, MAP_H);
+                let (x, y) = project_mercator(pos.latitude, pos.longitude, center, self.zoom, MAP_W, MAP_H);
                 let trail = s
                     .trail
                     .iter()
-                    .map(|p| project_mercator(p.latitude, p.longitude, center, ZOOM, MAP_W, MAP_H))
+                    .map(|p| project_mercator(p.latitude, p.longitude, center, self.zoom, MAP_W, MAP_H))
                     .collect();
                 ShipMarker { id: s.ship_id.clone(), x, y, stale: s.stale, source: s.source, trail }
             })
@@ -385,7 +480,24 @@ impl ShipApp {
         self.map_seq += 1;
         self.recentering = Some(ship.to_string());
         eprintln!("recentering on {ship}…");
-        let _ = tx.send((self.map_seq, at));
+        let _ = tx.send((self.map_seq, at, self.zoom));
+    }
+
+    /// Re-render at the current center and zoom without a recenter label.
+    fn refresh_map(&mut self) {
+        let Some(tx) = self.map_req_tx.clone() else {
+            return; // shutting down
+        };
+        self.map_seq += 1;
+        let _ = tx.send((self.map_seq, self.center, self.zoom));
+    }
+
+    /// Zoom step (slice iii): clamps, re-renders, and reports. Zones give
+    /// way to flags below ZONE_ZOOM.
+    fn zoom_by(&mut self, delta: f64) {
+        self.zoom = (self.zoom + delta).clamp(3.0, 18.0);
+        eprintln!("zoom {:.0}", self.zoom);
+        self.refresh_map();
     }
 
     /// Push one human line to the Log island feed (capped).
@@ -602,6 +714,9 @@ impl ShipApp {
                     if ui.small_button("open fleet picker").clicked() {
                         self.show_fleet = true;
                     }
+                    if ui.small_button("open groups").clicked() {
+                        self.show_groups = true;
+                    }
                     ui.label(format!("placed: {} unit(s) · {} player(s)", units.len(), roster.len()));
                 });
                 if ui
@@ -628,9 +743,271 @@ impl ShipApp {
                     self.fleet_pick = None;
                     self.helm.clear();
                     self.unit_commander.clear();
+                    self.groups = Groups::default();
+                    self.group_seq = 1;
+                    self.satgas_members.clear();
+                    self.gugus_members.clear();
+                    self.group_error = None;
                     eprintln!("back to setup");
                 }
             }
+        }
+    }
+
+    /// Zone + flag geometry for this frame (slice iii, grill #24): live
+    /// hulls over member markers in the per-level palette, single-unit
+    /// circles, centroid flags carrying lat/lon. Empty groups draw nothing.
+    fn group_geometry(&self, markers: &[ShipMarker]) -> (Vec<ZoneGeom>, Vec<FlagGeom>) {
+        // Gugus first so Satgas zones paint over them.
+        let mut work: Vec<(Vec<String>, String, String, egui::Color32, egui::Color32)> = Vec::new();
+        for g in self.groups.gugus_list() {
+            work.push((
+                self.groups.gugus_units(&g.id),
+                g.id.clone(),
+                g.name.clone(),
+                egui::Color32::from_rgba_unmultiplied(0x93, 0x33, 0xea, 70),
+                egui::Color32::from_rgb(0x93, 0x33, 0xea),
+            ));
+        }
+        for s in self.groups.satgas_list() {
+            work.push((
+                s.units.clone(),
+                s.id.clone(),
+                s.name.clone(),
+                egui::Color32::from_rgba_unmultiplied(0x25, 0x63, 0xeb, 70),
+                egui::Color32::from_rgb(0x25, 0x63, 0xeb),
+            ));
+        }
+        let mut zones = Vec::new();
+        let mut flags = Vec::new();
+        for (members, gid, name, fill, stroke) in work {
+            let pts: Vec<(f64, f64)> = markers
+                .iter()
+                .filter(|m| !self.hidden.contains(&m.id) && members.iter().any(|u| u == &m.id))
+                .map(|m| (m.x, m.y))
+                .collect();
+            if pts.is_empty() {
+                continue;
+            }
+            if self.zoom < ZONE_ZOOM {
+                let n = pts.len();
+                let (cx, cy) = (
+                    pts.iter().map(|p| p.0).sum::<f64>() / n as f64,
+                    pts.iter().map(|p| p.1).sum::<f64>() / n as f64,
+                );
+                let mut lat_sum = 0.0;
+                let mut lon_sum = 0.0;
+                let mut count = 0usize;
+                for m in markers.iter().filter(|m| members.iter().any(|u| u == &m.id)) {
+                    if let Some(s) = self.registry.ships().iter().find(|s| s.ship_id == m.id) {
+                        lat_sum += s.latest.position.latitude;
+                        lon_sum += s.latest.position.longitude;
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    continue;
+                }
+                flags.push(FlagGeom {
+                    x: cx as f32,
+                    y: cy as f32,
+                    lat: lat_sum / count as f64,
+                    lon: lon_sum / count as f64,
+                    label: format!("{name} ({n})"),
+                    group: gid,
+                    color: stroke,
+                });
+                continue;
+            }
+            let hull = pad_hull(&convex_hull(pts), ZONE_PAD_PX);
+            zones.push(ZoneGeom {
+                pts: hull.into_iter().map(|(x, y)| (x as f32, y as f32)).collect(),
+                fill,
+                stroke,
+            });
+        }
+        (zones, flags)
+    }
+
+    /// Groups island (slice iii): the organizer builds Satgas (units +
+    /// commander) and Gugus (satgas + commander) from the roster. Editing
+    /// is Setup-only; Live keeps the read-only list.
+    fn groups_island(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Groups");
+        ui.label("Satgas of units, Gugus of Satgas. Commanders from the roster.");
+        let editable = self.mode.phase == Phase::Setup;
+        let roster: Vec<String> = self.roster.clone();
+        if editable {
+            ui.separator();
+            ui.heading("New Satgas");
+            ui.horizontal(|ui| {
+                ui.label("name:");
+                ui.text_edit_singleline(&mut self.satgas_name);
+            });
+            let cmdr = self.satgas_commander.clone();
+            ui.horizontal(|ui| {
+                ui.label("commander:");
+                egui::ComboBox::from_id_salt("satgas-commander")
+                    .selected_text(cmdr.as_deref().unwrap_or("—"))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(cmdr.is_none(), "—").clicked() {
+                            self.satgas_commander = None;
+                        }
+                        for name in &roster {
+                            if ui.selectable_label(cmdr.as_deref() == Some(name.as_str()), name).clicked() {
+                                self.satgas_commander = Some(name.clone());
+                            }
+                        }
+                    });
+            });
+            let mut placed: Vec<(String, String)> = self
+                .placed_fleet
+                .iter()
+                .map(|id| {
+                    let label = self
+                        .fleet
+                        .get(id)
+                        .map(|u| format!("{} ({})", u.name, u.hull))
+                        .unwrap_or_else(|| id.clone());
+                    (id.clone(), label)
+                })
+                .collect();
+            placed.sort();
+            for (uid, label) in &placed {
+                let owner = self.groups.satgas_of_unit(uid).map(|s| s.name.clone());
+                let mut member = self.satgas_members.contains(uid);
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut member, "").changed() {
+                        if member {
+                            self.satgas_members.insert(uid.clone());
+                        } else {
+                            self.satgas_members.remove(uid);
+                        }
+                    }
+                    match owner {
+                        Some(o) => {
+                            ui.label(format!("{label} (in {o})"));
+                        }
+                        None => {
+                            ui.label(label);
+                        }
+                    }
+                });
+            }
+            if ui.small_button("create satgas").clicked() {
+                let id = format!("satgas-{}", self.group_seq);
+                let members: Vec<String> = self.satgas_members.iter().cloned().collect();
+                match self.groups.add_satgas(
+                    id.clone(),
+                    self.satgas_name.trim().to_string(),
+                    members,
+                    cmdr,
+                ) {
+                    Ok(()) => {
+                        self.group_seq += 1;
+                        self.satgas_name.clear();
+                        self.satgas_commander = None;
+                        self.satgas_members.clear();
+                        self.group_error = None;
+                        eprintln!("created satgas {id}");
+                    }
+                    Err(e) => {
+                        self.group_error = Some(e.clone());
+                        self.feed(format!("satgas rejected: {e}"));
+                    }
+                }
+            }
+        }
+        let satgas: Vec<(String, String, Option<String>, usize)> = self
+            .groups
+            .satgas_list()
+            .iter()
+            .map(|s| (s.id.clone(), s.name.clone(), s.commander.clone(), s.units.len()))
+            .collect();
+        for (id, name, commander, n) in &satgas {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} — {} · {} unit(s)", name, commander.as_deref().unwrap_or("no commander"), n));
+                if editable && ui.small_button("remove").clicked() {
+                    self.groups.remove_satgas(id);
+                }
+            });
+        }
+        if editable {
+            ui.separator();
+            ui.heading("New Gugus");
+            ui.horizontal(|ui| {
+                ui.label("name:");
+                ui.text_edit_singleline(&mut self.gugus_name);
+            });
+            let cmdr = self.gugus_commander.clone();
+            ui.horizontal(|ui| {
+                ui.label("commander:");
+                egui::ComboBox::from_id_salt("gugus-commander")
+                    .selected_text(cmdr.as_deref().unwrap_or("—"))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(cmdr.is_none(), "—").clicked() {
+                            self.gugus_commander = None;
+                        }
+                        for name in &roster {
+                            if ui.selectable_label(cmdr.as_deref() == Some(name.as_str()), name).clicked() {
+                                self.gugus_commander = Some(name.clone());
+                            }
+                        }
+                    });
+            });
+            for (id, name, _, n) in &satgas {
+                let mut member = self.gugus_members.contains(id);
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut member, "").changed() {
+                        if member {
+                            self.gugus_members.insert(id.clone());
+                        } else {
+                            self.gugus_members.remove(id);
+                        }
+                    }
+                    ui.label(format!("{name} · {n} unit(s)"));
+                });
+            }
+            if ui.small_button("create gugus").clicked() {
+                let id = format!("gugus-{}", self.group_seq);
+                let members: Vec<String> = self.gugus_members.iter().cloned().collect();
+                match self.groups.add_gugus(
+                    id.clone(),
+                    self.gugus_name.trim().to_string(),
+                    members,
+                    cmdr,
+                ) {
+                    Ok(()) => {
+                        self.group_seq += 1;
+                        self.gugus_name.clear();
+                        self.gugus_commander = None;
+                        self.gugus_members.clear();
+                        self.group_error = None;
+                        eprintln!("created gugus {id}");
+                    }
+                    Err(e) => {
+                        self.group_error = Some(e.clone());
+                        self.feed(format!("gugus rejected: {e}"));
+                    }
+                }
+            }
+        }
+        let gugus: Vec<(String, String, Option<String>, usize)> = self
+            .groups
+            .gugus_list()
+            .iter()
+            .map(|g| (g.id.clone(), g.name.clone(), g.commander.clone(), self.groups.gugus_units(&g.id).len()))
+            .collect();
+        for (id, name, commander, n) in &gugus {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} — {} · {} unit(s)", name, commander.as_deref().unwrap_or("no commander"), n));
+                if editable && ui.small_button("remove").clicked() {
+                    self.groups.remove_gugus(id);
+                }
+            });
+        }
+        if let Some(e) = self.group_error.clone() {
+            ui.label(egui::RichText::new(format!("⚠ {e}")).color(egui::Color32::YELLOW));
         }
     }
 
@@ -823,6 +1200,7 @@ impl ShipApp {
                         self.show_session = true;
                         self.show_roster = true;
                         self.show_fleet = true;
+                        self.show_groups = true;
                     }
                 });
             }
@@ -883,6 +1261,9 @@ impl eframe::App for ShipApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_map(ui.ctx());
         let markers = self.markers();
+        // Group overlays (slice iii, grill #24): recomputed per frame from
+        // live marker positions; zones above the zoom threshold, flags below.
+        let (zones, flags) = self.group_geometry(&markers);
         ui.ctx().request_repaint_after(Duration::from_millis(100));
 
         // Space toggles pause: a full hold (ADR-0004). The sim enforces it
@@ -905,6 +1286,14 @@ impl eframe::App for ShipApp {
                 ui.toggle_value(&mut self.show_inspector, "Inspector");
                 ui.toggle_value(&mut self.show_orders, "Orders");
                 ui.toggle_value(&mut self.show_log, "Log");
+                ui.toggle_value(&mut self.show_groups, "Groups");
+                if ui.small_button("−").clicked() {
+                    self.zoom_by(-1.0);
+                }
+                ui.label(format!("z{:.0}", self.zoom));
+                if ui.small_button("+").clicked() {
+                    self.zoom_by(1.0);
+                }
             });
             // Clock block: real + derived game time, humane format
             // (grill #17, ADR-0004). Both readings come from the sim.
@@ -1014,6 +1403,13 @@ impl eframe::App for ShipApp {
                 self.fleet_island(ui);
             });
             self.show_fleet = open;
+        }
+        if self.show_groups {
+            let mut open = self.show_groups;
+            egui::Window::new("Groups").movable(true).default_pos(egui::pos2(240.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
+                self.groups_island(ui);
+            });
+            self.show_groups = open;
         }
         if self.show_inspector {
             let mut open = self.show_inspector;
@@ -1311,7 +1707,7 @@ impl eframe::App for ShipApp {
                             && self.mode.armed.load(Ordering::SeqCst)
                         {
                             let (la, lo) = unproject_mercator(
-                                px, py, self.center, ZOOM, MAP_W, MAP_H,
+                                px, py, self.center, self.zoom, MAP_W, MAP_H,
                             );
                             // Fleet picker (task #29): only a picked,
                             // unplaced hull stands up. No generic or
@@ -1339,10 +1735,22 @@ impl eframe::App for ShipApp {
                             self.mode.tool = SetupTool::Select;
                         } else if self.placing {
                             let (la, lo) = unproject_mercator(
-                                px, py, self.center, ZOOM, MAP_W, MAP_H,
+                                px, py, self.center, self.zoom, MAP_W, MAP_H,
                             );
                             eprintln!("waypoint preview ({la:.4}, {lo:.4})");
                             self.pending_waypoint = Some((la, lo));
+                        } else if let Some(flag) = flags
+                            .iter()
+                            .find(|f| {
+                                ((f.x as f64 - px).powi(2) + (f.y as f64 - py).powi(2)).sqrt() < 16.0
+                            })
+                            .map(|f| (f.group.clone(), f.lat, f.lon))
+                        {
+                            // Click-to-expand (grill #24): center the group
+                            // and zoom in to its zone.
+                            self.center = (flag.1, flag.2);
+                            self.zoom = self.zoom.max(ZONE_ZOOM);
+                            self.request_frame(&flag.0, (flag.1, flag.2));
                         } else {
                             let visible: Vec<(String, f64, f64)> = markers
                                 .iter()
@@ -1357,6 +1765,40 @@ impl eframe::App for ShipApp {
                     }
                 }
                 let painter = ui.painter_at(rect);
+                // Group zones under ships, flags above them (slice iii).
+                for z in &zones {
+                    let pts: Vec<egui::Pos2> = z
+                        .pts
+                        .iter()
+                        .map(|(x, y)| rect.min + egui::vec2(*x, *y))
+                        .collect();
+                    if pts.len() >= 3 {
+                        painter.add(egui::Shape::convex_polygon(
+                            pts,
+                            z.fill,
+                            egui::Stroke::new(2.0, z.stroke),
+                        ));
+                    } else if pts.len() == 2 {
+                        painter.line_segment([pts[0], pts[1]], egui::Stroke::new(10.0, z.fill));
+                        painter.circle_filled(pts[0], 6.0, z.stroke);
+                        painter.circle_filled(pts[1], 6.0, z.stroke);
+                    } else if pts.len() == 1 {
+                        painter.circle_filled(pts[0], 14.0, z.fill);
+                        painter.circle_stroke(pts[0], 14.0, egui::Stroke::new(2.0, z.stroke));
+                    }
+                }
+                for f in &flags {
+                    let c = rect.min + egui::vec2(f.x, f.y);
+                    painter.circle_filled(c, 10.0, f.color);
+                    painter.circle_stroke(c, 10.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                    painter.text(
+                        c + egui::vec2(13.0, -10.0),
+                        egui::Align2::LEFT_TOP,
+                        &f.label,
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::BLACK,
+                    );
+                }
                 for m in &markers {
                     if self.hidden.contains(&m.id) {
                         continue;
@@ -1403,7 +1845,7 @@ impl eframe::App for ShipApp {
                         if let Some(wp) = v.waypoint {
                             if v.state == OrderState::EnRoute {
                                 let (wx, wy) = project_mercator(
-                                    wp.latitude, wp.longitude, self.center, ZOOM, MAP_W, MAP_H,
+                                    wp.latitude, wp.longitude, self.center, self.zoom, MAP_W, MAP_H,
                                 );
                                 legs.push(((m.x, m.y), (wx, wy), egui::Color32::LIGHT_BLUE));
                             }
@@ -1413,7 +1855,7 @@ impl eframe::App for ShipApp {
                 if let Some((la, lo)) = self.pending_waypoint {
                     if let Some(id) = self.selected.clone() {
                         if let Some(m) = markers.iter().find(|m| m.id == id) {
-                            let (wx, wy) = project_mercator(la, lo, self.center, ZOOM, MAP_W, MAP_H);
+                            let (wx, wy) = project_mercator(la, lo, self.center, self.zoom, MAP_W, MAP_H);
                             legs.push(((m.x, m.y), (wx, wy), egui::Color32::WHITE));
                         }
                     }
@@ -1522,12 +1964,12 @@ fn main() -> eframe::Result<()> {
     // Map thread owns the persistent scene; frames come back by channel.
     // It exits when the UI drops its request sender, dropping the scene
     // on this thread (see on_exit) instead of racing process teardown.
-    let (map_req_tx, map_req_rx) = mpsc::channel::<(u64, (f64, f64))>();
+    let (map_req_tx, map_req_rx) = mpsc::channel::<(u64, (f64, f64), f64)>>();
     let (map_resp_tx, map_resp_rx) = mpsc::channel::<(u64, (f64, f64), Vec<u8>)>();
     let map_handle = std::thread::spawn(move || {
         let mut scene = LiveMap::new(CENTER, ZOOM, MAP_W as u32, MAP_H as u32, STYLE, tfg::map_render::repo_cache_path());
-        while let Ok((seq, at)) = map_req_rx.recv() {
-            scene.set_center(at, ZOOM);
+        while let Ok((seq, at, zoom)) = map_req_rx.recv() {
+            scene.set_center(at, zoom);
             scene.pump(RECENTER_PUMP);
             let rgba = scene.frame_rgba();
             if map_resp_tx.send((seq, at, rgba)).is_err() {
@@ -1536,7 +1978,7 @@ fn main() -> eframe::Result<()> {
         }
     });
     // Initial frame so the window never opens empty-handed for long.
-    map_req_tx.send((0, CENTER)).expect("map thread alive");
+    map_req_tx.send((0, CENTER, ZOOM)).expect("map thread alive");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 640.0]),
@@ -1608,6 +2050,17 @@ fn main() -> eframe::Result<()> {
                 helm: HashMap::new(),
                 unit_commander: HashMap::new(),
                 session_ratio: SESSION_RATIO,
+                zoom: ZOOM,
+                groups: Groups::default(),
+                show_groups: false,
+                group_seq: 1,
+                satgas_name: String::new(),
+                satgas_commander: None,
+                satgas_members: HashSet::new(),
+                gugus_name: String::new(),
+                gugus_commander: None,
+                gugus_members: HashSet::new(),
+                group_error: None,
                 game_elapsed_secs: None,
                 game_ratio: 1.0,
                 game_paused: false,

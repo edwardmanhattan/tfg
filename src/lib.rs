@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod clock;
 pub mod command;
 pub mod fleet;
+pub mod groups;
 pub mod geo;
 pub mod land;
 pub mod log;
