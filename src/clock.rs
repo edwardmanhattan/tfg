@@ -79,6 +79,12 @@ impl GameClock {
         self.ratio
     }
 
+    /// Session pace (session flow): the organizer fixes the real-to-game
+    /// ratio at session start; mid-session changes just re-aim the slope.
+    pub fn set_ratio(&mut self, ratio: f64) {
+        self.ratio = ratio;
+    }
+
     pub fn started(&self) -> bool {
         self.started
     }
