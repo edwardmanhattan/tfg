@@ -114,6 +114,10 @@ _Avoid_: area (that's organizer-drawn, a different feature), region
 A collapsed group marker at the member centroid: group name plus member count. Clicking it zooms in to reveal the zone.
 _Avoid_: pin, icon
 
+**Desktop**:
+One scope's command view: the four panes (map, roster, inspector, orders) with action panes filtered to the scope's jurisdiction. Multi-scope players switch between desktops; organizer and observers get a single merged one.
+_Avoid_: window (that's the OS frame, not the scope view), screen
+
 **Log**:
 The append-only action journal of a session: one entry per action or event, replayable from genesis and retraceable per game minute. Entries name a commander seat as actor; fixes are cited by sequence, never duplicated.
 _Avoid_: track (that's the position record, see Track)
