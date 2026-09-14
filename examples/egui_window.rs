@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tfg::backend::{FileReplay, HttpPoll, PollSource};
+use tfg::catalog::Catalog;
 use tfg::geo::track::{Fix, FixSource, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
@@ -83,6 +84,9 @@ struct ShipApp {
     land: Option<Land>,
     /// Last order refusal from the sim, shown until the next attempt.
     order_warning: Option<String>,
+    /// Unit taxonomy (grill #18): class chosen at take-control.
+    catalog: Catalog,
+    selected_class: usize,
     /// Game clock readout from the sim (ADR-0004: game time is derived
     /// and reported per round; the UI never computes it itself).
     game_elapsed_secs: Option<u64>,
@@ -388,11 +392,31 @@ impl eframe::App for ShipApp {
                             ui.label(format!("eta: G+{}:{:02}", eta / 60, eta % 60));
                         }
                     }
-                    ui.add(
-                        egui::DragValue::new(&mut self.order_speed)
-                            .speed(1.0)
-                            .suffix(" kn"),
-                    );
+                    // Taxonomy readout (grill #18) + class-capped speed.
+                    if let Some((class_id, type_label, max_speed)) = self
+                        .order_views
+                        .get(&id)
+                        .map(|v| (v.class_id.clone(), v.type_label.clone(), v.max_speed_kn))
+                    {
+                        ui.label(format!(
+                            "{} · {} · max {:.0} kn",
+                            class_id, type_label, max_speed
+                        ));
+                        self.order_speed = self.order_speed.min(max_speed);
+                        ui.add(
+                            egui::DragValue::new(&mut self.order_speed)
+                                .speed(1.0)
+                                .range(0.0..=max_speed as f64)
+                                .suffix(" kn"),
+                        );
+                    } else {
+                        ui.label("waiting for sim…");
+                        ui.add(
+                            egui::DragValue::new(&mut self.order_speed)
+                                .speed(1.0)
+                                .suffix(" kn"),
+                        );
+                    }
                     if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
                         self.placing = !self.placing;
                     }
@@ -446,16 +470,36 @@ impl eframe::App for ShipApp {
                             self.placing = false;
                         }
                     });
-                } else if ui.small_button("take control").clicked() {
-                    if let Some(s) = self.registry.ships().iter().find(|s| s.ship_id == id) {
-                        if let Some(tx) = &self.sim_cmd_tx {
-                            let _ = tx.send(SimCommand::TakeControl {
-                                ship_id: id.clone(),
-                                pos: s.latest.position,
-                            });
-                            eprintln!("take control {id}");
+                } else {
+                    // Take-control with a class selector (grill #18): the
+                    // chosen class's stats drive the unit from then on.
+                    let ships = self.catalog.ship_classes();
+                    let names: Vec<&str> = ships.iter().map(|c| c.name.as_str()).collect();
+                    egui::ComboBox::from_label("")
+                        .selected_text(
+                            names.get(self.selected_class).copied().unwrap_or("—"),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (i, name) in names.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected_class, i, *name);
+                            }
+                        });
+                    if ui.small_button("take control").clicked() {
+                        if let Some(s) = self.registry.ships().iter().find(|s| s.ship_id == id) {
+                            if let Some(tx) = &self.sim_cmd_tx {
+                                let class_id = ships
+                                    .get(self.selected_class)
+                                    .map(|c| c.id.clone())
+                                    .unwrap_or_default();
+                                let _ = tx.send(SimCommand::TakeControl {
+                                    ship_id: id.clone(),
+                                    pos: s.latest.position,
+                                    class_id,
+                                });
+                                eprintln!("take control {id}");
+                            }
+                            self.controlled.insert(id);
                         }
-                        self.controlled.insert(id);
                     }
                 }
             } else {
@@ -712,6 +756,8 @@ fn main() -> eframe::Result<()> {
                 order_speed: 20.0,
                 land: Land::from_default_asset().ok(),
                 order_warning: None,
+                catalog: Catalog::from_default_asset().expect("catalog asset valid"),
+                selected_class: 0,
                 game_elapsed_secs: None,
                 game_ratio: 1.0,
                 game_paused: false,

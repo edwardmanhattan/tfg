@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "categories": {
+    "ship": {
+      "required_stats": ["speed_kn"],
+      "optional_stats": ["capacity_t"]
+    },
+    "plane": { "required_stats": [], "optional_stats": [] },
+    "tank": { "required_stats": [], "optional_stats": [] },
+    "port": { "required_stats": [], "optional_stats": [] }
+  },
+  "classes": [
+    {
+      "id": "tanker",
+      "category": "ship",
+      "name": "Tanker",
+      "stats": { "speed_kn": 16.0, "capacity_t": 300000.0 },
+      "types": ["Very Large Crude Carrier", "Suezmax"]
+    },
+    {
+      "id": "destroyer",
+      "category": "ship",
+      "name": "Destroyer",
+      "stats": { "speed_kn": 30.0 },
+      "types": ["Type 052D", "Arleigh Burke"]
+    },
+    {
+      "id": "container",
+      "category": "ship",
+      "name": "Container",
+      "stats": { "speed_kn": 20.0, "capacity_t": 150000.0 },
+      "types": ["Neo-Panamax"]
+    }
+  ]
+}

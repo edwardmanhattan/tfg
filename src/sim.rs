@@ -11,6 +11,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 
 use crate::backend::{PollSource, now_ts};
+use crate::catalog::{Catalog, Class};
 use crate::clock::GameClock;
 use crate::geo::coordinates::GeoPosition;
 use crate::geo::track::{Fix, FixSource};
@@ -41,7 +42,9 @@ pub struct Order {
 /// UI -> sim.
 #[derive(Debug, Clone)]
 pub enum SimCommand {
-    TakeControl { ship_id: String, pos: GeoPosition },
+    /// Take control with the class whose stats will drive the unit
+    /// (grill #18: class holds abilities; chosen at takeover).
+    TakeControl { ship_id: String, pos: GeoPosition, class_id: String },
     Release { ship_id: String },
     SetOrder { ship_id: String, waypoint: GeoPosition, speed_kn: f32 },
     CancelOrder { ship_id: String },
@@ -59,6 +62,11 @@ pub struct OrderView {
     pub ordered_speed_kn: Option<f32>,
     pub state: OrderState,
     pub eta_secs: Option<u64>,
+    /// Taxonomy readout (grill #18): class id + player-facing type label.
+    pub class_id: String,
+    pub type_label: String,
+    /// Class capability: the max speed this unit can sail at.
+    pub max_speed_kn: f32,
 }
 
 /// UI <- sim: why a SetOrder was refused (ticket #22).
@@ -91,6 +99,8 @@ struct SimShip {
     pos: GeoPosition,
     heading_deg: f32,
     order: Option<Order>,
+    /// Catalog class backing this unit (grill #18): holds its abilities.
+    class: Class,
 }
 
 pub struct SimSource {
@@ -100,6 +110,7 @@ pub struct SimSource {
     clock: GameClock,
     last_tick: Option<Instant>,
     land: Option<Land>,
+    catalog: Catalog,
 }
 
 impl SimSource {
@@ -113,7 +124,10 @@ impl SimSource {
                 None
             }
         };
-        Self { ships: HashMap::new(), cmd_rx, evt_tx, clock: GameClock::default(), last_tick: None, land }
+        // Taxonomy is required (grill #18): the catalog defines what a
+        // unit IS; without it take-control cannot work.
+        let catalog = Catalog::from_default_asset().expect("catalog asset valid");
+        Self { ships: HashMap::new(), cmd_rx, evt_tx, clock: GameClock::default(), last_tick: None, land, catalog }
     }
 
     pub fn owned_ids(&self) -> Vec<String> {
@@ -123,11 +137,21 @@ impl SimSource {
     fn drain_commands(&mut self) {
         for cmd in self.cmd_rx.try_iter() {
             match cmd {
-                SimCommand::TakeControl { ship_id, pos } => {
-                    self.ships.entry(ship_id).or_insert(SimShip {
+                SimCommand::TakeControl { ship_id, pos, class_id } => {
+                    // Class chosen at takeover (grill #18); unknown ids
+                    // fall back to the first ship class so a bad selector
+                    // value can never wedge the sim.
+                    let class = self
+                        .catalog
+                        .class(&class_id)
+                        .cloned()
+                        .or_else(|| self.catalog.ship_classes().into_iter().next().cloned())
+                        .expect("catalog has ship classes");
+                    self.ships.entry(ship_id).or_insert_with(|| SimShip {
                         pos,
                         heading_deg: 0.0,
                         order: None,
+                        class,
                     });
                 }
                 SimCommand::Release { ship_id } => {
@@ -152,9 +176,12 @@ impl SimSource {
                             reason,
                         });
                     } else if let Some(s) = self.ships.get_mut(&ship_id) {
+                        // Class caps the order (grill #18): abilities live
+                        // on the class; orders cannot exceed capability.
+                        let max = Catalog::stat(&s.class, "speed_kn", f64::MAX) as f32;
                         s.order = Some(Order {
                             waypoint,
-                            speed_kn,
+                            speed_kn: speed_kn.min(max),
                             state: OrderState::EnRoute,
                         });
                     }
@@ -187,6 +214,9 @@ impl SimSource {
                         ordered_speed_kn: Some(o.speed_kn),
                         state: o.state,
                         eta_secs: Some(eta),
+                        class_id: s.class.id.clone(),
+                        type_label: s.class.display_type().to_string(),
+                        max_speed_kn: Catalog::stat(&s.class, "speed_kn", f64::MAX) as f32,
                     }
                 }
                 None => OrderView {
@@ -195,6 +225,9 @@ impl SimSource {
                     ordered_speed_kn: None,
                     state: OrderState::Holding,
                     eta_secs: None,
+                    class_id: s.class.id.clone(),
+                    type_label: s.class.display_type().to_string(),
+                    max_speed_kn: Catalog::stat(&s.class, "speed_kn", f64::MAX) as f32,
                 },
             })
             .collect();
@@ -227,6 +260,8 @@ impl SimSource {
         let mut fixes = Vec::with_capacity(self.ships.len());
         let mut arrivals = Vec::new();
         let mut blocked = Vec::new();
+        // Sim speed fix reports the CLASS capability when there is no
+        // order (traffic-style readout), else the ordered speed.
         for (id, s) in self.ships.iter_mut() {
             if let Some(o) = s.order.as_mut() {
                 if o.state == OrderState::EnRoute {
@@ -267,7 +302,11 @@ impl SimSource {
                 position: s.pos,
                 ts: now_ts(),
                 heading_deg: Some(s.heading_deg),
-                speed_kn: s.order.as_ref().map(|o| o.speed_kn),
+                speed_kn: s
+                    .order
+                    .as_ref()
+                    .map(|o| o.speed_kn)
+                    .or(Some(Catalog::stat(&s.class, "speed_kn", 0.0) as f32)),
                 source: FixSource::Sim,
             });
         }
@@ -346,7 +385,7 @@ mod tests {
     fn order_advances_ship_and_arrives() {
         let (mut sim, evt_rx, cmd) = harness();
         let start = ship_at(-5.92, 106.92);
-        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start }).unwrap();
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "container".into() }).unwrap();
         // ~3.2 km east across open water at ludicrous speed.
         let wp = ship_at(-5.92, 106.955);
         cmd.send(SimCommand::SetOrder { ship_id: "t".into(), waypoint: wp, speed_kn: 120.0 }).unwrap();
@@ -356,9 +395,10 @@ mod tests {
         // First round stamps the session start (ADR-0004): emits the ship
         // but moves nothing yet.
         assert_eq!(first[0].position, start);
-        // Run until arrival.
+        // Run until arrival. Order clamps to the container class's
+        // 20 kn, so ~3.2 km takes ~160 two-second game ticks.
         let mut arrived = false;
-        for _ in 0..40 {
+        for _ in 0..200 {
             sim.poll_round(SIM_TICK_SECS).unwrap();
             if evt_rx.try_iter().any(|e| matches!(e, SimEvent::Arrival { .. })) {
                 arrived = true;
@@ -374,7 +414,7 @@ mod tests {
     fn cancel_holds_position() {
         let (mut sim, _, cmd) = harness();
         let start = ship_at(-5.92, 106.92);
-        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start }).unwrap();
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "container".into() }).unwrap();
         cmd.send(SimCommand::SetOrder {
             ship_id: "t".into(),
             waypoint: ship_at(-5.92, 106.95),
@@ -414,7 +454,7 @@ mod tests {
     fn paused_sim_holds_positions_and_game_time() {
         let (mut sim, evt_rx, cmd) = harness();
         let start = ship_at(-5.92, 106.92);
-        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start }).unwrap();
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "container".into() }).unwrap();
         cmd.send(SimCommand::SetOrder {
             ship_id: "t".into(),
             waypoint: ship_at(-5.92, 106.95),
@@ -444,7 +484,7 @@ mod tests {
     fn land_waypoint_is_rejected_and_water_accepted() {
         let (mut sim, evt_rx, cmd) = harness();
         // Ship in the Java Sea, waypoint inland on Java.
-        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.8, 106.7) })
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.8, 106.7), class_id: "container".into() })
             .unwrap();
         sim.poll_round(0.0).unwrap(); // arm + session start
         cmd.send(SimCommand::SetOrder {
@@ -474,7 +514,7 @@ mod tests {
         let (mut sim, evt_rx, cmd) = harness();
         // North of Java heading south across the island: water on both
         // ends, land between.
-        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.9, 106.9) })
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.9, 106.9), class_id: "container".into() })
             .unwrap();
         sim.poll_round(0.0).unwrap();
         cmd.send(SimCommand::SetOrder {
@@ -496,7 +536,7 @@ mod tests {
         // world changes under the order. Simulate that by swapping in a
         // synthetic island after the order is committed.
         let (mut sim, evt_rx, cmd) = harness();
-        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.8, 106.9) })
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.8, 106.9), class_id: "destroyer".into() })
             .unwrap();
         sim.poll_round(0.0).unwrap();
         cmd.send(SimCommand::SetOrder {
@@ -533,10 +573,45 @@ mod tests {
     }
 
     #[test]
+    fn class_caps_order_speed_and_views_expose_taxonomy() {
+        let (mut sim, _, cmd) = harness();
+        cmd.send(SimCommand::TakeControl {
+            ship_id: "t".into(),
+            pos: ship_at(-5.92, 106.92),
+            class_id: "tanker".into(), // 16 kn class
+        })
+        .unwrap();
+        sim.poll_round(0.0).unwrap();
+        // Order above capability: clamped to the class speed.
+        cmd.send(SimCommand::SetOrder {
+            ship_id: "t".into(),
+            waypoint: ship_at(-5.92, 106.95),
+            speed_kn: 999.0,
+        })
+        .unwrap();
+        sim.poll_round(0.0).unwrap();
+        let v = &sim.views()[0];
+        assert_eq!(v.ordered_speed_kn, Some(16.0), "order clamped to class");
+        assert_eq!(v.class_id, "tanker");
+        assert_eq!(v.type_label, "Very Large Crude Carrier");
+        assert_eq!(v.max_speed_kn, 16.0);
+        // Unknown class id falls back to the first ship class.
+        let (mut sim, _, cmd) = harness();
+        cmd.send(SimCommand::TakeControl {
+            ship_id: "t".into(),
+            pos: ship_at(-5.92, 106.92),
+            class_id: "nonexistent".into(),
+        })
+        .unwrap();
+        sim.poll_round(0.0).unwrap();
+        assert_eq!(sim.views()[0].class_id, "tanker", "fallback to first ship class");
+    }
+
+    #[test]
     fn merge_suppresses_wire_for_owned_ships() {
         use crate::backend::FileReplay;
         let (sim, _, cmd) = harness();
-        cmd.send(SimCommand::TakeControl { ship_id: "nordwind".into(), pos: ship_at(-6.1, 106.86) })
+        cmd.send(SimCommand::TakeControl { ship_id: "nordwind".into(), pos: ship_at(-6.1, 106.86), class_id: "container".into() })
             .unwrap();
         let wire = FileReplay::from_file("tests/fixtures/tracks.json").expect("fixture");
         let mut merge = MergeSource::new(Box::new(wire), sim);
