@@ -159,3 +159,48 @@ pub fn project_mercator(
     let (cx, cy) = world(center.0, center.1, zoom);
     (x - cx + w / 2.0, y - cy + h / 2.0)
 }
+
+/// Inverse of [`project_mercator`]: window pixels back to lat/lon.
+/// Used for click-to-order waypoints; exact round-trip of the forward path.
+#[allow(clippy::too_many_arguments)]
+pub fn unproject_mercator(
+    px: f64,
+    py: f64,
+    center: (f64, f64),
+    zoom: f64,
+    w: f64,
+    h: f64,
+) -> (f64, f64) {
+    use std::f64::consts::PI;
+    fn world(lat: f64, lon: f64, zoom: f64) -> (f64, f64) {
+        let scale = 256.0 * 2f64.powf(zoom);
+        let x = (lon + 180.0) / 360.0 * scale;
+        let s = (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln();
+        let y = (1.0 - s / PI) / 2.0 * scale;
+        (x, y)
+    }
+    let scale = 256.0 * 2f64.powf(zoom);
+    let (cx, cy) = world(center.0, center.1, zoom);
+    let x = px - w / 2.0 + cx;
+    let y = py - h / 2.0 + cy;
+    let lon = x / scale * 360.0 - 180.0;
+    let s = (1.0 - 2.0 * y / scale) * PI;
+    let lat = s.sinh().atan().to_degrees();
+    (lat, lon)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unproject_round_trips_project() {
+        let center = (-6.108, 106.910);
+        for (lat, lon) in [(-6.095, 106.85), (-6.14, 106.82), (-6.0, 107.1)] {
+            let (px, py) = project_mercator(lat, lon, center, 11.0, 800.0, 600.0);
+            let (la, lo) = unproject_mercator(px, py, center, 11.0, 800.0, 600.0);
+            assert!((la - lat).abs() < 1e-9, "lat {la} vs {lat}");
+            assert!((lo - lon).abs() < 1e-9, "lon {lo} vs {lon}");
+        }
+    }
+}

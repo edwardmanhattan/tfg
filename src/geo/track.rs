@@ -14,6 +14,15 @@ use serde::Deserialize;
 
 use super::coordinates::GeoPosition;
 
+/// Provenance of a Fix: backend report or synthetic sim emission.
+/// Decided in ADR-0003: the jitter guard and displays key off this.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum FixSource {
+    #[default]
+    Wire,
+    Sim,
+}
+
 /// One accepted position report for a ship.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fix {
@@ -24,6 +33,7 @@ pub struct Fix {
     pub ts: String,
     pub heading_deg: Option<f32>,
     pub speed_kn: Option<f32>,
+    pub source: FixSource,
 }
 
 /// Wire shape of a fix: flat lat/lon (serde) -> [`Fix`].
@@ -45,6 +55,7 @@ impl From<WireFix> for Fix {
             ts: w.ts,
             heading_deg: w.heading_deg,
             speed_kn: w.speed_kn,
+            source: FixSource::Wire,
         }
     }
 }
@@ -110,6 +121,7 @@ pub struct ShipView {
     pub latest: Fix,
     pub stale: bool,
     pub trail: Vec<GeoPosition>,
+    pub source: FixSource,
 }
 
 /// All tracked ships, advanced one backend poll at a time.
@@ -172,6 +184,7 @@ impl Registry {
                 latest: s.latest.clone(),
                 stale: s.stale,
                 trail: s.track.iter().map(|f| f.position).collect(),
+                source: s.latest.source,
             })
             .collect();
         out.sort_by(|a, b| a.ship_id.cmp(&b.ship_id));
@@ -200,7 +213,10 @@ impl Registry {
     pub fn blend(&self, ship_id: &str, frac: f64) -> Option<GeoPosition> {
         let s = self.ships.get(ship_id)?;
         let prev = s.previous.as_ref().unwrap_or(&s.latest);
-        if prev.position.distance_m(&s.latest.position) < JITTER_GUARD_M {
+        // Sim fixes are noiseless by construction: never hold them.
+        if s.latest.source == FixSource::Wire
+            && prev.position.distance_m(&s.latest.position) < JITTER_GUARD_M
+        {
             return Some(prev.position);
         }
         Some(prev.position.lerp(&s.latest.position, frac))
@@ -218,6 +234,7 @@ mod tests {
             ts: ts.into(),
             heading_deg: None,
             speed_kn: None,
+            source: FixSource::Wire,
         }
     }
 

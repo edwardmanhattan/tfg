@@ -25,11 +25,54 @@ impl GeoPosition {
             longitude: self.longitude + (other.longitude - self.longitude) * t,
         }
     }
+
+    /// Initial bearing to `other` in degrees (0 = north, clockwise).
+    /// Equirectangular approximation: fine for sim legs, not navigation.
+    pub fn bearing_deg_to(&self, other: &Self) -> f64 {
+        let d_lon = (other.longitude - self.longitude).to_radians();
+        let d_lat = (other.latitude - self.latitude).to_radians();
+        let x = d_lon * self.latitude.to_radians().cos();
+        (x.atan2(d_lat).to_degrees() + 360.0) % 360.0
+    }
+
+    /// Dead reckoning: advance along `heading_deg` at `speed_kn` for
+    /// `dt_secs`. Equirectangular approximation, matching `bearing_deg_to`.
+    pub fn dead_reckon(&self, heading_deg: f32, speed_kn: f32, dt_secs: f64) -> Self {
+        const R: f64 = 6_371_000.0;
+        const KN_TO_MS: f64 = 0.514_444;
+        let dist = speed_kn as f64 * KN_TO_MS * dt_secs;
+        let hdg = (heading_deg as f64).to_radians();
+        let dn = dist * hdg.cos();
+        let de = dist * hdg.sin();
+        Self {
+            latitude: self.latitude + (dn / R).to_degrees(),
+            longitude: self.longitude
+                + (de / (R * self.latitude.to_radians().cos())).to_degrees(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_reckon_north_one_hour_at_60kn_is_one_degree() {
+        // 60 kn = 1 nm/min = 1 degree latitude per hour, by definition.
+        let a = GeoPosition { latitude: 0.0, longitude: 0.0 };
+        let b = a.dead_reckon(0.0, 60.0, 3600.0);
+        assert!((b.latitude - 1.0).abs() < 1e-3, "got {}", b.latitude);
+        assert!(b.longitude.abs() < 1e-9);
+    }
+
+    #[test]
+    fn bearing_cardinal_points() {
+        let a = GeoPosition { latitude: 0.0, longitude: 0.0 };
+        let n = GeoPosition { latitude: 1.0, longitude: 0.0 };
+        let e = GeoPosition { latitude: 0.0, longitude: 1.0 };
+        assert!((a.bearing_deg_to(&n) - 0.0).abs() < 1e-9);
+        assert!((a.bearing_deg_to(&e) - 90.0).abs() < 1e-9);
+    }
 
     #[test]
     fn haversine_hamburg_harbor_is_about_9km() {

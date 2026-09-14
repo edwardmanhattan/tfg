@@ -18,11 +18,12 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tfg::backend::{FileReplay, HttpPoll, PollSource};
-use tfg::geo::track::{Fix, Registry, TrailBound, should_track};
+use tfg::geo::track::{Fix, FixSource, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
-use tfg::map_render::project_mercator;
+use tfg::map_render::{project_mercator, unproject_mercator};
 use tfg::overlay::hit_test;
+use tfg::sim::{MergeSource, OrderState, OrderView, SimCommand, SimEvent, SimSource};
 
 const MAP_W: f64 = 800.0;
 const MAP_H: f64 = 600.0;
@@ -39,6 +40,7 @@ struct ShipMarker {
     x: f64,
     y: f64,
     stale: bool,
+    source: FixSource,
     trail: Vec<(f64, f64)>,
 }
 
@@ -65,6 +67,14 @@ struct ShipApp {
     /// stamped as poll rounds arrive, so the geo model stays time-free).
     last_seen: HashMap<String, Instant>,
     fix_count: HashMap<String, usize>,
+    /// Sim orders channel + read views (prototype sim loop).
+    sim_cmd_tx: Option<Sender<SimCommand>>,
+    sim_evt_rx: Receiver<SimEvent>,
+    order_views: HashMap<String, OrderView>,
+    controlled: HashSet<String>,
+    pending_waypoint: Option<(f64, f64)>,
+    placing: bool,
+    order_speed: f32,
 }
 
 impl ShipApp {
@@ -86,6 +96,18 @@ impl ShipApp {
                 *self.fix_count.entry(f.ship_id.clone()).or_insert(0) += 1;
             }
             self.registry.poll(fixes);
+        }
+        for evt in self.sim_evt_rx.try_iter() {
+            match evt {
+                SimEvent::Orders(views) => {
+                    for v in views {
+                        self.order_views.insert(v.ship_id.clone(), v);
+                    }
+                }
+                SimEvent::Arrival { ship_id } => {
+                    eprintln!("arrived {ship_id}");
+                }
+            }
         }
         if rounds > 0 {
             self.last_poll = Instant::now();
@@ -113,7 +135,7 @@ impl ShipApp {
                     .iter()
                     .map(|p| project_mercator(p.latitude, p.longitude, center, ZOOM, MAP_W, MAP_H))
                     .collect();
-                ShipMarker { id: s.ship_id.clone(), x, y, stale: s.stale, trail }
+                ShipMarker { id: s.ship_id.clone(), x, y, stale: s.stale, source: s.source, trail }
             })
             .collect()
     }
@@ -200,13 +222,16 @@ impl eframe::App for ShipApp {
                         }
                         eprintln!("{}", if shown { "show " } else { "hide " }.to_string() + &m.id);
                     }
-                    let label = if Some(&m.id) == self.following.as_ref() {
-                        format!("{} (following)", m.id)
-                    } else if m.stale {
-                        format!("{} (stale)", m.id)
-                    } else {
-                        m.id.clone()
-                    };
+                    let mut label = m.id.clone();
+                    if Some(&m.id) == self.following.as_ref() {
+                        label += " (following)";
+                    }
+                    if m.stale {
+                        label += " (stale)";
+                    }
+                    if m.source == FixSource::Sim {
+                        label += " (sim)";
+                    }
                     if ui.selectable_value(&mut self.following, Some(m.id.clone()), label).clicked()
                     {
                         eprintln!("follow {:?}", self.following);
@@ -236,7 +261,8 @@ impl eframe::App for ShipApp {
                 self.registry.ships().iter().find(|s| s.ship_id == id).map(|s| (id, s.latest.clone(), s.stale, s.trail.len()))
             }) {
                 Some((id, fix, stale, trail_len)) => {
-                    ui.label(format!("ship: {id}{}", if stale { " (stale)" } else { "" }));
+                    let sim_badge = if fix.source == FixSource::Sim { " (sim)" } else { "" };
+                    ui.label(format!("ship: {id}{sim_badge}{}", if stale { " (stale)" } else { "" }));
                     ui.label(format!(
                         "pos: {:.6} {:.6}",
                         fix.position.latitude, fix.position.longitude
@@ -273,6 +299,78 @@ impl eframe::App for ShipApp {
                 self.following = Some(ship.clone());
                 self.request_frame(&ship, at);
             }
+            ui.separator();
+            // Orders (prototype sim loop): take control, place waypoint,
+            // commit speed order; sim advances the ship, inspector shows it.
+            ui.heading("Orders");
+            if let Some(id) = self.selected.clone() {
+                if self.controlled.contains(&id) {
+                    if let Some(v) = self.order_views.get(&id) {
+                        let state = match v.state {
+                            OrderState::EnRoute => "en route",
+                            OrderState::Arrived => "arrived",
+                            OrderState::Holding => "holding",
+                        };
+                        ui.label(format!("order: {state}"));
+                        if let Some(eta) = v.eta_secs {
+                            ui.label(format!("eta: {eta}s"));
+                        }
+                    }
+                    ui.add(
+                        egui::DragValue::new(&mut self.order_speed)
+                            .speed(1.0)
+                            .range(0.0..=120.0)
+                            .suffix(" kn"),
+                    );
+                    if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
+                        self.placing = !self.placing;
+                    }
+                    let can_commit = self.pending_waypoint.is_some();
+                    if ui.add_enabled(can_commit, egui::Button::new("order")).clicked() {
+                        if let Some((la, lo)) = self.pending_waypoint {
+                            if let Some(tx) = &self.sim_cmd_tx {
+                                let _ = tx.send(SimCommand::SetOrder {
+                                    ship_id: id.clone(),
+                                    waypoint: GeoPosition { latitude: la, longitude: lo },
+                                    speed_kn: self.order_speed,
+                                });
+                                eprintln!("order {id} -> ({la:.4}, {lo:.4}) @ {} kn", self.order_speed);
+                            }
+                            self.pending_waypoint = None;
+                            self.placing = false;
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.small_button("cancel").clicked() {
+                            if let Some(tx) = &self.sim_cmd_tx {
+                                let _ = tx.send(SimCommand::CancelOrder { ship_id: id.clone() });
+                            }
+                        }
+                        if ui.small_button("release").clicked() {
+                            if let Some(tx) = &self.sim_cmd_tx {
+                                let _ = tx.send(SimCommand::Release { ship_id: id.clone() });
+                            }
+                            self.controlled.remove(&id);
+                            self.order_views.remove(&id);
+                            self.pending_waypoint = None;
+                            self.placing = false;
+                        }
+                    });
+                } else if ui.small_button("take control").clicked() {
+                    if let Some(s) = self.registry.ships().iter().find(|s| s.ship_id == id) {
+                        if let Some(tx) = &self.sim_cmd_tx {
+                            let _ = tx.send(SimCommand::TakeControl {
+                                ship_id: id.clone(),
+                                pos: s.latest.position,
+                            });
+                            eprintln!("take control {id}");
+                        }
+                        self.controlled.insert(id);
+                    }
+                }
+            } else {
+                ui.label("select a ship first");
+            }
             if let Some((ship, at)) = follow_req {
                 self.request_frame(&ship, at);
             }
@@ -303,19 +401,28 @@ impl eframe::App for ShipApp {
                     egui::Image::new(tex).fit_to_exact_size(egui::vec2(MAP_W as f32, MAP_H as f32)),
                 );
                 let rect = response.rect;
-                // Map click: select the nearest visible marker (12px).
+                // Map click: place a pending waypoint when arming, else
+                // select the nearest visible marker (12px).
                 if response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let px = (pos.x - rect.min.x) as f64;
                         let py = (pos.y - rect.min.y) as f64;
-                        let visible: Vec<(String, f64, f64)> = markers
-                            .iter()
-                            .filter(|m| !self.hidden.contains(&m.id))
-                            .map(|m| (m.id.clone(), m.x, m.y))
-                            .collect();
-                        if let Some(id) = hit_test(&visible, px, py, 12.0) {
-                            eprintln!("select {id}");
-                            self.selected = Some(id);
+                        if self.placing {
+                            let (la, lo) = unproject_mercator(
+                                px, py, self.center, ZOOM, MAP_W, MAP_H,
+                            );
+                            eprintln!("waypoint preview ({la:.4}, {lo:.4})");
+                            self.pending_waypoint = Some((la, lo));
+                        } else {
+                            let visible: Vec<(String, f64, f64)> = markers
+                                .iter()
+                                .filter(|m| !self.hidden.contains(&m.id))
+                                .map(|m| (m.id.clone(), m.x, m.y))
+                                .collect();
+                            if let Some(id) = hit_test(&visible, px, py, 12.0) {
+                                eprintln!("select {id}");
+                                self.selected = Some(id);
+                            }
                         }
                     }
                 }
@@ -355,6 +462,44 @@ impl eframe::App for ShipApp {
                         egui::Color32::BLACK,
                     );
                 }
+                // Waypoint legs: pending preview (white) + committed per
+                // owned ship (light blue), drawn from the ship marker.
+                let mut legs: Vec<((f64, f64), (f64, f64), egui::Color32)> = Vec::new();
+                for m in &markers {
+                    if self.hidden.contains(&m.id) {
+                        continue;
+                    }
+                    if let Some(v) = self.order_views.get(&m.id) {
+                        if let Some(wp) = v.waypoint {
+                            if v.state == OrderState::EnRoute {
+                                let (wx, wy) = project_mercator(
+                                    wp.latitude, wp.longitude, self.center, ZOOM, MAP_W, MAP_H,
+                                );
+                                legs.push(((m.x, m.y), (wx, wy), egui::Color32::LIGHT_BLUE));
+                            }
+                        }
+                    }
+                }
+                if let Some((la, lo)) = self.pending_waypoint {
+                    if let Some(id) = self.selected.clone() {
+                        if let Some(m) = markers.iter().find(|m| m.id == id) {
+                            let (wx, wy) = project_mercator(la, lo, self.center, ZOOM, MAP_W, MAP_H);
+                            legs.push(((m.x, m.y), (wx, wy), egui::Color32::WHITE));
+                        }
+                    }
+                }
+                for ((x1, y1), (x2, y2), color) in legs {
+                    painter.line_segment(
+                        [rect.min + egui::vec2(x1 as f32, y1 as f32),
+                         rect.min + egui::vec2(x2 as f32, y2 as f32)],
+                        egui::Stroke::new(2.0, color),
+                    );
+                    painter.circle_filled(
+                        rect.min + egui::vec2(x2 as f32, y2 as f32),
+                        5.0,
+                        color,
+                    );
+                }
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label("loading map scene…");
@@ -367,12 +512,16 @@ impl eframe::App for ShipApp {
 fn main() -> eframe::Result<()> {
     // Poll thread owns the backend source; the UI owns the registry.
     // TFG_BACKEND_URL=http://host:port selects HTTP, else file replay.
+    // The sim joins every round via MergeSource (disarmed = wire only).
     let shutdown = std::sync::Arc::new(AtomicBool::new(false));
     let (poll_tx, poll_rx) = mpsc::channel();
+    let (sim_cmd_tx, sim_cmd_rx) = mpsc::channel::<SimCommand>();
+    let (sim_evt_tx, sim_evt_rx) = mpsc::channel::<SimEvent>();
+    let ui_sim_cmd_tx = sim_cmd_tx.clone();
     let poll_shutdown = shutdown.clone();
     let poll_handle = std::thread::spawn(move || {
         let fixture = format!("{}/tests/fixtures/tracks.json", env!("CARGO_MANIFEST_DIR"));
-        let mut source: Box<dyn PollSource> = match std::env::var("TFG_BACKEND_URL") {
+        let wire: Box<dyn PollSource> = match std::env::var("TFG_BACKEND_URL") {
             Ok(url) => {
                 eprintln!("backend: HTTP {url}");
                 match HttpPoll::new(&url) {
@@ -394,6 +543,7 @@ fn main() -> eframe::Result<()> {
                 }
             }
         };
+        let mut source = MergeSource::new(wire, SimSource::new(sim_cmd_rx, sim_evt_tx));
         loop {
             match source.poll() {
                 Ok(fixes) => {
@@ -461,6 +611,13 @@ fn main() -> eframe::Result<()> {
                 selected: None,
                 last_seen: HashMap::new(),
                 fix_count: HashMap::new(),
+                sim_cmd_tx: Some(ui_sim_cmd_tx),
+                sim_evt_rx,
+                order_views: HashMap::new(),
+                controlled: HashSet::new(),
+                pending_waypoint: None,
+                placing: false,
+                order_speed: 20.0,
             }))
         }),
     )

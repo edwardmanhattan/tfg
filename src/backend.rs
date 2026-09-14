@@ -23,13 +23,19 @@ struct Fixture {
     frames: Vec<Vec<serde_json::Value>>,
 }
 
+/// Current UTC time, millis precision, fixed-width (lexicographically ordered).
+/// Sources stamp this on serve; the registry compares `ts` as strings.
+pub fn now_ts() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
 /// Stamp one poll round with receipt time (UTC, millis).
 ///
 /// Replays loop canned frames, so wire `ts` rewinds every cycle and the
 /// registry (rightly) drops it as out-of-order. A live backend emits fresh
 /// timestamps; the replay sources model that by stamping on serve.
 fn stamp_now(frame: &mut [Fix]) {
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let now = now_ts();
     for fix in frame {
         fix.ts = now.clone();
     }
