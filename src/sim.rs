@@ -13,7 +13,7 @@ use std::time::Instant;
 use crate::backend::{PollSource, now_ts};
 use crate::catalog::{Catalog, Class};
 use crate::clock::GameClock;
-use crate::command::{Authority, GrantDenial, Leg, MoveCommand, Verb};
+use crate::command::{Authority, GrantDenial, MoveCommand, Verb};
 use crate::log::{Journal, LogKind};
 use crate::geo::coordinates::GeoPosition;
 use crate::geo::track::{Fix, FixSource};
@@ -216,7 +216,10 @@ impl SimSource {
     }
 
     fn drain_commands(&mut self) {
-        for cmd in self.cmd_rx.try_iter() {
+        // Drain first: the channel iterator borrows self, which would
+        // forbid the mutable borrows the command arms need below.
+        let cmds: Vec<SimCommand> = self.cmd_rx.try_iter().collect();
+        for cmd in cmds {
             match cmd {
                 SimCommand::TakeControl { ship_id, pos, class_id } => {
                     // Class chosen at takeover (grill #18); unknown ids
@@ -539,6 +542,7 @@ impl PollSource for MergeSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::Leg;
     use std::sync::mpsc;
 
     fn harness() -> (SimSource, Receiver<SimEvent>, Sender<SimCommand>) {
