@@ -389,6 +389,13 @@ impl ShipApp {
         self.session_log_path = path;
         self.mode.start();
         self.wizard_done = true;
+        // Going live needs the working islands; the Fleet picker is
+        // Setup-only, so it steps aside.
+        self.show_roster = true;
+        self.show_inspector = true;
+        self.show_orders = true;
+        self.show_log = true;
+        self.show_fleet = false;
         eprintln!("session live at {SESSION_RATIO}x");
     }
 
@@ -752,7 +759,8 @@ impl eframe::App for ShipApp {
         if self.mode.phase == Phase::Setup && !self.wizard_done {
             let mut wiz_open = true;
             egui::Window::new("Command center setup")
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .default_pos(egui::pos2(330.0, 140.0))
+                .movable(true)
                 .collapsible(false)
                 .open(&mut wiz_open)
                 .show(ui.ctx(), |ui| {
@@ -764,7 +772,7 @@ impl eframe::App for ShipApp {
         }
         if self.show_session {
             let mut open = self.show_session;
-            egui::Window::new("Session").open(&mut open).show(ui.ctx(), |ui| {
+            egui::Window::new("Session").movable(true).default_pos(egui::pos2(8.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
                 self.session_island(ui);
             });
             self.show_session = open;
@@ -772,7 +780,7 @@ impl eframe::App for ShipApp {
         let mut follow_req: Option<(String, (f64, f64))> = None;
         if self.show_roster {
             let mut open = self.show_roster;
-            egui::Window::new("Roster").open(&mut open).show(ui.ctx(), |ui| {
+            egui::Window::new("Roster").movable(true).default_pos(egui::pos2(816.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
             ui.label(format!("{} ships — click a name to follow", markers.len()));
             ui.separator();
             // State machine: trails belong to Live (nothing moves in
@@ -828,14 +836,14 @@ impl eframe::App for ShipApp {
         }
         if self.show_fleet {
             let mut open = self.show_fleet;
-            egui::Window::new("Fleet").open(&mut open).show(ui.ctx(), |ui| {
+            egui::Window::new("Fleet").movable(true).default_pos(egui::pos2(8.0, 300.0)).open(&mut open).show(ui.ctx(), |ui| {
                 self.fleet_island(ui);
             });
             self.show_fleet = open;
         }
         if self.show_inspector {
             let mut open = self.show_inspector;
-            egui::Window::new("Inspector").open(&mut open).show(ui.ctx(), |ui| {
+            egui::Window::new("Inspector").movable(true).default_pos(egui::pos2(816.0, 300.0)).open(&mut open).show(ui.ctx(), |ui| {
             // Inspector: live readout for the selected ship.
             ui.heading("Inspector");
             let mut close_inspector = false;
@@ -889,7 +897,7 @@ impl eframe::App for ShipApp {
         // Orders island: Live-only; observers get no orders pane at all.
         if self.show_orders && self.mode.live() {
             let mut open = self.show_orders;
-            egui::Window::new("Orders").open(&mut open).show(ui.ctx(), |ui| {
+            egui::Window::new("Orders").movable(true).default_pos(egui::pos2(576.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
             // Orders (prototype sim loop): take control, place waypoint,
             // commit speed order; sim advances the ship, inspector shows it.
             ui.heading("Orders");
@@ -1082,7 +1090,7 @@ impl eframe::App for ShipApp {
         }
         if self.show_log {
             let mut open = self.show_log;
-            egui::Window::new("Log").open(&mut open).show(ui.ctx(), |ui| {
+            egui::Window::new("Log").movable(true).default_pos(egui::pos2(8.0, 478.0)).open(&mut open).show(ui.ctx(), |ui| {
                 self.log_island(ui);
             });
             self.show_log = open;
@@ -1388,11 +1396,11 @@ fn main() -> eframe::Result<()> {
                 session_log_path: tfg::log::Journal::prototype_path(),
                 session_seq: 0,
                 transcript: Vec::new(),
-                show_session: true,
-                show_roster: true,
-                show_inspector: true,
-                show_orders: true,
-                show_log: true,
+                show_session: false,
+                show_roster: false,
+                show_inspector: false,
+                show_orders: false,
+                show_log: false,
                 wizard_step: 0,
                 wizard_done: false,
                 event_feed: VecDeque::new(),
@@ -1411,7 +1419,7 @@ fn main() -> eframe::Result<()> {
                 catalog: Catalog::from_default_asset().expect("catalog asset valid"),
                 selected_class: 0,
                 fleet: Fleet::from_default_asset().expect("fleet asset valid"),
-                show_fleet: true,
+                show_fleet: false,
                 fleet_cat: 0,
                 fleet_class: None,
                 fleet_query: String::new(),
