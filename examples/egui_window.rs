@@ -122,6 +122,21 @@ struct ShipMarker {
     trail: Vec<(f64, f64)>,
 }
 
+/// One desktop's order draft (slice iv, grill #25): pending waypoint,
+/// waypoint arming, and speed. Drafts persist per desktop across switches.
+#[derive(Clone)]
+struct Draft {
+    waypoint: Option<(f64, f64)>,
+    placing: bool,
+    speed: f32,
+}
+
+impl Default for Draft {
+    fn default() -> Self {
+        Self { waypoint: None, placing: false, speed: 20.0 }
+    }
+}
+
 /// Zone polygon for one group, in screen px (slice iii, grill #24).
 struct ZoneGeom {
     pts: Vec<(f32, f32)>,
@@ -297,6 +312,12 @@ struct ShipApp {
     gugus_commander: Option<String>,
     gugus_members: HashSet<String>,
     group_error: Option<String>,
+    /// Desktops (slice iv, grill #25): act-as identity + scope tabs.
+    /// No identity = organizer with the merged All desktop.
+    acting_as: Option<String>,
+    desktop: String,
+    /// Per-desktop order drafts, saved on every desktop switch.
+    drafts: HashMap<String, Draft>,
     /// Game clock readout from the sim (ADR-0004: game time is derived
     /// and reported per round; the UI never computes it itself).
     game_elapsed_secs: Option<u64>,
@@ -500,6 +521,104 @@ impl ShipApp {
         self.refresh_map();
     }
 
+    /// Stash the current draft under the current desktop.
+    fn save_draft(&mut self) {
+        let cur = self.desktop.clone();
+        self.drafts.insert(
+            cur,
+            Draft { waypoint: self.pending_waypoint, placing: self.placing, speed: self.order_speed },
+        );
+    }
+
+    /// Restore a desktop's draft (default speed 20 kn when never drafted).
+    fn load_draft(&mut self, id: &str) {
+        let d = self.drafts.get(id).cloned().unwrap_or_default();
+        self.pending_waypoint = d.waypoint;
+        self.placing = d.placing;
+        self.order_speed = d.speed;
+    }
+
+    /// Switch desktop tabs (grill #25): drafts persist per desktop, the
+    /// camera stays, observers lose the orders pane.
+    fn switch_desktop(&mut self, id: String) {
+        self.save_draft();
+        self.load_draft(&id);
+        self.desktop = id;
+        if self.is_observer() {
+            self.show_orders = false;
+        }
+    }
+
+    /// Default desktop for the acting identity: All, or the first scope.
+    fn default_desktop(&self) -> String {
+        match &self.acting_as {
+            None => "all".to_string(),
+            Some(user) => self
+                .groups
+                .scopes_for(user, &self.unit_commander, &self.helm)
+                .first()
+                .map(|s| s.id.clone())
+                .unwrap_or_else(|| "all".to_string()),
+        }
+    }
+
+    /// Seat-less acting players get the merged view-only desktop.
+    fn is_observer(&self) -> bool {
+        match &self.acting_as {
+            None => false,
+            Some(user) => self.groups.scopes_for(user, &self.unit_commander, &self.helm).is_empty(),
+        }
+    }
+
+    /// Units the current desktop may act on: None = unrestricted
+    /// (organizer). Everything still views all.
+    fn action_units(&self) -> Option<HashSet<String>> {
+        let user = self.acting_as.as_ref()?;
+        let mut scopes = self.groups.scopes_for(user, &self.unit_commander, &self.helm);
+        if scopes.is_empty() {
+            return Some(HashSet::new());
+        }
+        let pos = scopes.iter().position(|s| s.id == self.desktop).unwrap_or(0);
+        Some(scopes.remove(pos).units.into_iter().collect())
+    }
+
+    /// Whether the current desktop may command this ship.
+    fn action_allows(&self, ship: &str) -> bool {
+        match self.action_units() {
+            None => true,
+            Some(set) => set.contains(ship),
+        }
+    }
+
+    /// Desktop tabs: (id, label, unit count). Organizer gets the merged
+    /// All; observers a single view-only tab.
+    fn desktop_tabs(&self) -> Vec<(String, String, usize)> {
+        match &self.acting_as {
+            None => vec![("all".to_string(), "All".to_string(), self.placed_fleet.len())],
+            Some(user) => {
+                let scopes = self.groups.scopes_for(user, &self.unit_commander, &self.helm);
+                if scopes.is_empty() {
+                    return vec![("all".to_string(), "Observer".to_string(), 0)];
+                }
+                scopes
+                    .into_iter()
+                    .map(|s| {
+                        let n = s.units.len();
+                        let label = match s.id.strip_prefix("unit:") {
+                            Some(uid) => self
+                                .fleet
+                                .get(uid)
+                                .map(|u| format!("{} ({})", u.name, u.hull))
+                                .unwrap_or(s.label),
+                            None => s.label,
+                        };
+                        (s.id, label, n)
+                    })
+                    .collect()
+            }
+        }
+    }
+
     /// Push one human line to the Log island feed (capped).
     fn feed(&mut self, msg: String) {
         eprintln!("{msg}");
@@ -512,6 +631,11 @@ impl ShipApp {
     /// Start action shared by the Session island and the wizard:
     /// default windows, fresh per-session journal, 24:1 clock, armed.
     fn start_session(&mut self) {
+        // Going live is organizer-only (slice iv).
+        if self.acting_as.is_some() {
+            self.feed("start refused: organizer-only".to_string());
+            return;
+        }
         // Windows were validated in the Session island; re-parse defensively.
         let Some((rs, re, gs, ge)) = parse_windows(
             &self.time_real_start,
@@ -585,6 +709,13 @@ impl ShipApp {
         }
         match phase {
             Phase::Setup => {
+                // Setup editing is organizer-only (slice iv): acting
+                // players keep the read-only summary.
+                if self.acting_as.is_some() {
+                    ui.label("Setup is organizer-only: switch identity to Organizer to edit.");
+                    ui.label(format!("placed: {} unit(s) · {} player(s)", self.placed_fleet.len(), self.roster.len()));
+                    return;
+                }
                 ui.heading("Time windows (WIB)");
                 ui.horizontal(|ui| {
                     ui.label("real:");
@@ -835,7 +966,7 @@ impl ShipApp {
     fn groups_island(&mut self, ui: &mut egui::Ui) {
         ui.heading("Groups");
         ui.label("Satgas of units, Gugus of Satgas. Commanders from the roster.");
-        let editable = self.mode.phase == Phase::Setup;
+        let editable = self.mode.phase == Phase::Setup && self.acting_as.is_none();
         let roster: Vec<String> = self.roster.clone();
         if editable {
             ui.separator();
@@ -1135,6 +1266,8 @@ impl ShipApp {
                 self.mode.armed.store(true, Ordering::SeqCst);
                 eprintln!("sim armed");
             }
+        } else if self.acting_as.is_some() {
+            ui.label("Placement is organizer-only.");
         } else if pick_placed {
             ui.label("Already placed — pick another hull.");
         } else if let Some(id) = self.fleet_pick.clone() {
@@ -1275,6 +1408,28 @@ impl eframe::App for ShipApp {
                 eprintln!("{}", if paused { "pause" } else { "resume" });
             }
         }
+        // Number keys switch desktop tabs (grill #25); the camera stays.
+        let num_keys = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::Num6,
+            egui::Key::Num7,
+            egui::Key::Num8,
+            egui::Key::Num9,
+        ];
+        for (i, key) in num_keys.iter().enumerate() {
+            if ui.ctx().input(|inp| inp.key_pressed(*key)) {
+                let tabs = self.desktop_tabs();
+                if let Some((id, _, _)) = tabs.get(i) {
+                    let id = id.clone();
+                    self.switch_desktop(id);
+                }
+                break;
+            }
+        }
 
         // Toolbar (islands grill, #27): island toggles + the clock block.
         // The dock is dead; every flow below is a floating island.
@@ -1293,6 +1448,48 @@ impl eframe::App for ShipApp {
                 ui.label(format!("z{:.0}", self.zoom));
                 if ui.small_button("+").clicked() {
                     self.zoom_by(1.0);
+                }
+            });
+            // Identity + desktops (slice iv, grill #25): act as organizer
+            // (merged All) or a roster player (their scope tabs, view-all).
+            ui.horizontal(|ui| {
+                ui.label("act:");
+                let roster: Vec<String> = self.roster.clone();
+                let mut act_idx = match &self.acting_as {
+                    None => 0,
+                    Some(u) => roster.iter().position(|n| n == u).map(|i| i + 1).unwrap_or(0),
+                };
+                egui::ComboBox::from_label("identity")
+                    .selected_text(self.acting_as.as_deref().unwrap_or("Organizer"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut act_idx, 0, "Organizer");
+                        for (i, name) in roster.iter().enumerate() {
+                            ui.selectable_value(&mut act_idx, i + 1, name);
+                        }
+                    });
+                let new_acting =
+                    if act_idx == 0 { None } else { roster.get(act_idx - 1).cloned() };
+                if new_acting != self.acting_as {
+                    self.save_draft();
+                    self.acting_as = new_acting;
+                    let def = self.default_desktop();
+                    self.load_draft(&def);
+                    self.desktop = def;
+                    if self.is_observer() {
+                        self.show_orders = false;
+                    }
+                    eprintln!("acting as {}", self.acting_as.as_deref().unwrap_or("organizer"));
+                }
+                ui.separator();
+                let tabs = self.desktop_tabs();
+                for (i, (id, label, n)) in tabs.iter().enumerate() {
+                    let mut tab = format!("{label} ({n})");
+                    if i < 9 {
+                        tab = format!("[{}] {tab}", i + 1);
+                    }
+                    if ui.selectable_label(&self.desktop == id, tab).clicked() {
+                        self.switch_desktop(id.clone());
+                    }
                 }
             });
             // Clock block: real + derived game time, humane format
@@ -1465,13 +1662,19 @@ impl eframe::App for ShipApp {
             self.show_inspector = open;
         }
         // Orders island: Live-only; observers get no orders pane at all.
-        if self.show_orders && self.mode.live() {
+        if self.show_orders && self.mode.live() && !self.is_observer() {
             let mut open = self.show_orders;
             egui::Window::new("Orders").movable(true).default_pos(egui::pos2(576.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
             // Orders (prototype sim loop): take control, place waypoint,
             // commit speed order; sim advances the ship, inspector shows it.
             ui.heading("Orders");
             if let Some(id) = self.selected.clone() {
+                // Scoped desktop (slice iv): command inside jurisdiction,
+                // view everything.
+                let allowed = self.action_allows(&id);
+                if !allowed {
+                    ui.label("Outside your jurisdiction — view only.");
+                }
                 if self.controlled.contains(&id) {
                     if let Some(v) = self.order_views.get(&id) {
                         let state = match v.state {
@@ -1534,7 +1737,7 @@ impl eframe::App for ShipApp {
                     if let Some(w) = &self.order_warning {
                         ui.label(egui::RichText::new(format!("⚠ {w}")).color(egui::Color32::YELLOW));
                     }
-                    if ui.add_enabled(can_commit, egui::Button::new("order")).clicked() {
+                    if ui.add_enabled(can_commit && allowed, egui::Button::new("order")).clicked() {
                         self.order_warning = None;
                         if let Some((la, lo)) = self.pending_waypoint {
                             if let Some(tx) = &self.sim_cmd_tx {
@@ -1556,10 +1759,14 @@ impl eframe::App for ShipApp {
                     let mut controlled: Vec<String> =
                         self.controlled.iter().cloned().collect();
                     controlled.sort();
+                    // Order-all fans out inside jurisdiction only (slice iv).
+                    if let Some(scope) = self.action_units() {
+                        controlled.retain(|u| scope.contains(u));
+                    }
                     if controlled.len() > 1
                         && ui
                             .add_enabled(
-                                can_commit,
+                                can_commit && allowed,
                                 egui::Button::new(format!("order all ({})", controlled.len())),
                             )
                             .clicked()
@@ -1605,12 +1812,12 @@ impl eframe::App for ShipApp {
                         }
                     }
                     ui.horizontal(|ui| {
-                        if ui.small_button("cancel").clicked() {
+                        if allowed && ui.small_button("cancel").clicked() {
                             if let Some(tx) = &self.sim_cmd_tx {
                                 let _ = tx.send(SimCommand::CancelOrder { ship_id: id.clone() });
                             }
                         }
-                        if ui.small_button("release").clicked() {
+                        if allowed && ui.small_button("release").clicked() {
                             if let Some(tx) = &self.sim_cmd_tx {
                                 let _ = tx.send(SimCommand::Release { ship_id: id.clone() });
                             }
@@ -1634,7 +1841,7 @@ impl eframe::App for ShipApp {
                                 ui.selectable_value(&mut self.selected_class, i, *name);
                             }
                         });
-                    if ui.small_button("take control").clicked() {
+                    if allowed && ui.small_button("take control").clicked() {
                         if let Some(s) = self.registry.ships().iter().find(|s| s.ship_id == id) {
                             if let Some(tx) = &self.sim_cmd_tx {
                                 let class_id = ships
@@ -1705,6 +1912,7 @@ impl eframe::App for ShipApp {
                         if self.mode.tool == SetupTool::Place
                             && self.mode.phase == Phase::Setup
                             && self.mode.armed.load(Ordering::SeqCst)
+                            && self.acting_as.is_none()
                         {
                             let (la, lo) = unproject_mercator(
                                 px, py, self.center, self.zoom, MAP_W, MAP_H,
@@ -2061,6 +2269,9 @@ fn main() -> eframe::Result<()> {
                 gugus_commander: None,
                 gugus_members: HashSet::new(),
                 group_error: None,
+                acting_as: None,
+                desktop: "all".to_string(),
+                drafts: HashMap::new(),
                 game_elapsed_secs: None,
                 game_ratio: 1.0,
                 game_paused: false,
