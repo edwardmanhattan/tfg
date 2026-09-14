@@ -23,7 +23,10 @@ use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
 use tfg::map_render::{project_mercator, unproject_mercator};
 use tfg::overlay::hit_test;
-use tfg::sim::{MergeSource, OrderState, OrderView, SimCommand, SimEvent, SimSource};
+use tfg::land::Land;
+use tfg::sim::{
+    MergeSource, OrderRefusal, OrderState, OrderView, SimCommand, SimEvent, SimSource,
+};
 
 const MAP_W: f64 = 800.0;
 const MAP_H: f64 = 600.0;
@@ -75,6 +78,11 @@ struct ShipApp {
     pending_waypoint: Option<(f64, f64)>,
     placing: bool,
     order_speed: f32,
+    /// Land test for order validation (ticket #22): land waypoints are
+    /// rejected in the UI before they ever reach the sim.
+    land: Option<Land>,
+    /// Last order refusal from the sim, shown until the next attempt.
+    order_warning: Option<String>,
     /// Game clock readout from the sim (ADR-0004: game time is derived
     /// and reported per round; the UI never computes it itself).
     game_elapsed_secs: Option<u64>,
@@ -121,6 +129,17 @@ impl ShipApp {
                     self.real_ts = Some(real_ts);
                     self.game_ts = game_ts;
                     self.game_paused = paused;
+                }
+                SimEvent::OrderRefused { ship_id, reason } => {
+                    let why = match reason {
+                        OrderRefusal::LandWaypoint => "waypoint is on land",
+                        OrderRefusal::LandBetween => "path crosses land",
+                    };
+                    eprintln!("order refused ({ship_id}): {why}");
+                    self.order_warning = Some(format!("{ship_id}: {why}"));
+                }
+                SimEvent::ShipBlocked { ship_id } => {
+                    eprintln!("blocked at coast: {ship_id}");
                 }
                 SimEvent::Arrival { ship_id } => {
                     eprintln!("arrived {ship_id}");
@@ -358,6 +377,7 @@ impl eframe::App for ShipApp {
                     if let Some(v) = self.order_views.get(&id) {
                         let state = match v.state {
                             OrderState::EnRoute => "en route",
+                            OrderState::Blocked => "BLOCKED (land)",
                             OrderState::Arrived => "arrived",
                             OrderState::Holding => "holding",
                         };
@@ -376,8 +396,27 @@ impl eframe::App for ShipApp {
                     if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
                         self.placing = !self.placing;
                     }
-                    let can_commit = self.pending_waypoint.is_some();
+                    let can_commit = self
+                        .pending_waypoint
+                        .is_some_and(|(la, lo)| {
+                            self.land
+                                .as_ref()
+                                .map(|l| l.is_water(&GeoPosition { latitude: la, longitude: lo }))
+                                .unwrap_or(true)
+                        });
+                    if let Some((la, lo)) = self.pending_waypoint {
+                        if !can_commit {
+                            ui.label(
+                                egui::RichText::new("⚠ waypoint on land")
+                                    .color(egui::Color32::YELLOW),
+                            );
+                        }
+                    }
+                    if let Some(w) = &self.order_warning {
+                        ui.label(egui::RichText::new(format!("⚠ {w}")).color(egui::Color32::YELLOW));
+                    }
                     if ui.add_enabled(can_commit, egui::Button::new("order")).clicked() {
+                        self.order_warning = None;
                         if let Some((la, lo)) = self.pending_waypoint {
                             if let Some(tx) = &self.sim_cmd_tx {
                                 let _ = tx.send(SimCommand::SetOrder {
@@ -671,6 +710,8 @@ fn main() -> eframe::Result<()> {
                 pending_waypoint: None,
                 placing: false,
                 order_speed: 20.0,
+                land: Land::from_default_asset().ok(),
+                order_warning: None,
                 game_elapsed_secs: None,
                 game_ratio: 1.0,
                 game_paused: false,

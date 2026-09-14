@@ -14,6 +14,7 @@ use crate::backend::{PollSource, now_ts};
 use crate::clock::GameClock;
 use crate::geo::coordinates::GeoPosition;
 use crate::geo::track::{Fix, FixSource};
+use crate::land::Land;
 
 /// Real seconds between sim rounds (the poll cadence). Motion itself
 /// advances by GAME time: game_dt = real_dt × ratio (grill #17, ADR-0004).
@@ -24,6 +25,8 @@ pub const ARRIVAL_M: f64 = 50.0;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OrderState {
     EnRoute,
+    /// Path crossed land: ship stopped at the coast, order preserved.
+    Blocked,
     Arrived,
     Holding,
 }
@@ -56,11 +59,26 @@ pub struct OrderView {
     pub ordered_speed_kn: Option<f32>,
     pub state: OrderState,
     pub eta_secs: Option<u64>,
-}    /// Sim -> UI, drained per frame.
+}
+
+/// UI <- sim: why a SetOrder was refused (ticket #22).
+#[derive(Debug, Clone)]
+pub enum OrderRefusal {
+    /// Waypoint is on land.
+    LandWaypoint,
+    /// Straight path to the waypoint crosses land.
+    LandBetween,
+}
+
+/// Sim -> UI, drained per frame.
 #[derive(Debug, Clone)]
 pub enum SimEvent {
     Orders(Vec<OrderView>),
     Arrival { ship_id: String },
+    /// A SetOrder was rejected (land waypoint / land between).
+    OrderRefused { ship_id: String, reason: OrderRefusal },
+    /// An en-route ship stopped at the coast (order kept, state Blocked).
+    ShipBlocked { ship_id: String },
     /// Game-clock readout, sent every round (ADR-0004: game_ts is derived
     /// from ts via this clock, never stored on fixes).
     Clock { game_elapsed_secs: u64, ratio: f64, paused: bool },
@@ -81,11 +99,21 @@ pub struct SimSource {
     evt_tx: Sender<SimEvent>,
     clock: GameClock,
     last_tick: Option<Instant>,
+    land: Option<Land>,
 }
 
 impl SimSource {
     pub fn new(cmd_rx: Receiver<SimCommand>, evt_tx: Sender<SimEvent>) -> Self {
-        Self { ships: HashMap::new(), cmd_rx, evt_tx, clock: GameClock::default(), last_tick: None }
+        // Land data is optional: if the asset is missing the sim still
+        // runs (no collision), so a broken checkout never blocks dev.
+        let land = match Land::from_default_asset() {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("land collision disabled: {e}");
+                None
+            }
+        };
+        Self { ships: HashMap::new(), cmd_rx, evt_tx, clock: GameClock::default(), last_tick: None, land }
     }
 
     pub fn owned_ids(&self) -> Vec<String> {
@@ -106,7 +134,24 @@ impl SimSource {
                     self.ships.remove(&ship_id);
                 }
                 SimCommand::SetOrder { ship_id, waypoint, speed_kn } => {
-                    if let Some(s) = self.ships.get_mut(&ship_id) {
+                    // Reject at commit (ticket #22): land waypoint, or a
+                    // straight path that crosses land.
+                    let refusal = self.land.as_ref().and_then(|land| {
+                        if !land.is_water(&waypoint) {
+                            Some(OrderRefusal::LandWaypoint)
+                        } else if let Some(s) = self.ships.get(&ship_id) {
+                            (!land.path_is_water(&s.pos, &waypoint))
+                                .then_some(OrderRefusal::LandBetween)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(reason) = refusal {
+                        let _ = self.evt_tx.send(SimEvent::OrderRefused {
+                            ship_id: ship_id.clone(),
+                            reason,
+                        });
+                    } else if let Some(s) = self.ships.get_mut(&ship_id) {
                         s.order = Some(Order {
                             waypoint,
                             speed_kn,
@@ -181,6 +226,7 @@ impl SimSource {
         let game_dt = self.clock.tick(real_dt);
         let mut fixes = Vec::with_capacity(self.ships.len());
         let mut arrivals = Vec::new();
+        let mut blocked = Vec::new();
         for (id, s) in self.ships.iter_mut() {
             if let Some(o) = s.order.as_mut() {
                 if o.state == OrderState::EnRoute {
@@ -191,8 +237,28 @@ impl SimSource {
                         arrivals.push(id.clone());
                     } else {
                         s.heading_deg = s.pos.bearing_deg_to(&o.waypoint) as f32;
-                        // Motion integrates over GAME elapsed seconds.
-                        s.pos = s.pos.dead_reckon(s.heading_deg, o.speed_kn, game_dt);
+                        // Motion integrates over GAME elapsed seconds,
+                        // capped at the remaining distance: without the
+                        // cap a fast ship overshoots the waypoint every
+                        // tick and ping-pongs around it forever.
+                        let speed_mps = o.speed_kn as f64 * 0.514_444;
+                        let step_dt = game_dt.min(dist / speed_mps);
+                        let next = s.pos.dead_reckon(s.heading_deg, o.speed_kn, step_dt);
+                        // Stop en route at the coast (ticket #22): if the
+                        // leg this tick would touch land, hold position
+                        // and flag blocked; the order survives so a
+                        // player-edited waypoint can resume progress.
+                        let clear = self
+                            .land
+                            .as_ref()
+                            .map(|l| l.path_is_water(&s.pos, &next))
+                            .unwrap_or(true);
+                        if clear {
+                            s.pos = next;
+                        } else {
+                            o.state = OrderState::Blocked;
+                            blocked.push(id.clone());
+                        }
                     }
                 }
             }
@@ -219,6 +285,9 @@ impl SimSource {
         });
         for ship_id in arrivals {
             let _ = self.evt_tx.send(SimEvent::Arrival { ship_id });
+        }
+        for ship_id in blocked {
+            let _ = self.evt_tx.send(SimEvent::ShipBlocked { ship_id });
         }
         Ok(fixes)
     }
@@ -276,10 +345,10 @@ mod tests {
     #[test]
     fn order_advances_ship_and_arrives() {
         let (mut sim, evt_rx, cmd) = harness();
-        let start = ship_at(-6.10, 106.86);
+        let start = ship_at(-5.92, 106.92);
         cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start }).unwrap();
-        // ~330 m east at ludicrous speed: several 2 s ticks to arrive.
-        let wp = ship_at(-6.10, 106.863);
+        // ~3.2 km east across open water at ludicrous speed.
+        let wp = ship_at(-5.92, 106.955);
         cmd.send(SimCommand::SetOrder { ship_id: "t".into(), waypoint: wp, speed_kn: 120.0 }).unwrap();
         let first = sim.poll_round(SIM_TICK_SECS).unwrap();
         assert_eq!(first.len(), 1);
@@ -304,11 +373,11 @@ mod tests {
     #[test]
     fn cancel_holds_position() {
         let (mut sim, _, cmd) = harness();
-        let start = ship_at(-6.10, 106.86);
+        let start = ship_at(-5.92, 106.92);
         cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start }).unwrap();
         cmd.send(SimCommand::SetOrder {
             ship_id: "t".into(),
-            waypoint: ship_at(-6.10, 106.90),
+            waypoint: ship_at(-5.92, 106.95),
             speed_kn: 60.0,
         })
         .unwrap();
@@ -344,11 +413,11 @@ mod tests {
     #[test]
     fn paused_sim_holds_positions_and_game_time() {
         let (mut sim, evt_rx, cmd) = harness();
-        let start = ship_at(-6.10, 106.86);
+        let start = ship_at(-5.92, 106.92);
         cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start }).unwrap();
         cmd.send(SimCommand::SetOrder {
             ship_id: "t".into(),
-            waypoint: ship_at(-6.10, 106.90),
+            waypoint: ship_at(-5.92, 106.95),
             speed_kn: 60.0,
         })
         .unwrap();
@@ -369,6 +438,98 @@ mod tests {
         sim.poll_round(SIM_TICK_SECS).unwrap();
         let c = sim.poll_round(SIM_TICK_SECS).unwrap()[0].position;
         assert!(c.distance_m(&a) > 0.0, "motion resumes after unpause");
+    }
+
+    #[test]
+    fn land_waypoint_is_rejected_and_water_accepted() {
+        let (mut sim, evt_rx, cmd) = harness();
+        // Ship in the Java Sea, waypoint inland on Java.
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.8, 106.7) })
+            .unwrap();
+        sim.poll_round(0.0).unwrap(); // arm + session start
+        cmd.send(SimCommand::SetOrder {
+            ship_id: "t".into(),
+            waypoint: ship_at(-6.5, 107.0), // inland Java
+            speed_kn: 60.0,
+        })
+        .unwrap();
+        sim.poll_round(0.0).unwrap();
+        assert!(evt_rx.try_iter().any(
+            |e| matches!(e, SimEvent::OrderRefused { reason: OrderRefusal::LandWaypoint, .. })
+        ));
+        assert_eq!(sim.views()[0].state, OrderState::Holding, "no order created");
+        // A sea waypoint across open water is accepted.
+        cmd.send(SimCommand::SetOrder {
+            ship_id: "t".into(),
+            waypoint: ship_at(-5.6, 107.6),
+            speed_kn: 60.0,
+        })
+        .unwrap();
+        sim.poll_round(0.0).unwrap();
+        assert_eq!(sim.views()[0].state, OrderState::EnRoute);
+    }
+
+    #[test]
+    fn path_crossing_land_is_refused() {
+        let (mut sim, evt_rx, cmd) = harness();
+        // North of Java heading south across the island: water on both
+        // ends, land between.
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.9, 106.9) })
+            .unwrap();
+        sim.poll_round(0.0).unwrap();
+        cmd.send(SimCommand::SetOrder {
+            ship_id: "t".into(),
+            waypoint: ship_at(-7.5, 106.9), // open Indian Ocean, past Java
+            speed_kn: 60.0,
+        })
+        .unwrap();
+        sim.poll_round(0.0).unwrap();
+        assert!(evt_rx.try_iter().any(
+            |e| matches!(e, SimEvent::OrderRefused { reason: OrderRefusal::LandBetween, .. })
+        ));
+    }
+
+    #[test]
+    fn en_route_ship_stops_at_coast_and_keeps_order() {
+        // Defense in depth (ticket #22): the commit check covers the
+        // whole straight path, so en-route land only appears if the
+        // world changes under the order. Simulate that by swapping in a
+        // synthetic island after the order is committed.
+        let (mut sim, evt_rx, cmd) = harness();
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.8, 106.9) })
+            .unwrap();
+        sim.poll_round(0.0).unwrap();
+        cmd.send(SimCommand::SetOrder {
+            ship_id: "t".into(),
+            waypoint: ship_at(-5.8, 107.3), // open water, clear path
+            speed_kn: 600.0,
+        })
+        .unwrap();
+        sim.poll_round(0.0).unwrap(); // order committed
+        assert_eq!(sim.views()[0].state, OrderState::EnRoute);
+        // The world changes: an island rises athwart the ship's track.
+        sim.land = Some(
+            Land::from_geojson(
+                r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[107.05,-5.85],[107.15,-5.85],[107.15,-5.75],[107.05,-5.75],[107.05,-5.85]]]}}]}"#,
+            )
+            .expect("synthetic land parses"),
+        );
+        let mut saw_blocked = false;
+        for _ in 0..30 {
+            sim.poll_round(120.0).unwrap(); // 2 min game steps, fast ship
+            if evt_rx.try_iter().any(|e| matches!(e, SimEvent::ShipBlocked { .. })) {
+                saw_blocked = true;
+                break;
+            }
+        }
+        assert!(saw_blocked, "ship must stop at the coast");
+        let v = &sim.views()[0];
+        assert_eq!(v.state, OrderState::Blocked);
+        assert!(v.waypoint.is_some(), "order survives blocking");
+        assert!(
+            sim.land.as_ref().unwrap().is_water(&sim.ships["t"].pos),
+            "ship rests on water, not inside the island"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 pub mod backend;
 pub mod clock;
 pub mod geo;
+pub mod land;
 pub mod map_render;
 pub mod overlay;
 pub mod sim;
