@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use chrono::Utc;
 use tfg::backend::{FileReplay, HttpPoll, PollSource};
-use tfg::catalog::Catalog;
+use tfg::catalog::{Catalog, Category};
+use tfg::fleet::Fleet;
 use tfg::command::{Authority, Grant, GrantDenial, Leg, MoveCommand, Verb};
 use tfg::geo::track::{Fix, FixSource, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
@@ -143,9 +144,6 @@ struct ShipApp {
     session_log_path: std::path::PathBuf,
     session_seq: usize,
     transcript: Vec<String>,
-    /// Click-placement counter (session flow): stood-up units arrive
-    /// owned immediately.
-    unit_seq: usize,
     /// Islands (islands grill, #27): floating panels over the fullscreen
     /// map. Run-local visibility; phase decides what may show.
     show_session: bool,
@@ -180,6 +178,16 @@ struct ShipApp {
     /// Unit taxonomy (grill #18): class chosen at take-control.
     catalog: Catalog,
     selected_class: usize,
+    /// Fleet picker (task #29): organizer hull seeds from
+    /// assets/fleet.json, filtered by category/class/text, placed by hand
+    /// on the map — never automatically.
+    fleet: Fleet,
+    show_fleet: bool,
+    fleet_cat: usize,
+    fleet_class: Option<String>,
+    fleet_query: String,
+    fleet_pick: Option<String>,
+    placed_fleet: HashSet<String>,
     /// Game clock readout from the sim (ADR-0004: game time is derived
     /// and reported per round; the UI never computes it itself).
     game_elapsed_secs: Option<u64>,
@@ -417,25 +425,13 @@ impl ShipApp {
                 if ui.small_button("start session (prototype)").clicked() {
                     self.start_session();
                 }
-                let ships = self.catalog.ship_classes();
-                let names: Vec<&str> = ships.iter().map(|c| c.name.as_str()).collect();
                 ui.horizontal(|ui| {
-                    egui::ComboBox::from_label("place")
-                        .selected_text(
-                            names.get(self.selected_class).copied().unwrap_or("—"),
-                        )
-                        .show_ui(ui, |ui| {
-                            for (i, name) in names.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_class, i, *name);
-                            }
-                        });
-                    let placing = self.mode.tool == SetupTool::Place;
-                    if ui.small_button(if placing { "click map…" } else { "place unit" }).clicked() {
-                        self.mode.tool = if placing { SetupTool::Select } else { SetupTool::Place };
-                        self.placing = false;
+                    if ui.small_button("open fleet picker").clicked() {
+                        self.show_fleet = true;
                     }
+                    ui.label(format!("placed: {} unit(s)", self.placed_fleet.len()));
                 });
-                ui.label(format!("placed: {} unit(s)", self.unit_seq.saturating_sub(1)));
+                ui.label("Placement is by hand: pick a hull in the Fleet island, then click the map.");
             }
             Phase::Live => {
                 if let Some((rs, re, gs, ge)) = &self.session_windows {
@@ -450,9 +446,146 @@ impl ShipApp {
                 ui.label(format!("log: {}", self.session_log_path.display()));
                 if ui.small_button("new setup").clicked() {
                     self.mode.reset();
+                    self.placed_fleet.clear();
+                    self.fleet_pick = None;
                     eprintln!("back to setup");
                 }
             }
+        }
+    }
+
+    /// Fleet island (task #29): organizer hull picker. Filter the 125
+    /// seeds by category, class, and type/name/hull text, pick one hull,
+    /// then place it by hand with a map click. Nothing places itself.
+    fn fleet_island(&mut self, ui: &mut egui::Ui) {
+        const CAT_OPTS: [Option<Category>; 5] = [
+            None,
+            Some(Category::Ship),
+            Some(Category::Plane),
+            Some(Category::Tank),
+            Some(Category::Port),
+        ];
+        const CAT_LABELS: [&str; 5] = ["All", "Ship", "Plane", "Tank", "Port"];
+        ui.heading("Fleet picker");
+        ui.label("Organizer: filter, pick one hull, place it on the map by hand.");
+        // Collect options first: the combos mutate self while the
+        // catalog borrows would still be live (E0502 pattern).
+        let class_opts: Vec<(String, String)> = self
+            .catalog
+            .ship_classes()
+            .iter()
+            .map(|c| (c.id.clone(), c.name.clone()))
+            .collect();
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_label("category")
+                .selected_text(CAT_LABELS[self.fleet_cat])
+                .show_ui(ui, |ui| {
+                    for (i, label) in CAT_LABELS.iter().enumerate() {
+                        ui.selectable_value(&mut self.fleet_cat, i, *label);
+                    }
+                });
+            let class_label = self
+                .fleet_class
+                .as_ref()
+                .and_then(|id| class_opts.iter().find(|(cid, _)| cid == id))
+                .map(|(_, name)| name.as_str())
+                .unwrap_or("All classes");
+            egui::ComboBox::from_label("class")
+                .selected_text(class_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.fleet_class, None, "All classes");
+                    for (id, name) in &class_opts {
+                        ui.selectable_value(&mut self.fleet_class, Some(id.clone()), name);
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("type / name / hull:");
+            ui.text_edit_singleline(&mut self.fleet_query);
+            if ui.small_button("clear").clicked() {
+                self.fleet_query.clear();
+                self.fleet_class = None;
+                self.fleet_cat = 0;
+            }
+        });
+        let query = self.fleet_query.to_lowercase();
+        let rows: Vec<tfg::fleet::FleetUnit> = self
+            .fleet
+            .units()
+            .iter()
+            .filter(|u| {
+                if CAT_OPTS[self.fleet_cat] != self.catalog.class(&u.class_id).map(|c| c.category) {
+                    return false;
+                }
+                if let Some(ref cid) = self.fleet_class {
+                    if &u.class_id != cid {
+                        return false;
+                    }
+                }
+                if !query.is_empty() {
+                    let class_name = self
+                        .catalog
+                        .class(&u.class_id)
+                        .map(|c| c.name.as_str())
+                        .unwrap_or("");
+                    let hay = format!(
+                        "{} {} {} {} {} {}",
+                        u.name, u.hull, u.role, class_name, u.satuan, u.pangkalan
+                    )
+                    .to_lowercase();
+                    if !hay.contains(&query) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        ui.label(format!(
+            "{} hulls · {} shown · {} placed",
+            self.fleet.len(),
+            rows.len(),
+            self.placed_fleet.len()
+        ));
+        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+            for u in &rows {
+                if self.placed_fleet.contains(&u.id) {
+                    ui.label(format!("✓ {} ({}) — placed", u.name, u.hull));
+                } else {
+                    let class_name: String = self
+                        .catalog
+                        .class(&u.class_id)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    ui.selectable_value(
+                        &mut self.fleet_pick,
+                        Some(u.id.clone()),
+                        format!("{} ({}) · {}", u.name, u.hull, class_name),
+                    );
+                }
+            }
+        });
+        let pick_placed = self.fleet_pick.as_ref().map_or(false, |id| self.placed_fleet.contains(id));
+        if self.mode.phase != Phase::Setup {
+            ui.label("Placement is Setup-only.");
+        } else if pick_placed {
+            ui.label("Already placed — pick another hull.");
+        } else if let Some(id) = self.fleet_pick.clone() {
+            let placing = self.mode.tool == SetupTool::Place;
+            let name: String = self.fleet.get(&id).map(|u| u.name.clone()).unwrap_or_default();
+            if ui
+                .small_button(if placing {
+                    format!("click the map to place {name}…")
+                } else {
+                    format!("place {name}")
+                })
+                .clicked()
+            {
+                self.mode.tool = if placing { SetupTool::Select } else { SetupTool::Place };
+                self.placing = false;
+            }
+        } else {
+            ui.label("Pick a hull above to arm placement.");
         }
     }
 
@@ -499,12 +632,13 @@ impl ShipApp {
                         self.wizard_step = 2;
                         self.show_session = true;
                         self.show_roster = true;
+                        self.show_fleet = true;
                     }
                 });
             }
             2 => {
-                ui.label("Fleet: pick a class in the Session island, then click the map to place units.");
-                ui.label(format!("placed: {} unit(s)", self.unit_seq.saturating_sub(1)));
+                ui.label("Fleet: in the Fleet island, filter by category, class, or type, pick one hull, then click the map to place it by hand.");
+                ui.label(format!("placed: {} unit(s)", self.placed_fleet.len()));
                 ui.horizontal(|ui| {
                     if ui.button("← Back").clicked() {
                         self.wizard_step = 1;
@@ -516,7 +650,7 @@ impl ShipApp {
                 });
             }
             _ => {
-                let placed = self.unit_seq.saturating_sub(1);
+                let placed = self.placed_fleet.len();
                 ui.label(format!(
                     "Review: {placed} placed, {} owned.",
                     self.controlled.len()
@@ -576,6 +710,7 @@ impl eframe::App for ShipApp {
             ui.horizontal(|ui| {
                 ui.toggle_value(&mut self.show_session, "Session");
                 ui.toggle_value(&mut self.show_roster, "Roster");
+                ui.toggle_value(&mut self.show_fleet, "Fleet");
                 ui.toggle_value(&mut self.show_inspector, "Inspector");
                 ui.toggle_value(&mut self.show_orders, "Orders");
                 ui.toggle_value(&mut self.show_log, "Log");
@@ -680,6 +815,13 @@ impl eframe::App for ShipApp {
             ui.separator();
             });
             self.show_roster = open;
+        }
+        if self.show_fleet {
+            let mut open = self.show_fleet;
+            egui::Window::new("Fleet").open(&mut open).show(ui.ctx(), |ui| {
+                self.fleet_island(ui);
+            });
+            self.show_fleet = open;
         }
         if self.show_inspector {
             let mut open = self.show_inspector;
@@ -976,26 +1118,29 @@ impl eframe::App for ShipApp {
                             let (la, lo) = unproject_mercator(
                                 px, py, self.center, ZOOM, MAP_W, MAP_H,
                             );
-                            let id = format!("unit-{}", self.unit_seq);
-                            self.unit_seq += 1;
-                            let class_id = self
-                                .catalog
-                                .ship_classes()
-                                .get(self.selected_class)
-                                .map(|c| c.id.clone())
-                                .unwrap_or_default();
-                            if let Some(tx) = &self.sim_cmd_tx {
-                                let _ = tx.send(SimCommand::TakeControl {
-                                    ship_id: id.clone(),
-                                    pos: GeoPosition { latitude: la, longitude: lo },
-                                    class_id,
-                                });
-                                eprintln!("placed {id} at ({la:.4}, {lo:.4})");
+                            // Fleet picker (task #29): only a picked,
+                            // unplaced hull stands up. No generic or
+                            // automatic placement.
+                            let seed = self.fleet_pick.clone().and_then(|id| self.fleet.get(&id).cloned());
+                            if let Some(seed) = seed {
+                                if !self.placed_fleet.contains(&seed.id) {
+                                    let id = seed.id.clone();
+                                    if let Some(tx) = &self.sim_cmd_tx {
+                                        let _ = tx.send(SimCommand::TakeControl {
+                                            ship_id: id.clone(),
+                                            pos: GeoPosition { latitude: la, longitude: lo },
+                                            class_id: seed.class_id.clone(),
+                                        });
+                                        eprintln!("placed {} ({}) at ({la:.4}, {lo:.4})", seed.name, seed.hull);
+                                    }
+                                    // Placed units arrive owned (Q3): the click is
+                                    // the take-control, no second step.
+                                    self.controlled.insert(id.clone());
+                                    self.selected = Some(id.clone());
+                                    self.placed_fleet.insert(id);
+                                    self.fleet_pick = None;
+                                }
                             }
-                            // Placed units arrive owned (Q3): the click is
-                            // the take-control, no second step.
-                            self.controlled.insert(id.clone());
-                            self.selected = Some(id);
                             self.mode.tool = SetupTool::Select;
                         } else if self.placing {
                             let (la, lo) = unproject_mercator(
@@ -1230,7 +1375,6 @@ fn main() -> eframe::Result<()> {
                 session_log_path: tfg::log::Journal::prototype_path(),
                 session_seq: 0,
                 transcript: Vec::new(),
-                unit_seq: 1,
                 show_session: true,
                 show_roster: true,
                 show_inspector: true,
@@ -1253,6 +1397,13 @@ fn main() -> eframe::Result<()> {
                 order_warning: None,
                 catalog: Catalog::from_default_asset().expect("catalog asset valid"),
                 selected_class: 0,
+                fleet: Fleet::from_default_asset().expect("fleet asset valid"),
+                show_fleet: true,
+                fleet_cat: 0,
+                fleet_class: None,
+                fleet_query: String::new(),
+                fleet_pick: None,
+                placed_fleet: HashSet::new(),
                 game_elapsed_secs: None,
                 game_ratio: 1.0,
                 game_paused: false,
