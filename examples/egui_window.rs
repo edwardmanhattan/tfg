@@ -75,6 +75,14 @@ struct ShipApp {
     pending_waypoint: Option<(f64, f64)>,
     placing: bool,
     order_speed: f32,
+    /// Game clock readout from the sim (ADR-0004: game time is derived
+    /// and reported per round; the UI never computes it itself).
+    game_elapsed_secs: Option<u64>,
+    game_ratio: f64,
+    game_paused: bool,
+    /// Real + derived game clock readings, humane format, per round.
+    real_ts: Option<String>,
+    game_ts: Option<String>,
 }
 
 impl ShipApp {
@@ -103,6 +111,16 @@ impl ShipApp {
                     for v in views {
                         self.order_views.insert(v.ship_id.clone(), v);
                     }
+                }
+                SimEvent::Clock { game_elapsed_secs, ratio, paused } => {
+                    self.game_elapsed_secs = Some(game_elapsed_secs);
+                    self.game_ratio = ratio;
+                    self.game_paused = paused;
+                }
+                SimEvent::ClockReadout { real_ts, game_ts, paused } => {
+                    self.real_ts = Some(real_ts);
+                    self.game_ts = game_ts;
+                    self.game_paused = paused;
                 }
                 SimEvent::Arrival { ship_id } => {
                     eprintln!("arrived {ship_id}");
@@ -204,8 +222,40 @@ impl eframe::App for ShipApp {
         let markers = self.markers();
         ui.ctx().request_repaint_after(Duration::from_millis(100));
 
+        // Space toggles pause: a full hold (ADR-0004). The sim enforces it
+        // tick-wise; the UI just forwards the verb.
+        if ui.ctx().input(|i| i.key_pressed(egui::Key::Space)) {
+            if let Some(tx) = &self.sim_cmd_tx {
+                let paused = !self.game_paused;
+                let _ = tx.send(SimCommand::SetPaused { paused });
+                eprintln!("{}", if paused { "pause" } else { "resume" });
+            }
+        }
+
         egui::Panel::left("roster").show(ui, |ui| {
             ui.heading("Command center");
+            // Clock block: real + derived game time, humane format
+            // (grill #17, ADR-0004). Both readings come from the sim.
+            ui.horizontal(|ui| {
+                ui.label(format!("UTC {}", self.real_ts.as_deref().unwrap_or("—")));
+                if self.game_paused {
+                    ui.label(
+                        egui::RichText::new("PAUSED")
+                            .strong()
+                            .color(egui::Color32::YELLOW),
+                    );
+                }
+            });
+            ui.horizontal(|ui| {
+                let elapsed = self.game_elapsed_secs.unwrap_or(0);
+                let g = self.game_ts.as_deref().unwrap_or("—");
+                ui.label(format!(
+                    "GAME {g} · G+{:02}:{:02} ({:.0}×)",
+                    elapsed / 60,
+                    elapsed % 60,
+                    self.game_ratio
+                ));
+            });
             ui.label(format!("{} ships — click a name to follow", markers.len()));
             ui.separator();
             ui.checkbox(&mut self.show_trail, "trails");
@@ -313,13 +363,14 @@ impl eframe::App for ShipApp {
                         };
                         ui.label(format!("order: {state}"));
                         if let Some(eta) = v.eta_secs {
-                            ui.label(format!("eta: {eta}s"));
+                            // Game seconds (ADR-0004): motion covers the
+                            // distance over game time, so ETA quotes game time.
+                            ui.label(format!("eta: G+{}:{:02}", eta / 60, eta % 60));
                         }
                     }
                     ui.add(
                         egui::DragValue::new(&mut self.order_speed)
                             .speed(1.0)
-                            .range(0.0..=120.0)
                             .suffix(" kn"),
                     );
                     if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
@@ -620,6 +671,11 @@ fn main() -> eframe::Result<()> {
                 pending_waypoint: None,
                 placing: false,
                 order_speed: 20.0,
+                game_elapsed_secs: None,
+                game_ratio: 1.0,
+                game_paused: false,
+                real_ts: None,
+                game_ts: None,
             }))
         }),
     )

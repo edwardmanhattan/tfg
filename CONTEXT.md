@@ -41,3 +41,11 @@ _Avoid_: background, NPC
 **Waypoint**:
 The ordered position an owned ship is steering toward.
 _Avoid_: destination, target
+
+**Game time**:
+The session clock, derived from real time through a fixed ratio (ADR-0004): `game_now = game_start + elapsed_real × ratio`. Quoted as `game_ts` readings and `G+mm:ss` elapsed; never stored on fixes.
+_Avoid_: sim time, virtual time, compressed time
+
+**Pause**:
+A full hold of game time: motion, game_now, and the log clock freeze while the real wall clock runs on. Enforced tick-wise by the sim; session datetimes are never edited.
+_Avoid_: freeze (that is the effect, not the verb), stop
