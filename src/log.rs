@@ -2,9 +2,10 @@
 //!
 //! One line per entry, flushed per append; the file IS the export
 //! (close = flush, no transform). Entries cite fixes by ingest sequence
-//! range, never duplicating positions. The registry feedback that fills
-//! `fix_range` is a later slice: the field exists, the sim cannot know
-//! ingest seqs yet, so it stays `None` until then.
+//! in their payload — never duplicating positions — via seqs the UI
+//! reports back after ingest (`SimCommand::FixAck`): arrival/blocked
+//! entries cite the ship's latest acked seq, minute markers carry a full
+//! ship-to-seq snapshot.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -30,14 +31,14 @@ pub enum LogKind {
 
 /// `{seq, game_ts, actor, kind, payload}` with seat actors (precedence
 /// grill, #19). Until seats land, command actors read `authority:<rank>`
-/// and sim-observed entries read `sim`.
+/// and sim-observed entries read `sim`. Fix citations ride in `payload`:
+/// single `fix_seq` on ship events, `fix_seqs` snapshot on markers.
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
     pub seq: u64,
     pub game_ts: Option<String>,
     pub actor: String,
     pub kind: LogKind,
-    pub fix_range: Option<(u64, u64)>,
     pub payload: serde_json::Value,
 }
 
@@ -75,7 +76,6 @@ impl Journal {
             game_ts,
             actor: actor.into(),
             kind,
-            fix_range: None,
             payload,
         };
         self.next_seq += 1;

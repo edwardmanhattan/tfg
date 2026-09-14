@@ -143,11 +143,15 @@ impl Registry {
 
     /// Ingest one poll round. Unknown ids appear as new pending ships;
     /// ships with no fix this round accumulate `missed` and go stale at 3.
-    pub fn poll(&mut self, fixes: Vec<Fix>) {
+    /// Returns the accepted fixes as (ship, seq) pairs for ingest acks
+    /// (Log grill, #20); dropped out-of-order fixes consume seqs silently.
+    pub fn poll(&mut self, fixes: Vec<Fix>) -> Vec<(String, u64)> {
         let mut seen = std::collections::HashSet::new();
+        let mut acked = Vec::with_capacity(fixes.len());
         for mut fix in fixes {
             fix.seq = self.next_seq;
             self.next_seq += 1;
+            let pair = (fix.ship_id.clone(), fix.seq);
             seen.insert(fix.ship_id.clone());
             match self.ships.get_mut(&fix.ship_id) {
                 Some(s) => {
@@ -161,6 +165,7 @@ impl Registry {
                     }
                     s.missed = 0;
                     s.stale = false;
+                    acked.push(pair);
                 }
                 None => {
                     let mut track = VecDeque::new();
@@ -169,6 +174,7 @@ impl Registry {
                         fix.ship_id.clone(),
                         ShipState { latest: fix, previous: None, track, missed: 0, stale: false },
                     );
+                    acked.push(pair);
                 }
             }
         }
@@ -180,6 +186,7 @@ impl Registry {
                 }
             }
         }
+        acked
     }
 
     pub fn ships(&self) -> Vec<ShipView> {

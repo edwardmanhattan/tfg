@@ -117,7 +117,14 @@ impl ShipApp {
                 self.last_seen.insert(f.ship_id.clone(), Instant::now());
                 *self.fix_count.entry(f.ship_id.clone()).or_insert(0) += 1;
             }
-            self.registry.poll(fixes);
+            let acked = self.registry.poll(fixes);
+            // Ingest acks (Log grill, #20): report stamped seqs back to
+            // the sim AFTER ingest, so journal entries can cite fix seqs.
+            if let Some(tx) = &self.sim_cmd_tx {
+                for (ship_id, seq) in acked {
+                    let _ = tx.send(SimCommand::FixAck { ship_id, seq });
+                }
+            }
         }
         for evt in self.sim_evt_rx.try_iter() {
             match evt {

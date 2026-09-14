@@ -56,6 +56,10 @@ pub enum SimCommand {
     OrderMove { command: MoveCommand },
     /// Pause is a full hold: motion + game time freeze, wall clock runs on.
     SetPaused { paused: bool },
+    /// Ingest ack (Log grill, #20): the UI reports back each fix's
+    /// Registry-stamped seq after ingest, so journal entries can cite
+    /// fix seqs. Reuses the command channel; no new plumbing.
+    FixAck { ship_id: String, seq: u64 },
 }
 
 /// Read view of one owned ship for the orders UI.
@@ -141,6 +145,9 @@ pub struct SimSource {
     /// the event channel.
     journal: Journal,
     last_marker_min: u64,
+    /// Latest acked ingest seq per ship (Log grill, #20): what journal
+    /// entries cite. Updated by FixAck; read when events journal.
+    last_seq: HashMap<String, u64>,
 }
 
 impl SimSource {
@@ -175,6 +182,7 @@ impl SimSource {
             catalog,
             journal,
             last_marker_min: 0,
+            last_seq: HashMap::new(),
         }
     }
 
@@ -346,6 +354,10 @@ impl SimSource {
                 SimCommand::SetPaused { paused } => {
                     self.clock.set_paused(paused);
                 }
+                SimCommand::FixAck { ship_id, seq } => {
+                    let slot = self.last_seq.entry(ship_id).or_insert(seq);
+                    *slot = (*slot).max(seq);
+                }
             }
         }
     }
@@ -479,32 +491,37 @@ impl SimSource {
         });
         for ship_id in arrivals {
             let _ = self.evt_tx.send(SimEvent::Arrival { ship_id: ship_id.clone() });
+            let fix_seq = self.last_seq.get(&ship_id).copied();
             self.journal.append(
                 self.clock.game_now_ts(),
                 "sim",
                 LogKind::Arrival,
-                serde_json::json!({"ship": ship_id}),
+                serde_json::json!({"ship": ship_id, "fix_seq": fix_seq}),
             );
         }
         for ship_id in blocked {
             let _ = self.evt_tx.send(SimEvent::ShipBlocked { ship_id: ship_id.clone() });
+            let fix_seq = self.last_seq.get(&ship_id).copied();
             self.journal.append(
                 self.clock.game_now_ts(),
                 "sim",
                 LogKind::ShipBlocked,
-                serde_json::json!({"ship": ship_id}),
+                serde_json::json!({"ship": ship_id, "fix_seq": fix_seq}),
             );
         }
         // Game-minute markers (Log grill, #20): derived from the game
-        // clock, so pause accrues none.
+        // clock, so pause accrues none. Each marker snapshots the latest
+        // acked fix seq per ship: replay positions recoverable by seq.
         let minute = self.clock.game_elapsed_secs() / 60;
         if minute > self.last_marker_min {
             self.last_marker_min = minute;
+            let fix_seqs: HashMap<String, u64> =
+                self.last_seq.iter().map(|(k, v)| (k.clone(), *v)).collect();
             self.journal.append(
                 self.clock.game_now_ts(),
                 "sim",
                 LogKind::Marker,
-                serde_json::json!({"minute": minute}),
+                serde_json::json!({"minute": minute, "fix_seqs": fix_seqs}),
             );
         }
         Ok(fixes)
@@ -890,5 +907,82 @@ mod tests {
             )),
             "expiry is loud"
         );
+    }
+
+    fn journal_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let text = std::fs::read_to_string(path).unwrap();
+        text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    #[test]
+    fn arrival_cites_last_acked_fix_seq() {
+        let path = std::env::temp_dir().join("tfg-log-test-arrival.jsonl");
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let journal = Journal::open(path.clone()).unwrap();
+        let mut sim = SimSource::new_with_journal(cmd_rx, evt_tx, journal);
+        let start = ship_at(-5.92, 106.92);
+        cmd_tx
+            .send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "container".into() })
+            .unwrap();
+        cmd_tx
+            .send(SimCommand::SetOrder {
+                ship_id: "t".into(),
+                waypoint: ship_at(-5.92, 106.955),
+                speed_kn: 120.0,
+            })
+            .unwrap();
+        sim.poll_round(SIM_TICK_SECS).unwrap();
+        // Ingest ack lands before arrival: the citation trails reality
+        // by one round, exactly as the live UI feeds it.
+        cmd_tx.send(SimCommand::FixAck { ship_id: "t".into(), seq: 7 }).unwrap();
+        let mut arrived = false;
+        for _ in 0..200 {
+            sim.poll_round(SIM_TICK_SECS).unwrap();
+            if evt_rx.try_iter().any(|e| matches!(e, SimEvent::Arrival { .. })) {
+                arrived = true;
+                break;
+            }
+        }
+        assert!(arrived, "ship arrives");
+        drop(sim);
+        let arrival = journal_lines(&path)
+            .into_iter()
+            .find(|e| e["kind"] == "Arrival")
+            .expect("arrival journaled");
+        assert_eq!(arrival["payload"]["fix_seq"], 7);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn minute_marker_snapshots_acked_seqs() {
+        let path = std::env::temp_dir().join("tfg-log-test-marker.jsonl");
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let journal = Journal::open(path.clone()).unwrap();
+        let mut sim = SimSource::new_with_journal(cmd_rx, evt_tx, journal);
+        cmd_tx
+            .send(SimCommand::TakeControl {
+                ship_id: "t".into(),
+                pos: ship_at(-5.92, 106.92),
+                class_id: "container".into(),
+            })
+            .unwrap();
+        cmd_tx.send(SimCommand::FixAck { ship_id: "t".into(), seq: 3 }).unwrap();
+        cmd_tx.send(SimCommand::FixAck { ship_id: "u".into(), seq: 5 }).unwrap();
+        // 35 two-second game ticks cross minute one (the first stamps
+        // the start and moves nothing).
+        for _ in 0..35 {
+            sim.poll_round(SIM_TICK_SECS).unwrap();
+        }
+        drop(sim);
+        let marker = journal_lines(&path)
+            .into_iter()
+            .find(|e| e["kind"] == "Marker")
+            .expect("marker journaled");
+        assert_eq!(marker["payload"]["minute"], 1);
+        assert_eq!(marker["payload"]["fix_seqs"]["t"], 3);
+        assert_eq!(marker["payload"]["fix_seqs"]["u"], 5);
+        std::fs::remove_file(&path).ok();
     }
 }
