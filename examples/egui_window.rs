@@ -11,12 +11,14 @@
 //! Run: `scripts/run-egui-window.sh`
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use chrono::Utc;
 use tfg::backend::{FileReplay, HttpPoll, PollSource};
 use tfg::catalog::Catalog;
 use tfg::command::{Authority, Grant, GrantDenial, Leg, MoveCommand, Verb};
@@ -36,6 +38,10 @@ const MAP_H: f64 = 600.0;
 const CENTER: (f64, f64) = (-6.108, 106.910);
 const ZOOM: f64 = 11.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
+/// Session stub pace (session flow): 7 real hours play 7 game days.
+/// Full windows UI lands with the organizer flow; the ratio is the load-
+/// bearing part (clock.rs derives everything else from it).
+const SESSION_RATIO: f64 = 24.0;
 /// v0 poll cadence, in seconds.
 const POLL_SECS: f64 = 2.0;
 /// Pumped frames per recenter on the hot scene.
@@ -68,6 +74,16 @@ struct ShipApp {
     hidden: HashSet<String>,
     following: Option<String>,
     show_trail: bool,
+    /// Session flow: arm flag shared with the poll thread (simulation
+    /// mode joins the sim; presentation mode is wire-only and frozen).
+    sim_armed: Arc<AtomicBool>,
+    /// Session stub: live flag + default windows stamped at start.
+    session_live: bool,
+    session_windows: Option<(String, String, String, String)>,
+    /// Click-placement (session flow): arm, then click the map to stand
+    /// up a catalog unit, owned immediately.
+    placing_unit: bool,
+    unit_seq: usize,
     selected: Option<String>,
     /// Wall-clock last-seen + fix counts per ship (inspector readout;
     /// stamped as poll rounds arrive, so the geo model stays time-free).
@@ -289,6 +305,64 @@ impl eframe::App for ShipApp {
 
         egui::Panel::left("roster").show(ui, |ui| {
             ui.heading("Command center");
+            // Session flow (prototype): mode toggle, session stub with
+            // default windows, and click-placement of catalog units.
+            let mut armed = self.sim_armed.load(Ordering::SeqCst);
+            if ui.checkbox(&mut armed, "simulation mode").changed() {
+                self.sim_armed.store(armed, Ordering::SeqCst);
+                eprintln!("{}", if armed { "sim armed" } else { "presentation only" });
+            }
+            if !self.session_live {
+                if ui.small_button("start session (prototype)").clicked() {
+                    // Thin stub (Q2): default windows, local player as
+                    // organizer, clock at session pace.
+                    let real_start = Utc::now();
+                    let fmt = "%Y-%m-%d %H:%M UTC";
+                    self.session_windows = Some((
+                        real_start.format(fmt).to_string(),
+                        (real_start + chrono::Duration::hours(7)).format(fmt).to_string(),
+                        real_start.format(fmt).to_string(),
+                        (real_start + chrono::Duration::days(7)).format(fmt).to_string(),
+                    ));
+                    self.session_live = true;
+                    self.sim_armed.store(true, Ordering::SeqCst);
+                    if let Some(tx) = &self.sim_cmd_tx {
+                        let _ = tx.send(SimCommand::SetClockRatio { ratio: SESSION_RATIO });
+                    }
+                    eprintln!("session live at {SESSION_RATIO}x");
+                }
+            } else {
+                if let Some((rs, re, gs, ge)) = &self.session_windows {
+                    ui.label(format!("real {rs} → {re}"));
+                    ui.label(format!("game {gs} → {ge} ({SESSION_RATIO}x)"));
+                }
+                if ui.small_button("end session").clicked() {
+                    self.session_live = false;
+                    self.sim_armed.store(false, Ordering::SeqCst);
+                    self.placing_unit = false;
+                    eprintln!("session ended");
+                }
+            }
+            if armed {
+                let ships = self.catalog.ship_classes();
+                let names: Vec<&str> = ships.iter().map(|c| c.name.as_str()).collect();
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_label("place")
+                        .selected_text(
+                            names.get(self.selected_class).copied().unwrap_or("—"),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (i, name) in names.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected_class, i, *name);
+                            }
+                        });
+                    if ui.small_button(if self.placing_unit { "click map…" } else { "place unit" }).clicked() {
+                        self.placing_unit = !self.placing_unit;
+                        self.placing = false;
+                    }
+                });
+            }
+            ui.separator();
             // Clock block: real + derived game time, humane format
             // (grill #17, ADR-0004). Both readings come from the sim.
             ui.horizontal(|ui| {
@@ -624,13 +698,38 @@ impl eframe::App for ShipApp {
                         .sense(egui::Sense::click()),
                 );
                 let rect = response.rect;
-                // Map click: place a pending waypoint when arming, else
-                // select the nearest visible marker (12px).
+                // Map click: stand up a catalog unit when placing, place
+                // a pending waypoint when arming, else select nearest.
                 if response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let px = (pos.x - rect.min.x) as f64;
                         let py = (pos.y - rect.min.y) as f64;
-                        if self.placing {
+                        if self.placing_unit {
+                            let (la, lo) = unproject_mercator(
+                                px, py, self.center, ZOOM, MAP_W, MAP_H,
+                            );
+                            let id = format!("unit-{}", self.unit_seq);
+                            self.unit_seq += 1;
+                            let class_id = self
+                                .catalog
+                                .ship_classes()
+                                .get(self.selected_class)
+                                .map(|c| c.id.clone())
+                                .unwrap_or_default();
+                            if let Some(tx) = &self.sim_cmd_tx {
+                                let _ = tx.send(SimCommand::TakeControl {
+                                    ship_id: id.clone(),
+                                    pos: GeoPosition { latitude: la, longitude: lo },
+                                    class_id,
+                                });
+                                eprintln!("placed {id} at ({la:.4}, {lo:.4})");
+                            }
+                            // Placed units arrive owned (Q3): the click is
+                            // the take-control, no second step.
+                            self.controlled.insert(id.clone());
+                            self.selected = Some(id);
+                            self.placing_unit = false;
+                        } else if self.placing {
                             let (la, lo) = unproject_mercator(
                                 px, py, self.center, ZOOM, MAP_W, MAP_H,
                             );
@@ -742,6 +841,10 @@ fn main() -> eframe::Result<()> {
     let (sim_evt_tx, sim_evt_rx) = mpsc::channel::<SimEvent>();
     let ui_sim_cmd_tx = sim_cmd_tx.clone();
     let poll_shutdown = shutdown.clone();
+    // Session flow: presentation mode boots disarmed (wire-only); the
+    // shell arms simulation mode through this flag (Q1: freeze, no lies).
+    let sim_armed = Arc::new(AtomicBool::new(false));
+    let poll_armed = sim_armed.clone();
     let poll_handle = std::thread::spawn(move || {
         let fixture = format!("{}/tests/fixtures/tracks.json", env!("CARGO_MANIFEST_DIR"));
         let wire: Box<dyn PollSource> = match std::env::var("TFG_BACKEND_URL") {
@@ -756,7 +859,18 @@ fn main() -> eframe::Result<()> {
                 }
             }
             Err(_) => {
-                eprintln!("backend: file replay");
+                // TFG_SCENARIO=name replays scenarios/{name}.json (e.g.
+                // `empty` for the setup canvas); default is the dev loop.
+                let fixture = match std::env::var("TFG_SCENARIO") {
+                    Ok(name) => {
+                        eprintln!("backend: scenario {name}");
+                        format!("{}/scenarios/{name}.json", env!("CARGO_MANIFEST_DIR"))
+                    }
+                    Err(_) => {
+                        eprintln!("backend: file replay");
+                        fixture
+                    }
+                };
                 match FileReplay::from_file(&fixture) {
                     Ok(r) => Box::new(r),
                     Err(e) => {
@@ -778,6 +892,7 @@ fn main() -> eframe::Result<()> {
                     }),
             ),
         );
+        source.set_armed_flag(poll_armed);
         loop {
             match source.poll() {
                 Ok(fixes) => {
@@ -842,6 +957,11 @@ fn main() -> eframe::Result<()> {
                 hidden: HashSet::new(),
                 following: None,
                 show_trail: true,
+                sim_armed: sim_armed.clone(),
+                session_live: false,
+                session_windows: None,
+                placing_unit: false,
+                unit_seq: 1,
                 selected: None,
                 last_seen: HashMap::new(),
                 fix_count: HashMap::new(),

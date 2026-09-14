@@ -7,7 +7,9 @@
 //! wire fixes for sim-owned ships.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::backend::{PollSource, now_ts};
@@ -56,6 +58,9 @@ pub enum SimCommand {
     OrderMove { command: MoveCommand },
     /// Pause is a full hold: motion + game time freeze, wall clock runs on.
     SetPaused { paused: bool },
+    /// Session clock pace (session flow): fixed-ratio mapping real to
+    /// game seconds (ADR-0004). The organizer sets it at session start.
+    SetClockRatio { ratio: f64 },
     /// Ingest ack (Log grill, #20): the UI reports back each fix's
     /// Registry-stamped seq after ingest, so journal entries can cite
     /// fix seqs. Reuses the command channel; no new plumbing.
@@ -354,6 +359,9 @@ impl SimSource {
                 SimCommand::SetPaused { paused } => {
                     self.clock.set_paused(paused);
                 }
+                SimCommand::SetClockRatio { ratio } => {
+                    self.clock.set_ratio(ratio);
+                }
                 SimCommand::FixAck { ship_id, seq } => {
                     let slot = self.last_seq.entry(ship_id).or_insert(seq);
                     *slot = (*slot).max(seq);
@@ -530,22 +538,34 @@ impl SimSource {
 
 /// Joins a wire source with the sim: wire fixes for sim-owned ships are
 /// suppressed (owned vs traffic). A wire error yields sim-only output.
+/// Disarmed (presentation mode) the sim is not polled at all: owned ships
+/// freeze and go stale by the normal miss counter; the clock stops too.
 pub struct MergeSource {
     wire: Box<dyn PollSource>,
     sim: SimSource,
+    armed: Arc<AtomicBool>,
 }
 
 impl MergeSource {
     pub fn new(wire: Box<dyn PollSource>, sim: SimSource) -> Self {
-        Self { wire, sim }
+        Self { wire, sim, armed: Arc::new(AtomicBool::new(true)) }
+    }
+
+    /// Share the arm flag with the UI thread (session flow): the shell
+    /// toggles presentation/simulation mode through it.
+    pub fn set_armed_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.armed = flag;
     }
 }
 
 impl PollSource for MergeSource {
     fn poll(&mut self) -> Result<Vec<Fix>, String> {
-        let sim_fixes = self.sim.poll()?;
+        let mut out = if self.armed.load(Ordering::SeqCst) {
+            self.sim.poll()?
+        } else {
+            Vec::new()
+        };
         let owned = self.sim.owned_ids();
-        let mut out = sim_fixes;
         match self.wire.poll() {
             Ok(wire_fixes) => {
                 out.extend(wire_fixes.into_iter().filter(|f| !owned.contains(&f.ship_id)));
