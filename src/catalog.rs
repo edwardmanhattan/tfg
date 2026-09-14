@@ -1,16 +1,23 @@
-//! Unit taxonomy catalog (grill #18, ADR-0005).
+//! Unit taxonomy catalog (grill #18, ADR-0005; fleet data task #28).
 //!
 //! Three levels, dev-type stripped:
 //! - **Category** — what the unit is in the world (`Ship`/`Plane`/`Tank`/
 //!   `Port`). Determines WHICH stat keys exist (the schema).
-//! - **Class** — the stat VALUES (abilities): `tanker` 16 kn vs `destroyer`
-//!   30 kn. All types under a class behave identically in the sim.
+//! - **Class** — the stat VALUES (abilities): `mandau-psm-mk-iii` 33 kn vs
+//!   `cakra-type-209-1300` 11 kn. All types under a class behave identically
+//!   in the sim.
 //! - **Type** — flavor only: the player-facing designation, no mechanics.
 //!
-//! Backed by `assets/catalog.json` (data-driven, like scenarios). Stats
-//! are a generic map (user decision) with schema validation at load:
-//! every class must define all `required_stats` of its category, fails
-//! loud otherwise.
+//! Backed by `assets/catalog.json` (data-driven, like scenarios), generated
+//! from the TNI AL fleet sheet by `scripts/fleet_import.py` (task #28):
+//! 41 ship classes, one per sheet Kelas. Stats are a generic map (user
+//! decision) with schema validation at load: every class must define all
+//! `required_stats` of its category, fails loud otherwise.
+//!
+//! The sim reads only `speed_kn` (order cap); `cruise_kn`/`range_nm` ride
+//! along as validated capabilities for the next slice (default transit
+//! speed, patrol radius). Hull instances live in `assets/fleet.json`
+//! (see [`crate::fleet`]), not here.
 
 use std::collections::HashMap;
 
@@ -127,11 +134,26 @@ mod tests {
     fn default_asset_loads_and_validates() {
         let cat = Catalog::from_default_asset().expect("asset parses + validates");
         let ships = cat.ship_classes();
-        assert_eq!(ships.len(), 3, "three ship classes");
-        let destroyer = cat.class("destroyer").unwrap();
-        assert_eq!(destroyer.category, Category::Ship);
-        assert_eq!(Catalog::stat(destroyer, "speed_kn", 0.0), 30.0);
-        assert_eq!(destroyer.display_type(), "Type 052D");
+        assert_eq!(ships.len(), 41, "one class per sheet Kelas");
+        let mandau = cat.class("mandau-psm-mk-iii").unwrap();
+        assert_eq!(mandau.category, Category::Ship);
+        assert_eq!(Catalog::stat(mandau, "speed_kn", 0.0), 33.0);
+        assert_eq!(mandau.display_type(), "Kapal cepat rudal/torpedo");
+    }
+
+    #[test]
+    fn every_ship_class_carries_cruise_and_range() {
+        // Generator contract (task #28): the sheet gives max/cruise/range
+        // per hull, so every class row carries all three.
+        let cat = Catalog::from_default_asset().expect("asset parses");
+        for c in cat.ship_classes() {
+            assert!(c.stats.contains_key("cruise_kn"), "{}: missing cruise_kn", c.id);
+            assert!(c.stats.contains_key("range_nm"), "{}: missing range_nm", c.id);
+            assert!(
+                c.stats["cruise_kn"] <= c.stats["speed_kn"],
+                "{}: cruise above max", c.id
+            );
+        }
     }
 
     #[test]
@@ -162,8 +184,8 @@ mod tests {
     #[test]
     fn optional_stats_default_when_absent() {
         let cat = Catalog::from_default_asset().unwrap();
-        let destroyer = cat.class("destroyer").unwrap();
-        // `capacity_t` is optional for ships: absent -> fallback.
-        assert_eq!(Catalog::stat(destroyer, "capacity_t", 0.0), 0.0);
+        let mandau = cat.class("mandau-psm-mk-iii").unwrap();
+        // `capacity_t` is not a ship stat: absent -> fallback.
+        assert_eq!(Catalog::stat(mandau, "capacity_t", 0.0), 0.0);
     }
 }

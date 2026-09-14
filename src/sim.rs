@@ -614,7 +614,7 @@ mod tests {
     fn order_advances_ship_and_arrives() {
         let (mut sim, evt_rx, cmd) = harness();
         let start = ship_at(-5.92, 106.92);
-        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "container".into() }).unwrap();
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "martadinata-sigma-10514-pkr".into() }).unwrap();
         // ~3.2 km east across open water at ludicrous speed.
         let wp = ship_at(-5.92, 106.955);
         cmd.send(SimCommand::SetOrder { ship_id: "t".into(), waypoint: wp, speed_kn: 120.0 }).unwrap();
@@ -624,8 +624,8 @@ mod tests {
         // First round stamps the session start (ADR-0004): emits the ship
         // but moves nothing yet.
         assert_eq!(first[0].position, start);
-        // Run until arrival. Order clamps to the container class's
-        // 20 kn, so ~3.2 km takes ~160 two-second game ticks.
+        // Run until arrival. Order clamps to the Martadinata class's
+        // 28 kn, so ~3.9 km takes ~135 two-second game ticks.
         let mut arrived = false;
         for _ in 0..200 {
             sim.poll_round(SIM_TICK_SECS).unwrap();
@@ -643,7 +643,7 @@ mod tests {
     fn cancel_holds_position() {
         let (mut sim, _, cmd) = harness();
         let start = ship_at(-5.92, 106.92);
-        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "container".into() }).unwrap();
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "martadinata-sigma-10514-pkr".into() }).unwrap();
         cmd.send(SimCommand::SetOrder {
             ship_id: "t".into(),
             waypoint: ship_at(-5.92, 106.95),
@@ -683,7 +683,7 @@ mod tests {
     fn paused_sim_holds_positions_and_game_time() {
         let (mut sim, evt_rx, cmd) = harness();
         let start = ship_at(-5.92, 106.92);
-        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "container".into() }).unwrap();
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "martadinata-sigma-10514-pkr".into() }).unwrap();
         cmd.send(SimCommand::SetOrder {
             ship_id: "t".into(),
             waypoint: ship_at(-5.92, 106.95),
@@ -713,7 +713,7 @@ mod tests {
     fn land_waypoint_is_rejected_and_water_accepted() {
         let (mut sim, evt_rx, cmd) = harness();
         // Ship in the Java Sea, waypoint inland on Java.
-        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.8, 106.7), class_id: "container".into() })
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.8, 106.7), class_id: "martadinata-sigma-10514-pkr".into() })
             .unwrap();
         sim.poll_round(0.0).unwrap(); // arm + session start
         cmd.send(SimCommand::SetOrder {
@@ -743,7 +743,7 @@ mod tests {
         let (mut sim, evt_rx, cmd) = harness();
         // North of Java heading south across the island: water on both
         // ends, land between.
-        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.9, 106.9), class_id: "container".into() })
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.9, 106.9), class_id: "martadinata-sigma-10514-pkr".into() })
             .unwrap();
         sim.poll_round(0.0).unwrap();
         cmd.send(SimCommand::SetOrder {
@@ -765,7 +765,7 @@ mod tests {
         // world changes under the order. Simulate that by swapping in a
         // synthetic island after the order is committed.
         let (mut sim, evt_rx, cmd) = harness();
-        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.8, 106.9), class_id: "destroyer".into() })
+        cmd.send(SimCommand::TakeControl { ship_id: "t".into(), pos: ship_at(-5.8, 106.9), class_id: "martadinata-sigma-10514-pkr".into() })
             .unwrap();
         sim.poll_round(0.0).unwrap();
         cmd.send(SimCommand::SetOrder {
@@ -807,7 +807,7 @@ mod tests {
         cmd.send(SimCommand::TakeControl {
             ship_id: "t".into(),
             pos: ship_at(-5.92, 106.92),
-            class_id: "tanker".into(), // 16 kn class
+            class_id: "cakra-type-209-1300".into(), // 11 kn class
         })
         .unwrap();
         sim.poll_round(0.0).unwrap();
@@ -820,10 +820,10 @@ mod tests {
         .unwrap();
         sim.poll_round(0.0).unwrap();
         let v = &sim.views()[0];
-        assert_eq!(v.ordered_speed_kn, Some(16.0), "order clamped to class");
-        assert_eq!(v.class_id, "tanker");
-        assert_eq!(v.type_label, "Very Large Crude Carrier");
-        assert_eq!(v.max_speed_kn, 16.0);
+        assert_eq!(v.ordered_speed_kn, Some(11.0), "order clamped to class");
+        assert_eq!(v.class_id, "cakra-type-209-1300");
+        assert_eq!(v.type_label, "Kapal selam serang diesel-elektrik");
+        assert_eq!(v.max_speed_kn, 11.0);
         // Unknown class id falls back to the first ship class.
         let (mut sim, _, cmd) = harness();
         cmd.send(SimCommand::TakeControl {
@@ -833,14 +833,14 @@ mod tests {
         })
         .unwrap();
         sim.poll_round(0.0).unwrap();
-        assert_eq!(sim.views()[0].class_id, "tanker", "fallback to first ship class");
+        assert_eq!(sim.views()[0].class_id, "cakra-type-209-1300", "fallback to first ship class");
     }
 
     #[test]
     fn merge_suppresses_wire_for_owned_ships() {
         use crate::backend::FileReplay;
         let (sim, _, cmd) = harness();
-        cmd.send(SimCommand::TakeControl { ship_id: "nordwind".into(), pos: ship_at(-6.1, 106.86), class_id: "container".into() })
+        cmd.send(SimCommand::TakeControl { ship_id: "nordwind".into(), pos: ship_at(-6.1, 106.86), class_id: "martadinata-sigma-10514-pkr".into() })
             .unwrap();
         let wire = FileReplay::from_file("tests/fixtures/tracks.json").expect("fixture");
         let mut merge = MergeSource::new(Box::new(wire), sim);
@@ -879,7 +879,7 @@ mod tests {
         cmd.send(SimCommand::TakeControl {
             ship_id: "t".into(),
             pos: ship_at(-5.92, 106.92),
-            class_id: "container".into(),
+            class_id: "martadinata-sigma-10514-pkr".into(),
         })
         .unwrap();
         cmd.send(move_cmd(Authority::UNIT, -5.92, 106.95, u64::MAX)).unwrap();
@@ -922,7 +922,7 @@ mod tests {
         cmd.send(SimCommand::TakeControl {
             ship_id: "t".into(),
             pos: ship_at(-5.92, 106.92),
-            class_id: "container".into(),
+            class_id: "martadinata-sigma-10514-pkr".into(),
         })
         .unwrap();
         // Expired grant (game clock starts at 0, expiry 0 is past).
@@ -955,7 +955,7 @@ mod tests {
         let mut sim = SimSource::new_with_journal(cmd_rx, evt_tx, journal);
         let start = ship_at(-5.92, 106.92);
         cmd_tx
-            .send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "container".into() })
+            .send(SimCommand::TakeControl { ship_id: "t".into(), pos: start, class_id: "martadinata-sigma-10514-pkr".into() })
             .unwrap();
         cmd_tx
             .send(SimCommand::SetOrder {
@@ -997,7 +997,7 @@ mod tests {
             .send(SimCommand::TakeControl {
                 ship_id: "t".into(),
                 pos: ship_at(-5.92, 106.92),
-                class_id: "container".into(),
+                class_id: "martadinata-sigma-10514-pkr".into(),
             })
             .unwrap();
         cmd_tx.send(SimCommand::FixAck { ship_id: "t".into(), seq: 3 }).unwrap();
@@ -1030,7 +1030,7 @@ mod tests {
         cmd_tx.send(SimCommand::TakeControl {
             ship_id: "t".into(),
             pos: ship_at(-5.92, 106.92),
-            class_id: "container".into(),
+            class_id: "martadinata-sigma-10514-pkr".into(),
         }).unwrap();
         sim.poll_round(0.0).unwrap();
         cmd_tx.send(SimCommand::RotateJournal { path: second.clone() }).unwrap();
