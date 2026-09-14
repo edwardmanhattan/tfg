@@ -28,7 +28,7 @@ _Avoid_: origin, type
 
 **Order**:
 One active directive on an owned ship: a waypoint plus a speed. New orders overwrite; cancel clears; arrival holds position.
-_Avoid_: command (reserved for the broader game model), instruction
+_Avoid_: command (that's the multi-unit directive, see Command), instruction
 
 **Owned**:
 A ship driven by the sim from a player's orders.
@@ -69,3 +69,27 @@ _Avoid_: blueprint, template
 **GameUnit**:
 An in-game instance referencing a Unit: position, state, order. What a unit IS DOING in one session.
 _Avoid_: unit instance (redundant in context), entity
+
+**Command**:
+One directive from a commander over units in their jurisdiction: it fans out into one Order per named unit. The sim never sees commands, only orders.
+_Avoid_: order (that's the per-ship directive)
+
+**Jurisdiction**:
+The set of units a commander may command: full orders inside it, view-only outside.
+_Avoid_: scope
+
+**Commander**:
+The role commanding a unit, a Satgas, or a Gugus. Higher jurisdictions override lower ones; the organizer commands all.
+_Avoid_: player (that's who holds the role, not the role)
+
+**Organizer**:
+The role that sets up a session: players, units with placements, groups with commanders, and the real and game time windows. Commands all units.
+_Avoid_: admin, host
+
+**Satgas**:
+A group of units under one commander.
+_Avoid_: squadron, fleet
+
+**Gugus**:
+A group of Satgas under one commander.
+_Avoid_: flotilla
