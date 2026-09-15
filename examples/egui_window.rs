@@ -2276,10 +2276,8 @@ fn apply_ops_theme(ctx: &egui::Context) {
         v.faint_bg_color = egui::Color32::from_rgb(0x1E, 0x29, 0x3B);
         v.extreme_bg_color = sunken;
         v.hyperlink_color = accent;
-        v.selection = egui::Selection {
-            bg_fill: accent,
-            stroke: egui::Stroke::new(1.0, sunken),
-        };
+        v.selection.bg_fill = accent;
+        v.selection.stroke = egui::Stroke::new(1.0, sunken);
         for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
             w.corner_radius = egui::CornerRadius::same(6);
         }
