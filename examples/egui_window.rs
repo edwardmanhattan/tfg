@@ -2503,9 +2503,9 @@ impl eframe::App for ShipApp {
                 }
             }
         }
-        if let Some(ship) = self.recentering.clone() {
-            ui.label(format!("centering on {ship}…"));
-        }
+        // Follow progress stays in the terminal (task #44):
+        // request_frame logs "recentering on …", drain_map logs
+        // "recentered". Nothing on the map.
 
         // Full-window canvas (task #38): the map owns every point the
         // panel offers, no margins. Renderer resize is debounced: the
