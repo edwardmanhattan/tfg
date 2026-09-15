@@ -1612,6 +1612,7 @@ impl eframe::App for ShipApp {
                 ui.toggle_value(&mut self.show_orders, "Orders");
                 ui.toggle_value(&mut self.show_log, "Log");
                 ui.toggle_value(&mut self.show_groups, "Groups");
+                ui.separator();
                 if ui.small_button("−").clicked() {
                     self.zoom_by(-1.0);
                 }
@@ -2172,7 +2173,7 @@ impl eframe::App for ShipApp {
                         egui::Align2::LEFT_TOP,
                         &f.label,
                         egui::FontId::proportional(12.0),
-                        egui::Color32::BLACK,
+                        MAP_INK,
                     );
                 }
                 for m in &markers {
@@ -2207,7 +2208,7 @@ impl eframe::App for ShipApp {
                         egui::Align2::LEFT_TOP,
                         &m.id,
                         egui::FontId::proportional(12.0),
-                        egui::Color32::BLACK,
+                        MAP_INK,
                     );
                 }
                 // Waypoint legs: pending preview (white) + committed per
@@ -2256,6 +2257,45 @@ impl eframe::App for ShipApp {
         });
     }
 }
+
+/// Dark ops-console theme (task #37): navy chrome over dark tiles, one
+/// cyan accent, rounded islands, roomier spacing. Stock font, applied to
+/// every theme slot so the look holds regardless of system preference.
+fn apply_ops_theme(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        style.visuals = egui::Visuals::dark();
+        let v = &mut style.visuals;
+        let chrome = egui::Color32::from_rgb(0x0F, 0x17, 0x2A);
+        let sunken = egui::Color32::from_rgb(0x02, 0x06, 0x17);
+        let line = egui::Color32::from_rgb(0x33, 0x41, 0x55);
+        let accent = egui::Color32::from_rgb(0x22, 0xD3, 0xEE);
+        v.window_fill = chrome;
+        v.window_stroke = egui::Stroke::new(1.0, line);
+        v.window_corner_radius = egui::CornerRadius::same(8);
+        v.panel_fill = chrome;
+        v.faint_bg_color = egui::Color32::from_rgb(0x1E, 0x29, 0x3B);
+        v.extreme_bg_color = sunken;
+        v.hyperlink_color = accent;
+        v.selection = egui::Selection {
+            bg_fill: accent,
+            stroke: egui::Stroke::new(1.0, sunken),
+        };
+        for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+            w.corner_radius = egui::CornerRadius::same(6);
+        }
+        v.widgets.hovered.weak_bg_fill =
+            egui::Color32::from_rgba_unmultiplied(0x22, 0xD3, 0xEE, 40);
+        v.widgets.active.weak_bg_fill =
+            egui::Color32::from_rgba_unmultiplied(0x22, 0xD3, 0xEE, 70);
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        style.spacing.indent = 20.0;
+    });
+}
+
+/// Light label ink for dark tiles (task #37): ship ids and flags read
+/// against night water, not against paper.
+const MAP_INK: egui::Color32 = egui::Color32::from_rgb(0xE2, 0xE8, 0xF0);
 
 fn main() -> eframe::Result<()> {
     // Poll thread owns the backend source; the UI owns the registry.
@@ -2366,6 +2406,7 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             // Required once: without image loaders, from_bytes fails.
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            apply_ops_theme(&cc.egui_ctx);
             Ok(Box::new(ShipApp {
                 map_tex: None,
                 map_version: 0,
