@@ -138,6 +138,13 @@ impl LiveMap {
     }
 }
 
+/// World-size base in px at zoom 0 for the overlay math. Calibrated
+/// against the renderer (task #42, `examples/calibrate_projection.rs`):
+/// a +0.02° latitude pan at zoom 11 moves content 59.0px on the frame
+/// vs 29.3px under a 256 base (ratio 2.014) — the MapLibre world is
+/// 512-based, so the overlay must be too, or units drift with zoom.
+const WORLD_BASE_PX: f64 = 512.0;
+
 /// Project lat/lon to window pixels for a `w` x `h` viewport centered on
 /// `center` at `zoom`.
 pub fn project_mercator(
@@ -149,7 +156,7 @@ pub fn project_mercator(
     h: f64,
 ) -> (f64, f64) {
     fn world(lat: f64, lon: f64, zoom: f64) -> (f64, f64) {
-        let scale = 256.0 * 2f64.powf(zoom);
+        let scale = WORLD_BASE_PX * 2f64.powf(zoom);
         let x = (lon + 180.0) / 360.0 * scale;
         let s = (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln();
         let y = (1.0 - s / std::f64::consts::PI) / 2.0 * scale;
@@ -173,13 +180,13 @@ pub fn unproject_mercator(
 ) -> (f64, f64) {
     use std::f64::consts::PI;
     fn world(lat: f64, lon: f64, zoom: f64) -> (f64, f64) {
-        let scale = 256.0 * 2f64.powf(zoom);
+        let scale = WORLD_BASE_PX * 2f64.powf(zoom);
         let x = (lon + 180.0) / 360.0 * scale;
         let s = (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln();
         let y = (1.0 - s / PI) / 2.0 * scale;
         (x, y)
     }
-    let scale = 256.0 * 2f64.powf(zoom);
+    let scale = WORLD_BASE_PX * 2f64.powf(zoom);
     let (cx, cy) = world(center.0, center.1, zoom);
     let x = px - w / 2.0 + cx;
     let y = py - h / 2.0 + cy;
