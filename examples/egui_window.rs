@@ -27,7 +27,7 @@ use tfg::command::{Authority, Grant, GrantDenial, Leg, MoveCommand, Verb};
 use tfg::geo::track::{Fix, FixSource, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
-use tfg::map_render::{project_mercator, unproject_mercator};
+use tfg::map_render::{anchor_center, project_mercator, unproject_mercator};
 use tfg::overlay::hit_test;
 use tfg::land::Land;
 use tfg::sim::{
@@ -371,6 +371,10 @@ struct ShipApp {
     /// Map zoom (slice iii): feeds the map thread per request; the
     /// zone/flag threshold reads it per frame.
     zoom: f64,
+    /// Seamless zoom throttle (task #43): overlays track every tick,
+    /// the texture follows at most every 250ms; dirty flushes the tail.
+    last_zoom_req: Instant,
+    zoom_dirty: bool,
     /// Top-level mode (task #39): session only in Simulation.
     app_mode: AppMode,
     /// Connection island state (task #39): URL field, current source
@@ -1964,6 +1968,13 @@ impl eframe::App for ShipApp {
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_map(ui.ctx());
+        // Flush a trailing seamless-zoom step (task #43): the last tick
+        // inside the throttle window still gets its frame.
+        if self.zoom_dirty && self.last_zoom_req.elapsed() >= Duration::from_millis(250) {
+            self.zoom_dirty = false;
+            self.last_zoom_req = Instant::now();
+            self.refresh_map();
+        }
         let markers = self.markers();
         // Group overlays (slice iii, grill #24): recomputed per frame from
         // live marker positions; zones above the zoom threshold, flags below.
@@ -2591,6 +2602,48 @@ impl eframe::App for ShipApp {
                         }
                     }
                 }
+                // Seamless zoom (task #43): shift+wheel glides, pinch
+                // follows; the point under the cursor stays put via
+                // anchor math. Overlays track every tick, the texture is
+                // throttled (see ui() flush).
+                if response.hovered() {
+                    let wheel: f64 = ui.input(|i| {
+                        let w = i.scroll_delta.y + i.smooth_scroll_delta.y;
+                        let shift_wheel = if i.modifiers.shift { w } else { 0.0 };
+                        let pinch = if i.zoom_delta() != 1.0 {
+                            i.zoom_delta().ln() * 1200.0
+                        } else {
+                            0.0
+                        };
+                        (shift_wheel + pinch) as f64
+                    });
+                    if wheel != 0.0 {
+                        let old = self.zoom;
+                        let new = (old + wheel * 0.005).clamp(3.0, 18.0);
+                        if new != old {
+                            if let Some(pos) = response.hover_pos() {
+                                let (mw, mh) = self.map_dims();
+                                self.center = anchor_center(
+                                    (pos.x - rect.min.x) as f64,
+                                    (pos.y - rect.min.y) as f64,
+                                    self.center,
+                                    old,
+                                    new,
+                                    mw,
+                                    mh,
+                                );
+                            }
+                            self.zoom = new;
+                            eprintln!("zoom {new:.1}");
+                            self.zoom_dirty = true;
+                            if self.last_zoom_req.elapsed() >= Duration::from_millis(250) {
+                                self.zoom_dirty = false;
+                                self.last_zoom_req = Instant::now();
+                                self.refresh_map();
+                            }
+                        }
+                    }
+                }
                 let painter = ui.painter_at(rect);
                 // Group zones under ships, flags above them (slice iii).
                 for z in &zones {
@@ -2856,7 +2909,14 @@ fn main() -> eframe::Result<()> {
     let map_handle = std::thread::spawn(move || {
         let mut size = (MAP_W as u32, MAP_H as u32);
         let mut scene = LiveMap::new(CENTER, ZOOM, size.0, size.1, STYLE, tfg::map_render::repo_cache_path());
-        while let Ok((seq, at, zoom, px)) = map_req_rx.recv() {
+        while let Ok(first) = map_req_rx.recv() {
+            // Newest-wins (task #43): a burst of scroll-zoom requests
+            // renders once, so the texture never lags seconds behind.
+            let mut latest = first;
+            for newer in map_req_rx.try_iter() {
+                latest = newer;
+            }
+            let (seq, at, zoom, px) = latest;
             if px != size {
                 // Window resize: rebuild the scene once at the new size.
                 scene = LiveMap::new(at, zoom, px.0.max(1), px.1.max(1), STYLE, tfg::map_render::repo_cache_path());
@@ -2871,7 +2931,7 @@ fn main() -> eframe::Result<()> {
         }
     });
     // Initial frame so the window never opens empty-handed for long.
-    map_req_tx.send((0, CENTER, ZOOM)).expect("map thread alive");
+    map_req_tx.send((0, CENTER, ZOOM, (MAP_W as u32, MAP_H as u32))).expect("map thread alive");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 640.0]),
@@ -2950,6 +3010,8 @@ fn main() -> eframe::Result<()> {
                 invite_status: "local records".to_string(),
                 session_ratio: SESSION_RATIO,
                 zoom: ZOOM,
+                last_zoom_req: Instant::now(),
+                zoom_dirty: false,
                 app_mode: AppMode::Simulation,
                 // Mirrors the poll thread's boot-wire choice above (task
                 // #39): status text only, the thread owns the source.
