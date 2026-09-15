@@ -155,6 +155,24 @@ fn build_wire(kind: &WireKind) -> Result<(Box<dyn PollSource>, String), String> 
         WireKind::Empty => Ok((Box::new(EmptyWire) as Box<dyn PollSource>, "empty".to_string())),
     }
 }
+/// One parsed history line: display text plus its actor and ships for
+/// the unit/player filters (task #41).
+struct LogLine {
+    text: String,
+    actor: String,
+    ships: Vec<String>,
+}
+
+/// One placement-affecting journal entry (task #41): take-control adds
+/// the ghost, release removes it. Parsed from Command payloads.
+struct ReplayEvent {
+    game_ts: String,
+    ship: String,
+    lat: f64,
+    lon: f64,
+    placed: bool,
+}
+
 /// v0 poll cadence, in seconds.
 const POLL_SECS: f64 = 2.0;
 /// Pumped frames per recenter on the hot scene.
@@ -364,6 +382,12 @@ struct ShipApp {
     wire_ctl_tx: Option<Sender<WireKind>>,
     /// Session-log history view (task #40): selected past journal.
     log_view_path: Option<std::path::PathBuf>,
+    /// Replay (task #41): placement events, slider position, map ghosts,
+    /// unit/player filter.
+    log_events: Vec<ReplayEvent>,
+    replay_pos: usize,
+    show_replay: bool,
+    log_filter: String,
     /// Full-window canvas (task #38): renderer pixels, current display
     /// points, and last frame's desired size (resize debounce).
     map_px: (u32, u32),
@@ -949,9 +973,9 @@ impl ShipApp {
         out
     }
 
-    /// History view for one journal: compact entries plus the units and
+    /// History view for one journal: structured lines plus the units and
     /// players seen (ship ids from payloads, non-sim actors).
-    fn read_log_view(path: &std::path::PathBuf) -> (Vec<String>, Vec<String>, Vec<String>) {
+    fn read_log_view(path: &std::path::PathBuf) -> (Vec<LogLine>, Vec<String>, Vec<String>) {
         let mut entries = Vec::new();
         let mut units = std::collections::BTreeSet::new();
         let mut players = std::collections::BTreeSet::new();
@@ -961,26 +985,102 @@ impl ShipApp {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let actor = v["actor"].as_str().unwrap_or("?");
+                let actor = v["actor"].as_str().unwrap_or("?").to_string();
                 if actor != "sim" && !actor.starts_with("authority:") {
-                    players.insert(actor.to_string());
+                    players.insert(actor.clone());
                 }
                 let payload = &v["payload"];
-                for key in ["ship_id", "ship"] {
+                let mut ships = Vec::new();
+                for key in ["ship_id", "ship", "ships"] {
                     if let Some(s) = payload[key].as_str() {
+                        ships.push(s.to_string());
                         units.insert(s.to_string());
                     }
+                    if let Some(arr) = payload[key].as_array() {
+                        for s in arr.iter().filter_map(|x| x.as_str()) {
+                            ships.push(s.to_string());
+                            units.insert(s.to_string());
+                        }
+                    }
                 }
-                entries.push(format!(
-                    "{} {} {}: {}",
-                    v["game_ts"].as_str().unwrap_or("—"),
+                entries.push(LogLine {
+                    text: format!(
+                        "{} {} {}: {}",
+                        v["game_ts"].as_str().unwrap_or("—"),
+                        actor,
+                        v["kind"].as_str().unwrap_or("?"),
+                        payload,
+                    ),
                     actor,
-                    v["kind"].as_str().unwrap_or("?"),
-                    payload,
-                ));
+                    ships,
+                });
             }
         }
         (entries, units.into_iter().collect(), players.into_iter().collect())
+    }
+
+    /// Placement events for the replay slider (task #41): take-control /
+    /// release Commands in journal order.
+    fn parse_replay(path: &std::path::PathBuf) -> Vec<ReplayEvent> {
+        let mut out = Vec::new();
+        if let Ok(text) = std::fs::read_to_string(path) {
+            for line in text.lines() {
+                let v: serde_json::Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if v["kind"].as_str() != Some("Command") {
+                    continue;
+                }
+                let payload = &v["payload"];
+                let event = payload["event"].as_str().unwrap_or("");
+                let Some(ship) = payload["ship"].as_str() else {
+                    continue;
+                };
+                let game_ts = v["game_ts"].as_str().unwrap_or("—").to_string();
+                match event {
+                    "take-control" => {
+                        let (Some(la), Some(lo)) =
+                            (payload["lat"].as_f64(), payload["lon"].as_f64())
+                        else {
+                            continue;
+                        };
+                        out.push(ReplayEvent {
+                            game_ts,
+                            ship: ship.to_string(),
+                            lat: la,
+                            lon: lo,
+                            placed: true,
+                        });
+                    }
+                    "release" => out.push(ReplayEvent {
+                        game_ts,
+                        ship: ship.to_string(),
+                        lat: 0.0,
+                        lon: 0.0,
+                        placed: false,
+                    }),
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// Ghost units as placed up to the slider: fold take/release events.
+    fn replay_state(&self) -> Vec<(String, f64, f64)> {
+        let mut map: HashMap<String, (f64, f64)> = HashMap::new();
+        for e in self.log_events.iter().take(self.replay_pos) {
+            if e.placed {
+                map.insert(e.ship.clone(), (e.lat, e.lon));
+            } else {
+                map.remove(&e.ship);
+            }
+        }
+        let mut out: Vec<(String, f64, f64)> =
+            map.into_iter().map(|(s, (la, lo))| (s, la, lo)).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// End action: disarm into Closed, lock working islands, and freeze
@@ -1040,9 +1140,57 @@ impl ShipApp {
                         if units.is_empty() { "—".to_string() } else { units.join(", ") },
                         if players.is_empty() { "—".to_string() } else { players.join(", ") },
                     ));
+                    egui::ComboBox::from_label("show")
+                        .selected_text(&self.log_filter)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.log_filter,
+                                "all".to_string(),
+                                "all events",
+                            );
+                            for u in &units {
+                                ui.selectable_value(
+                                    &mut self.log_filter,
+                                    format!("unit:{u}"),
+                                    format!("unit {u}"),
+                                );
+                            }
+                            for p in &players {
+                                ui.selectable_value(
+                                    &mut self.log_filter,
+                                    format!("player:{p}"),
+                                    format!("player {p}"),
+                                );
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.show_replay, "show on map");
+                        let max = self.log_events.len();
+                        if self.replay_pos > max {
+                            self.replay_pos = max;
+                        }
+                        ui.add(egui::Slider::new(&mut self.replay_pos, 0..=max).text("replay"));
+                    });
+                    if let Some(e) = self.log_events.get(self.replay_pos.saturating_sub(1)) {
+                        ui.label(format!("replay @ {}", e.game_ts));
+                    } else {
+                        ui.label("replay @ start");
+                    }
+                    let filter = self.log_filter.clone();
                     egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
                         for e in entries.iter().rev().take(200) {
-                            ui.label(e);
+                            let show = if filter == "all" {
+                                true
+                            } else if let Some(u) = filter.strip_prefix("unit:") {
+                                e.ships.iter().any(|s| s == u)
+                            } else if let Some(p) = filter.strip_prefix("player:") {
+                                e.actor == p
+                            } else {
+                                true
+                            };
+                            if show {
+                                ui.label(&e.text);
+                            }
                         }
                     });
                 } else {
@@ -1057,6 +1205,9 @@ impl ShipApp {
                             .unwrap_or("?")
                             .to_string();
                         if ui.small_button(&name).clicked() {
+                            self.log_events = Self::parse_replay(&f);
+                            self.replay_pos = self.log_events.len();
+                            self.log_filter = "all".to_string();
                             self.log_view_path = Some(f);
                         }
                     }
@@ -2510,6 +2661,31 @@ impl eframe::App for ShipApp {
                         MAP_INK,
                     );
                 }
+                // Log replay ghosts (task #41): hollow amber units as
+                // placed up to the slider, from the journal — not live.
+                if self.show_replay && self.log_view_path.is_some() {
+                    let (rw, rh) = self.map_dims();
+                    for (id, la, lo) in self.replay_state() {
+                        let (gx, gy) =
+                            project_mercator(la, lo, self.center, self.zoom, rw, rh);
+                        let g = rect.min + egui::vec2(gx as f32, gy as f32);
+                        painter.circle_stroke(
+                            g,
+                            8.0,
+                            egui::Stroke::new(
+                                2.0,
+                                egui::Color32::from_rgb(0xF5, 0x9E, 0x0B),
+                            ),
+                        );
+                        painter.text(
+                            g + egui::vec2(10.0, -10.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{id} (replay)"),
+                            egui::FontId::proportional(12.0),
+                            MAP_INK,
+                        );
+                    }
+                }
                 // Waypoint legs: pending preview (white) + committed per
                 // owned ship (light blue), drawn from the ship marker.
                 let mut legs: Vec<((f64, f64), (f64, f64), egui::Color32)> = Vec::new();
@@ -2793,6 +2969,10 @@ fn main() -> eframe::Result<()> {
                 show_session: true,
                 wire_ctl_tx: Some(ui_wire_ctl_tx),
                 log_view_path: None,
+                log_events: Vec::new(),
+                replay_pos: 0,
+                show_replay: true,
+                log_filter: "all".to_string(),
                 groups: Groups::default(),
                 show_groups: false,
                 group_seq: 1,
