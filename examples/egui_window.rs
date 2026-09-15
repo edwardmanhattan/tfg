@@ -114,6 +114,47 @@ impl UiMode {
         self.tool = SetupTool::Select;
     }
 }
+/// Top-level mode (task #39): a session exists only in Simulation;
+/// Presentation renders live backend data through the same Registry.
+/// Switching clears the *view* either way — wire ships and sim ships
+/// never share a screen — while the simulation underneath (session,
+/// roster, journal, owned units) survives for the return trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    Presentation,
+    Simulation,
+}
+
+/// Runtime wire backends for the poll thread (task #39). Replay stays
+/// boot-only (env); the Connection island swaps Http/Empty live.
+enum WireKind {
+    Http(String),
+    Replay(String),
+    Empty,
+}
+
+/// Wire source that yields nothing: a disconnected presentation, or a
+/// simulation running on sim data alone.
+struct EmptyWire;
+
+impl PollSource for EmptyWire {
+    fn poll(&mut self) -> Result<Vec<Fix>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// Build a wire source plus its status description.
+fn build_wire(kind: &WireKind) -> Result<(Box<dyn PollSource>, String), String> {
+    match kind {
+        WireKind::Http(url) => HttpPoll::new(url)
+            .map(|h| (Box::new(h) as Box<dyn PollSource>, format!("HTTP {url}")))
+            .map_err(|e| e),
+        WireKind::Replay(path) => FileReplay::from_file(path)
+            .map(|r| (Box::new(r) as Box<dyn PollSource>, format!("replay {path}")))
+            .map_err(|e| e),
+        WireKind::Empty => Ok((Box::new(EmptyWire) as Box<dyn PollSource>, "empty".to_string())),
+    }
+}
 /// v0 poll cadence, in seconds.
 const POLL_SECS: f64 = 2.0;
 /// Pumped frames per recenter on the hot scene.
@@ -312,6 +353,15 @@ struct ShipApp {
     /// Map zoom (slice iii): feeds the map thread per request; the
     /// zone/flag threshold reads it per frame.
     zoom: f64,
+    /// Top-level mode (task #39): session only in Simulation.
+    app_mode: AppMode,
+    /// Connection island state (task #39): URL field, current source
+    /// description, last connect/disconnect note, control channel.
+    backend_url: String,
+    wire_desc: String,
+    conn_status: String,
+    show_connection: bool,
+    wire_ctl_tx: Option<Sender<WireKind>>,
     /// Full-window canvas (task #38): renderer pixels, current display
     /// points, and last frame's desired size (resize debounce).
     map_px: (u32, u32),
@@ -478,6 +528,77 @@ impl ShipApp {
                 ShipMarker { id: s.ship_id.clone(), x, y, stale: s.stale, source: s.source, trail }
             })
             .collect()
+    }
+
+    /// Switch top-level modes (task #39): the view clears either way
+    /// and Presentation disarms the engine, so watching never stands
+    /// anything up. Simulation state underneath is untouched.
+    fn set_app_mode(&mut self, mode: AppMode) {
+        if self.app_mode == mode {
+            return;
+        }
+        self.app_mode = mode;
+        self.registry = Registry::new(TrailBound::default());
+        self.selected = None;
+        self.following = None;
+        self.recentering = None;
+        if mode == AppMode::Presentation {
+            self.mode.armed.store(false, Ordering::SeqCst);
+            self.show_session = false;
+            self.show_roster = false;
+            self.show_fleet = false;
+            self.show_orders = false;
+            self.show_groups = false;
+            self.show_connection = true;
+        } else {
+            self.show_connection = false;
+        }
+        eprintln!("mode: {mode:?}");
+    }
+
+    /// Connection island (task #39): the wire controls plus status.
+    /// Same Registry underneath — this only swaps the source.
+    fn connection_island(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Connection");
+        ui.label(format!("source: {}", self.wire_desc));
+        let backend_ships = self
+            .registry
+            .ships()
+            .iter()
+            .filter(|s| s.source == FixSource::Wire)
+            .count();
+        ui.label(format!("backend ships in view: {backend_ships}"));
+        ui.horizontal(|ui| {
+            ui.label("backend:");
+            ui.text_edit_singleline(&mut self.backend_url);
+        });
+        ui.horizontal(|ui| {
+            if ui.button("connect").clicked() {
+                let url = self.backend_url.clone();
+                if let Some(tx) = &self.wire_ctl_tx {
+                    match HttpPoll::new(&url) {
+                        Ok(_) => {
+                            let _ = tx.send(WireKind::Http(url.clone()));
+                            self.wire_desc = format!("HTTP {url}");
+                            self.conn_status = format!("connected {url}");
+                            eprintln!("wire: HTTP {url}");
+                        }
+                        Err(e) => {
+                            self.conn_status = format!("connect failed: {e}");
+                        }
+                    }
+                }
+            }
+            if ui.button("disconnect").clicked() {
+                if let Some(tx) = &self.wire_ctl_tx {
+                    let _ = tx.send(WireKind::Empty);
+                    self.wire_desc = "empty".to_string();
+                    self.conn_status = "disconnected".to_string();
+                    eprintln!("wire: empty");
+                }
+            }
+        });
+        ui.label(&self.conn_status);
     }
 
     /// Display size in points: what overlays project against. The
@@ -1623,13 +1744,25 @@ impl eframe::App for ShipApp {
         // The dock is dead; every flow below is a floating island.
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.toggle_value(&mut self.show_session, "Session");
-                ui.toggle_value(&mut self.show_roster, "Roster");
-                ui.toggle_value(&mut self.show_fleet, "Fleet");
+                // Top-level mode (task #39): session lives in
+                // Simulation; Presentation watches a backend.
+                let mut mode = self.app_mode;
+                ui.selectable_value(&mut mode, AppMode::Presentation, "📡 Presentation");
+                ui.selectable_value(&mut mode, AppMode::Simulation, "🎮 Simulation");
+                if mode != self.app_mode {
+                    self.set_app_mode(mode);
+                }
+                ui.separator();
+                ui.toggle_value(&mut self.show_connection, "Connection");
                 ui.toggle_value(&mut self.show_inspector, "Inspector");
-                ui.toggle_value(&mut self.show_orders, "Orders");
                 ui.toggle_value(&mut self.show_log, "Log");
-                ui.toggle_value(&mut self.show_groups, "Groups");
+                if self.app_mode == AppMode::Simulation {
+                    ui.toggle_value(&mut self.show_session, "Session");
+                    ui.toggle_value(&mut self.show_roster, "Roster");
+                    ui.toggle_value(&mut self.show_fleet, "Fleet");
+                    ui.toggle_value(&mut self.show_orders, "Orders");
+                    ui.toggle_value(&mut self.show_groups, "Groups");
+                }
                 ui.separator();
                 if ui.small_button("−").clicked() {
                     self.zoom_by(-1.0);
@@ -1639,8 +1772,9 @@ impl eframe::App for ShipApp {
                     self.zoom_by(1.0);
                 }
             });
-            // Identity + desktops (slice iv, grill #25): act as organizer
-            // (merged All) or a roster player (their scope tabs, view-all).
+            // Identity + desktops (slice iv, grill #25): simulation-only
+            // (task #39) — there is nobody to act as in Presentation.
+            if self.app_mode == AppMode::Simulation {
             ui.horizontal(|ui| {
                 ui.label("act:");
                 let roster: Vec<String> = self.roster.clone();
@@ -1681,6 +1815,7 @@ impl eframe::App for ShipApp {
                     }
                 }
             });
+            }
             // Clock block: real + derived game time, humane format
             // (grill #17, ADR-0004). Both readings come from the sim.
             ui.horizontal(|ui| {
@@ -2052,6 +2187,13 @@ impl eframe::App for ShipApp {
             });
             self.show_orders = open;
         }
+        if self.show_connection {
+            let mut open = self.show_connection;
+            egui::Window::new("Connection").movable(true).default_pos(egui::pos2(8.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
+                self.connection_island(ui);
+            });
+            self.show_connection = open;
+        }
         if self.show_log {
             let mut open = self.show_log;
             egui::Window::new("Log").movable(true).default_pos(egui::pos2(8.0, 478.0)).open(&mut open).show(ui.ctx(), |ui| {
@@ -2346,41 +2488,28 @@ fn main() -> eframe::Result<()> {
     // shell arms simulation mode through this flag (Q1: freeze, no lies).
     let sim_armed = Arc::new(AtomicBool::new(false));
     let poll_armed = sim_armed.clone();
+    let (wire_ctl_tx, wire_ctl_rx) = mpsc::channel::<WireKind>();
+    let ui_wire_ctl_tx = wire_ctl_tx.clone();
     let poll_handle = std::thread::spawn(move || {
-        let fixture = format!("{}/scenarios/empty.json", env!("CARGO_MANIFEST_DIR"));
-        let wire: Box<dyn PollSource> = match std::env::var("TFG_BACKEND_URL") {
-            Ok(url) => {
-                eprintln!("backend: HTTP {url}");
-                match HttpPoll::new(&url) {
-                    Ok(h) => Box::new(h),
-                    Err(e) => {
-                        eprintln!("http backend failed to start: {e}");
-                        return;
-                    }
-                }
-            }
-            Err(_) => {
-                // TFG_SCENARIO=name replays scenarios/{name}.json (e.g.
-                // `surge` for the traffic demo); default is the clear canvas.
-                let fixture = match std::env::var("TFG_SCENARIO") {
-                    Ok(name) => {
-                        eprintln!("backend: scenario {name}");
-                        format!("{}/scenarios/{name}.json", env!("CARGO_MANIFEST_DIR"))
-                    }
-                    Err(_) => {
-                        eprintln!("backend: file replay");
-                        fixture
-                    }
-                };
-                match FileReplay::from_file(&fixture) {
-                    Ok(r) => Box::new(r),
-                    Err(e) => {
-                        eprintln!("fixture failed to load: {e}");
-                        return;
-                    }
-                }
+        // Boot wire (task #39): env picks HTTP vs replay; the Connection
+        // island can swap it later without restarting the sim.
+        let empty = format!("{}/scenarios/empty.json", env!("CARGO_MANIFEST_DIR"));
+        let boot_kind = match std::env::var("TFG_BACKEND_URL") {
+            Ok(url) => WireKind::Http(url),
+            Err(_) => WireKind::Replay(match std::env::var("TFG_SCENARIO") {
+                // `surge` for the traffic demo; default is the clear canvas.
+                Ok(name) => format!("{}/scenarios/{name}.json", env!("CARGO_MANIFEST_DIR")),
+                Err(_) => empty,
+            }),
+        };
+        let (wire, desc) = match build_wire(&boot_kind) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("backend failed to start: {e}");
+                return;
             }
         };
+        eprintln!("backend: {desc}");
         let mut source = MergeSource::new(
             wire,
             SimSource::new_with_journal(
@@ -2395,6 +2524,16 @@ fn main() -> eframe::Result<()> {
         );
         source.set_armed_flag(poll_armed);
         loop {
+            // Runtime wire swaps from the Connection island (task #39).
+            while let Ok(kind) = wire_ctl_rx.try_recv() {
+                match build_wire(&kind) {
+                    Ok((w, desc)) => {
+                        eprintln!("backend: {desc}");
+                        source.set_wire(w);
+                    }
+                    Err(e) => eprintln!("wire swap failed: {e}"),
+                }
+            }
             match source.poll() {
                 Ok(fixes) => {
                     if poll_tx.send(fixes).is_err() {
@@ -2515,6 +2654,21 @@ fn main() -> eframe::Result<()> {
                 invite_status: "local records".to_string(),
                 session_ratio: SESSION_RATIO,
                 zoom: ZOOM,
+                app_mode: AppMode::Simulation,
+                // Mirrors the poll thread's boot-wire choice above (task
+                // #39): status text only, the thread owns the source.
+                backend_url: std::env::var("TFG_BACKEND_URL")
+                    .unwrap_or("http://127.0.0.1:3000".to_string()),
+                wire_desc: match std::env::var("TFG_BACKEND_URL") {
+                    Ok(url) => format!("HTTP {url}"),
+                    Err(_) => match std::env::var("TFG_SCENARIO") {
+                        Ok(name) => format!("replay scenarios/{name}.json"),
+                        Err(_) => "replay scenarios/empty.json".to_string(),
+                    },
+                },
+                conn_status: "boot source (env)".to_string(),
+                show_connection: false,
+                wire_ctl_tx: Some(ui_wire_ctl_tx),
                 groups: Groups::default(),
                 show_groups: false,
                 group_seq: 1,
