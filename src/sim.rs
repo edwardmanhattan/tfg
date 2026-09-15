@@ -568,6 +568,12 @@ impl MergeSource {
     pub fn set_armed_flag(&mut self, flag: Arc<AtomicBool>) {
         self.armed = flag;
     }
+
+    /// Swap the wire source at runtime (mode model, #39): the poll thread
+    /// replaces backends without restarting the sim underneath.
+    pub fn set_wire(&mut self, wire: Box<dyn PollSource>) {
+        self.wire = wire;
+    }
 }
 
 impl PollSource for MergeSource {
