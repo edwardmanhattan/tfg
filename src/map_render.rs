@@ -167,6 +167,33 @@ pub fn project_mercator(
     (x - cx + w / 2.0, y - cy + h / 2.0)
 }
 
+/// Keep the point under the cursor fixed across a zoom step (task #43):
+/// the new center puts the cursor's geographic point back under it.
+/// Exact inverse of the forward path by construction (see test).
+#[allow(clippy::too_many_arguments)]
+pub fn anchor_center(
+    px: f64,
+    py: f64,
+    center: (f64, f64),
+    zoom: f64,
+    new_zoom: f64,
+    w: f64,
+    h: f64,
+) -> (f64, f64) {
+    use std::f64::consts::PI;
+    let (gla, glo) = unproject_mercator(px, py, center, zoom, w, h);
+    let scale = WORLD_BASE_PX * 2f64.powf(new_zoom);
+    let gx = (glo + 180.0) / 360.0 * scale;
+    let s = (gla.to_radians().tan() + 1.0 / gla.to_radians().cos()).ln();
+    let gy = (1.0 - s / PI) / 2.0 * scale;
+    let cx = gx - (px - w / 2.0);
+    let cy = gy - (py - h / 2.0);
+    let lon = cx / scale * 360.0 - 180.0;
+    let s2 = (1.0 - 2.0 * cy / scale) * PI;
+    let lat = s2.sinh().atan().to_degrees();
+    (lat, lon)
+}
+
 /// Inverse of [`project_mercator`]: window pixels back to lat/lon.
 /// Used for click-to-order waypoints; exact round-trip of the forward path.
 #[allow(clippy::too_many_arguments)]
@@ -199,6 +226,20 @@ pub fn unproject_mercator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchor_keeps_cursor_geo_fixed() {
+        let center = (-6.108, 106.910);
+        for (px, py) in [(400.0, 300.0), (100.0, 500.0), (700.0, 120.0)] {
+            let (gla, glo) = unproject_mercator(px, py, center, 11.0, 800.0, 600.0);
+            for new_zoom in [10.0, 11.5, 13.0] {
+                let nc = anchor_center(px, py, center, 11.0, new_zoom, 800.0, 600.0);
+                let (gla2, glo2) = unproject_mercator(px, py, nc, new_zoom, 800.0, 600.0);
+                assert!((gla - gla2).abs() < 1e-9, "lat stable at {new_zoom}");
+                assert!((glo - glo2).abs() < 1e-9, "lon stable at {new_zoom}");
+            }
+        }
+    }
 
     #[test]
     fn unproject_round_trips_project() {
