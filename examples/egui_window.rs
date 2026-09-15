@@ -37,6 +37,12 @@ use tfg::sim::{
 
 const MAP_W: f64 = 800.0;
 const MAP_H: f64 = 600.0;
+
+/// Map thread protocol (task #38): every request carries the renderer
+/// size so the canvas can fill the window; responses echo it back so the
+/// texture is sized right.
+type MapReq = (u64, (f64, f64), f64, (u32, u32));
+type MapResp = (u64, (f64, f64), (u32, u32), Vec<u8>);
 const CENTER: (f64, f64) = (-6.108, 106.910);
 const ZOOM: f64 = 11.0;
 /// Zone/flag threshold (grill #24, slice iii): zones at or above this
@@ -219,8 +225,8 @@ struct ShipApp {
     center: (f64, f64),
     registry: Registry,
     poll_rx: Receiver<Vec<Fix>>,
-    map_req_tx: Option<Sender<(u64, (f64, f64), f64)>>,
-    map_resp_rx: Receiver<(u64, (f64, f64), Vec<u8>)>,
+    map_req_tx: Option<Sender<MapReq>>>,
+    map_resp_rx: Receiver<MapResp>,
     map_seq: u64,
     recentering: Option<String>,
     shutdown: std::sync::Arc<AtomicBool>,
@@ -306,6 +312,11 @@ struct ShipApp {
     /// Map zoom (slice iii): feeds the map thread per request; the
     /// zone/flag threshold reads it per frame.
     zoom: f64,
+    /// Full-window canvas (task #38): renderer pixels, current display
+    /// points, and last frame's desired size (resize debounce).
+    map_px: (u32, u32),
+    map_view: (f64, f64),
+    last_desired_px: (u32, u32),
     /// Session groups (slice iii): Satgas/Gugus hierarchy + drafts.
     groups: Groups,
     show_groups: bool,
@@ -452,34 +463,41 @@ impl ShipApp {
         }
         let frac = (self.last_poll.elapsed().as_secs_f64() / POLL_SECS).clamp(0.0, 1.0);
         let center = self.center;
+        let (mw, mh) = self.map_dims();
         self.registry
             .ships()
             .iter()
             .map(|s| {
                 let pos = self.registry.blend(&s.ship_id, frac).unwrap_or(s.latest.position);
-                let (x, y) = project_mercator(pos.latitude, pos.longitude, center, self.zoom, MAP_W, MAP_H);
+                let (x, y) = project_mercator(pos.latitude, pos.longitude, center, self.zoom, mw, mh);
                 let trail = s
                     .trail
                     .iter()
-                    .map(|p| project_mercator(p.latitude, p.longitude, center, self.zoom, MAP_W, MAP_H))
+                    .map(|p| project_mercator(p.latitude, p.longitude, center, self.zoom, mw, mh))
                     .collect();
                 ShipMarker { id: s.ship_id.clone(), x, y, stale: s.stale, source: s.source, trail }
             })
             .collect()
     }
 
+    /// Display size in points: what overlays project against. The
+    /// renderer works in physical pixels; both derive per frame.
+    fn map_dims(&self) -> (f64, f64) {
+        self.map_view
+    }
+
     /// Apply finished map frames (last-writer-wins by sequence).
     fn drain_map(&mut self, ctx: &egui::Context) {
-        for (seq, center, rgba) in self.map_resp_rx.try_iter() {
+        for (seq, center, size, rgba) in self.map_resp_rx.try_iter() {
             if seq == self.map_seq {
                 let img = if LiveMap::is_premultiplied() {
                     egui::ColorImage::from_rgba_premultiplied(
-                        [MAP_W as usize, MAP_H as usize],
+                        [size.0 as usize, size.1 as usize],
                         &rgba,
                     )
                 } else {
                     egui::ColorImage::from_rgba_unmultiplied(
-                        [MAP_W as usize, MAP_H as usize],
+                        [size.0 as usize, size.1 as usize],
                         &rgba,
                     )
                 };
@@ -506,7 +524,7 @@ impl ShipApp {
         self.map_seq += 1;
         self.recentering = Some(ship.to_string());
         eprintln!("recentering on {ship}…");
-        let _ = tx.send((self.map_seq, at, self.zoom));
+        let _ = tx.send((self.map_seq, at, self.zoom, self.map_px));
     }
 
     /// Re-render at the current center and zoom without a recenter label.
@@ -515,7 +533,7 @@ impl ShipApp {
             return; // shutting down
         };
         self.map_seq += 1;
-        let _ = tx.send((self.map_seq, self.center, self.zoom));
+        let _ = tx.send((self.map_seq, self.center, self.zoom, self.map_px));
     }
 
     /// Zoom step (slice iii): clamps, re-renders, and reports. Zones give
@@ -2064,11 +2082,28 @@ impl eframe::App for ShipApp {
             ui.label(format!("centering on {ship}…"));
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
+        // Full-window canvas (task #38): the map owns every point the
+        // panel offers, no margins. Renderer resize is debounced: the
+        // scene rebuilds once the size settles a frame.
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+            let avail = ui.available_size();
+            self.map_view = (avail.x.max(1.0) as f64, avail.y.max(1.0) as f64);
+            let ppp = ui.ctx().pixels_per_point();
+            let desired = (
+                (avail.x.max(1.0) * ppp).round().max(1.0) as u32,
+                (avail.y.max(1.0) * ppp).round().max(1.0) as u32,
+            );
+            if desired != self.map_px {
+                if desired == self.last_desired_px {
+                    self.map_px = desired;
+                    self.refresh_map();
+                }
+                self.last_desired_px = desired;
+            }
             if let Some(tex) = &self.map_tex {
                 let response = ui.add(
                     egui::Image::new(tex)
-                        .fit_to_exact_size(egui::vec2(MAP_W as f32, MAP_H as f32))
+                        .fit_to_exact_size(avail)
                         .sense(egui::Sense::click()),
                 );
                 let rect = response.rect;
@@ -2078,13 +2113,14 @@ impl eframe::App for ShipApp {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let px = (pos.x - rect.min.x) as f64;
                         let py = (pos.y - rect.min.y) as f64;
+                        let (mw, mh) = self.map_dims();
                         if self.mode.tool == SetupTool::Place
                             && self.mode.phase == Phase::Setup
                             && self.mode.armed.load(Ordering::SeqCst)
                             && self.acting_as.is_none()
                         {
                             let (la, lo) = unproject_mercator(
-                                px, py, self.center, self.zoom, MAP_W, MAP_H,
+                                px, py, self.center, self.zoom, mw, mh,
                             );
                             // Fleet picker (task #29): only a picked,
                             // unplaced hull stands up. No generic or
@@ -2112,7 +2148,7 @@ impl eframe::App for ShipApp {
                             self.mode.tool = SetupTool::Select;
                         } else if self.placing {
                             let (la, lo) = unproject_mercator(
-                                px, py, self.center, self.zoom, MAP_W, MAP_H,
+                                px, py, self.center, self.zoom, mw, mh,
                             );
                             eprintln!("waypoint preview ({la:.4}, {lo:.4})");
                             self.pending_waypoint = Some((la, lo));
@@ -2214,6 +2250,7 @@ impl eframe::App for ShipApp {
                 // Waypoint legs: pending preview (white) + committed per
                 // owned ship (light blue), drawn from the ship marker.
                 let mut legs: Vec<((f64, f64), (f64, f64), egui::Color32)> = Vec::new();
+                let (mw, mh) = self.map_dims();
                 for m in &markers {
                     if self.hidden.contains(&m.id) {
                         continue;
@@ -2222,7 +2259,7 @@ impl eframe::App for ShipApp {
                         if let Some(wp) = v.waypoint {
                             if v.state == OrderState::EnRoute {
                                 let (wx, wy) = project_mercator(
-                                    wp.latitude, wp.longitude, self.center, self.zoom, MAP_W, MAP_H,
+                                    wp.latitude, wp.longitude, self.center, self.zoom, mw, mh,
                                 );
                                 legs.push(((m.x, m.y), (wx, wy), egui::Color32::LIGHT_BLUE));
                             }
@@ -2232,7 +2269,7 @@ impl eframe::App for ShipApp {
                 if let Some((la, lo)) = self.pending_waypoint {
                     if let Some(id) = self.selected.clone() {
                         if let Some(m) = markers.iter().find(|m| m.id == id) {
-                            let (wx, wy) = project_mercator(la, lo, self.center, self.zoom, MAP_W, MAP_H);
+                            let (wx, wy) = project_mercator(la, lo, self.center, self.zoom, mw, mh);
                             legs.push(((m.x, m.y), (wx, wy), egui::Color32::WHITE));
                         }
                     }
@@ -2378,15 +2415,21 @@ fn main() -> eframe::Result<()> {
     // Map thread owns the persistent scene; frames come back by channel.
     // It exits when the UI drops its request sender, dropping the scene
     // on this thread (see on_exit) instead of racing process teardown.
-    let (map_req_tx, map_req_rx) = mpsc::channel::<(u64, (f64, f64), f64)>();
-    let (map_resp_tx, map_resp_rx) = mpsc::channel::<(u64, (f64, f64), Vec<u8>)>();
+    let (map_req_tx, map_req_rx) = mpsc::channel::<MapReq>();
+    let (map_resp_tx, map_resp_rx) = mpsc::channel::<MapResp>();
     let map_handle = std::thread::spawn(move || {
-        let mut scene = LiveMap::new(CENTER, ZOOM, MAP_W as u32, MAP_H as u32, STYLE, tfg::map_render::repo_cache_path());
-        while let Ok((seq, at, zoom)) = map_req_rx.recv() {
+        let mut size = (MAP_W as u32, MAP_H as u32);
+        let mut scene = LiveMap::new(CENTER, ZOOM, size.0, size.1, STYLE, tfg::map_render::repo_cache_path());
+        while let Ok((seq, at, zoom, px)) = map_req_rx.recv() {
+            if px != size {
+                // Window resize: rebuild the scene once at the new size.
+                scene = LiveMap::new(at, zoom, px.0.max(1), px.1.max(1), STYLE, tfg::map_render::repo_cache_path());
+                size = px;
+            }
             scene.set_center(at, zoom);
             scene.pump(RECENTER_PUMP);
             let rgba = scene.frame_rgba();
-            if map_resp_tx.send((seq, at, rgba)).is_err() {
+            if map_resp_tx.send((seq, at, size, rgba)).is_err() {
                 break; // UI gone
             }
         }
@@ -2408,6 +2451,9 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(ShipApp {
                 map_tex: None,
                 map_version: 0,
+                map_px: (MAP_W as u32, MAP_H as u32),
+                map_view: (MAP_W, MAP_H),
+                last_desired_px: (MAP_W as u32, MAP_H as u32),
                 center: CENTER,
                 registry: Registry::new(TrailBound::default()),
                 poll_rx,
