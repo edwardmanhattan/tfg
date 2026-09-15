@@ -41,7 +41,7 @@ const MAP_H: f64 = 600.0;
 /// Map thread protocol (task #38): every request carries the renderer
 /// size so the canvas can fill the window; responses echo it back so the
 /// texture is sized right.
-type MapReq = (u64, (f64, f64), f64, (u32, u32));
+type MapReq = (u64, (f64, f64), f64, (u32, u32), u32);
 type MapResp = (u64, (f64, f64), (u32, u32), Vec<u8>);
 const CENTER: (f64, f64) = (-6.108, 106.910);
 const ZOOM: f64 = 11.0;
@@ -175,8 +175,19 @@ struct ReplayEvent {
 
 /// v0 poll cadence, in seconds.
 const POLL_SECS: f64 = 2.0;
-/// Pumped frames per recenter on the hot scene.
-const RECENTER_PUMP: u32 = 6;
+/// Pumped frames per map request, by kind (task #45): jumps rebuild
+/// the view (6), zoom steps split the difference (4), follow tracking
+/// turns over fast on near-neighbor tiles (2). Fewer pumps = fresher
+/// frames while panning; tile fetch itself stays async either way.
+const JUMP_PUMP: u32 = 6;
+const ZOOM_PUMP: u32 = 4;
+const TRACK_PUMP: u32 = 2;
+/// Slowest follow re-request rate: tiles can't arrive faster than the
+/// network, so chasing harder only renders stale centers (task #45).
+const TRACK_MIN_INTERVAL_MS: u64 = 800;
+/// Lead a followed ship by this many seconds of dead reckoning, so tile
+/// fetches run ahead of motion instead of behind it (task #45).
+const TRACK_LEAD_SECS: f64 = 8.0;
 
 struct ShipMarker {
     id: String,
@@ -374,6 +385,8 @@ struct ShipApp {
     /// Seamless zoom throttle (task #43): overlays track every tick,
     /// the texture follows at most every 250ms; dirty flushes the tail.
     last_zoom_req: Instant,
+    /// Slowest follow re-request instant (task #45).
+    last_track_req: Instant,
     zoom_dirty: bool,
     /// Top-level mode (task #39): session only in Simulation.
     app_mode: AppMode,
@@ -675,7 +688,17 @@ impl ShipApp {
         self.map_seq += 1;
         self.recentering = Some(ship.to_string());
         eprintln!("recentering on {ship}…");
-        let _ = tx.send((self.map_seq, at, self.zoom, self.map_px));
+        let _ = tx.send((self.map_seq, at, self.zoom, self.map_px, JUMP_PUMP));
+    }
+
+    /// Follow-tracking frame (task #45): light pump, no recenter label.
+    fn track_frame(&mut self, ship: &str, at: (f64, f64)) {
+        let Some(tx) = self.map_req_tx.clone() else {
+            return; // shutting down
+        };
+        self.map_seq += 1;
+        self.recentering = Some(ship.to_string());
+        let _ = tx.send((self.map_seq, at, self.zoom, self.map_px, TRACK_PUMP));
     }
 
     /// Re-render at the current center and zoom without a recenter label.
@@ -684,7 +707,7 @@ impl ShipApp {
             return; // shutting down
         };
         self.map_seq += 1;
-        let _ = tx.send((self.map_seq, self.center, self.zoom, self.map_px));
+        let _ = tx.send((self.map_seq, self.center, self.zoom, self.map_px, ZOOM_PUMP));
     }
 
     /// Zoom step (slice iii): clamps, re-renders, and reports. Zones give
@@ -2488,7 +2511,8 @@ impl eframe::App for ShipApp {
             self.request_frame(&ship, at);
         }
         // Follow-tracking: chase the followed ship when it drifts from
-        // center. Gated on no re-render in flight, so frames can't pile.
+        // center, rate-capped and leading (task #45). Gated on no
+        // re-render in flight, so frames can't pile.
         if self.recentering.is_none() {
             if let Some(id) = self.following.clone() {
                 if let Some(s) = self.registry.ships().iter().find(|s| s.ship_id == id) {
@@ -2497,8 +2521,21 @@ impl eframe::App for ShipApp {
                         latitude: self.center.0,
                         longitude: self.center.1,
                     };
-                    if should_track(center, ship_pos) {
-                        self.request_frame(&id, (ship_pos.latitude, ship_pos.longitude));
+                    if should_track(center, ship_pos)
+                        && self.last_track_req.elapsed()
+                            >= Duration::from_millis(TRACK_MIN_INTERVAL_MS)
+                    {
+                        // Lead the ship: request tiles for where it is
+                        // going, not where it was.
+                        let at = match (s.latest.heading_deg, s.latest.speed_kn) {
+                            (Some(h), Some(v)) if v > 0.5 => {
+                                let p = ship_pos.dead_reckon(h, v, TRACK_LEAD_SECS);
+                                (p.latitude, p.longitude)
+                            }
+                            _ => (ship_pos.latitude, ship_pos.longitude),
+                        };
+                        self.last_track_req = Instant::now();
+                        self.track_frame(&id, at);
                     }
                 }
             }
@@ -2916,14 +2953,14 @@ fn main() -> eframe::Result<()> {
             for newer in map_req_rx.try_iter() {
                 latest = newer;
             }
-            let (seq, at, zoom, px) = latest;
+            let (seq, at, zoom, px, pump) = latest;
             if px != size {
                 // Window resize: rebuild the scene once at the new size.
                 scene = LiveMap::new(at, zoom, px.0.max(1), px.1.max(1), STYLE, tfg::map_render::repo_cache_path());
                 size = px;
             }
             scene.set_center(at, zoom);
-            scene.pump(RECENTER_PUMP);
+            scene.pump(pump);
             let rgba = scene.frame_rgba();
             if map_resp_tx.send((seq, at, size, rgba)).is_err() {
                 break; // UI gone
@@ -2931,7 +2968,7 @@ fn main() -> eframe::Result<()> {
         }
     });
     // Initial frame so the window never opens empty-handed for long.
-    map_req_tx.send((0, CENTER, ZOOM, (MAP_W as u32, MAP_H as u32))).expect("map thread alive");
+    map_req_tx.send((0, CENTER, ZOOM, (MAP_W as u32, MAP_H as u32), JUMP_PUMP)).expect("map thread alive");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 640.0]),
@@ -3011,6 +3048,7 @@ fn main() -> eframe::Result<()> {
                 session_ratio: SESSION_RATIO,
                 zoom: ZOOM,
                 last_zoom_req: Instant::now(),
+                last_track_req: Instant::now(),
                 zoom_dirty: false,
                 app_mode: AppMode::Simulation,
                 // Mirrors the poll thread's boot-wire choice above (task
