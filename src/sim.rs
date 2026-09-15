@@ -239,6 +239,13 @@ impl SimSource {
         for cmd in cmds {
             match cmd {
                 SimCommand::TakeControl { ship_id, pos, class_id } => {
+                    // Journaled so session logs replay placement (#41).
+                    self.journal.append(
+                        self.clock.game_now_ts(),
+                        "organizer",
+                        LogKind::Command,
+                        serde_json::json!({"event": "take-control", "ship": ship_id, "lat": pos.latitude, "lon": pos.longitude, "class": class_id}),
+                    );
                     // Class chosen at takeover (grill #18); unknown ids
                     // fall back to the first ship class so a bad selector
                     // value can never wedge the sim.
@@ -257,6 +264,12 @@ impl SimSource {
                     });
                 }
                 SimCommand::Release { ship_id } => {
+                    self.journal.append(
+                        self.clock.game_now_ts(),
+                        "organizer",
+                        LogKind::Command,
+                        serde_json::json!({"event": "release", "ship": ship_id}),
+                    );
                     self.ships.remove(&ship_id);
                 }
                 SimCommand::SetOrder { ship_id, waypoint, speed_kn } => {
