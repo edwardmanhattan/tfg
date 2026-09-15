@@ -295,7 +295,7 @@ struct ShipApp {
     center: (f64, f64),
     registry: Registry,
     poll_rx: Receiver<Vec<Fix>>,
-    map_req_tx: Option<Sender<MapReq>>>,
+    map_req_tx: Option<Sender<MapReq>>,
     map_resp_rx: Receiver<MapResp>,
     map_seq: u64,
     recentering: Option<String>,
@@ -2645,7 +2645,10 @@ impl eframe::App for ShipApp {
                 // throttled (see ui() flush).
                 if response.hovered() {
                     let wheel: f64 = ui.input(|i| {
-                        let w = i.scroll_delta.y + i.smooth_scroll_delta.y;
+                        // 0.36 funnels wheel + trackpad through the
+                        // smoothed delta; islands consume it first when
+                        // hovered, so the map only sees open-canvas scrolls.
+                        let w = i.smooth_scroll_delta().y;
                         let shift_wheel = if i.modifiers.shift { w } else { 0.0 };
                         let pinch = if i.zoom_delta() != 1.0 {
                             i.zoom_delta().ln() * 1200.0
