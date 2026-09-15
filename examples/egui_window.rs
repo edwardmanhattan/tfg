@@ -362,6 +362,8 @@ struct ShipApp {
     conn_status: String,
     show_connection: bool,
     wire_ctl_tx: Option<Sender<WireKind>>,
+    /// Session-log history view (task #40): selected past journal.
+    log_view_path: Option<std::path::PathBuf>,
     /// Full-window canvas (task #38): renderer pixels, current display
     /// points, and last frame's desired size (resize debounce).
     map_px: (u32, u32),
@@ -915,9 +917,77 @@ impl ShipApp {
         eprintln!("session live at {ratio:.1}x");
     }
 
-    /// End action: disarm into Closed and freeze the transcript tail.
+    /// A session exists once started (task #40): working islands unlock
+    /// off Live, and lock again when the session ends or resets.
+    fn session_live(&self) -> bool {
+        self.mode.phase == Phase::Live
+    }
+
+    /// Lock the working islands (task #40).
+    fn close_working_islands(&mut self) {
+        self.show_roster = false;
+        self.show_fleet = false;
+        self.show_inspector = false;
+        self.show_orders = false;
+        self.show_log = false;
+        self.show_groups = false;
+    }
+
+    /// Past session journals on disk, oldest first.
+    fn session_log_files() -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(dir) = std::fs::read_dir(format!("{}/target", env!("CARGO_MANIFEST_DIR"))) {
+            for e in dir.flatten() {
+                let p = e.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with("tfg-session-log") && p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// History view for one journal: compact entries plus the units and
+    /// players seen (ship ids from payloads, non-sim actors).
+    fn read_log_view(path: &std::path::PathBuf) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let mut entries = Vec::new();
+        let mut units = std::collections::BTreeSet::new();
+        let mut players = std::collections::BTreeSet::new();
+        if let Ok(text) = std::fs::read_to_string(path) {
+            for line in text.lines() {
+                let v: serde_json::Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let actor = v["actor"].as_str().unwrap_or("?");
+                if actor != "sim" && !actor.starts_with("authority:") {
+                    players.insert(actor.to_string());
+                }
+                let payload = &v["payload"];
+                for key in ["ship_id", "ship"] {
+                    if let Some(s) = payload[key].as_str() {
+                        units.insert(s.to_string());
+                    }
+                }
+                entries.push(format!(
+                    "{} {} {}: {}",
+                    v["game_ts"].as_str().unwrap_or("—"),
+                    actor,
+                    v["kind"].as_str().unwrap_or("?"),
+                    payload,
+                ));
+            }
+        }
+        (entries, units.into_iter().collect(), players.into_iter().collect())
+    }
+
+    /// End action: disarm into Closed, lock working islands, and freeze
+    /// the transcript tail.
     fn end_session(&mut self) {
         self.mode.end();
+        self.close_working_islands();
         if let Ok(text) = std::fs::read_to_string(&self.session_log_path) {
             let lines: Vec<String> =
                 text.lines().map(|s| s.to_string()).collect();
@@ -952,6 +1022,46 @@ impl ShipApp {
                     ui.label(format!("placed: {} unit(s) · {} player(s)", self.placed_fleet.len(), self.roster.len()));
                     return;
                 }
+                ui.heading("Session logs");
+                if let Some(path) = self.log_view_path.clone() {
+                    let (entries, units, players) = Self::read_log_view(&path);
+                    ui.horizontal(|ui| {
+                        if ui.small_button("← all logs").clicked() {
+                            self.log_view_path = None;
+                        }
+                        ui.label(
+                            path.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("?"),
+                        );
+                    });
+                    ui.label(format!(
+                        "units: {} · players: {}",
+                        if units.is_empty() { "—".to_string() } else { units.join(", ") },
+                        if players.is_empty() { "—".to_string() } else { players.join(", ") },
+                    ));
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        for e in entries.iter().rev().take(200) {
+                            ui.label(e);
+                        }
+                    });
+                } else {
+                    let files = Self::session_log_files();
+                    if files.is_empty() {
+                        ui.label("no past sessions yet");
+                    }
+                    for f in files {
+                        let name = f
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        if ui.small_button(&name).clicked() {
+                            self.log_view_path = Some(f);
+                        }
+                    }
+                }
+                ui.separator();
                 ui.heading("Time windows (WIB)");
                 ui.horizontal(|ui| {
                     ui.label("real:");
@@ -1176,6 +1286,7 @@ impl ShipApp {
                 ui.label(format!("log: {}", self.session_log_path.display()));
                 if ui.small_button("new setup").clicked() {
                     self.mode.reset();
+                    self.close_working_islands();
                     self.placed_fleet.clear();
                     self.fleet_pick = None;
                     self.helm.clear();
@@ -1754,14 +1865,22 @@ impl eframe::App for ShipApp {
                 }
                 ui.separator();
                 ui.toggle_value(&mut self.show_connection, "Connection");
-                ui.toggle_value(&mut self.show_inspector, "Inspector");
-                ui.toggle_value(&mut self.show_log, "Log");
+                if self.app_mode == AppMode::Presentation {
+                    ui.toggle_value(&mut self.show_inspector, "Inspector");
+                    ui.toggle_value(&mut self.show_log, "Log");
+                }
                 if self.app_mode == AppMode::Simulation {
                     ui.toggle_value(&mut self.show_session, "Session");
-                    ui.toggle_value(&mut self.show_roster, "Roster");
-                    ui.toggle_value(&mut self.show_fleet, "Fleet");
-                    ui.toggle_value(&mut self.show_orders, "Orders");
-                    ui.toggle_value(&mut self.show_groups, "Groups");
+                    // Working islands unlock once a session exists (task
+                    // #40): pre-session the lobby is Session + Connection.
+                    if self.session_live() {
+                        ui.toggle_value(&mut self.show_roster, "Roster");
+                        ui.toggle_value(&mut self.show_fleet, "Fleet");
+                        ui.toggle_value(&mut self.show_inspector, "Inspector");
+                        ui.toggle_value(&mut self.show_orders, "Orders");
+                        ui.toggle_value(&mut self.show_log, "Log");
+                        ui.toggle_value(&mut self.show_groups, "Groups");
+                    }
                 }
                 ui.separator();
                 if ui.small_button("−").clicked() {
@@ -1862,7 +1981,7 @@ impl eframe::App for ShipApp {
             self.show_session = open;
         }
         let mut follow_req: Option<(String, (f64, f64))> = None;
-        if self.show_roster {
+        if self.show_roster && self.session_live() {
             let mut open = self.show_roster;
             egui::Window::new("Roster").movable(true).default_pos(egui::pos2(816.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
             ui.label(format!("{} ships — click a name to follow", markers.len()));
@@ -1918,21 +2037,23 @@ impl eframe::App for ShipApp {
             });
             self.show_roster = open;
         }
-        if self.show_fleet {
+        if self.show_fleet && self.session_live() {
             let mut open = self.show_fleet;
             egui::Window::new("Fleet").movable(true).default_pos(egui::pos2(8.0, 300.0)).open(&mut open).show(ui.ctx(), |ui| {
                 self.fleet_island(ui);
             });
             self.show_fleet = open;
         }
-        if self.show_groups {
+        if self.show_groups && self.session_live() {
             let mut open = self.show_groups;
             egui::Window::new("Groups").movable(true).default_pos(egui::pos2(240.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
                 self.groups_island(ui);
             });
             self.show_groups = open;
         }
-        if self.show_inspector {
+        if self.show_inspector
+            && (self.session_live() || self.app_mode == AppMode::Presentation)
+        {
             let mut open = self.show_inspector;
             egui::Window::new("Inspector").movable(true).default_pos(egui::pos2(816.0, 300.0)).open(&mut open).show(ui.ctx(), |ui| {
             // Inspector: live readout for the selected ship.
@@ -2194,7 +2315,7 @@ impl eframe::App for ShipApp {
             });
             self.show_connection = open;
         }
-        if self.show_log {
+        if self.show_log && (self.session_live() || self.app_mode == AppMode::Presentation) {
             let mut open = self.show_log;
             egui::Window::new("Log").movable(true).default_pos(egui::pos2(8.0, 478.0)).open(&mut open).show(ui.ctx(), |ui| {
                 self.log_island(ui);
@@ -2612,7 +2733,6 @@ fn main() -> eframe::Result<()> {
                 session_log_path: tfg::log::Journal::prototype_path(),
                 session_seq: 0,
                 transcript: Vec::new(),
-                show_session: false,
                 show_roster: false,
                 show_inspector: false,
                 show_orders: false,
@@ -2668,7 +2788,11 @@ fn main() -> eframe::Result<()> {
                 },
                 conn_status: "boot source (env)".to_string(),
                 show_connection: false,
+                // Boot is the lobby (task #40): the mode toggle plus the
+                // Simulation start wizard. Everything working opens later.
+                show_session: true,
                 wire_ctl_tx: Some(ui_wire_ctl_tx),
+                log_view_path: None,
                 groups: Groups::default(),
                 show_groups: false,
                 group_seq: 1,
