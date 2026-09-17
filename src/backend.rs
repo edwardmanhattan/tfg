@@ -332,7 +332,7 @@ pub fn keyring_load(user: &str) -> Result<Option<String>, String> {
 /// Forget the stored refresh token (sign out). Missing entry is fine.
 pub fn keyring_clear(user: &str) -> Result<(), String> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| e.to_string())?;
-    match entry.delete_password() {
+    match entry.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
