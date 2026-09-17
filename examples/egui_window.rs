@@ -2566,12 +2566,46 @@ impl eframe::App for ShipApp {
                 let response = ui.add(
                     egui::Image::new(tex)
                         .fit_to_exact_size(avail)
-                        .sense(egui::Sense::click()),
+                        // PROTOTYPE (pan-zoom ticket): click+drag so drags
+                        // pan while plain clicks keep select/place meaning.
+                        .sense(egui::Sense::click_and_drag()),
                 );
                 let rect = response.rect;
+                // PROTOTYPE: drag-to-pan. egui only reports clicked()
+                // when the press never became a drag, so drags pan and
+                // clicks place/select with no extra threshold of ours.
+                // Overlays track the center live every frame; the texture
+                // follows through the existing 250ms throttle + flush.
+                // Frozen when Closed (#55: map clicks go inert).
+                if self.mode.phase != Phase::Closed && response.dragged() {
+                    if response.drag_started() && self.following.is_some() {
+                        self.following = None;
+                        eprintln!("follow broken by drag");
+                    }
+                    let delta = response.drag_delta();
+                    if delta.x != 0.0 || delta.y != 0.0 {
+                        let (mw, mh) = self.map_dims();
+                        self.center = unproject_mercator(
+                            mw / 2.0 - delta.x as f64,
+                            mh / 2.0 - delta.y as f64,
+                            self.center,
+                            self.zoom,
+                            mw,
+                            mh,
+                        );
+                        self.zoom_dirty = true;
+                        if self.last_zoom_req.elapsed() >= Duration::from_millis(250) {
+                            self.zoom_dirty = false;
+                            self.last_zoom_req = Instant::now();
+                            self.refresh_map();
+                        }
+                    }
+                }
                 // Map click: stand up a catalog unit when placing, place
                 // a pending waypoint when arming, else select nearest.
-                if response.clicked() {
+                // PROTOTYPE: inert when Closed (#55); empty water
+                // deselects (#55: selection is Inspector visibility).
+                if self.mode.phase != Phase::Closed && response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let px = (pos.x - rect.min.x) as f64;
                         let py = (pos.y - rect.min.y) as f64;
@@ -2635,6 +2669,13 @@ impl eframe::App for ShipApp {
                             if let Some(id) = hit_test(&visible, px, py, 12.0) {
                                 eprintln!("select {id}");
                                 self.selected = Some(id);
+                            } else {
+                                // PROTOTYPE (#55): empty water deselects.
+                                // Armed placement/waypoint branches above
+                                // already consumed their clicks, so reaching
+                                // here unarmed always closes the Inspector.
+                                eprintln!("deselect");
+                                self.selected = None;
                             }
                         }
                     }
@@ -2645,17 +2686,17 @@ impl eframe::App for ShipApp {
                 // throttled (see ui() flush).
                 if response.hovered() {
                     let wheel: f64 = ui.input(|i| {
-                        // 0.36 funnels wheel + trackpad through the
-                        // smoothed delta; islands consume it first when
-                        // hovered, so the map only sees open-canvas scrolls.
+                        // PROTOTYPE (pan-zoom ticket): plain wheel joins
+                        // shift+wheel — every open-canvas scroll zooms,
+                        // anchored at the cursor (islands consume their own
+                        // scrolls first, so the map only sees open canvas).
                         let w = i.smooth_scroll_delta().y;
-                        let shift_wheel = if i.modifiers.shift { w } else { 0.0 };
                         let pinch = if i.zoom_delta() != 1.0 {
                             i.zoom_delta().ln() * 1200.0
                         } else {
                             0.0
                         };
-                        (shift_wheel + pinch) as f64
+                        (w + pinch) as f64
                     });
                     if wheel != 0.0 {
                         let old = self.zoom;
