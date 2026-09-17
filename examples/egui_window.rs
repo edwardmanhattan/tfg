@@ -42,7 +42,7 @@ const MAP_H: f64 = 600.0;
 /// size so the canvas can fill the window; responses echo it back so the
 /// texture is sized right.
 type MapReq = (u64, (f64, f64), f64, (u32, u32), u32);
-type MapResp = (u64, (f64, f64), (u32, u32), Vec<u8>);
+type MapResp = (u64, (f64, f64), f64, (u32, u32), Vec<u8>);
 const CENTER: (f64, f64) = (-6.108, 106.910);
 const ZOOM: f64 = 11.0;
 /// Zone/flag threshold (grill #24, slice iii): zones at or above this
@@ -325,7 +325,12 @@ fn pad_hull(pts: &[(f64, f64)], pad: f64) -> Vec<(f64, f64)> {
 
 struct ShipApp {
     map_tex: Option<egui::TextureHandle>,
-    map_version: u64,
+    /// What the current texture was rendered for: the canvas translates
+    /// (and scales, across zooms) it to the live camera while the fresh
+    /// tile is in flight, so gestures glide instead of stepping.
+    tex_center: (f64, f64),
+    tex_zoom: f64,
+    tex_px: (u32, u32),
     /// Viewport center shared by projection and (on swap) the frame.
     center: (f64, f64),
     registry: Registry,
@@ -690,9 +695,12 @@ impl ShipApp {
         self.map_view
     }
 
-    /// Apply finished map frames (last-writer-wins by sequence).
+    /// Apply finished map frames (last-writer-wins by sequence). The
+    /// camera stays authoritative: the texture only records what it was
+    /// rendered for (center/zoom/size) so the canvas can translate it
+    /// while a fresher tile is in flight. One texture, updated in place.
     fn drain_map(&mut self, ctx: &egui::Context) {
-        for (seq, center, size, rgba) in self.map_resp_rx.try_iter() {
+        for (seq, center, zoom, size, rgba) in self.map_resp_rx.try_iter() {
             if seq == self.map_seq {
                 let img = if LiveMap::is_premultiplied() {
                     egui::ColorImage::from_rgba_premultiplied(
@@ -705,13 +713,16 @@ impl ShipApp {
                         &rgba,
                     )
                 };
-                self.map_tex = Some(ctx.load_texture(
-                    format!("map-{}", self.map_version),
-                    img,
-                    egui::TextureOptions::LINEAR,
-                ));
-                self.map_version += 1;
-                self.center = center;
+                match &mut self.map_tex {
+                    Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
+                    None => {
+                        self.map_tex =
+                            Some(ctx.load_texture("map", img, egui::TextureOptions::LINEAR));
+                    }
+                }
+                self.tex_center = center;
+                self.tex_zoom = zoom;
+                self.tex_px = size;
                 if self.recentering.is_some() {
                     eprintln!("recentered");
                 }
@@ -720,34 +731,49 @@ impl ShipApp {
         }
     }
 
-    /// Ask the map thread for a frame centered on `at` for `ship`.
+    /// Ask the map thread for a frame centered on `at` for `ship`. The
+    /// camera jumps now; the texture catches up translated underneath.
     fn request_frame(&mut self, ship: &str, at: (f64, f64)) {
         let Some(tx) = self.map_req_tx.clone() else {
             return; // shutting down
         };
         self.map_seq += 1;
         self.recentering = Some(ship.to_string());
+        self.center = at;
         eprintln!("recentering on {ship}…");
         let _ = tx.send((self.map_seq, at, self.zoom, self.map_px, JUMP_PUMP));
     }
 
     /// Follow-tracking frame (task #45): light pump, no recenter label.
+    /// The camera tracks now; the texture follows translated.
     fn track_frame(&mut self, ship: &str, at: (f64, f64)) {
         let Some(tx) = self.map_req_tx.clone() else {
             return; // shutting down
         };
         self.map_seq += 1;
         self.recentering = Some(ship.to_string());
+        self.center = at;
         let _ = tx.send((self.map_seq, at, self.zoom, self.map_px, TRACK_PUMP));
     }
 
     /// Re-render at the current center and zoom without a recenter label.
     fn refresh_map(&mut self) {
+        self.refresh_map_with(ZOOM_PUMP);
+    }
+
+    /// Gesture preview (smoothness pass): pump 1 keeps the tile pipeline
+    /// under ~a throttle tick while the translated stale texture carries
+    /// the frame; the full-pump settle lands on the throttle flush.
+    fn refresh_map_light(&mut self) {
+        self.refresh_map_with(1);
+    }
+
+    fn refresh_map_with(&mut self, pump: u32) {
         let Some(tx) = self.map_req_tx.clone() else {
             return; // shutting down
         };
         self.map_seq += 1;
-        let _ = tx.send((self.map_seq, self.center, self.zoom, self.map_px, ZOOM_PUMP));
+        let _ = tx.send((self.map_seq, self.center, self.zoom, self.map_px, pump));
     }
 
     /// Zoom step (slice iii): clamps, re-renders, and reports. Zones give
@@ -2889,6 +2915,9 @@ impl eframe::App for ShipApp {
                         };
                         self.last_track_req = Instant::now();
                         self.track_frame(&id, at);
+                        // H1: repaint through the chase; idle cadence
+                        // resumes when the ship settles under the camera.
+                        ui.ctx().request_repaint();
                     }
                 }
             }
@@ -2916,9 +2945,32 @@ impl eframe::App for ShipApp {
                 self.last_desired_px = desired;
             }
             if let Some(tex) = &self.map_tex {
+                // Buttery canvas (smoothness pass): the camera is live but
+                // tiles lag it by a throttle tick, so draw the last texture
+                // translated (and scaled, across zooms) onto the current
+                // view. Screen corners round-trip through world space into
+                // texture texels; the fresh tile resolves underneath. Parts
+                // outside the texture smear one frame — transient by design.
+                let (mw, mh) = self.map_dims();
+                let (tw, th) = (self.tex_px.0 as f64, self.tex_px.1 as f64);
+                let center = self.center;
+                let zoom = self.zoom;
+                let tex_center = self.tex_center;
+                let tex_zoom = self.tex_zoom;
+                let to_uv = |px: f64, py: f64| {
+                    let (la, lo) = unproject_mercator(px, py, center, zoom, mw, mh);
+                    let (tx, ty) = project_mercator(la, lo, tex_center, tex_zoom, tw, th);
+                    (tx / tw, ty / th)
+                };
+                let (u0, v0) = to_uv(0.0, 0.0);
+                let (u1, v1) = to_uv(avail.x as f64, avail.y as f64);
                 let response = ui.add(
                     egui::Image::new(tex)
                         .fit_to_exact_size(avail)
+                        .uv(egui::Rect::from_min_max(
+                            egui::pos2(u0 as f32, v0 as f32),
+                            egui::pos2(u1 as f32, v1 as f32),
+                        ))
                         // click+drag: drags pan, plain clicks keep
                         // select/place meaning (pan-zoom ticket).
                         .sense(egui::Sense::click_and_drag()),
@@ -2947,10 +2999,13 @@ impl eframe::App for ShipApp {
                             mh,
                         );
                         self.zoom_dirty = true;
+                        // H1: keep repainting while the gesture runs; the
+                        // idle 100ms cadence resumes when it ends.
+                        ui.ctx().request_repaint();
                         if self.last_zoom_req.elapsed() >= Duration::from_millis(250) {
                             self.zoom_dirty = false;
                             self.last_zoom_req = Instant::now();
-                            self.refresh_map();
+                            self.refresh_map_light();
                         }
                     }
                 }
@@ -3075,10 +3130,12 @@ impl eframe::App for ShipApp {
                             self.zoom = new;
                             eprintln!("zoom {new:.1}");
                             self.zoom_dirty = true;
+                            // H1: repaint through the gesture.
+                            ui.ctx().request_repaint();
                             if self.last_zoom_req.elapsed() >= Duration::from_millis(250) {
                                 self.zoom_dirty = false;
                                 self.last_zoom_req = Instant::now();
-                                self.refresh_map();
+                                self.refresh_map_light();
                             }
                         }
                     }
@@ -3384,9 +3441,13 @@ fn main() -> eframe::Result<()> {
                 size = px;
             }
             scene.set_center(at, zoom);
+            // Smoothness measurement: round-trip cost per frame, so tile
+            // lag can be split into pump-bound vs render/network-bound.
+            let t0 = std::time::Instant::now();
             scene.pump(pump);
             let rgba = scene.frame_rgba();
-            if map_resp_tx.send((seq, at, size, rgba)).is_err() {
+            eprintln!("map frame {seq}: {}ms (pump {pump})", t0.elapsed().as_millis());
+            if map_resp_tx.send((seq, at, zoom, size, rgba)).is_err() {
                 break; // UI gone
             }
         }
@@ -3407,7 +3468,9 @@ fn main() -> eframe::Result<()> {
             apply_ops_theme(&cc.egui_ctx);
             Ok(Box::new(ShipApp {
                 map_tex: None,
-                map_version: 0,
+                tex_center: CENTER,
+                tex_zoom: ZOOM,
+                tex_px: (MAP_W as u32, MAP_H as u32),
                 map_px: (MAP_W as u32, MAP_H as u32),
                 map_view: (MAP_W, MAP_H),
                 last_desired_px: (MAP_W as u32, MAP_H as u32),
