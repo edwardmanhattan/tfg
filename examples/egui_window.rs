@@ -50,6 +50,11 @@ const ZOOM: f64 = 11.0;
 const ZONE_ZOOM: f64 = 11.0;
 /// Fixed ground padding around live hulls, in screen px (grill #24).
 const ZONE_PAD_PX: f64 = 26.0;
+/// Island scroll rule (scrollbar ticket): island bodies whose content can
+/// exceed the window scroll vertically instead of clipping. 420px fits a
+/// 640px viewport under the toolbar with room for window chrome; unbounded
+/// lists inside already-capped islands keep their own tighter cap.
+const ISLAND_SCROLL_MAX: f32 = 420.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Session stub pace (session flow): 7 real hours play 7 game days.
 /// Full windows UI lands with the organizer flow; the ratio is the load-
@@ -2152,7 +2157,9 @@ impl eframe::App for ShipApp {
                 .collapsible(false)
                 .open(&mut wiz_open)
                 .show(ui.ctx(), |ui| {
-                    self.wizard_island(ui);
+                    egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
+                        self.wizard_island(ui);
+                    });
                 });
             if !wiz_open {
                 self.wizard_done = true;
@@ -2161,7 +2168,9 @@ impl eframe::App for ShipApp {
         if self.show_session {
             let mut open = self.show_session;
             egui::Window::new("Session").movable(true).default_pos(egui::pos2(8.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
                 self.session_island(ui);
+                });
             });
             self.show_session = open;
         }
@@ -2177,6 +2186,10 @@ impl eframe::App for ShipApp {
                 ui.checkbox(&mut self.show_trail, "trails");
             }
             ui.separator();
+            // Scrollbar ticket: the marker list is unbounded, so it gets
+            // its own cap (300px, same as the Fleet hull list) while the
+            // header, trails toggle, and unfollow stay pinned outside it.
+            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
             for m in &markers {
                 ui.horizontal(|ui| {
                     let mut shown = !self.hidden.contains(&m.id);
@@ -2215,6 +2228,7 @@ impl eframe::App for ShipApp {
                     }
                 });
             }
+            });
             if ui.small_button("unfollow").clicked() {
                 self.following = None;
             }
@@ -2225,14 +2239,18 @@ impl eframe::App for ShipApp {
         if self.show_fleet && self.session_live() {
             let mut open = self.show_fleet;
             egui::Window::new("Fleet").movable(true).default_pos(egui::pos2(8.0, 300.0)).open(&mut open).show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
                 self.fleet_island(ui);
+                });
             });
             self.show_fleet = open;
         }
         if self.show_groups && self.session_live() {
             let mut open = self.show_groups;
             egui::Window::new("Groups").movable(true).default_pos(egui::pos2(240.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
                 self.groups_island(ui);
+                });
             });
             self.show_groups = open;
         }
