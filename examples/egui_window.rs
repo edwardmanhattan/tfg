@@ -50,6 +50,11 @@ const ZOOM: f64 = 11.0;
 const ZONE_ZOOM: f64 = 11.0;
 /// Fixed ground padding around live hulls, in screen px (grill #24).
 const ZONE_PAD_PX: f64 = 26.0;
+/// Island scroll rule (scrollbar ticket): island bodies whose content can
+/// exceed the window scroll vertically instead of clipping. 420px fits a
+/// 640px viewport under the toolbar with room for window chrome; unbounded
+/// lists inside already-capped islands keep their own tighter cap.
+const ISLAND_SCROLL_MAX: f32 = 420.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Session stub pace (session flow): 7 real hours play 7 game days.
 /// Full windows UI lands with the organizer flow; the ratio is the load-
@@ -66,12 +71,21 @@ enum Phase {
     Closed,
 }
 
-/// Setup pointer tool. Placement unmounts with Setup (reinforcements
-/// are fog); waypoint arming is a separate Live draft (`placing`).
+/// Placement pointer tool. Active in Setup (initial fleet) and Live
+/// (reinforcements); waypoint arming is a separate Live draft (`placing`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupTool {
     Select,
     Place,
+}
+
+/// Unified selection (Inspector-model ticket): one selection, ship-or-group.
+/// Selecting either kind clears the other; Inspector visibility IS selection
+/// presence — select opens it, deselect closes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Selection {
+    Ship(String),
+    Group(String),
 }
 
 struct UiMode {
@@ -214,10 +228,31 @@ impl Default for Draft {
 }
 
 /// Zone polygon for one group, in screen px (slice iii, grill #24).
+/// Carries the group id so zones are clickable like flags.
 struct ZoneGeom {
+    group: String,
     pts: Vec<(f32, f32)>,
     fill: egui::Color32,
     stroke: egui::Color32,
+}
+
+/// Point-in-polygon over a zone's screen pts (ray cast). Degenerate
+/// hulls (fewer than 3 pts) never hit: click the ship or flag instead.
+fn in_poly(px: f64, py: f64, pts: &[(f32, f32)]) -> bool {
+    if pts.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = pts.len() - 1;
+    for i in 0..pts.len() {
+        let (xi, yi) = (pts[i].0 as f64, pts[i].1 as f64);
+        let (xj, yj) = (pts[j].0 as f64, pts[j].1 as f64);
+        if (yi > py) != (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 /// Collapsed group flag: centroid screen point + lat/lon for click-to-expand.
@@ -320,7 +355,6 @@ struct ShipApp {
     /// map. Run-local visibility; phase decides what may show.
     show_session: bool,
     show_roster: bool,
-    show_inspector: bool,
     show_orders: bool,
     show_log: bool,
     /// Wizard (islands grill, #27): stepped Setup, dismissed on Live.
@@ -329,7 +363,10 @@ struct ShipApp {
     /// Event feed for the Log island: capped human lines drained from
     /// sim events (arrivals, refusals, overrides, blockages).
     event_feed: VecDeque<String>,
-    selected: Option<String>,
+    /// Unified selection (Inspector-model ticket): the Inspector shows
+    /// whichever is set and shuts when it clears. Helpers below
+    /// (select_ship/select_group/deselect) are the only writers.
+    selection: Option<Selection>,
     /// Wall-clock last-seen + fix counts per ship (inspector readout;
     /// stamped as poll rounds arrive, so the geo model stays time-free).
     last_seen: HashMap<String, Instant>,
@@ -529,9 +566,12 @@ impl ShipApp {
                     self.order_warning = Some(format!("{ship_id}: {why}"));
                 }
                 SimEvent::CommandOverridden { ship_id, prev_rank, by_rank } => {
-                    self.feed(format!("overridden {ship_id}: {prev_rank} -> {by_rank}"));
-                    self.order_warning =
-                        Some(format!("{ship_id}: overridden by higher authority"));
+                    // Escalation, not a hijack: the command succeeded and
+                    // took the ship to a higher authority (e.g. the
+                    // organizer's Satgas order lifting UNIT-held ships).
+                    // Loud in the feed + journal, but no sticky warning:
+                    // warnings are for orders that did NOT happen.
+                    self.feed(format!("authority {ship_id}: {prev_rank} -> {by_rank}"));
                 }
                 SimEvent::ShipBlocked { ship_id } => {
                     self.feed(format!("blocked at coast: {ship_id}"));
@@ -582,7 +622,7 @@ impl ShipApp {
         }
         self.app_mode = mode;
         self.registry = Registry::new(TrailBound::default());
-        self.selected = None;
+        self.deselect();
         self.following = None;
         self.recentering = None;
         if mode == AppMode::Presentation {
@@ -716,6 +756,66 @@ impl ShipApp {
         self.zoom = (self.zoom + delta).clamp(3.0, 18.0);
         eprintln!("zoom {:.0}", self.zoom);
         self.refresh_map();
+    }
+
+    /// Select a ship: clears any group selection and opens the Inspector.
+    fn select_ship(&mut self, id: String) {
+        self.selection = Some(Selection::Ship(id));
+    }
+
+    /// Select a group: clears any ship selection and opens the Inspector.
+    fn select_group(&mut self, gid: String) {
+        self.selection = Some(Selection::Group(gid));
+    }
+
+    /// Deselect: the Inspector shuts with the selection. Follow (camera)
+    /// is independent and untouched.
+    fn deselect(&mut self) {
+        self.selection = None;
+    }
+
+    /// Group display name + member units for a Satgas or Gugus id.
+    fn group_info(&self, gid: &str) -> Option<(String, Vec<String>)> {
+        if let Some(s) = self.groups.satgas_list().iter().find(|s| s.id == gid) {
+            return Some((s.name.clone(), s.units.clone()));
+        }
+        if let Some(g) = self.groups.gugus_list().iter().find(|g| g.id == gid) {
+            return Some((g.name.clone(), self.groups.gugus_units(&g.id)));
+        }
+        None
+    }
+
+    /// Authority the acting identity holds over these units: the
+    /// organizer commands all; others take their highest group level
+    /// over the set (Gugus > Satgas > unit), falling back to unit
+    /// level where the desktop scope allows (helm). None = view-only.
+    fn command_authority(&self, units: &[String]) -> Option<Authority> {
+        let Some(user) = self.acting_as.as_ref() else {
+            return Some(Authority::ORGANIZER);
+        };
+        let mut best: Option<Authority> = None;
+        for u in units {
+            let a = match self.groups.authority(user, u, &self.unit_commander) {
+                Some(a) => a,
+                None if self.action_allows(u) => Authority::UNIT,
+                None => continue,
+            };
+            best = Some(best.map_or(a, |b: Authority| b.max(a)));
+        }
+        best
+    }
+
+    /// Human label for a command authority level.
+    fn authority_label(a: Authority) -> &'static str {
+        if a == Authority::ORGANIZER {
+            "organizer"
+        } else if a == Authority::GUGUS {
+            "gugus"
+        } else if a == Authority::SATGAS {
+            "satgas"
+        } else {
+            "unit"
+        }
     }
 
     /// Display name for a placed unit: fleet name + hull, or the raw id.
@@ -958,13 +1058,12 @@ impl ShipApp {
         self.session_log_path = path;
         self.mode.start();
         self.wizard_done = true;
-        // Going live needs the working islands; the Fleet picker is
-        // Setup-only, so it steps aside.
+        // Going live needs the working islands; the Fleet picker stays
+        // available for Live reinforcements, so it is left as-is. The
+        // Inspector opens on first selection, not here.
         self.show_roster = true;
-        self.show_inspector = true;
         self.show_orders = true;
         self.show_log = true;
-        self.show_fleet = false;
         eprintln!("session live at {ratio:.1}x");
     }
 
@@ -978,7 +1077,6 @@ impl ShipApp {
     fn close_working_islands(&mut self) {
         self.show_roster = false;
         self.show_fleet = false;
-        self.show_inspector = false;
         self.show_orders = false;
         self.show_log = false;
         self.show_groups = false;
@@ -1115,6 +1213,9 @@ impl ShipApp {
     fn end_session(&mut self) {
         self.mode.end();
         self.close_working_islands();
+        // Closed clears selection: the map freezes under its transcript,
+        // clicks go inert, the Inspector shuts.
+        self.deselect();
         if let Ok(text) = std::fs::read_to_string(&self.session_log_path) {
             let lines: Vec<String> =
                 text.lines().map(|s| s.to_string()).collect();
@@ -1465,6 +1566,7 @@ impl ShipApp {
                 if ui.small_button("new setup").clicked() {
                     self.mode.reset();
                     self.close_working_islands();
+                    self.selection = None;
                     self.placed_fleet.clear();
                     self.fleet_pick = None;
                     self.helm.clear();
@@ -1550,6 +1652,7 @@ impl ShipApp {
             }
             let hull = pad_hull(&convex_hull(pts), ZONE_PAD_PX);
             zones.push(ZoneGeom {
+                group: gid,
                 pts: hull.into_iter().map(|(x, y)| (x as f32, y as f32)).collect(),
                 fill,
                 stroke,
@@ -1560,11 +1663,12 @@ impl ShipApp {
 
     /// Groups island (slice iii): the organizer builds Satgas (units +
     /// commander) and Gugus (satgas + commander) from the roster. Editing
-    /// is Setup-only; Live keeps the read-only list.
+    /// runs in Setup and Live (reorganization mid-session); Closed is read-only.
     fn groups_island(&mut self, ui: &mut egui::Ui) {
         ui.heading("Groups");
         ui.label("Satgas of units, Gugus of Satgas. Commanders from the roster.");
-        let editable = self.mode.phase == Phase::Setup && self.acting_as.is_none();
+        let editable =
+            (self.mode.phase == Phase::Setup || self.mode.phase == Phase::Live) && self.acting_as.is_none();
         let roster: Vec<String> = self.roster.clone();
         if editable {
             ui.separator();
@@ -1655,7 +1759,12 @@ impl ShipApp {
             .collect();
         for (id, name, commander, n) in &satgas {
             ui.horizontal(|ui| {
-                ui.label(format!("{} — {} · {} unit(s)", name, commander.as_deref().unwrap_or("no commander"), n));
+                let mark = if self.selection == Some(Selection::Group(id.clone())) { " ●" } else { "" };
+                ui.label(format!("{} — {} · {} unit(s){mark}", name, commander.as_deref().unwrap_or("no commander"), n));
+                if ui.small_button("select").clicked() {
+                    self.select_group(id.clone());
+                    self.show_orders = true;
+                }
                 if editable && ui.small_button("remove").clicked() {
                     self.groups.remove_satgas(id);
                 }
@@ -1729,7 +1838,12 @@ impl ShipApp {
             .collect();
         for (id, name, commander, n) in &gugus {
             ui.horizontal(|ui| {
-                ui.label(format!("{} — {} · {} unit(s)", name, commander.as_deref().unwrap_or("no commander"), n));
+                let mark = if self.selection == Some(Selection::Group(id.clone())) { " ●" } else { "" };
+                ui.label(format!("{} — {} · {} unit(s){mark}", name, commander.as_deref().unwrap_or("no commander"), n));
+                if ui.small_button("select").clicked() {
+                    self.select_group(id.clone());
+                    self.show_orders = true;
+                }
                 if editable && ui.small_button("remove").clicked() {
                     self.groups.remove_gugus(id);
                 }
@@ -1855,9 +1969,11 @@ impl ShipApp {
         // The sim is not polled while disarmed, so a TakeControl sent
         // with the engine off would sit in the queue invisibly. Gate
         // arming placement on the engine, with a one-click arm here.
+        // Placement runs in Setup (initial fleet) and Live
+        // (reinforcements); Closed is read-only.
         let armed = self.mode.armed.load(Ordering::SeqCst);
-        if self.mode.phase != Phase::Setup {
-            ui.label("Placement is Setup-only.");
+        if self.mode.phase == Phase::Closed {
+            ui.label("Placement is unavailable once the session is closed.");
         } else if !armed {
             ui.label("Engine is presentation-only: placed hulls stay invisible until it runs.");
             if ui.small_button("arm engine").clicked() {
@@ -2051,20 +2167,23 @@ impl eframe::App for ShipApp {
                 ui.separator();
                 ui.toggle_value(&mut self.show_connection, "Connection");
                 if self.app_mode == AppMode::Presentation {
-                    ui.toggle_value(&mut self.show_inspector, "Inspector");
+                    // No Inspector toggle: selection drives it (a marker or
+                    // roster click opens it, deselect closes it).
                     ui.toggle_value(&mut self.show_log, "Log");
                 }
                 if self.app_mode == AppMode::Simulation {
                     ui.toggle_value(&mut self.show_session, "Session");
+                    // Fleet spans Setup (initial placement) and Live
+                    // (reinforcements); Groups likewise (setup + mid-session
+                    // reorganization). The rest unlock once live (task #40).
+                    ui.toggle_value(&mut self.show_fleet, "Fleet");
+                    ui.toggle_value(&mut self.show_groups, "Groups");
                     // Working islands unlock once a session exists (task
-                    // #40): pre-session the lobby is Session + Connection.
+                    // #40): pre-session the lobby is Session + Fleet + Groups + Connection.
                     if self.session_live() {
                         ui.toggle_value(&mut self.show_roster, "Roster");
-                        ui.toggle_value(&mut self.show_fleet, "Fleet");
-                        ui.toggle_value(&mut self.show_inspector, "Inspector");
                         ui.toggle_value(&mut self.show_orders, "Orders");
                         ui.toggle_value(&mut self.show_log, "Log");
-                        ui.toggle_value(&mut self.show_groups, "Groups");
                     }
                 }
                 ui.separator();
@@ -2152,7 +2271,9 @@ impl eframe::App for ShipApp {
                 .collapsible(false)
                 .open(&mut wiz_open)
                 .show(ui.ctx(), |ui| {
-                    self.wizard_island(ui);
+                    egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
+                        self.wizard_island(ui);
+                    });
                 });
             if !wiz_open {
                 self.wizard_done = true;
@@ -2161,7 +2282,9 @@ impl eframe::App for ShipApp {
         if self.show_session {
             let mut open = self.show_session;
             egui::Window::new("Session").movable(true).default_pos(egui::pos2(8.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
                 self.session_island(ui);
+                });
             });
             self.show_session = open;
         }
@@ -2177,6 +2300,10 @@ impl eframe::App for ShipApp {
                 ui.checkbox(&mut self.show_trail, "trails");
             }
             ui.separator();
+            // Scrollbar ticket: the marker list is unbounded, so it gets
+            // its own cap (300px, same as the Fleet hull list) while the
+            // header, trails toggle, and unfollow stay pinned outside it.
+            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
             for m in &markers {
                 ui.horizontal(|ui| {
                     let mut shown = !self.hidden.contains(&m.id);
@@ -2201,7 +2328,8 @@ impl eframe::App for ShipApp {
                     if ui.selectable_value(&mut self.following, Some(m.id.clone()), label).clicked()
                     {
                         eprintln!("follow {:?}", self.following);
-                        self.selected = Some(m.id.clone());
+                        // Roster click is a select like a marker click.
+                        self.select_ship(m.id.clone());
                         if self.following.as_deref() == Some(&m.id) {
                             if let Some(s) =
                                 self.registry.ships().iter().find(|s| s.ship_id == m.id)
@@ -2215,6 +2343,7 @@ impl eframe::App for ShipApp {
                     }
                 });
             }
+            });
             if ui.small_button("unfollow").clicked() {
                 self.following = None;
             }
@@ -2222,35 +2351,45 @@ impl eframe::App for ShipApp {
             });
             self.show_roster = open;
         }
-        if self.show_fleet && self.session_live() {
+        if self.show_fleet && self.mode.phase != Phase::Closed {
             let mut open = self.show_fleet;
             egui::Window::new("Fleet").movable(true).default_pos(egui::pos2(8.0, 300.0)).open(&mut open).show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
                 self.fleet_island(ui);
+                });
             });
             self.show_fleet = open;
         }
-        if self.show_groups && self.session_live() {
+        if self.show_groups && self.mode.phase != Phase::Closed {
             let mut open = self.show_groups;
             egui::Window::new("Groups").movable(true).default_pos(egui::pos2(240.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
                 self.groups_island(ui);
+                });
             });
             self.show_groups = open;
         }
-        if self.show_inspector
+        // Inspector: selection-driven (Inspector-model ticket). The window
+        // exists iff a selection exists; closing it deselects. Ships get
+        // the live readout, groups get members/commander/authority plus
+        // command + focus actions.
+        if self.selection.is_some()
             && (self.session_live() || self.app_mode == AppMode::Presentation)
         {
-            let mut open = self.show_inspector;
+            let mut open = true;
             egui::Window::new("Inspector").movable(true).default_pos(egui::pos2(816.0, 300.0)).open(&mut open).show(ui.ctx(), |ui| {
-            // Inspector: live readout for the selected ship.
             ui.heading("Inspector");
-            let mut close_inspector = false;
             let mut follow_selected: Option<(String, (f64, f64))> = None;
-            match self.selected.clone().and_then(|id| {
-                self.registry.ships().iter().find(|s| s.ship_id == id).map(|s| (id, s.latest.clone(), s.stale, s.trail.len()))
-            }) {
-                Some((id, fix, stale, trail_len)) => {
+            let mut focus_group: Option<(String, (f64, f64))> = None;
+            let mut drill_ship: Option<String> = None;
+            let mut drill_group: Option<String> = None;
+            let mut deselect = false;
+            match self.selection.clone() {
+                Some(Selection::Ship(id)) => {
+            match self.registry.ships().iter().find(|s| s.ship_id == id).map(|s| (s.latest.clone(), s.stale, s.trail.len())) {
+                Some((fix, stale, trail_len)) => {
                     let sim_badge = if fix.source == FixSource::Sim { " (sim)" } else { "" };
-                    ui.label(format!("ship: {id}{sim_badge}{}", if stale { " (stale)" } else { "" }));
+                    ui.label(format!("ship: {}{sim_badge}{}", self.unit_label(&id), if stale { " (stale)" } else { "" }));
                     ui.label(format!(
                         "pos: {:.6} {:.6}",
                         fix.position.latitude, fix.position.longitude
@@ -2272,24 +2411,126 @@ impl eframe::App for ShipApp {
                             ));
                         }
                         if ui.small_button("close").clicked() {
-                            close_inspector = true;
+                            deselect = true;
                         }
                     });
                 }
                 None => {
-                    ui.label("click a ship on the map or roster");
+                    ui.label("ship out of view — deselect and pick again");
+                    if ui.small_button("clear").clicked() {
+                        deselect = true;
+                    }
                 }
             }
-            if close_inspector {
-                self.selected = None;
+                }
+                Some(Selection::Group(gid)) => {
+                    match self.group_info(&gid) {
+                        Some((name, members)) => {
+                            let commander = self.groups.satgas_list().iter().find(|s| s.id == gid).and_then(|s| s.commander.clone()).or_else(|| self.groups.gugus_list().iter().find(|g| g.id == gid).and_then(|g| g.commander.clone()));
+                            let allowed: Vec<String> = members.iter().filter(|u| self.action_allows(u)).cloned().collect();
+                            let auth = self.command_authority(&allowed).map(Self::authority_label).unwrap_or("view only");
+                            ui.label(format!("group: {name} · {} unit(s)", members.len()));
+                            ui.label(format!(
+                                "commander: {} · you hold: {auth}",
+                                commander.as_deref().unwrap_or("—")
+                            ));
+                            // Gugus lists member Satgas, not a flat unit dump.
+                            let satgas_ids: Vec<String> = self
+                                .groups
+                                .gugus_list()
+                                .iter()
+                                .find(|g| g.id == gid)
+                                .map(|g| g.satgas.clone())
+                                .unwrap_or_default();
+                            if satgas_ids.is_empty() {
+                                for u in &members {
+                                    ui.horizontal(|ui| {
+                                        ui.label(self.unit_label(u));
+                                        if ui.small_button("inspect").clicked() {
+                                            drill_ship = Some(u.clone());
+                                        }
+                                    });
+                                }
+                            } else {
+                                for sid in &satgas_ids {
+                                    if let Some(s) = self.groups.satgas_list().iter().find(|s| &s.id == sid) {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("{} · {} unit(s)", s.name, s.units.len()));
+                                            if ui.small_button("select").clicked() {
+                                                drill_group = Some(s.id.clone());
+                                            }
+                                        });
+                                        for u in &s.units {
+                                            ui.horizontal(|ui| {
+                                                ui.label(format!("  {}", self.unit_label(u)));
+                                                if ui.small_button("inspect").clicked() {
+                                                    drill_ship = Some(u.clone());
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.small_button("command").clicked() {
+                                    self.show_orders = true;
+                                }
+                                if ui.small_button("focus").clicked() {
+                                    let mut lat_sum = 0.0;
+                                    let mut lon_sum = 0.0;
+                                    let mut count = 0usize;
+                                    for m in &members {
+                                        if let Some(s) = self.registry.ships().iter().find(|s| &s.ship_id == m) {
+                                            lat_sum += s.latest.position.latitude;
+                                            lon_sum += s.latest.position.longitude;
+                                            count += 1;
+                                        }
+                                    }
+                                    if count > 0 {
+                                        focus_group = Some((
+                                            gid.clone(),
+                                            (lat_sum / count as f64, lon_sum / count as f64),
+                                        ));
+                                    }
+                                }
+                                if ui.small_button("close").clicked() {
+                                    deselect = true;
+                                }
+                            });
+                        }
+                        None => {
+                            ui.label("group removed.");
+                            if ui.small_button("clear").clicked() {
+                                deselect = true;
+                            }
+                        }
+                    }
+                }
+                None => {}
+            }
+            if deselect {
+                self.deselect();
+            }
+            if let Some(id) = drill_ship {
+                self.select_ship(id);
+            }
+            if let Some(gid) = drill_group {
+                self.select_group(gid);
             }
             if let Some((ship, at)) = follow_selected {
                 self.following = Some(ship.clone());
                 self.request_frame(&ship, at);
             }
+            if let Some((gid, at)) = focus_group {
+                self.center = at;
+                self.zoom = self.zoom.max(ZONE_ZOOM);
+                self.request_frame(&gid, at);
+            }
             ui.separator();
             });
-            self.show_inspector = open;
+            if !open {
+                self.deselect();
+            }
         }
         // Orders island: Live-only; observers get no orders pane at all.
         if self.show_orders && self.mode.live() && !self.is_observer() {
@@ -2298,7 +2539,119 @@ impl eframe::App for ShipApp {
             // Orders (prototype sim loop): take control, place waypoint,
             // commit speed order; sim advances the ship, inspector shows it.
             ui.heading("Orders");
-            if let Some(id) = self.selected.clone() {
+            // Group command: a zone/flag click (or the Groups island)
+            // selects the group; whoever holds authority fans one
+            // waypoint out to every unit in jurisdiction. The waypoint
+            // draft is shared with single-ship orders.
+            if let Some(Selection::Group(gid)) = self.selection.clone() {
+                match self.group_info(&gid) {
+                    Some((name, members)) => {
+                        let allowed: Vec<String> = members
+                            .iter()
+                            .filter(|u| self.action_allows(u))
+                            .cloned()
+                            .collect();
+                        let auth = self.command_authority(&allowed);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(format!("group: {name} · {} unit(s)", members.len()));
+                            if ui.small_button("✕").clicked() {
+                                self.deselect();
+                            }
+                        });
+                        match auth {
+                            Some(a) if !allowed.is_empty() => {
+                                ui.label(format!(
+                                    "authority: {} · {} in jurisdiction",
+                                    Self::authority_label(a),
+                                    allowed.len()
+                                ));
+                                if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
+                                    self.placing = !self.placing;
+                                }
+                                let can_commit = self
+                                    .pending_waypoint
+                                    .is_some_and(|(la, lo)| {
+                                        self.land
+                                            .as_ref()
+                                            .map(|l| {
+                                                l.is_water(&GeoPosition {
+                                                    latitude: la,
+                                                    longitude: lo,
+                                                })
+                                            })
+                                            .unwrap_or(true)
+                                    });
+                                if self.pending_waypoint.is_some() && !can_commit {
+                                    ui.label(
+                                        egui::RichText::new("⚠ waypoint on land")
+                                            .color(egui::Color32::YELLOW),
+                                    );
+                                }
+                                if ui
+                                    .add_enabled(
+                                        can_commit,
+                                        egui::Button::new(format!("order group ({})", allowed.len())),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some((la, lo)) = self.pending_waypoint {
+                                        if let Some(tx) = &self.sim_cmd_tx {
+                                            let waypoint = GeoPosition {
+                                                latitude: la,
+                                                longitude: lo,
+                                            };
+                                            let legs: Vec<Leg> = allowed
+                                                .iter()
+                                                .map(|ship| {
+                                                    let max = self
+                                                        .order_views
+                                                        .get(ship)
+                                                        .map(|v| v.max_speed_kn)
+                                                        .unwrap_or(self.order_speed);
+                                                    Leg {
+                                                        ship_id: ship.clone(),
+                                                        waypoint,
+                                                        speed_kn: self.order_speed.min(max),
+                                                    }
+                                                })
+                                                .collect();
+                                            let _ = tx.send(SimCommand::OrderMove {
+                                                command: MoveCommand {
+                                                    legs,
+                                                    default_speed_kn: Some(self.order_speed),
+                                                    authority: a,
+                                                    grant: Grant {
+                                                        units: allowed.clone(),
+                                                        expires_game_secs: u64::MAX,
+                                                        verbs: vec![Verb::Move],
+                                                    },
+                                                },
+                                            });
+                                            eprintln!(
+                                                "order group {name} -> ({la:.4}, {lo:.4})"
+                                            );
+                                        }
+                                        self.pending_waypoint = None;
+                                        self.placing = false;
+                                    }
+                                }
+                            }
+                            _ => {
+                                ui.label("Outside your jurisdiction — view only.");
+                            }
+                        }
+                        ui.separator();
+                    }
+                    None => {
+                        ui.label("group removed.");
+                        if ui.small_button("clear").clicked() {
+                            self.deselect();
+                        }
+                    }
+                }
+            }
+            if let Some(Selection::Ship(id)) = self.selection.clone() {
                 // Scoped desktop (slice iv): command inside jurisdiction,
                 // view everything.
                 let allowed = self.action_allows(&id);
@@ -2487,8 +2840,8 @@ impl eframe::App for ShipApp {
                         }
                     }
                 }
-            } else {
-                ui.label("select a ship first");
+            } else if self.selection.is_none() {
+                ui.label("select a ship or group first");
             }
             });
             self.show_orders = open;
@@ -2566,18 +2919,52 @@ impl eframe::App for ShipApp {
                 let response = ui.add(
                     egui::Image::new(tex)
                         .fit_to_exact_size(avail)
-                        .sense(egui::Sense::click()),
+                        // click+drag: drags pan, plain clicks keep
+                        // select/place meaning (pan-zoom ticket).
+                        .sense(egui::Sense::click_and_drag()),
                 );
                 let rect = response.rect;
+                // Drag-to-pan (pan-zoom ticket): drags move the camera and
+                // break follow; egui only reports clicked() when the press
+                // never became a drag, so clicks keep their meaning with no
+                // extra threshold. Overlays track the center live; the
+                // texture follows through the 250ms throttle + flush.
+                // Closed is inert (Inspector-model ticket).
+                if self.mode.phase != Phase::Closed && response.dragged() {
+                    if response.drag_started() && self.following.is_some() {
+                        self.following = None;
+                        eprintln!("follow broken by drag");
+                    }
+                    let delta = response.drag_delta();
+                    if delta.x != 0.0 || delta.y != 0.0 {
+                        let (mw, mh) = self.map_dims();
+                        self.center = unproject_mercator(
+                            mw / 2.0 - delta.x as f64,
+                            mh / 2.0 - delta.y as f64,
+                            self.center,
+                            self.zoom,
+                            mw,
+                            mh,
+                        );
+                        self.zoom_dirty = true;
+                        if self.last_zoom_req.elapsed() >= Duration::from_millis(250) {
+                            self.zoom_dirty = false;
+                            self.last_zoom_req = Instant::now();
+                            self.refresh_map();
+                        }
+                    }
+                }
                 // Map click: stand up a catalog unit when placing, place
                 // a pending waypoint when arming, else select nearest.
-                if response.clicked() {
+                // Armed clicks never deselect; empty water clears the
+                // selection (Inspector-model ticket).
+                if self.mode.phase != Phase::Closed && response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let px = (pos.x - rect.min.x) as f64;
                         let py = (pos.y - rect.min.y) as f64;
                         let (mw, mh) = self.map_dims();
                         if self.mode.tool == SetupTool::Place
-                            && self.mode.phase == Phase::Setup
+                            && (self.mode.phase == Phase::Setup || self.mode.phase == Phase::Live)
                             && self.mode.armed.load(Ordering::SeqCst)
                             && self.acting_as.is_none()
                         {
@@ -2602,7 +2989,7 @@ impl eframe::App for ShipApp {
                                     // Placed units arrive owned (Q3): the click is
                                     // the take-control, no second step.
                                     self.controlled.insert(id.clone());
-                                    self.selected = Some(id.clone());
+                                    self.select_ship(id.clone());
                                     self.placed_fleet.insert(id);
                                     self.fleet_pick = None;
                                 }
@@ -2622,9 +3009,11 @@ impl eframe::App for ShipApp {
                             .map(|f| (f.group.clone(), f.lat, f.lon))
                         {
                             // Click-to-expand (grill #24): center the group
-                            // and zoom in to its zone.
+                            // and zoom in to its zone; the group selection
+                            // opens its Inspector and arms group command.
                             self.center = (flag.1, flag.2);
                             self.zoom = self.zoom.max(ZONE_ZOOM);
+                            self.select_group(flag.0.clone());
                             self.request_frame(&flag.0, (flag.1, flag.2));
                         } else {
                             let visible: Vec<(String, f64, f64)> = markers
@@ -2634,28 +3023,38 @@ impl eframe::App for ShipApp {
                                 .collect();
                             if let Some(id) = hit_test(&visible, px, py, 12.0) {
                                 eprintln!("select {id}");
-                                self.selected = Some(id);
+                                self.select_ship(id);
+                            } else if let Some(gid) = zones
+                                .iter()
+                                .find(|z| in_poly(px, py, &z.pts))
+                                .map(|z| z.group.clone())
+                            {
+                                // Zone click (no ship hit): select the group.
+                                eprintln!("select group {gid}");
+                                self.select_group(gid);
+                            } else if self.mode.tool != SetupTool::Place && !self.placing {
+                                // Empty water, nothing armed: deselect (the
+                                // Inspector shuts with the selection).
+                                eprintln!("deselect");
+                                self.deselect();
                             }
                         }
                     }
                 }
-                // Seamless zoom (task #43): shift+wheel glides, pinch
-                // follows; the point under the cursor stays put via
-                // anchor math. Overlays track every tick, the texture is
-                // throttled (see ui() flush).
+                // Seamless zoom (task #43 + pan-zoom ticket): plain wheel
+                // joins shift+wheel and pinch; the point under the cursor
+                // stays put via anchor math. Overlays track every tick, the
+                // texture is throttled (see ui() flush). Islands consume
+                // their own scrolls first, so the map only sees open canvas.
                 if response.hovered() {
                     let wheel: f64 = ui.input(|i| {
-                        // 0.36 funnels wheel + trackpad through the
-                        // smoothed delta; islands consume it first when
-                        // hovered, so the map only sees open-canvas scrolls.
                         let w = i.smooth_scroll_delta().y;
-                        let shift_wheel = if i.modifiers.shift { w } else { 0.0 };
                         let pinch = if i.zoom_delta() != 1.0 {
                             i.zoom_delta().ln() * 1200.0
                         } else {
                             0.0
                         };
-                        (shift_wheel + pinch) as f64
+                        (w + pinch) as f64
                     });
                     if wheel != 0.0 {
                         let old = self.zoom;
@@ -2692,11 +3091,18 @@ impl eframe::App for ShipApp {
                         .iter()
                         .map(|(x, y)| rect.min + egui::vec2(*x, *y))
                         .collect();
+                    // Selected group draws proud: white stroke, thicker.
+                    let (stroke_color, stroke_w) =
+                        if self.selection == Some(Selection::Group(z.group.clone())) {
+                            (egui::Color32::WHITE, 4.0)
+                        } else {
+                            (z.stroke, 2.0)
+                        };
                     if pts.len() >= 3 {
                         painter.add(egui::Shape::convex_polygon(
                             pts,
                             z.fill,
-                            egui::Stroke::new(2.0, z.stroke),
+                            egui::Stroke::new(stroke_w, stroke_color),
                         ));
                     } else if pts.len() == 2 {
                         painter.line_segment([pts[0], pts[1]], egui::Stroke::new(10.0, z.fill));
@@ -2739,7 +3145,7 @@ impl eframe::App for ShipApp {
                     if Some(&m.id) == self.following.as_ref() {
                         painter.circle_stroke(c, 12.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
                     }
-                    if Some(&m.id) == self.selected.as_ref() {
+                    if self.selection == Some(Selection::Ship(m.id.clone())) {
                         painter.circle_stroke(
                             c,
                             12.0,
@@ -2799,10 +3205,25 @@ impl eframe::App for ShipApp {
                     }
                 }
                 if let Some((la, lo)) = self.pending_waypoint {
-                    if let Some(id) = self.selected.clone() {
+                    if let Some(Selection::Ship(id)) = self.selection.clone() {
                         if let Some(m) = markers.iter().find(|m| m.id == id) {
                             let (wx, wy) = project_mercator(la, lo, self.center, self.zoom, mw, mh);
                             legs.push(((m.x, m.y), (wx, wy), egui::Color32::WHITE));
+                        }
+                    }
+                    // Group preview: white legs from every in-jurisdiction
+                    // member of the selected group.
+                    if let Some(Selection::Group(gid)) = self.selection.clone() {
+                        if let Some((_, members)) = self.group_info(&gid) {
+                            for m in markers.iter().filter(|m| {
+                                members.iter().any(|u| u == &m.id)
+                                    && !self.hidden.contains(&m.id)
+                                    && self.action_allows(&m.id)
+                            }) {
+                                let (wx, wy) =
+                                    project_mercator(la, lo, self.center, self.zoom, mw, mh);
+                                legs.push(((m.x, m.y), (wx, wy), egui::Color32::WHITE));
+                            }
                         }
                     }
                 }
@@ -3010,13 +3431,12 @@ fn main() -> eframe::Result<()> {
                 session_seq: 0,
                 transcript: Vec::new(),
                 show_roster: false,
-                show_inspector: false,
                 show_orders: false,
                 show_log: false,
                 wizard_step: 0,
                 wizard_done: false,
                 event_feed: VecDeque::new(),
-                selected: None,
+                selection: None,
                 last_seen: HashMap::new(),
                 fix_count: HashMap::new(),
                 sim_cmd_tx: Some(ui_sim_cmd_tx),
