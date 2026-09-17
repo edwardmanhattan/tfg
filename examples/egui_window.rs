@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use chrono::{TimeZone, Utc};
-use tfg::backend::{FileReplay, HttpPoll, Invite, InviteClient, PollSource};
+use tfg::backend::{FileReplay, HttpPoll, Invite, InviteClient, MinosAuth, PollSource, TokenPair};
 use tfg::catalog::{Catalog, Category};
 use tfg::fleet::Fleet;
 use tfg::groups::Groups;
@@ -419,6 +419,24 @@ struct ShipApp {
     invites: Vec<Invite>,
     invite_seq: usize,
     invite_status: String,
+    /// Minos auth state (login ticket): REST base, island fields, and the
+    /// session — identifier plus in-memory access token with issue time +
+    /// TTL. The refresh token lives in the OS keyring (memory fallback
+    /// when degraded, flagged). Bearer-ready for the later socket work.
+    minos_base: String,
+    show_login: bool,
+    login_identifier: String,
+    login_password: String,
+    auth_user: Option<String>,
+    auth_token: Option<String>,
+    auth_issued_at: Option<Instant>,
+    auth_ttl_secs: u64,
+    auth_refresh_memory: Option<String>,
+    auth_degraded: bool,
+    auth_status: String,
+    auth_needs_password_change: bool,
+    pw_current: String,
+    pw_new: String,
     /// Ratio derived from the entered windows (replaces the 24x stub).
     session_ratio: f64,
     /// Map zoom (slice iii): feeds the map thread per request; the
@@ -687,6 +705,185 @@ impl ShipApp {
             }
         });
         ui.label(&self.conn_status);
+    }
+
+    /// Stash a fresh pair: access token in memory with a fresh issue
+    /// time, refresh token to the keyring (memory fallback, flagged).
+    fn store_pair(&mut self, user: String, pair: TokenPair) {
+        if let Some(rt) = pair.refresh_token.clone() {
+            if tfg::backend::keyring_save(&user, &rt).is_err() {
+                self.auth_refresh_memory = Some(rt);
+                self.auth_degraded = true;
+            } else {
+                self.auth_refresh_memory = None;
+                self.auth_degraded = false;
+            }
+        }
+        self.auth_user = Some(user);
+        self.auth_token = Some(pair.access_token);
+        self.auth_issued_at = Some(Instant::now());
+        self.auth_ttl_secs = pair.expires_in;
+    }
+
+    /// Sign out everywhere: keyring entry best-effort first, then memory.
+    fn sign_out(&mut self, why: &str) {
+        if let Some(user) = self.auth_user.clone() {
+            let _ = tfg::backend::keyring_clear(&user);
+        }
+        self.auth_user = None;
+        self.auth_token = None;
+        self.auth_issued_at = None;
+        self.auth_ttl_secs = 0;
+        self.auth_refresh_memory = None;
+        self.auth_needs_password_change = false;
+        self.login_password.clear();
+        self.pw_current.clear();
+        self.pw_new.clear();
+        self.auth_status = format!("signed out ({why})");
+        eprintln!("signed out ({why})");
+    }
+
+    /// Run one sign-in attempt with the island's credentials: store the
+    /// pair, then probe the gate (200 green, 403 must-change-password).
+    fn attempt_sign_in(&mut self) {
+        let base = self.minos_base.clone();
+        let id = self.login_identifier.trim().to_string();
+        if id.is_empty() {
+            self.auth_status = "sign-in failed: identifier is empty".to_string();
+            return;
+        }
+        let client = match MinosAuth::new(&base) {
+            Ok(c) => c,
+            Err(e) => {
+                self.auth_status = format!("sign-in failed: {e}");
+                return;
+            }
+        };
+        match client.login(&id, &self.login_password) {
+            Ok(pair) => {
+                self.store_pair(id.clone(), pair);
+                self.login_password.clear();
+                match client.me(self.auth_token.as_deref().unwrap_or("")) {
+                    Ok(()) => {
+                        self.auth_needs_password_change = false;
+                        self.auth_status = format!("signed in as {id}");
+                    }
+                    Err(e) if e.contains("403") => {
+                        self.auth_needs_password_change = true;
+                        self.auth_status =
+                            format!("signed in as {id} · must change password");
+                    }
+                    Err(e) => {
+                        self.auth_status = format!("signed in as {id} · probe: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                self.auth_status = format!("sign-in failed: {e}");
+            }
+        }
+    }
+
+    /// Login island (login ticket): Minos sign-in against minos_base, the
+    /// must_change_password gate as a blocking form, sign-out. Token state
+    /// feeds the later socket work; refresh runs proactively per frame.
+    fn login_island(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Login");
+        ui.horizontal(|ui| {
+            ui.label("minos:");
+            ui.text_edit_singleline(&mut self.minos_base);
+        });
+        if let Some(user) = self.auth_user.clone() {
+            let ttl_note = match (self.auth_issued_at, self.auth_ttl_secs) {
+                (Some(t), ttl) if ttl > 0 => {
+                    let left = ttl.saturating_sub(t.elapsed().as_secs());
+                    format!(" · expires in {}:{:02}", left / 60, left % 60)
+                }
+                _ => String::new(),
+            };
+            ui.label(format!(
+                "signed in as {user}{ttl_note}{}",
+                if self.auth_degraded { " · degraded store" } else { "" }
+            ));
+            if ui.small_button("sign out").clicked() {
+                self.sign_out("operator");
+            }
+            if self.auth_needs_password_change {
+                ui.separator();
+                ui.heading("Change password");
+                ui.label("The backend shuts every door until this is done.");
+                ui.horizontal(|ui| {
+                    ui.label("current:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.pw_current).password(true),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("new (12+):");
+                    ui.add(egui::TextEdit::singleline(&mut self.pw_new).password(true));
+                });
+                if ui.button("change and re-enter").clicked() {
+                    let base = self.minos_base.clone();
+                    let tok = self.auth_token.clone().unwrap_or_default();
+                    let cur = self.pw_current.clone();
+                    let new = self.pw_new.clone();
+                    match MinosAuth::new(&base)
+                        .and_then(|a| a.change_password(&tok, &cur, &new))
+                    {
+                        Ok(()) => {
+                            self.pw_current.clear();
+                            self.pw_new.clear();
+                            // Password change invalidates other refresh
+                            // tokens: re-enter with the new password.
+                            match MinosAuth::new(&base)
+                                .and_then(|a| a.login(&user, &new))
+                            {
+                                Ok(pair) => {
+                                    self.store_pair(user.clone(), pair);
+                                    match MinosAuth::new(&base).and_then(|a| {
+                                        a.me(self.auth_token.as_deref().unwrap_or(""))
+                                    }) {
+                                        Ok(()) => {
+                                            self.auth_needs_password_change = false;
+                                            self.auth_status =
+                                                format!("signed in as {user}");
+                                        }
+                                        Err(e) => {
+                                            self.auth_status = format!(
+                                                "re-entered, gate still shut: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    self.auth_status =
+                                        format!("changed, re-entry failed: {e}");
+                                    self.sign_out("re-entry failed");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.auth_status = format!("change failed: {e}");
+                        }
+                    }
+                }
+            }
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("identifier:");
+                ui.text_edit_singleline(&mut self.login_identifier);
+            });
+            ui.horizontal(|ui| {
+                ui.label("password:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.login_password).password(true),
+                );
+            });
+            if ui.button("sign in").clicked() {
+                self.attempt_sign_in();
+            }
+        }
+        ui.label(&self.auth_status);
     }
 
     /// Display size in points: what overlays project against. The
@@ -2141,6 +2338,41 @@ impl eframe::App for ShipApp {
             self.refresh_map();
         }
         let markers = self.markers();
+        // Proactive refresh (auth resolution): at 80% of TTL, on our
+        // terms so the map never blanks on a timer. Blocking like the
+        // other backend calls; refresh failure signs out loud (a 401 is
+        // already over — the token it would refresh with is dead).
+        if let (Some(user), Some(issued), ttl) =
+            (self.auth_user.clone(), self.auth_issued_at, self.auth_ttl_secs)
+        {
+            if ttl > 0 && issued.elapsed().as_secs() * 5 >= ttl * 4 {
+                let base = self.minos_base.clone();
+                let stored = match tfg::backend::keyring_load(&user) {
+                    Ok(Some(rt)) => Some(rt),
+                    Ok(None) => self.auth_refresh_memory.clone(),
+                    Err(e) => {
+                        eprintln!("keyring unreadable ({e}); memory fallback");
+                        self.auth_refresh_memory.clone()
+                    }
+                };
+                match stored {
+                    Some(rt) => match MinosAuth::new(&base).and_then(|a| a.refresh(&rt)) {
+                        Ok(pair) => {
+                            let who = user.clone();
+                            self.store_pair(who.clone(), pair);
+                            self.auth_status = format!("signed in as {who} · refreshed");
+                            eprintln!("auth refreshed for {who}");
+                        }
+                        Err(e) => {
+                            self.sign_out(&format!("refresh failed: {e}"));
+                        }
+                    },
+                    None => {
+                        self.sign_out("refresh token missing");
+                    }
+                }
+            }
+        }
         // Group overlays (slice iii, grill #24): recomputed per frame from
         // live marker positions; zones above the zoom threshold, flags below.
         let (zones, flags) = self.group_geometry(&markers);
@@ -2192,6 +2424,9 @@ impl eframe::App for ShipApp {
                 }
                 ui.separator();
                 ui.toggle_value(&mut self.show_connection, "Connection");
+                // Auth is cross-mode: the token feeds both Presentation
+                // watching and Simulation play.
+                ui.toggle_value(&mut self.show_login, "Login");
                 if self.app_mode == AppMode::Presentation {
                     // No Inspector toggle: selection drives it (a marker or
                     // roster click opens it, deselect closes it).
@@ -2879,6 +3114,15 @@ impl eframe::App for ShipApp {
             });
             self.show_connection = open;
         }
+        if self.show_login {
+            let mut open = self.show_login;
+            egui::Window::new("Login").movable(true).default_pos(egui::pos2(8.0, 120.0)).open(&mut open).show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
+                self.login_island(ui);
+                });
+            });
+            self.show_login = open;
+        }
         if self.show_log && (self.session_live() || self.app_mode == AppMode::Presentation) {
             let mut open = self.show_log;
             egui::Window::new("Log").movable(true).default_pos(egui::pos2(8.0, 478.0)).open(&mut open).show(ui.ctx(), |ui| {
@@ -3531,6 +3775,29 @@ fn main() -> eframe::Result<()> {
                 invites: Vec::new(),
                 invite_seq: 1,
                 invite_status: "local records".to_string(),
+                // Minos REST base: full URL wins, else host with derived
+                // :8080/api/v1 (transport ticket), else the hosted dev.
+                minos_base: match std::env::var("TFG_MINOS_HOST") {
+                    Ok(h) if h.contains("://") => h.trim_end_matches('/').to_string(),
+                    Ok(h) => format!(
+                        "http://{}/api/v1",
+                        h.trim_end_matches('/').trim_start_matches("http://").trim_start_matches("https://")
+                    ),
+                    Err(_) => "https://api.tfg.development.crossnet.co.id/api/v1".to_string(),
+                },
+                show_login: false,
+                login_identifier: String::new(),
+                login_password: String::new(),
+                auth_user: None,
+                auth_token: None,
+                auth_issued_at: None,
+                auth_ttl_secs: 0,
+                auth_refresh_memory: None,
+                auth_degraded: false,
+                auth_status: "signed out".to_string(),
+                auth_needs_password_change: false,
+                pw_current: String::new(),
+                pw_new: String::new(),
                 session_ratio: SESSION_RATIO,
                 zoom: ZOOM,
                 last_zoom_req: Instant::now(),
