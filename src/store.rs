@@ -409,6 +409,31 @@ pub fn has_taxonomy(conn: &Connection) -> Result<bool, String> {
     Ok(n > 0)
 }
 
+/// One lookup vocabulary (session-users ticket): id, both names, and
+/// the judge-side flag — e.g. `game_roles` for the role pick.
+pub fn helper_list(
+    conn: &Connection,
+    table: &str,
+) -> Result<Vec<(i64, String, String, bool)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, id_name, is_judge_side FROM helpers
+             WHERE table_name = ?1 ORDER BY name",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([table], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)? != 0,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
 /// Upsert the standing picture (one row per vessel): wire fixes seen
 /// this round. Cheap enough per poll tick; restarts resume warm.
 pub fn upsert_positions(
@@ -782,5 +807,25 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].trail(), "Navy / Frigate / FFG");
         assert!(tax_search(&conn, "nope").expect("miss").is_empty());
+    }
+
+    #[test]
+    fn helper_list_reads_game_roles() {
+        let conn = open(&std::path::PathBuf::from(":memory:")).expect("open");
+        assert!(helper_list(&conn, "game_roles").expect("empty").is_empty());
+        conn.execute(
+            "INSERT INTO helpers (table_name, id, name, id_name, is_judge_side) VALUES
+             ('game_roles', 1, 'Commando', 'Kommando', 0),
+             ('game_roles', 4, 'Referee', 'Wasit', 1)",
+            [],
+        )
+        .expect("roles");
+        assert_eq!(
+            helper_list(&conn, "game_roles").expect("roles"),
+            vec![
+                (1, "Commando".to_string(), "Kommando".to_string(), false),
+                (4, "Referee".to_string(), "Wasit".to_string(), true),
+            ]
+        );
     }
 }

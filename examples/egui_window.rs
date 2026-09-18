@@ -517,6 +517,21 @@ struct ShipApp {
     /// tracked from the press origin instead.
     drag_press: Option<(String, String, egui::Pos2)>,
     drag_unit: Option<(String, String)>,
+    /// Session users (build ticket): memory-held game plus live lists —
+    /// directory and game reads are blocking operator actions, the role
+    /// vocabulary comes from the synced helpers mirror.
+    show_users: bool,
+    users_game: Option<(i64, String)>,
+    users_games: Vec<tfg::backend::GameRow>,
+    users_list: Vec<tfg::backend::BackendUser>,
+    users_search: String,
+    users_role: Option<i64>,
+    users_roles: Vec<(i64, String, String, bool)>,
+    users_roster: Vec<tfg::backend::Participant>,
+    users_gunits: Vec<tfg::backend::GameUnit>,
+    users_status: String,
+    upress: Option<(i64, String, egui::Pos2)>,
+    udrag: Option<(i64, String)>,
     placed_fleet: HashSet<String>,
     /// Labels captured at placement (both picker sources), so register
     /// hulls keep their name + hull after the picker moves on.
@@ -848,6 +863,7 @@ impl ShipApp {
             self.show_fleet = false;
             self.show_orders = false;
             self.show_groups = false;
+            self.show_users = false;
             self.show_connection = true;
         } else {
             // Simulation arms the engine (setup-overhaul pass): the old
@@ -1137,6 +1153,285 @@ impl ShipApp {
             "specs: {fetched} fetched, {skipped} already known, {failed} failed"
         );
         eprintln!("spec sync done: {}", self.sync_status);
+    }
+
+    /// Session-users client (build ticket): env-owned endpoint plus the
+    /// in-memory access token. Every call below is a blocking operator
+    /// action with a loud status line — never a background poll.
+    fn users_client(&self) -> Result<(MinosMaster, String), String> {
+        let tok = self.auth_token.clone().ok_or_else(|| "sign in first".to_string())?;
+        let master = MinosMaster::new(&self.minos_base)?;
+        Ok((master, tok))
+    }
+
+    fn users_refresh_games(&mut self) {
+        match self.users_client().and_then(|(m, t)| m.games_list(&t)) {
+            Ok(games) => {
+                self.users_games = games;
+                // A held game may have closed or vanished: drop it loudly.
+                if let Some((gid, _)) = self.users_game.clone() {
+                    if !self.users_games.iter().any(|g| g.id == gid) {
+                        self.users_game = None;
+                        self.users_status = "held game is gone — pick another".to_string();
+                        return;
+                    }
+                }
+                self.users_status = format!("{} game(s)", self.users_games.len());
+            }
+            Err(e) => self.users_status = format!("games failed: {e}"),
+        }
+    }
+
+    fn users_refresh_directory(&mut self) {
+        // Role vocabulary rides the synced helpers mirror (cheap, always).
+        if let Some(conn) = self.store.as_ref() {
+            self.users_roles = tfg::store::helper_list(conn, "game_roles").unwrap_or_default();
+            if self.users_role.is_none() {
+                self.users_role = self
+                    .users_roles
+                    .iter()
+                    .find(|(_, n, _, _)| n == "Commando")
+                    .map(|(id, _, _, _)| *id);
+            }
+        }
+        let query = self.users_search.clone();
+        match self.users_client().and_then(|(m, t)| m.users_list(&t, &query)) {
+            Ok(users) => {
+                self.users_list = users;
+                self.users_status = format!("directory: {} account(s)", self.users_list.len());
+            }
+            Err(e) => {
+                self.users_list.clear();
+                self.users_status =
+                    format!("directory unavailable (needs read on /system/users): {e}");
+            }
+        }
+    }
+
+    fn users_refresh_game(&mut self) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_roster.clear();
+            self.users_gunits.clear();
+            return;
+        };
+        match self.users_client().and_then(|(m, t)| m.game_participants(&t, gid)) {
+            Ok(r) => self.users_roster = r,
+            Err(e) => {
+                self.users_status = format!("roster failed: {e}");
+                return;
+            }
+        }
+        match self.users_client().and_then(|(m, t)| m.game_units_list(&t, gid)) {
+            Ok(u) => {
+                self.users_gunits = u;
+                self.users_status = format!(
+                    "roster: {} · units: {}",
+                    self.users_roster.len(),
+                    self.users_gunits.len()
+                );
+            }
+            Err(e) => self.users_status = format!("game units failed: {e}"),
+        }
+    }
+
+    fn users_add(&mut self, user_id: i64) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "pick a game first".to_string();
+            return;
+        };
+        let Some(role) = self.users_role else {
+            self.users_status = "pick a role first".to_string();
+            return;
+        };
+        match self
+            .users_client()
+            .and_then(|(m, t)| m.add_participant(&t, gid, user_id, role))
+        {
+            Ok(()) => {
+                self.users_status = format!("seated {user_id} in game {gid}");
+                self.users_refresh_game();
+            }
+            Err(e) => self.users_status = format!("add failed: {e}"),
+        }
+    }
+
+    fn users_command(&mut self, unit_id: i64, commander_id: i64) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "pick a game first".to_string();
+            return;
+        };
+        match self
+            .users_client()
+            .and_then(|(m, t)| m.set_unit_commander(&t, gid, unit_id, commander_id))
+        {
+            Ok(()) => {
+                self.users_status = format!("unit {unit_id} now commanded by {commander_id}");
+                self.users_refresh_game();
+            }
+            Err(e) => self.users_status = format!("command failed: {e}"),
+        }
+    }
+
+    /// Session-users island (build ticket): game picker, live directory
+    /// with role pick + add, roster, and per-unit commander assigns.
+    /// Layout thesis: heading → game → status → directory → roster →
+    /// units, each separated, nav-free (one screen, no steps).
+    fn users_island(&mut self, ui: &mut egui::Ui) {
+        // User-drag gesture (same press-origin pattern as hull rows):
+        // candidate until past the click threshold, then a live drag.
+        if let Some(start) = self.upress.as_ref().map(|(_, _, s)| *s) {
+            let (down, dist) = ui.ctx().input(|i| {
+                (
+                    i.pointer.any_down(),
+                    i.pointer.hover_pos().map_or(0.0, |p| p.distance(start)),
+                )
+            });
+            if !down {
+                self.upress = None;
+            } else if dist > 6.0 {
+                if let Some((uid, name, _)) = self.upress.take() {
+                    self.udrag = Some((uid, name));
+                }
+            }
+        }
+        if let Some((_, name)) = &self.udrag {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            ui.label(format!("moving {name} — release over a unit marker or group flag"));
+        }
+        ui.heading("Session users");
+        ui.horizontal(|ui| {
+            let picked = self
+                .users_game
+                .clone()
+                .map(|(_, n)| n)
+                .unwrap_or_else(|| "pick a game".to_string());
+            egui::ComboBox::from_label("game")
+                .selected_text(picked)
+                .show_ui(ui, |ui| {
+                    for g in &self.users_games {
+                        ui.selectable_value(
+                            &mut self.users_game,
+                            Some((g.id, g.name.clone())),
+                            format!("{} ({})", g.name, g.state),
+                        );
+                    }
+                });
+            if ui.small_button("refresh").clicked() {
+                self.users_refresh_games();
+                self.users_refresh_directory();
+                self.users_refresh_game();
+            }
+        });
+        ui.label(&self.users_status);
+        ui.separator();
+        ui.strong("Directory");
+        ui.horizontal(|ui| {
+            ui.label("search:");
+            ui.text_edit_singleline(&mut self.users_search);
+            if ui.small_button("find").clicked() {
+                self.users_refresh_directory();
+            }
+            let role_name = self
+                .users_role
+                .and_then(|r| self.users_roles.iter().find(|(id, _, _, _)| *id == r))
+                .map(|(_, n, _, _)| n.clone())
+                .unwrap_or_else(|| "role".to_string());
+            egui::ComboBox::from_label("role")
+                .selected_text(role_name)
+                .show_ui(ui, |ui| {
+                    for (id, name, _, _) in &self.users_roles {
+                        ui.selectable_value(&mut self.users_role, Some(*id), name);
+                    }
+                });
+        });
+        let mut seating: Vec<i64> = Vec::new();
+        egui::ScrollArea::vertical().id_salt("users-dir").max_height(170.0).show(
+            ui,
+            |ui| {
+                if self.users_list.is_empty() {
+                    ui.weak("No accounts — sign in, then refresh.");
+                }
+                for u in &self.users_list {
+                    ui.horizontal(|ui| {
+                        let resp =
+                            ui.selectable_label(false, format!("{} ({})", u.name, u.username));
+                        if resp.is_pointer_button_down_on()
+                            && self.udrag.is_none()
+                            && self.upress.is_none()
+                        {
+                            if let Some(start) = resp.interact_pointer_pos() {
+                                self.upress = Some((u.id, u.name.clone(), start));
+                            }
+                        }
+                        if ui.small_button("add").clicked() {
+                            seating.push(u.id);
+                        }
+                    });
+                }
+            },
+        );
+        for uid in seating {
+            self.users_add(uid);
+        }
+        ui.separator();
+        ui.strong("Roster");
+        if self.users_game.is_none() {
+            ui.weak("Pick a game to see its roster.");
+        } else if self.users_roster.is_empty() {
+            ui.weak("Nobody seated yet.");
+        } else {
+            for p in &self.users_roster {
+                ui.label(format!(
+                    "{} — {}{}",
+                    p.user_name,
+                    p.role_name,
+                    if p.judge { " (judge)" } else { "" }
+                ));
+            }
+        }
+        ui.separator();
+        ui.strong("Units");
+        if self.users_game.is_none() {
+            ui.weak("Pick a game to command its units.");
+        } else if self.users_gunits.is_empty() {
+            ui.weak("No pieces in this game yet.");
+        } else {
+            let mut commanding: Vec<(i64, i64)> = Vec::new();
+            let crew: Vec<(i64, String)> = self
+                .users_roster
+                .iter()
+                .filter(|p| !p.judge)
+                .map(|p| (p.user_id, p.user_name.clone()))
+                .collect();
+            for gu in &self.users_gunits {
+                ui.horizontal(|ui| {
+                    ui.label(&gu.unit_name);
+                    egui::ComboBox::from_id_salt(("ucmd", gu.unit_id))
+                        .selected_text(if gu.commander_name.is_empty() {
+                            "—".to_string()
+                        } else {
+                            gu.commander_name.clone()
+                        })
+                        .show_ui(ui, |ui| {
+                            for (uid, name) in &crew {
+                                // Re-picking the current commander is a
+                                // no-op, not a re-assignment (PUT closes
+                                // and reopens the assignment each time).
+                                if gu.commander_id != Some(*uid) {
+                                    let mut tmp = gu.commander_id;
+                                    if ui.selectable_value(&mut tmp, Some(*uid), name).clicked()
+                                    {
+                                        commanding.push((gu.unit_id, *uid));
+                                    }
+                                }
+                            }
+                        });
+                });
+            }
+            for (unit, cmdr) in commanding {
+                self.users_command(unit, cmdr);
+            }
+        }
     }
 
     /// Login island (login ticket): Minos sign-in against the env-owned
@@ -3325,6 +3620,7 @@ impl eframe::App for ShipApp {
                     // reorganization). The rest unlock once live (task #40).
                     ui.toggle_value(&mut self.show_fleet, "Fleet");
                     ui.toggle_value(&mut self.show_groups, "Groups");
+                    ui.toggle_value(&mut self.show_users, "Users");
                     // Working islands unlock once a session exists (task
                     // #40): pre-session the lobby is Session + Fleet + Groups + Connection.
                     if self.session_live() {
@@ -3441,6 +3737,15 @@ impl eframe::App for ShipApp {
                 });
             });
             self.show_session = open;
+        }
+        if self.show_users && self.app_mode == AppMode::Simulation {
+            let mut open = self.show_users;
+            egui::Window::new("Session users").movable(true).resizable(true).default_pos(egui::pos2(560.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
+                self.users_island(ui);
+                });
+            });
+            self.show_users = open;
         }
         let mut follow_req: Option<(String, (f64, f64))> = None;
         if self.show_roster && self.session_live() {
@@ -4241,6 +4546,81 @@ impl eframe::App for ShipApp {
                         }
                     }
                 }
+                // User drop (session-users ticket): onto a unit marker to
+                // command that piece, onto a group flag for a bulk assign
+                // across its hulls. Same release frame as hull drops; only
+                // one drag is ever active.
+                if self.udrag.is_some() && ui.ctx().input(|i| i.pointer.any_released()) {
+                    let drop = ui.ctx().input(|i| i.pointer.interact_pos());
+                    let (uid, uname) = self.udrag.clone().unwrap_or((0, String::new()));
+                    match (drop, self.users_game.clone()) {
+                        (Some(p), Some((gid, _))) if rect.contains(p) => {
+                            let px = (p.x - rect.min.x) as f64;
+                            let py = (p.y - rect.min.y) as f64;
+                            let near_marker = markers
+                                .iter()
+                                .find(|m| {
+                                    ((m.x - px).powi(2) + (m.y - py).powi(2)).sqrt() < 16.0
+                                })
+                                .map(|m| m.id.clone());
+                            let near_flag = flags
+                                .iter()
+                                .find(|f| {
+                                    ((f.x as f64 - px).powi(2) + (f.y as f64 - py).powi(2)).sqrt()
+                                        < 16.0
+                                })
+                                .map(|f| f.group.clone());
+                            if let Some(mid) = near_marker {
+                                match mid.parse::<i64>() {
+                                    Ok(hull) => self.users_command(hull, uid),
+                                    Err(_) => self.feed(format!(
+                                        "drop refused: {mid} is not a register hull"
+                                    )),
+                                }
+                            } else if let Some(group) = near_flag {
+                                let mut members = self.groups.satgas_units(&group);
+                                if members.is_empty() {
+                                    members = self.groups.gugus_units(&group);
+                                }
+                                match self.users_client() {
+                                    Ok((m, t)) => {
+                                        let mut ok = 0;
+                                        let mut fail = 0;
+                                        for mid in members {
+                                            match mid.parse::<i64>() {
+                                                Ok(hull) => match m.set_unit_commander(&t, gid, hull, uid) {
+                                                    Ok(()) => ok += 1,
+                                                    Err(e) => {
+                                                        fail += 1;
+                                                        eprintln!("group drop: hull {hull} refused: {e}");
+                                                    }
+                                                },
+                                                Err(_) => fail += 1,
+                                            }
+                                        }
+                                        self.feed(format!(
+                                            "{uname} takes group: {ok} commanded, {fail} refused"
+                                        ));
+                                        self.users_refresh_game();
+                                    }
+                                    Err(e) => self.users_status = e,
+                                }
+                            } else {
+                                self.feed(
+                                    "drop cancelled: release over a unit marker or group flag"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        _ => {
+                            self.feed(
+                                "drop cancelled: pick a game, release over the map".to_string(),
+                            );
+                        }
+                    }
+                    self.udrag = None;
+                    self.upress = None;
+                }
                 // Drag-and-drop placement (setup-overhaul): a fleet-row
                 // drag released over the map places through the shared
                 // core. The press began outside the map, so the click and
@@ -4739,6 +5119,18 @@ fn main() -> eframe::Result<()> {
                 drill_class: None,
                 drag_press: None,
                 drag_unit: None,
+                show_users: false,
+                users_game: None,
+                users_games: Vec::new(),
+                users_list: Vec::new(),
+                users_search: String::new(),
+                users_role: None,
+                users_roles: Vec::new(),
+                users_roster: Vec::new(),
+                users_gunits: Vec::new(),
+                users_status: "pick a game".to_string(),
+                upress: None,
+                udrag: None,
                 placed_fleet: HashSet::new(),
                 placed_labels: HashMap::new(),
                 time_real_start: (Utc::now() + chrono::Duration::hours(7)).format("%Y-%m-%d %H:%M").to_string(),

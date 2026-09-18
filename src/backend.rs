@@ -599,6 +599,210 @@ impl MinosMaster {
             .filter(|id| *id > 0)
             .collect())
     }
+
+    fn post(&self, token: &str, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+        unwrap_envelope(
+            self.client
+                .post(&format!("{}{}", self.base_url, path))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .map_err(|e| e.to_string())?,
+        )
+    }
+
+    fn patch(
+        &self,
+        token: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        unwrap_envelope(
+            self.client
+                .patch(&format!("{}{}", self.base_url, path))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .map_err(|e| e.to_string())?,
+        )
+    }
+
+    /// One page walk for small paged endpoints (games, users): 100 rows
+    /// a page, stops at the first short page. Permission failures (403)
+    /// surface as errors — the UI degrades to the game roster instead.
+    fn paged(&self, token: &str, path: &str) -> Result<Vec<serde_json::Value>, String> {
+        let mut out = Vec::new();
+        let sep = if path.contains('?') { '&' } else { '?' };
+        for page in 1..=10 {
+            let data = self.get(token, &format!("{path}{sep}page_size=100&page_number={page}"))?;
+            let list = data.as_array().cloned().unwrap_or_default();
+            let short = list.len() < 100;
+            out.extend(list);
+            if short {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn enc(s: &str) -> String {
+        let mut o = String::new();
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                o.push(b as char);
+            } else {
+                o.push_str(&format!("%{b:02X}"));
+            }
+        }
+        o
+    }
+
+    /// Games for the session-users picker (summary shape, newest first).
+    pub fn games_list(&self, token: &str) -> Result<Vec<GameRow>, String> {
+        Ok(self
+            .paged(token, "/games")?
+            .iter()
+            .filter_map(|g| {
+                Some(GameRow {
+                    id: g["id"].as_i64()?,
+                    name: g["name"].as_str().unwrap_or("").to_string(),
+                    state: g["state"].as_str().unwrap_or("").to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// Backend user directory (session-users ticket): live-read, paged,
+    /// optional search. Needs `read` on `/system/users` — a 403 here is
+    /// the roster-fallback signal, not a bug.
+    pub fn users_list(&self, token: &str, search: &str) -> Result<Vec<BackendUser>, String> {
+        let path = if search.trim().is_empty() {
+            "/users".to_string()
+        } else {
+            format!("/users?search={}", Self::enc(search.trim()))
+        };
+        Ok(self
+            .paged(token, &path)?
+            .iter()
+            .filter_map(|u| {
+                Some(BackendUser {
+                    id: u["id"].as_i64()?,
+                    username: u["username"].as_str().unwrap_or("").to_string(),
+                    name: u["name"].as_str().unwrap_or("").to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// One game's roster (staff-facing): exercise side first by server order.
+    pub fn game_participants(&self, token: &str, game_id: i64) -> Result<Vec<Participant>, String> {
+        let data = self.get(token, &format!("/games/{game_id}/participants"))?;
+        Ok(data
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| {
+                Some(Participant {
+                    user_id: p["id_user"].as_i64()?,
+                    user_name: p["user_name"].as_str().unwrap_or("").to_string(),
+                    role_id: p["id_game_role"].as_i64().unwrap_or(0),
+                    role_name: p["role_name"].as_str().unwrap_or("").to_string(),
+                    judge: p["is_judge_side"].as_bool().unwrap_or(false),
+                })
+            })
+            .collect())
+    }
+
+    /// Seat somebody in a game (planning|preparation only, one role per
+    /// person). A 409 names the world refusing (already seated, closed
+    /// roster) — loud by contract.
+    pub fn add_participant(
+        &self,
+        token: &str,
+        game_id: i64,
+        user_id: i64,
+        role_id: i64,
+    ) -> Result<(), String> {
+        self.post(
+            token,
+            &format!("/games/{game_id}/participants"),
+            serde_json::json!({ "id_user": user_id, "id_game_role": role_id }),
+        )?;
+        Ok(())
+    }
+
+    /// A game's order of battle with current commanders.
+    pub fn game_units_list(&self, token: &str, game_id: i64) -> Result<Vec<GameUnit>, String> {
+        let data = self.get(token, &format!("/games/{game_id}/units"))?;
+        Ok(data
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|u| {
+                Some(GameUnit {
+                    unit_id: u["id_unit"].as_i64()?,
+                    unit_name: u["unit_name"].as_str().unwrap_or("").to_string(),
+                    commander_id: u["id_commander"].as_i64(),
+                    commander_name: u["commander_name"].as_str().unwrap_or("").to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// Hand a game piece to a commander (planning|preparation). The new
+    /// commander must be a participant and never judge-side — refused
+    /// loudly otherwise.
+    pub fn set_unit_commander(
+        &self,
+        token: &str,
+        game_id: i64,
+        unit_id: i64,
+        commander_id: i64,
+    ) -> Result<(), String> {
+        self.patch(
+            token,
+            &format!("/games/{game_id}/units/{unit_id}"),
+            serde_json::json!({ "id_commander": commander_id }),
+        )?;
+        Ok(())
+    }
+}
+
+/// Backend user row for the session-users panel (live-read, no mirror).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendUser {
+    pub id: i64,
+    pub username: String,
+    pub name: String,
+}
+
+/// Game summary row for the session-users game picker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameRow {
+    pub id: i64,
+    pub name: String,
+    pub state: String,
+}
+
+/// One game roster row: who holds which seat, and on which side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Participant {
+    pub user_id: i64,
+    pub user_name: String,
+    pub role_id: i64,
+    pub role_name: String,
+    pub judge: bool,
+}
+
+/// One game piece with its current commander, if any.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameUnit {
+    pub unit_id: i64,
+    pub unit_name: String,
+    pub commander_id: Option<i64>,
+    pub commander_name: String,
 }
 
 fn b2i(b: bool) -> i64 {
@@ -1334,6 +1538,31 @@ mod tests {
         let master = MinosMaster::new("http://127.0.0.1:18087/api/v1").expect("client builds");
         assert_eq!(master.category_ids_for_branch("AT", 1).expect("ids"), vec![2]);
         assert!(master.category_ids_for_branch("AT", 3).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn session_users_list_search_add_and_command() {
+        let server = tiny_http::Server::http("127.0.0.1:18088").expect("bind test port");
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests().take(4) {
+                let (method, url) = (rq.method().as_str().to_string(), rq.url().to_string());
+                let body = if method == "GET" && url.contains("/users") && url.contains("page_number=1") {
+                    r#"{"status_code":200,"message":"Successfull","data":[{"id":6,"username":"budi","name":"Budi Santoso"}]}"#
+                } else if method == "GET" {
+                    r#"{"status_code":200,"message":"Successfull","data":[]}"#
+                } else if method == "POST" {
+                    r#"{"status_code":201,"message":"Created","data":[]}"#
+                } else {
+                    r#"{"status_code":200,"message":"Successfull","data":{"id_unit":13}}"#
+                };
+                let _ = rq.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18088/api/v1").expect("client builds");
+        let users = master.users_list("AT", "bud").expect("directory");
+        assert_eq!(users, vec![BackendUser { id: 6, username: "budi".into(), name: "Budi Santoso".into() }]);
+        master.add_participant("AT", 3, 6, 1).expect("seat");
+        master.set_unit_commander("AT", 3, 13, 6).expect("command");
     }
 
     #[test]
