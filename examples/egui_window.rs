@@ -262,6 +262,7 @@ fn units_col(
     leaf: &[PickerRow],
     placed: &std::collections::HashSet<String>,
     pick: &mut Option<String>,
+    press: &mut Option<(String, String, egui::Pos2)>,
     drag: &mut Option<(String, String)>,
 ) {
     ui.vertical(|ui| {
@@ -286,9 +287,10 @@ fn units_col(
                                 Some(u.id.clone()),
                                 format!("{} ({})", u.name, u.hull),
                             );
-                            if resp.drag_started() {
-                                *drag = Some((u.id.clone(), u.name.clone()));
-                                eprintln!("drag {}", u.name);
+                            if resp.is_pointer_button_down_on() && drag.is_none() && press.is_none() {
+                                if let Some(start) = resp.interact_pointer_pos() {
+                                    *press = Some((u.id.clone(), u.name.clone(), start));
+                                }
                             }
                         }
                     }
@@ -508,8 +510,12 @@ struct ShipApp {
     drill_category: Option<i64>,
     drill_type: Option<i64>,
     drill_class: Option<i64>,
-    /// Active fleet-row drag (setup-overhaul dnd): hull id + name from
-    /// drag_started until release (drop places) or cancel.
+    /// Active fleet-row drag (setup-overhaul dnd): press candidate with
+    /// origin until it moves past the click threshold, then a live drag
+    /// (hull id + name) until release (drop places) or cancel.
+    /// Click-sense rows never report drag_started, so the gesture is
+    /// tracked from the press origin instead.
+    drag_press: Option<(String, String, egui::Pos2)>,
     drag_unit: Option<(String, String)>,
     placed_fleet: HashSet<String>,
     /// Labels captured at placement (both picker sources), so register
@@ -2555,8 +2561,26 @@ impl ShipApp {
         const CAT_LABELS: [&str; 5] = ["All", "Ship", "Plane", "Tank", "Port"];
         ui.heading("Fleet picker");
         ui.label("Organizer: filter, pick one hull, place it on the map by hand.");
-        // Drag state (dnd ticket): grabbing cursor plus the drop hint
-        // while a hull is mid-drag; release outside the map cancels.
+        // Drag gesture (dnd ticket): a press on a row is a candidate
+        // until it moves past the click threshold, then a live drag.
+        // Plain clicks never promote, so selection is unaffected.
+        if let Some(start) = self.drag_press.as_ref().map(|(_, _, s)| *s) {
+            let (down, dist) = ui.ctx().input(|i| {
+                (
+                    i.pointer.any_down(),
+                    i.pointer.hover_pos().map_or(0.0, |p| p.distance(start)),
+                )
+            });
+            if !down {
+                self.drag_press = None;
+            } else if dist > 6.0 {
+                if let Some((id, name, _)) = self.drag_press.take() {
+                    self.drag_unit = Some((id, name));
+                }
+            }
+        }
+        // Drag state: grabbing cursor plus the drop hint while a hull is
+        // mid-drag; release outside the map cancels.
         if let Some((_, name)) = &self.drag_unit {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             ui.label(format!("moving {name} — release over the map to place"));
@@ -2935,6 +2959,7 @@ impl ShipApp {
                             &out,
                             &self.placed_fleet,
                             &mut self.fleet_pick,
+                            &mut self.drag_press,
                             &mut self.drag_unit,
                         );
                     }
@@ -2980,9 +3005,15 @@ impl ShipApp {
                                 )
                             },
                         );
-                        if resp.drag_started() {
-                            self.drag_unit = Some((u.id.clone(), u.name.clone()));
-                            eprintln!("drag {}", u.name);
+                        if resp.is_pointer_button_down_on()
+                            && self.drag_unit.is_none()
+                            && self.drag_press.is_none()
+                        {
+                            // Press origin, not drag_started: click-sense
+                            // rows never report drags (see struct docs).
+                            if let Some(start) = resp.interact_pointer_pos() {
+                                self.drag_press = Some((u.id.clone(), u.name.clone(), start));
+                            }
                         }
                     }
                 }
@@ -4230,6 +4261,7 @@ impl eframe::App for ShipApp {
                         }
                     }
                     self.drag_unit = None;
+                    self.drag_press = None;
                 }
                 // Seamless zoom (task #43 + pan-zoom ticket): plain wheel
                 // joins shift+wheel and pinch; the point under the cursor
@@ -4705,6 +4737,7 @@ fn main() -> eframe::Result<()> {
                 drill_category: None,
                 drill_type: None,
                 drill_class: None,
+                drag_press: None,
                 drag_unit: None,
                 placed_fleet: HashSet::new(),
                 placed_labels: HashMap::new(),
