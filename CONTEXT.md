@@ -110,6 +110,7 @@ _Avoid_: driver, pilot
 **Roster**:
 The organizer-kept list of named users available to a session: the source of players and seat holders. Local only until a networked backend exists.
 _Avoid_: crew, manifest
+_When connected, session membership is read live from the backend (user directory, game participants); the local list holds only unposted drafts._
 
 **Invite**:
 An organizer-issued code binding a named roster entry to a session seat. Generated locally (mock backend in dev); redemption over the network is a later slice.
