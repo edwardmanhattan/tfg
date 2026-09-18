@@ -4232,11 +4232,11 @@ fn main() -> eframe::Result<()> {
             if let Some(conn) = &store {
                 match tfg::store::current_figures(conn) {
                     Ok(figs) => {
-                        for f in figs {
+                        for f in &figs {
                             if f.speed_kn.is_some() {
                                 catalog.upsert_runtime_class(
                                     f.class_id,
-                                    f.class_name,
+                                    f.class_name.clone(),
                                     f.speed_kn.unwrap_or(0.0),
                                     f.cruise_kn.unwrap_or(0.0),
                                     f.range_nm.unwrap_or(0.0),
