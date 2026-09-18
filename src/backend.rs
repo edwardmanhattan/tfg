@@ -682,6 +682,7 @@ fn run_actor(
                 });
                 shared.live.store(true, Ordering::SeqCst);
                 if tokio::runtime::Handle::try_current().is_ok() {
+                    let resub = resub.clone();
                     tokio::task::spawn(async move {
                         let _ = resub.subscribe().await;
                     });
