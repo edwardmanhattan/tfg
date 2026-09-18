@@ -53,6 +53,7 @@ _Avoid_: freeze (that is the effect, not the verb), stop
 **Category**:
 What a unit is in the world (Ship, Plane, Tank, Port). Determines which stat keys exist — the schema, not the values.
 _Avoid_: kind, sort, domain
+_Minos `unit_categories` are a separate, operator-authored taxonomy, shown as-is in the picker drill; no correspondence with this enum is assumed._
 
 **Class**:
 The stat values (abilities) for a family of units: a tanker's 16 kn vs a destroyer's 30 kn. All types under a class behave identically in the sim.
