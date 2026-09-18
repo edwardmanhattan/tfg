@@ -14,6 +14,10 @@ eframe = "0.36.2"
 egui_extras = { version = "0.36.2", features = ["image"] }
 reqwest = { version = "0.13.5", features = ["blocking", "json"] }
 tiny_http = "0.12.0"
+# Live socket (transport resolution): pinned exact, own thread + own
+# runtime in the actor; the UI thread never touches async.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+tokio-centrifuge = "=0.2.6"
 # Refresh-token store (keyring resolution): OS keyring via the sync API,
 # no async runtime needed. Secret Service on Linux (this host has a daemon;
 # daemon-less machines degrade to a visible memory fallback, never silently).

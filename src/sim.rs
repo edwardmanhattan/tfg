@@ -498,12 +498,17 @@ impl SimSource {
                 ship_id: id.clone(),
                 position: s.pos,
                 ts: now_ts(),
+                received_at: None,
                 heading_deg: Some(s.heading_deg),
                 speed_kn: s
                     .order
                     .as_ref()
                     .map(|o| o.speed_kn)
                     .or(Some(Catalog::stat(&s.class, "speed_kn", 0.0) as f32)),
+                accuracy_m: None,
+                name: None,
+                hull_number: None,
+                backfilled: false,
                 source: FixSource::Sim,
                 // Ingest sequence is stamped by the Registry (Log grill,
                 // #20); the sim only fills the placeholder.

@@ -23,16 +23,31 @@ pub enum FixSource {
     Sim,
 }
 
-/// One accepted position report for a ship.
+/// One accepted position report for a ship. `ts` is the recorded time
+/// (orders fixes); `received_at` is the receipt time (ages the fix at
+/// render). Labels ride each fix so the journal stays faithful without
+/// a separate label table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fix {
-    /// Identity of the ship. Wire format uses `ship_id`.
+    /// Identity of the ship. Wire format uses `ship_id`; Minos wire ships
+    /// key as decimal strings of their unit id (see `Registry::announce`).
     pub ship_id: String,
     pub position: GeoPosition,
-    /// RFC3339 UTC, e.g. `2026-09-12T00:00:02Z`. Orders fixes.
+    /// RFC3339 UTC, e.g. `2026-09-12T00:00:02Z`. Orders fixes. Minos
+    /// semantics: recorded_at (re-stamped live, kept on backfill).
     pub ts: String,
+    /// Minos received_at: when the server accepted the fix. Ages live
+    /// fixes at render; absent on sim/replay emissions.
+    pub received_at: Option<String>,
     pub heading_deg: Option<f32>,
     pub speed_kn: Option<f32>,
+    pub accuracy_m: Option<f32>,
+    /// Human labels stamped per fix (Minos name/hull_number).
+    pub name: Option<String>,
+    pub hull_number: Option<String>,
+    /// True when reconstructed from an offline backlog: joins the trail
+    /// but never moves the marker (see `Registry::blend`).
+    pub backfilled: bool,
     pub source: FixSource,
     /// Ingest sequence stamped by the Registry (Log grill, #20): total
     /// ingest order, gaps where out-of-order fixes were dropped.
@@ -48,6 +63,16 @@ struct WireFix {
     ts: String,
     heading_deg: Option<f32>,
     speed_kn: Option<f32>,
+    #[serde(default)]
+    accuracy_m: Option<f32>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    hull_number: Option<String>,
+    #[serde(default)]
+    received_at: Option<String>,
+    #[serde(default)]
+    backfilled: bool,
 }
 
 impl From<WireFix> for Fix {
@@ -56,8 +81,13 @@ impl From<WireFix> for Fix {
             ship_id: w.ship_id,
             position: GeoPosition { latitude: w.lat, longitude: w.lon },
             ts: w.ts,
+            received_at: w.received_at,
             heading_deg: w.heading_deg,
             speed_kn: w.speed_kn,
+            accuracy_m: w.accuracy_m,
+            name: w.name,
+            hull_number: w.hull_number,
+            backfilled: w.backfilled,
             source: FixSource::Wire,
             seq: 0,
         }
@@ -66,10 +96,28 @@ impl From<WireFix> for Fix {
 
 impl Fix {
     pub fn epoch_secs(&self) -> i64 {
-        self.ts
-            .parse::<DateTime<chrono::Utc>>()
-            .map(|dt| dt.timestamp())
-            .unwrap_or(0)
+        parse_epoch(&self.ts).unwrap_or(0)
+    }
+
+    /// Data age at render, in seconds (backfilled ticket): live fixes age
+    /// from received_at, backfilled ones from recorded_at (`ts`) — the
+    /// receipt time of a flush would read age-zero on days-old data.
+    /// Falls back to `ts` when receipt is unknown (sim/replay).
+    pub fn data_age_secs(&self, now_epoch: i64) -> Option<i64> {
+        if self.backfilled {
+            return parse_epoch(&self.ts).map(|t| now_epoch - t);
+        }
+        match self.received_at.as_deref().and_then(parse_epoch) {
+            Some(t) => Some(now_epoch - t),
+            None => parse_epoch(&self.ts).map(|t| now_epoch - t),
+        }
+    }
+
+    /// Old-data indication (backfilled ticket): data older than the
+    /// threshold. The caller decides which sources badge (wire only:
+    /// sim clocks are game time, not wall time).
+    pub fn is_old_data(&self, now_epoch: i64) -> bool {
+        self.data_age_secs(now_epoch).is_some_and(|a| a > OLD_DATA_AFTER_SECS)
     }
 
     /// Parse the wire shape used by fixtures and (later) the HTTP backend.
@@ -78,6 +126,11 @@ impl Fix {
             .map(Fix::from)
             .map_err(|e| e.to_string())
     }
+}
+
+/// Parse one RFC3339 timestamp to epoch seconds.
+fn parse_epoch(s: &str) -> Option<i64> {
+    s.parse::<DateTime<chrono::Utc>>().ok().map(|dt| dt.timestamp())
 }
 
 /// How much history a track keeps.
@@ -109,6 +162,11 @@ pub fn should_track(center: GeoPosition, ship: GeoPosition) -> bool {
 /// Missed polls before a ship is flagged stale.
 pub const STALE_AFTER_MISSED: u32 = 3;
 
+/// Data older than this reads as old data (backfilled ticket): fixed
+/// default, clears the 3-minute moored-report trap (moored beacons
+/// report every 3 minutes, well under this).
+pub const OLD_DATA_AFTER_SECS: i64 = 600;
+
 #[derive(Debug)]
 struct ShipState {
     latest: Fix,
@@ -124,21 +182,67 @@ pub struct ShipView {
     pub ship_id: String,
     pub latest: Fix,
     pub stale: bool,
+    /// Announced but never tracked (silent vessel): no position exists.
+    /// Renderers skip these; the roster lists them without follow.
+    pub silent: bool,
     pub trail: Vec<GeoPosition>,
     pub source: FixSource,
+}
+
+/// A vessel known from the REST snapshot that has never reported:
+/// listed so silence and non-existence stay distinct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnnouncedShip {
+    pub ship_id: String,
+    pub name: Option<String>,
+    pub hull_number: Option<String>,
 }
 
 /// All tracked ships, advanced one backend poll at a time.
 #[derive(Debug, Default)]
 pub struct Registry {
     ships: HashMap<String, ShipState>,
+    /// Snapshot-known vessels (REST mapping ticket): ids with labels that
+    /// have no fix yet. Never counted as missed/stale; a first fix
+    /// promotes the id into `ships` and drops it from here on read.
+    known: HashMap<String, (Option<String>, Option<String>)>,
     bound: TrailBound,
     next_seq: u64,
 }
 
 impl Registry {
     pub fn new(bound: TrailBound) -> Self {
-        Self { ships: HashMap::new(), bound, next_seq: 0 }
+        Self { ships: HashMap::new(), known: HashMap::new(), bound, next_seq: 0 }
+    }
+
+    /// Announce a snapshot-known vessel (REST mapping ticket): listed as
+    /// silent until its first fix arrives. Re-announcing refreshes labels.
+    pub fn announce(
+        &mut self,
+        ship_id: String,
+        name: Option<String>,
+        hull_number: Option<String>,
+    ) {
+        if !self.ships.contains_key(&ship_id) {
+            self.known.insert(ship_id, (name, hull_number));
+        }
+    }
+
+    /// Silent vessels: announced but never fixed. Sorted by id. Drops ids
+    /// that have since reported (promotion is one-way).
+    pub fn announced(&self) -> Vec<AnnouncedShip> {
+        let mut out: Vec<AnnouncedShip> = self
+            .known
+            .iter()
+            .filter(|(id, _)| !self.ships.contains_key(*id))
+            .map(|(id, (name, hull))| AnnouncedShip {
+                ship_id: id.clone(),
+                name: name.clone(),
+                hull_number: hull.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.ship_id.cmp(&b.ship_id));
+        out
     }
 
     /// Ingest one poll round. Unknown ids appear as new pending ships;
@@ -197,6 +301,7 @@ impl Registry {
                 ship_id: s.latest.ship_id.clone(),
                 latest: s.latest.clone(),
                 stale: s.stale,
+                silent: false,
                 trail: s.track.iter().map(|f| f.position).collect(),
                 source: s.latest.source,
             })
@@ -206,10 +311,15 @@ impl Registry {
     }
 
     /// Where to draw the marker at wall-clock `now_epoch`: lerp
-    /// previous -> latest, holding on sub-guard jumps. No prediction
-    /// past the latest fix.
+    /// previous -> latest, holding on sub-guard jumps. A backfilled
+    /// latest never moves the marker while a previous live fix exists
+    /// (backfilled ticket) — the flush joins the trail, not the position.
+    /// No prediction past the latest fix.
     pub fn displayed_position(&self, ship_id: &str, now_epoch: i64) -> Option<GeoPosition> {
         let s = self.ships.get(ship_id)?;
+        if s.latest.backfilled && s.previous.is_some() {
+            return s.previous.as_ref().map(|p| p.position);
+        }
         let prev = s.previous.as_ref().unwrap_or(&s.latest);
         let t0 = prev.epoch_secs();
         let t1 = s.latest.epoch_secs();
@@ -223,10 +333,14 @@ impl Registry {
     /// Blend previous -> latest by explicit fraction in [0, 1] (clamped).
     /// Wall-clock driven: the UI maps elapsed-since-poll onto the poll
     /// interval, so markers glide between fixes instead of jumping.
-    /// Holds on sub-guard jumps; unknown ships yield None.
+    /// Holds on sub-guard jumps; a backfilled latest holds previous while
+    /// one exists (no lerp into the past); unknown ships yield None.
     pub fn blend(&self, ship_id: &str, frac: f64) -> Option<GeoPosition> {
         let s = self.ships.get(ship_id)?;
         let prev = s.previous.as_ref().unwrap_or(&s.latest);
+        if s.latest.backfilled && s.previous.is_some() {
+            return Some(prev.position);
+        }
         // Sim fixes are noiseless by construction: never hold them.
         if s.latest.source == FixSource::Wire
             && prev.position.distance_m(&s.latest.position) < JITTER_GUARD_M
@@ -246,8 +360,13 @@ mod tests {
             ship_id: id.into(),
             position: GeoPosition { latitude: lat, longitude: lon },
             ts: ts.into(),
+            received_at: None,
             heading_deg: None,
             speed_kn: None,
+            accuracy_m: None,
+            name: None,
+            hull_number: None,
+            backfilled: false,
             source: FixSource::Wire,
             seq: 0,
         }
@@ -352,6 +471,65 @@ mod tests {
         let far = GeoPosition { latitude: 53.55, longitude: 10.0 };
         assert!(!should_track(center, near));
         assert!(should_track(center, far));
+    }
+
+    #[test]
+    fn announce_lists_silent_until_first_fix() {
+        let mut r = Registry::new(TrailBound::default());
+        r.announce("13".into(), Some("KRI Ahmad Yani".into()), Some("KRI-AH-YN".into()));
+        assert!(r.ships().is_empty(), "silent ships are not tracked");
+        let silent = r.announced();
+        assert_eq!(silent.len(), 1);
+        assert_eq!(silent[0].name.as_deref(), Some("KRI Ahmad Yani"));
+        // Empty rounds never stale the announced id (it was never seen).
+        r.poll(vec![]);
+        r.poll(vec![]);
+        r.poll(vec![]);
+        assert_eq!(r.announced().len(), 1);
+        // First fix promotes: tracked once, announced never again.
+        r.poll(vec![fix("13", -6.0, 106.0, "2026-09-12T00:00:00Z")]);
+        assert_eq!(r.ships().len(), 1);
+        assert!(!r.ships()[0].silent);
+        assert!(r.announced().is_empty());
+    }
+
+    #[test]
+    fn backfilled_latest_holds_marker_but_joins_trail() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![fix("a", 53.5, 9.9, "2026-09-12T00:00:00Z")]);
+        let mut flush = fix("a", 54.5, 10.9, "2026-09-12T00:00:10Z");
+        flush.backfilled = true;
+        flush.received_at = Some("2026-09-12T00:05:00Z".into());
+        r.poll(vec![flush]);
+        // Marker holds previous live position at every fraction.
+        assert_eq!(
+            r.blend("a", 1.0).unwrap(),
+            GeoPosition { latitude: 53.5, longitude: 9.9 }
+        );
+        assert_eq!(
+            r.displayed_position("a", 1789171210).unwrap(),
+            GeoPosition { latitude: 53.5, longitude: 9.9 }
+        );
+        // The flush still joins the trail.
+        assert_eq!(r.ships()[0].trail.len(), 2);
+    }
+
+    #[test]
+    fn data_age_uses_received_for_live_and_recorded_for_backfill() {
+        let now = 1789171800; // 2026-09-12T00:10:00Z
+        let mut live = fix("a", 53.5, 9.9, "2026-09-12T00:09:00Z");
+        live.received_at = Some("2026-09-12T00:09:05Z".into());
+        assert_eq!(live.data_age_secs(now), Some(55));
+        assert!(!live.is_old_data(now));
+        let mut old = fix("b", 53.5, 9.9, "2026-09-12T00:09:00Z");
+        old.received_at = Some("2026-09-12T00:09:05Z".into());
+        assert!(old.is_old_data(now + 3600));
+        // Backfill ages from recorded_at even with a fresh receipt.
+        let mut flush = fix("c", 53.5, 9.9, "2026-09-10T00:00:00Z");
+        flush.backfilled = true;
+        flush.received_at = Some("2026-09-12T00:10:00Z".into());
+        assert!(flush.data_age_secs(now).unwrap() > OLD_DATA_AFTER_SECS);
+        assert!(flush.is_old_data(now));
     }
 
     #[test]

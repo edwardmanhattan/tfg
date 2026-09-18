@@ -10,7 +10,7 @@ use std::fs;
 
 use serde::{Deserialize, Serialize};
 
-use crate::geo::track::Fix;
+use crate::geo::track::{Fix, FixSource};
 
 /// One round of polling. Errors are strings; the registry treats a failed
 /// round as "no fixes" (ships accumulate misses toward stale).
@@ -38,6 +38,9 @@ fn stamp_now(frame: &mut [Fix]) {
     let now = now_ts();
     for fix in frame {
         fix.ts = now.clone();
+        // Receipt time too: replayed frames are fresh on serve, so the
+        // old-data badge (wire-gated) stays quiet on fixtures.
+        fix.received_at = Some(now.clone());
     }
 }
 
@@ -339,6 +342,458 @@ pub fn keyring_clear(user: &str) -> Result<(), String> {
     }
 }
 
+/// Minos standing picture (REST mapping ticket): the initial picture the
+/// socket then keeps current. Vessels that never reported carry labels
+/// but no position — announced as silent, never zero-filled.
+#[derive(Debug, Clone, Deserialize)]
+struct FeedPosition {
+    id_unit: u64,
+    name: String,
+    hull_number: Option<String>,
+    position: Option<FeedFix>,
+}
+
+/// One stored fix as the server holds it.
+#[derive(Debug, Clone, Deserialize)]
+struct FeedFix {
+    latitude: f64,
+    longitude: f64,
+    speed_kn: Option<f32>,
+    course_deg: Option<f32>,
+    accuracy_m: Option<f32>,
+    recorded_at: String,
+    received_at: String,
+    #[serde(default)]
+    backfilled: bool,
+}
+
+impl FeedFix {
+    fn to_fix(&self, ship_id: String, name: String, hull_number: Option<String>) -> Fix {
+        Fix {
+            ship_id,
+            position: crate::geo::GeoPosition {
+                latitude: self.latitude,
+                longitude: self.longitude,
+            },
+            ts: self.recorded_at.clone(),
+            received_at: Some(self.received_at.clone()),
+            heading_deg: self.course_deg,
+            speed_kn: self.speed_kn,
+            accuracy_m: self.accuracy_m,
+            name: Some(name),
+            hull_number,
+            backfilled: self.backfilled,
+            source: FixSource::Wire,
+            seq: 0,
+        }
+    }
+}
+
+/// Snapshot out of one REST read: silent announcements plus latest fixes.
+pub struct Snapshot {
+    pub announced: Vec<(String, Option<String>, Option<String>)>,
+    pub fixes: Vec<Fix>,
+}
+
+/// Minos REST reads (REST mapping ticket): snapshot fetch beside the
+/// auth client. Same blocking style; the poll thread calls it, the
+/// socket actor re-reads it after every reconnect.
+pub struct MinosRest {
+    base_url: String,
+    client: reqwest::blocking::Client,
+}
+
+impl MinosRest {
+    pub fn new(base_url: &str) -> Result<Self, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), client })
+    }
+
+    /// Standing picture: every vessel, ordered by id. Not paginated by
+    /// design (a page of a picture is a wrong picture).
+    pub fn snapshot(&self, access_token: &str) -> Result<Snapshot, String> {
+        let positions: Vec<FeedPosition> = unwrap_envelope(
+            self.client
+                .get(&format!("{}/live-feed/positions", self.base_url))
+                .bearer_auth(access_token)
+                .send()
+                .map_err(|e| e.to_string())?,
+        )
+        .and_then(|data| serde_json::from_value(data).map_err(|e| e.to_string()))?;
+        let mut announced = Vec::with_capacity(positions.len());
+        let mut fixes = Vec::new();
+        for p in positions {
+            let id = p.id_unit.to_string();
+            announced.push((id.clone(), Some(p.name.clone()), p.hull_number.clone()));
+            if let Some(pos) = p.position {
+                fixes.push(pos.to_fix(id, p.name, p.hull_number));
+            }
+        }
+        Ok(Snapshot { announced, fixes })
+    }
+}
+
+/// One live-feed publication (§5): one message per beacon batch, per
+/// vessel. Optional numerics are absent-never-zero on the wire.
+#[derive(Debug, Clone, Deserialize)]
+struct FeedEvent {
+    id_unit: u64,
+    name: Option<String>,
+    hull_number: Option<String>,
+    latitude: f64,
+    longitude: f64,
+    speed_kn: Option<f32>,
+    course_deg: Option<f32>,
+    accuracy_m: Option<f32>,
+    recorded_at: String,
+    received_at: String,
+    #[serde(default)]
+    backfilled: bool,
+}
+
+impl FeedEvent {
+    fn to_fix(&self) -> Fix {
+        Fix {
+            ship_id: self.id_unit.to_string(),
+            position: crate::geo::GeoPosition {
+                latitude: self.latitude,
+                longitude: self.longitude,
+            },
+            ts: self.recorded_at.clone(),
+            received_at: Some(self.received_at.clone()),
+            heading_deg: self.course_deg,
+            speed_kn: self.speed_kn,
+            accuracy_m: self.accuracy_m,
+            name: self.name.clone(),
+            hull_number: self.hull_number.clone(),
+            backfilled: self.backfilled,
+            source: FixSource::Wire,
+            seq: 0,
+        }
+    }
+}
+
+/// Backoff for socket retries (transport ticket): base 1 s, cap 30 s,
+/// full jitter. Tunable here, applied in the actor loop.
+pub const LIVE_BACKOFF_BASE_SECS: u64 = 1;
+pub const LIVE_BACKOFF_CAP_SECS: u64 = 30;
+
+/// Full jitter in whole seconds over [0, bound].
+fn full_jitter_secs(bound: u64) -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    nanos % (bound + 1)
+}
+
+/// Actor -> UI reports. The UI owns refresh (keyring) and sign-out; the
+/// actor never touches either.
+#[derive(Debug, Clone)]
+pub enum LiveEvent {
+    Connected { client_id: String },
+    Announced(Vec<(String, Option<String>, Option<String>)>),
+    Reconnecting { attempt: u32, wait_secs: u64 },
+    /// Fatal refusal (101/103/107): the actor stops itself. The UI signs
+    /// out (101) or shows the error; the wire goes quiet and stale flags
+    /// read the outage as feed-down.
+    Refused { code: u32, reason: String },
+    /// Token expiry (109): the UI refreshes silently and pushes the new
+    /// token back down.
+    RefreshDue,
+    SocketError(String),
+}
+
+/// UI -> actor commands.
+#[derive(Debug)]
+pub enum LiveCmd {
+    SetToken(String),
+    Shutdown,
+}
+
+struct LiveShared {
+    queue: std::sync::Mutex<std::collections::VecDeque<FeedEvent>>,
+    /// Last-known picture per ship (snapshot seed + socket overlay).
+    /// The poll side replays it every tick; reconnect re-reads reseed it.
+    known: std::sync::Mutex<std::collections::HashMap<String, Fix>>,
+    live: std::sync::atomic::AtomicBool,
+}
+
+/// Tick-batched live wire (transport ticket): socket publications queue
+/// on the actor thread; each poll drains newest-per-ship and replays the
+/// last-known picture for every known vessel (snapshot + socket overlay),
+/// so silence counts as Registry misses and disconnects read as stale.
+/// Disconnect yields empty rounds.
+pub struct LiveWire {
+    shared: std::sync::Arc<LiveShared>,
+    cmd_tx: std::sync::mpsc::Sender<LiveCmd>,
+}
+
+impl LiveWire {
+    /// Snapshot first (announcements + seed picture), then stand up the
+    /// actor. Snapshot failure fails the whole connect — the caller falls
+    /// back to an empty wire with the reason in its description.
+    pub fn connect(
+        ws_url: &str,
+        rest: &MinosRest,
+        token: &str,
+        cmd_tx: std::sync::mpsc::Sender<LiveCmd>,
+        cmd_rx: std::sync::mpsc::Receiver<LiveCmd>,
+        event_tx: std::sync::mpsc::Sender<LiveEvent>,
+    ) -> Result<Self, String> {
+        let snap = rest.snapshot(token)?;
+        let _ = event_tx.send(LiveEvent::Announced(snap.announced));
+        let mut known = std::collections::HashMap::new();
+        for f in snap.fixes {
+            known.insert(f.ship_id.clone(), f);
+        }
+        let shared = std::sync::Arc::new(LiveShared {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            known: std::sync::Mutex::new(known),
+            live: std::sync::atomic::AtomicBool::new(true),
+        });
+        let token = token.to_string();
+        let ws_url = ws_url.to_string();
+        let rest_base = rest.base_url.clone();
+        let actor_shared = shared.clone();
+        std::thread::spawn(move || {
+            run_actor(ws_url, rest_base, token, actor_shared, cmd_rx, event_tx);
+        });
+        Ok(Self { shared, cmd_tx })
+    }
+
+    /// Newest queued event per ship, overlaid on the known picture.
+    fn drain_queue(&self) {
+        let mut fresh: std::collections::HashMap<String, Fix> = std::collections::HashMap::new();
+        if let Ok(mut q) = self.shared.queue.lock() {
+            for ev in q.drain(..) {
+                let fix = ev.to_fix();
+                match fresh.get(&fix.ship_id) {
+                    Some(prev) if prev.ts >= fix.ts => {}
+                    _ => {
+                        fresh.insert(fix.ship_id.clone(), fix);
+                    }
+                }
+            }
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        if let Ok(mut known) = self.shared.known.lock() {
+            for (id, fix) in fresh {
+                known.insert(id, fix);
+            }
+        }
+    }
+}
+
+impl PollSource for LiveWire {
+    fn poll(&mut self) -> Result<Vec<Fix>, String> {
+        if !self.shared.live.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(Vec::new()); // actor down: feed-down reads as stale
+        }
+        self.drain_queue();
+        match self.shared.known.lock() {
+            Ok(known) => Ok(known.values().cloned().collect()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+impl Drop for LiveWire {
+    /// Swapping the wire away stops the actor: disconnect, mark down,
+    /// end the thread. Best-effort — a dead actor's mailbox is gone.
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(LiveCmd::Shutdown);
+    }
+}
+
+/// The actor: own thread, own multi-thread runtime (blocking REST re-reads
+/// must not stall callbacks), SDK client with JSON protocol. Reconnects
+/// pace on our backoff consts; fatal codes stop the loop and mark down.
+fn run_actor(
+    ws_url: String,
+    rest_base: String,
+    token: String,
+    shared: std::sync::Arc<LiveShared>,
+    cmd_rx: std::sync::mpsc::Receiver<LiveCmd>,
+    event_tx: std::sync::mpsc::Sender<LiveEvent>,
+) {
+    use std::sync::atomic::Ordering;
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = event_tx.send(LiveEvent::SocketError(format!("runtime: {e}")));
+            shared.live.store(false, Ordering::SeqCst);
+            return;
+        }
+    };
+    rt.block_on(async move {
+        use tokio_centrifuge::client::Client;
+        use tokio_centrifuge::config::Config;
+        use tokio_centrifuge::events::{ConnectedEvent, DisconnectedEvent};
+        use tokio_centrifuge::protocol::Publication;
+        let client = Client::new(
+            &ws_url,
+            Config::new().with_token(token.clone()).use_json(),
+        );
+        let current_token = std::sync::Arc::new(std::sync::Mutex::new(token));
+        // One subscription object: publications attach once, reconnects
+        // re-arm the same object (idempotent server-side).
+        let sub = client.new_subscription("live-feed");
+        // Publications: parse §5, queue newest-wins per tick. Personal
+        // channel traffic has no client-subscription path here; when the
+        // SDK surfaces it, drain it to the terminal, never to the Registry.
+        {
+            let shared = shared.clone();
+            sub.on_publication(move |p: Publication| {
+                match serde_json::from_slice::<FeedEvent>(&p.data) {
+                    Ok(ev) => {
+                        if let Ok(mut q) = shared.queue.lock() {
+                            q.push_back(ev);
+                        }
+                    }
+                    Err(e) => eprintln!("live-feed: unparsable publication: {e}"),
+                }
+            });
+            sub.on_error(|e| {
+                eprintln!("live-feed subscription error: {e:?}");
+            });
+        }
+        // Connected: report up, reset backoff, re-read the snapshot
+        // (reconcile-by-id: no channel history), re-arm the subscription.
+        {
+            let event_tx = event_tx.clone();
+            let shared = shared.clone();
+            let rest_base = rest_base.clone();
+            let current_token = current_token.clone();
+            let resub = sub.clone();
+            client.on_connected(move |e: ConnectedEvent<'_>| {
+                let _ = event_tx.send(LiveEvent::Connected {
+                    client_id: e.client_id.to_string(),
+                });
+                shared.live.store(true, Ordering::SeqCst);
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    tokio::task::spawn(async move {
+                        let _ = resub.subscribe().await;
+                    });
+                    // Snapshot re-read off the callback path.
+                    let event_tx = event_tx.clone();
+                    let shared = shared.clone();
+                    let rest_base = rest_base.clone();
+                    let current_token = current_token.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let tok =
+                            current_token.lock().map(|t| t.clone()).unwrap_or_default();
+                        let Ok(rest) = MinosRest::new(&rest_base) else { return };
+                        let Ok(snap) = rest.snapshot(&tok) else { return };
+                        let _ = event_tx.send(LiveEvent::Announced(snap.announced));
+                        if let Ok(mut known) = shared.known.lock() {
+                            for f in snap.fixes {
+                                known.insert(f.ship_id.clone(), f);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        // Disconnects: the refusal policy. Fatal codes stop the loop;
+        // 109 asks the UI for a silent refresh; the rest back off.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        {
+            let event_tx = event_tx.clone();
+            let stop = stop.clone();
+            let attempts = attempts.clone();
+            let shared = shared.clone();
+            client.on_disconnected(move |e: DisconnectedEvent<'_>| {
+                shared.live.store(false, Ordering::SeqCst);
+                match e.code {
+                    101 | 103 | 107 => {
+                        let _ = event_tx.send(LiveEvent::Refused {
+                            code: e.code,
+                            reason: e.reason.to_string(),
+                        });
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                    109 => {
+                        let _ = event_tx.send(LiveEvent::RefreshDue);
+                    }
+                    _ => {
+                        let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                        let wait = (LIVE_BACKOFF_BASE_SECS
+                            .saturating_mul(1u64 << n.min(6))
+                            .min(LIVE_BACKOFF_CAP_SECS))
+                            + full_jitter_secs(LIVE_BACKOFF_CAP_SECS.min(5));
+                        let _ = event_tx.send(LiveEvent::Reconnecting {
+                            attempt: n,
+                            wait_secs: wait,
+                        });
+                    }
+                }
+            });
+        }
+        client.on_error(|e| {
+            eprintln!("live socket error: {e:?}");
+        });
+        // Initial subscribe attempt (pre-connect declaration; the server
+        // arms it on handshake, and on_connected re-arms per reconnect).
+        {
+            let sub = client.new_subscription("live-feed");
+            let _ = sub.subscribe().await;
+        }
+        let _ = client.connect().await;
+        // Command + reconnect loop: token push-down applies live via
+        // set_token; shutdown/fatal disconnects the client and ends us.
+        let mut backoff_wait: Option<u64> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            match cmd_rx.try_recv() {
+                Ok(LiveCmd::SetToken(t)) => {
+                    if let Ok(mut cur) = current_token.lock() {
+                        *cur = t.clone();
+                    }
+                    client.set_token(t);
+                }
+                Ok(LiveCmd::Shutdown) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            // Retryable disconnect outstanding: pace our explicit
+            // re-handshake on our backoff (harmless if the SDK's own
+            // reconnect already won the race — the server dedupes).
+            if !shared.live.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+                let wait = backoff_wait.get_or_insert_with(|| {
+                    let n = attempts.load(Ordering::SeqCst).max(1);
+                    LIVE_BACKOFF_BASE_SECS
+                        .saturating_mul(1u64 << n.min(6))
+                        .min(LIVE_BACKOFF_CAP_SECS)
+                        + full_jitter_secs(5)
+                });
+                tokio::time::sleep(std::time::Duration::from_secs(*wait)).await;
+                backoff_wait = None;
+                let _ = client.connect().await;
+            } else {
+                backoff_wait = None;
+            }
+        }
+        let _ = client.disconnect().await;
+        shared.live.store(false, Ordering::SeqCst);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +966,52 @@ mod tests {
         });
         let auth = MinosAuth::new("http://127.0.0.1:18084/api/v1").expect("client builds");
         auth.change_password("AT", "old-pw", "new-pw-12-chars").expect("change succeeds");
+    }
+
+    #[test]
+    fn feed_event_maps_section_five_to_fix() {
+        // §5 publication: decimal unit id, labels, recorded vs received
+        // time, omitted-never-zero optionals, backfilled flag.
+        let ev: FeedEvent = serde_json::from_str(
+            r#"{"id_unit":13,"name":"KRI Ahmad Yani","hull_number":"KRI-AH-YN","latitude":-6.0888,"longitude":106.9111,"speed_kn":14.2,"course_deg":87.5,"recorded_at":"2026-09-15T09:56:28Z","received_at":"2026-09-15T09:56:29Z","backfilled":false}"#,
+        )
+        .expect("§5 parses");
+        assert!(ev.accuracy_m.is_none(), "absent stays absent, never zero");
+        let f = ev.to_fix();
+        assert_eq!(f.ship_id, "13");
+        assert_eq!(f.ts, "2026-09-15T09:56:28Z");
+        assert_eq!(f.received_at.as_deref(), Some("2026-09-15T09:56:29Z"));
+        assert_eq!(f.heading_deg, Some(87.5));
+        assert_eq!(f.speed_kn, Some(14.2));
+        assert_eq!(f.name.as_deref(), Some("KRI Ahmad Yani"));
+        assert!(!f.backfilled);
+        assert_eq!(f.source, FixSource::Wire);
+    }
+
+    #[test]
+    fn snapshot_splits_silent_and_fixes() {
+        // Standing picture: one reporting vessel (backfilled flush) and
+        // one silent vessel (labels, no position key at all).
+        let server = tiny_http::Server::http("127.0.0.1:18085").expect("bind test port");
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests().take(1) {
+                assert_eq!(rq.url(), "/api/v1/live-feed/positions");
+                let _ = rq.respond(tiny_http::Response::from_string(
+                    r#"{"status_code":200,"message":"Successfull","data":[
+                        {"id_unit":13,"name":"KRI Ahmad Yani","hull_number":"KRI-AH-YN","position":{"latitude":-6.08,"longitude":106.91,"recorded_at":"2026-09-10T00:00:00Z","received_at":"2026-09-15T09:56:29Z","backfilled":true}},
+                        {"id_unit":14,"name":"KRI Ahmad Yani II","hull_number":null}
+                    ]}"#,
+                ));
+            }
+        });
+        let rest = MinosRest::new("http://127.0.0.1:18085/api/v1").expect("client builds");
+        let snap = rest.snapshot("AT").expect("snapshot succeeds");
+        assert_eq!(snap.announced.len(), 2);
+        assert_eq!(snap.fixes.len(), 1);
+        let f = &snap.fixes[0];
+        assert_eq!(f.ship_id, "13");
+        assert!(f.backfilled);
+        assert_eq!(f.received_at.as_deref(), Some("2026-09-15T09:56:29Z"));
     }
 
     #[test]

@@ -53,6 +53,16 @@ impl Fleet {
             if !seen.insert(u.id.clone()) {
                 return Err(format!("duplicate fleet id `{}`", u.id));
             }
+            // Namespace guard (REST mapping ticket): Minos wire ships key
+            // as decimal unit ids ("13"), so seed ids must never be
+            // all-digit — or a wire fix would collide with a sim hull and
+            // the MergeSource owned-filter could not tell them apart.
+            if u.id.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!(
+                    "fleet id `{}` is all-digit: reserved for Minos wire ships",
+                    u.id
+                ));
+            }
             if !( -11.0..=6.5).contains(&u.lat) || !(95.0..=141.5).contains(&u.lon) {
                 return Err(format!("fleet unit {}: coords out of range ({}, {})", u.id, u.lat, u.lon));
             }
@@ -104,6 +114,13 @@ mod tests {
         assert_eq!(nagapasa.satuan, "Satsel Koarmada II");
         assert!((nagapasa.lat - -7.1917).abs() < 1e-4);
         assert!((nagapasa.lon - 112.735).abs() < 1e-4);
+    }
+
+    #[test]
+    fn all_digit_ids_are_rejected_for_wire_namespace() {
+        let doc = r#"{"units":[{"id":"13","name":"X","hull":"H","class_id":"c","role":"","origin":"","year":"","satuan":"","pangkalan":"","lokasi":"","lat":0.0,"lon":100.0}]}"#;
+        let err = Fleet::parse(doc).unwrap_err();
+        assert!(err.contains("all-digit"), "{err}");
     }
 
     #[test]

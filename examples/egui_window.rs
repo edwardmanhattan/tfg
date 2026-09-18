@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use chrono::{TimeZone, Utc};
-use tfg::backend::{FileReplay, HttpPoll, Invite, InviteClient, MinosAuth, PollSource, TokenPair};
+use tfg::backend::{FileReplay, HttpPoll, Invite, InviteClient, LiveCmd, LiveEvent, LiveWire, MinosAuth, MinosRest, PollSource, TokenPair};
 use tfg::catalog::{Catalog, Category};
 use tfg::fleet::Fleet;
 use tfg::groups::Groups;
@@ -140,10 +140,18 @@ enum AppMode {
 }
 
 /// Runtime wire backends for the poll thread (task #39). Replay stays
-/// boot-only (env); the Connection island swaps Http/Empty live.
+/// boot-only (env); the Connection island swaps Http/Empty/Live.
 enum WireKind {
     Http(String),
     Replay(String),
+    Live {
+        ws_url: String,
+        rest_base: String,
+        token: String,
+        cmd_tx: Sender<LiveCmd>,
+        cmd_rx: Receiver<LiveCmd>,
+        event_tx: Sender<LiveEvent>,
+    },
     Empty,
 }
 
@@ -157,15 +165,26 @@ impl PollSource for EmptyWire {
     }
 }
 
-/// Build a wire source plus its status description.
-fn build_wire(kind: &WireKind) -> Result<(Box<dyn PollSource>, String), String> {
+/// Build a wire source plus its status description. Live failures fall
+/// back to an empty wire with the reason (feed-down reads as stale).
+fn build_wire(kind: WireKind) -> Result<(Box<dyn PollSource>, String), String> {
     match kind {
-        WireKind::Http(url) => HttpPoll::new(url)
+        WireKind::Http(url) => HttpPoll::new(&url)
             .map(|h| (Box::new(h) as Box<dyn PollSource>, format!("HTTP {url}")))
             .map_err(|e| e),
-        WireKind::Replay(path) => FileReplay::from_file(path)
+        WireKind::Replay(path) => FileReplay::from_file(&path)
             .map(|r| (Box::new(r) as Box<dyn PollSource>, format!("replay {path}")))
             .map_err(|e| e),
+        WireKind::Live { ws_url, rest_base, token, cmd_tx, cmd_rx, event_tx } => {
+            let rest = MinosRest::new(&rest_base).map_err(|e| e)?;
+            match LiveWire::connect(&ws_url, &rest, &token, cmd_tx, cmd_rx, event_tx) {
+                Ok(w) => Ok((Box::new(w) as Box<dyn PollSource>, format!("live {ws_url}"))),
+                Err(e) => Ok((
+                    Box::new(EmptyWire) as Box<dyn PollSource>,
+                    format!("live failed ({e}); empty"),
+                )),
+            }
+        }
         WireKind::Empty => Ok((Box::new(EmptyWire) as Box<dyn PollSource>, "empty".to_string())),
     }
 }
@@ -208,6 +227,8 @@ struct ShipMarker {
     x: f64,
     y: f64,
     stale: bool,
+    /// Wire data older than the old-data threshold (backfilled ticket).
+    old_data: bool,
     source: FixSource,
     trail: Vec<(f64, f64)>,
 }
@@ -457,6 +478,12 @@ struct ShipApp {
     conn_status: String,
     show_connection: bool,
     wire_ctl_tx: Option<Sender<WireKind>>,
+    /// Live socket handles (live-wire ticket): token push-down to the
+    /// actor, event reports up. Set on connect-live, cleared on swap
+    /// away; dropping the wire drops the actor (LiveWire::drop).
+    live_cmd_tx: Option<Sender<LiveCmd>>,
+    live_evt_rx: Option<Receiver<LiveEvent>>,
+    live_status: String,
     /// Session-log history view (task #40): selected past journal.
     log_view_path: Option<std::path::PathBuf>,
     /// Replay (task #41): placement events, slider position, map ghosts,
@@ -604,6 +631,52 @@ impl ShipApp {
                 }
             }
         }
+        // Live socket reports (live-wire ticket): same drain-then-feed
+        // borrow rule. Announcements seed silent vessels; refusals drive
+        // sign-out/error UX; 109 refreshes silently on our path.
+        let live_evts: Vec<LiveEvent> = match &self.live_evt_rx {
+            Some(rx) => rx.try_iter().collect(),
+            None => Vec::new(),
+        };
+        for evt in live_evts {
+            match evt {
+                LiveEvent::Connected { client_id } => {
+                    self.live_status = format!("connected ({client_id})");
+                    self.feed(format!("live connected ({client_id})"));
+                }
+                LiveEvent::Announced(list) => {
+                    let n = list.len();
+                    for (id, name, hull) in list {
+                        self.registry.announce(id, name, hull);
+                    }
+                    self.feed(format!("live snapshot: {n} vessel(s) known"));
+                }
+                LiveEvent::Reconnecting { attempt, wait_secs } => {
+                    self.live_status =
+                        format!("reconnecting (attempt {attempt}, ~{wait_secs}s)");
+                }
+                LiveEvent::Refused { code, reason } => {
+                    self.live_status = format!("refused {code}: {reason}");
+                    self.feed(format!("live refused {code}: {reason}"));
+                    if code == 101 {
+                        // Token is dead: sign out to the Login island.
+                        self.sign_out("live refused 101");
+                        self.show_login = true;
+                    } else {
+                        self.order_warning =
+                            Some(format!("live feed refused {code}: {reason}"));
+                    }
+                }
+                LiveEvent::RefreshDue => {
+                    self.feed("live token expired (109): refreshing".to_string());
+                    self.refresh_now();
+                }
+                LiveEvent::SocketError(e) => {
+                    self.live_status = format!("socket error: {e}");
+                    eprintln!("live socket error: {e}");
+                }
+            }
+        }
         if rounds > 0 {
             self.last_poll = Instant::now();
             let ships = self.registry.ships();
@@ -620,6 +693,9 @@ impl ShipApp {
         let frac = (self.last_poll.elapsed().as_secs_f64() / POLL_SECS).clamp(0.0, 1.0);
         let center = self.center;
         let (mw, mh) = self.map_dims();
+        // Wall clock for the old-data badge (wire sources only: sim
+        // clocks are game time, replay receipts are fresh by stamp).
+        let now_epoch = chrono::Utc::now().timestamp();
         self.registry
             .ships()
             .iter()
@@ -631,7 +707,8 @@ impl ShipApp {
                     .iter()
                     .map(|p| project_mercator(p.latitude, p.longitude, center, self.zoom, mw, mh))
                     .collect();
-                ShipMarker { id: s.ship_id.clone(), x, y, stale: s.stale, source: s.source, trail }
+                let old_data = s.source == FixSource::Wire && s.latest.is_old_data(now_epoch);
+                ShipMarker { id: s.ship_id.clone(), x, y, stale: s.stale, old_data, source: s.source, trail }
             })
             .collect()
     }
@@ -700,15 +777,64 @@ impl ShipApp {
                     let _ = tx.send(WireKind::Empty);
                     self.wire_desc = "empty".to_string();
                     self.conn_status = "disconnected".to_string();
+                    self.live_cmd_tx = None;
+                    self.live_evt_rx = None;
+                    self.live_status = "idle".to_string();
                     eprintln!("wire: empty");
                 }
             }
         });
         ui.label(&self.conn_status);
+        // Live socket (live-wire ticket): token-gated swap. Snapshot
+        // failure lands back on empty with the reason; fatal refusals
+        // arrive as events below.
+        ui.separator();
+        ui.heading("Live feed");
+        let ws_url = Self::ws_url_for(&self.minos_base);
+        ui.label(format!("socket: {ws_url}"));
+        ui.label(format!("live: {}", self.live_status));
+        ui.horizontal(|ui| {
+            let authed = self.auth_token.is_some();
+            if ui.add_enabled(authed, egui::Button::new("connect live")).clicked() {
+                let token = self.auth_token.clone().unwrap_or_default();
+                let rest_base = self.minos_base.clone();
+                let (cmd_tx, cmd_rx) = mpsc::channel();
+                let (event_tx, event_rx) = mpsc::channel();
+                if let Some(tx) = &self.wire_ctl_tx {
+                    let _ = tx.send(WireKind::Live {
+                        ws_url: ws_url.clone(),
+                        rest_base,
+                        token,
+                        cmd_tx: cmd_tx.clone(),
+                        cmd_rx,
+                        event_tx,
+                    });
+                    self.live_cmd_tx = Some(cmd_tx);
+                    self.live_evt_rx = Some(event_rx);
+                    self.live_status = "connecting…".to_string();
+                    self.wire_desc = format!("live {ws_url}");
+                    eprintln!("wire: live {ws_url}");
+                }
+            }
+            if ui.button("stop live").clicked() {
+                if let Some(tx) = &self.wire_ctl_tx {
+                    let _ = tx.send(WireKind::Empty);
+                    self.live_cmd_tx = None;
+                    self.live_evt_rx = None;
+                    self.live_status = "idle".to_string();
+                    self.wire_desc = "empty".to_string();
+                    eprintln!("wire: live stopped");
+                }
+            }
+        });
+        if self.auth_token.is_none() {
+            ui.label("Sign in through the Login island first.");
+        }
     }
 
     /// Stash a fresh pair: access token in memory with a fresh issue
     /// time, refresh token to the keyring (memory fallback, flagged).
+    /// Rotations push down to the live actor when one runs.
     fn store_pair(&mut self, user: String, pair: TokenPair) {
         if let Some(rt) = pair.refresh_token.clone() {
             if tfg::backend::keyring_save(&user, &rt).is_err() {
@@ -720,9 +846,12 @@ impl ShipApp {
             }
         }
         self.auth_user = Some(user);
-        self.auth_token = Some(pair.access_token);
+        self.auth_token = Some(pair.access_token.clone());
         self.auth_issued_at = Some(Instant::now());
         self.auth_ttl_secs = pair.expires_in;
+        if let Some(tx) = &self.live_cmd_tx {
+            let _ = tx.send(LiveCmd::SetToken(pair.access_token));
+        }
     }
 
     /// Sign out everywhere: keyring entry best-effort first, then memory.
@@ -780,6 +909,38 @@ impl ShipApp {
             }
             Err(e) => {
                 self.auth_status = format!("sign-in failed: {e}");
+            }
+        }
+    }
+
+    /// One refresh attempt, now (proactive tick and 109 path share it):
+    /// keyring first, memory fallback, loud sign-out when rotation fails.
+    fn refresh_now(&mut self) {
+        let Some(user) = self.auth_user.clone() else {
+            return;
+        };
+        let base = self.minos_base.clone();
+        let stored = match tfg::backend::keyring_load(&user) {
+            Ok(Some(rt)) => Some(rt),
+            Ok(None) => self.auth_refresh_memory.clone(),
+            Err(e) => {
+                eprintln!("keyring unreadable ({e}); memory fallback");
+                self.auth_refresh_memory.clone()
+            }
+        };
+        match stored {
+            Some(rt) => match MinosAuth::new(&base).and_then(|a| a.refresh(&rt)) {
+                Ok(pair) => {
+                    self.store_pair(user.clone(), pair);
+                    self.auth_status = format!("signed in as {user} · refreshed");
+                    eprintln!("auth refreshed for {user}");
+                }
+                Err(e) => {
+                    self.sign_out(&format!("refresh failed: {e}"));
+                }
+            },
+            None => {
+                self.sign_out("refresh token missing");
             }
         }
     }
@@ -1080,6 +1241,22 @@ impl ShipApp {
     /// as the poll source).
     fn backend_base() -> Option<String> {
         std::env::var("TFG_BACKEND_URL").ok()
+    }
+
+    /// Socket URL for a Minos REST base (live-wire ticket): same host,
+    /// wss without port on https, ws :8000 on http (transport ticket).
+    fn ws_url_for(minos_base: &str) -> String {
+        let (scheme, rest) = match minos_base.split_once("://") {
+            Some((s, r)) => (s, r),
+            None => ("http", minos_base),
+        };
+        let hostport = rest.split('/').next().unwrap_or(rest);
+        let host = hostport.split(':').next().unwrap_or(hostport);
+        if scheme == "https" {
+            format!("wss://{host}/connection/websocket")
+        } else {
+            format!("ws://{host}:8000/connection/websocket")
+        }
     }
 
     /// Push every local invite record to the mock (client codes win).
@@ -2339,38 +2516,13 @@ impl eframe::App for ShipApp {
         }
         let markers = self.markers();
         // Proactive refresh (auth resolution): at 80% of TTL, on our
-        // terms so the map never blanks on a timer. Blocking like the
-        // other backend calls; refresh failure signs out loud (a 401 is
-        // already over — the token it would refresh with is dead).
-        if let (Some(user), Some(issued), ttl) =
+        // terms so the map never blanks on a timer. See refresh_now
+        // (shared with the socket 109 path).
+        if let (Some(_user), Some(issued), ttl) =
             (self.auth_user.clone(), self.auth_issued_at, self.auth_ttl_secs)
         {
             if ttl > 0 && issued.elapsed().as_secs() * 5 >= ttl * 4 {
-                let base = self.minos_base.clone();
-                let stored = match tfg::backend::keyring_load(&user) {
-                    Ok(Some(rt)) => Some(rt),
-                    Ok(None) => self.auth_refresh_memory.clone(),
-                    Err(e) => {
-                        eprintln!("keyring unreadable ({e}); memory fallback");
-                        self.auth_refresh_memory.clone()
-                    }
-                };
-                match stored {
-                    Some(rt) => match MinosAuth::new(&base).and_then(|a| a.refresh(&rt)) {
-                        Ok(pair) => {
-                            let who = user.clone();
-                            self.store_pair(who.clone(), pair);
-                            self.auth_status = format!("signed in as {who} · refreshed");
-                            eprintln!("auth refreshed for {who}");
-                        }
-                        Err(e) => {
-                            self.sign_out(&format!("refresh failed: {e}"));
-                        }
-                    },
-                    None => {
-                        self.sign_out("refresh token missing");
-                    }
-                }
+                self.refresh_now();
             }
         }
         // Group overlays (slice iii, grill #24): recomputed per frame from
@@ -2583,6 +2735,9 @@ impl eframe::App for ShipApp {
                     if m.stale {
                         label += " (stale)";
                     }
+                    if m.old_data {
+                        label += " (old data)";
+                    }
                     if m.source == FixSource::Sim {
                         label += " (sim)";
                     }
@@ -2605,6 +2760,15 @@ impl eframe::App for ShipApp {
                 });
             }
             });
+            // Silent vessels (REST mapping ticket): announced but never
+            // reported — listed so silence and non-existence stay distinct.
+            // No follow, no select: there is no position to show.
+            for a in self.registry.announced() {
+                ui.horizontal(|ui| {
+                    let name = a.name.as_deref().unwrap_or(&a.ship_id);
+                    ui.label(format!("{name} — silent"));
+                });
+            }
             if ui.small_button("unfollow").clicked() {
                 self.following = None;
             }
@@ -2664,6 +2828,21 @@ impl eframe::App for ShipApp {
                     let n = self.fix_count.get(&id).copied().unwrap_or(0);
                     ui.label(format!("last update: {age}s ago · {n} fixes · trail {trail_len}"));
                     ui.label(format!("wire ts: {}", fix.ts));
+                    // Data age at render (backfilled ticket): live fixes
+                    // age from receipt, backfills from recorded time.
+                    // Badged on wire sources only (sim clocks are game time).
+                    if fix.source == FixSource::Wire {
+                        let now = Utc::now().timestamp();
+                        match fix.data_age_secs(now) {
+                            Some(a) if fix.is_old_data(now) => {
+                                ui.label(format!("data age: {}:{:02} · OLD DATA", a / 60, a % 60));
+                            }
+                            Some(a) => {
+                                ui.label(format!("data age: {a}s"));
+                            }
+                            None => {}
+                        }
+                    }
                     ui.horizontal(|ui| {
                         if ui.small_button("follow").clicked() {
                             follow_selected = Some((
@@ -3453,6 +3632,18 @@ impl eframe::App for ShipApp {
                             egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE),
                         );
                     }
+                    // Old-data indication (backfilled ticket): amber ring
+                    // over stale-gray; data age, not feed state.
+                    if m.old_data && !m.stale {
+                        painter.circle_stroke(
+                            c,
+                            12.0,
+                            egui::Stroke::new(
+                                2.0,
+                                egui::Color32::from_rgb(0xF5, 0x9E, 0x0B),
+                            ),
+                        );
+                    }
                     painter.text(
                         c + egui::vec2(10.0, -10.0),
                         egui::Align2::LEFT_TOP,
@@ -3614,7 +3805,7 @@ fn main() -> eframe::Result<()> {
                 Err(_) => empty,
             }),
         };
-        let (wire, desc) = match build_wire(&boot_kind) {
+        let (wire, desc) = match build_wire(boot_kind) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("backend failed to start: {e}");
@@ -3638,7 +3829,7 @@ fn main() -> eframe::Result<()> {
         loop {
             // Runtime wire swaps from the Connection island (task #39).
             while let Ok(kind) = wire_ctl_rx.try_recv() {
-                match build_wire(&kind) {
+                match build_wire(kind) {
                     Ok((w, desc)) => {
                         eprintln!("backend: {desc}");
                         source.set_wire(w);
@@ -3821,6 +4012,9 @@ fn main() -> eframe::Result<()> {
                 // Simulation start wizard. Everything working opens later.
                 show_session: true,
                 wire_ctl_tx: Some(ui_wire_ctl_tx),
+                live_cmd_tx: None,
+                live_evt_rx: None,
+                live_status: "idle".to_string(),
                 log_view_path: None,
                 log_events: Vec::new(),
                 replay_pos: 0,
