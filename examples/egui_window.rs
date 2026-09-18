@@ -244,7 +244,9 @@ fn drill_col(
 ) {
     ui.vertical(|ui| {
         ui.strong(title);
-        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+        // Unique salt per column: four bare ScrollAreas share the auto
+        // ID otherwise, and egui paints the red ID-clash overlay.
+        egui::ScrollArea::vertical().id_salt(title).max_height(220.0).show(ui, |ui| {
             ui.selectable_value(sel, None, "All");
             for o in opts {
                 let label = if o.name.is_empty() || o.name == o.id_name {
