@@ -129,6 +129,36 @@ impl Catalog {
         class.stats.get(key).copied().unwrap_or(default)
     }
 
+    /// Register a runtime class from synced spec figures (spec-sync
+    /// ticket): a Minos hull's own numbers as a sim-drivable class.
+    /// Id is namespaced (`minos-<class id>`) so register classes never
+    /// collide with asset ids; re-fetch overwrites in place.
+    pub fn upsert_runtime_class(
+        &mut self,
+        minos_class_id: i64,
+        name: String,
+        speed_kn: f64,
+        cruise_kn: f64,
+        range_nm: f64,
+    ) {
+        let id = format!("minos-{minos_class_id}");
+        let class = Class {
+            id: id.clone(),
+            category: Category::Ship,
+            name,
+            stats: HashMap::from([
+                ("speed_kn".to_string(), speed_kn),
+                ("cruise_kn".to_string(), cruise_kn),
+                ("range_nm".to_string(), range_nm),
+            ]),
+            types: Vec::new(),
+        };
+        match self.classes.iter_mut().find(|c| c.id == id) {
+            Some(slot) => *slot = class,
+            None => self.classes.push(class),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn schema(&self, category: Category) -> Option<&StatSchema> {
         self.schemas.get(&category)
@@ -176,6 +206,21 @@ mod tests {
             Some(&yani.id)
         );
         assert!(cat.find_class_by_name("No Such Class").is_none());
+    }
+
+    #[test]
+    fn runtime_class_registers_and_overwrites() {
+        let mut cat = Catalog::from_default_asset().expect("asset parses");
+        let n = cat.ship_classes().len();
+        cat.upsert_runtime_class(7, "Ahmad Yani".into(), 28.0, 18.0, 4000.0);
+        assert_eq!(cat.ship_classes().len(), n + 1);
+        let c = cat.class("minos-7").expect("runtime class");
+        assert_eq!(Catalog::stat(c, "speed_kn", 0.0), 28.0);
+        // Name match hits the runtime row for register resolution.
+        assert_eq!(cat.find_class_by_name("ahmad yani").map(|c| &c.id), Some(&c.id));
+        cat.upsert_runtime_class(7, "Ahmad Yani".into(), 30.0, 18.0, 4000.0);
+        assert_eq!(cat.ship_classes().len(), n + 1, "overwrite, no duplicate");
+        assert_eq!(Catalog::stat(cat.class("minos-7").unwrap(), "speed_kn", 0.0), 30.0);
     }
 
     #[test]

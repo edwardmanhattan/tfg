@@ -593,6 +593,63 @@ fn b2i(b: bool) -> i64 {
     }
 }
 
+/// One hull's current figures (spec-sync ticket): the sim-driving
+/// numbers for a register hull, carried by name so the picker can
+/// match them to a runtime catalog class.
+#[derive(Debug, Clone)]
+pub struct HullSpec {
+    pub unit_id: i64,
+    pub version: i64,
+    pub class_id: i64,
+    pub class_name: String,
+    pub speed_kn: Option<f64>,
+    pub cruise_kn: Option<f64>,
+    pub range_nm: Option<f64>,
+}
+
+impl MinosMaster {
+    /// Current specification for one hull. Absent when the hull has no
+    /// published version yet — the API invents no speed, neither do we.
+    pub fn hull_spec(&self, token: &str, unit_id: i64) -> Result<HullSpec, String> {
+        let data = self.get(token, &format!("/units/{unit_id}"))?;
+        let spec = data["current_specification"].as_object().cloned().unwrap_or_default();
+        if spec.is_empty() {
+            return Err(format!("unit {unit_id}: no published specification"));
+        }
+        let num = |key: &str| spec.get(key).and_then(|v| v.as_f64());
+        Ok(HullSpec {
+            unit_id,
+            version: spec.get("version").and_then(|v| v.as_i64()).unwrap_or(0),
+            class_id: data["unit_class"]["id"].as_i64().unwrap_or(0),
+            class_name: data["unit_class"]["name"].as_str().unwrap_or("").to_string(),
+            speed_kn: num("speed_max_surface_kn"),
+            cruise_kn: num("speed_cruise_kn"),
+            range_nm: num("range_nm"),
+        })
+    }
+
+    /// Fetch one hull's current figures and store them. The caller
+    /// checks spec_versions first when backfilling.
+    pub fn sync_spec(
+        &self,
+        token: &str,
+        conn: &rusqlite::Connection,
+        unit_id: i64,
+    ) -> Result<HullSpec, String> {
+        let spec = self.hull_spec(token, unit_id)?;
+        let body = serde_json::json!({
+            "class_id": spec.class_id,
+            "class_name": spec.class_name,
+            "speed_kn": spec.speed_kn,
+            "cruise_kn": spec.cruise_kn,
+            "range_nm": spec.range_nm,
+        })
+        .to_string();
+        crate::store::store_spec(conn, unit_id, spec.version, true, &body)?;
+        Ok(spec)
+    }
+}
+
 /// Minos standing picture (REST mapping ticket): the initial picture the
 /// socket then keeps current. Vessels that never reported carry labels
 /// but no position — announced as silent, never zero-filled.
@@ -1218,6 +1275,30 @@ mod tests {
         });
         let auth = MinosAuth::new("http://127.0.0.1:18084/api/v1").expect("client builds");
         auth.change_password("AT", "old-pw", "new-pw-12-chars").expect("change succeeds");
+    }
+
+    #[test]
+    fn hull_spec_parses_detail_and_refuses_unpublished() {
+        let server = tiny_http::Server::http("127.0.0.1:18086").expect("bind test port");
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests().take(2) {
+                let url = rq.url().to_string();
+                let body = if url == "/api/v1/units/13" {
+                    r#"{"status_code":200,"message":"Successfull","data":{"id":13,"name":"KRI Ahmad Yani","unit_class":{"id":5,"name":"Sigma"},"current_specification":{"version":3,"is_current":true,"speed_max_surface_kn":28.5,"speed_cruise_kn":18.0,"range_nm":4000.0}}}"#
+                } else {
+                    r#"{"status_code":200,"message":"Successfull","data":{"id":14,"name":"Bare Hull"}}"#
+                };
+                let _ = rq.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18086/api/v1").expect("client builds");
+        let spec = master.hull_spec("AT", 13).expect("spec parses");
+        assert_eq!(spec.version, 3);
+        assert_eq!(spec.class_id, 5);
+        assert_eq!(spec.class_name, "Sigma");
+        assert_eq!(spec.speed_kn, Some(28.5));
+        let err = master.hull_spec("AT", 14).unwrap_err();
+        assert!(err.contains("no published specification"), "{err}");
     }
 
     #[test]

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use chrono::{TimeZone, Utc};
-use tfg::backend::{FileReplay, HttpPoll, Invite, InviteClient, LiveCmd, LiveEvent, LiveWire, MinosAuth, MinosRest, PollSource, TokenPair};
+use tfg::backend::{FileReplay, HttpPoll, Invite, InviteClient, LiveCmd, LiveEvent, LiveWire, MinosAuth, MinosMaster, MinosRest, PollSource, TokenPair};
 use tfg::catalog::{Catalog, Category};
 use tfg::fleet::Fleet;
 use tfg::groups::Groups;
@@ -1018,6 +1018,77 @@ impl ShipApp {
         }
     }
 
+    /// Bulk spec backfill (spec-sync ticket): every register hull
+    /// without stored figures gets one detail fetch. Skips what is
+    /// known (versions are immutable, refetch buys nothing). Blocking
+    /// and loud — this is an operator action, not a background task.
+    fn sync_specs_now(&mut self) {
+        let Some(tok) = self.auth_token.clone() else {
+            self.sync_status = "sign in first".to_string();
+            return;
+        };
+        let base = self.minos_base.clone();
+        let Some(conn) = self.store.as_ref() else {
+            self.sync_status = "store unavailable".to_string();
+            return;
+        };
+        let master = match MinosMaster::new(&base) {
+            Ok(m) => m,
+            Err(e) => {
+                self.sync_status = format!("spec sync failed: {e}");
+                return;
+            }
+        };
+        let ids = match tfg::store::unit_ids(conn) {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.sync_status = format!("spec sync failed: {e}");
+                return;
+            }
+        };
+        let mut fetched = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+        for (i, uid) in ids.iter().enumerate() {
+            match tfg::store::spec_versions(conn, *uid) {
+                Ok(v) if !v.is_empty() => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(e) => {
+                    self.sync_status = format!("spec sync failed: {e}");
+                    return;
+                }
+                _ => {}
+            }
+            match master.sync_spec(&tok, conn, *uid) {
+                Ok(spec) => {
+                    fetched += 1;
+                    if let Some(speed) = spec.speed_kn {
+                        self.catalog.upsert_runtime_class(
+                            spec.class_id,
+                            spec.class_name.clone(),
+                            speed,
+                            spec.cruise_kn.unwrap_or(0.0),
+                            spec.range_nm.unwrap_or(0.0),
+                        );
+                    }
+                    if fetched % 10 == 0 {
+                        eprintln!("spec sync: {fetched} fetched (hull {i})");
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("spec sync: hull {uid} failed: {e}");
+                }
+            }
+        }
+        self.sync_status = format!(
+            "specs: {fetched} fetched, {skipped} already known, {failed} failed"
+        );
+        eprintln!("spec sync done: {}", self.sync_status);
+    }
+
     /// Login island (login ticket): Minos sign-in against minos_base, the
     /// must_change_password gate as a blocking form, sign-out. Token state
     /// feeds the later socket work; refresh runs proactively per frame.
@@ -1128,6 +1199,12 @@ impl ShipApp {
             let authed = self.auth_token.is_some();
             if ui.add_enabled(authed, egui::Button::new("sync now")).clicked() {
                 self.sync_now();
+            }
+            if ui
+                .add_enabled(authed, egui::Button::new("fetch hull specs"))
+                .clicked()
+            {
+                self.sync_specs_now();
             }
             if !authed {
                 ui.label("sign in first");
@@ -2577,8 +2654,51 @@ impl ShipApp {
                 }
                 Some((name, class_name, None)) => {
                     ui.label(format!(
-                        "No sim stats for {name} (class '{class_name}' not in catalog) — cannot place."
+                        "No sim stats for {name} (class '{class_name}' not in catalog)."
                     ));
+                    // Lazy spec fetch (spec-sync ticket): one hull's
+                    // figures become a runtime catalog class; unknown
+                    // speed refuses (null means unknown, not zero).
+                    let fetchable =
+                        pick.parse::<i64>().is_ok() && self.auth_token.is_some();
+                    if fetchable && ui.small_button("fetch sim stats").clicked() {
+                        let uid = pick.parse::<i64>().unwrap_or(0);
+                        let base = self.minos_base.clone();
+                        let tok = self.auth_token.clone().unwrap_or_default();
+                        let result = self.store.as_ref().map(|conn| {
+                            MinosMaster::new(&base).and_then(|m| m.sync_spec(&tok, conn, uid))
+                        });
+                        match result {
+                            Some(Ok(spec)) => match spec.speed_kn {
+                                Some(speed) => {
+                                    self.catalog.upsert_runtime_class(
+                                        spec.class_id,
+                                        spec.class_name.clone(),
+                                        speed,
+                                        spec.cruise_kn.unwrap_or(0.0),
+                                        spec.range_nm.unwrap_or(0.0),
+                                    );
+                                    self.feed(format!(
+                                        "stats v{} stored for {name}",
+                                        spec.version
+                                    ));
+                                }
+                                None => {
+                                    self.feed(format!(
+                                        "stats for {name} carry no surface speed — cannot drive"
+                                    ));
+                                }
+                            },
+                            Some(Err(e)) => {
+                                self.feed(format!("stats fetch failed: {e}"));
+                            }
+                            None => {
+                                self.feed("stats fetch failed: store unavailable".to_string());
+                            }
+                        }
+                    } else if !fetchable {
+                        ui.label("sign in to fetch from the register");
+                    }
                 }
                 None => {
                     // Stale pick (source switched under it): drop it.
@@ -4098,6 +4218,38 @@ fn main() -> eframe::Result<()> {
             // Required once: without image loaders, from_bytes fails.
             egui_extras::install_image_loaders(&cc.egui_ctx);
             apply_ops_theme(&cc.egui_ctx);
+            // Boot restore (spec-sync ticket): stored spec figures become
+            // runtime catalog classes before the first frame, so register
+            // hulls placed last session drive again without refetching.
+            let mut catalog = Catalog::from_default_asset().expect("catalog asset valid");
+            let store = match tfg::store::open(&tfg::store::local_db_path()) {
+                Ok(conn) => Some(conn),
+                Err(e) => {
+                    eprintln!("local store unavailable: {e}");
+                    None
+                }
+            };
+            if let Some(conn) = &store {
+                match tfg::store::current_figures(conn) {
+                    Ok(figs) => {
+                        for f in figs {
+                            if f.speed_kn.is_some() {
+                                catalog.upsert_runtime_class(
+                                    f.class_id,
+                                    f.class_name,
+                                    f.speed_kn.unwrap_or(0.0),
+                                    f.cruise_kn.unwrap_or(0.0),
+                                    f.range_nm.unwrap_or(0.0),
+                                );
+                            }
+                        }
+                        if !figs.is_empty() {
+                            eprintln!("restored {} spec class(es) from store", figs.len());
+                        }
+                    }
+                    Err(e) => eprintln!("spec restore failed: {e}"),
+                }
+            }
             Ok(Box::new(ShipApp {
                 map_tex: None,
                 tex_center: CENTER,
@@ -4143,7 +4295,7 @@ fn main() -> eframe::Result<()> {
                 order_speed: 20.0,
                 land: Land::from_default_asset().ok(),
                 order_warning: None,
-                catalog: Catalog::from_default_asset().expect("catalog asset valid"),
+                catalog,
                 selected_class: 0,
                 fleet: Fleet::from_default_asset().expect("fleet asset valid"),
                 show_fleet: false,
@@ -4187,13 +4339,7 @@ fn main() -> eframe::Result<()> {
                 auth_needs_password_change: false,
                 pw_current: String::new(),
                 pw_new: String::new(),
-                store: match tfg::store::open(&tfg::store::local_db_path()) {
-                    Ok(conn) => Some(conn),
-                    Err(e) => {
-                        eprintln!("local store unavailable: {e}");
-                        None
-                    }
-                },
+                store,
                 sync_status: "never synced".to_string(),
                 session_ratio: SESSION_RATIO,
                 zoom: ZOOM,

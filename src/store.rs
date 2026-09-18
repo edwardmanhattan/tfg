@@ -328,6 +328,102 @@ pub fn units_count(conn: &Connection) -> Result<i64, String> {
         .map_err(|e| e.to_string())
 }
 
+/// All register hull ids, for the spec backfill.
+pub fn unit_ids(conn: &Connection) -> Result<Vec<i64>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM units ORDER BY id")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<i64>, _>>().map_err(|e| e.to_string())
+}
+
+/// Store one hull's figures (spec-sync ticket): versioned JSON body.
+/// Versions are immutable server-side, so rows only ever append.
+pub fn store_spec(
+    conn: &Connection,
+    unit_id: i64,
+    version: i64,
+    is_current: bool,
+    body: &str,
+) -> Result<(), String> {
+    // One current version at a time: a newer fetch demotes the old row.
+    if is_current {
+        conn.execute("UPDATE unit_specs SET is_current = 0 WHERE unit_id = ?1", [unit_id])
+            .map_err(|e| e.to_string())?;
+    }
+    conn.execute(
+        "INSERT INTO unit_specs (unit_id, version, is_current, body)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(unit_id, version) DO UPDATE SET
+           is_current = excluded.is_current, body = excluded.body",
+        rusqlite::params![unit_id, version, if is_current { 1 } else { 0 }, body],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Known spec versions for one hull (skip-list for the backfill).
+pub fn spec_versions(conn: &Connection, unit_id: i64) -> Result<Vec<i64>, String> {
+    let mut stmt = conn
+        .prepare("SELECT version FROM unit_specs WHERE unit_id = ?1 ORDER BY version")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([unit_id], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<i64>, _>>().map_err(|e| e.to_string())
+}
+
+/// One hull's stored figures, parsed back out of the versioned body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredFigures {
+    pub unit_id: i64,
+    pub version: i64,
+    pub class_id: i64,
+    pub class_name: String,
+    pub speed_kn: Option<f64>,
+    pub cruise_kn: Option<f64>,
+    pub range_nm: Option<f64>,
+}
+
+/// Current figures for every stored hull (boot restore + picker).
+/// Unparseable bodies are skipped loudly through the error — a corrupt
+/// row must not poison the whole restore.
+pub fn current_figures(conn: &Connection) -> Result<Vec<StoredFigures>, String> {
+    let mut stmt = conn
+        .prepare("SELECT unit_id, version, body FROM unit_specs WHERE is_current = 1")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            let unit_id: i64 = r.get(0)?;
+            let version: i64 = r.get(1)?;
+            let body: String = r.get(2)?;
+            let v: serde_json::Value =
+                serde_json::from_str(&body).map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                ))?;
+            let num = |key: &str| v.get(key).and_then(|x| x.as_f64());
+            Ok(StoredFigures {
+                unit_id,
+                version,
+                class_id: v.get("class_id").and_then(|x| x.as_i64()).unwrap_or(0),
+                class_name: v
+                    .get("class_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                speed_kn: num("speed_kn"),
+                cruise_kn: num("cruise_kn"),
+                range_nm: num("range_nm"),
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +510,22 @@ mod tests {
         assert!(fleet_unit(&conn, "999").expect("unknown").is_none());
         let classes = unit_class_names(&conn).expect("classes");
         assert_eq!(classes, vec![(5, "Sigma".to_string())]);
+    }
+
+    #[test]
+    fn specs_version_and_restore() {
+        let conn = open(&std::path::PathBuf::from(":memory:")).expect("open");
+        assert!(spec_versions(&conn, 13).expect("versions").is_empty());
+        store_spec(&conn, 13, 1, true, r#"{"class_name":"Sigma","speed_kn":20.0}"#)
+            .expect("store v1");
+        store_spec(&conn, 13, 2, true, r#"{"class_name":"Sigma","speed_kn":22.0}"#)
+            .expect("store v2");
+        assert_eq!(spec_versions(&conn, 13).expect("versions"), vec![1, 2]);
+        // Only one current version survives the overwrite.
+        let figs = current_figures(&conn).expect("figures");
+        assert_eq!(figs.len(), 1);
+        assert_eq!(figs[0].version, 2);
+        assert_eq!(figs[0].speed_kn, Some(22.0));
+        assert_eq!(figs[0].class_name, "Sigma");
     }
 }
