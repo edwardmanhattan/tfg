@@ -233,31 +233,14 @@ struct ShipMarker {
     trail: Vec<(f64, f64)>,
 }
 
-/// One drill column (setup-overhaul prototype): id_name-first rows
-/// (grill decision) with next-level counts. An unpicked parent shows
-/// All only — empty levels render zero rows, never an error.
-fn drill_col(
-    ui: &mut egui::Ui,
-    title: &str,
-    opts: &[tfg::store::TaxRow],
-    sel: &mut Option<i64>,
-) {
-    ui.vertical(|ui| {
-        ui.strong(title);
-        // Unique salt per column: four bare ScrollAreas share the auto
-        // ID otherwise, and egui paints the red ID-clash overlay.
-        egui::ScrollArea::vertical().id_salt(title).max_height(220.0).show(ui, |ui| {
-            ui.selectable_value(sel, None, "All");
-            for o in opts {
-                let label = if o.name.is_empty() || o.name == o.id_name {
-                    format!("{} ({})", o.id_name, o.count)
-                } else {
-                    format!("{} · {} ({})", o.id_name, o.name, o.count)
-                };
-                ui.selectable_value(sel, Some(o.id), label);
-            }
-        });
-    });
+/// One drill row label (setup-overhaul picker): id_name first (grill
+/// decision), English subtitle when it differs, next-level count.
+fn drill_label(o: &tfg::store::TaxRow) -> String {
+    if o.name.is_empty() || o.name == o.id_name {
+        format!("{} ({})", o.id_name, o.count)
+    } else {
+        format!("{} · {} ({})", o.id_name, o.name, o.count)
+    }
 }
 
 /// One pickable hull row, from either picker source (cutover ticket):
@@ -2703,13 +2686,50 @@ impl ShipApp {
             ),
             None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
-        ui.horizontal(|ui| {
-            drill_col(ui, "branch", &branches, &mut self.drill_branch);
-            drill_col(ui, "category", &categories, &mut self.drill_category);
-            drill_col(ui, "type", &types, &mut self.drill_type);
-            drill_col(ui, "class", &classes, &mut self.drill_class);
+        // Breadcrumb + single list (layout pass): one depth visible at
+        // a time — the trail is the navigation, not four squeezed
+        // columns. Tapping a row drills in; tapping a crumb goes back.
+        let crumb = |opts: &[tfg::store::TaxRow], id: Option<i64>| {
+            id.and_then(|w| opts.iter().find(|o| o.id == w))
+                .map(|o| o.id_name.clone())
+        };
+        let crumbs: Vec<(String, usize)> = [
+            crumb(&branches, self.drill_branch).map(|s| (s, 1)),
+            crumb(&categories, self.drill_category).map(|s| (s, 2)),
+            crumb(&types, self.drill_type).map(|s| (s, 3)),
+            crumb(&classes, self.drill_class).map(|s| (s, 4)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut keep_depth: Option<usize> = None;
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("Fleet").clicked() {
+                keep_depth = Some(0);
+            }
+            for (label, depth) in &crumbs {
+                ui.label("/");
+                if ui.small_button(label).clicked() {
+                    keep_depth = Some(*depth);
+                }
+            }
         });
-        // A parent change clears the levels below it.
+        if let Some(d) = keep_depth {
+            if d < 1 {
+                self.drill_branch = None;
+            }
+            if d < 2 {
+                self.drill_category = None;
+            }
+            if d < 3 {
+                self.drill_type = None;
+            }
+            if d < 4 {
+                self.drill_class = None;
+            }
+        }
+        // One list: children of the deepest selection. A parent change
+        // clears the levels below it.
         if self.drill_branch != b {
             self.drill_category = None;
             self.drill_type = None;
@@ -2722,8 +2742,63 @@ impl ShipApp {
         if self.drill_type != t {
             self.drill_class = None;
         }
+        let (level_title, level_opts) = if self.drill_branch.is_none() {
+            ("Branches", &branches)
+        } else if self.drill_category.is_none() {
+            ("Categories", &categories)
+        } else if self.drill_type.is_none() {
+            ("Types", &types)
+        } else if self.drill_class.is_none() {
+            ("Classes", &classes)
+        } else {
+            ("", &classes)
+        };
         if self.drill_class.is_none() {
-            ui.label("drill to a class to list hulls (empty levels render zero rows, not errors)");
+            ui.strong(level_title);
+            if level_opts.is_empty() {
+                ui.label(format!("No {level_title} in the register yet."));
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt(("drill", level_title))
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        // Next-level selection per depth: the row tap is
+                        // the drill-in gesture (no separate affordance).
+                        if self.drill_branch.is_none() {
+                            for o in level_opts {
+                                ui.selectable_value(
+                                    &mut self.drill_branch,
+                                    Some(o.id),
+                                    drill_label(o),
+                                );
+                            }
+                        } else if self.drill_category.is_none() {
+                            for o in level_opts {
+                                ui.selectable_value(
+                                    &mut self.drill_category,
+                                    Some(o.id),
+                                    drill_label(o),
+                                );
+                            }
+                        } else if self.drill_type.is_none() {
+                            for o in level_opts {
+                                ui.selectable_value(
+                                    &mut self.drill_type,
+                                    Some(o.id),
+                                    drill_label(o),
+                                );
+                            }
+                        } else {
+                            for o in level_opts {
+                                ui.selectable_value(
+                                    &mut self.drill_class,
+                                    Some(o.id),
+                                    drill_label(o),
+                                );
+                            }
+                        }
+                    });
+            }
         }
         let mut out = Vec::new();
         if let (Some(conn), Some(class_id)) = (self.store.as_ref(), self.drill_class) {
@@ -2755,7 +2830,9 @@ impl ShipApp {
             rows.len(),
             self.placed_fleet.len()
         ));
-        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+        // Salted: the drill level list above is a second ScrollArea on
+        // the same screen, and bare pairs share the auto ID.
+        egui::ScrollArea::vertical().id_salt("picker-rows").max_height(300.0).show(ui, |ui| {
             for u in rows {
                 if self.placed_fleet.contains(&u.id) {
                     ui.label(format!("✓ {} ({}) — placed", u.name, u.hull));
