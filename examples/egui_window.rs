@@ -233,6 +233,31 @@ struct ShipMarker {
     trail: Vec<(f64, f64)>,
 }
 
+/// One drill column (setup-overhaul prototype): id_name-first rows
+/// (grill decision) with next-level counts. An unpicked parent shows
+/// All only — empty levels render zero rows, never an error.
+fn drill_col(
+    ui: &mut egui::Ui,
+    title: &str,
+    opts: &[tfg::store::TaxRow],
+    sel: &mut Option<i64>,
+) {
+    ui.vertical(|ui| {
+        ui.strong(title);
+        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+            ui.selectable_value(sel, None, "All");
+            for o in opts {
+                let label = if o.name.is_empty() || o.name == o.id_name {
+                    format!("{} ({})", o.id_name, o.count)
+                } else {
+                    format!("{} · {} ({})", o.id_name, o.name, o.count)
+                };
+                ui.selectable_value(sel, Some(o.id), label);
+            }
+        });
+    });
+}
+
 /// One pickable hull row, from either picker source (cutover ticket):
 /// asset seeds carry their catalog class; register rows resolve the
 /// Minos class name to sim stats, or to None (loud refusal, never
@@ -243,6 +268,9 @@ struct PickerRow {
     hull: String,
     class_name: String,
     stat_class: Option<String>,
+    /// Drill breadcrumb (setup-overhaul picker): empty in column mode,
+    /// "branch / category / type" in whole-tree search mode.
+    trail: String,
 }
 
 /// One desktop's order draft (slice iv, grill #25): pending waypoint,
@@ -434,6 +462,12 @@ struct ShipApp {
     fleet_class: Option<String>,
     fleet_query: String,
     fleet_pick: Option<String>,
+    /// Drill selections (setup-overhaul prototype): branch > category >
+    /// type > class ids from the synced taxonomy; leaf units list below.
+    drill_branch: Option<i64>,
+    drill_category: Option<i64>,
+    drill_type: Option<i64>,
+    drill_class: Option<i64>,
     placed_fleet: HashSet<String>,
     /// Labels captured at placement (both picker sources), so register
     /// hulls keep their name + hull after the picker moves on.
@@ -2463,6 +2497,19 @@ impl ShipApp {
         } else {
             format!("source: bundled assets ({} hulls — sync to refresh)", self.fleet.len())
         });
+        // Drill cutover (setup-overhaul prototype): synced taxonomy
+        // renders branch > category > type > class columns with the
+        // unit leaf below; unsynced stores keep the flat pickers.
+        let has_tax = self
+            .store
+            .as_ref()
+            .and_then(|c| tfg::store::has_taxonomy(c).ok())
+            .unwrap_or(false);
+        if has_tax {
+            let rows = self.drill_rows_ui(ui);
+            self.picker_tail(ui, &rows);
+            return;
+        }
         // Collect options first: the combos mutate self while the
         // catalog borrows would still be live (E0502 pattern).
         let class_opts: Vec<(String, String)> = if from_register {
@@ -2542,6 +2589,7 @@ impl ShipApp {
                             hull: u.hull,
                             class_name: u.class_name,
                             stat_class,
+                            trail: String::new(),
                         });
                     }
                 }
@@ -2589,10 +2637,116 @@ impl ShipApp {
                         hull: u.hull.clone(),
                         class_name,
                         stat_class: Some(u.class_id.clone()),
+                        trail: String::new(),
                     }
                 })
                 .collect()
         };
+        self.picker_tail(ui, &rows);
+    }
+
+    /// Drill picker (setup-overhaul prototype): branch > category >
+    /// type > class columns from the sqlite mirror, whole-tree search
+    /// with breadcrumb jump, leaf units as shared picker rows.
+    fn drill_rows_ui(&mut self, ui: &mut egui::Ui) -> Vec<PickerRow> {
+        ui.horizontal(|ui| {
+            ui.label("search all hulls:");
+            ui.text_edit_singleline(&mut self.fleet_query);
+            if ui.small_button("clear").clicked() {
+                self.fleet_query.clear();
+                self.drill_branch = None;
+                self.drill_category = None;
+                self.drill_type = None;
+                self.drill_class = None;
+            }
+        });
+        let query = self.fleet_query.to_lowercase();
+        // Whole-tree search (setup-overhaul grill): flat matches with
+        // breadcrumb trails, jumping past the columns.
+        if !query.is_empty() {
+            let mut out = Vec::new();
+            if let Some(conn) = self.store.as_ref() {
+                if let Ok(hits) = tfg::store::tax_search(conn, &query) {
+                    for h in hits {
+                        let stat_class = self
+                            .catalog
+                            .find_class_by_name(&h.class_name)
+                            .map(|c| c.id.clone());
+                        out.push(PickerRow {
+                            id: h.id,
+                            name: h.name,
+                            hull: h.hull,
+                            class_name: h.class_name,
+                            stat_class,
+                            trail: h.trail(),
+                        });
+                    }
+                }
+            }
+            return out;
+        }
+        // Selections first (Copy): option fetches borrow the store,
+        // the column UI mutates drill state — never both live (E0502).
+        let (b, c, t) = (self.drill_branch, self.drill_category, self.drill_type);
+        let (branches, categories, types, classes) = match self.store.as_ref() {
+            Some(conn) => (
+                tfg::store::tax_branches(conn).unwrap_or_default(),
+                b.map(|id| tfg::store::tax_categories(conn, id).unwrap_or_default())
+                    .unwrap_or_default(),
+                c.map(|id| tfg::store::tax_types(conn, id).unwrap_or_default())
+                    .unwrap_or_default(),
+                t.map(|id| tfg::store::tax_classes(conn, id).unwrap_or_default())
+                    .unwrap_or_default(),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        };
+        ui.horizontal(|ui| {
+            drill_col(ui, "branch", &branches, &mut self.drill_branch);
+            drill_col(ui, "category", &categories, &mut self.drill_category);
+            drill_col(ui, "type", &types, &mut self.drill_type);
+            drill_col(ui, "class", &classes, &mut self.drill_class);
+        });
+        // A parent change clears the levels below it.
+        if self.drill_branch != b {
+            self.drill_category = None;
+            self.drill_type = None;
+            self.drill_class = None;
+        }
+        if self.drill_category != c {
+            self.drill_type = None;
+            self.drill_class = None;
+        }
+        if self.drill_type != t {
+            self.drill_class = None;
+        }
+        if self.drill_class.is_none() {
+            ui.label("drill to a class to list hulls (empty levels render zero rows, not errors)");
+        }
+        let mut out = Vec::new();
+        if let (Some(conn), Some(class_id)) = (self.store.as_ref(), self.drill_class) {
+            if let Ok(units) = tfg::store::tax_units(conn, class_id) {
+                for u in units {
+                    let stat_class = self
+                        .catalog
+                        .find_class_by_name(&u.class_name)
+                        .map(|cc| cc.id.clone());
+                    out.push(PickerRow {
+                        id: u.id,
+                        name: u.name,
+                        hull: u.hull,
+                        class_name: u.class_name,
+                        stat_class,
+                        trail: String::new(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Shared picker tail (setup-overhaul prototype): row list plus the
+    /// placement block, identical for flat and drill sources.
+    fn picker_tail(&mut self, ui: &mut egui::Ui, rows: &[PickerRow]) {
         ui.label(format!(
             "{} shown · {} placed",
             rows.len(),
@@ -2606,7 +2760,11 @@ impl ShipApp {
                     ui.selectable_value(
                         &mut self.fleet_pick,
                         Some(u.id.clone()),
-                        format!("{} ({}) · {}", u.name, u.hull, u.class_name),
+                        if u.trail.is_empty() {
+                            format!("{} ({}) · {}", u.name, u.hull, u.class_name)
+                        } else {
+                            format!("{} ({}) · {} — {}", u.name, u.hull, u.class_name, u.trail)
+                        },
                     );
                 }
             }
@@ -4303,6 +4461,10 @@ fn main() -> eframe::Result<()> {
                 fleet_class: None,
                 fleet_query: String::new(),
                 fleet_pick: None,
+                drill_branch: None,
+                drill_category: None,
+                drill_type: None,
+                drill_class: None,
                 placed_fleet: HashSet::new(),
                 placed_labels: HashMap::new(),
                 time_real_start: (Utc::now() + chrono::Duration::hours(7)).format("%Y-%m-%d %H:%M").to_string(),
