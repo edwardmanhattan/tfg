@@ -521,11 +521,8 @@ struct ShipApp {
     zoom_dirty: bool,
     /// Top-level mode (task #39): session only in Simulation.
     app_mode: AppMode,
-    /// Connection island state (task #39): URL field, current source
-    /// description, last connect/disconnect note, control channel.
-    backend_url: String,
-    wire_desc: String,
-    conn_status: String,
+    /// Connection island state: control channel for wire swaps (the
+    /// wires themselves come from the environment, boot-owned).
     show_connection: bool,
     wire_ctl_tx: Option<Sender<WireKind>>,
     /// Live socket handles (live-wire ticket): token push-down to the
@@ -800,68 +797,49 @@ impl ShipApp {
             self.show_groups = false;
             self.show_connection = true;
         } else {
+            // Simulation arms the engine (setup-overhaul pass): the old
+            // session-island checkbox was this switch wearing a disguise.
+            self.mode.armed.store(true, Ordering::SeqCst);
             self.show_connection = false;
         }
         eprintln!("mode: {mode:?}");
     }
 
-    /// Connection island (task #39): the wire controls plus status.
-    /// Same Registry underneath — this only swaps the source.
+    /// Connection island: the live feed only (setup-overhaul pass).
+    /// Wires come from the environment (`.env`, boot); the island shows
+    /// a status indicator plus one connect toggle — no endpoint text,
+    /// no manual backend swapping.
     fn connection_island(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Connection");
-        ui.label(format!("source: {}", self.wire_desc));
-        let backend_ships = self
-            .registry
-            .ships()
-            .iter()
-            .filter(|s| s.source == FixSource::Wire)
-            .count();
-        ui.label(format!("backend ships in view: {backend_ships}"));
-        ui.horizontal(|ui| {
-            ui.label("backend:");
-            ui.text_edit_singleline(&mut self.backend_url);
-        });
-        ui.horizontal(|ui| {
-            if ui.button("connect").clicked() {
-                let url = self.backend_url.clone();
-                if let Some(tx) = &self.wire_ctl_tx {
-                    match HttpPoll::new(&url) {
-                        Ok(_) => {
-                            let _ = tx.send(WireKind::Http(url.clone()));
-                            self.wire_desc = format!("HTTP {url}");
-                            self.conn_status = format!("connected {url}");
-                            eprintln!("wire: HTTP {url}");
-                        }
-                        Err(e) => {
-                            self.conn_status = format!("connect failed: {e}");
-                        }
-                    }
-                }
-            }
-            if ui.button("disconnect").clicked() {
+        ui.heading("Live feed");
+        let ink = if self.live_status.starts_with("connected") {
+            egui::Color32::from_rgb(0x4A, 0xDE, 0x80)
+        } else if self.live_status.starts_with("connecting") {
+            egui::Color32::from_rgb(0xFA, 0xBF, 0x69)
+        } else if self.live_status.starts_with("refused")
+            || self.live_status.starts_with("socket error")
+        {
+            egui::Color32::from_rgb(0xF8, 0x71, 0x71)
+        } else {
+            egui::Color32::GRAY
+        };
+        ui.label(egui::RichText::new(format!("live: {}", self.live_status)).color(ink));
+        // Single toggle (was connect/stop pair): token-gated swap onto
+        // the socket, or back to the boot wire. Snapshot failure lands
+        // back with the reason; fatal refusals arrive as status below.
+        let ws_url = Self::ws_url_for(&self.minos_base);
+        let live_on = self.live_cmd_tx.is_some();
+        let authed = self.auth_token.is_some();
+        let label = if live_on { "stop live" } else { "connect live" };
+        if ui.add_enabled(authed || live_on, egui::Button::new(label)).clicked() {
+            if live_on {
                 if let Some(tx) = &self.wire_ctl_tx {
                     let _ = tx.send(WireKind::Empty);
-                    self.wire_desc = "empty".to_string();
-                    self.conn_status = "disconnected".to_string();
                     self.live_cmd_tx = None;
                     self.live_evt_rx = None;
                     self.live_status = "idle".to_string();
-                    eprintln!("wire: empty");
+                    eprintln!("wire: live stopped");
                 }
-            }
-        });
-        ui.label(&self.conn_status);
-        // Live socket (live-wire ticket): token-gated swap. Snapshot
-        // failure lands back on empty with the reason; fatal refusals
-        // arrive as events below.
-        ui.separator();
-        ui.heading("Live feed");
-        let ws_url = Self::ws_url_for(&self.minos_base);
-        ui.label(format!("socket: {ws_url}"));
-        ui.label(format!("live: {}", self.live_status));
-        ui.horizontal(|ui| {
-            let authed = self.auth_token.is_some();
-            if ui.add_enabled(authed, egui::Button::new("connect live")).clicked() {
+            } else {
                 let token = self.auth_token.clone().unwrap_or_default();
                 let rest_base = self.minos_base.clone();
                 let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -878,22 +856,11 @@ impl ShipApp {
                     self.live_cmd_tx = Some(cmd_tx);
                     self.live_evt_rx = Some(event_rx);
                     self.live_status = "connecting…".to_string();
-                    self.wire_desc = format!("live {ws_url}");
                     eprintln!("wire: live {ws_url}");
                 }
             }
-            if ui.button("stop live").clicked() {
-                if let Some(tx) = &self.wire_ctl_tx {
-                    let _ = tx.send(WireKind::Empty);
-                    self.live_cmd_tx = None;
-                    self.live_evt_rx = None;
-                    self.live_status = "idle".to_string();
-                    self.wire_desc = "empty".to_string();
-                    eprintln!("wire: live stopped");
-                }
-            }
-        });
-        if self.auth_token.is_none() {
+        }
+        if !authed && !live_on {
             ui.label("Sign in through the Login island first.");
         }
     }
@@ -1119,15 +1086,12 @@ impl ShipApp {
         eprintln!("spec sync done: {}", self.sync_status);
     }
 
-    /// Login island (login ticket): Minos sign-in against minos_base, the
-    /// must_change_password gate as a blocking form, sign-out. Token state
-    /// feeds the later socket work; refresh runs proactively per frame.
+    /// Login island (login ticket): Minos sign-in against the env-owned
+    /// endpoint, the must_change_password gate as a blocking form,
+    /// sign-out. Token state feeds the later socket work; refresh runs
+    /// proactively per frame.
     fn login_island(&mut self, ui: &mut egui::Ui) {
         ui.heading("Login");
-        ui.horizontal(|ui| {
-            ui.label("minos:");
-            ui.text_edit_singleline(&mut self.minos_base);
-        });
         if let Some(user) = self.auth_user.clone() {
             let ttl_note = match (self.auth_issued_at, self.auth_ttl_secs) {
                 (Some(t), ttl) if ttl > 0 => {
@@ -1470,6 +1434,35 @@ impl ShipApp {
             format!("wss://{host}/connection/websocket")
         } else {
             format!("ws://{host}:8000/connection/websocket")
+        }
+    }
+
+    /// Load `.env` from the working directory (setup-overhaul pass):
+    /// `KEY=VALUE` lines, `#` comments, matching quotes unwrapped.
+    /// Real environment variables always win — the file only fills gaps.
+    fn load_dotenv() {
+        let Ok(text) = std::fs::read_to_string(".env") else {
+            return;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let (k, v) = (k.trim(), v.trim());
+            if k.is_empty() || std::env::var(k).is_ok() {
+                continue;
+            }
+            let v = v
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(v);
+            // Tab: set_var is unsafe under edition 2024 (process-wide).
+            unsafe { std::env::set_var(k, v) };
         }
     }
 
@@ -1843,21 +1836,12 @@ impl ShipApp {
         eprintln!("session ended");
     }
 
-    /// Session island: phase, engine toggle, and the per-phase controls.
-    /// Reads UiMode; writes only through start()/end()/reset().
+    /// Session island: phase and the per-phase controls. Arming follows
+    /// the app mode (Simulation arms, Presentation disarms) — no separate
+    /// engine toggle. Reads UiMode; writes only through start()/end()/reset().
     fn session_island(&mut self, ui: &mut egui::Ui) {
         let phase = self.mode.phase;
-        ui.label(format!(
-            "phase: {phase:?}{}",
-            if self.mode.armed.load(Ordering::SeqCst) { " · armed" } else { " · presentation" }
-        ));
-        if phase != Phase::Closed {
-            let mut armed = self.mode.armed.load(Ordering::SeqCst);
-            if ui.checkbox(&mut armed, "simulation mode (engine)").changed() {
-                self.mode.armed.store(armed, Ordering::SeqCst);
-                eprintln!("{}", if armed { "sim armed" } else { "presentation only" });
-            }
-        }
+        ui.label(format!("phase: {phase:?}"));
         match phase {
             Phase::Setup => {
                 // Setup editing is organizer-only (slice iv): acting
@@ -3006,10 +2990,22 @@ impl ShipApp {
                 });
             }
             1 => {
-                ui.label("Session: arm the engine, then start. Defaults play 7 hours as 7 days.");
+                ui.label("Session: pick a mode, then start. Defaults play 7 hours as 7 days.");
+                // Mode switch lives here too (setup-overhaul pass): the
+                // switch is the arm — Simulation arms, Presentation
+                // disarms — so the wizard never needs an engine toggle.
+                ui.horizontal(|ui| {
+                    let mut mode = self.app_mode;
+                    ui.selectable_value(&mut mode, AppMode::Presentation, "Presentation");
+                    ui.selectable_value(&mut mode, AppMode::Simulation, "Simulation");
+                    if mode != self.app_mode {
+                        self.set_app_mode(mode);
+                    }
+                });
                 if self.mode.phase == Phase::Setup && ui.button("Start session").clicked() {
                     self.start_session();
                 }
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("← Back").clicked() {
                         self.wizard_step = 0;
@@ -3024,8 +3020,9 @@ impl ShipApp {
                 });
             }
             2 => {
-                ui.label("Fleet: in the Fleet island, filter by category, class, or type, pick one hull, then click the map to place it by hand.");
+                ui.label("Fleet: in the Fleet island, drill branch → class or search all hulls, pick one, then click the map to place it.");
                 ui.label(format!("placed: {} unit(s)", self.placed_fleet.len()));
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("← Back").clicked() {
                         self.wizard_step = 1;
@@ -3044,6 +3041,7 @@ impl ShipApp {
                     self.roster.len()
                 ));
                 ui.label("Gaps are fine: unowned units sail as traffic.");
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("← Back").clicked() {
                         self.wizard_step = 2;
@@ -4366,6 +4364,9 @@ fn apply_ops_theme(ctx: &egui::Context) {
 const MAP_INK: egui::Color32 = egui::Color32::from_rgb(0xE2, 0xE8, 0xF0);
 
 fn main() -> eframe::Result<()> {
+    // Endpoints live in `.env` (setup-overhaul pass), never in UI
+    // fields: load first so every env read below sees the file.
+    ShipApp::load_dotenv();
     // Poll thread owns the backend source; the UI owns the registry.
     // TFG_BACKEND_URL=http://host:port selects HTTP, else file replay.
     // The sim joins every round via MergeSource (disarmed = wire only).
@@ -4622,18 +4623,6 @@ fn main() -> eframe::Result<()> {
                 last_track_req: Instant::now(),
                 zoom_dirty: false,
                 app_mode: AppMode::Simulation,
-                // Mirrors the poll thread's boot-wire choice above (task
-                // #39): status text only, the thread owns the source.
-                backend_url: std::env::var("TFG_BACKEND_URL")
-                    .unwrap_or("http://127.0.0.1:3000".to_string()),
-                wire_desc: match std::env::var("TFG_BACKEND_URL") {
-                    Ok(url) => format!("HTTP {url}"),
-                    Err(_) => match std::env::var("TFG_SCENARIO") {
-                        Ok(name) => format!("replay scenarios/{name}.json"),
-                        Err(_) => "replay scenarios/empty.json".to_string(),
-                    },
-                },
-                conn_status: "boot source (env)".to_string(),
                 show_connection: false,
                 // Boot is the lobby (task #40): the mode toggle plus the
                 // Simulation start wizard. Everything working opens later.
