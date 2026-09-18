@@ -248,6 +248,86 @@ pub fn upsert_positions(
     Ok(n)
 }
 
+/// One register hull for the picker: Minos identity plus the class name
+/// for display and stats resolution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoreUnit {
+    pub id: String,
+    pub name: String,
+    pub hull: String,
+    pub class_id: i64,
+    pub class_name: String,
+}
+
+/// Picker rows: register hulls with their class names, in name order.
+pub fn fleet_units(conn: &Connection) -> Result<Vec<StoreUnit>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT u.id, u.name, COALESCE(u.hull_number, ''),
+                    u.class_id, COALESCE(c.name, '')
+             FROM units u LEFT JOIN unit_classes c ON c.id = u.class_id
+             ORDER BY u.name",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            Ok(StoreUnit {
+                id: id.to_string(),
+                name: r.get(1)?,
+                hull: r.get(2)?,
+                class_id: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                class_name: r.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// One register hull by id (decimal string form).
+pub fn fleet_unit(conn: &Connection, id: &str) -> Result<Option<StoreUnit>, String> {
+    let Ok(want) = id.parse::<i64>() else {
+        return Ok(None);
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT u.id, u.name, COALESCE(u.hull_number, ''),
+                    u.class_id, COALESCE(c.name, '')
+             FROM units u LEFT JOIN unit_classes c ON c.id = u.class_id
+             WHERE u.id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    stmt.query_row([want], |r| {
+        Ok(StoreUnit {
+            id: want.to_string(),
+            name: r.get(1)?,
+            hull: r.get(2)?,
+            class_id: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            class_name: r.get(4)?,
+        })
+    })
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// Class dropdown source for the register picker.
+pub fn unit_class_names(conn: &Connection) -> Result<Vec<(i64, String)>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, name FROM unit_classes ORDER BY name")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<(i64, String)>, _>>().map_err(|e| e.to_string())
+}
+
+/// Register size: the picker source switch (synced register wins,
+// bundled assets seed).
+pub fn units_count(conn: &Connection) -> Result<i64, String> {
+    conn.query_row("SELECT COUNT(*) FROM units", [], |r| r.get(0))
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +368,51 @@ mod tests {
             Some("2026-09-18T00:00:00Z")
         );
         assert_eq!(meta_get(&conn, "nope").expect("meta miss"), None);
+    }
+
+    #[test]
+    fn fleet_units_joins_class_names() {
+        let mut conn = open(&std::path::PathBuf::from(":memory:")).expect("open");
+        replace_all(
+            &mut conn,
+            "unit_classes",
+            "id, name",
+            "?1, ?2",
+            vec![vec![StoredValue::Int(5), StoredValue::Text("Sigma".into())]],
+        )
+        .expect("classes");
+        replace_all(
+            &mut conn,
+            "units",
+            "id, name, hull_number, class_id",
+            "?1, ?2, ?3, ?4",
+            vec![
+                vec![
+                    StoredValue::Int(13),
+                    StoredValue::Text("KRI Ahmad Yani".into()),
+                    StoredValue::Text("KRI-AH-YN".into()),
+                    StoredValue::Int(5),
+                ],
+                vec![
+                    StoredValue::Int(14),
+                    StoredValue::Text("Bare Hull".into()),
+                    StoredValue::Null,
+                    StoredValue::Null,
+                ],
+            ],
+        )
+        .expect("units");
+        assert_eq!(units_count(&conn).expect("count"), 2);
+        let rows = fleet_units(&conn).expect("rows");
+        // Name order: Bare Hull sorts before KRI Ahmad Yani.
+        assert_eq!(rows[0].id, "14");
+        assert_eq!(rows[0].class_name, "");
+        assert_eq!(rows[1].class_name, "Sigma");
+        let one = fleet_unit(&conn, "13").expect("lookup").expect("found");
+        assert_eq!(one.name, "KRI Ahmad Yani");
+        assert!(fleet_unit(&conn, "kri-x").expect("non-decimal").is_none());
+        assert!(fleet_unit(&conn, "999").expect("unknown").is_none());
+        let classes = unit_class_names(&conn).expect("classes");
+        assert_eq!(classes, vec![(5, "Sigma".to_string())]);
     }
 }

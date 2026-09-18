@@ -233,6 +233,18 @@ struct ShipMarker {
     trail: Vec<(f64, f64)>,
 }
 
+/// One pickable hull row, from either picker source (cutover ticket):
+/// asset seeds carry their catalog class; register rows resolve the
+/// Minos class name to sim stats, or to None (loud refusal, never
+/// invented abilities).
+struct PickerRow {
+    id: String,
+    name: String,
+    hull: String,
+    class_name: String,
+    stat_class: Option<String>,
+}
+
 /// One desktop's order draft (slice iv, grill #25): pending waypoint,
 /// waypoint arming, and speed. Drafts persist per desktop across switches.
 #[derive(Clone)]
@@ -423,6 +435,9 @@ struct ShipApp {
     fleet_query: String,
     fleet_pick: Option<String>,
     placed_fleet: HashSet<String>,
+    /// Labels captured at placement (both picker sources), so register
+    /// hulls keep their name + hull after the picker moves on.
+    placed_labels: HashMap<String, (String, String)>,
     /// Setup slice (ii): WIB-entered windows, local roster, seat drafts.
     /// Times are entered in WIB and stored as UTC; the roster names assignees.
     time_real_start: String,
@@ -1276,12 +1291,30 @@ impl ShipApp {
         }
     }
 
-    /// Display name for a placed unit: fleet name + hull, or the raw id.
+    /// Display name for a placed unit: labels captured at placement
+    /// (either source), asset fleet lookup, or the raw id.
     fn unit_label(&self, id: &str) -> String {
+        if let Some((name, hull)) = self.placed_labels.get(id) {
+            return format!("{name} ({hull})");
+        }
         self.fleet
             .get(id)
             .map(|u| format!("{} ({})", u.name, u.hull))
             .unwrap_or_else(|| id.to_string())
+    }
+
+    /// Resolve a picked hull to (name, hull, catalog class id for sim
+    /// stats). Asset seeds carry their class; register rows resolve the
+    /// Minos class name against the catalog — None means no sim stats,
+    /// and placement refuses loudly rather than inventing abilities.
+    fn placement_seed(&self, id: &str) -> Option<(String, String, Option<String>)> {
+        if let Some(u) = self.fleet.get(id) {
+            return Some((u.name.clone(), u.hull.clone(), Some(u.class_id.clone())));
+        }
+        let conn = self.store.as_ref()?;
+        let row = tfg::store::fleet_unit(conn, id).ok()??;
+        let class = self.catalog.find_class_by_name(&row.class_name).map(|c| c.id.clone());
+        Some((row.name, row.hull, class))
     }
 
     /// Seat labels for one roster user: helm, unit command, group command.
@@ -1468,6 +1501,9 @@ impl ShipApp {
                     .map(|s| {
                         let n = s.units.len();
                         let label = match s.id.strip_prefix("unit:") {
+                            Some(uid) if self.placed_labels.contains_key(uid) => {
+                                self.unit_label(uid)
+                            }
                             Some(uid) => self
                                 .fleet
                                 .get(uid)
@@ -1875,11 +1911,7 @@ impl ShipApp {
                     .placed_fleet
                     .iter()
                     .map(|id| {
-                        let label = self
-                            .fleet
-                            .get(id)
-                            .map(|u| format!("{} ({})", u.name, u.hull))
-                            .unwrap_or_else(|| id.clone());
+                        let label = self.unit_label(id);
                         (id.clone(), label)
                     })
                     .collect();
@@ -2042,6 +2074,7 @@ impl ShipApp {
                     self.close_working_islands();
                     self.selection = None;
                     self.placed_fleet.clear();
+                    self.placed_labels.clear();
                     self.fleet_pick = None;
                     self.helm.clear();
                     self.unit_commander.clear();
@@ -2171,11 +2204,7 @@ impl ShipApp {
                 .placed_fleet
                 .iter()
                 .map(|id| {
-                    let label = self
-                        .fleet
-                        .get(id)
-                        .map(|u| format!("{} ({})", u.name, u.hull))
-                        .unwrap_or_else(|| id.clone());
+                    let label = self.unit_label(id);
                     (id.clone(), label)
                 })
                 .collect();
@@ -2342,22 +2371,48 @@ impl ShipApp {
         const CAT_LABELS: [&str; 5] = ["All", "Ship", "Plane", "Tank", "Port"];
         ui.heading("Fleet picker");
         ui.label("Organizer: filter, pick one hull, place it on the map by hand.");
+        // Source switch (cutover ticket): the synced register wins, the
+        // bundled assets seed. Minos categories don't map to the Category
+        // enum, so the category filter is asset-only; fleet_class holds a
+        // catalog class id for assets, a Minos class name for the register.
+        let register_n = self
+            .store
+            .as_ref()
+            .and_then(|c| tfg::store::units_count(c).ok())
+            .unwrap_or(0);
+        let from_register = register_n > 0;
+        ui.label(if from_register {
+            format!("source: synced register ({register_n} hulls)")
+        } else {
+            format!("source: bundled assets ({} hulls — sync to refresh)", self.fleet.len())
+        });
         // Collect options first: the combos mutate self while the
         // catalog borrows would still be live (E0502 pattern).
-        let class_opts: Vec<(String, String)> = self
-            .catalog
-            .ship_classes()
-            .iter()
-            .map(|c| (c.id.clone(), c.name.clone()))
-            .collect();
+        let class_opts: Vec<(String, String)> = if from_register {
+            self.store
+                .as_ref()
+                .and_then(|c| tfg::store::unit_class_names(c).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, name)| (name.clone(), name))
+                .collect()
+        } else {
+            self.catalog
+                .ship_classes()
+                .iter()
+                .map(|c| (c.id.clone(), c.name.clone()))
+                .collect()
+        };
         ui.horizontal(|ui| {
-            egui::ComboBox::from_label("category")
-                .selected_text(CAT_LABELS[self.fleet_cat])
-                .show_ui(ui, |ui| {
-                    for (i, label) in CAT_LABELS.iter().enumerate() {
-                        ui.selectable_value(&mut self.fleet_cat, i, *label);
-                    }
-                });
+            if !from_register {
+                egui::ComboBox::from_label("category")
+                    .selected_text(CAT_LABELS[self.fleet_cat])
+                    .show_ui(ui, |ui| {
+                        for (i, label) in CAT_LABELS.iter().enumerate() {
+                            ui.selectable_value(&mut self.fleet_cat, i, *label);
+                        }
+                    });
+            }
             let class_label = self
                 .fleet_class
                 .as_ref()
@@ -2383,41 +2438,86 @@ impl ShipApp {
             }
         });
         let query = self.fleet_query.to_lowercase();
-        let rows: Vec<tfg::fleet::FleetUnit> = self
-            .fleet
-            .units()
-            .iter()
-            .filter(|u| {
-                if CAT_OPTS[self.fleet_cat] != self.catalog.class(&u.class_id).map(|c| c.category) {
-                    return false;
-                }
-                if let Some(ref cid) = self.fleet_class {
-                    if &u.class_id != cid {
-                        return false;
+        let rows: Vec<PickerRow> = if from_register {
+            let mut out = Vec::new();
+            if let Some(conn) = &self.store {
+                if let Ok(units) = tfg::store::fleet_units(conn) {
+                    for u in units {
+                        if let Some(ref want) = self.fleet_class {
+                            if &u.class_name != want {
+                                continue;
+                            }
+                        }
+                        if !query.is_empty()
+                            && !format!("{} {} {}", u.name, u.hull, u.class_name)
+                                .to_lowercase()
+                                .contains(&query)
+                        {
+                            continue;
+                        }
+                        let stat_class = self
+                            .catalog
+                            .find_class_by_name(&u.class_name)
+                            .map(|c| c.id.clone());
+                        out.push(PickerRow {
+                            id: u.id,
+                            name: u.name,
+                            hull: u.hull,
+                            class_name: u.class_name,
+                            stat_class,
+                        });
                     }
                 }
-                if !query.is_empty() {
+            }
+            out
+        } else {
+            self.fleet
+                .units()
+                .iter()
+                .filter(|u| {
+                    if CAT_OPTS[self.fleet_cat] != self.catalog.class(&u.class_id).map(|c| c.category) {
+                        return false;
+                    }
+                    if let Some(ref cid) = self.fleet_class {
+                        if &u.class_id != cid {
+                            return false;
+                        }
+                    }
+                    if !query.is_empty() {
+                        let class_name = self
+                            .catalog
+                            .class(&u.class_id)
+                            .map(|c| c.name.as_str())
+                            .unwrap_or("");
+                        let hay = format!(
+                            "{} {} {} {} {} {}",
+                            u.name, u.hull, u.role, class_name, u.satuan, u.pangkalan
+                        )
+                        .to_lowercase();
+                        if !hay.contains(&query) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .map(|u| {
                     let class_name = self
                         .catalog
                         .class(&u.class_id)
-                        .map(|c| c.name.as_str())
-                        .unwrap_or("");
-                    let hay = format!(
-                        "{} {} {} {} {} {}",
-                        u.name, u.hull, u.role, class_name, u.satuan, u.pangkalan
-                    )
-                    .to_lowercase();
-                    if !hay.contains(&query) {
-                        return false;
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    PickerRow {
+                        id: u.id.clone(),
+                        name: u.name.clone(),
+                        hull: u.hull.clone(),
+                        class_name,
+                        stat_class: Some(u.class_id.clone()),
                     }
-                }
-                true
-            })
-            .cloned()
-            .collect();
+                })
+                .collect()
+        };
         ui.label(format!(
-            "{} hulls · {} shown · {} placed",
-            self.fleet.len(),
+            "{} shown · {} placed",
             rows.len(),
             self.placed_fleet.len()
         ));
@@ -2426,15 +2526,10 @@ impl ShipApp {
                 if self.placed_fleet.contains(&u.id) {
                     ui.label(format!("✓ {} ({}) — placed", u.name, u.hull));
                 } else {
-                    let class_name: String = self
-                        .catalog
-                        .class(&u.class_id)
-                        .map(|c| c.name.clone())
-                        .unwrap_or_default();
                     ui.selectable_value(
                         &mut self.fleet_pick,
                         Some(u.id.clone()),
-                        format!("{} ({}) · {}", u.name, u.hull, class_name),
+                        format!("{} ({}) · {}", u.name, u.hull, u.class_name),
                     );
                 }
             }
@@ -2458,19 +2553,38 @@ impl ShipApp {
             ui.label("Placement is organizer-only.");
         } else if pick_placed {
             ui.label("Already placed — pick another hull.");
-        } else if let Some(id) = self.fleet_pick.clone() {
-            let placing = self.mode.tool == SetupTool::Place;
-            let name: String = self.fleet.get(&id).map(|u| u.name.clone()).unwrap_or_default();
-            if ui
-                .small_button(if placing {
-                    format!("click the map to place {name}…")
-                } else {
-                    format!("place {name}")
-                })
-                .clicked()
-            {
-                self.mode.tool = if placing { SetupTool::Select } else { SetupTool::Place };
-                self.placing = false;
+        } else if let Some(pick) = self.fleet_pick.clone() {
+            // Resolve against the rendered rows (owned copy first: the
+            // arm below mutates self).
+            let seed = rows
+                .iter()
+                .find(|r| r.id == pick)
+                .map(|r| (r.name.clone(), r.class_name.clone(), r.stat_class.clone()));
+            match seed {
+                Some((name, _, Some(_))) => {
+                    let placing = self.mode.tool == SetupTool::Place;
+                    if ui
+                        .small_button(if placing {
+                            format!("click the map to place {name}…")
+                        } else {
+                            format!("place {name}")
+                        })
+                        .clicked()
+                    {
+                        self.mode.tool = if placing { SetupTool::Select } else { SetupTool::Place };
+                        self.placing = false;
+                    }
+                }
+                Some((name, class_name, None)) => {
+                    ui.label(format!(
+                        "No sim stats for {name} (class '{class_name}' not in catalog) — cannot place."
+                    ));
+                }
+                None => {
+                    // Stale pick (source switched under it): drop it.
+                    ui.label("Pick a hull above to arm placement.");
+                    self.fleet_pick = None;
+                }
             }
         } else {
             ui.label("Pick a hull above to arm placement.");
@@ -3523,27 +3637,36 @@ impl eframe::App for ShipApp {
                             let (la, lo) = unproject_mercator(
                                 px, py, self.center, self.zoom, mw, mh,
                             );
-                            // Fleet picker (task #29): only a picked,
-                            // unplaced hull stands up. No generic or
-                            // automatic placement.
-                            let seed = self.fleet_pick.clone().and_then(|id| self.fleet.get(&id).cloned());
-                            if let Some(seed) = seed {
-                                if !self.placed_fleet.contains(&seed.id) {
-                                    let id = seed.id.clone();
-                                    if let Some(tx) = &self.sim_cmd_tx {
-                                        let _ = tx.send(SimCommand::TakeControl {
-                                            ship_id: id.clone(),
-                                            pos: GeoPosition { latitude: la, longitude: lo },
-                                            class_id: seed.class_id.clone(),
-                                        });
-                                        eprintln!("placed {} ({}) at ({la:.4}, {lo:.4})", seed.name, seed.hull);
+                            // Fleet picker: only a picked, unplaced hull
+                            // stands up, with sim stats resolved. No generic
+                            // or automatic placement.
+                            if let Some(pid) = self.fleet_pick.clone() {
+                                if let Some((name, hull, class_id)) = self.placement_seed(&pid) {
+                                    if !self.placed_fleet.contains(&pid) {
+                                        match class_id {
+                                            Some(class_id) => {
+                                                let id = pid.clone();
+                                                if let Some(tx) = &self.sim_cmd_tx {
+                                                    let _ = tx.send(SimCommand::TakeControl {
+                                                        ship_id: id.clone(),
+                                                        pos: GeoPosition { latitude: la, longitude: lo },
+                                                        class_id: class_id.clone(),
+                                                    });
+                                                    eprintln!("placed {name} ({hull}) at ({la:.4}, {lo:.4})");
+                                                }
+                                                // Placed units arrive owned (Q3): the click is
+                                                // the take-control, no second step.
+                                                self.controlled.insert(id.clone());
+                                                self.select_ship(id.clone());
+                                                self.placed_labels.insert(id.clone(), (name, hull));
+                                                self.placed_fleet.insert(id);
+                                                self.fleet_pick = None;
+                                            }
+                                            None => {
+                                                eprintln!("place refused: no sim stats for {name}");
+                                            }
+                                        }
                                     }
-                                    // Placed units arrive owned (Q3): the click is
-                                    // the take-control, no second step.
-                                    self.controlled.insert(id.clone());
-                                    self.select_ship(id.clone());
-                                    self.placed_fleet.insert(id);
-                                    self.fleet_pick = None;
                                 }
                             }
                             self.mode.tool = SetupTool::Select;
@@ -4029,6 +4152,7 @@ fn main() -> eframe::Result<()> {
                 fleet_query: String::new(),
                 fleet_pick: None,
                 placed_fleet: HashSet::new(),
+                placed_labels: HashMap::new(),
                 time_real_start: (Utc::now() + chrono::Duration::hours(7)).format("%Y-%m-%d %H:%M").to_string(),
                 time_real_end: (Utc::now() + chrono::Duration::hours(14)).format("%Y-%m-%d %H:%M").to_string(),
                 time_game_start: "2026-11-01 00:00".to_string(),

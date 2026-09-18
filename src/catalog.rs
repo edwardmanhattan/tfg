@@ -114,6 +114,15 @@ impl Catalog {
         self.classes.iter().find(|c| c.id == id)
     }
 
+    /// Stats resolution for register hulls (picker cutover ticket):
+    /// match a Minos class name to a catalog class (case-insensitive).
+    /// None means no sim stats exist for that class — placement refuses
+    /// loudly rather than inventing abilities.
+    pub fn find_class_by_name(&self, name: &str) -> Option<&Class> {
+        let want = name.trim().to_lowercase();
+        self.classes.iter().find(|c| c.name.to_lowercase() == want)
+    }
+
     /// A class stat value; falls back to `default` when the key is
     /// absent (optional keys, or schemas without the stat).
     pub fn stat(class: &Class, key: &str, default: f64) -> f64 {
@@ -154,6 +163,19 @@ mod tests {
                 "{}: cruise above max", c.id
             );
         }
+    }
+
+    #[test]
+    fn find_class_by_name_matches_case_insensitively() {
+        let cat = Catalog::from_default_asset().expect("asset parses");
+        let yani = cat
+            .find_class_by_name("ahmad yani / van speijk")
+            .expect("Ahmad Yani found");
+        assert_eq!(
+            cat.find_class_by_name("  Ahmad Yani / Van Speijk ").map(|c| &c.id),
+            Some(&yani.id)
+        );
+        assert!(cat.find_class_by_name("No Such Class").is_none());
     }
 
     #[test]
