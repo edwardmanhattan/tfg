@@ -55,6 +55,17 @@ const ZONE_PAD_PX: f64 = 26.0;
 /// 640px viewport under the toolbar with room for window chrome; unbounded
 /// lists inside already-capped islands keep their own tighter cap.
 const ISLAND_SCROLL_MAX: f32 = 420.0;
+/// Wizard island sizing (layout fix): the stepped Setup is a centered
+/// island with real content width. Without a floor the window shrinks
+/// to the longest label (~thin strip) and border drags only repaint
+/// the background — the inner ScrollArea never expands.
+const WIZARD_MIN_WIDTH: f32 = 460.0;
+/// Fleet picker sizing (layout fix): four miller columns at a readable
+/// measure plus window chrome. The island scrolls horizontally below
+/// this width instead of squeezing the columns.
+const FLEET_MIN_WIDTH: f32 = 760.0;
+const MILLER_COL_WIDTH: f32 = 176.0;
+const MILLER_COL_HEIGHT: f32 = 220.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Session stub pace (session flow): 7 real hours play 7 game days.
 /// Full windows UI lands with the organizer flow; the ratio is the load-
@@ -2686,9 +2697,11 @@ impl ShipApp {
             ),
             None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
-        // Breadcrumb + single list (layout pass): one depth visible at
-        // a time — the trail is the navigation, not four squeezed
-        // columns. Tapping a row drills in; tapping a crumb goes back.
+        // Miller columns (layout fix): branch | category | type |
+        // class stay visible side by side so the hierarchy reads left
+        // to right. A parent change clears the levels below it; the
+        // breadcrumb above is the jump-back affordance. Narrow islands
+        // scroll horizontally instead of squeezing the columns.
         let crumb = |opts: &[tfg::store::TaxRow], id: Option<i64>| {
             id.and_then(|w| opts.iter().find(|o| o.id == w))
                 .map(|o| o.id_name.clone())
@@ -2728,8 +2741,6 @@ impl ShipApp {
                 self.drill_class = None;
             }
         }
-        // One list: children of the deepest selection. A parent change
-        // clears the levels below it.
         if self.drill_branch != b {
             self.drill_category = None;
             self.drill_type = None;
@@ -2742,64 +2753,75 @@ impl ShipApp {
         if self.drill_type != t {
             self.drill_class = None;
         }
-        let (level_title, level_opts) = if self.drill_branch.is_none() {
-            ("Branches", &branches)
-        } else if self.drill_category.is_none() {
-            ("Categories", &categories)
-        } else if self.drill_type.is_none() {
-            ("Types", &types)
-        } else if self.drill_class.is_none() {
-            ("Classes", &classes)
-        } else {
-            ("", &classes)
-        };
-        if self.drill_class.is_none() {
-            ui.strong(level_title);
-            if level_opts.is_empty() {
-                ui.label(format!("No {level_title} in the register yet."));
-            } else {
-                egui::ScrollArea::vertical()
-                    .id_salt(("drill", level_title))
-                    .max_height(220.0)
-                    .show(ui, |ui| {
-                        // Next-level selection per depth: the row tap is
-                        // the drill-in gesture (no separate affordance).
-                        if self.drill_branch.is_none() {
-                            for o in level_opts {
-                                ui.selectable_value(
-                                    &mut self.drill_branch,
-                                    Some(o.id),
-                                    drill_label(o),
-                                );
-                            }
-                        } else if self.drill_category.is_none() {
-                            for o in level_opts {
-                                ui.selectable_value(
-                                    &mut self.drill_category,
-                                    Some(o.id),
-                                    drill_label(o),
-                                );
-                            }
-                        } else if self.drill_type.is_none() {
-                            for o in level_opts {
-                                ui.selectable_value(
-                                    &mut self.drill_type,
-                                    Some(o.id),
-                                    drill_label(o),
-                                );
-                            }
-                        } else {
-                            for o in level_opts {
-                                ui.selectable_value(
-                                    &mut self.drill_class,
-                                    Some(o.id),
-                                    drill_label(o),
-                                );
-                            }
-                        }
-                    });
-            }
-        }
+        egui::ScrollArea::horizontal()
+            .id_salt("drill-miller")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    // One column per hierarchy level. A column activates
+                    // once its parent is picked; deeper columns show the
+                    // prompt instead of stale options.
+                    let levels: [(&str, &[tfg::store::TaxRow], bool); 4] = [
+                        ("Branch", &branches, true),
+                        ("Category", &categories, self.drill_branch.is_some()),
+                        ("Type", &types, self.drill_category.is_some()),
+                        ("Class", &classes, self.drill_type.is_some()),
+                    ];
+                    for (depth, (title, opts, active)) in levels.iter().enumerate() {
+                        ui.vertical(|ui| {
+                            ui.set_min_width(MILLER_COL_WIDTH);
+                            ui.set_max_width(MILLER_COL_WIDTH);
+                            ui.strong(format!("{title} ({})", opts.len()));
+                            egui::ScrollArea::vertical()
+                                .id_salt(("drill", *title))
+                                .auto_shrink([false, false])
+                                .max_height(MILLER_COL_HEIGHT)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(MILLER_COL_WIDTH - 16.0);
+                                    if !active {
+                                        ui.weak("Pick ← first");
+                                    } else if opts.is_empty() {
+                                        ui.weak("None yet");
+                                    } else {
+                                        for o in opts.iter() {
+                                            match depth {
+                                                0 => {
+                                                    ui.selectable_value(
+                                                        &mut self.drill_branch,
+                                                        Some(o.id),
+                                                        drill_label(o),
+                                                    );
+                                                }
+                                                1 => {
+                                                    ui.selectable_value(
+                                                        &mut self.drill_category,
+                                                        Some(o.id),
+                                                        drill_label(o),
+                                                    );
+                                                }
+                                                2 => {
+                                                    ui.selectable_value(
+                                                        &mut self.drill_type,
+                                                        Some(o.id),
+                                                        drill_label(o),
+                                                    );
+                                                }
+                                                _ => {
+                                                    ui.selectable_value(
+                                                        &mut self.drill_class,
+                                                        Some(o.id),
+                                                        drill_label(o),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                        });
+                        ui.separator();
+                    }
+                });
+            });
         let mut out = Vec::new();
         if let (Some(conn), Some(class_id)) = (self.store.as_ref(), self.drill_class) {
             if let Ok(units) = tfg::store::tax_units(conn, class_id) {
@@ -2964,6 +2986,10 @@ impl ShipApp {
     /// Wizard island (islands grill, #27): stepped Setup that dismisses
     /// on Live. Points at the working islands; never duplicates them.
     fn wizard_island(&mut self, ui: &mut egui::Ui) {
+        // Layout fix: claim the island width so the window never
+        // collapses to the longest label and border drags resize content,
+        // not just the background.
+        ui.set_min_width(WIZARD_MIN_WIDTH);
         ui.heading("Command center setup");
         ui.label("Four steps to a live game. Skip any time; the islands stay.");
         match self.wizard_step {
@@ -3226,13 +3252,20 @@ impl eframe::App for ShipApp {
             let mut wiz_open = true;
             egui::Window::new("Command center setup")
                 .default_pos(egui::pos2(330.0, 140.0))
+                .default_size([WIZARD_MIN_WIDTH + 40.0, 300.0])
+                .min_width(WIZARD_MIN_WIDTH)
+                .min_height(220.0)
+                .resizable(true)
                 .movable(true)
                 .collapsible(false)
                 .open(&mut wiz_open)
                 .show(ui.ctx(), |ui| {
-                    egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
-                        self.wizard_island(ui);
-                    });
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(ISLAND_SCROLL_MAX)
+                        .show(ui, |ui| {
+                            self.wizard_island(ui);
+                        });
                 });
             if !wiz_open {
                 self.wizard_done = true;
@@ -3324,8 +3357,8 @@ impl eframe::App for ShipApp {
         }
         if self.show_fleet && self.mode.phase != Phase::Closed {
             let mut open = self.show_fleet;
-            egui::Window::new("Fleet").movable(true).default_pos(egui::pos2(8.0, 300.0)).open(&mut open).show(ui.ctx(), |ui| {
-                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
+            egui::Window::new("Fleet").movable(true).resizable(true).default_pos(egui::pos2(8.0, 300.0)).default_size([FLEET_MIN_WIDTH, 540.0]).min_width(FLEET_MIN_WIDTH).min_height(360.0).open(&mut open).show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
                 self.fleet_island(ui);
                 });
             });
