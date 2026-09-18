@@ -18,6 +18,9 @@ tiny_http = "0.12.0"
 # runtime in the actor; the UI thread never touches async.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
 tokio-centrifuge = "=0.2.6"
+# Local-first store (master-data ticket): sqlite with the amalgamation
+# compiled in, so air-gapped delivery machines need no system library.
+rusqlite = { version = "0.32", features = ["bundled"] }
 # Refresh-token store (keyring resolution): OS keyring via the sync API,
 # no async runtime needed. Secret Service on Linux (this host has a daemon;
 # daemon-less machines degrade to a visible memory fallback, never silently).

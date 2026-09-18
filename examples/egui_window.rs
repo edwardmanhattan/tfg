@@ -458,6 +458,11 @@ struct ShipApp {
     auth_needs_password_change: bool,
     pw_current: String,
     pw_new: String,
+    /// Local-first store (master-data ticket): sqlite working copy of
+    /// reference truth. None when the file cannot open (sync disabled,
+    /// said loudly). UI thread owns it; sync replaces whole tables.
+    store: Option<rusqlite::Connection>,
+    sync_status: String,
     /// Ratio derived from the entered windows (replaces the 24x stub).
     session_ratio: f64,
     /// Map zoom (slice iii): feeds the map thread per request; the
@@ -559,6 +564,22 @@ impl ShipApp {
             for f in &fixes {
                 self.last_seen.insert(f.ship_id.clone(), Instant::now());
                 *self.fix_count.entry(f.ship_id.clone()).or_insert(0) += 1;
+            }
+            // Local-first (master-data ticket): every wire fix seen lands
+            // in the standing-picture table (decimal ids only; sim and
+            // replay names have no unit row). Best-effort per round.
+            if let Some(conn) = &self.store {
+                let wire: Vec<tfg::geo::track::Fix> = fixes
+                    .iter()
+                    .filter(|f| {
+                        f.source == tfg::geo::track::FixSource::Wire
+                            && f.ship_id.bytes().all(|b| b.is_ascii_digit())
+                    })
+                    .cloned()
+                    .collect();
+                if !wire.is_empty() {
+                    let _ = tfg::store::upsert_positions(conn, &wire, &tfg::backend::now_ts());
+                }
             }
             let acked = self.registry.poll(fixes);
             // Ingest acks (Log grill, #20): report stamped seqs back to
@@ -896,6 +917,9 @@ impl ShipApp {
                     Ok(()) => {
                         self.auth_needs_password_change = false;
                         self.auth_status = format!("signed in as {id}");
+                        // Login syncs (master-data ticket): the working
+                        // copy refreshes on every entry.
+                        self.sync_now();
                     }
                     Err(e) if e.contains("403") => {
                         self.auth_needs_password_change = true;
@@ -941,6 +965,40 @@ impl ShipApp {
             },
             None => {
                 self.sign_out("refresh token missing");
+            }
+        }
+    }
+
+    /// Full master-data sync (server wins, whole-table replace):
+    /// helpers, hierarchy, taxonomy, units. Runs after sign-in and on
+    /// the Sync button; failures report loudly, never half-applied
+    /// silently (replace_all commits per table, counts recorded).
+    fn sync_now(&mut self) {
+        let Some(tok) = self.auth_token.clone() else {
+            self.sync_status = "sign in first".to_string();
+            return;
+        };
+        let base = self.minos_base.clone();
+        let Some(conn) = self.store.as_mut() else {
+            self.sync_status = "store unavailable".to_string();
+            return;
+        };
+        match tfg::backend::MinosMaster::new(&base) {
+            Ok(master) => match tfg::store::sync_from(&master, &tok, conn) {
+                Ok(counts) => {
+                    let total: usize = counts.iter().map(|(_, n)| n).sum();
+                    let detail: Vec<String> =
+                        counts.iter().map(|(t, n)| format!("{t} {n}")).collect();
+                    self.sync_status = format!("synced {total} rows: {}", detail.join(", "));
+                    eprintln!("sync ok: {}", self.sync_status);
+                }
+                Err(e) => {
+                    self.sync_status = format!("sync failed: {e}");
+                    eprintln!("sync failed: {e}");
+                }
+            },
+            Err(e) => {
+                self.sync_status = format!("sync failed: {e}");
             }
         }
     }
@@ -1008,6 +1066,7 @@ impl ShipApp {
                                             self.auth_needs_password_change = false;
                                             self.auth_status =
                                                 format!("signed in as {user}");
+                                            self.sync_now();
                                         }
                                         Err(e) => {
                                             self.auth_status = format!(
@@ -1045,6 +1104,21 @@ impl ShipApp {
             }
         }
         ui.label(&self.auth_status);
+        // Local-first sync (master-data ticket): whole-table replace
+        // from the backend, server wins. Runs on sign-in; the button
+        // re-runs it any time. Reads serve from disk either way.
+        ui.separator();
+        ui.heading("Sync");
+        ui.horizontal(|ui| {
+            let authed = self.auth_token.is_some();
+            if ui.add_enabled(authed, egui::Button::new("sync now")).clicked() {
+                self.sync_now();
+            }
+            if !authed {
+                ui.label("sign in first");
+            }
+        });
+        ui.label(&self.sync_status);
     }
 
     /// Display size in points: what overlays project against. The
@@ -3989,6 +4063,14 @@ fn main() -> eframe::Result<()> {
                 auth_needs_password_change: false,
                 pw_current: String::new(),
                 pw_new: String::new(),
+                store: match tfg::store::open(&tfg::store::local_db_path()) {
+                    Ok(conn) => Some(conn),
+                    Err(e) => {
+                        eprintln!("local store unavailable: {e}");
+                        None
+                    }
+                },
+                sync_status: "never synced".to_string(),
                 session_ratio: SESSION_RATIO,
                 zoom: ZOOM,
                 last_zoom_req: Instant::now(),

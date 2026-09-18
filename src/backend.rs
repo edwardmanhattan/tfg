@@ -342,6 +342,257 @@ pub fn keyring_clear(user: &str) -> Result<(), String> {
     }
 }
 
+/// Minos master-data reads (master-data ticket): helpers, taxonomy,
+/// units, hierarchy. Bearer-authed, envelope-unwrapped, paged where the
+/// contract pages. Rows come out as store cells; orchestration lives in
+/// [`crate::store::sync_from`].
+pub struct MinosMaster {
+    base_url: String,
+    client: reqwest::blocking::Client,
+}
+
+/// One mirrored table: target, columns, and rows.
+pub struct TableData {
+    pub table: &'static str,
+    pub columns: &'static str,
+    pub placeholders: &'static str,
+    pub rows: Vec<Vec<crate::store::StoredValue>>,
+}
+
+use crate::store::{opt_int, opt_real, opt_text, StoredValue};
+
+impl MinosMaster {
+    pub fn new(base_url: &str) -> Result<Self, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), client })
+    }
+
+    fn get(&self, token: &str, path: &str) -> Result<serde_json::Value, String> {
+        unwrap_envelope(
+            self.client
+                .get(&format!("{}{}", self.base_url, path))
+                .bearer_auth(token)
+                .send()
+                .map_err(|e| e.to_string())?,
+        )
+    }
+
+    fn str_of(v: &serde_json::Value, key: &str) -> Option<String> {
+        v[key].as_str().map(|s| s.to_string())
+    }
+
+    fn int_of(v: &serde_json::Value, key: &str) -> Option<i64> {
+        v[key].as_i64()
+    }
+
+    fn bool_of(v: &serde_json::Value, key: &str) -> bool {
+        v[key].as_bool().unwrap_or(false)
+    }
+
+    fn helper_row(table: &str, h: &serde_json::Value) -> Vec<StoredValue> {
+        vec![
+            StoredValue::Text(table.to_string()),
+            StoredValue::Int(h["id"].as_i64().unwrap_or(0)),
+            StoredValue::Text(h["name"].as_str().unwrap_or("").to_string()),
+            StoredValue::Text(h["id_name"].as_str().unwrap_or("").to_string()),
+            StoredValue::Text(h["description_en"].as_str().unwrap_or("").to_string()),
+            StoredValue::Int(b2i(Self::bool_of(h, "is_system"))),
+            StoredValue::Int(b2i(Self::bool_of(h, "is_judge_side"))),
+        ]
+    }
+
+    /// Every lookup table in one payload, keyed by table name.
+    pub fn helpers(&self, token: &str) -> Result<TableData, String> {
+        let data = self.get(token, "/helpers")?;
+        let helpers = data["helpers"].as_object().cloned().unwrap_or_default();
+        let mut rows = Vec::new();
+        let mut tables: Vec<String> = helpers.keys().cloned().collect();
+        tables.sort();
+        for t in tables {
+            if let Some(list) = helpers[&t].as_array() {
+                for h in list {
+                    rows.push(Self::helper_row(&t, h));
+                }
+            }
+        }
+        Ok(TableData {
+            table: "helpers",
+            columns: "table_name, id, name, id_name, description_en, is_system, is_judge_side",
+            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7",
+            rows,
+        })
+    }
+
+    /// Echelon vocabulary, lowest first. Order lives in echelon_rank.
+    pub fn hierarchy(&self, token: &str) -> Result<TableData, String> {
+        let data = self.get(token, "/hierarchy")?;
+        let list = data.as_array().cloned().unwrap_or_default();
+        let rows = list
+            .iter()
+            .map(|h| {
+                vec![
+                    StoredValue::Int(h["id"].as_i64().unwrap_or(0)),
+                    StoredValue::Text(h["name"].as_str().unwrap_or("").to_string()),
+                    StoredValue::Text(h["id_name"].as_str().unwrap_or("").to_string()),
+                    StoredValue::Text(h["description_en"].as_str().unwrap_or("").to_string()),
+                    StoredValue::Int(h["echelon_rank"].as_i64().unwrap_or(0)),
+                    StoredValue::Int(b2i(Self::bool_of(h, "is_system"))),
+                    StoredValue::Text(h["note"].as_str().unwrap_or("").to_string()),
+                ]
+            })
+            .collect();
+        Ok(TableData {
+            table: "hierarchy_echelons",
+            columns: "id, name, id_name, description_en, echelon_rank, is_system, note",
+            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7",
+            rows,
+        })
+    }
+
+    /// Categories with their type counts (no paging by design).
+    pub fn categories(&self, token: &str) -> Result<TableData, String> {
+        let data = self.get(token, "/unit-categories")?;
+        let list = data.as_array().cloned().unwrap_or_default();
+        let rows = list
+            .iter()
+            .map(|c| {
+                vec![
+                    StoredValue::Int(c["id"].as_i64().unwrap_or(0)),
+                    StoredValue::Text(c["name"].as_str().unwrap_or("").to_string()),
+                    StoredValue::Text(c["id_name"].as_str().unwrap_or("").to_string()),
+                    StoredValue::Text(c["description_en"].as_str().unwrap_or("").to_string()),
+                    StoredValue::Int(b2i(Self::bool_of(c, "is_system"))),
+                    StoredValue::Int(c["type_count"].as_i64().unwrap_or(0)),
+                ]
+            })
+            .collect();
+        Ok(TableData {
+            table: "unit_categories",
+            columns: "id, name, id_name, description_en, is_system, type_count",
+            placeholders: "?1, ?2, ?3, ?4, ?5, ?6",
+            rows,
+        })
+    }
+
+    /// Full taxonomy types (paged defensively; small in practice).
+    pub fn types(&self, token: &str) -> Result<TableData, String> {
+        let mut rows = Vec::new();
+        for page in 1..=50 {
+            let data = self.get(
+                token,
+                &format!("/unit-types?page_size=200&page_number={page}"),
+            )?;
+            let list = data.as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                break;
+            }
+            for t in &list {
+                rows.push(vec![
+                    StoredValue::Int(t["id"].as_i64().unwrap_or(0)),
+                    StoredValue::Text(t["name"].as_str().unwrap_or("").to_string()),
+                    StoredValue::Text(t["id_name"].as_str().unwrap_or("").to_string()),
+                    StoredValue::Text(
+                        t["description_en"].as_str().unwrap_or("").to_string(),
+                    ),
+                    StoredValue::Int(b2i(Self::bool_of(t, "is_system"))),
+                    opt_int(Self::int_of(&t["category"], "id")),
+                    StoredValue::Int(t["class_count"].as_i64().unwrap_or(0)),
+                ]);
+            }
+            if list.len() < 200 {
+                break;
+            }
+        }
+        Ok(TableData {
+            table: "unit_types",
+            columns: "id, name, id_name, description_en, is_system, category_id, class_count",
+            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7",
+            rows,
+        })
+    }
+
+    /// Classes with taxonomy link, turn rate, hull count, image URL.
+    pub fn classes(&self, token: &str) -> Result<TableData, String> {
+        let mut rows = Vec::new();
+        for page in 1..=50 {
+            let data = self.get(
+                token,
+                &format!("/unit-classes?page_size=200&page_number={page}"),
+            )?;
+            let list = data.as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                break;
+            }
+            for c in &list {
+                rows.push(vec![
+                    StoredValue::Int(c["id"].as_i64().unwrap_or(0)),
+                    StoredValue::Text(c["name"].as_str().unwrap_or("").to_string()),
+                    StoredValue::Text(c["id_name"].as_str().unwrap_or("").to_string()),
+                    opt_int(Self::int_of(&c["unit_type"], "id")),
+                    opt_real(c["default_turn_rate_max_deg_s"].as_f64()),
+                    StoredValue::Int(c["hull_count"].as_i64().unwrap_or(0)),
+                    opt_text(Self::str_of(c, "image_url")),
+                ]);
+            }
+            if list.len() < 200 {
+                break;
+            }
+        }
+        Ok(TableData {
+            table: "unit_classes",
+            columns: "id, name, id_name, type_id, turn_rate, hull_count, image_url",
+            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7",
+            rows,
+        })
+    }
+
+    /// Hull register, paged. Nested taxonomy objects flatten to ids;
+    /// per-version specifications stay server-side in v1 (one request
+    /// per hull would turn every sync into a request storm).
+    pub fn units(&self, token: &str) -> Result<TableData, String> {
+        let mut rows = Vec::new();
+        for page in 1..=50 {
+            let data =
+                self.get(token, &format!("/units?page_size=200&page_number={page}"))?;
+            let list = data.as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                break;
+            }
+            for u in &list {
+                rows.push(vec![
+                    StoredValue::Int(u["id"].as_i64().unwrap_or(0)),
+                    StoredValue::Text(u["name"].as_str().unwrap_or("").to_string()),
+                    opt_text(Self::str_of(u, "hull_number")),
+                    opt_int(Self::int_of(&u["unit_class"], "id")),
+                    opt_int(Self::int_of(&u["unit_status"], "id")),
+                    opt_int(Self::int_of(&u["service_branch"], "id")),
+                    opt_int(Self::int_of(&u["movement_domain"], "id")),
+                ]);
+            }
+            if list.len() < 200 {
+                break;
+            }
+        }
+        Ok(TableData {
+            table: "units",
+            columns: "id, name, hull_number, class_id, status_id, branch_id, domain_id",
+            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7",
+            rows,
+        })
+    }
+}
+
+fn b2i(b: bool) -> i64 {
+    if b {
+        1
+    } else {
+        0
+    }
+}
+
 /// Minos standing picture (REST mapping ticket): the initial picture the
 /// socket then keeps current. Vessels that never reported carry labels
 /// but no position — announced as silent, never zero-filled.

@@ -15,3 +15,4 @@ pub mod log;
 pub mod map_render;
 pub mod overlay;
 pub mod sim;
+pub mod store;
