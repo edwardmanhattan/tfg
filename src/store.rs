@@ -56,6 +56,13 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
             class_id INTEGER, status_id INTEGER,
             branch_id INTEGER, domain_id INTEGER
         );
+        -- Operator-authored branch → category ownership (setup-overhaul
+        -- picker): declared mapping, not derived from hulls. Synced per
+        -- branch from GET /unit-categories?id_service_branch=.
+        CREATE TABLE IF NOT EXISTS branch_categories (
+            branch_id INTEGER NOT NULL, category_id INTEGER NOT NULL,
+            PRIMARY KEY (branch_id, category_id)
+        );
         CREATE TABLE IF NOT EXISTS unit_specs (
             unit_id INTEGER NOT NULL, version INTEGER NOT NULL,
             is_current INTEGER NOT NULL DEFAULT 0, body TEXT NOT NULL,
@@ -166,6 +173,7 @@ pub fn table_counts(conn: &Connection) -> Result<Vec<(String, i64)>, String> {
         "unit_types",
         "unit_classes",
         "units",
+        "branch_categories",
         "unit_specs",
         "hierarchy_echelons",
         "vessel_positions",
@@ -197,8 +205,208 @@ pub fn sync_from(
         let n = replace_all(conn, table.table, table.columns, table.placeholders, table.rows)?;
         counts.push((table.table.to_string(), n));
     }
+    // Declared branch → category ownership (setup-overhaul picker):
+    // one filtered fetch per branch, ids only (rows already mirrored).
+    let branch_ids: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM helpers WHERE table_name = 'service_branches' ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        stmt.query_map([], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<i64>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    let mut map_n = 0;
+    for bid in branch_ids {
+        let ids = master.category_ids_for_branch(token, bid)?;
+        map_n += replace_branch_categories(conn, bid, &ids)?;
+    }
+    counts.push(("branch_categories".to_string(), map_n));
     meta_set(conn, "last_sync", &crate::backend::now_ts())?;
     Ok(counts)
+}
+
+/// Replace one branch's declared category set (server wins).
+pub fn replace_branch_categories(
+    conn: &Connection,
+    branch_id: i64,
+    category_ids: &[i64],
+) -> Result<usize, String> {
+    conn.execute("DELETE FROM branch_categories WHERE branch_id = ?1", [branch_id])
+        .map_err(|e| e.to_string())?;
+    let mut n = 0;
+    for cid in category_ids {
+        conn.execute(
+            "INSERT OR IGNORE INTO branch_categories (branch_id, category_id) VALUES (?1, ?2)",
+            rusqlite::params![branch_id, cid],
+        )
+        .map_err(|e| e.to_string())?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// One drill-down row (setup-overhaul picker): taxonomy label in both
+/// languages plus the header count for the next level.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaxRow {
+    pub id: i64,
+    pub name: String,
+    pub id_name: String,
+    pub count: i64,
+}
+
+fn tax_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaxRow> {
+    Ok(TaxRow { id: r.get(0)?, name: r.get(1)?, id_name: r.get(2)?, count: r.get(3)? })
+}
+
+fn tax_rows(conn: &Connection, sql: &str, param: Option<i64>) -> Result<Vec<TaxRow>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    // One fn item for both arms: two inline closures would be two
+    // distinct types and the match would not compile.
+    let rows = match param {
+        Some(p) => stmt.query_map([p], tax_row),
+        None => stmt.query_map([], tax_row),
+    }
+    .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// Branches with live local hull counts (COUNT of mirrored units).
+pub fn tax_branches(conn: &Connection) -> Result<Vec<TaxRow>, String> {
+    tax_rows(
+        conn,
+        "SELECT h.id, h.name, h.id_name, COUNT(u.id)
+         FROM helpers h LEFT JOIN units u ON u.branch_id = h.id
+         WHERE h.table_name = 'service_branches'
+         GROUP BY h.id ORDER BY h.name",
+        None,
+    )
+}
+
+/// One branch's declared categories, with server type counts.
+pub fn tax_categories(conn: &Connection, branch_id: i64) -> Result<Vec<TaxRow>, String> {
+    tax_rows(
+        conn,
+        "SELECT c.id, c.name, c.id_name, c.type_count
+         FROM unit_categories c JOIN branch_categories b ON b.category_id = c.id
+         WHERE b.branch_id = ?1 ORDER BY c.name",
+        Some(branch_id),
+    )
+}
+
+/// One category's types, with server class counts.
+pub fn tax_types(conn: &Connection, category_id: i64) -> Result<Vec<TaxRow>, String> {
+    tax_rows(
+        conn,
+        "SELECT id, name, id_name, class_count FROM unit_types
+         WHERE category_id = ?1 ORDER BY name",
+        Some(category_id),
+    )
+}
+
+/// One type's classes, with server hull counts.
+pub fn tax_classes(conn: &Connection, type_id: i64) -> Result<Vec<TaxRow>, String> {
+    tax_rows(
+        conn,
+        "SELECT id, name, id_name, hull_count FROM unit_classes
+         WHERE type_id = ?1 ORDER BY name",
+        Some(type_id),
+    )
+}
+
+/// One class's hulls (leaf of the drill).
+pub fn tax_units(conn: &Connection, class_id: i64) -> Result<Vec<StoreUnit>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT u.id, u.name, COALESCE(u.hull_number, ''),
+                    u.class_id, COALESCE(c.name, '')
+             FROM units u LEFT JOIN unit_classes c ON c.id = u.class_id
+             WHERE u.class_id = ?1 ORDER BY u.name",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([class_id], |r| {
+            let id: i64 = r.get(0)?;
+            Ok(StoreUnit {
+                id: id.to_string(),
+                name: r.get(1)?,
+                hull: r.get(2)?,
+                class_id: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                class_name: r.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// Whole-tree search hit (setup-overhaul grill): the hull plus its
+/// breadcrumb path for the jump-to-match list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DrillHit {
+    pub id: String,
+    pub name: String,
+    pub hull: String,
+    pub class_name: String,
+    pub type_name: String,
+    pub category_name: String,
+    pub branch_name: String,
+}
+
+impl DrillHit {
+    /// Breadcrumb for the match list (id_name-first rendering happens
+    /// in the UI; the mirror holds display names as synced).
+    pub fn trail(&self) -> String {
+        [self.branch_name.clone(), self.category_name.clone(), self.type_name.clone()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" / ")
+    }
+}
+
+/// Hulls matching name/hull/class anywhere in the tree, capped.
+pub fn tax_search(conn: &Connection, query: &str) -> Result<Vec<DrillHit>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT u.id, u.name, COALESCE(u.hull_number, ''), COALESCE(c.name, ''),
+                    COALESCE(t.name, ''), COALESCE(cat.name, ''), COALESCE(h.name, '')
+             FROM units u
+             LEFT JOIN unit_classes c ON c.id = u.class_id
+             LEFT JOIN unit_types t ON t.id = c.type_id
+             LEFT JOIN unit_categories cat ON cat.id = t.category_id
+             LEFT JOIN branch_categories bc ON bc.category_id = cat.id
+             LEFT JOIN helpers h ON h.table_name = 'service_branches' AND h.id = bc.branch_id
+             WHERE LOWER(u.name || ' ' || COALESCE(u.hull_number, '') || ' ' || COALESCE(c.name, ''))
+                   LIKE ?1
+             GROUP BY u.id ORDER BY u.name LIMIT 200",
+        )
+        .map_err(|e| e.to_string())?;
+    let like = format!("%{}%", query.to_lowercase());
+    let rows = stmt
+        .query_map([like], |r| {
+            let id: i64 = r.get(0)?;
+            Ok(DrillHit {
+                id: id.to_string(),
+                name: r.get(1)?,
+                hull: r.get(2)?,
+                class_name: r.get(3)?,
+                type_name: r.get(4)?,
+                category_name: r.get(5)?,
+                branch_name: r.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+/// Drill precondition: synced taxonomy present (independent of hulls —
+/// the register below types may legitimately be empty).
+pub fn has_taxonomy(conn: &Connection) -> Result<bool, String> {
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM unit_categories", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
 }
 
 /// Upsert the standing picture (one row per vessel): wire fixes seen
@@ -527,5 +735,52 @@ mod tests {
         assert_eq!(figs[0].version, 2);
         assert_eq!(figs[0].speed_kn, Some(22.0));
         assert_eq!(figs[0].class_name, "Sigma");
+    }
+
+    #[test]
+    fn drill_readers_walk_branch_to_hull() {
+        let conn = open(&std::path::PathBuf::from(":memory:")).expect("open");
+        assert!(!has_taxonomy(&conn).expect("empty store"));
+        conn.execute(
+            "INSERT INTO helpers (table_name, id, name, id_name) VALUES ('service_branches', 1, 'Navy', 'TNI Angkatan Laut')",
+            [],
+        )
+        .expect("branch");
+        conn.execute(
+            "INSERT INTO unit_categories (id, name, id_name, type_count) VALUES (2, 'Frigate', 'Frigat', 1)",
+            [],
+        )
+        .expect("category");
+        conn.execute(
+            "INSERT INTO unit_types (id, name, id_name, category_id, class_count) VALUES (3, 'FFG', 'Frigat', 2, 1)",
+            [],
+        )
+        .expect("type");
+        conn.execute(
+            "INSERT INTO unit_classes (id, name, id_name, type_id, hull_count) VALUES (5, 'Sigma', 'Sigma', 3, 1)",
+            [],
+        )
+        .expect("class");
+        conn.execute(
+            "INSERT INTO units (id, name, hull_number, class_id, branch_id) VALUES (13, 'KRI Ahmad Yani', '381', 5, 1)",
+            [],
+        )
+        .expect("hull");
+        assert!(has_taxonomy(&conn).expect("tax"));
+        // Mapping replace is idempotent over duplicate ids.
+        replace_branch_categories(&conn, 1, &[2, 2]).expect("mapping");
+        let branches = tax_branches(&conn).expect("branches");
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].count, 1, "local hull count, not server");
+        let cats = tax_categories(&conn, 1).expect("cats");
+        assert_eq!(cats, vec![TaxRow { id: 2, name: "Frigate".into(), id_name: "Frigat".into(), count: 1 }]);
+        assert!(tax_categories(&conn, 9).expect("other branch").is_empty());
+        assert_eq!(tax_types(&conn, 2).expect("types").len(), 1);
+        assert_eq!(tax_classes(&conn, 3).expect("classes").len(), 1);
+        assert_eq!(tax_units(&conn, 5).expect("hulls").len(), 1);
+        let hits = tax_search(&conn, "yani").expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].trail(), "Navy / Frigate / FFG");
+        assert!(tax_search(&conn, "nope").expect("miss").is_empty());
     }
 }

@@ -583,6 +583,22 @@ impl MinosMaster {
             rows,
         })
     }
+
+    /// Declared branch → category ownership (setup-overhaul picker):
+    /// ids only — the rows themselves come from categories(). Empty is
+    /// a real answer (a branch owning nothing renders a zero, not an
+    /// error); non-numeric ids are refused upstream with 422.
+    pub fn category_ids_for_branch(&self, token: &str, branch_id: i64) -> Result<Vec<i64>, String> {
+        let data = self.get(token, &format!("/unit-categories?id_service_branch={branch_id}"))?;
+        Ok(data
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|c| c["id"].as_i64())
+            .filter(|id| *id > 0)
+            .collect())
+    }
 }
 
 fn b2i(b: bool) -> i64 {
@@ -1299,6 +1315,25 @@ mod tests {
         assert_eq!(spec.speed_kn, Some(28.5));
         let err = master.hull_spec("AT", 14).unwrap_err();
         assert!(err.contains("no published specification"), "{err}");
+    }
+
+    #[test]
+    fn branch_categories_return_ids_and_empty_is_real() {
+        let server = tiny_http::Server::http("127.0.0.1:18087").expect("bind test port");
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests().take(2) {
+                let url = rq.url().to_string();
+                let body = if url.contains("id_service_branch=1") {
+                    r#"{"status_code":200,"message":"Successfull","data":[{"id":2,"name":"Frigate","type_count":2},{"id":0,"name":"Ghost"}]}"#
+                } else {
+                    r#"{"status_code":200,"message":"Successfull","data":[]}"#
+                };
+                let _ = rq.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18087/api/v1").expect("client builds");
+        assert_eq!(master.category_ids_for_branch("AT", 1).expect("ids"), vec![2]);
+        assert!(master.category_ids_for_branch("AT", 3).expect("empty").is_empty());
     }
 
     #[test]

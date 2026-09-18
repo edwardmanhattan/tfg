@@ -55,6 +55,17 @@ const ZONE_PAD_PX: f64 = 26.0;
 /// 640px viewport under the toolbar with room for window chrome; unbounded
 /// lists inside already-capped islands keep their own tighter cap.
 const ISLAND_SCROLL_MAX: f32 = 420.0;
+/// Wizard island sizing (layout fix): the stepped Setup is a centered
+/// island with real content width. Without a floor the window shrinks
+/// to the longest label (~thin strip) and border drags only repaint
+/// the background — the inner ScrollArea never expands.
+const WIZARD_MIN_WIDTH: f32 = 460.0;
+/// Fleet picker sizing (layout fix): four miller columns at a readable
+/// measure plus window chrome. The island scrolls horizontally below
+/// this width instead of squeezing the columns.
+const FLEET_MIN_WIDTH: f32 = 760.0;
+const MILLER_COL_WIDTH: f32 = 176.0;
+const MILLER_COL_HEIGHT: f32 = 170.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Session stub pace (session flow): 7 real hours play 7 game days.
 /// Full windows UI lands with the organizer flow; the ratio is the load-
@@ -233,6 +244,62 @@ struct ShipMarker {
     trail: Vec<(f64, f64)>,
 }
 
+/// One drill row label (setup-overhaul picker): id_name first (grill
+/// decision), English subtitle when it differs, next-level count.
+fn drill_label(o: &tfg::store::TaxRow) -> String {
+    if o.name.is_empty() || o.name == o.id_name {
+        format!("{} ({})", o.id_name, o.count)
+    } else {
+        format!("{} · {} ({})", o.id_name, o.name, o.count)
+    }
+}
+
+/// Fifth miller column (dnd ticket): hulls of the picked class beside
+/// the taxonomy. Row tap picks for click-placement, drag starts a map
+/// drop; placed hulls show a check and stay out of the way.
+fn units_col(
+    ui: &mut egui::Ui,
+    leaf: &[PickerRow],
+    placed: &std::collections::HashSet<String>,
+    pick: &mut Option<String>,
+    press: &mut Option<(String, String, egui::Pos2)>,
+    drag: &mut Option<(String, String)>,
+) {
+    ui.vertical(|ui| {
+        ui.set_min_width(MILLER_COL_WIDTH);
+        ui.set_max_width(MILLER_COL_WIDTH);
+        ui.strong(format!("Units ({})", leaf.len()));
+        egui::ScrollArea::vertical()
+            .id_salt("drill-units")
+            .auto_shrink([false, false])
+            .max_height(MILLER_COL_HEIGHT)
+            .show(ui, |ui| {
+                ui.set_min_width(MILLER_COL_WIDTH - 16.0);
+                if leaf.is_empty() {
+                    ui.weak("None yet");
+                } else {
+                    for u in leaf {
+                        if placed.contains(&u.id) {
+                            ui.label(format!("✓ {} ({})", u.name, u.hull));
+                        } else {
+                            let resp = ui.selectable_value(
+                                pick,
+                                Some(u.id.clone()),
+                                format!("{} ({})", u.name, u.hull),
+                            );
+                            if resp.is_pointer_button_down_on() && drag.is_none() && press.is_none() {
+                                if let Some(start) = resp.interact_pointer_pos() {
+                                    *press = Some((u.id.clone(), u.name.clone(), start));
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+    });
+    ui.separator();
+}
+
 /// One pickable hull row, from either picker source (cutover ticket):
 /// asset seeds carry their catalog class; register rows resolve the
 /// Minos class name to sim stats, or to None (loud refusal, never
@@ -243,6 +310,9 @@ struct PickerRow {
     hull: String,
     class_name: String,
     stat_class: Option<String>,
+    /// Drill breadcrumb (setup-overhaul picker): empty in column mode,
+    /// "branch / category / type" in whole-tree search mode.
+    trail: String,
 }
 
 /// One desktop's order draft (slice iv, grill #25): pending waypoint,
@@ -434,6 +504,19 @@ struct ShipApp {
     fleet_class: Option<String>,
     fleet_query: String,
     fleet_pick: Option<String>,
+    /// Drill selections (setup-overhaul prototype): branch > category >
+    /// type > class ids from the synced taxonomy; leaf units list below.
+    drill_branch: Option<i64>,
+    drill_category: Option<i64>,
+    drill_type: Option<i64>,
+    drill_class: Option<i64>,
+    /// Active fleet-row drag (setup-overhaul dnd): press candidate with
+    /// origin until it moves past the click threshold, then a live drag
+    /// (hull id + name) until release (drop places) or cancel.
+    /// Click-sense rows never report drag_started, so the gesture is
+    /// tracked from the press origin instead.
+    drag_press: Option<(String, String, egui::Pos2)>,
+    drag_unit: Option<(String, String)>,
     placed_fleet: HashSet<String>,
     /// Labels captured at placement (both picker sources), so register
     /// hulls keep their name + hull after the picker moves on.
@@ -491,11 +574,8 @@ struct ShipApp {
     zoom_dirty: bool,
     /// Top-level mode (task #39): session only in Simulation.
     app_mode: AppMode,
-    /// Connection island state (task #39): URL field, current source
-    /// description, last connect/disconnect note, control channel.
-    backend_url: String,
-    wire_desc: String,
-    conn_status: String,
+    /// Connection island state: control channel for wire swaps (the
+    /// wires themselves come from the environment, boot-owned).
     show_connection: bool,
     wire_ctl_tx: Option<Sender<WireKind>>,
     /// Live socket handles (live-wire ticket): token push-down to the
@@ -770,68 +850,49 @@ impl ShipApp {
             self.show_groups = false;
             self.show_connection = true;
         } else {
+            // Simulation arms the engine (setup-overhaul pass): the old
+            // session-island checkbox was this switch wearing a disguise.
+            self.mode.armed.store(true, Ordering::SeqCst);
             self.show_connection = false;
         }
         eprintln!("mode: {mode:?}");
     }
 
-    /// Connection island (task #39): the wire controls plus status.
-    /// Same Registry underneath — this only swaps the source.
+    /// Connection island: the live feed only (setup-overhaul pass).
+    /// Wires come from the environment (`.env`, boot); the island shows
+    /// a status indicator plus one connect toggle — no endpoint text,
+    /// no manual backend swapping.
     fn connection_island(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Connection");
-        ui.label(format!("source: {}", self.wire_desc));
-        let backend_ships = self
-            .registry
-            .ships()
-            .iter()
-            .filter(|s| s.source == FixSource::Wire)
-            .count();
-        ui.label(format!("backend ships in view: {backend_ships}"));
-        ui.horizontal(|ui| {
-            ui.label("backend:");
-            ui.text_edit_singleline(&mut self.backend_url);
-        });
-        ui.horizontal(|ui| {
-            if ui.button("connect").clicked() {
-                let url = self.backend_url.clone();
-                if let Some(tx) = &self.wire_ctl_tx {
-                    match HttpPoll::new(&url) {
-                        Ok(_) => {
-                            let _ = tx.send(WireKind::Http(url.clone()));
-                            self.wire_desc = format!("HTTP {url}");
-                            self.conn_status = format!("connected {url}");
-                            eprintln!("wire: HTTP {url}");
-                        }
-                        Err(e) => {
-                            self.conn_status = format!("connect failed: {e}");
-                        }
-                    }
-                }
-            }
-            if ui.button("disconnect").clicked() {
+        ui.heading("Live feed");
+        let ink = if self.live_status.starts_with("connected") {
+            egui::Color32::from_rgb(0x4A, 0xDE, 0x80)
+        } else if self.live_status.starts_with("connecting") {
+            egui::Color32::from_rgb(0xFA, 0xBF, 0x69)
+        } else if self.live_status.starts_with("refused")
+            || self.live_status.starts_with("socket error")
+        {
+            egui::Color32::from_rgb(0xF8, 0x71, 0x71)
+        } else {
+            egui::Color32::GRAY
+        };
+        ui.label(egui::RichText::new(format!("live: {}", self.live_status)).color(ink));
+        // Single toggle (was connect/stop pair): token-gated swap onto
+        // the socket, or back to the boot wire. Snapshot failure lands
+        // back with the reason; fatal refusals arrive as status below.
+        let ws_url = Self::ws_url_for(&self.minos_base);
+        let live_on = self.live_cmd_tx.is_some();
+        let authed = self.auth_token.is_some();
+        let label = if live_on { "stop live" } else { "connect live" };
+        if ui.add_enabled(authed || live_on, egui::Button::new(label)).clicked() {
+            if live_on {
                 if let Some(tx) = &self.wire_ctl_tx {
                     let _ = tx.send(WireKind::Empty);
-                    self.wire_desc = "empty".to_string();
-                    self.conn_status = "disconnected".to_string();
                     self.live_cmd_tx = None;
                     self.live_evt_rx = None;
                     self.live_status = "idle".to_string();
-                    eprintln!("wire: empty");
+                    eprintln!("wire: live stopped");
                 }
-            }
-        });
-        ui.label(&self.conn_status);
-        // Live socket (live-wire ticket): token-gated swap. Snapshot
-        // failure lands back on empty with the reason; fatal refusals
-        // arrive as events below.
-        ui.separator();
-        ui.heading("Live feed");
-        let ws_url = Self::ws_url_for(&self.minos_base);
-        ui.label(format!("socket: {ws_url}"));
-        ui.label(format!("live: {}", self.live_status));
-        ui.horizontal(|ui| {
-            let authed = self.auth_token.is_some();
-            if ui.add_enabled(authed, egui::Button::new("connect live")).clicked() {
+            } else {
                 let token = self.auth_token.clone().unwrap_or_default();
                 let rest_base = self.minos_base.clone();
                 let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -848,22 +909,11 @@ impl ShipApp {
                     self.live_cmd_tx = Some(cmd_tx);
                     self.live_evt_rx = Some(event_rx);
                     self.live_status = "connecting…".to_string();
-                    self.wire_desc = format!("live {ws_url}");
                     eprintln!("wire: live {ws_url}");
                 }
             }
-            if ui.button("stop live").clicked() {
-                if let Some(tx) = &self.wire_ctl_tx {
-                    let _ = tx.send(WireKind::Empty);
-                    self.live_cmd_tx = None;
-                    self.live_evt_rx = None;
-                    self.live_status = "idle".to_string();
-                    self.wire_desc = "empty".to_string();
-                    eprintln!("wire: live stopped");
-                }
-            }
-        });
-        if self.auth_token.is_none() {
+        }
+        if !authed && !live_on {
             ui.label("Sign in through the Login island first.");
         }
     }
@@ -1089,15 +1139,12 @@ impl ShipApp {
         eprintln!("spec sync done: {}", self.sync_status);
     }
 
-    /// Login island (login ticket): Minos sign-in against minos_base, the
-    /// must_change_password gate as a blocking form, sign-out. Token state
-    /// feeds the later socket work; refresh runs proactively per frame.
+    /// Login island (login ticket): Minos sign-in against the env-owned
+    /// endpoint, the must_change_password gate as a blocking form,
+    /// sign-out. Token state feeds the later socket work; refresh runs
+    /// proactively per frame.
     fn login_island(&mut self, ui: &mut egui::Ui) {
         ui.heading("Login");
-        ui.horizontal(|ui| {
-            ui.label("minos:");
-            ui.text_edit_singleline(&mut self.minos_base);
-        });
         if let Some(user) = self.auth_user.clone() {
             let ttl_note = match (self.auth_issued_at, self.auth_ttl_secs) {
                 (Some(t), ttl) if ttl > 0 => {
@@ -1394,6 +1441,52 @@ impl ShipApp {
         Some((row.name, row.hull, class))
     }
 
+    /// Shared place core (click + drag-and-drop): the click path's
+    /// guards, then TakeControl for a picked, unplaced hull with stats.
+    /// Returns the placed id, if any.
+    fn try_place_picked(&mut self, la: f64, lo: f64) -> Option<String> {
+        if !(self.mode.phase == Phase::Setup || self.mode.phase == Phase::Live) {
+            return None;
+        }
+        if !self.mode.armed.load(Ordering::SeqCst) {
+            self.feed("place refused: engine disarmed".to_string());
+            return None;
+        }
+        if self.acting_as.is_some() {
+            return None;
+        }
+        let pid = self.fleet_pick.clone()?;
+        let (name, hull, class_id) = self.placement_seed(&pid)?;
+        if self.placed_fleet.contains(&pid) {
+            return None;
+        }
+        match class_id {
+            Some(class_id) => {
+                let id = pid.clone();
+                if let Some(tx) = &self.sim_cmd_tx {
+                    let _ = tx.send(SimCommand::TakeControl {
+                        ship_id: id.clone(),
+                        pos: GeoPosition { latitude: la, longitude: lo },
+                        class_id: class_id.clone(),
+                    });
+                }
+                // Placed units arrive owned (Q3): the gesture is the
+                // take-control, no second step.
+                self.controlled.insert(id.clone());
+                self.select_ship(id.clone());
+                self.placed_labels.insert(id.clone(), (name.clone(), hull.clone()));
+                self.placed_fleet.insert(id);
+                self.fleet_pick = None;
+                self.feed(format!("placed {name} ({hull}) at ({la:.4}, {lo:.4})"));
+                Some(pid)
+            }
+            None => {
+                self.feed(format!("place refused: no sim stats for {name}"));
+                None
+            }
+        }
+    }
+
     /// Seat labels for one roster user: helm, unit command, group command.
     fn seat_labels(&self, user: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -1440,6 +1533,35 @@ impl ShipApp {
             format!("wss://{host}/connection/websocket")
         } else {
             format!("ws://{host}:8000/connection/websocket")
+        }
+    }
+
+    /// Load `.env` from the working directory (setup-overhaul pass):
+    /// `KEY=VALUE` lines, `#` comments, matching quotes unwrapped.
+    /// Real environment variables always win — the file only fills gaps.
+    fn load_dotenv() {
+        let Ok(text) = std::fs::read_to_string(".env") else {
+            return;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let (k, v) = (k.trim(), v.trim());
+            if k.is_empty() || std::env::var(k).is_ok() {
+                continue;
+            }
+            let v = v
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(v);
+            // Tab: set_var is unsafe under edition 2024 (process-wide).
+            unsafe { std::env::set_var(k, v) };
         }
     }
 
@@ -1813,21 +1935,12 @@ impl ShipApp {
         eprintln!("session ended");
     }
 
-    /// Session island: phase, engine toggle, and the per-phase controls.
-    /// Reads UiMode; writes only through start()/end()/reset().
+    /// Session island: phase and the per-phase controls. Arming follows
+    /// the app mode (Simulation arms, Presentation disarms) — no separate
+    /// engine toggle. Reads UiMode; writes only through start()/end()/reset().
     fn session_island(&mut self, ui: &mut egui::Ui) {
         let phase = self.mode.phase;
-        ui.label(format!(
-            "phase: {phase:?}{}",
-            if self.mode.armed.load(Ordering::SeqCst) { " · armed" } else { " · presentation" }
-        ));
-        if phase != Phase::Closed {
-            let mut armed = self.mode.armed.load(Ordering::SeqCst);
-            if ui.checkbox(&mut armed, "simulation mode (engine)").changed() {
-                self.mode.armed.store(armed, Ordering::SeqCst);
-                eprintln!("{}", if armed { "sim armed" } else { "presentation only" });
-            }
-        }
+        ui.label(format!("phase: {phase:?}"));
         match phase {
             Phase::Setup => {
                 // Setup editing is organizer-only (slice iv): acting
@@ -2448,6 +2561,30 @@ impl ShipApp {
         const CAT_LABELS: [&str; 5] = ["All", "Ship", "Plane", "Tank", "Port"];
         ui.heading("Fleet picker");
         ui.label("Organizer: filter, pick one hull, place it on the map by hand.");
+        // Drag gesture (dnd ticket): a press on a row is a candidate
+        // until it moves past the click threshold, then a live drag.
+        // Plain clicks never promote, so selection is unaffected.
+        if let Some(start) = self.drag_press.as_ref().map(|(_, _, s)| *s) {
+            let (down, dist) = ui.ctx().input(|i| {
+                (
+                    i.pointer.any_down(),
+                    i.pointer.hover_pos().map_or(0.0, |p| p.distance(start)),
+                )
+            });
+            if !down {
+                self.drag_press = None;
+            } else if dist > 6.0 {
+                if let Some((id, name, _)) = self.drag_press.take() {
+                    self.drag_unit = Some((id, name));
+                }
+            }
+        }
+        // Drag state: grabbing cursor plus the drop hint while a hull is
+        // mid-drag; release outside the map cancels.
+        if let Some((_, name)) = &self.drag_unit {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            ui.label(format!("moving {name} — release over the map to place"));
+        }
         // Source switch (cutover ticket): the synced register wins, the
         // bundled assets seed. Minos categories don't map to the Category
         // enum, so the category filter is asset-only; fleet_class holds a
@@ -2463,6 +2600,19 @@ impl ShipApp {
         } else {
             format!("source: bundled assets ({} hulls — sync to refresh)", self.fleet.len())
         });
+        // Drill cutover (setup-overhaul prototype): synced taxonomy
+        // renders branch > category > type > class columns with the
+        // unit leaf below; unsynced stores keep the flat pickers.
+        let has_tax = self
+            .store
+            .as_ref()
+            .and_then(|c| tfg::store::has_taxonomy(c).ok())
+            .unwrap_or(false);
+        if has_tax {
+            let (rows, show_list) = self.drill_rows_ui(ui);
+            self.picker_tail(ui, &rows, show_list);
+            return;
+        }
         // Collect options first: the combos mutate self while the
         // catalog borrows would still be live (E0502 pattern).
         let class_opts: Vec<(String, String)> = if from_register {
@@ -2542,6 +2692,7 @@ impl ShipApp {
                             hull: u.hull,
                             class_name: u.class_name,
                             stat_class,
+                            trail: String::new(),
                         });
                     }
                 }
@@ -2589,28 +2740,285 @@ impl ShipApp {
                         hull: u.hull.clone(),
                         class_name,
                         stat_class: Some(u.class_id.clone()),
+                        trail: String::new(),
                     }
                 })
                 .collect()
         };
+        self.picker_tail(ui, &rows, true);
+    }
+
+    /// Drill picker (setup-overhaul prototype): branch > category >
+    /// type > class columns from the sqlite mirror, whole-tree search
+    /// with breadcrumb jump, leaf units as shared picker rows plus a
+    /// fifth Units column. Returns the rows with whether the tail
+    /// renders its own list (search mode) or the column does.
+    fn drill_rows_ui(&mut self, ui: &mut egui::Ui) -> (Vec<PickerRow>, bool) {
+        ui.horizontal(|ui| {
+            ui.label("search all hulls:");
+            ui.text_edit_singleline(&mut self.fleet_query);
+            if ui.small_button("clear").clicked() {
+                self.fleet_query.clear();
+                self.drill_branch = None;
+                self.drill_category = None;
+                self.drill_type = None;
+                self.drill_class = None;
+            }
+        });
+        let query = self.fleet_query.to_lowercase();
+        // Whole-tree search (setup-overhaul grill): flat matches with
+        // breadcrumb trails, jumping past the columns.
+        if !query.is_empty() {
+            let mut out = Vec::new();
+            if let Some(conn) = self.store.as_ref() {
+                if let Ok(hits) = tfg::store::tax_search(conn, &query) {
+                    for h in hits {
+                        let stat_class = self
+                            .catalog
+                            .find_class_by_name(&h.class_name)
+                            .map(|c| c.id.clone());
+                        let trail = h.trail();
+                        out.push(PickerRow {
+                            id: h.id,
+                            name: h.name,
+                            hull: h.hull,
+                            class_name: h.class_name,
+                            stat_class,
+                            trail,
+                        });
+                    }
+                }
+            }
+            return (out, true);
+        }
+        // Selections first (Copy): option fetches borrow the store,
+        // the column UI mutates drill state — never both live (E0502).
+        let (b, c, t) = (self.drill_branch, self.drill_category, self.drill_type);
+        let (branches, categories, types, classes) = match self.store.as_ref() {
+            Some(conn) => (
+                tfg::store::tax_branches(conn).unwrap_or_default(),
+                b.map(|id| tfg::store::tax_categories(conn, id).unwrap_or_default())
+                    .unwrap_or_default(),
+                c.map(|id| tfg::store::tax_types(conn, id).unwrap_or_default())
+                    .unwrap_or_default(),
+                t.map(|id| tfg::store::tax_classes(conn, id).unwrap_or_default())
+                    .unwrap_or_default(),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        };
+        // Miller columns (layout fix): branch | category | type |
+        // class stay visible side by side so the hierarchy reads left
+        // to right. A parent change clears the levels below it; the
+        // breadcrumb above is the jump-back affordance. Narrow islands
+        // scroll horizontally instead of squeezing the columns.
+        let crumb = |opts: &[tfg::store::TaxRow], id: Option<i64>| {
+            id.and_then(|w| opts.iter().find(|o| o.id == w))
+                .map(|o| o.id_name.clone())
+        };
+        let crumbs: Vec<(String, usize)> = [
+            crumb(&branches, self.drill_branch).map(|s| (s, 1)),
+            crumb(&categories, self.drill_category).map(|s| (s, 2)),
+            crumb(&types, self.drill_type).map(|s| (s, 3)),
+            crumb(&classes, self.drill_class).map(|s| (s, 4)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut keep_depth: Option<usize> = None;
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("Fleet").clicked() {
+                keep_depth = Some(0);
+            }
+            for (label, depth) in &crumbs {
+                ui.label("/");
+                if ui.small_button(label).clicked() {
+                    keep_depth = Some(*depth);
+                }
+            }
+        });
+        if let Some(d) = keep_depth {
+            if d < 1 {
+                self.drill_branch = None;
+            }
+            if d < 2 {
+                self.drill_category = None;
+            }
+            if d < 3 {
+                self.drill_type = None;
+            }
+            if d < 4 {
+                self.drill_class = None;
+            }
+        }
+        if self.drill_branch != b {
+            self.drill_category = None;
+            self.drill_type = None;
+            self.drill_class = None;
+        }
+        if self.drill_category != c {
+            self.drill_type = None;
+            self.drill_class = None;
+        }
+        if self.drill_type != t {
+            self.drill_class = None;
+        }
+        // Leaf hulls first (dnd ticket): the fifth column renders them
+        // beside the taxonomy when a class is picked.
+        let mut out = Vec::new();
+        if let (Some(conn), Some(class_id)) = (self.store.as_ref(), self.drill_class) {
+            if let Ok(units) = tfg::store::tax_units(conn, class_id) {
+                for u in units {
+                    let stat_class = self
+                        .catalog
+                        .find_class_by_name(&u.class_name)
+                        .map(|cc| cc.id.clone());
+                    out.push(PickerRow {
+                        id: u.id,
+                        name: u.name,
+                        hull: u.hull,
+                        class_name: u.class_name,
+                        stat_class,
+                        trail: String::new(),
+                    });
+                }
+            }
+        }
+        egui::ScrollArea::horizontal()
+            .id_salt("drill-miller")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    // One column per hierarchy level. A column activates
+                    // once its parent is picked; deeper columns show the
+                    // prompt instead of stale options.
+                    let levels: [(&str, &[tfg::store::TaxRow], bool); 4] = [
+                        ("Branch", &branches, true),
+                        ("Category", &categories, self.drill_branch.is_some()),
+                        ("Type", &types, self.drill_category.is_some()),
+                        ("Class", &classes, self.drill_type.is_some()),
+                    ];
+                    for (depth, (title, opts, active)) in levels.iter().enumerate() {
+                        ui.vertical(|ui| {
+                            ui.set_min_width(MILLER_COL_WIDTH);
+                            ui.set_max_width(MILLER_COL_WIDTH);
+                            ui.strong(format!("{title} ({})", opts.len()));
+                            egui::ScrollArea::vertical()
+                                .id_salt(("drill", *title))
+                                .auto_shrink([false, false])
+                                .max_height(MILLER_COL_HEIGHT)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(MILLER_COL_WIDTH - 16.0);
+                                    if !active {
+                                        ui.weak("Pick ← first");
+                                    } else if opts.is_empty() {
+                                        ui.weak("None yet");
+                                    } else {
+                                        for o in opts.iter() {
+                                            match depth {
+                                                0 => {
+                                                    ui.selectable_value(
+                                                        &mut self.drill_branch,
+                                                        Some(o.id),
+                                                        drill_label(o),
+                                                    );
+                                                }
+                                                1 => {
+                                                    ui.selectable_value(
+                                                        &mut self.drill_category,
+                                                        Some(o.id),
+                                                        drill_label(o),
+                                                    );
+                                                }
+                                                2 => {
+                                                    ui.selectable_value(
+                                                        &mut self.drill_type,
+                                                        Some(o.id),
+                                                        drill_label(o),
+                                                    );
+                                                }
+                                                _ => {
+                                                    ui.selectable_value(
+                                                        &mut self.drill_class,
+                                                        Some(o.id),
+                                                        drill_label(o),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                        });
+                        ui.separator();
+                    }
+                    // Fifth column (dnd ticket): hulls of the picked class
+                    // sit beside the taxonomy instead of below it. Row tap
+                    // picks for click-placement; drag starts a map drop.
+                    if self.drill_class.is_some() {
+                        units_col(
+                            ui,
+                            &out,
+                            &self.placed_fleet,
+                            &mut self.fleet_pick,
+                            &mut self.drag_press,
+                            &mut self.drag_unit,
+                        );
+                    }
+                });
+            });
+        // Column mode (a class is picked): hulls live in the fifth
+        // column, so the tail skips its own list but keeps the count
+        // and the placement block.
+        let column_mode = self.drill_class.is_some();
+        if !column_mode {
+            ui.label("Select a class to list its hulls.");
+        }
+        (out, !column_mode)
+    }
+
+    /// Shared picker tail (setup-overhaul prototype): row list plus the
+    /// placement block, identical for flat and drill sources. Drill
+    /// column mode hides the list (the fifth column shows the hulls)
+    /// but keeps the count and placement.
+    fn picker_tail(&mut self, ui: &mut egui::Ui, rows: &[PickerRow], show_list: bool) {
         ui.label(format!(
             "{} shown · {} placed",
             rows.len(),
             self.placed_fleet.len()
         ));
-        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-            for u in &rows {
-                if self.placed_fleet.contains(&u.id) {
-                    ui.label(format!("✓ {} ({}) — placed", u.name, u.hull));
-                } else {
-                    ui.selectable_value(
-                        &mut self.fleet_pick,
-                        Some(u.id.clone()),
-                        format!("{} ({}) · {}", u.name, u.hull, u.class_name),
-                    );
+        // Salted: the drill level lists above share the screen, and bare
+        // pairs take the same auto ID.
+        if show_list {
+            egui::ScrollArea::vertical().id_salt("picker-rows").max_height(200.0).show(ui, |ui| {
+                for u in rows {
+                    if self.placed_fleet.contains(&u.id) {
+                        ui.label(format!("✓ {} ({}) — placed", u.name, u.hull));
+                    } else {
+                        let resp = ui.selectable_value(
+                            &mut self.fleet_pick,
+                            Some(u.id.clone()),
+                            if u.trail.is_empty() {
+                                format!("{} ({}) · {}", u.name, u.hull, u.class_name)
+                            } else {
+                                format!(
+                                    "{} ({}) · {} — {}",
+                                    u.name, u.hull, u.class_name, u.trail
+                                )
+                            },
+                        );
+                        if resp.is_pointer_button_down_on()
+                            && self.drag_unit.is_none()
+                            && self.drag_press.is_none()
+                        {
+                            // Press origin, not drag_started: click-sense
+                            // rows never report drags (see struct docs).
+                            if let Some(start) = resp.interact_pointer_pos() {
+                                self.drag_press = Some((u.id.clone(), u.name.clone(), start));
+                            }
+                        }
+                    }
                 }
-            }
-        });
+            });
+        }
         let pick_placed = self.fleet_pick.as_ref().map_or(false, |id| self.placed_fleet.contains(id));
         // The sim is not polled while disarmed, so a TakeControl sent
         // with the engine off would sit in the queue invisibly. Gate
@@ -2726,6 +3134,10 @@ impl ShipApp {
     /// Wizard island (islands grill, #27): stepped Setup that dismisses
     /// on Live. Points at the working islands; never duplicates them.
     fn wizard_island(&mut self, ui: &mut egui::Ui) {
+        // Layout fix: claim the island width so the window never
+        // collapses to the longest label and border drags resize content,
+        // not just the background.
+        ui.set_min_width(WIZARD_MIN_WIDTH);
         ui.heading("Command center setup");
         ui.label("Four steps to a live game. Skip any time; the islands stay.");
         match self.wizard_step {
@@ -2742,10 +3154,22 @@ impl ShipApp {
                 });
             }
             1 => {
-                ui.label("Session: arm the engine, then start. Defaults play 7 hours as 7 days.");
+                ui.label("Session: pick a mode, then start. Defaults play 7 hours as 7 days.");
+                // Mode switch lives here too (setup-overhaul pass): the
+                // switch is the arm — Simulation arms, Presentation
+                // disarms — so the wizard never needs an engine toggle.
+                ui.horizontal(|ui| {
+                    let mut mode = self.app_mode;
+                    ui.selectable_value(&mut mode, AppMode::Presentation, "Presentation");
+                    ui.selectable_value(&mut mode, AppMode::Simulation, "Simulation");
+                    if mode != self.app_mode {
+                        self.set_app_mode(mode);
+                    }
+                });
                 if self.mode.phase == Phase::Setup && ui.button("Start session").clicked() {
                     self.start_session();
                 }
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("← Back").clicked() {
                         self.wizard_step = 0;
@@ -2760,8 +3184,9 @@ impl ShipApp {
                 });
             }
             2 => {
-                ui.label("Fleet: in the Fleet island, filter by category, class, or type, pick one hull, then click the map to place it by hand.");
+                ui.label("Fleet: in the Fleet island, drill branch → class or search all hulls, pick one, then click the map to place it.");
                 ui.label(format!("placed: {} unit(s)", self.placed_fleet.len()));
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("← Back").clicked() {
                         self.wizard_step = 1;
@@ -2780,6 +3205,7 @@ impl ShipApp {
                     self.roster.len()
                 ));
                 ui.label("Gaps are fine: unowned units sail as traffic.");
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("← Back").clicked() {
                         self.wizard_step = 2;
@@ -2988,13 +3414,20 @@ impl eframe::App for ShipApp {
             let mut wiz_open = true;
             egui::Window::new("Command center setup")
                 .default_pos(egui::pos2(330.0, 140.0))
+                .default_size([WIZARD_MIN_WIDTH + 40.0, 300.0])
+                .min_width(WIZARD_MIN_WIDTH)
+                .min_height(220.0)
+                .resizable(true)
                 .movable(true)
                 .collapsible(false)
                 .open(&mut wiz_open)
                 .show(ui.ctx(), |ui| {
-                    egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
-                        self.wizard_island(ui);
-                    });
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(ISLAND_SCROLL_MAX)
+                        .show(ui, |ui| {
+                            self.wizard_island(ui);
+                        });
                 });
             if !wiz_open {
                 self.wizard_done = true;
@@ -3086,8 +3519,8 @@ impl eframe::App for ShipApp {
         }
         if self.show_fleet && self.mode.phase != Phase::Closed {
             let mut open = self.show_fleet;
-            egui::Window::new("Fleet").movable(true).default_pos(egui::pos2(8.0, 300.0)).open(&mut open).show(ui.ctx(), |ui| {
-                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
+            egui::Window::new("Fleet").movable(true).resizable(true).default_pos(egui::pos2(8.0, 300.0)).default_size([900.0, 520.0]).min_width(FLEET_MIN_WIDTH).min_height(320.0).open(&mut open).show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
                 self.fleet_island(ui);
                 });
             });
@@ -3760,35 +4193,7 @@ impl eframe::App for ShipApp {
                             // Fleet picker: only a picked, unplaced hull
                             // stands up, with sim stats resolved. No generic
                             // or automatic placement.
-                            if let Some(pid) = self.fleet_pick.clone() {
-                                if let Some((name, hull, class_id)) = self.placement_seed(&pid) {
-                                    if !self.placed_fleet.contains(&pid) {
-                                        match class_id {
-                                            Some(class_id) => {
-                                                let id = pid.clone();
-                                                if let Some(tx) = &self.sim_cmd_tx {
-                                                    let _ = tx.send(SimCommand::TakeControl {
-                                                        ship_id: id.clone(),
-                                                        pos: GeoPosition { latitude: la, longitude: lo },
-                                                        class_id: class_id.clone(),
-                                                    });
-                                                    eprintln!("placed {name} ({hull}) at ({la:.4}, {lo:.4})");
-                                                }
-                                                // Placed units arrive owned (Q3): the click is
-                                                // the take-control, no second step.
-                                                self.controlled.insert(id.clone());
-                                                self.select_ship(id.clone());
-                                                self.placed_labels.insert(id.clone(), (name, hull));
-                                                self.placed_fleet.insert(id);
-                                                self.fleet_pick = None;
-                                            }
-                                            None => {
-                                                eprintln!("place refused: no sim stats for {name}");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            self.try_place_picked(la, lo);
                             self.mode.tool = SetupTool::Select;
                         } else if self.placing {
                             let (la, lo) = unproject_mercator(
@@ -3835,6 +4240,28 @@ impl eframe::App for ShipApp {
                             }
                         }
                     }
+                }
+                // Drag-and-drop placement (setup-overhaul): a fleet-row
+                // drag released over the map places through the shared
+                // core. The press began outside the map, so the click and
+                // pan gestures above never fire for it — no conflict.
+                if self.drag_unit.is_some() && ui.ctx().input(|i| i.pointer.any_released()) {
+                    let drop = ui.ctx().input(|i| i.pointer.interact_pos());
+                    match drop {
+                        Some(p) if rect.contains(p) => {
+                            let px = (p.x - rect.min.x) as f64;
+                            let py = (p.y - rect.min.y) as f64;
+                            let (mw, mh) = self.map_dims();
+                            let (la, lo) =
+                                unproject_mercator(px, py, self.center, self.zoom, mw, mh);
+                            self.try_place_picked(la, lo);
+                        }
+                        _ => {
+                            self.feed("drop cancelled: release over the map to place".to_string());
+                        }
+                    }
+                    self.drag_unit = None;
+                    self.drag_press = None;
                 }
                 // Seamless zoom (task #43 + pan-zoom ticket): plain wheel
                 // joins shift+wheel and pinch; the point under the cursor
@@ -4095,6 +4522,9 @@ fn apply_ops_theme(ctx: &egui::Context) {
 const MAP_INK: egui::Color32 = egui::Color32::from_rgb(0xE2, 0xE8, 0xF0);
 
 fn main() -> eframe::Result<()> {
+    // Endpoints live in `.env` (setup-overhaul pass), never in UI
+    // fields: load first so every env read below sees the file.
+    ShipApp::load_dotenv();
     // Poll thread owns the backend source; the UI owns the registry.
     // TFG_BACKEND_URL=http://host:port selects HTTP, else file replay.
     // The sim joins every round via MergeSource (disarmed = wire only).
@@ -4303,6 +4733,12 @@ fn main() -> eframe::Result<()> {
                 fleet_class: None,
                 fleet_query: String::new(),
                 fleet_pick: None,
+                drill_branch: None,
+                drill_category: None,
+                drill_type: None,
+                drill_class: None,
+                drag_press: None,
+                drag_unit: None,
                 placed_fleet: HashSet::new(),
                 placed_labels: HashMap::new(),
                 time_real_start: (Utc::now() + chrono::Duration::hours(7)).format("%Y-%m-%d %H:%M").to_string(),
@@ -4347,18 +4783,6 @@ fn main() -> eframe::Result<()> {
                 last_track_req: Instant::now(),
                 zoom_dirty: false,
                 app_mode: AppMode::Simulation,
-                // Mirrors the poll thread's boot-wire choice above (task
-                // #39): status text only, the thread owns the source.
-                backend_url: std::env::var("TFG_BACKEND_URL")
-                    .unwrap_or("http://127.0.0.1:3000".to_string()),
-                wire_desc: match std::env::var("TFG_BACKEND_URL") {
-                    Ok(url) => format!("HTTP {url}"),
-                    Err(_) => match std::env::var("TFG_SCENARIO") {
-                        Ok(name) => format!("replay scenarios/{name}.json"),
-                        Err(_) => "replay scenarios/empty.json".to_string(),
-                    },
-                },
-                conn_status: "boot source (env)".to_string(),
                 show_connection: false,
                 // Boot is the lobby (task #40): the mode toggle plus the
                 // Simulation start wizard. Everything working opens later.
