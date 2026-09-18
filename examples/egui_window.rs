@@ -65,7 +65,7 @@ const WIZARD_MIN_WIDTH: f32 = 460.0;
 /// this width instead of squeezing the columns.
 const FLEET_MIN_WIDTH: f32 = 760.0;
 const MILLER_COL_WIDTH: f32 = 176.0;
-const MILLER_COL_HEIGHT: f32 = 220.0;
+const MILLER_COL_HEIGHT: f32 = 170.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Session stub pace (session flow): 7 real hours play 7 game days.
 /// Full windows UI lands with the organizer flow; the ratio is the load-
@@ -252,6 +252,50 @@ fn drill_label(o: &tfg::store::TaxRow) -> String {
     } else {
         format!("{} · {} ({})", o.id_name, o.name, o.count)
     }
+}
+
+/// Fifth miller column (dnd ticket): hulls of the picked class beside
+/// the taxonomy. Row tap picks for click-placement, drag starts a map
+/// drop; placed hulls show a check and stay out of the way.
+fn units_col(
+    ui: &mut egui::Ui,
+    leaf: &[PickerRow],
+    placed: &std::collections::HashSet<String>,
+    pick: &mut Option<String>,
+    drag: &mut Option<(String, String)>,
+) {
+    ui.vertical(|ui| {
+        ui.set_min_width(MILLER_COL_WIDTH);
+        ui.set_max_width(MILLER_COL_WIDTH);
+        ui.strong(format!("Units ({})", leaf.len()));
+        egui::ScrollArea::vertical()
+            .id_salt("drill-units")
+            .auto_shrink([false, false])
+            .max_height(MILLER_COL_HEIGHT)
+            .show(ui, |ui| {
+                ui.set_min_width(MILLER_COL_WIDTH - 16.0);
+                if leaf.is_empty() {
+                    ui.weak("None yet");
+                } else {
+                    for u in leaf {
+                        if placed.contains(&u.id) {
+                            ui.label(format!("✓ {} ({})", u.name, u.hull));
+                        } else {
+                            let resp = ui.selectable_value(
+                                pick,
+                                Some(u.id.clone()),
+                                format!("{} ({})", u.name, u.hull),
+                            );
+                            if resp.drag_started() {
+                                *drag = Some((u.id.clone(), u.name.clone()));
+                                eprintln!("drag {}", u.name);
+                            }
+                        }
+                    }
+                }
+            });
+    });
+    ui.separator();
 }
 
 /// One pickable hull row, from either picker source (cutover ticket):
@@ -464,6 +508,9 @@ struct ShipApp {
     drill_category: Option<i64>,
     drill_type: Option<i64>,
     drill_class: Option<i64>,
+    /// Active fleet-row drag (setup-overhaul dnd): hull id + name from
+    /// drag_started until release (drop places) or cancel.
+    drag_unit: Option<(String, String)>,
     placed_fleet: HashSet<String>,
     /// Labels captured at placement (both picker sources), so register
     /// hulls keep their name + hull after the picker moves on.
@@ -1386,6 +1433,52 @@ impl ShipApp {
         let row = tfg::store::fleet_unit(conn, id).ok()??;
         let class = self.catalog.find_class_by_name(&row.class_name).map(|c| c.id.clone());
         Some((row.name, row.hull, class))
+    }
+
+    /// Shared place core (click + drag-and-drop): the click path's
+    /// guards, then TakeControl for a picked, unplaced hull with stats.
+    /// Returns the placed id, if any.
+    fn try_place_picked(&mut self, la: f64, lo: f64) -> Option<String> {
+        if !(self.mode.phase == Phase::Setup || self.mode.phase == Phase::Live) {
+            return None;
+        }
+        if !self.mode.armed.load(Ordering::SeqCst) {
+            self.feed("place refused: engine disarmed".to_string());
+            return None;
+        }
+        if self.acting_as.is_some() {
+            return None;
+        }
+        let pid = self.fleet_pick.clone()?;
+        let (name, hull, class_id) = self.placement_seed(&pid)?;
+        if self.placed_fleet.contains(&pid) {
+            return None;
+        }
+        match class_id {
+            Some(class_id) => {
+                let id = pid.clone();
+                if let Some(tx) = &self.sim_cmd_tx {
+                    let _ = tx.send(SimCommand::TakeControl {
+                        ship_id: id.clone(),
+                        pos: GeoPosition { latitude: la, longitude: lo },
+                        class_id: class_id.clone(),
+                    });
+                }
+                // Placed units arrive owned (Q3): the gesture is the
+                // take-control, no second step.
+                self.controlled.insert(id.clone());
+                self.select_ship(id.clone());
+                self.placed_labels.insert(id.clone(), (name.clone(), hull.clone()));
+                self.placed_fleet.insert(id);
+                self.fleet_pick = None;
+                self.feed(format!("placed {name} ({hull}) at ({la:.4}, {lo:.4})"));
+                Some(pid)
+            }
+            None => {
+                self.feed(format!("place refused: no sim stats for {name}"));
+                None
+            }
+        }
     }
 
     /// Seat labels for one roster user: helm, unit command, group command.
@@ -2462,6 +2555,12 @@ impl ShipApp {
         const CAT_LABELS: [&str; 5] = ["All", "Ship", "Plane", "Tank", "Port"];
         ui.heading("Fleet picker");
         ui.label("Organizer: filter, pick one hull, place it on the map by hand.");
+        // Drag state (dnd ticket): grabbing cursor plus the drop hint
+        // while a hull is mid-drag; release outside the map cancels.
+        if let Some((_, name)) = &self.drag_unit {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            ui.label(format!("moving {name} — release over the map to place"));
+        }
         // Source switch (cutover ticket): the synced register wins, the
         // bundled assets seed. Minos categories don't map to the Category
         // enum, so the category filter is asset-only; fleet_class holds a
@@ -2486,8 +2585,8 @@ impl ShipApp {
             .and_then(|c| tfg::store::has_taxonomy(c).ok())
             .unwrap_or(false);
         if has_tax {
-            let rows = self.drill_rows_ui(ui);
-            self.picker_tail(ui, &rows);
+            let (rows, show_list) = self.drill_rows_ui(ui);
+            self.picker_tail(ui, &rows, show_list);
             return;
         }
         // Collect options first: the combos mutate self while the
@@ -2622,13 +2721,15 @@ impl ShipApp {
                 })
                 .collect()
         };
-        self.picker_tail(ui, &rows);
+        self.picker_tail(ui, &rows, true);
     }
 
     /// Drill picker (setup-overhaul prototype): branch > category >
     /// type > class columns from the sqlite mirror, whole-tree search
-    /// with breadcrumb jump, leaf units as shared picker rows.
-    fn drill_rows_ui(&mut self, ui: &mut egui::Ui) -> Vec<PickerRow> {
+    /// with breadcrumb jump, leaf units as shared picker rows plus a
+    /// fifth Units column. Returns the rows with whether the tail
+    /// renders its own list (search mode) or the column does.
+    fn drill_rows_ui(&mut self, ui: &mut egui::Ui) -> (Vec<PickerRow>, bool) {
         ui.horizontal(|ui| {
             ui.label("search all hulls:");
             ui.text_edit_singleline(&mut self.fleet_query);
@@ -2664,7 +2765,7 @@ impl ShipApp {
                     }
                 }
             }
-            return out;
+            return (out, true);
         }
         // Selections first (Copy): option fetches borrow the store,
         // the column UI mutates drill state — never both live (E0502).
@@ -2737,6 +2838,27 @@ impl ShipApp {
         if self.drill_type != t {
             self.drill_class = None;
         }
+        // Leaf hulls first (dnd ticket): the fifth column renders them
+        // beside the taxonomy when a class is picked.
+        let mut out = Vec::new();
+        if let (Some(conn), Some(class_id)) = (self.store.as_ref(), self.drill_class) {
+            if let Ok(units) = tfg::store::tax_units(conn, class_id) {
+                for u in units {
+                    let stat_class = self
+                        .catalog
+                        .find_class_by_name(&u.class_name)
+                        .map(|cc| cc.id.clone());
+                    out.push(PickerRow {
+                        id: u.id,
+                        name: u.name,
+                        hull: u.hull,
+                        class_name: u.class_name,
+                        stat_class,
+                        trail: String::new(),
+                    });
+                }
+            }
+        }
         egui::ScrollArea::horizontal()
             .id_salt("drill-miller")
             .auto_shrink([false, false])
@@ -2804,57 +2926,68 @@ impl ShipApp {
                         });
                         ui.separator();
                     }
+                    // Fifth column (dnd ticket): hulls of the picked class
+                    // sit beside the taxonomy instead of below it. Row tap
+                    // picks for click-placement; drag starts a map drop.
+                    if self.drill_class.is_some() {
+                        units_col(
+                            ui,
+                            &out,
+                            &self.placed_fleet,
+                            &mut self.fleet_pick,
+                            &mut self.drag_unit,
+                        );
+                    }
                 });
             });
-        let mut out = Vec::new();
-        if let (Some(conn), Some(class_id)) = (self.store.as_ref(), self.drill_class) {
-            if let Ok(units) = tfg::store::tax_units(conn, class_id) {
-                for u in units {
-                    let stat_class = self
-                        .catalog
-                        .find_class_by_name(&u.class_name)
-                        .map(|cc| cc.id.clone());
-                    out.push(PickerRow {
-                        id: u.id,
-                        name: u.name,
-                        hull: u.hull,
-                        class_name: u.class_name,
-                        stat_class,
-                        trail: String::new(),
-                    });
-                }
-            }
+        // Column mode (a class is picked): hulls live in the fifth
+        // column, so the tail skips its own list but keeps the count
+        // and the placement block.
+        let column_mode = self.drill_class.is_some();
+        if !column_mode {
+            ui.label("Select a class to list its hulls.");
         }
-        out
+        (out, !column_mode)
     }
 
     /// Shared picker tail (setup-overhaul prototype): row list plus the
-    /// placement block, identical for flat and drill sources.
-    fn picker_tail(&mut self, ui: &mut egui::Ui, rows: &[PickerRow]) {
+    /// placement block, identical for flat and drill sources. Drill
+    /// column mode hides the list (the fifth column shows the hulls)
+    /// but keeps the count and placement.
+    fn picker_tail(&mut self, ui: &mut egui::Ui, rows: &[PickerRow], show_list: bool) {
         ui.label(format!(
             "{} shown · {} placed",
             rows.len(),
             self.placed_fleet.len()
         ));
-        // Salted: the drill level list above is a second ScrollArea on
-        // the same screen, and bare pairs share the auto ID.
-        egui::ScrollArea::vertical().id_salt("picker-rows").max_height(300.0).show(ui, |ui| {
-            for u in rows {
-                if self.placed_fleet.contains(&u.id) {
-                    ui.label(format!("✓ {} ({}) — placed", u.name, u.hull));
-                } else {
-                    ui.selectable_value(
-                        &mut self.fleet_pick,
-                        Some(u.id.clone()),
-                        if u.trail.is_empty() {
-                            format!("{} ({}) · {}", u.name, u.hull, u.class_name)
-                        } else {
-                            format!("{} ({}) · {} — {}", u.name, u.hull, u.class_name, u.trail)
-                        },
-                    );
+        // Salted: the drill level lists above share the screen, and bare
+        // pairs take the same auto ID.
+        if show_list {
+            egui::ScrollArea::vertical().id_salt("picker-rows").max_height(200.0).show(ui, |ui| {
+                for u in rows {
+                    if self.placed_fleet.contains(&u.id) {
+                        ui.label(format!("✓ {} ({}) — placed", u.name, u.hull));
+                    } else {
+                        let resp = ui.selectable_value(
+                            &mut self.fleet_pick,
+                            Some(u.id.clone()),
+                            if u.trail.is_empty() {
+                                format!("{} ({}) · {}", u.name, u.hull, u.class_name)
+                            } else {
+                                format!(
+                                    "{} ({}) · {} — {}",
+                                    u.name, u.hull, u.class_name, u.trail
+                                )
+                            },
+                        );
+                        if resp.drag_started() {
+                            self.drag_unit = Some((u.id.clone(), u.name.clone()));
+                            eprintln!("drag {}", u.name);
+                        }
+                    }
                 }
-            }
-        });
+            });
+        }
         let pick_placed = self.fleet_pick.as_ref().map_or(false, |id| self.placed_fleet.contains(id));
         // The sim is not polled while disarmed, so a TakeControl sent
         // with the engine off would sit in the queue invisibly. Gate
@@ -3355,7 +3488,7 @@ impl eframe::App for ShipApp {
         }
         if self.show_fleet && self.mode.phase != Phase::Closed {
             let mut open = self.show_fleet;
-            egui::Window::new("Fleet").movable(true).resizable(true).default_pos(egui::pos2(8.0, 300.0)).default_size([FLEET_MIN_WIDTH, 540.0]).min_width(FLEET_MIN_WIDTH).min_height(360.0).open(&mut open).show(ui.ctx(), |ui| {
+            egui::Window::new("Fleet").movable(true).resizable(true).default_pos(egui::pos2(8.0, 300.0)).default_size([900.0, 520.0]).min_width(FLEET_MIN_WIDTH).min_height(320.0).open(&mut open).show(ui.ctx(), |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
                 self.fleet_island(ui);
                 });
@@ -4029,35 +4162,7 @@ impl eframe::App for ShipApp {
                             // Fleet picker: only a picked, unplaced hull
                             // stands up, with sim stats resolved. No generic
                             // or automatic placement.
-                            if let Some(pid) = self.fleet_pick.clone() {
-                                if let Some((name, hull, class_id)) = self.placement_seed(&pid) {
-                                    if !self.placed_fleet.contains(&pid) {
-                                        match class_id {
-                                            Some(class_id) => {
-                                                let id = pid.clone();
-                                                if let Some(tx) = &self.sim_cmd_tx {
-                                                    let _ = tx.send(SimCommand::TakeControl {
-                                                        ship_id: id.clone(),
-                                                        pos: GeoPosition { latitude: la, longitude: lo },
-                                                        class_id: class_id.clone(),
-                                                    });
-                                                    eprintln!("placed {name} ({hull}) at ({la:.4}, {lo:.4})");
-                                                }
-                                                // Placed units arrive owned (Q3): the click is
-                                                // the take-control, no second step.
-                                                self.controlled.insert(id.clone());
-                                                self.select_ship(id.clone());
-                                                self.placed_labels.insert(id.clone(), (name, hull));
-                                                self.placed_fleet.insert(id);
-                                                self.fleet_pick = None;
-                                            }
-                                            None => {
-                                                eprintln!("place refused: no sim stats for {name}");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            self.try_place_picked(la, lo);
                             self.mode.tool = SetupTool::Select;
                         } else if self.placing {
                             let (la, lo) = unproject_mercator(
@@ -4104,6 +4209,27 @@ impl eframe::App for ShipApp {
                             }
                         }
                     }
+                }
+                // Drag-and-drop placement (setup-overhaul): a fleet-row
+                // drag released over the map places through the shared
+                // core. The press began outside the map, so the click and
+                // pan gestures above never fire for it — no conflict.
+                if self.drag_unit.is_some() && ui.ctx().input(|i| i.pointer.any_released()) {
+                    let drop = ui.ctx().input(|i| i.pointer.interact_pos());
+                    match drop {
+                        Some(p) if rect.contains(p) => {
+                            let px = (p.x - rect.min.x) as f64;
+                            let py = (p.y - rect.min.y) as f64;
+                            let (mw, mh) = self.map_dims();
+                            let (la, lo) =
+                                unproject_mercator(px, py, self.center, self.zoom, mw, mh);
+                            self.try_place_picked(la, lo);
+                        }
+                        _ => {
+                            self.feed("drop cancelled: release over the map to place".to_string());
+                        }
+                    }
+                    self.drag_unit = None;
                 }
                 // Seamless zoom (task #43 + pan-zoom ticket): plain wheel
                 // joins shift+wheel and pinch; the point under the cursor
@@ -4579,6 +4705,7 @@ fn main() -> eframe::Result<()> {
                 drill_category: None,
                 drill_type: None,
                 drill_class: None,
+                drag_unit: None,
                 placed_fleet: HashSet::new(),
                 placed_labels: HashMap::new(),
                 time_real_start: (Utc::now() + chrono::Duration::hours(7)).format("%Y-%m-%d %H:%M").to_string(),
