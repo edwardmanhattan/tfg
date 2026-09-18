@@ -2672,13 +2672,14 @@ impl ShipApp {
                             .catalog
                             .find_class_by_name(&h.class_name)
                             .map(|c| c.id.clone());
+                        let trail = h.trail();
                         out.push(PickerRow {
                             id: h.id,
                             name: h.name,
                             hull: h.hull,
                             class_name: h.class_name,
                             stat_class,
-                            trail: h.trail(),
+                            trail,
                         });
                     }
                 }
@@ -2753,7 +2754,7 @@ impl ShipApp {
             self.placed_fleet.len()
         ));
         egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-            for u in &rows {
+            for u in rows {
                 if self.placed_fleet.contains(&u.id) {
                     ui.label(format!("✓ {} ({}) — placed", u.name, u.hull));
                 } else {
