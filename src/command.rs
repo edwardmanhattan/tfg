@@ -7,16 +7,30 @@
 
 use crate::geo::coordinates::GeoPosition;
 
-/// Command authority rank: Unit < Satgas < Gugus < Organizer.
+/// Command authority rank, derived from the commanding scope's level:
+/// unit-direct command is 0, group levels carry their [`GroupKind`] rank
+/// (Unsur 10 < Satuan Tugas 20 < Gugus 30 < Operasi Gabungan 40, with
+/// gaps for middle insertion), the organizer tops all.
 /// Higher wins; equal re-applies; lower is refused loudly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Authority(u8);
 
 impl Authority {
     pub const UNIT: Self = Self(0);
-    pub const SATGAS: Self = Self(1);
-    pub const GUGUS: Self = Self(2);
-    pub const ORGANIZER: Self = Self(3);
+    pub const UNSUR: Self = Self(10);
+    /// `Satgas` survives only as an alias: the glossary canonicalizes
+    /// Satuan Tugas.
+    pub const SATGAS: Self = Self(20);
+    pub const GUGUS: Self = Self(30);
+    pub const OPERASI_GABUNGAN: Self = Self(40);
+    pub const ORGANIZER: Self = Self(u8::MAX);
+
+    /// Authority from a group rank (see [`GroupKind::rank`]).
+    ///
+    /// [`GroupKind::rank`]: crate::groups::GroupKind::rank
+    pub const fn from_rank(rank: u8) -> Self {
+        Self(rank)
+    }
 
     pub fn rank(self) -> u8 {
         self.0
@@ -139,9 +153,12 @@ mod tests {
 
     #[test]
     fn authority_orders_by_jurisdiction() {
-        assert!(Authority::UNIT < Authority::SATGAS);
+        assert!(Authority::UNIT < Authority::UNSUR);
+        assert!(Authority::UNSUR < Authority::SATGAS);
         assert!(Authority::SATGAS < Authority::GUGUS);
-        assert!(Authority::GUGUS < Authority::ORGANIZER);
+        assert!(Authority::GUGUS < Authority::OPERASI_GABUNGAN);
+        assert!(Authority::OPERASI_GABUNGAN < Authority::ORGANIZER);
+        assert_eq!(Authority::from_rank(crate::groups::GroupKind::Gugus.rank()), Authority::GUGUS);
     }
 
     #[test]

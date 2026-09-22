@@ -1,254 +1,67 @@
-//! Session groups (slice iii, task #33): Satgas of units, Gugus of Satgas.
+//! Session groups (map #70, spec #76): one unified group model.
 //!
-//! Organizer-built in Setup with roster commanders; one player may command
-//! several scopes. Jurisdiction: a commander's units are their directly
-//! commanded units plus every unit under their commanded Satgas/Gugus.
-//! The local operator is the organizer and commands all (authority sent
-//! on commands stays [`Authority::ORGANIZER`]); this model answers who
-//! else may command what (scoping in slice iv, zones here).
+//! A [`Group`] is id/name/commander plus `units` and `children` members;
+//! [`GroupKind`] fixes the level (Unsur < Satuan Tugas < Gugus < Operasi
+//! Gabungan) as an explicit gapped rank, so middle insertion never
+//! renumbers. Per-responsibility submodules below; the parent keeps the
+//! [`Groups`] facade, the re-exports, and the tests.
+//!
+//! - [`model`]: [`Group`], [`GroupKind`], ranks.
+//! - [`hierarchy`]: build/remove/query the forest, fail-loud validation.
+//! - [`authority`]: rank-derived jurisdiction and authority.
+//! - [`scopes`]: desktop [`Scope`]s with `kind:id` ids.
 
-use std::collections::{HashMap, HashSet};
+mod authority;
+mod hierarchy;
+mod model;
+mod scopes;
 
-use crate::command::Authority;
+pub use model::{Group, GroupKind};
+pub use scopes::Scope;
 
-/// A group of units under one commander.
-#[derive(Debug, Clone)]
-pub struct Satgas {
-    pub id: String,
-    pub name: String,
-    pub units: Vec<String>,
-    pub commander: Option<String>,
-}
-
-/// A group of Satgas under one commander.
-#[derive(Debug, Clone)]
-pub struct Gugus {
-    pub id: String,
-    pub name: String,
-    pub satgas: Vec<String>,
-    pub commander: Option<String>,
-}
-
-/// The session's group hierarchy.
+/// The session's group forest.
 #[derive(Debug, Clone, Default)]
 pub struct Groups {
-    satgas: Vec<Satgas>,
-    gugus: Vec<Gugus>,
-}
-
-impl Groups {
-    /// Add a Satgas. Fails loud: blank/dup name or id, or a unit already
-    /// mustered in another Satgas (jurisdiction stays unambiguous).
-    pub fn add_satgas(
-        &mut self,
-        id: String,
-        name: String,
-        units: Vec<String>,
-        commander: Option<String>,
-    ) -> Result<(), String> {
-        if name.trim().is_empty() {
-            return Err("satgas needs a name".into());
-        }
-        if self.satgas.iter().any(|s| s.id == id) {
-            return Err(format!("duplicate satgas id `{id}`"));
-        }
-        if self.satgas.iter().any(|s| s.name == name) {
-            return Err(format!("duplicate satgas name `{name}`"));
-        }
-        for u in &units {
-            if let Some(owner) = self.satgas.iter().find(|s| s.units.iter().any(|m| m == u)) {
-                return Err(format!("unit `{u}` already in satgas `{}`", owner.name));
-            }
-        }
-        self.satgas.push(Satgas { id, name, units, commander });
-        Ok(())
-    }
-
-    /// Remove a Satgas; Gugus references to it are stripped with it.
-    pub fn remove_satgas(&mut self, id: &str) {
-        self.satgas.retain(|s| s.id != id);
-        for g in &mut self.gugus {
-            g.satgas.retain(|s| s != id);
-        }
-    }
-
-    /// Add a Gugus over existing Satgas. Fails loud: blank/dup name or
-    /// id, or a referenced Satgas that does not exist.
-    pub fn add_gugus(
-        &mut self,
-        id: String,
-        name: String,
-        satgas: Vec<String>,
-        commander: Option<String>,
-    ) -> Result<(), String> {
-        if name.trim().is_empty() {
-            return Err("gugus needs a name".into());
-        }
-        if self.gugus.iter().any(|g| g.id == id) {
-            return Err(format!("duplicate gugus id `{id}`"));
-        }
-        if self.gugus.iter().any(|g| g.name == name) {
-            return Err(format!("duplicate gugus name `{name}`"));
-        }
-        for s in &satgas {
-            if !self.satgas.iter().any(|x| &x.id == s) {
-                return Err(format!("unknown satgas `{s}`"));
-            }
-        }
-        self.gugus.push(Gugus { id, name, satgas, commander });
-        Ok(())
-    }
-
-    /// Remove a Gugus.
-    pub fn remove_gugus(&mut self, id: &str) {
-        self.gugus.retain(|g| g.id != id);
-    }
-
-    pub fn satgas_list(&self) -> &[Satgas] {
-        &self.satgas
-    }
-
-    pub fn gugus_list(&self) -> &[Gugus] {
-        &self.gugus
-    }
-
-    /// The Satgas mustering a unit, if any.
-    pub fn satgas_of_unit(&self, unit: &str) -> Option<&Satgas> {
-        self.satgas.iter().find(|s| s.units.iter().any(|u| u == unit))
-    }
-
-    /// Member units of one Satgas.
-    pub fn satgas_units(&self, id: &str) -> Vec<String> {
-        self.satgas
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.units.clone())
-            .unwrap_or_default()
-    }
-
-    /// All units under a Gugus, descended through its Satgas.
-    pub fn gugus_units(&self, id: &str) -> Vec<String> {
-        self.gugus
-            .iter()
-            .find(|g| g.id == id)
-            .map(|g| g.satgas.iter().flat_map(|s| self.satgas_units(s)).collect())
-            .unwrap_or_default()
-    }
-
-    /// Every unit under a user's command: directly commanded units plus
-    /// all units under their commanded Satgas/Gugus (grill #19 fan-out
-    /// scope; `unit_commander` is the slice-ii seat draft map).
-    pub fn commanded_units(
-        &self,
-        user: &str,
-        unit_commander: &HashMap<String, String>,
-    ) -> HashSet<String> {
-        let mut out: HashSet<String> = unit_commander
-            .iter()
-            .filter(|(_, c)| c.as_str() == user)
-            .map(|(u, _)| u.clone())
-            .collect();
-        for s in &self.satgas {
-            if s.commander.as_deref() == Some(user) {
-                out.extend(s.units.iter().cloned());
-            }
-        }
-        for g in &self.gugus {
-            if g.commander.as_deref() == Some(user) {
-                out.extend(self.gugus_units(&g.id));
-            }
-        }
-        out
-    }
-
-    /// A user's authority over a ship: the highest applicable level
-    /// (Gugus > Satgas > unit, grill #19). None when outside jurisdiction.
-    pub fn authority(
-        &self,
-        user: &str,
-        ship: &str,
-        unit_commander: &HashMap<String, String>,
-    ) -> Option<Authority> {
-        let mut level: Option<Authority> = None;
-        if unit_commander.get(ship).map(|c| c.as_str()) == Some(user) {
-            level = Some(Authority::UNIT);
-        }
-        if self.satgas_of_unit(ship).and_then(|s| s.commander.as_deref()) == Some(user) {
-            level = Some(Authority::SATGAS);
-        }
-        for g in &self.gugus {
-            if g.commander.as_deref() == Some(user) && self.gugus_units(&g.id).iter().any(|u| u == ship) {
-                level = Some(Authority::GUGUS);
-            }
-        }
-        level
-    }
-}
-
-/// One desktop scope (slice iv, grill #25): everything views all, actions
-/// gate on the scope's unit set.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Scope {
-    pub id: String,
-    pub label: String,
-    pub units: Vec<String>,
-}
-
-impl Groups {
-    /// A user's desktop scopes: directly commanded units (helm counts as
-    /// a unit scope), commanded Satgas, commanded Gugus. Empty for the
-    /// seat-less (observers get the merged view-only desktop instead).
-    pub fn scopes_for(
-        &self,
-        user: &str,
-        unit_commander: &HashMap<String, String>,
-        helm: &HashMap<String, String>,
-    ) -> Vec<Scope> {
-        let mut scopes: Vec<Scope> = Vec::new();
-        let mut unit_scoped: HashSet<String> = HashSet::new();
-        for (u, c) in unit_commander.iter().chain(helm.iter()) {
-            if c.as_str() == user && unit_scoped.insert(u.clone()) {
-                scopes.push(Scope { id: format!("unit:{u}"), label: u.clone(), units: vec![u.clone()] });
-            }
-        }
-        for s in &self.satgas {
-            if s.commander.as_deref() == Some(user) {
-                scopes.push(Scope {
-                    id: format!("satgas:{}", s.id),
-                    label: s.name.clone(),
-                    units: s.units.clone(),
-                });
-            }
-        }
-        for g in &self.gugus {
-            if g.commander.as_deref() == Some(user) {
-                scopes.push(Scope { id: format!("gugus:{}", g.id), label: g.name.clone(), units: self.gugus_units(&g.id) });
-            }
-        }
-        scopes
-    }
+    groups: Vec<Group>,
 }
 
 #[cfg(test)]
 mod scope_tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn scopes_cover_command_and_helm() {
         let mut g = Groups::default();
-        g.add_satgas("s1".into(), "Satgas A".into(), vec!["u1".into(), "u2".into()], Some("ani".into())).unwrap();
-        g.add_gugus("g1".into(), "Gugus X".into(), vec!["s1".into()], Some("caca".into())).unwrap();
+        g.add_group(
+            "s1".into(),
+            "Satgas A".into(),
+            GroupKind::SatuanTugas,
+            vec!["u1".into(), "u2".into()],
+            vec![],
+            Some("ani".into()),
+        )
+        .unwrap();
+        g.add_group(
+            "g1".into(),
+            "Gugus X".into(),
+            GroupKind::Gugus,
+            vec![],
+            vec!["s1".into()],
+            Some("caca".into()),
+        )
+        .unwrap();
         let mut seats = HashMap::new();
         seats.insert("u2".into(), "budi".into());
         let mut helm = HashMap::new();
         helm.insert("u3".into(), "budi".into());
         let scopes = g.scopes_for("ani", &seats, &helm);
         assert_eq!(scopes.len(), 1);
-        assert_eq!(scopes[0].id, "satgas:s1");
+        assert_eq!(scopes[0].id, "SatuanTugas:s1");
         assert_eq!(scopes[0].units, vec!["u1".to_string(), "u2".to_string()]);
         let scopes = g.scopes_for("caca", &seats, &helm);
         assert_eq!(scopes.len(), 1);
-        assert_eq!(scopes[0].id, "gugus:g1");
+        assert_eq!(scopes[0].id, "Gugus:g1");
         // budi commands u2 and helms u3: two unit scopes.
         let scopes = g.scopes_for("budi", &seats, &helm);
         assert_eq!(scopes.len(), 2);
@@ -260,21 +73,45 @@ mod scope_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::Authority;
+    use std::collections::HashMap;
 
     fn rig() -> (Groups, HashMap<String, String>) {
         let mut g = Groups::default();
-        g.add_satgas("s1".into(), "Satgas A".into(), vec!["u1".into(), "u2".into()], Some("ani".into()))
-            .unwrap();
-        g.add_satgas("s2".into(), "Satgas B".into(), vec!["u3".into()], Some("budi".into())).unwrap();
-        g.add_gugus("g1".into(), "Gugus X".into(), vec!["s1".into(), "s2".into()], Some("caca".into()))
-            .unwrap();
+        g.add_group(
+            "s1".into(),
+            "Satgas A".into(),
+            GroupKind::SatuanTugas,
+            vec!["u1".into(), "u2".into()],
+            vec![],
+            Some("ani".into()),
+        )
+        .unwrap();
+        g.add_group(
+            "s2".into(),
+            "Satgas B".into(),
+            GroupKind::SatuanTugas,
+            vec!["u3".into()],
+            vec![],
+            Some("budi".into()),
+        )
+        .unwrap();
+        g.add_group(
+            "g1".into(),
+            "Gugus X".into(),
+            GroupKind::Gugus,
+            vec![],
+            vec!["s1".into(), "s2".into()],
+            Some("caca".into()),
+        )
+        .unwrap();
         let mut seats = HashMap::new();
         seats.insert("u1".into(), "ani".into());
         (g, seats)
     }
 
     #[test]
-    fn jurisdiction_descends_through_gugus() {
+    fn jurisdiction_descends_through_children() {
         let (g, seats) = rig();
         let caca = g.commanded_units("caca", &seats);
         assert_eq!(caca, ["u1", "u2", "u3"].into_iter().map(String::from).collect());
@@ -284,36 +121,76 @@ mod tests {
     }
 
     #[test]
-    fn authority_takes_highest_level() {
+    fn authority_takes_highest_rank() {
         let (g, seats) = rig();
         assert_eq!(g.authority("caca", "u1", &seats), Some(Authority::GUGUS));
-        // ani commands u1 directly AND its satgas: satgas wins.
+        // ani commands u1 directly AND its group: the group rank wins.
         assert_eq!(g.authority("ani", "u1", &seats), Some(Authority::SATGAS));
         assert_eq!(g.authority("budi", "u3", &seats), Some(Authority::SATGAS));
         assert_eq!(g.authority("ani", "u3", &seats), None);
     }
 
     #[test]
-    fn unit_in_two_satgas_is_rejected() {
+    fn deeper_level_outranks_shallower() {
+        let (mut g, seats) = (Groups::default(), HashMap::new());
+        g.add_group("e1".into(), "Unsur 1".into(), GroupKind::Unsur, vec!["u1".into()], vec![], Some(
+            "ani".into(),
+        ))
+        .unwrap();
+        g.add_group(
+            "o1".into(),
+            "OpGab".into(),
+            GroupKind::OperasiGabungan,
+            vec![],
+            vec!["e1".into()],
+            Some("caca".into()),
+        )
+        .unwrap();
+        assert_eq!(g.authority("caca", "u1", &seats), Some(Authority::OPERASI_GABUNGAN));
+        assert_eq!(g.authority("ani", "u1", &seats), Some(Authority::UNSUR));
+    }
+
+    #[test]
+    fn middle_insertion_needs_no_renumber() {
+        assert!(GroupKind::Unsur.rank() < GroupKind::SatuanTugas.rank());
+        assert!(GroupKind::SatuanTugas.rank() < GroupKind::Gugus.rank());
+        assert!(GroupKind::Gugus.rank() < GroupKind::OperasiGabungan.rank());
+        // A Koarmada between Gugus(30) and OperasiGabungan(40) fits at 35.
+        assert!(GroupKind::Gugus.rank() < 35 && 35 < GroupKind::OperasiGabungan.rank());
+    }
+
+    #[test]
+    fn unit_in_two_groups_is_rejected() {
         let (mut g, _) = rig();
         let err = g
-            .add_satgas("s3".into(), "Satgas C".into(), vec!["u1".into()], None)
+            .add_group("s3".into(), "Satgas C".into(), GroupKind::SatuanTugas, vec!["u1".into()], vec![], None)
             .unwrap_err();
-        assert!(err.contains("already in satgas"), "{err}");
+        assert!(err.contains("already in group"), "{err}");
     }
 
     #[test]
-    fn gugus_over_unknown_satgas_is_rejected() {
+    fn group_over_unknown_child_is_rejected() {
         let (mut g, _) = rig();
-        let err = g.add_gugus("g2".into(), "Gugus Y".into(), vec!["nope".into()], None).unwrap_err();
-        assert!(err.contains("unknown satgas"), "{err}");
+        let err = g
+            .add_group("g2".into(), "Gugus Y".into(), GroupKind::Gugus, vec![], vec!["nope".into()], None)
+            .unwrap_err();
+        assert!(err.contains("unknown group"), "{err}");
     }
 
     #[test]
-    fn remove_satgas_strips_gugus_refs() {
+    fn child_at_or_above_own_rank_is_rejected() {
         let (mut g, _) = rig();
-        g.remove_satgas("s1");
-        assert!(g.satgas_of_unit("u1").is_none());
-        assert_eq!(g.gugus_units("g1"), vec!["u3".to_string()]);
+        let err = g
+            .add_group("x1".into(), "Sideways".into(), GroupKind::SatuanTugas, vec![], vec!["s1".into()], None)
+            .unwrap_err();
+        assert!(err.contains("rank violation"), "{err}");
+    }
+
+    #[test]
+    fn remove_group_strips_parent_refs() {
+        let (mut g, _) = rig();
+        g.remove_group("s1");
+        assert!(g.group_of_unit("u1").is_none());
+        assert_eq!(g.group_units("g1"), vec!["u3".to_string()]);
     }
 }

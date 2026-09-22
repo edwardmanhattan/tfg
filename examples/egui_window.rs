@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use chrono::{TimeZone, Utc};
-use tfg::backend::{FileReplay, HttpPoll, Invite, InviteClient, LiveCmd, LiveEvent, LiveWire, MinosAuth, MinosMaster, MinosRest, PollSource, TokenPair};
+use tfg::backend::{BackendError, FileReplay, HttpPoll, Invite, InviteClient, LiveCmd, LiveEvent, LiveWire, MinosAuth, MinosMaster, MinosRest, PollSource, TokenPair};
 use tfg::catalog::{Catalog, Category};
 use tfg::fleet::Fleet;
-use tfg::groups::Groups;
+use tfg::groups::{GroupKind, Groups};
 use tfg::command::{Authority, Grant, GrantDenial, Leg, MoveCommand, Verb};
 use tfg::geo::track::{Fix, FixSource, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
@@ -162,6 +162,7 @@ enum WireKind {
         cmd_tx: Sender<LiveCmd>,
         cmd_rx: Receiver<LiveCmd>,
         event_tx: Sender<LiveEvent>,
+        wake_tx: Sender<()>,
     },
     Empty,
 }
@@ -171,7 +172,7 @@ enum WireKind {
 struct EmptyWire;
 
 impl PollSource for EmptyWire {
-    fn poll(&mut self) -> Result<Vec<Fix>, String> {
+    fn poll(&mut self) -> Result<Vec<Fix>, BackendError> {
         Ok(Vec::new())
     }
 }
@@ -186,9 +187,9 @@ fn build_wire(kind: WireKind) -> Result<(Box<dyn PollSource>, String), String> {
         WireKind::Replay(path) => FileReplay::from_file(&path)
             .map(|r| (Box::new(r) as Box<dyn PollSource>, format!("replay {path}")))
             .map_err(|e| e),
-        WireKind::Live { ws_url, rest_base, token, cmd_tx, cmd_rx, event_tx } => {
+        WireKind::Live { ws_url, rest_base, token, cmd_tx, cmd_rx, event_tx, wake_tx } => {
             let rest = MinosRest::new(&rest_base).map_err(|e| e)?;
-            match LiveWire::connect(&ws_url, &rest, &token, cmd_tx, cmd_rx, event_tx) {
+            match LiveWire::connect(&ws_url, &rest, &token, cmd_tx, cmd_rx, event_tx, wake_tx) {
                 Ok(w) => Ok((Box::new(w) as Box<dyn PollSource>, format!("live {ws_url}"))),
                 Err(e) => Ok((
                     Box::new(EmptyWire) as Box<dyn PollSource>,
@@ -246,12 +247,72 @@ struct ShipMarker {
 
 /// One drill row label (setup-overhaul picker): id_name first (grill
 /// decision), English subtitle when it differs, next-level count.
+/// Truncated to one line so long taxonomy names never stretch the column.
 fn drill_label(o: &tfg::store::TaxRow) -> String {
+    const MAX: usize = 28;
+    let cut = |s: &str| {
+        let mut out: String = s.chars().take(MAX).collect();
+        if s.chars().count() > MAX {
+            out.push('…');
+        }
+        out
+    };
     if o.name.is_empty() || o.name == o.id_name {
-        format!("{} ({})", o.id_name, o.count)
+        format!("{} ({})", cut(&o.id_name), o.count)
     } else {
-        format!("{} · {} ({})", o.id_name, o.name, o.count)
+        format!("{} · {} ({})", cut(&o.id_name), cut(&o.name), o.count)
     }
+}
+
+/// Status ink (harden): success reads green, failure red, idle gray.
+/// Every `*_status` line goes through this so state is never gray-on-gray.
+fn status_ink(msg: &str) -> egui::Color32 {
+    let m = msg.to_lowercase();
+    if m.contains("fail")
+        || m.contains("refused")
+        || m.contains("error")
+        || m.contains("unreachable")
+        || m.starts_with("sync stopped")
+        || m.starts_with("socket error")
+    {
+        egui::Color32::from_rgb(0xF8, 0x71, 0x71)
+    } else if m.contains("signed in as")
+        || m.starts_with("synced")
+        || m.starts_with("connected")
+        || m.contains("refreshed")
+        || m.contains("issued")
+        || m.contains("redeemed")
+    {
+        egui::Color32::from_rgb(0x4A, 0xDE, 0x80)
+    } else {
+        egui::Color32::GRAY
+    }
+}
+
+/// One-line status readout with state ink. Long backend messages wrap
+/// instead of stretching the island.
+fn status_line(ui: &mut egui::Ui, msg: &str) {
+    ui.label(egui::RichText::new(msg).color(status_ink(msg)));
+}
+
+/// Warning line: names the problem; the adjacent control names the recovery.
+fn warn_line(ui: &mut egui::Ui, msg: String) {
+    ui.label(egui::RichText::new(format!("⚠ {msg}")).color(egui::Color32::YELLOW));
+}
+
+/// Player/group/unit names: trimmed, capped so translations and long
+/// designations never break island rows. Returns None when blank.
+fn clean_name(s: &str) -> Option<String> {
+    const MAX_NAME: usize = 40;
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let mut out: String = t.chars().take(MAX_NAME).collect();
+    if t.chars().count() > MAX_NAME {
+        out.push('…');
+    }
+    Some(out)
 }
 
 /// Fifth miller column (dnd ticket): hulls of the picked class beside
@@ -545,7 +606,7 @@ struct ShipApp {
     roster: Vec<String>,
     roster_input: String,
     /// Helm per placed unit (unit_id -> user). Commander seats for
-    /// Satgas/Gugus wait for groups (slice iii); unit commanders draft here.
+    /// Unit commanders draft here; groups wait for the groups island.
     helm: HashMap<String, String>,
     unit_commander: HashMap<String, String>,
     /// Invites (slice v): local records (source of truth) mirrored to the
@@ -593,6 +654,10 @@ struct ShipApp {
     /// wires themselves come from the environment, boot-owned).
     show_connection: bool,
     wire_ctl_tx: Option<Sender<WireKind>>,
+    /// Live-wire fast lane: the socket actor pings this per publication;
+    /// the poll thread cuts its sleep short. One channel for the app's
+    /// lifetime; each connect carries a clone to its actor.
+    wire_wake_tx: Sender<()>,
     /// Live socket handles (live-wire ticket): token push-down to the
     /// actor, event reports up. Set on connect-live, cleared on swap
     /// away; dropping the wire drops the actor (LiveWire::drop).
@@ -612,7 +677,8 @@ struct ShipApp {
     map_px: (u32, u32),
     map_view: (f64, f64),
     last_desired_px: (u32, u32),
-    /// Session groups (slice iii): Satgas/Gugus hierarchy + drafts.
+    /// Session groups: unified group forest (Satuan Tugas of units,
+    /// Gugus of groups) + drafts.
     groups: Groups,
     show_groups: bool,
     group_seq: usize,
@@ -669,6 +735,10 @@ impl ShipApp {
     /// Drain pending poll rounds, then derive marker geometry for this frame.
     fn markers(&mut self) -> Vec<ShipMarker> {
         let mut rounds = 0;
+        // The glide clock restarts only on genuinely new data (see below):
+        // the live wire replays the whole picture every tick, and duplicate
+        // rounds must not replay the animation.
+        let mut advanced = false;
         for fixes in self.poll_rx.try_iter() {
             rounds += 1;
             for f in &fixes {
@@ -692,6 +762,12 @@ impl ShipApp {
                 }
             }
             let acked = self.registry.poll(fixes);
+            // Accepted fixes move the glide clock; dropped duplicates and
+            // out-of-order arrivals leave it alone, so one move animates
+            // exactly once no matter how often the picture replays.
+            if !acked.is_empty() {
+                advanced = true;
+            }
             // Ingest acks (Log grill, #20): report stamped seqs back to
             // the sim AFTER ingest, so journal entries can cite fix seqs.
             if let Some(tx) = &self.sim_cmd_tx {
@@ -749,7 +825,7 @@ impl ShipApp {
                 SimEvent::CommandOverridden { ship_id, prev_rank, by_rank } => {
                     // Escalation, not a hijack: the command succeeded and
                     // took the ship to a higher authority (e.g. the
-                    // organizer's Satgas order lifting UNIT-held ships).
+                    // organizer's group order lifting UNIT-held ships).
                     // Loud in the feed + journal, but no sticky warning:
                     // warnings are for orders that did NOT happen.
                     self.feed(format!("authority {ship_id}: {prev_rank} -> {by_rank}"));
@@ -809,7 +885,6 @@ impl ShipApp {
             }
         }
         if rounds > 0 {
-            self.last_poll = Instant::now();
             let ships = self.registry.ships();
             eprintln!(
                 "poll: {} ship(s){}",
@@ -820,6 +895,12 @@ impl ShipApp {
                     .map(|s| format!(" [stale: {}]", s.ship_id))
                     .collect::<String>()
             );
+        }
+        // Glide clock: restarted above only when new fixes were accepted.
+        // Duplicate rounds leave it running, so frac parks at 1.0 and the
+        // marker rests instead of re-animating previous → latest.
+        if advanced {
+            self.last_poll = Instant::now();
         }
         let frac = (self.last_poll.elapsed().as_secs_f64() / POLL_SECS).clamp(0.0, 1.0);
         let center = self.center;
@@ -921,6 +1002,7 @@ impl ShipApp {
                         cmd_tx: cmd_tx.clone(),
                         cmd_rx,
                         event_tx,
+                        wake_tx: self.wire_wake_tx.clone(),
                     });
                     self.live_cmd_tx = Some(cmd_tx);
                     self.live_evt_rx = Some(event_rx);
@@ -1002,7 +1084,7 @@ impl ShipApp {
                         // copy refreshes on every entry.
                         self.sync_now();
                     }
-                    Err(e) if e.contains("403") => {
+                    Err(tfg::backend::BackendError::Forbidden { .. }) => {
                         self.auth_needs_password_change = true;
                         self.auth_status =
                             format!("signed in as {id} · must change password");
@@ -1158,8 +1240,11 @@ impl ShipApp {
     /// Session-users client (build ticket): env-owned endpoint plus the
     /// in-memory access token. Every call below is a blocking operator
     /// action with a loud status line — never a background poll.
-    fn users_client(&self) -> Result<(MinosMaster, String), String> {
-        let tok = self.auth_token.clone().ok_or_else(|| "sign in first".to_string())?;
+    fn users_client(&self) -> Result<(MinosMaster, String), tfg::backend::BackendError> {
+        let tok = self
+            .auth_token
+            .clone()
+            .ok_or_else(|| tfg::backend::BackendError::Other("sign in first".into()))?;
         let master = MinosMaster::new(&self.minos_base)?;
         Ok((master, tok))
     }
@@ -1322,7 +1407,7 @@ impl ShipApp {
                 self.users_refresh_game();
             }
         });
-        ui.label(&self.users_status);
+        status_line(ui, &self.users_status.clone());
         ui.separator();
         ui.strong("Directory");
         ui.horizontal(|ui| {
@@ -1470,6 +1555,13 @@ impl ShipApp {
                     ui.add(egui::TextEdit::singleline(&mut self.pw_new).password(true));
                 });
                 if ui.button("change and re-enter").clicked() {
+                    // Client-side length gate (harden): the backend enforces
+                    // 12+, so refuse locally with a specific message first.
+                    if self.pw_new.len() < 12 {
+                        self.auth_status =
+                            "change refused: new password needs 12+ characters".to_string();
+                        return;
+                    }
                     let base = self.minos_base.clone();
                     let tok = self.auth_token.clone().unwrap_or_default();
                     let cur = self.pw_current.clone();
@@ -1531,7 +1623,7 @@ impl ShipApp {
                 self.attempt_sign_in();
             }
         }
-        ui.label(&self.auth_status);
+        status_line(ui, &self.auth_status.clone());
         // Local-first sync (master-data ticket): whole-table replace
         // from the backend, server wins. Runs on sign-in; the button
         // re-runs it any time. Reads serve from disk either way.
@@ -1552,7 +1644,7 @@ impl ShipApp {
                 ui.label("sign in first");
             }
         });
-        ui.label(&self.sync_status);
+        status_line(ui, &self.sync_status.clone());
     }
 
     /// Display size in points: what overlays project against. The
@@ -1666,20 +1758,15 @@ impl ShipApp {
         self.selection = None;
     }
 
-    /// Group display name + member units for a Satgas or Gugus id.
+    /// Group display name + member units for any group id.
     fn group_info(&self, gid: &str) -> Option<(String, Vec<String>)> {
-        if let Some(s) = self.groups.satgas_list().iter().find(|s| s.id == gid) {
-            return Some((s.name.clone(), s.units.clone()));
-        }
-        if let Some(g) = self.groups.gugus_list().iter().find(|g| g.id == gid) {
-            return Some((g.name.clone(), self.groups.gugus_units(&g.id)));
-        }
-        None
+        let g = self.groups.group(gid)?;
+        Some((g.name.clone(), self.groups.group_units(&g.id)))
     }
 
     /// Authority the acting identity holds over these units: the
-    /// organizer commands all; others take their highest group level
-    /// over the set (Gugus > Satgas > unit), falling back to unit
+    /// organizer commands all; others take their highest covering rank
+    /// over the set (deeper outranks shallower), falling back to unit
     /// level where the desktop scope allows (helm). None = view-only.
     fn command_authority(&self, units: &[String]) -> Option<Authority> {
         let Some(user) = self.acting_as.as_ref() else {
@@ -1701,10 +1788,14 @@ impl ShipApp {
     fn authority_label(a: Authority) -> &'static str {
         if a == Authority::ORGANIZER {
             "organizer"
+        } else if a == Authority::OPERASI_GABUNGAN {
+            "operasi gabungan"
         } else if a == Authority::GUGUS {
             "gugus"
         } else if a == Authority::SATGAS {
             "satgas"
+        } else if a == Authority::UNSUR {
+            "unsur"
         } else {
             "unit"
         }
@@ -1795,12 +1886,7 @@ impl ShipApp {
                 out.push(format!("cmdr {}", self.unit_label(u)));
             }
         }
-        for s in self.groups.satgas_list() {
-            if s.commander.as_deref() == Some(user) {
-                out.push(format!("cmdr {}", s.name));
-            }
-        }
-        for g in self.groups.gugus_list() {
+        for g in self.groups.group_list() {
             if g.commander.as_deref() == Some(user) {
                 out.push(format!("cmdr {}", g.name));
             }
@@ -2133,13 +2219,25 @@ impl ShipApp {
                     }
                 }
                 entries.push(LogLine {
-                    text: format!(
-                        "{} {} {}: {}",
-                        v["game_ts"].as_str().unwrap_or("—"),
-                        actor,
-                        v["kind"].as_str().unwrap_or("?"),
-                        payload,
-                    ),
+                    // Concise row (harden): kind + actor + ship, never the
+                    // raw payload dump — long JSON stretched islands and
+                    // buried the signal. Full detail stays in the file.
+                    text: {
+                        let ship = ships.first().cloned().unwrap_or_default();
+                        let extra = if ships.len() > 1 {
+                            format!(" +{}", ships.len() - 1)
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "{} {} {}: {}{}",
+                            v["game_ts"].as_str().unwrap_or("—"),
+                            actor,
+                            v["kind"].as_str().unwrap_or("?"),
+                            ship,
+                            extra,
+                        )
+                    },
                     actor,
                     ships,
                 });
@@ -2321,18 +2419,22 @@ impl ShipApp {
                     if files.is_empty() {
                         ui.label("no past sessions yet");
                     }
-                    for f in files {
+                    // Cap the list (harden): journals accumulate per Start.
+                    for f in files.iter().take(20) {
                         let name = f
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("?")
                             .to_string();
                         if ui.small_button(&name).clicked() {
-                            self.log_events = Self::parse_replay(&f);
+                            self.log_events = Self::parse_replay(f);
                             self.replay_pos = self.log_events.len();
                             self.log_filter = "all".to_string();
-                            self.log_view_path = Some(f);
+                            self.log_view_path = Some(f.clone());
                         }
+                    }
+                    if files.len() > 20 {
+                        ui.weak(format!("…and {} older", files.len() - 20));
                     }
                 }
                 ui.separator();
@@ -2370,10 +2472,16 @@ impl ShipApp {
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut self.roster_input);
                     if ui.small_button("add").clicked() {
-                        let name = self.roster_input.trim().to_string();
-                        if !name.is_empty() && !self.roster.contains(&name) {
-                            self.roster.push(name);
-                            self.roster_input.clear();
+                        // Capped + trimmed (harden): duplicates refuse loudly.
+                        match clean_name(&self.roster_input) {
+                            Some(name) if !self.roster.contains(&name) => {
+                                self.roster.push(name);
+                                self.roster_input.clear();
+                            }
+                            Some(_) => {
+                                self.feed("roster refused: duplicate name".to_string());
+                            }
+                            None => {}
                         }
                     }
                 });
@@ -2401,6 +2509,9 @@ impl ShipApp {
                     })
                     .collect();
                 units.sort();
+                if units.is_empty() {
+                    ui.weak("No units placed yet — pick hulls in Fleet first.");
+                }
                 for (uid, label) in &units {
                     ui.horizontal(|ui| {
                         ui.label(label);
@@ -2506,7 +2617,7 @@ impl ShipApp {
                     if ui.small_button("refresh from mock").clicked() {
                         self.refresh_invites();
                     }
-                    ui.label(&self.invite_status);
+                    status_line(ui, &self.invite_status.clone());
                 });
                 ui.separator();
                 // Warn-not-block go-live (grill #23): gaps are listed,
@@ -2525,7 +2636,7 @@ impl ShipApp {
                     }
                 }
                 for w in &warnings {
-                    ui.label(egui::RichText::new(format!("⚠ {w}")).color(egui::Color32::YELLOW));
+                    warn_line(ui, w.clone());
                 }
                 ui.horizontal(|ui| {
                     if ui.small_button("open fleet picker").clicked() {
@@ -2578,28 +2689,33 @@ impl ShipApp {
     }
 
     /// Zone + flag geometry for this frame (slice iii, grill #24): live
-    /// hulls over member markers in the per-level palette, single-unit
+    /// hulls over member markers in the per-rank palette, single-unit
     /// circles, centroid flags carrying lat/lon. Empty groups draw nothing.
     fn group_geometry(&self, markers: &[ShipMarker]) -> (Vec<ZoneGeom>, Vec<FlagGeom>) {
-        // Gugus first so Satgas zones paint over them.
+        // Higher ranks first so lower-rank zones paint over them.
+        let mut ordered: Vec<_> = self.groups.group_list().iter().collect();
+        ordered.sort_by_key(|g| std::cmp::Reverse(g.kind.rank()));
         let mut work: Vec<(Vec<String>, String, String, egui::Color32, egui::Color32)> = Vec::new();
-        for g in self.groups.gugus_list() {
-            work.push((
-                self.groups.gugus_units(&g.id),
-                g.id.clone(),
-                g.name.clone(),
-                egui::Color32::from_rgba_unmultiplied(0x93, 0x33, 0xea, 70),
-                egui::Color32::from_rgb(0x93, 0x33, 0xea),
-            ));
-        }
-        for s in self.groups.satgas_list() {
-            work.push((
-                s.units.clone(),
-                s.id.clone(),
-                s.name.clone(),
-                egui::Color32::from_rgba_unmultiplied(0x25, 0x63, 0xeb, 70),
-                egui::Color32::from_rgb(0x25, 0x63, 0xeb),
-            ));
+        for g in ordered {
+            let (fill, stroke) = match g.kind {
+                GroupKind::Unsur => (
+                    egui::Color32::from_rgba_unmultiplied(0x16, 0xa3, 0x4a, 70),
+                    egui::Color32::from_rgb(0x16, 0xa3, 0x4a),
+                ),
+                GroupKind::SatuanTugas => (
+                    egui::Color32::from_rgba_unmultiplied(0x25, 0x63, 0xeb, 70),
+                    egui::Color32::from_rgb(0x25, 0x63, 0xeb),
+                ),
+                GroupKind::Gugus => (
+                    egui::Color32::from_rgba_unmultiplied(0x93, 0x33, 0xea, 70),
+                    egui::Color32::from_rgb(0x93, 0x33, 0xea),
+                ),
+                GroupKind::OperasiGabungan => (
+                    egui::Color32::from_rgba_unmultiplied(0xea, 0x58, 0x0c, 70),
+                    egui::Color32::from_rgb(0xea, 0x58, 0x0c),
+                ),
+            };
+            work.push((self.groups.group_units(&g.id), g.id.clone(), g.name.clone(), fill, stroke));
         }
         let mut zones = Vec::new();
         let mut flags = Vec::new();
@@ -2653,12 +2769,12 @@ impl ShipApp {
         (zones, flags)
     }
 
-    /// Groups island (slice iii): the organizer builds Satgas (units +
-    /// commander) and Gugus (satgas + commander) from the roster. Editing
+    /// Groups island: the organizer builds Satuan Tugas (units +
+    /// commander) and Gugus (groups + commander) from the roster. Editing
     /// runs in Setup and Live (reorganization mid-session); Closed is read-only.
     fn groups_island(&mut self, ui: &mut egui::Ui) {
         ui.heading("Groups");
-        ui.label("Satgas of units, Gugus of Satgas. Commanders from the roster.");
+        ui.label("Satuan Tugas of units, Gugus of groups. Commanders from the roster.");
         let editable =
             (self.mode.phase == Phase::Setup || self.mode.phase == Phase::Live) && self.acting_as.is_none();
         let roster: Vec<String> = self.roster.clone();
@@ -2695,7 +2811,7 @@ impl ShipApp {
                 .collect();
             placed.sort();
             for (uid, label) in &placed {
-                let owner = self.groups.satgas_of_unit(uid).map(|s| s.name.clone());
+                let owner = self.groups.group_of_unit(uid).map(|g| g.name.clone());
                 let mut member = self.satgas_members.contains(uid);
                 ui.horizontal(|ui| {
                     if ui.checkbox(&mut member, "").changed() {
@@ -2718,10 +2834,12 @@ impl ShipApp {
             if ui.small_button("create satgas").clicked() {
                 let id = format!("satgas-{}", self.group_seq);
                 let members: Vec<String> = self.satgas_members.iter().cloned().collect();
-                match self.groups.add_satgas(
+                match self.groups.add_group(
                     id.clone(),
                     self.satgas_name.trim().to_string(),
+                    GroupKind::SatuanTugas,
                     members,
+                    Vec::new(),
                     cmdr,
                 ) {
                     Ok(()) => {
@@ -2741,9 +2859,10 @@ impl ShipApp {
         }
         let satgas: Vec<(String, String, Option<String>, usize)> = self
             .groups
-            .satgas_list()
+            .group_list()
             .iter()
-            .map(|s| (s.id.clone(), s.name.clone(), s.commander.clone(), s.units.len()))
+            .filter(|g| g.kind == GroupKind::SatuanTugas)
+            .map(|g| (g.id.clone(), g.name.clone(), g.commander.clone(), g.units.len()))
             .collect();
         for (id, name, commander, n) in &satgas {
             ui.horizontal(|ui| {
@@ -2754,7 +2873,7 @@ impl ShipApp {
                     self.show_orders = true;
                 }
                 if editable && ui.small_button("remove").clicked() {
-                    self.groups.remove_satgas(id);
+                    self.groups.remove_group(id);
                 }
             });
         }
@@ -2797,9 +2916,11 @@ impl ShipApp {
             if ui.small_button("create gugus").clicked() {
                 let id = format!("gugus-{}", self.group_seq);
                 let members: Vec<String> = self.gugus_members.iter().cloned().collect();
-                match self.groups.add_gugus(
+                match self.groups.add_group(
                     id.clone(),
                     self.gugus_name.trim().to_string(),
+                    GroupKind::Gugus,
+                    Vec::new(),
                     members,
                     cmdr,
                 ) {
@@ -2820,9 +2941,10 @@ impl ShipApp {
         }
         let gugus: Vec<(String, String, Option<String>, usize)> = self
             .groups
-            .gugus_list()
+            .group_list()
             .iter()
-            .map(|g| (g.id.clone(), g.name.clone(), g.commander.clone(), self.groups.gugus_units(&g.id).len()))
+            .filter(|g| g.kind == GroupKind::Gugus)
+            .map(|g| (g.id.clone(), g.name.clone(), g.commander.clone(), self.groups.group_units(&g.id).len()))
             .collect();
         for (id, name, commander, n) in &gugus {
             ui.horizontal(|ui| {
@@ -2833,12 +2955,15 @@ impl ShipApp {
                     self.show_orders = true;
                 }
                 if editable && ui.small_button("remove").clicked() {
-                    self.groups.remove_gugus(id);
+                    self.groups.remove_group(id);
                 }
             });
         }
+        if self.groups.group_list().is_empty() {
+            ui.weak("No groups yet — name a Satgas, muster units, create.");
+        }
         if let Some(e) = self.group_error.clone() {
-            ui.label(egui::RichText::new(format!("⚠ {e}")).color(egui::Color32::YELLOW));
+            warn_line(ui, e);
         }
     }
 
@@ -3415,9 +3540,14 @@ impl ShipApp {
     }
 
     /// Log island: current warning plus the capped sim event feed.
+    /// Empty feed names the next action instead of showing a blank box.
     fn log_island(&mut self, ui: &mut egui::Ui) {
-        if let Some(w) = &self.order_warning {
-            ui.label(egui::RichText::new(format!("⚠ {w}")).color(egui::Color32::YELLOW));
+        if let Some(w) = self.order_warning.clone() {
+            warn_line(ui, w);
+        }
+        if self.event_feed.is_empty() {
+            ui.weak("No events yet — orders and arrivals land here.");
+            return;
         }
         egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
             for line in &self.event_feed {
@@ -3479,7 +3609,7 @@ impl ShipApp {
                 });
             }
             2 => {
-                ui.label("Fleet: in the Fleet island, drill branch → class or search all hulls, pick one, then click the map to place it.");
+                ui.label("Fleet: pick a hull in the Fleet island, then click the map to place it.");
                 ui.label(format!("placed: {} unit(s)", self.placed_fleet.len()));
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -3642,13 +3772,12 @@ impl eframe::App for ShipApp {
             // (task #39) — there is nobody to act as in Presentation.
             if self.app_mode == AppMode::Simulation {
             ui.horizontal(|ui| {
-                ui.label("act:");
                 let roster: Vec<String> = self.roster.clone();
                 let mut act_idx = match &self.acting_as {
                     None => 0,
                     Some(u) => roster.iter().position(|n| n == u).map(|i| i + 1).unwrap_or(0),
                 };
-                egui::ComboBox::from_label("identity")
+                egui::ComboBox::from_label("act")
                     .selected_text(self.acting_as.as_deref().unwrap_or("Organizer"))
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut act_idx, 0, "Organizer");
@@ -3752,6 +3881,9 @@ impl eframe::App for ShipApp {
             let mut open = self.show_roster;
             egui::Window::new("Roster").movable(true).default_pos(egui::pos2(816.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
             ui.label(format!("{} ships — click a name to follow", markers.len()));
+            if markers.is_empty() {
+                ui.weak("No ships in view — place hulls from Fleet, or check the feed.");
+            }
             ui.separator();
             // State machine: trails belong to Live (nothing moves in
             // Setup; Closed is frozen under its transcript).
@@ -3912,7 +4044,7 @@ impl eframe::App for ShipApp {
                 Some(Selection::Group(gid)) => {
                     match self.group_info(&gid) {
                         Some((name, members)) => {
-                            let commander = self.groups.satgas_list().iter().find(|s| s.id == gid).and_then(|s| s.commander.clone()).or_else(|| self.groups.gugus_list().iter().find(|g| g.id == gid).and_then(|g| g.commander.clone()));
+                            let commander = self.groups.group(&gid).and_then(|g| g.commander.clone());
                             let allowed: Vec<String> = members.iter().filter(|u| self.action_allows(u)).cloned().collect();
                             let auth = self.command_authority(&allowed).map(Self::authority_label).unwrap_or("view only");
                             ui.label(format!("group: {name} · {} unit(s)", members.len()));
@@ -3920,15 +4052,14 @@ impl eframe::App for ShipApp {
                                 "commander: {} · you hold: {auth}",
                                 commander.as_deref().unwrap_or("—")
                             ));
-                            // Gugus lists member Satgas, not a flat unit dump.
-                            let satgas_ids: Vec<String> = self
+                            // A group with children lists them (drillable),
+                            // not a flat unit dump.
+                            let child_ids: Vec<String> = self
                                 .groups
-                                .gugus_list()
-                                .iter()
-                                .find(|g| g.id == gid)
-                                .map(|g| g.satgas.clone())
+                                .group(&gid)
+                                .map(|g| g.children.clone())
                                 .unwrap_or_default();
-                            if satgas_ids.is_empty() {
+                            if child_ids.is_empty() {
                                 for u in &members {
                                     ui.horizontal(|ui| {
                                         ui.label(self.unit_label(u));
@@ -3938,15 +4069,15 @@ impl eframe::App for ShipApp {
                                     });
                                 }
                             } else {
-                                for sid in &satgas_ids {
-                                    if let Some(s) = self.groups.satgas_list().iter().find(|s| &s.id == sid) {
+                                for cid in &child_ids {
+                                    if let Some(c) = self.groups.group(cid) {
                                         ui.horizontal(|ui| {
-                                            ui.label(format!("{} · {} unit(s)", s.name, s.units.len()));
+                                            ui.label(format!("{} · {} unit(s)", c.name, self.groups.group_units(&c.id).len()));
                                             if ui.small_button("select").clicked() {
-                                                drill_group = Some(s.id.clone());
+                                                drill_group = Some(c.id.clone());
                                             }
                                         });
-                                        for u in &s.units {
+                                        for u in &c.units {
                                             ui.horizontal(|ui| {
                                                 ui.label(format!("  {}", self.unit_label(u)));
                                                 if ui.small_button("inspect").clicked() {
@@ -4069,10 +4200,7 @@ impl eframe::App for ShipApp {
                                             .unwrap_or(true)
                                     });
                                 if self.pending_waypoint.is_some() && !can_commit {
-                                    ui.label(
-                                        egui::RichText::new("⚠ waypoint on land")
-                                            .color(egui::Color32::YELLOW),
-                                    );
+                                    warn_line(ui, "waypoint on land — pick water".to_string());
                                 }
                                 if ui
                                     .add_enabled(
@@ -4196,13 +4324,10 @@ impl eframe::App for ShipApp {
                                 .unwrap_or(true)
                         });
                     if self.pending_waypoint.is_some() && !can_commit {
-                        ui.label(
-                            egui::RichText::new("⚠ waypoint on land")
-                                .color(egui::Color32::YELLOW),
-                        );
+                        warn_line(ui, "waypoint on land — pick water".to_string());
                     }
-                    if let Some(w) = &self.order_warning {
-                        ui.label(egui::RichText::new(format!("⚠ {w}")).color(egui::Color32::YELLOW));
+                    if let Some(w) = self.order_warning.clone() {
+                        warn_line(ui, w);
                     }
                     if ui.add_enabled(can_commit && allowed, egui::Button::new("order")).clicked() {
                         self.order_warning = None;
@@ -4578,10 +4703,7 @@ impl eframe::App for ShipApp {
                                     )),
                                 }
                             } else if let Some(group) = near_flag {
-                                let mut members = self.groups.satgas_units(&group);
-                                if members.is_empty() {
-                                    members = self.groups.gugus_units(&group);
-                                }
+                                let members = self.groups.group_units(&group);
                                 match self.users_client() {
                                     Ok((m, t)) => {
                                         let mut ok = 0;
@@ -4603,7 +4725,7 @@ impl eframe::App for ShipApp {
                                         ));
                                         self.users_refresh_game();
                                     }
-                                    Err(e) => self.users_status = e,
+                                    Err(e) => self.users_status = e.to_string(),
                                 }
                             } else {
                                 self.feed(
@@ -4920,6 +5042,10 @@ fn main() -> eframe::Result<()> {
     let poll_armed = sim_armed.clone();
     let (wire_ctl_tx, wire_ctl_rx) = mpsc::channel::<WireKind>();
     let ui_wire_ctl_tx = wire_ctl_tx.clone();
+    // Live-wire fast lane (see WireKind::Live): actor pings, poll thread
+    // wakes early. Receiver lives in the poll thread below.
+    let (wire_wake_tx, wire_wake_rx) = mpsc::channel::<()>();
+    let ui_wire_wake_tx = wire_wake_tx;
     let poll_handle = std::thread::spawn(move || {
         // Boot wire (task #39): env picks HTTP vs replay; the Connection
         // island can swap it later without restarting the sim.
@@ -4976,6 +5102,12 @@ fn main() -> eframe::Result<()> {
                 std::thread::sleep(Duration::from_millis(100));
                 if poll_shutdown.load(Ordering::SeqCst) {
                     return;
+                }
+                // Live-wire fast lane: a queued socket publication cuts the
+                // 2 s sleep short, so the marker moves in ~100 ms. The sim
+                // cadence is untouched — this only skips idle sleeping.
+                if wire_wake_rx.try_iter().count() > 0 {
+                    break;
                 }
             }
         }
@@ -5180,6 +5312,7 @@ fn main() -> eframe::Result<()> {
                 // Simulation start wizard. Everything working opens later.
                 show_session: true,
                 wire_ctl_tx: Some(ui_wire_ctl_tx),
+                wire_wake_tx: ui_wire_wake_tx,
                 live_cmd_tx: None,
                 live_evt_rx: None,
                 live_status: "idle".to_string(),

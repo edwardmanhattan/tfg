@@ -80,27 +80,43 @@ The set of units a commander may command: full orders inside it, view-only outsi
 _Avoid_: scope
 
 **Commander**:
-The role commanding a unit, a Satgas, or a Gugus. Higher jurisdictions override lower ones; the organizer commands all.
+The role commanding a unit or a group. Higher ranks override lower ones; the organizer commands all.
 _Avoid_: player (that's who holds the role, not the role)
 
 **Organizer**:
 The role that sets up a session: players, units with placements, groups with commanders, and the real and game time windows. Commands all units.
 _Avoid_: admin, host
 
-**Satgas**:
-A group of units under one commander.
+**Group**:
+One node of the session's task organisation: id, name, level, commander, mustered units and child groups. Every child sits at a strictly lower level than its parent.
+_Avoid_: team, party
+
+**GroupKind**:
+The level of a group, lowest first: Unsur, Satuan Tugas, Gugus, Operasi Gabungan. Carries an explicit gapped rank (never a position), so inserting a level in the middle never renumbers.
+_Avoid_: echelon (that's the Minos vocabulary term, see Minos docs), tier
+
+**Unsur**:
+The lowest group level: individual units under one commander.
+_Avoid_: element, squad
+
+**Satuan Tugas**:
+A group of units and/or Unsur groups under one commander. `Satgas` is the accepted local alias.
 _Avoid_: squadron, fleet
 
 **Gugus**:
-A group of Satgas under one commander.
+A group of lower groups under one commander.
 _Avoid_: flotilla
+
+**Operasi Gabungan**:
+The highest group level: the whole task organisation under one commander.
+_Avoid_: joint operation (that's the exercise, not the group)
 
 **Session**:
 One organized play instance: time windows, players, units with placements, groups with commanders. Runs setup → live → closed.
 _Avoid_: game (that's the model, not the instance), mission
 
 **Seat**:
-One command slot in a session: helm of a unit, or commander of a unit, Satgas, or Gugus. Users are bound to seats; one user may hold several.
+One command slot in a session: helm of a unit, or commander of a unit or group. Users are bound to seats; one user may hold several.
 _Avoid_: slot, position
 
 **Helm**:
@@ -117,7 +133,7 @@ An organizer-issued code binding a named roster entry to a session seat. Generat
 _Avoid_: invitation (that's the message, not the code), token
 
 **Zone**:
-The rendered area of a group (Satgas, Gugus): a live hull around member positions plus a fixed ground padding, in the level color. Collapses to a flag when zoomed out.
+The rendered area of a group: a live hull around member positions plus a fixed ground padding, in the level color. Collapses to a flag when zoomed out.
 _Avoid_: area (that's organizer-drawn, a different feature), region
 
 **Flag**:
