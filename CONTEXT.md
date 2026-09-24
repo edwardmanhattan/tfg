@@ -27,11 +27,15 @@ The provenance of a Fix: wire (backend report), sim (synthetic, emitted from ord
 _Avoid_: origin, type
 
 **Order**:
-One active directive on an owned ship: a waypoint plus a speed. New orders overwrite; cancel clears; arrival holds position.
-_Avoid_: command (that's the multi-unit directive, see Command), instruction
+A legacy waypoint-and-speed directive retained for old replay data and possible future navigation work. It is not the current helm directive.
+_Avoid_: current helm directive, command (that's the multi-unit directive, see Command), instruction
+
+**HelmOrder**:
+One persistent directive for a single GameUnit: a compass heading and speed in knots. An accepted HelmOrder replaces the previous one; speed zero is Hold position and retains the last accepted heading. It is not a waypoint, route, or client-invented destination.
+_Avoid_: waypoint, move order, navigation plan, instruction
 
 **Owned**:
-A ship driven by the sim from a player's orders.
+A ship driven by the sim from a player's HelmOrders or legacy Orders.
 _Avoid_: ownship, friendly
 
 **Traffic**:
@@ -74,7 +78,7 @@ An in-game instance referencing a Unit: position, state, order. What a unit IS D
 _Avoid_: unit instance (redundant in context), entity
 
 **Command**:
-One directive from a commander over units in their jurisdiction: it fans out into one Order per named unit. The sim never sees commands, only orders.
+One directive from a commander over units in their jurisdiction: it fans out into one per-unit directive, currently a HelmOrder for helm control or a legacy Order for waypoint navigation. The sim never sees commands, only per-unit directives.
 _Avoid_: order (that's the per-ship directive)
 
 **Jurisdiction**:
