@@ -1,124 +1,70 @@
-//! Backend polling (v0 contract, see resolution on the backend ticket).
+//! Backend clients, split by responsibility:
 //!
 //! - [`PollSource`]: one poll round -> the fixes seen this round.
-//! - [`FileReplay`]: dev default. Replays canned frames from a JSON fixture
-//!   (`tests/fixtures/tracks.json`), looping. No network, deterministic.
-//! - [`HttpPoll`]: real backend. Not wired yet — returns an error until the
-//!   backend exists; swapping impls is one line at the call site.
+//! - [`replay`]: dev fixture replay ([`FileReplay`]) and the serve clock.
+//! - [`auth`]: login, refresh, gate probe, keyring.
+//! - [`master`]: master-data reads, session-users rows, hull specs.
+//! - [`feed`]: snapshot REST, publication shapes.
+//! - [`live`]: socket actor, bridge, refusal policy.
+//!
+//! The parent keeps the trait, the legacy mock clients, the shared
+//! envelope helper, and the tests. Everything else lives below.
 
-use std::fs;
+mod auth;
+mod error;
+mod feed;
+mod live;
+mod master;
+mod replay;
+
+pub use error::BackendError;
+
+pub use auth::{MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
+pub use feed::{GameMsg, MinosRest, Snapshot};
+pub use live::{LIVE_BACKOFF_BASE_SECS, LIVE_BACKOFF_CAP_SECS, LiveCmd, LiveEvent, LiveWire};
+pub use master::{BackendUser, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePlacement, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, Review, ScenarioRole, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
+pub use replay::{FileReplay, now_ts};
+// Shared with live.rs and the tests below; not public API.
+pub(crate) use feed::FeedEvent;
+pub(crate) use feed::parse_message_event;
 
 use serde::{Deserialize, Serialize};
 
-use crate::geo::track::{Fix, FixSource};
+use crate::geo::track::Fix;
 
-/// One round of polling. Errors are strings; the registry treats a failed
-/// round as "no fixes" (ships accumulate misses toward stale).
 pub trait PollSource {
-    fn poll(&mut self) -> Result<Vec<Fix>, String>;
+    fn poll(&mut self) -> Result<Vec<Fix>, BackendError>;
 }
 
-#[derive(Debug, Deserialize)]
-struct Fixture {
-    frames: Vec<Vec<serde_json::Value>>,
-}
-
-/// Current UTC time, millis precision, fixed-width (lexicographically ordered).
-/// Sources stamp this on serve; the registry compares `ts` as strings.
-pub fn now_ts() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
-}
-
-/// Stamp one poll round with receipt time (UTC, millis).
-///
-/// Replays loop canned frames, so wire `ts` rewinds every cycle and the
-/// registry (rightly) drops it as out-of-order. A live backend emits fresh
-/// timestamps; the replay sources model that by stamping on serve.
-fn stamp_now(frame: &mut [Fix]) {
-    let now = now_ts();
-    for fix in frame {
-        fix.ts = now.clone();
-        // Receipt time too: replayed frames are fresh on serve, so the
-        // old-data badge (wire-gated) stays quiet on fixtures.
-        fix.received_at = Some(now.clone());
-    }
-}
-
-/// Parse one poll round from wire JSON values (flat lat/lon per fix).
-fn parse_frame(raw_frame: Vec<serde_json::Value>) -> Result<Vec<Fix>, String> {
-    let mut frame = Vec::with_capacity(raw_frame.len());
-    for raw in raw_frame {
-        let text = serde_json::to_string(&raw).map_err(|e| e.to_string())?;
-        frame.push(Fix::from_wire_json(&text)?);
-    }
-    Ok(frame)
-}
-
-/// Replays fixture frames in order, looping forever.
-pub struct FileReplay {
-    frames: Vec<Vec<Fix>>,
-    cursor: usize,
-}
-
-impl FileReplay {
-    pub fn from_file(path: &str) -> Result<Self, String> {
-        let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let fixture: Fixture = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        let mut frames = Vec::with_capacity(fixture.frames.len());
-        for (i, raw_frame) in fixture.frames.iter().enumerate() {
-            frames.push(
-                parse_frame(raw_frame.clone()).map_err(|e| format!("frame {i}: {e}"))?,
-            );
-        }
-        if frames.is_empty() {
-            return Err("fixture has no frames".into());
-        }
-        Ok(Self { frames, cursor: 0 })
-    }
-
-    pub fn frame_count(&self) -> usize {
-        self.frames.len()
-    }
-}
-
-impl PollSource for FileReplay {
-    fn poll(&mut self) -> Result<Vec<Fix>, String> {
-        let mut frame = self.frames[self.cursor % self.frames.len()].clone();
-        self.cursor += 1;
-        stamp_now(&mut frame);
-        Ok(frame)
-    }
-}
-
-/// Real HTTP backend: `GET {base_url}/v0/positions` returning a JSON array
-/// of wire fixes. Against `examples/mock_backend.rs` today, the real
-/// backend tomorrow: same contract, different URL.
-pub struct HttpPoll {
+/// Mock HTTP source (M10): `GET {base_url}/v0/positions` returning a
+/// JSON array of wire fixes, served by `examples/mock_backend.rs`.
+/// Explicit mock/replay compatibility only — this is NOT the Minos
+/// integration (Minos is `GET /api/v1/live-feed/positions` with a
+/// bearer envelope via [`MinosRest`], plus the Centrifugo socket via
+/// [`LiveWire`]). Nothing here may be mistaken for a backend route.
+pub struct MockPoll {
     base_url: String,
     client: reqwest::blocking::Client,
 }
 
-impl HttpPoll {
+impl MockPoll {
     pub fn new(base_url: &str) -> Result<Self, String> {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), client })
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client,
+        })
     }
 }
 
-impl PollSource for HttpPoll {
-    fn poll(&mut self) -> Result<Vec<Fix>, String> {
+impl PollSource for MockPoll {
+    fn poll(&mut self) -> Result<Vec<Fix>, BackendError> {
         let url = format!("{}/v0/positions", self.base_url);
-        let fixes: Vec<serde_json::Value> = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| e.to_string())?
-            .json()
-            .map_err(|e| e.to_string())?;
-        parse_frame(fixes)
+        let fixes: Vec<serde_json::Value> = self.client.get(&url).send()?.json()?;
+        replay::parse_frame(fixes).map_err(BackendError::Other)
     }
 }
 
@@ -135,7 +81,7 @@ pub struct Invite {
 }
 
 /// Identity endpoints against the mock (later real) backend: issue, list,
-/// redeem. Same contract style as [`HttpPoll`]: base URL + blocking client.
+/// redeem. Same contract style as [`MockPoll`]: base URL + blocking client.
 pub struct InviteClient {
     base_url: String,
     client: reqwest::blocking::Client,
@@ -147,7 +93,10 @@ impl InviteClient {
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), client })
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client,
+        })
     }
 
     /// Mirror a locally issued record: the mock honors the client code
@@ -191,1144 +140,144 @@ impl InviteClient {
     }
 }
 
-/// Minos token pair (docs/minos-api.yaml): short-lived access token plus
-/// the desktop refresh path. `refresh_token` is present only when the
-/// login asked for it (`return_refresh_token`), which native clients must.
-#[derive(Debug, Clone)]
-pub struct TokenPair {
-    pub access_token: String,
-    pub expires_in: u64,
-    pub refresh_token: Option<String>,
-}
-
-/// Minos auth (auth grill resolution): identifier login, rotation refresh,
-/// password-change gate probe. Blocking client like the other backends.
-/// Tokens live with the caller — access in memory, refresh in the keyring.
-pub struct MinosAuth {
-    base_url: String,
-    client: reqwest::blocking::Client,
-}
-
 /// Unwrap the Minos envelope `{status_code, message, data}`: non-2xx
-/// becomes the server's message, success yields `data`.
-fn unwrap_envelope(resp: reqwest::blocking::Response) -> Result<serde_json::Value, String> {
+/// becomes a classified [`BackendError`] (401/403 by variant, the rest
+/// with status), success yields `data`. Shared with the submodules.
+pub(crate) fn unwrap_envelope(
+    resp: reqwest::blocking::Response,
+) -> Result<serde_json::Value, BackendError> {
     let status = resp.status();
-    let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    let body: serde_json::Value = resp.json()?;
     if !status.is_success() {
-        return Err(format!(
-            "HTTP {status}: {}",
-            body["message"].as_str().unwrap_or("request failed")
-        ));
+        return Err(BackendError::http_error(status.as_u16(), &body));
     }
     Ok(body["data"].clone())
 }
 
-impl MinosAuth {
-    pub fn new(base_url: &str) -> Result<Self, String> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?;
-        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), client })
+/// Envelope with its cursor page block (timeline): data plus the
+/// metadata the load-more control binds to. Absent metadata reads as
+/// a single final page, never an error.
+pub(crate) fn unwrap_envelope_page(
+    resp: reqwest::blocking::Response,
+) -> Result<(serde_json::Value, serde_json::Value), BackendError> {
+    let status = resp.status();
+    let body: serde_json::Value = resp.json()?;
+    if !status.is_success() {
+        return Err(BackendError::http_error(status.as_u16(), &body));
     }
-
-    /// Sign in. Desktop path: `return_refresh_token` true (no cookie jar).
-    /// Unknown user and wrong password are an identical 401 by design.
-    pub fn login(&self, identifier: &str, password: &str) -> Result<TokenPair, String> {
-        let data = unwrap_envelope(
-            self.client
-                .post(&format!("{}/auth/login", self.base_url))
-                .json(&serde_json::json!({
-                    "identifier": identifier,
-                    "password": password,
-                    "return_refresh_token": true,
-                }))
-                .send()
-                .map_err(|e| e.to_string())?,
-        )?;
-        Ok(TokenPair {
-            access_token: data["access_token"].as_str().unwrap_or("").to_string(),
-            expires_in: data["expires_in"].as_u64().unwrap_or(0),
-            refresh_token: data["refresh_token"].as_str().map(|s| s.to_string()),
-        })
-    }
-
-    /// Rotate: presents the refresh token, returns a new pair. The old
-    /// refresh token is invalidated server-side (replay is rejected).
-    pub fn refresh(&self, refresh_token: &str) -> Result<TokenPair, String> {
-        let data = unwrap_envelope(
-            self.client
-                .post(&format!("{}/auth/refresh", self.base_url))
-                .json(&serde_json::json!({ "refresh_token": refresh_token }))
-                .send()
-                .map_err(|e| e.to_string())?,
-        )?;
-        Ok(TokenPair {
-            access_token: data["access_token"].as_str().unwrap_or("").to_string(),
-            expires_in: data["expires_in"].as_u64().unwrap_or(0),
-            refresh_token: data["refresh_token"].as_str().map(|s| s.to_string()),
-        })
-    }
-
-    /// Change the account password (the must_change_password gate). 204 on
-    /// success; every other refresh token for the account is invalidated,
-    /// so the caller re-logins afterwards. Passwords go byte for byte.
-    pub fn change_password(
-        &self,
-        access_token: &str,
-        current_password: &str,
-        new_password: &str,
-    ) -> Result<(), String> {
-        self.client
-            .put(&format!("{}/users/me/password", self.base_url))
-            .bearer_auth(access_token)
-            .json(&serde_json::json!({
-                "current_password": current_password,
-                "new_password": new_password,
-            }))
-            .send()
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    /// Gate probe: who am I with this token. Ok means the token works and
-    /// no gate stands in the way; a 403 with valid credentials means the
-    /// account is not Active (or must_change_password still shuts doors).
-    pub fn me(&self, access_token: &str) -> Result<(), String> {
-        self.client
-            .get(&format!("{}/users/me", self.base_url))
-            .bearer_auth(access_token)
-            .send()
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-}
-
-/// Refresh-token store (keyring resolution): OS keyring entry per
-/// identifier, single writer on the UI thread. `None` on load means no
-/// entry (fresh login); any other store failure degrades to memory with
-/// a visible degraded status — never silently.
-const KEYRING_SERVICE: &str = "tfg-minos";
-
-/// Save (overwrite) the refresh token for this identifier.
-pub fn keyring_save(user: &str, token: &str) -> Result<(), String> {
-    keyring::Entry::new(KEYRING_SERVICE, user)
-        .map_err(|e| e.to_string())?
-        .set_password(token)
-        .map_err(|e| e.to_string())
-}
-
-/// Load the stored refresh token, if any.
-pub fn keyring_load(user: &str) -> Result<Option<String>, String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| e.to_string())?;
-    match entry.get_password() {
-        Ok(pw) => Ok(Some(pw)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// Forget the stored refresh token (sign out). Missing entry is fine.
-pub fn keyring_clear(user: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| e.to_string())?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// Minos master-data reads (master-data ticket): helpers, taxonomy,
-/// units, hierarchy. Bearer-authed, envelope-unwrapped, paged where the
-/// contract pages. Rows come out as store cells; orchestration lives in
-/// [`crate::store::sync_from`].
-pub struct MinosMaster {
-    base_url: String,
-    client: reqwest::blocking::Client,
-}
-
-/// One mirrored table: target, columns, and rows.
-pub struct TableData {
-    pub table: &'static str,
-    pub columns: &'static str,
-    pub placeholders: &'static str,
-    pub rows: Vec<Vec<crate::store::StoredValue>>,
-}
-
-use crate::store::{opt_int, opt_real, opt_text, StoredValue};
-
-impl MinosMaster {
-    pub fn new(base_url: &str) -> Result<Self, String> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .map_err(|e| e.to_string())?;
-        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), client })
-    }
-
-    fn get(&self, token: &str, path: &str) -> Result<serde_json::Value, String> {
-        unwrap_envelope(
-            self.client
-                .get(&format!("{}{}", self.base_url, path))
-                .bearer_auth(token)
-                .send()
-                .map_err(|e| e.to_string())?,
-        )
-    }
-
-    fn str_of(v: &serde_json::Value, key: &str) -> Option<String> {
-        v[key].as_str().map(|s| s.to_string())
-    }
-
-    fn int_of(v: &serde_json::Value, key: &str) -> Option<i64> {
-        v[key].as_i64()
-    }
-
-    fn bool_of(v: &serde_json::Value, key: &str) -> bool {
-        v[key].as_bool().unwrap_or(false)
-    }
-
-    fn helper_row(table: &str, h: &serde_json::Value) -> Vec<StoredValue> {
-        vec![
-            StoredValue::Text(table.to_string()),
-            StoredValue::Int(h["id"].as_i64().unwrap_or(0)),
-            StoredValue::Text(h["name"].as_str().unwrap_or("").to_string()),
-            StoredValue::Text(h["id_name"].as_str().unwrap_or("").to_string()),
-            StoredValue::Text(h["description_en"].as_str().unwrap_or("").to_string()),
-            StoredValue::Int(b2i(Self::bool_of(h, "is_system"))),
-            StoredValue::Int(b2i(Self::bool_of(h, "is_judge_side"))),
-        ]
-    }
-
-    /// Every lookup table in one payload, keyed by table name.
-    pub fn helpers(&self, token: &str) -> Result<TableData, String> {
-        let data = self.get(token, "/helpers")?;
-        let helpers = data["helpers"].as_object().cloned().unwrap_or_default();
-        let mut rows = Vec::new();
-        let mut tables: Vec<String> = helpers.keys().cloned().collect();
-        tables.sort();
-        for t in tables {
-            if let Some(list) = helpers[&t].as_array() {
-                for h in list {
-                    rows.push(Self::helper_row(&t, h));
-                }
-            }
-        }
-        Ok(TableData {
-            table: "helpers",
-            columns: "table_name, id, name, id_name, description_en, is_system, is_judge_side",
-            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7",
-            rows,
-        })
-    }
-
-    /// Echelon vocabulary, lowest first. Order lives in echelon_rank.
-    pub fn hierarchy(&self, token: &str) -> Result<TableData, String> {
-        let data = self.get(token, "/hierarchy")?;
-        let list = data.as_array().cloned().unwrap_or_default();
-        let rows = list
-            .iter()
-            .map(|h| {
-                vec![
-                    StoredValue::Int(h["id"].as_i64().unwrap_or(0)),
-                    StoredValue::Text(h["name"].as_str().unwrap_or("").to_string()),
-                    StoredValue::Text(h["id_name"].as_str().unwrap_or("").to_string()),
-                    StoredValue::Text(h["description_en"].as_str().unwrap_or("").to_string()),
-                    StoredValue::Int(h["echelon_rank"].as_i64().unwrap_or(0)),
-                    StoredValue::Int(b2i(Self::bool_of(h, "is_system"))),
-                    StoredValue::Text(h["note"].as_str().unwrap_or("").to_string()),
-                ]
-            })
-            .collect();
-        Ok(TableData {
-            table: "hierarchy_echelons",
-            columns: "id, name, id_name, description_en, echelon_rank, is_system, note",
-            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7",
-            rows,
-        })
-    }
-
-    /// Categories with their type counts (no paging by design).
-    pub fn categories(&self, token: &str) -> Result<TableData, String> {
-        let data = self.get(token, "/unit-categories")?;
-        let list = data.as_array().cloned().unwrap_or_default();
-        let rows = list
-            .iter()
-            .map(|c| {
-                vec![
-                    StoredValue::Int(c["id"].as_i64().unwrap_or(0)),
-                    StoredValue::Text(c["name"].as_str().unwrap_or("").to_string()),
-                    StoredValue::Text(c["id_name"].as_str().unwrap_or("").to_string()),
-                    StoredValue::Text(c["description_en"].as_str().unwrap_or("").to_string()),
-                    StoredValue::Int(b2i(Self::bool_of(c, "is_system"))),
-                    StoredValue::Int(c["type_count"].as_i64().unwrap_or(0)),
-                ]
-            })
-            .collect();
-        Ok(TableData {
-            table: "unit_categories",
-            columns: "id, name, id_name, description_en, is_system, type_count",
-            placeholders: "?1, ?2, ?3, ?4, ?5, ?6",
-            rows,
-        })
-    }
-
-    /// Full taxonomy types (paged defensively; small in practice).
-    pub fn types(&self, token: &str) -> Result<TableData, String> {
-        let mut rows = Vec::new();
-        for page in 1..=50 {
-            let data = self.get(
-                token,
-                &format!("/unit-types?page_size=200&page_number={page}"),
-            )?;
-            let list = data.as_array().cloned().unwrap_or_default();
-            if list.is_empty() {
-                break;
-            }
-            for t in &list {
-                rows.push(vec![
-                    StoredValue::Int(t["id"].as_i64().unwrap_or(0)),
-                    StoredValue::Text(t["name"].as_str().unwrap_or("").to_string()),
-                    StoredValue::Text(t["id_name"].as_str().unwrap_or("").to_string()),
-                    StoredValue::Text(
-                        t["description_en"].as_str().unwrap_or("").to_string(),
-                    ),
-                    StoredValue::Int(b2i(Self::bool_of(t, "is_system"))),
-                    opt_int(Self::int_of(&t["category"], "id")),
-                    StoredValue::Int(t["class_count"].as_i64().unwrap_or(0)),
-                ]);
-            }
-            if list.len() < 200 {
-                break;
-            }
-        }
-        Ok(TableData {
-            table: "unit_types",
-            columns: "id, name, id_name, description_en, is_system, category_id, class_count",
-            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7",
-            rows,
-        })
-    }
-
-    /// Classes with taxonomy link, turn rate, hull count, image URL.
-    pub fn classes(&self, token: &str) -> Result<TableData, String> {
-        let mut rows = Vec::new();
-        for page in 1..=50 {
-            let data = self.get(
-                token,
-                &format!("/unit-classes?page_size=200&page_number={page}"),
-            )?;
-            let list = data.as_array().cloned().unwrap_or_default();
-            if list.is_empty() {
-                break;
-            }
-            for c in &list {
-                rows.push(vec![
-                    StoredValue::Int(c["id"].as_i64().unwrap_or(0)),
-                    StoredValue::Text(c["name"].as_str().unwrap_or("").to_string()),
-                    StoredValue::Text(c["id_name"].as_str().unwrap_or("").to_string()),
-                    opt_int(Self::int_of(&c["unit_type"], "id")),
-                    opt_real(c["default_turn_rate_max_deg_s"].as_f64()),
-                    StoredValue::Int(c["hull_count"].as_i64().unwrap_or(0)),
-                    opt_text(Self::str_of(c, "image_url")),
-                ]);
-            }
-            if list.len() < 200 {
-                break;
-            }
-        }
-        Ok(TableData {
-            table: "unit_classes",
-            columns: "id, name, id_name, type_id, turn_rate, hull_count, image_url",
-            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7",
-            rows,
-        })
-    }
-
-    /// Hull register, paged. Nested taxonomy objects flatten to ids;
-    /// per-version specifications stay server-side in v1 (one request
-    /// per hull would turn every sync into a request storm).
-    pub fn units(&self, token: &str) -> Result<TableData, String> {
-        let mut rows = Vec::new();
-        for page in 1..=50 {
-            let data =
-                self.get(token, &format!("/units?page_size=200&page_number={page}"))?;
-            let list = data.as_array().cloned().unwrap_or_default();
-            if list.is_empty() {
-                break;
-            }
-            for u in &list {
-                rows.push(vec![
-                    StoredValue::Int(u["id"].as_i64().unwrap_or(0)),
-                    StoredValue::Text(u["name"].as_str().unwrap_or("").to_string()),
-                    opt_text(Self::str_of(u, "hull_number")),
-                    opt_int(Self::int_of(&u["unit_class"], "id")),
-                    opt_int(Self::int_of(&u["unit_status"], "id")),
-                    opt_int(Self::int_of(&u["service_branch"], "id")),
-                    opt_int(Self::int_of(&u["movement_domain"], "id")),
-                ]);
-            }
-            if list.len() < 200 {
-                break;
-            }
-        }
-        Ok(TableData {
-            table: "units",
-            columns: "id, name, hull_number, class_id, status_id, branch_id, domain_id",
-            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7",
-            rows,
-        })
-    }
-
-    /// Declared branch → category ownership (setup-overhaul picker):
-    /// ids only — the rows themselves come from categories(). Empty is
-    /// a real answer (a branch owning nothing renders a zero, not an
-    /// error); non-numeric ids are refused upstream with 422.
-    pub fn category_ids_for_branch(&self, token: &str, branch_id: i64) -> Result<Vec<i64>, String> {
-        let data = self.get(token, &format!("/unit-categories?id_service_branch={branch_id}"))?;
-        Ok(data
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|c| c["id"].as_i64())
-            .filter(|id| *id > 0)
-            .collect())
-    }
-
-    fn post(&self, token: &str, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
-        unwrap_envelope(
-            self.client
-                .post(&format!("{}{}", self.base_url, path))
-                .bearer_auth(token)
-                .json(&body)
-                .send()
-                .map_err(|e| e.to_string())?,
-        )
-    }
-
-    fn patch(
-        &self,
-        token: &str,
-        path: &str,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        unwrap_envelope(
-            self.client
-                .patch(&format!("{}{}", self.base_url, path))
-                .bearer_auth(token)
-                .json(&body)
-                .send()
-                .map_err(|e| e.to_string())?,
-        )
-    }
-
-    /// One page walk for small paged endpoints (games, users): 100 rows
-    /// a page, stops at the first short page. Permission failures (403)
-    /// surface as errors — the UI degrades to the game roster instead.
-    fn paged(&self, token: &str, path: &str) -> Result<Vec<serde_json::Value>, String> {
-        let mut out = Vec::new();
-        let sep = if path.contains('?') { '&' } else { '?' };
-        for page in 1..=10 {
-            let data = self.get(token, &format!("{path}{sep}page_size=100&page_number={page}"))?;
-            let list = data.as_array().cloned().unwrap_or_default();
-            let short = list.len() < 100;
-            out.extend(list);
-            if short {
-                break;
-            }
-        }
-        Ok(out)
-    }
-
-    fn enc(s: &str) -> String {
-        let mut o = String::new();
-        for b in s.bytes() {
-            if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
-                o.push(b as char);
-            } else {
-                o.push_str(&format!("%{b:02X}"));
-            }
-        }
-        o
-    }
-
-    /// Games for the session-users picker (summary shape, newest first).
-    pub fn games_list(&self, token: &str) -> Result<Vec<GameRow>, String> {
-        Ok(self
-            .paged(token, "/games")?
-            .iter()
-            .filter_map(|g| {
-                Some(GameRow {
-                    id: g["id"].as_i64()?,
-                    name: g["name"].as_str().unwrap_or("").to_string(),
-                    state: g["state"].as_str().unwrap_or("").to_string(),
-                })
-            })
-            .collect())
-    }
-
-    /// Backend user directory (session-users ticket): live-read, paged,
-    /// optional search. Needs `read` on `/system/users` — a 403 here is
-    /// the roster-fallback signal, not a bug.
-    pub fn users_list(&self, token: &str, search: &str) -> Result<Vec<BackendUser>, String> {
-        let path = if search.trim().is_empty() {
-            "/users".to_string()
-        } else {
-            format!("/users?search={}", Self::enc(search.trim()))
-        };
-        Ok(self
-            .paged(token, &path)?
-            .iter()
-            .filter_map(|u| {
-                Some(BackendUser {
-                    id: u["id"].as_i64()?,
-                    username: u["username"].as_str().unwrap_or("").to_string(),
-                    name: u["name"].as_str().unwrap_or("").to_string(),
-                })
-            })
-            .collect())
-    }
-
-    /// One game's roster (staff-facing): exercise side first by server order.
-    pub fn game_participants(&self, token: &str, game_id: i64) -> Result<Vec<Participant>, String> {
-        let data = self.get(token, &format!("/games/{game_id}/participants"))?;
-        Ok(data
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|p| {
-                Some(Participant {
-                    user_id: p["id_user"].as_i64()?,
-                    user_name: p["user_name"].as_str().unwrap_or("").to_string(),
-                    role_id: p["id_game_role"].as_i64().unwrap_or(0),
-                    role_name: p["role_name"].as_str().unwrap_or("").to_string(),
-                    judge: p["is_judge_side"].as_bool().unwrap_or(false),
-                })
-            })
-            .collect())
-    }
-
-    /// Seat somebody in a game (planning|preparation only, one role per
-    /// person). A 409 names the world refusing (already seated, closed
-    /// roster) — loud by contract.
-    pub fn add_participant(
-        &self,
-        token: &str,
-        game_id: i64,
-        user_id: i64,
-        role_id: i64,
-    ) -> Result<(), String> {
-        self.post(
-            token,
-            &format!("/games/{game_id}/participants"),
-            serde_json::json!({ "id_user": user_id, "id_game_role": role_id }),
-        )?;
-        Ok(())
-    }
-
-    /// A game's order of battle with current commanders.
-    pub fn game_units_list(&self, token: &str, game_id: i64) -> Result<Vec<GameUnit>, String> {
-        let data = self.get(token, &format!("/games/{game_id}/units"))?;
-        Ok(data
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|u| {
-                Some(GameUnit {
-                    unit_id: u["id_unit"].as_i64()?,
-                    unit_name: u["unit_name"].as_str().unwrap_or("").to_string(),
-                    commander_id: u["id_commander"].as_i64(),
-                    commander_name: u["commander_name"].as_str().unwrap_or("").to_string(),
-                })
-            })
-            .collect())
-    }
-
-    /// Hand a game piece to a commander (planning|preparation). The new
-    /// commander must be a participant and never judge-side — refused
-    /// loudly otherwise.
-    pub fn set_unit_commander(
-        &self,
-        token: &str,
-        game_id: i64,
-        unit_id: i64,
-        commander_id: i64,
-    ) -> Result<(), String> {
-        self.patch(
-            token,
-            &format!("/games/{game_id}/units/{unit_id}"),
-            serde_json::json!({ "id_commander": commander_id }),
-        )?;
-        Ok(())
-    }
-}
-
-/// Backend user row for the session-users panel (live-read, no mirror).
-#[derive(Debug, Clone, PartialEq)]
-pub struct BackendUser {
-    pub id: i64,
-    pub username: String,
-    pub name: String,
-}
-
-/// Game summary row for the session-users game picker.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GameRow {
-    pub id: i64,
-    pub name: String,
-    pub state: String,
-}
-
-/// One game roster row: who holds which seat, and on which side.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Participant {
-    pub user_id: i64,
-    pub user_name: String,
-    pub role_id: i64,
-    pub role_name: String,
-    pub judge: bool,
-}
-
-/// One game piece with its current commander, if any.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GameUnit {
-    pub unit_id: i64,
-    pub unit_name: String,
-    pub commander_id: Option<i64>,
-    pub commander_name: String,
-}
-
-fn b2i(b: bool) -> i64 {
-    if b {
-        1
-    } else {
-        0
-    }
-}
-
-/// One hull's current figures (spec-sync ticket): the sim-driving
-/// numbers for a register hull, carried by name so the picker can
-/// match them to a runtime catalog class.
-#[derive(Debug, Clone)]
-pub struct HullSpec {
-    pub unit_id: i64,
-    pub version: i64,
-    pub class_id: i64,
-    pub class_name: String,
-    pub speed_kn: Option<f64>,
-    pub cruise_kn: Option<f64>,
-    pub range_nm: Option<f64>,
-}
-
-impl MinosMaster {
-    /// Current specification for one hull. Absent when the hull has no
-    /// published version yet — the API invents no speed, neither do we.
-    pub fn hull_spec(&self, token: &str, unit_id: i64) -> Result<HullSpec, String> {
-        let data = self.get(token, &format!("/units/{unit_id}"))?;
-        let spec = data["current_specification"].as_object().cloned().unwrap_or_default();
-        if spec.is_empty() {
-            return Err(format!("unit {unit_id}: no published specification"));
-        }
-        let num = |key: &str| spec.get(key).and_then(|v| v.as_f64());
-        Ok(HullSpec {
-            unit_id,
-            version: spec.get("version").and_then(|v| v.as_i64()).unwrap_or(0),
-            class_id: data["unit_class"]["id"].as_i64().unwrap_or(0),
-            class_name: data["unit_class"]["name"].as_str().unwrap_or("").to_string(),
-            speed_kn: num("speed_max_surface_kn"),
-            cruise_kn: num("speed_cruise_kn"),
-            range_nm: num("range_nm"),
-        })
-    }
-
-    /// Fetch one hull's current figures and store them. The caller
-    /// checks spec_versions first when backfilling.
-    pub fn sync_spec(
-        &self,
-        token: &str,
-        conn: &rusqlite::Connection,
-        unit_id: i64,
-    ) -> Result<HullSpec, String> {
-        let spec = self.hull_spec(token, unit_id)?;
-        let body = serde_json::json!({
-            "class_id": spec.class_id,
-            "class_name": spec.class_name,
-            "speed_kn": spec.speed_kn,
-            "cruise_kn": spec.cruise_kn,
-            "range_nm": spec.range_nm,
-        })
-        .to_string();
-        crate::store::store_spec(conn, unit_id, spec.version, true, &body)?;
-        Ok(spec)
-    }
-}
-
-/// Minos standing picture (REST mapping ticket): the initial picture the
-/// socket then keeps current. Vessels that never reported carry labels
-/// but no position — announced as silent, never zero-filled.
-#[derive(Debug, Clone, Deserialize)]
-struct FeedPosition {
-    id_unit: u64,
-    name: String,
-    hull_number: Option<String>,
-    position: Option<FeedFix>,
-}
-
-/// One stored fix as the server holds it.
-#[derive(Debug, Clone, Deserialize)]
-struct FeedFix {
-    latitude: f64,
-    longitude: f64,
-    speed_kn: Option<f32>,
-    course_deg: Option<f32>,
-    accuracy_m: Option<f32>,
-    recorded_at: String,
-    received_at: String,
-    #[serde(default)]
-    backfilled: bool,
-}
-
-impl FeedFix {
-    fn to_fix(&self, ship_id: String, name: String, hull_number: Option<String>) -> Fix {
-        Fix {
-            ship_id,
-            position: crate::geo::GeoPosition {
-                latitude: self.latitude,
-                longitude: self.longitude,
-            },
-            ts: self.recorded_at.clone(),
-            received_at: Some(self.received_at.clone()),
-            heading_deg: self.course_deg,
-            speed_kn: self.speed_kn,
-            accuracy_m: self.accuracy_m,
-            name: Some(name),
-            hull_number,
-            backfilled: self.backfilled,
-            source: FixSource::Wire,
-            seq: 0,
-        }
-    }
-}
-
-/// Snapshot out of one REST read: silent announcements plus latest fixes.
-pub struct Snapshot {
-    pub announced: Vec<(String, Option<String>, Option<String>)>,
-    pub fixes: Vec<Fix>,
-}
-
-/// Minos REST reads (REST mapping ticket): snapshot fetch beside the
-/// auth client. Same blocking style; the poll thread calls it, the
-/// socket actor re-reads it after every reconnect.
-pub struct MinosRest {
-    base_url: String,
-    client: reqwest::blocking::Client,
-}
-
-impl MinosRest {
-    pub fn new(base_url: &str) -> Result<Self, String> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?;
-        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), client })
-    }
-
-    /// Standing picture: every vessel, ordered by id. Not paginated by
-    /// design (a page of a picture is a wrong picture).
-    pub fn snapshot(&self, access_token: &str) -> Result<Snapshot, String> {
-        let positions: Vec<FeedPosition> = unwrap_envelope(
-            self.client
-                .get(&format!("{}/live-feed/positions", self.base_url))
-                .bearer_auth(access_token)
-                .send()
-                .map_err(|e| e.to_string())?,
-        )
-        .and_then(|data| serde_json::from_value(data).map_err(|e| e.to_string()))?;
-        let mut announced = Vec::with_capacity(positions.len());
-        let mut fixes = Vec::new();
-        for p in positions {
-            let id = p.id_unit.to_string();
-            announced.push((id.clone(), Some(p.name.clone()), p.hull_number.clone()));
-            if let Some(pos) = p.position {
-                fixes.push(pos.to_fix(id, p.name, p.hull_number));
-            }
-        }
-        Ok(Snapshot { announced, fixes })
-    }
-}
-
-/// One live-feed publication (§5): one message per beacon batch, per
-/// vessel. Optional numerics are absent-never-zero on the wire.
-#[derive(Debug, Clone, Deserialize)]
-struct FeedEvent {
-    id_unit: u64,
-    name: Option<String>,
-    hull_number: Option<String>,
-    latitude: f64,
-    longitude: f64,
-    speed_kn: Option<f32>,
-    course_deg: Option<f32>,
-    accuracy_m: Option<f32>,
-    recorded_at: String,
-    received_at: String,
-    #[serde(default)]
-    backfilled: bool,
-}
-
-impl FeedEvent {
-    fn to_fix(&self) -> Fix {
-        Fix {
-            ship_id: self.id_unit.to_string(),
-            position: crate::geo::GeoPosition {
-                latitude: self.latitude,
-                longitude: self.longitude,
-            },
-            ts: self.recorded_at.clone(),
-            received_at: Some(self.received_at.clone()),
-            heading_deg: self.course_deg,
-            speed_kn: self.speed_kn,
-            accuracy_m: self.accuracy_m,
-            name: self.name.clone(),
-            hull_number: self.hull_number.clone(),
-            backfilled: self.backfilled,
-            source: FixSource::Wire,
-            seq: 0,
-        }
-    }
-}
-
-/// Backoff for socket retries (transport ticket): base 1 s, cap 30 s,
-/// full jitter. Tunable here, applied in the actor loop.
-pub const LIVE_BACKOFF_BASE_SECS: u64 = 1;
-pub const LIVE_BACKOFF_CAP_SECS: u64 = 30;
-
-/// Full jitter in whole seconds over [0, bound].
-fn full_jitter_secs(bound: u64) -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0);
-    nanos % (bound + 1)
-}
-
-/// Actor -> UI reports. The UI owns refresh (keyring) and sign-out; the
-/// actor never touches either.
-#[derive(Debug, Clone)]
-pub enum LiveEvent {
-    Connected { client_id: String },
-    Announced(Vec<(String, Option<String>, Option<String>)>),
-    Reconnecting { attempt: u32, wait_secs: u64 },
-    /// Fatal refusal (101/103/107): the actor stops itself. The UI signs
-    /// out (101) or shows the error; the wire goes quiet and stale flags
-    /// read the outage as feed-down.
-    Refused { code: u32, reason: String },
-    /// Token expiry (109): the UI refreshes silently and pushes the new
-    /// token back down.
-    RefreshDue,
-    SocketError(String),
-}
-
-/// UI -> actor commands.
-#[derive(Debug)]
-pub enum LiveCmd {
-    SetToken(String),
-    Shutdown,
-}
-
-struct LiveShared {
-    queue: std::sync::Mutex<std::collections::VecDeque<FeedEvent>>,
-    /// Last-known picture per ship (snapshot seed + socket overlay).
-    /// The poll side replays it every tick; reconnect re-reads reseed it.
-    known: std::sync::Mutex<std::collections::HashMap<String, Fix>>,
-    live: std::sync::atomic::AtomicBool,
-}
-
-/// Tick-batched live wire (transport ticket): socket publications queue
-/// on the actor thread; each poll drains newest-per-ship and replays the
-/// last-known picture for every known vessel (snapshot + socket overlay),
-/// so silence counts as Registry misses and disconnects read as stale.
-/// Disconnect yields empty rounds.
-pub struct LiveWire {
-    shared: std::sync::Arc<LiveShared>,
-    cmd_tx: std::sync::mpsc::Sender<LiveCmd>,
-}
-
-impl LiveWire {
-    /// Snapshot first (announcements + seed picture), then stand up the
-    /// actor. Snapshot failure fails the whole connect — the caller falls
-    /// back to an empty wire with the reason in its description.
-    pub fn connect(
-        ws_url: &str,
-        rest: &MinosRest,
-        token: &str,
-        cmd_tx: std::sync::mpsc::Sender<LiveCmd>,
-        cmd_rx: std::sync::mpsc::Receiver<LiveCmd>,
-        event_tx: std::sync::mpsc::Sender<LiveEvent>,
-    ) -> Result<Self, String> {
-        let snap = rest.snapshot(token)?;
-        let _ = event_tx.send(LiveEvent::Announced(snap.announced));
-        let mut known = std::collections::HashMap::new();
-        for f in snap.fixes {
-            known.insert(f.ship_id.clone(), f);
-        }
-        let shared = std::sync::Arc::new(LiveShared {
-            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            known: std::sync::Mutex::new(known),
-            live: std::sync::atomic::AtomicBool::new(true),
-        });
-        let token = token.to_string();
-        let ws_url = ws_url.to_string();
-        let rest_base = rest.base_url.clone();
-        let actor_shared = shared.clone();
-        std::thread::spawn(move || {
-            run_actor(ws_url, rest_base, token, actor_shared, cmd_rx, event_tx);
-        });
-        Ok(Self { shared, cmd_tx })
-    }
-
-    /// Newest queued event per ship, overlaid on the known picture.
-    fn drain_queue(&self) {
-        let mut fresh: std::collections::HashMap<String, Fix> = std::collections::HashMap::new();
-        if let Ok(mut q) = self.shared.queue.lock() {
-            for ev in q.drain(..) {
-                let fix = ev.to_fix();
-                match fresh.get(&fix.ship_id) {
-                    Some(prev) if prev.ts >= fix.ts => {}
-                    _ => {
-                        fresh.insert(fix.ship_id.clone(), fix);
-                    }
-                }
-            }
-        }
-        if fresh.is_empty() {
-            return;
-        }
-        if let Ok(mut known) = self.shared.known.lock() {
-            for (id, fix) in fresh {
-                known.insert(id, fix);
-            }
-        }
-    }
-}
-
-impl PollSource for LiveWire {
-    fn poll(&mut self) -> Result<Vec<Fix>, String> {
-        if !self.shared.live.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(Vec::new()); // actor down: feed-down reads as stale
-        }
-        self.drain_queue();
-        match self.shared.known.lock() {
-            Ok(known) => Ok(known.values().cloned().collect()),
-            Err(e) => Err(e.to_string()),
-        }
-    }
-}
-
-impl Drop for LiveWire {
-    /// Swapping the wire away stops the actor: disconnect, mark down,
-    /// end the thread. Best-effort — a dead actor's mailbox is gone.
-    fn drop(&mut self) {
-        let _ = self.cmd_tx.send(LiveCmd::Shutdown);
-    }
-}
-
-/// The actor: own thread, own multi-thread runtime (blocking REST re-reads
-/// must not stall callbacks), SDK client with JSON protocol. Reconnects
-/// pace on our backoff consts; fatal codes stop the loop and mark down.
-fn run_actor(
-    ws_url: String,
-    rest_base: String,
-    token: String,
-    shared: std::sync::Arc<LiveShared>,
-    cmd_rx: std::sync::mpsc::Receiver<LiveCmd>,
-    event_tx: std::sync::mpsc::Sender<LiveEvent>,
-) {
-    use std::sync::atomic::Ordering;
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            let _ = event_tx.send(LiveEvent::SocketError(format!("runtime: {e}")));
-            shared.live.store(false, Ordering::SeqCst);
-            return;
-        }
-    };
-    rt.block_on(async move {
-        use tokio_centrifuge::client::Client;
-        use tokio_centrifuge::config::Config;
-        use tokio_centrifuge::events::{ConnectedEvent, DisconnectedEvent};
-        use tokio_centrifuge::protocol::Publication;
-        let client = Client::new(
-            &ws_url,
-            Config::new().with_token(token.clone()).use_json(),
-        );
-        let current_token = std::sync::Arc::new(std::sync::Mutex::new(token));
-        // One subscription object: publications attach once, reconnects
-        // re-arm the same object (idempotent server-side).
-        let sub = client.new_subscription("live-feed");
-        // Publications: parse §5, queue newest-wins per tick. Personal
-        // channel traffic has no client-subscription path here; when the
-        // SDK surfaces it, drain it to the terminal, never to the Registry.
-        {
-            let shared = shared.clone();
-            sub.on_publication(move |p: Publication| {
-                match serde_json::from_slice::<FeedEvent>(&p.data) {
-                    Ok(ev) => {
-                        if let Ok(mut q) = shared.queue.lock() {
-                            q.push_back(ev);
-                        }
-                    }
-                    Err(e) => eprintln!("live-feed: unparsable publication: {e}"),
-                }
-            });
-            sub.on_error(|e| {
-                eprintln!("live-feed subscription error: {e:?}");
-            });
-        }
-        // Connected: report up, reset backoff, re-read the snapshot
-        // (reconcile-by-id: no channel history), re-arm the subscription.
-        {
-            let event_tx = event_tx.clone();
-            let shared = shared.clone();
-            let rest_base = rest_base.clone();
-            let current_token = current_token.clone();
-            let resub = sub.clone();
-            client.on_connected(move |e: ConnectedEvent<'_>| {
-                let _ = event_tx.send(LiveEvent::Connected {
-                    client_id: e.client_id.to_string(),
-                });
-                shared.live.store(true, Ordering::SeqCst);
-                if tokio::runtime::Handle::try_current().is_ok() {
-                    let resub = resub.clone();
-                    tokio::task::spawn(async move {
-                        let _ = resub.subscribe().await;
-                    });
-                    // Snapshot re-read off the callback path.
-                    let event_tx = event_tx.clone();
-                    let shared = shared.clone();
-                    let rest_base = rest_base.clone();
-                    let current_token = current_token.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let tok =
-                            current_token.lock().map(|t| t.clone()).unwrap_or_default();
-                        let Ok(rest) = MinosRest::new(&rest_base) else { return };
-                        let Ok(snap) = rest.snapshot(&tok) else { return };
-                        let _ = event_tx.send(LiveEvent::Announced(snap.announced));
-                        if let Ok(mut known) = shared.known.lock() {
-                            for f in snap.fixes {
-                                known.insert(f.ship_id.clone(), f);
-                            }
-                        }
-                    });
-                }
-            });
-        }
-        // Disconnects: the refusal policy. Fatal codes stop the loop;
-        // 109 asks the UI for a silent refresh; the rest back off.
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        {
-            let event_tx = event_tx.clone();
-            let stop = stop.clone();
-            let attempts = attempts.clone();
-            let shared = shared.clone();
-            client.on_disconnected(move |e: DisconnectedEvent<'_>| {
-                shared.live.store(false, Ordering::SeqCst);
-                match e.code {
-                    101 | 103 | 107 => {
-                        let _ = event_tx.send(LiveEvent::Refused {
-                            code: e.code,
-                            reason: e.reason.to_string(),
-                        });
-                        stop.store(true, Ordering::SeqCst);
-                    }
-                    109 => {
-                        let _ = event_tx.send(LiveEvent::RefreshDue);
-                    }
-                    _ => {
-                        let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                        let wait = (LIVE_BACKOFF_BASE_SECS
-                            .saturating_mul(1u64 << n.min(6))
-                            .min(LIVE_BACKOFF_CAP_SECS))
-                            + full_jitter_secs(LIVE_BACKOFF_CAP_SECS.min(5));
-                        let _ = event_tx.send(LiveEvent::Reconnecting {
-                            attempt: n,
-                            wait_secs: wait,
-                        });
-                    }
-                }
-            });
-        }
-        client.on_error(|e| {
-            eprintln!("live socket error: {e:?}");
-        });
-        // Initial subscribe attempt (pre-connect declaration; the server
-        // arms it on handshake, and on_connected re-arms per reconnect).
-        {
-            let sub = client.new_subscription("live-feed");
-            let _ = sub.subscribe().await;
-        }
-        let _ = client.connect().await;
-        // Command + reconnect loop: token push-down applies live via
-        // set_token; shutdown/fatal disconnects the client and ends us.
-        let mut backoff_wait: Option<u64> = None;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            match cmd_rx.try_recv() {
-                Ok(LiveCmd::SetToken(t)) => {
-                    if let Ok(mut cur) = current_token.lock() {
-                        *cur = t.clone();
-                    }
-                    client.set_token(t);
-                }
-                Ok(LiveCmd::Shutdown) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    break;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-            if stop.load(Ordering::SeqCst) {
-                break;
-            }
-            // Retryable disconnect outstanding: pace our explicit
-            // re-handshake on our backoff (harmless if the SDK's own
-            // reconnect already won the race — the server dedupes).
-            if !shared.live.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
-                let wait = backoff_wait.get_or_insert_with(|| {
-                    let n = attempts.load(Ordering::SeqCst).max(1);
-                    LIVE_BACKOFF_BASE_SECS
-                        .saturating_mul(1u64 << n.min(6))
-                        .min(LIVE_BACKOFF_CAP_SECS)
-                        + full_jitter_secs(5)
-                });
-                tokio::time::sleep(std::time::Duration::from_secs(*wait)).await;
-                backoff_wait = None;
-                let _ = client.connect().await;
-            } else {
-                backoff_wait = None;
-            }
-        }
-        let _ = client.disconnect().await;
-        shared.live.store(false, Ordering::SeqCst);
-    });
+    Ok((body["data"].clone(), body["metadata"].clone()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geo::track::FixSource;
+
+    /// Manifest parsing is pure JSON work, so it is tested against
+    /// the envelope shape without a server: dimensions present,
+    /// dimensions absent, and the coverage counter.
+    #[test]
+    fn image_manifest_reads_pixel_dimensions_and_coverage() {
+        let data = serde_json::json!({
+            "content_changed_at": "2026-09-24T10:00:00Z",
+            "etag": "\"asset-v1\"",
+            "entry_count": 2,
+            "units_without_image_count": 7,
+            "entries": [
+                {
+                    "asset_kind": "unit_image",
+                    "id_unit": 6006,
+                    "name": "KRI Ahmad Yani",
+                    "hull_number": "381",
+                    "file_name": "images/6006.png",
+                    "content_type": "image/png",
+                    "size_bytes": 4096,
+                    "width_px": 512,
+                    "height_px": 256,
+                    "loa_m": 120.5,
+                    "beam_m": 16.2
+                },
+                {
+                    "asset_kind": "unit_image",
+                    "id_unit": 6020,
+                    "name": "KRI 상담",
+                    "file_name": "images/6020.jpg",
+                    "content_type": "image/jpeg",
+                    "size_bytes": 64
+                }
+            ]
+        });
+        let m = master::parse_image_manifest(&data);
+        assert_eq!(m.version, "\"asset-v1\"", "ETag is the content identity");
+        assert_eq!(m.entry_count, 2);
+        assert_eq!(m.units_without_image, 7);
+        assert_eq!(m.entries.len(), 2);
+        let sized = m.entries.iter().find(|e| e.unit_id == 6006).expect("6006");
+        assert_eq!(sized.asset_kind, "unit_image");
+        assert_eq!(sized.width_px, Some(512));
+        assert_eq!(sized.height_px, Some(256));
+        assert_eq!(sized.loa_m, Some(120.5));
+        assert_eq!(sized.beam_m, Some(16.2));
+        // Absent is preserved as absent — never read as zero, which
+        // would make a 0×0 image look measured rather than unknown.
+        let bare = m.entries.iter().find(|e| e.unit_id == 6020).expect("6020");
+        assert_eq!(bare.width_px, None);
+        assert_eq!(bare.height_px, None);
+        assert_eq!(bare.loa_m, None);
+        assert_eq!(bare.beam_m, None);
+        // A hull with no image is absent from entries, not a null row.
+        assert!(m.entries.iter().all(|e| e.unit_id != 0));
+    }
+
+    /// The spec parser is the boundary where an unpublished
+    /// measurement must stay unpublished.
+    #[test]
+    fn hull_spec_keeps_measurements_and_preserves_none() {
+        let full = serde_json::json!({
+            "unit_class": { "id": 5, "name": "Sigma" },
+            "current_specification": {
+                "version": 2,
+                "speed_max_surface_kn": 30.0,
+                "speed_cruise_kn": 18.0,
+                "range_nm": 3200.0,
+                "loa_m": 120.5,
+                "beam_m": 16.2,
+                "draft_m": 4.1,
+                "displacement_standard_t": 3900.0,
+                "displacement_full_t": 5200.0,
+                "turn_rate_max_deg_s": 2.5
+            }
+        });
+        let s = master::parse_hull_spec(&full, 13).expect("full spec");
+        assert_eq!(s.loa_m, Some(120.5));
+        assert_eq!(s.beam_m, Some(16.2));
+        assert_eq!(s.draft_m, Some(4.1));
+        assert_eq!(s.displacement_standard_t, Some(3900.0));
+        assert_eq!(s.displacement_full_t, Some(5200.0));
+        assert_eq!(s.turn_rate_max_deg_s, Some(2.5));
+        // The sim figures are untouched by the map's.
+        assert_eq!(s.speed_kn, Some(30.0));
+
+        // A published spec that omits every physical measurement.
+        let bare = serde_json::json!({
+            "unit_class": { "id": 5, "name": "Sigma" },
+            "current_specification": { "version": 1, "speed_max_surface_kn": 12.0 }
+        });
+        let s = master::parse_hull_spec(&bare, 13).expect("bare spec");
+        assert_eq!(s.loa_m, None, "an absent loa_m is unknown, not zero");
+        assert_eq!(s.beam_m, None);
+        assert_eq!(s.draft_m, None);
+        assert_eq!(s.displacement_standard_t, None);
+        assert_eq!(s.turn_rate_max_deg_s, None);
+        assert_eq!(s.speed_kn, Some(12.0), "published speed still parses");
+
+        // No published spec at all is the NoSpec refusal, as before.
+        let none = serde_json::json!({ "unit_class": { "id": 5, "name": "Sigma" } });
+        assert!(master::parse_hull_spec(&none, 13).is_err());
+    }
 
     #[test]
-    fn http_poll_fetches_mock_backend() {
+    fn mock_poll_fetches_mock_backend() {
         let body = r#"[{"ship_id":"a","lat":53.5,"lon":9.9,"ts":"2026-09-12T00:00:00Z"}]"#;
         let server = tiny_http::Server::http("127.0.0.1:18080").expect("bind test port");
         std::thread::spawn(move || {
@@ -1337,7 +286,7 @@ mod tests {
                 let _ = rq.respond(tiny_http::Response::from_string(body));
             }
         });
-        let mut src = HttpPoll::new("http://127.0.0.1:18080").expect("client builds");
+        let mut src = MockPoll::new("http://127.0.0.1:18080").expect("client builds");
         let fixes = src.poll().expect("poll succeeds");
         assert_eq!(fixes.len(), 1);
         assert_eq!(fixes[0].ship_id, "a");
@@ -1359,8 +308,9 @@ mod tests {
                     let _ = rq.respond(tiny_http::Response::from_string(body));
                 } else if post && url == "/v0/invites" {
                     let mut text = String::new();
-                    use std::io::Read;
-                    rq.as_reader().read_to_string(&mut text).expect("body reads");
+                    rq.as_reader()
+                        .read_to_string(&mut text)
+                        .expect("body reads");
                     let v: serde_json::Value = serde_json::from_str(&text).expect("json body");
                     let rec = Invite {
                         code: v["code"].as_str().unwrap_or("TFG-0000").to_string(),
@@ -1374,8 +324,9 @@ mod tests {
                     ));
                 } else if post && url == "/v0/invites/redeem" {
                     let mut text = String::new();
-                    use std::io::Read;
-                    rq.as_reader().read_to_string(&mut text).expect("body reads");
+                    rq.as_reader()
+                        .read_to_string(&mut text)
+                        .expect("body reads");
                     let v: serde_json::Value = serde_json::from_str(&text).expect("json body");
                     let code = v["code"].as_str().unwrap_or("");
                     match store.iter_mut().find(|r| r.code == code) {
@@ -1395,14 +346,19 @@ mod tests {
             }
         });
         let client = InviteClient::new("http://127.0.0.1:18081").expect("client builds");
-        let rec = client.issue("ani", "helm kri-a", "TFG-0007").expect("issue succeeds");
+        let rec = client
+            .issue("ani", "helm kri-a", "TFG-0007")
+            .expect("issue succeeds");
         assert_eq!(rec.code, "TFG-0007");
         assert!(!rec.redeemed);
         let all = client.list().expect("list succeeds");
         assert_eq!(all.len(), 1);
         let done = client.redeem("TFG-0007").expect("redeem succeeds");
         assert!(done.redeemed);
-        assert!(client.redeem("TFG-9999").is_err(), "unknown code fails loud");
+        assert!(
+            client.redeem("TFG-9999").is_err(),
+            "unknown code fails loud"
+        );
     }
 
     #[test]
@@ -1413,7 +369,6 @@ mod tests {
         std::thread::spawn(move || {
             for mut rq in server.incoming_requests().take(4) {
                 let mut text = String::new();
-                use std::io::Read;
                 rq.as_reader().read_to_string(&mut text).unwrap_or(0);
                 let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                 let url = rq.url().to_string();
@@ -1433,7 +388,7 @@ mod tests {
                         r#"{"status_code":200,"message":"Successfull","data":{"id":7,"username":"operator1"}}"#,
                     )
                 } else {
-                    tiny_http::Response::empty(404)
+                    tiny_http::Response::from_string("").with_status_code(404)
                 };
                 let _ = rq.respond(resp);
             }
@@ -1446,7 +401,137 @@ mod tests {
         let pair2 = auth.refresh("RT1").expect("refresh rotates");
         assert_eq!(pair2.access_token, "AT2");
         assert_eq!(pair2.refresh_token.as_deref(), Some("RT2"));
-        auth.me("AT2").expect("gate open");
+        let uid = auth.me("AT2").expect("gate open");
+        assert_eq!(uid, 7, "probe carries the caller id for readiness matching");
+    }
+
+    #[test]
+    fn refusal_detail_surfaces_gate_reasons() {
+        // M1: data.errors rides the error — status and top message stay,
+        // the gate's own words join them instead of a bare 409.
+        let server = tiny_http::Server::http("127.0.0.1:18093").expect("bind test port");
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests().take(1) {
+                assert!(rq.url().contains("/transitions"));
+                let _ = rq.respond(
+                    tiny_http::Response::from_string(
+                        r#"{"status_code":409,"message":"Conflict occurred","data":{"errors":{"_request":"2 hull(s) still need a starting position; Commando Rina Wijaya is not ready"}}}"#,
+                    )
+                    .with_status_code(409),
+                );
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18093/api/v1").expect("client builds");
+        let err = master.transition_game("AT", 3, "execution").unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("409"), "status kept: {text}");
+        assert!(text.contains("starting position"), "gate detail surfaces: {text}");
+        assert!(text.contains("not ready"), "every reason joins: {text}");
+        assert!(
+            err.detail().is_some_and(|d| d.contains("Rina Wijaya")),
+            "structured access preserved"
+        );
+    }
+
+    #[test]
+    fn messages_send_list_read_against_stub() {
+        // #99: send answers the stored message, the inbox pages it,
+        // receipts come back on the row, roles list for sending-as.
+        let server = tiny_http::Server::http("127.0.0.1:18095").expect("bind test port");
+        std::thread::spawn(move || {
+            for mut rq in server.incoming_requests().take(4) {
+                let (method, url) = (rq.method().as_str().to_string(), rq.url().to_string());
+                let mut text = String::new();
+                rq.as_reader().read_to_string(&mut text).unwrap_or(0);
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                let (status, body) = if method == "POST" && url.ends_with("/games/3/messages") {
+                    assert_eq!(v["kind"].as_str(), Some("telegram"));
+                    assert_eq!(v["classification"].as_str(), Some("TERBUKA"));
+                    assert!(v.get("to").is_none(), "no audience sent means broadcast");
+                    (201, r#"{"status_code":201,"message":"Created","data":{"id":11,"id_game":3,"kind":"telegram","classification":{"code":"TERBUKA","label":"Terbuka"},"sender":{"assumed_role":{"id":2,"name":"Panglima"}},"recipients":[],"broadcast":true,"content":"Mulai latihan","callsign":"","created_at":"2026-11-01T02:00:00Z","assumed_at":"2026-11-01T02:00:00Z"}}"#)
+                } else if method == "GET" && url.contains("/games/3/messages") {
+                    (200, r#"{"status_code":200,"message":"Successfull","data":[{"id":11,"id_game":3,"kind":"telegram","classification":{"code":"TERBUKA","label":"Terbuka"},"sender":{"assumed_role":{"id":2,"name":"Panglima"}},"recipients":[],"broadcast":true,"content":"Mulai latihan","callsign":"","created_at":"2026-11-01T02:00:00Z","assumed_at":"2026-11-01T02:00:00Z"},{"id":12,"id_game":3,"kind":"administrative","classification":{"code":"RAHASIA","label":"Rahasia"},"sender":{"author":{"id":6,"username":"budi","name":"Budi Santoso"}},"recipients":[{"id_user":7,"kind":"to","read_at":null}],"broadcast":false,"content":"Rapat jam 3","callsign":"KRI-381","created_at":"2026-11-01T02:01:00Z","assumed_at":"2026-11-01T02:01:00Z"}]}"#)
+                } else if method == "POST" && url.ends_with("/messages/12/read") {
+                    (200, r#"{"status_code":200,"message":"Successfull","data":{"id":12,"id_game":3,"kind":"administrative","classification":{"code":"RAHASIA","label":"Rahasia"},"sender":{"author":{"id":6,"username":"budi","name":"Budi Santoso"}},"recipients":[{"id_user":7,"kind":"to","read_at":"2026-11-01T02:05:00Z"}],"broadcast":false,"content":"Rapat jam 3","callsign":"KRI-381","created_at":"2026-11-01T02:01:00Z","assumed_at":"2026-11-01T02:01:00Z"}}"#)
+                } else if method == "GET" && url.ends_with("/scenario-roles") {
+                    (200, r#"{"status_code":200,"message":"Successfull","data":[{"id":2,"id_game":3,"name":"Panglima","created_at":"2026-11-01T01:00:00Z"}]}"#)
+                } else {
+                    (404, r#"{"status_code":404,"message":"Not Found","data":null}"#)
+                };
+                let resp = if status == 404 {
+                    tiny_http::Response::from_string(body).with_status_code(404)
+                } else {
+                    tiny_http::Response::from_string(body).with_status_code(status)
+                };
+                let _ = rq.respond(resp);
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18095/api/v1").expect("client builds");
+        let draft = MsgDraft {
+            kind: "telegram".into(),
+            classification: "TERBUKA".into(),
+            content: "Mulai latihan".into(),
+            degree: 1,
+            ..Default::default()
+        };
+        let sent = master.send_message("AT", 3, &draft).expect("send");
+        assert_eq!(sent.sender, "Panglima");
+        assert!(sent.broadcast);
+        let inbox = master.inbox_list("AT", 3, None, false).expect("inbox");
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(inbox[1].sender, "Budi Santoso");
+        assert!(inbox[1].recipients.iter().all(|r| r.read_at.is_none()));
+        let read = master.mark_read("AT", 3, 12).expect("receipt");
+        assert!(read.recipients.iter().all(|r| r.read_at.is_some()));
+        let roles = master.scenario_roles("AT", 3).expect("roles");
+        assert_eq!(roles, vec![ScenarioRole { id: 2, name: "Panglima".into() }]);
+    }
+
+    #[test]
+    fn token_pair_parses_strictly() {
+        // M2: token_type and lifetime are enforced, not defaulted; the
+        // courtesy flag parses; a missing token is a decode error.
+        let server = tiny_http::Server::http("127.0.0.1:18094").expect("bind test port");
+        std::thread::spawn(move || {
+            for mut rq in server.incoming_requests().take(4) {
+                let mut text = String::new();
+                rq.as_reader().read_to_string(&mut text).unwrap_or(0);
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                let body = match v["identifier"].as_str() {
+                    Some("full") => r#"{"status_code":200,"message":"Successfull","data":{"access_token":"AT","token_type":"Bearer","expires_in":3600,"refresh_token":"RT","must_change_password":true}}"#,
+                    Some("notoken") => r#"{"status_code":200,"message":"Successfull","data":{"token_type":"Bearer","expires_in":3600}}"#,
+                    Some("badscheme") => r#"{"status_code":200,"message":"Successfull","data":{"access_token":"AT","token_type":"MAC","expires_in":3600}}"#,
+                    _ => r#"{"status_code":200,"message":"Successfull","data":{"access_token":"AT","token_type":"Bearer"}}"#,
+                };
+                let _ = rq.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        let auth = MinosAuth::new("http://127.0.0.1:18094/api/v1").expect("client builds");
+        let pair = auth.login("full", "s3cret!").expect("full pair parses");
+        assert_eq!(pair.token_type, "Bearer");
+        assert!(pair.must_change_password, "courtesy flag routes to change-password");
+        assert!(auth.login("notoken", "x").is_err(), "missing token is a decode error");
+        assert!(auth.login("badscheme", "x").is_err(), "non-Bearer scheme refused");
+        assert!(auth.login("notime", "x").is_err(), "missing lifetime refused, never zero");
+    }
+
+    #[test]
+    fn minos_logout_revokes_204() {
+        // H9: logout presents the refresh token as JSON and answers 204
+        // with no body — whatever happened, so it cannot probe tokens.
+        let server = tiny_http::Server::http("127.0.0.1:18092").expect("bind test port");
+        std::thread::spawn(move || {
+            for mut rq in server.incoming_requests().take(1) {
+                assert_eq!(rq.url(), "/api/v1/auth/logout");
+                let mut text = String::new();
+                rq.as_reader().read_to_string(&mut text).unwrap_or(0);
+                let v: serde_json::Value = serde_json::from_str(&text).expect("json body");
+                assert_eq!(v["refresh_token"].as_str(), Some("RT1"));
+                let _ = rq.respond(tiny_http::Response::empty(204));
+            }
+        });
+        let auth = MinosAuth::new("http://127.0.0.1:18092/api/v1").expect("client builds");
+        auth.logout(Some("RT1")).expect("logout succeeds");
     }
 
     #[test]
@@ -1473,9 +558,9 @@ mod tests {
         });
         let auth = MinosAuth::new("http://127.0.0.1:18083/api/v1").expect("client builds");
         let err = auth.login("nobody", "wrong").unwrap_err();
-        assert!(err.contains("401"), "{err}");
+        assert!(matches!(err, BackendError::Unauthorized { .. }), "{err}");
         let err = auth.me("STALE").unwrap_err();
-        assert!(err.contains("403"), "{err}");
+        assert!(matches!(err, BackendError::Forbidden { .. }), "{err}");
     }
 
     #[test]
@@ -1485,8 +570,9 @@ mod tests {
             for mut rq in server.incoming_requests().take(1) {
                 assert_eq!(rq.url(), "/api/v1/users/me/password");
                 let mut text = String::new();
-                use std::io::Read;
-                rq.as_reader().read_to_string(&mut text).expect("body reads");
+                rq.as_reader()
+                    .read_to_string(&mut text)
+                    .expect("body reads");
                 let v: serde_json::Value = serde_json::from_str(&text).expect("json body");
                 assert!(v["current_password"].is_string());
                 assert!(v["new_password"].is_string());
@@ -1494,7 +580,8 @@ mod tests {
             }
         });
         let auth = MinosAuth::new("http://127.0.0.1:18084/api/v1").expect("client builds");
-        auth.change_password("AT", "old-pw", "new-pw-12-chars").expect("change succeeds");
+        auth.change_password("AT", "old-pw", "new-pw-12-chars")
+            .expect("change succeeds");
     }
 
     #[test]
@@ -1518,7 +605,7 @@ mod tests {
         assert_eq!(spec.class_name, "Sigma");
         assert_eq!(spec.speed_kn, Some(28.5));
         let err = master.hull_spec("AT", 14).unwrap_err();
-        assert!(err.contains("no published specification"), "{err}");
+        assert!(matches!(err, BackendError::NoSpec { unit_id: 14 }), "{err}");
     }
 
     #[test]
@@ -1536,33 +623,249 @@ mod tests {
             }
         });
         let master = MinosMaster::new("http://127.0.0.1:18087/api/v1").expect("client builds");
-        assert_eq!(master.category_ids_for_branch("AT", 1).expect("ids"), vec![2]);
-        assert!(master.category_ids_for_branch("AT", 3).expect("empty").is_empty());
+        assert_eq!(
+            master.category_ids_for_branch("AT", 1).expect("ids"),
+            vec![2]
+        );
+        assert!(
+            master
+                .category_ids_for_branch("AT", 3)
+                .expect("empty")
+                .is_empty()
+        );
     }
 
     #[test]
     fn session_users_list_search_add_and_command() {
         let server = tiny_http::Server::http("127.0.0.1:18088").expect("bind test port");
         std::thread::spawn(move || {
-            for rq in server.incoming_requests().take(4) {
+            for rq in server.incoming_requests().take(8) {
                 let (method, url) = (rq.method().as_str().to_string(), rq.url().to_string());
-                let body = if method == "GET" && url.contains("/users") && url.contains("page_number=1") {
-                    r#"{"status_code":200,"message":"Successfull","data":[{"id":6,"username":"budi","name":"Budi Santoso"}]}"#
+                let body = if method == "GET"
+                    && url.contains("/users")
+                    && url.contains("page_number=1")
+                    && url.contains("search=bud")
+                    && url.contains("id_user_status=9")
+                    && url.contains("id_app_role=7")
+                {
+                    r#"{"status_code":200,"message":"Successfull","data":[{"id":6,"username":"budi","name":"Budi Santoso","pangkat":"Serda","satuan":"KRI Sigma","jabatan":"Nakhoda","status":{"id":9,"name":"Active","id_name":"Aktif"}}]}"#
+                } else if method == "GET" && url.ends_with("/games/3") {
+                    r#"{"status_code":200,"message":"Successfull","data":{"id":3,"name":"Operasi Batu Malang","mode":"maneuver","state":"preparation","time_factor":2.0}}"#
                 } else if method == "GET" {
                     r#"{"status_code":200,"message":"Successfull","data":[]}"#
+                } else if url.contains("/transitions") {
+                    r#"{"status_code":200,"message":"Successfull","data":{"id":3,"name":"Operasi Batu Malang","mode":"maneuver","state":"preparation"}}"#
+                } else if method == "POST" && url.ends_with("/games") {
+                    r#"{"status_code":201,"message":"Created","data":{"id":3,"name":"Operasi Batu Malang","mode":"maneuver","state":"planning"}}"#
+                } else if method == "DELETE" {
+                    r#"{"status_code":200,"message":"Successfull","data":[]}"#
+                } else if method == "POST" && url.contains("/units") {
+                    r#"{"status_code":200,"message":"Successfull","data":[{"id_unit":13,"unit_name":"KRI Ahmad Yani","hull_number":"KRI-AH-YN","id_commander":6,"commander_name":"Budi Santoso"}]}"#
                 } else if method == "POST" {
-                    r#"{"status_code":201,"message":"Created","data":[]}"#
+                    r#"{"status_code":201,"message":"Created","data":[{"id_user":6,"user_name":"Budi Santoso","id_game_role":1,"role_name":"Commando","is_judge_side":false,"is_ready":false},{"id_user":7,"user_name":"Rina Wijaya","id_game_role":4,"role_name":"Referee","is_judge_side":true,"is_ready":false}]}"#
                 } else {
-                    r#"{"status_code":200,"message":"Successfull","data":{"id_unit":13}}"#
+                    r#"{"status_code":200,"message":"Successfull","data":[{"id_unit":13,"unit_name":"KRI Ahmad Yani","hull_number":"KRI-AH-YN","id_commander":6,"commander_name":"Budi Santoso"}]}"#
                 };
                 let _ = rq.respond(tiny_http::Response::from_string(body));
             }
         });
         let master = MinosMaster::new("http://127.0.0.1:18088/api/v1").expect("client builds");
-        let users = master.users_list("AT", "bud").expect("directory");
-        assert_eq!(users, vec![BackendUser { id: 6, username: "budi".into(), name: "Budi Santoso".into() }]);
-        master.add_participant("AT", 3, 6, 1).expect("seat");
-        master.set_unit_commander("AT", 3, 13, 6).expect("command");
+        // The filters reach the wire: the row only parses when every
+        // query param above matched.
+        let users = master.users_list("AT", "bud", Some(9), Some(7)).expect("directory");
+        assert_eq!(
+            users,
+            vec![BackendUser {
+                id: 6,
+                username: "budi".into(),
+                name: "Budi Santoso".into(),
+                nrp: String::new(),
+                pangkat: "Serda".into(),
+                satuan: "KRI Sigma".into(),
+                jabatan: "Nakhoda".into(),
+                status_id: Some(9),
+                status_name: "Active".into(),
+            }]
+        );
+        let seated = master.add_participant("AT", 3, 6, 1).expect("seat");
+        assert_eq!(seated.len(), 2, "seat answers with the whole roster");
+        assert!(!seated[0].ready, "fresh seat is never ready");
+        // The judge flag has to parse: the UI's commander exclusions
+        // hang off it, and a silent false would let a Referee in.
+        assert!(!seated[0].judge, "exercise side reads as non-judge");
+        assert!(seated[1].judge, "judge-side row parses as judge");
+        assert_eq!(seated[1].role_name, "Referee");
+        let units = master.set_unit_commander("AT", 3, 13, 6).expect("command");
+        assert_eq!(units[0].commander_id, Some(6), "command answers with units");
+        assert_eq!(units[0].hull_number, "KRI-AH-YN");
+        // Game lifecycle for the setup flow: create, assign, remove,
+        // advance — every write answers with the collection it changed.
+        let game = master
+            .create_game("AT", "Operasi Batu Malang", "", "", "", "", "")
+            .expect("create");
+        assert_eq!(game.id, 3);
+        assert_eq!(game.state, "planning", "games are born in planning");
+        let pieces = master.assign_unit("AT", 3, 13, 6).expect("assign");
+        assert_eq!(pieces[0].commander_id, Some(6), "assign answers with units");
+        let pieces = master.remove_unit("AT", 3, 13).expect("remove");
+        assert!(pieces.is_empty(), "remove answers with the emptied units");
+        let moved = master.transition_game("AT", 3, "preparation").expect("advance");
+        assert_eq!(moved.state, "preparation");
+        // H1: the held game's stage derives from the detail read, so a
+        // transition another client made is visible on select/refresh.
+        let detail = master.game_detail("AT", 3).expect("detail");
+        assert_eq!(detail.state, "preparation");
+        assert_eq!(detail.mode, "maneuver");
+        assert_eq!(detail.name, "Operasi Batu Malang");
+        // H2: the anchor rides the detail, so mid-exercise selects learn
+        // the clock without moving it.
+        assert_eq!(detail.time_factor, 2.0);
+        assert!(detail.actual_start.is_none(), "preparation has no anchor yet");
+    }
+
+    #[test]
+    fn execution_gate_writes_against_stub() {
+        // C2: placements, readiness, and join speak the game contract —
+        // PUT placement answers the setup view, readiness/join answer
+        // the game plus the caller's own row.
+        let server = tiny_http::Server::http("127.0.0.1:18089").expect("bind test port");
+        std::thread::spawn(move || {
+            for mut rq in server.incoming_requests().take(4) {
+                let (method, url) = (rq.method().as_str().to_string(), rq.url().to_string());
+                let mut text = String::new();
+                rq.as_reader().read_to_string(&mut text).unwrap_or(0);
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                let body = if method == "PUT" && url.ends_with("/units/13/placement") {
+                    assert_eq!(v["latitude"].as_f64(), Some(-6.0888));
+                    assert_eq!(v["longitude"].as_f64(), Some(106.9111));
+                    r#"{"status_code":200,"message":"Successfull","data":{"placements":[{"id_unit":13,"latitude":-6.0888,"longitude":106.9111}],"placed":1,"unplaced":2,"ready":false}}"#
+                } else if method == "GET" && url.ends_with("/placements") {
+                    r#"{"status_code":200,"message":"Successfull","data":{"placements":[{"id_unit":13,"latitude":-6.0888,"longitude":106.9111}],"placed":1,"unplaced":0,"ready":true}}"#
+                } else if method == "PUT" && url.ends_with("/readiness") {
+                    r#"{"status_code":200,"message":"Successfull","data":{"game":{"id":3,"name":"Operasi Batu Malang","mode":"maneuver","state":"preparation"},"participant":{"id_user":6,"user_name":"Budi Santoso","id_game_role":1,"role_name":"Commando","is_judge_side":false,"is_ready":true},"commanded_units":[]}}"#
+                } else if method == "POST" && url.ends_with("/games/join") {
+                    assert_eq!(v["room_key"].as_str(), Some("RUNG-7X2"));
+                    r#"{"status_code":200,"message":"Successfull","data":{"game":{"id":3,"name":"Operasi Batu Malang","mode":"maneuver","state":"preparation"},"participant":{"id_user":6,"user_name":"Budi Santoso","id_game_role":1,"role_name":"Commando","is_judge_side":false,"is_ready":false},"commanded_units":[]}}"#
+                } else {
+                    r#"{"status_code":404,"message":"Not Found","data":null}"#
+                };
+                let resp = if body.contains("\"status_code\":404") {
+                    tiny_http::Response::from_string(body).with_status_code(404)
+                } else {
+                    tiny_http::Response::from_string(body)
+                };
+                let _ = rq.respond(resp);
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18089/api/v1").expect("client builds");
+        let view = master
+            .set_placement("AT", 3, 13, -6.0888, 106.9111)
+            .expect("place");
+        assert_eq!(view.placed, 1);
+        assert_eq!(view.unplaced, 2);
+        assert!(!view.ready, "two hulls still need a position");
+        assert_eq!(view.placements[0].unit_id, 13);
+        let view = master.placements_list("AT", 3).expect("list");
+        assert!(view.ready, "server arithmetic decides readiness, never the client");
+        assert_eq!(view.unplaced, 0);
+        let j = master.set_readiness("AT", 3, true).expect("declare");
+        assert_eq!(j.game_id, 3);
+        assert_eq!(j.game_state, "preparation");
+        assert_eq!(j.user_id, 6);
+        assert!(j.ready, "answer carries the row the database decided");
+        assert!(!j.judge);
+        let j = master.join_game("AT", "RUNG-7X2").expect("join");
+        assert_eq!(j.game_name, "Operasi Batu Malang");
+        assert!(!j.ready, "fresh join has not declared yet");
+    }
+
+    #[test]
+    fn authoritative_orders_and_plot_against_stub() {
+        // C3: orders carry heading + speed only (no position, no time —
+        // both are the server's); the answer is the fix the order closed
+        // at, and the plot echoes the instant it answered for.
+        let server = tiny_http::Server::http("127.0.0.1:18090").expect("bind test port");
+        std::thread::spawn(move || {
+            for mut rq in server.incoming_requests().take(2) {
+                let (method, url) = (rq.method().as_str().to_string(), rq.url().to_string());
+                let mut text = String::new();
+                rq.as_reader().read_to_string(&mut text).unwrap_or(0);
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                let (status, body) = if method == "POST" && url.ends_with("/units/13/order") {
+                    assert_eq!(v["heading_deg"].as_f64(), Some(45.0));
+                    assert_eq!(v["speed_kn"].as_f64(), Some(20.0));
+                    assert!(v.get("latitude").is_none(), "orders carry no position");
+                    (201, r#"{"status_code":201,"message":"Created","data":{"id_unit":13,"assumed_time":"2026-11-01T01:00:00Z","latitude":-6.0888,"longitude":106.9111,"heading_deg":45.0,"speed_kn":12.0,"requested_speed_kn":20.0,"clamped":true,"created_at":"2026-11-01T01:00:00Z","created_by":6}}"#)
+                } else if method == "GET" && url.ends_with("/positions") {
+                    (200, r#"{"status_code":200,"message":"Successfull","data":{"assumed_time":"2026-11-01T01:05:00Z","positions":[{"id_unit":13,"latitude":-6.08,"longitude":106.92,"heading_deg":45.0,"speed_kn":12.0,"assumed_time":"2026-11-01T01:00:00Z"}]}}"#)
+                } else {
+                    (404, r#"{"status_code":404,"message":"Not Found","data":null}"#)
+                };
+                let resp = if status == 200 || status == 201 {
+                    tiny_http::Response::from_string(body).with_status_code(status)
+                } else {
+                    tiny_http::Response::from_string(body).with_status_code(404)
+                };
+                let _ = rq.respond(resp);
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18090/api/v1").expect("client builds");
+        let fix = master.order_unit("AT", 3, 13, 45.0, 20.0).expect("order");
+        assert_eq!(fix.unit_id, 13);
+        assert!(fix.clamped, "20 kn exceeded the hull's published max");
+        assert_eq!(fix.requested_speed, Some(20.0), "ask preserved beside the clamp");
+        assert_eq!(fix.speed, 12.0, "applied speed is the clamped one");
+        assert_eq!(fix.assumed_time, "2026-11-01T01:00:00Z");
+        let plot = master.positions("AT", 3, None, None).expect("plot");
+        assert_eq!(plot.assumed_time, "2026-11-01T01:05:00Z", "instant echoed back");
+        assert_eq!(plot.positions.len(), 1);
+        assert_eq!(plot.positions[0].heading, 45.0);
+    }
+
+    #[test]
+    fn scenario_clock_writes_against_stub() {
+        // H2: pause appends the zero segment and closes orders while the
+        // chosen factor is kept; resume reopens at that rate; factor
+        // writes the rate (no upper bound) and answers the whole clock.
+        // Every write IS the read — there is no clock GET.
+        let server = tiny_http::Server::http("127.0.0.1:18091").expect("bind test port");
+        std::thread::spawn(move || {
+            for mut rq in server.incoming_requests().take(3) {
+                let (method, url) = (rq.method().as_str().to_string(), rq.url().to_string());
+                let mut text = String::new();
+                rq.as_reader().read_to_string(&mut text).unwrap_or(0);
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                let body = if method == "POST" && url.ends_with("/games/3/pause") {
+                    assert!(v.is_null(), "pause is bodiless");
+                    r#"{"status_code":200,"message":"Successfull","data":{"state":"execution","actual_start":"2026-11-01T00:00:00Z","assumed_start":"2026-11-01T00:00:00Z","assumed_now":"2026-11-01T02:00:00Z","time_factor":2.0,"accepting_actions":false,"running":false,"segments":[{"factor":2.0,"effective_from":"2026-11-01T00:00:00Z","source":"execution"},{"factor":0.0,"effective_from":"2026-11-01T02:00:00Z","source":"pause"}]}}"#
+                } else if method == "POST" && url.ends_with("/games/3/resume") {
+                    r#"{"status_code":200,"message":"Successfull","data":{"state":"execution","actual_start":"2026-11-01T00:00:00Z","assumed_start":"2026-11-01T00:00:00Z","assumed_now":"2026-11-01T02:30:00Z","time_factor":2.0,"accepting_actions":true,"running":true,"segments":[{"factor":2.0,"effective_from":"2026-11-01T00:00:00Z","source":"execution"},{"factor":0.0,"effective_from":"2026-11-01T02:00:00Z","source":"pause"},{"factor":2.0,"effective_from":"2026-11-01T02:30:00Z","source":"resume"}]}}"#
+                } else if method == "PATCH" && url.ends_with("/games/3/time-factor") {
+                    assert_eq!(v["time_factor"].as_f64(), Some(6.0));
+                    r#"{"status_code":200,"message":"Successfull","data":{"state":"execution","actual_start":"2026-11-01T00:00:00Z","assumed_start":"2026-11-01T00:00:00Z","assumed_now":"2026-11-01T03:00:00Z","time_factor":6.0,"accepting_actions":true,"running":true,"segments":[{"factor":6.0,"effective_from":"2026-11-01T03:00:00Z","source":"gm"}]}}"#
+                } else {
+                    r#"{"status_code":404,"message":"Not Found","data":null}"#
+                };
+                let resp = if body.contains("\"status_code\":404") {
+                    tiny_http::Response::from_string(body).with_status_code(404)
+                } else {
+                    tiny_http::Response::from_string(body)
+                };
+                let _ = rq.respond(resp);
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18091/api/v1").expect("client builds");
+        let held = master.pause_game("AT", 3).expect("pause");
+        assert!(!held.running, "last segment is the zero one");
+        assert!(!held.accepting_actions, "pause closes the exercise to orders");
+        assert_eq!(held.time_factor, 2.0, "chosen rate kept for resume");
+        assert_eq!(held.segments.last().map(|s| s.source.as_str()), Some("pause"));
+        let live = master.resume_game("AT", 3).expect("resume");
+        assert!(live.running && live.accepting_actions);
+        assert_eq!(live.time_factor, 2.0, "resume restarts at the chosen rate");
+        let fast = master.set_time_factor("AT", 3, 6.0).expect("factor");
+        assert_eq!(fast.time_factor, 6.0);
+        assert!(fast.assumed_now.is_some(), "writes echo the instant they built for");
     }
 
     #[test]
@@ -1595,7 +898,7 @@ mod tests {
                 assert_eq!(rq.url(), "/api/v1/live-feed/positions");
                 let _ = rq.respond(tiny_http::Response::from_string(
                     r#"{"status_code":200,"message":"Successfull","data":[
-                        {"id_unit":13,"name":"KRI Ahmad Yani","hull_number":"KRI-AH-YN","position":{"latitude":-6.08,"longitude":106.91,"recorded_at":"2026-09-10T00:00:00Z","received_at":"2026-09-15T09:56:29Z","backfilled":true}},
+                        {"id_unit":13,"name":"KRI Ahmad Yani","hull_number":"KRI-AH-YN","position":{"latitude":-6.08,"longitude":106.91,"recorded_at":"2026-09-10T00:00:00Z","received_at":"2026-09-15T09:56:29Z","age_seconds":492301.0,"backfilled":true}},
                         {"id_unit":14,"name":"KRI Ahmad Yani II","hull_number":null}
                     ]}"#,
                 ));
@@ -1609,13 +912,15 @@ mod tests {
         assert_eq!(f.ship_id, "13");
         assert!(f.backfilled);
         assert_eq!(f.received_at.as_deref(), Some("2026-09-15T09:56:29Z"));
+        // M4: the server-stated age rides the snapshot fix.
+        assert_eq!(f.age_secs, Some(492301.0));
+        assert_eq!(f.data_age_secs(1_700_000_000), Some(492301));
     }
 
     #[test]
     fn replay_loop_stays_fresh_past_wrap() {
         use crate::geo::track::Registry;
-        let mut src =
-            FileReplay::from_file("tests/fixtures/tracks.json").expect("fixture loads");
+        let mut src = FileReplay::from_file("tests/fixtures/tracks.json").expect("fixture loads");
         let mut reg = Registry::default();
         let n = src.frame_count();
         for _ in 0..n {
@@ -1648,8 +953,7 @@ mod tests {
 
     #[test]
     fn replay_serves_frames_in_order_and_loops() {
-        let mut src =
-            FileReplay::from_file("tests/fixtures/tracks.json").expect("fixture loads");
+        let mut src = FileReplay::from_file("tests/fixtures/tracks.json").expect("fixture loads");
         assert!(src.frame_count() >= 2);
         let first = src.poll().unwrap();
         let ids: Vec<&str> = first.iter().map(|f| f.ship_id.as_str()).collect();
@@ -1662,5 +966,4 @@ mod tests {
         assert_eq!(again.len(), first.len());
         assert_eq!(again[0].ship_id, first[0].ship_id);
     }
-
 }

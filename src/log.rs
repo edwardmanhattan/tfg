@@ -6,6 +6,17 @@
 //! reports back after ingest (`SimCommand::FixAck`): arrival/blocked
 //! entries cite the ship's latest acked seq, minute markers carry a full
 //! ship-to-seq snapshot.
+//!
+//! SCOPE (M8): this is a LOCAL CLIENT TRACE, not the Minos session
+//! record. It omits, by construction rather than by accident:
+//! - single-ship Minos orders that succeeded (the fix chain on the
+//!   server is the record; only refusals journal locally),
+//! - order cancellation, pause/resume, and time-factor changes,
+//! - backend lifecycle writes (transitions, placements, readiness,
+//!   joins) and their gate refusals beyond the status line,
+//! - placement persistence and backend order acceptance/clamping.
+//! Anything above lives authoritatively on Minos; this file answers
+//! "what did this client do", never "what happened in the exercise".
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -42,6 +53,27 @@ pub struct LogEntry {
     pub payload: serde_json::Value,
 }
 
+/// Next per-session journal number (M9): one past the highest
+/// `tfg-session-log-<n>.jsonl` on disk, so a restart never truncates a
+/// previous session's file. Unparseable names are ignored, never fatal.
+pub fn next_session_seq() -> usize {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+    let mut max = 0usize;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(n) = name
+                .strip_prefix("tfg-session-log-")
+                .and_then(|s| s.strip_suffix(".jsonl"))
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                max = max.max(n);
+            }
+        }
+    }
+    max + 1
+}
+
 /// Single-writer journal owned by the sim. `disabled()` is a no-op sink
 /// for tests and log-less runs.
 pub struct Journal {
@@ -62,6 +94,15 @@ impl Journal {
 
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
         Ok(Self { next_seq: 0, writer: Some(BufWriter::new(File::create(path)?)) })
+    }
+
+    /// Open for append (M9): rotation never truncates a previous
+    /// session's file. Entry seqs continue past existing lines so one
+    /// file never holds two seq-0 entries.
+    pub fn open_append(path: PathBuf) -> std::io::Result<Self> {
+        let next_seq = std::fs::read_to_string(&path).map(|t| t.lines().count() as u64).unwrap_or(0);
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self { next_seq, writer: Some(BufWriter::new(file)) })
     }
 
     pub fn append(
@@ -122,5 +163,28 @@ mod tests {
     fn disabled_journal_is_a_quiet_noop() {
         let mut j = Journal::disabled();
         j.append(None, "sim", LogKind::Marker, json!({}));
+    }
+
+    #[test]
+    fn rotation_appends_without_truncating_or_resequencing() {
+        // M9: a rotation onto an existing file keeps its lines and
+        // continues entry seqs past them.
+        let path = scratch("rotation");
+        std::fs::remove_file(&path).ok();
+        let mut j = Journal::open(path.clone()).unwrap();
+        j.append(None, "sim", LogKind::Marker, json!({"minute": 1}));
+        drop(j);
+        let mut j = Journal::open_append(path.clone()).unwrap();
+        j.append(None, "sim", LogKind::Marker, json!({"minute": 2}));
+        drop(j);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "nothing truncated");
+        let seqs: Vec<i64> = lines
+            .iter()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["seq"].as_i64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![0, 1], "seqs continue, never restart");
+        std::fs::remove_file(&path).ok();
     }
 }

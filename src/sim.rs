@@ -13,7 +13,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::backend::{PollSource, now_ts};
+use crate::backend::{BackendError, PollSource, now_ts};
 use crate::catalog::{Catalog, Class};
 use crate::clock::GameClock;
 use crate::command::{Authority, GrantDenial, MoveCommand, Verb};
@@ -49,7 +49,21 @@ pub struct Order {
 pub enum SimCommand {
     /// Take control with the class whose stats will drive the unit
     /// (grill #18: class holds abilities; chosen at takeover).
+    /// Unknown ids are refused, never fallen back (H10): inventing a
+    /// ship's abilities is worse than standing it down.
     TakeControl { ship_id: String, pos: GeoPosition, class_id: String },
+    /// Push Minos-synced figures into the sim's catalog (H10): the sim
+    /// owns a catalog of its own, and UI-side runtime classes would
+    /// otherwise resolve to nothing here. Same namespaced shape as
+    /// [`Catalog::upsert_runtime_class`](crate::catalog::Catalog::upsert_runtime_class).
+    UpsertClass {
+        minos_class_id: i64,
+        name: String,
+        version: i64,
+        speed_kn: f64,
+        cruise_kn: f64,
+        range_nm: f64,
+    },
     Release { ship_id: String },
     SetOrder { ship_id: String, waypoint: GeoPosition, speed_kn: f32 },
     CancelOrder { ship_id: String },
@@ -62,6 +76,13 @@ pub enum SimCommand {
     /// Session clock pace (session flow): fixed-ratio mapping real to
     /// game seconds (ADR-0004). The organizer sets it at session start.
     SetClockRatio { ratio: f64 },
+    /// Scenario epoch seed (participant-correct map): the Minos
+    /// assumed_start, so the display readout anchors on scenario time
+    /// instead of the wall-clock first tick. Idempotent — re-seeding
+    /// the same epoch changes nothing; local elapsed keeps
+    /// accumulating on top, which is exactly the projection's
+    /// contract (never the server's integral).
+    SeedClockStart { ts: String },
     /// Ingest ack (Log grill, #20): the UI reports back each fix's
     /// Registry-stamped seq after ingest, so journal entries can cite
     /// fix seqs. Reuses the command channel; no new plumbing.
@@ -95,6 +116,9 @@ pub enum OrderRefusal {
     LandWaypoint,
     /// Straight path to the waypoint crosses land.
     LandBetween,
+    /// Takeover named a class the sim does not know (H10): no stats,
+    /// no ship. Sync specs first — the sim invents no abilities.
+    UnknownClass,
 }
 
 /// UI <- sim: why an OrderMove leg was refused (precedence grill, #19).
@@ -221,8 +245,9 @@ impl SimSource {
         }
         if let Some(s) = self.ships.get_mut(ship_id) {
             // Class caps the order (grill #18): abilities live on the
-            // class; orders cannot exceed capability.
-            let max = Catalog::stat(&s.class, "speed_kn", f64::MAX) as f32;
+            // class; orders cannot exceed capability. A missing cap
+            // reads as no speed (H10) — failing closed, never infinite.
+            let max = Catalog::stat(&s.class, "speed_kn", 0.0) as f32;
             s.order = Some(Order {
                 waypoint,
                 speed_kn: speed_kn.min(max),
@@ -246,15 +271,25 @@ impl SimSource {
                         LogKind::Command,
                         serde_json::json!({"event": "take-control", "ship": ship_id, "lat": pos.latitude, "lon": pos.longitude, "class": class_id}),
                     );
-                    // Class chosen at takeover (grill #18); unknown ids
-                    // fall back to the first ship class so a bad selector
-                    // value can never wedge the sim.
-                    let class = self
-                        .catalog
-                        .class(&class_id)
-                        .cloned()
-                        .or_else(|| self.catalog.ship_classes().into_iter().next().cloned())
-                        .expect("catalog has ship classes");
+                    // H10: fail closed. An unknown class id means no
+                    // published figures reached this sim — driving the
+                    // hull on another class's abilities would be an
+                    // invention, so the takeover is refused loudly and
+                    // no ship is stood up.
+                    let Some(class) = self.catalog.class(&class_id).cloned() else {
+                        let reason = OrderRefusal::UnknownClass;
+                        let _ = self.evt_tx.send(SimEvent::OrderRefused {
+                            ship_id: ship_id.clone(),
+                            reason: reason.clone(),
+                        });
+                        self.journal.append(
+                            self.clock.game_now_ts(),
+                            "sim",
+                            LogKind::OrderRefused,
+                            serde_json::json!({"ship": ship_id, "reason": format!("{reason:?}")}),
+                        );
+                        continue;
+                    };
                     self.ships.entry(ship_id).or_insert_with(|| SimShip {
                         pos,
                         heading_deg: 0.0,
@@ -262,6 +297,23 @@ impl SimSource {
                         class,
                         held_by: Authority::UNIT,
                     });
+                }
+                SimCommand::UpsertClass {
+                    minos_class_id,
+                    name,
+                    version,
+                    speed_kn,
+                    cruise_kn,
+                    range_nm,
+                } => {
+                    self.catalog.upsert_runtime_class(
+                        minos_class_id,
+                        name,
+                        version,
+                        speed_kn,
+                        cruise_kn,
+                        range_nm,
+                    );
                 }
                 SimCommand::Release { ship_id } => {
                     self.journal.append(
@@ -379,12 +431,15 @@ impl SimSource {
                 SimCommand::SetClockRatio { ratio } => {
                     self.clock.set_ratio(ratio);
                 }
+                SimCommand::SeedClockStart { ts } => {
+                    self.clock.begin(&ts);
+                }
                 SimCommand::FixAck { ship_id, seq } => {
                     let slot = self.last_seq.entry(ship_id).or_insert(seq);
                     *slot = (*slot).max(seq);
                 }
                 SimCommand::RotateJournal { path } => {
-                    self.journal = Journal::open(path).unwrap_or_else(|e| {
+                    self.journal = Journal::open_append(path).unwrap_or_else(|e| {
                         eprintln!("journal rotation failed: {e}");
                         Journal::disabled()
                     });
@@ -413,7 +468,7 @@ impl SimSource {
                         eta_secs: Some(eta),
                         class_id: s.class.id.clone(),
                         type_label: s.class.display_type().to_string(),
-                        max_speed_kn: Catalog::stat(&s.class, "speed_kn", f64::MAX) as f32,
+                        max_speed_kn: Catalog::stat(&s.class, "speed_kn", 0.0) as f32,
                     }
                 }
                 None => OrderView {
@@ -424,7 +479,7 @@ impl SimSource {
                     eta_secs: None,
                     class_id: s.class.id.clone(),
                     type_label: s.class.display_type().to_string(),
-                    max_speed_kn: Catalog::stat(&s.class, "speed_kn", f64::MAX) as f32,
+                    max_speed_kn: Catalog::stat(&s.class, "speed_kn", 0.0) as f32,
                 },
             })
             .collect();
@@ -434,7 +489,7 @@ impl SimSource {
 }
 
 impl PollSource for SimSource {
-    fn poll(&mut self) -> Result<Vec<Fix>, String> {
+    fn poll(&mut self) -> Result<Vec<Fix>, BackendError> {
         let now = Instant::now();
         let real_dt = self.last_tick.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
         self.last_tick = Some(now);
@@ -445,7 +500,7 @@ impl PollSource for SimSource {
 impl SimSource {
     /// One sim round given `real_dt` real seconds elapsed since the last
     /// round. Split from `poll` so tests drive time deterministically.
-    fn poll_round(&mut self, real_dt: f64) -> Result<Vec<Fix>, String> {
+    fn poll_round(&mut self, real_dt: f64) -> Result<Vec<Fix>, BackendError> {
         self.drain_commands();
         // Advance the game clock. First round stamps the session start and
         // moves nothing; paused rounds advance nothing while the wall clock
@@ -510,6 +565,8 @@ impl SimSource {
                 hull_number: None,
                 backfilled: false,
                 source: FixSource::Sim,
+                // Sim emissions are game-time: no server age to retain.
+                age_secs: None,
                 // Ingest sequence is stamped by the Registry (Log grill,
                 // #20); the sim only fills the placeholder.
                 seq: 0,
@@ -595,7 +652,7 @@ impl MergeSource {
 }
 
 impl PollSource for MergeSource {
-    fn poll(&mut self) -> Result<Vec<Fix>, String> {
+    fn poll(&mut self) -> Result<Vec<Fix>, BackendError> {
         let mut out = if self.armed.load(Ordering::SeqCst) {
             self.sim.poll()?
         } else {
@@ -615,6 +672,7 @@ impl PollSource for MergeSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::Grant;
     use crate::command::Leg;
     use std::sync::mpsc;
 
@@ -848,8 +906,8 @@ mod tests {
         assert_eq!(v.class_id, "cakra-type-209-1300");
         assert_eq!(v.type_label, "Kapal selam serang diesel-elektrik");
         assert_eq!(v.max_speed_kn, 11.0);
-        // Unknown class id falls back to the first ship class.
-        let (mut sim, _, cmd) = harness();
+        // Unknown class id fails closed (H10): no ship, loud refusal.
+        let (mut sim, evt_rx, cmd) = harness();
         cmd.send(SimCommand::TakeControl {
             ship_id: "t".into(),
             pos: ship_at(-5.92, 106.92),
@@ -857,7 +915,39 @@ mod tests {
         })
         .unwrap();
         sim.poll_round(0.0).unwrap();
-        assert_eq!(sim.views()[0].class_id, "cakra-type-209-1300", "fallback to first ship class");
+        assert!(sim.views().is_empty(), "no ship on unknown class");
+        assert!(
+            evt_rx.try_iter().any(
+                |e| matches!(e, SimEvent::OrderRefused { reason: OrderRefusal::UnknownClass, .. })
+            ),
+            "takeover refusal names the missing class"
+        );
+    }
+
+    #[test]
+    fn upsert_class_makes_minos_figures_drivable() {
+        // H10: synced figures pushed down from the UI drive the sim —
+        // the sim's own catalog starts asset-only.
+        let (mut sim, _, cmd) = harness();
+        cmd.send(SimCommand::UpsertClass {
+            minos_class_id: 5,
+            name: "Sigma".into(),
+            version: 3,
+            speed_kn: 28.0,
+            cruise_kn: 18.0,
+            range_nm: 5000.0,
+        })
+        .unwrap();
+        cmd.send(SimCommand::TakeControl {
+            ship_id: "t".into(),
+            pos: ship_at(-5.92, 106.92),
+            class_id: "minos-5".into(),
+        })
+        .unwrap();
+        sim.poll_round(0.0).unwrap();
+        let v = &sim.views()[0];
+        assert_eq!(v.class_id, "minos-5");
+        assert_eq!(v.max_speed_kn, 28.0, "Minos figures drive, not bundled ones");
     }
 
     #[test]
@@ -1071,7 +1161,11 @@ mod tests {
         drop(sim);
         let first_lines = journal_lines(&first);
         let second_lines = journal_lines(&second);
-        assert!(first_lines.is_empty(), "nothing journaled before rotation");
+        // TakeControl journals its placement (#41, replay needs it), so the
+        // pre-rotation file holds exactly that entry. Rotation is proven by
+        // the refusal landing in the NEW file, not by the old file being empty.
+        assert_eq!(first_lines.len(), 1, "take-control journaled before rotation");
+        assert_eq!(first_lines[0]["payload"]["event"], "take-control");
         assert!(
             second_lines.iter().any(|e| e["kind"] == "OrderRefused"),
             "post-rotation entries land in the new file"

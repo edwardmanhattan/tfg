@@ -1,7 +1,9 @@
 //! Presentation movement model (see CONTEXT.md): Fix / Ship / Track / Trail.
 //!
 //! Rules (from the v0 + geo tickets):
-//! - Backend `ts` (RFC3339 UTC) orders fixes; an older-or-equal `ts` is dropped.
+//! - Fix instants order fixes (nanos, parsed — never string-compared:
+//!   the wire mixes `Z` with numeric offsets); an older-or-equal instant
+//!   is dropped.
 //! - A ship with no fix for 3 consecutive polls is `stale` (marker kept).
 //! - Displayed position lerps previous -> latest by wall-clock fraction,
 //!   with a small-jump guard (sub-8 m jumps hold, killing GPS jitter).
@@ -14,13 +16,17 @@ use serde::Deserialize;
 
 use super::coordinates::GeoPosition;
 
-/// Provenance of a Fix: backend report or synthetic sim emission.
+/// Provenance of a Fix: backend report, synthetic sim emission, or
+/// authoritative Minos game position (C3: computed exercise truth —
+/// noiseless like sim, scenario-stamped like nothing else, so it ages
+/// by neither wall clock nor jitter guard).
 /// Decided in ADR-0003: the jitter guard and displays key off this.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum FixSource {
     #[default]
     Wire,
     Sim,
+    Game,
 }
 
 /// One accepted position report for a ship. `ts` is the recorded time
@@ -48,6 +54,13 @@ pub struct Fix {
     /// True when reconstructed from an offline backlog: joins the trail
     /// but never moves the marker (see `Registry::blend`).
     pub backfilled: bool,
+    /// Server-stated age in seconds (M4): Minos measures the fix
+    /// against its own clock at response time and says so on REST
+    /// snapshots. Socket events carry none — the client computes those
+    /// from receipt. Present beats computed everywhere it is used:
+    /// the server knows both clocks, the client only trusts its own
+    /// against server timestamps.
+    pub age_secs: Option<f64>,
     pub source: FixSource,
     /// Ingest sequence stamped by the Registry (Log grill, #20): total
     /// ingest order, gaps where out-of-order fixes were dropped.
@@ -89,6 +102,7 @@ impl From<WireFix> for Fix {
             hull_number: w.hull_number,
             backfilled: w.backfilled,
             source: FixSource::Wire,
+            age_secs: None,
             seq: 0,
         }
     }
@@ -99,11 +113,28 @@ impl Fix {
         parse_epoch(&self.ts).unwrap_or(0)
     }
 
+    /// Instant ordering for ingest guards, nanos precision. String order
+    /// only matches time order within one format, and the wire mixes `Z`
+    /// with numeric offsets (`+07:00`) — compare instants, never strings.
+    pub fn epoch_nanos(&self) -> i64 {
+        self.ts
+            .parse::<DateTime<chrono::Utc>>()
+            .ok()
+            .and_then(|dt| dt.timestamp_nanos_opt())
+            .unwrap_or(0)
+    }
+
     /// Data age at render, in seconds (backfilled ticket): live fixes age
     /// from received_at, backfilled ones from recorded_at (`ts`) — the
     /// receipt time of a flush would read age-zero on days-old data.
-    /// Falls back to `ts` when receipt is unknown (sim/replay).
+    /// A server-stated age (M4, REST snapshots) wins over both: it was
+    /// measured at response time, so it understates by transit, which
+    /// is noted rather than corrected. Falls back to `ts` when receipt
+    /// is unknown (sim/replay).
     pub fn data_age_secs(&self, now_epoch: i64) -> Option<i64> {
+        if let Some(a) = self.age_secs {
+            return Some(a as i64);
+        }
         if self.backfilled {
             return parse_epoch(&self.ts).map(|t| now_epoch - t);
         }
@@ -259,7 +290,8 @@ impl Registry {
             seen.insert(fix.ship_id.clone());
             match self.ships.get_mut(&fix.ship_id) {
                 Some(s) => {
-                    if fix.ts <= s.latest.ts {
+                    // Instant order, not string order (mixed `Z`/offsets).
+                    if fix.epoch_nanos() <= s.latest.epoch_nanos() {
                         continue; // out-of-order or duplicate: drop
                     }
                     s.previous = Some(std::mem::replace(&mut s.latest, fix.clone()));
@@ -341,13 +373,45 @@ impl Registry {
         if s.latest.backfilled && s.previous.is_some() {
             return Some(prev.position);
         }
-        // Sim fixes are noiseless by construction: never hold them.
+        // Sim and Game fixes are noiseless by construction: never hold
+        // them. Wire alone gets the jitter guard.
         if s.latest.source == FixSource::Wire
             && prev.position.distance_m(&s.latest.position) < JITTER_GUARD_M
         {
             return Some(prev.position);
         }
         Some(prev.position.lerp(&s.latest.position, frac))
+    }
+
+    /// Heading interpolated across the same poll fraction as position,
+    /// along the SHORTEST ARC.
+    ///
+    /// Naive `a + (b - a) * frac` takes the long way round whenever the
+    /// reports straddle north: 350° to 10° is a 20° turn, but the
+    /// arithmetic produces a 340° swing, and a rotated image would spin
+    /// almost a full circle between two fixes that meant a gentle
+    /// starboard nudge. Normalising the delta into (-180, 180] first
+    /// makes the turn direction the shorter one.
+    ///
+    /// `None` when the latest fix has no heading, or when there is
+    /// nothing to interpolate from — the caller draws neutral rather
+    /// than inventing a course. A fix that HAS a heading but whose
+    /// predecessor does not uses the latest one outright: there is no
+    /// arc to follow, but the known course is still known.
+    pub fn blend_heading(&self, ship_id: &str, frac: f64) -> Option<f32> {
+        let s = self.ships.get(ship_id)?;
+        let to = s.latest.heading_deg?;
+        let Some(from) = s.previous.as_ref().and_then(|p| p.heading_deg) else {
+            return Some(to);
+        };
+        let frac = frac.clamp(0.0, 1.0) as f32;
+        // Wrapping the delta into (-180, 180] is the whole trick: it
+        // makes the interpolation take whichever direction is shorter.
+        let mut delta = (to - from).rem_euclid(360.0);
+        if delta > 180.0 {
+            delta -= 360.0;
+        }
+        Some((from + delta * frac).rem_euclid(360.0))
     }
 }
 
@@ -368,8 +432,25 @@ mod tests {
             hull_number: None,
             backfilled: false,
             source: FixSource::Wire,
+            age_secs: None,
             seq: 0,
         }
+    }
+
+    #[test]
+    fn ordered_rounds_keep_every_point_on_the_trail() {
+        // M5: intermediate publications must survive to the Track — one
+        // round carrying three increasing fixes keeps all three.
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![
+            fix("a", 53.5, 9.9, "2026-09-12T00:00:00Z"),
+            fix("a", 53.6, 9.9, "2026-09-12T00:00:01Z"),
+            fix("a", 53.7, 9.9, "2026-09-12T00:00:02Z"),
+        ]);
+        let ships = r.ships();
+        assert_eq!(ships.len(), 1);
+        assert_eq!(ships[0].trail.len(), 3, "no intermediate dropped");
+        assert!((ships[0].latest.position.latitude - 53.7).abs() < 1e-9);
     }
 
     #[test]
@@ -438,6 +519,78 @@ mod tests {
         r.poll(vec![fix("jit", 53.50001, 9.90001, "2026-09-12T00:00:10Z")]);
         let held = r.displayed_position("jit", 1789171205).unwrap();
         assert_eq!(held.latitude, 53.5);
+    }
+
+    fn headed(id: &str, lat: f64, lon: f64, ts: &str, heading: Option<f32>) -> Fix {
+        let mut f = fix(id, lat, lon, ts);
+        f.heading_deg = heading;
+        f
+    }
+
+    /// 350° to 10° is a 20° starboard nudge, and the blend must take
+    /// that short way. The naive `a + (b-a)*frac` would swing 340°
+    /// the other way and spin the image almost a full circle between
+    /// two fixes that meant a gentle turn.
+    #[test]
+    fn heading_blend_takes_the_shortest_arc() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![headed("h", 0.0, 0.0, "2026-09-12T00:00:00Z", Some(350.0))]);
+        r.poll(vec![headed("h", 0.0, 0.1, "2026-09-12T00:00:10Z", Some(10.0))]);
+        let mid = r.blend_heading("h", 0.5).expect("heading blends");
+        // Halfway between 350 and 10 the short way is 0/360, NOT 180.
+        assert!(mid < 1.0 || mid > 359.0, "mid {mid} should be near north");
+        // Full fraction lands exactly on the reported course.
+        assert!((r.blend_heading("h", 1.0).expect("end") - 10.0).abs() < 1e-3);
+        // Quarter and three-quarter walk the short arc in order.
+        let q = r.blend_heading("h", 0.25).expect("q");
+        let tq = r.blend_heading("h", 0.75).expect("tq");
+        assert!(q > 350.0, "quarter {q} still west of north");
+        assert!(tq < 10.0, "three-quarter {tq} past north");
+    }
+
+    /// The long way round is only ever chosen when it genuinely is
+    /// shorter: 0 to 270 is 90° anticlockwise, not 270° clockwise.
+    #[test]
+    fn heading_blend_picks_shorter_direction_both_ways() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![headed("h", 0.0, 0.0, "2026-09-12T00:00:00Z", Some(0.0))]);
+        r.poll(vec![headed("h", 0.0, 0.1, "2026-09-12T00:00:10Z", Some(270.0))]);
+        let mid = r.blend_heading("h", 0.5).expect("blend");
+        // Half of a 90° anticlockwise turn: 315, not 135.
+        assert!((mid - 315.0).abs() < 1e-3, "mid {mid}, wanted 315");
+    }
+
+    /// No course means no rotation, never a zero. A fix with a
+    /// heading but no headed predecessor uses its own course; an
+    /// unheaded latest stays unheaded.
+    #[test]
+    fn heading_blend_preserves_unknown() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![headed("h", 0.0, 0.0, "2026-09-12T00:00:00Z", Some(90.0))]);
+        r.poll(vec![headed("h", 0.0, 0.1, "2026-09-12T00:00:10Z", None)]);
+        assert_eq!(r.blend_heading("h", 0.5), None, "latest has no course");
+
+        // A headed latest over an unheaded predecessor still knows its
+        // own course: there is no arc, but the fact is real.
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![headed("h", 0.0, 0.0, "2026-09-12T00:00:00Z", None)]);
+        r.poll(vec![headed("h", 0.0, 0.1, "2026-09-12T00:00:10Z", Some(45.0))]);
+        assert_eq!(r.blend_heading("h", 0.5), Some(45.0));
+
+        // A ship nobody has heard of has no heading, and that is not
+        // an error.
+        assert_eq!(r.blend_heading("ghost", 0.5), None);
+    }
+
+    /// Fractions outside 0..1 clamp rather than extrapolating a
+    /// course past what was reported.
+    #[test]
+    fn heading_blend_clamps_fraction() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![headed("h", 0.0, 0.0, "2026-09-12T00:00:00Z", Some(10.0))]);
+        r.poll(vec![headed("h", 0.0, 0.1, "2026-09-12T00:00:10Z", Some(50.0))]);
+        assert!((r.blend_heading("h", -5.0).expect("lo") - 10.0).abs() < 1e-3);
+        assert!((r.blend_heading("h", 9.0).expect("hi") - 50.0).abs() < 1e-3);
     }
 
     #[test]

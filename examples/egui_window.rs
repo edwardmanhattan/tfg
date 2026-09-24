@@ -19,15 +19,18 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use chrono::{TimeZone, Utc};
-use tfg::backend::{BackendError, FileReplay, HttpPoll, Invite, InviteClient, LiveCmd, LiveEvent, LiveWire, MinosAuth, MinosMaster, MinosRest, PollSource, TokenPair};
-use tfg::catalog::{Catalog, Category};
+use tfg::backend::{BackendError, FileReplay, GameMsg, LiveCmd, LiveEvent, LiveWire, MinosAuth, MinosMaster, MinosRest, MockPoll, PollSource, TokenPair};
+use tfg::catalog::Catalog;
 use tfg::fleet::Fleet;
 use tfg::groups::{GroupKind, Groups};
 use tfg::command::{Authority, Grant, GrantDenial, Leg, MoveCommand, Verb};
 use tfg::geo::track::{Fix, FixSource, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
-use tfg::map_render::{anchor_center, project_mercator, unproject_mercator};
+use tfg::map_render::{
+    ProjectedUnitGeometry, UnitLod, anchor_center, project_mercator, projected_unit_geometry,
+    rotated_unit_quad_with_forward_heading, select_unit_lod, unproject_mercator,
+};
 use tfg::overlay::hit_test;
 use tfg::land::Land;
 use tfg::sim::{
@@ -42,7 +45,10 @@ const MAP_H: f64 = 600.0;
 /// size so the canvas can fill the window; responses echo it back so the
 /// texture is sized right.
 type MapReq = (u64, (f64, f64), f64, (u32, u32), u32);
-type MapResp = (u64, (f64, f64), f64, (u32, u32), Vec<u8>);
+/// Map frame answer: conversion to ColorImage happens on the map
+/// thread — the frame pump only uploads to the GPU, never memcpys
+/// pixels on the UI thread.
+type MapResp = (u64, (f64, f64), f64, (u32, u32), egui::ColorImage);
 const CENTER: (f64, f64) = (-6.108, 106.910);
 const ZOOM: f64 = 11.0;
 /// Zone/flag threshold (grill #24, slice iii): zones at or above this
@@ -55,17 +61,6 @@ const ZONE_PAD_PX: f64 = 26.0;
 /// 640px viewport under the toolbar with room for window chrome; unbounded
 /// lists inside already-capped islands keep their own tighter cap.
 const ISLAND_SCROLL_MAX: f32 = 420.0;
-/// Wizard island sizing (layout fix): the stepped Setup is a centered
-/// island with real content width. Without a floor the window shrinks
-/// to the longest label (~thin strip) and border drags only repaint
-/// the background — the inner ScrollArea never expands.
-const WIZARD_MIN_WIDTH: f32 = 460.0;
-/// Fleet picker sizing (layout fix): four miller columns at a readable
-/// measure plus window chrome. The island scrolls horizontally below
-/// this width instead of squeezing the columns.
-const FLEET_MIN_WIDTH: f32 = 760.0;
-const MILLER_COL_WIDTH: f32 = 176.0;
-const MILLER_COL_HEIGHT: f32 = 170.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Session stub pace (session flow): 7 real hours play 7 game days.
 /// Full windows UI lands with the organizer flow; the ratio is the load-
@@ -150,10 +145,38 @@ enum AppMode {
     Simulation,
 }
 
+/// Onboarding state machine (onboarding ticket, #77): the first-run
+/// path is A (Login) → B (Mode) → shell. A and B render on a clean
+/// gradient — no toolbar, islands, or wizard — and the shell is
+/// State C (Presentation) or State D (Simulation). Boots to A every
+/// launch: it doubles as the login gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Onboard {
+    Login,
+    Mode,
+    App,
+}
+
+/// Simulation's four phases (onboarding ticket, #77): Planning
+/// (Perencanaan) and Ready (Persiapan / OnReady) both live in
+/// `Phase::Setup` — the `sim_ready` flag is the gate between them —
+/// Eksekusi is `Phase::Live`, Evaluasi is `Phase::Closed`. Derived
+/// from `UiMode` every frame, never stored, so the existing state
+/// machine (#26) stays the single writer of the phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimStage {
+    Planning,
+    Ready,
+    Live,
+    Eval,
+}
+
 /// Runtime wire backends for the poll thread (task #39). Replay stays
-/// boot-only (env); the Connection island swaps Http/Empty/Live.
+/// boot-only (env).
 enum WireKind {
-    Http(String),
+    /// Explicit mock source (M10): examples/mock_backend.rs over
+    /// TFG_BACKEND_URL. Never a Minos route — Minos is Live below.
+    Mock(String),
     Replay(String),
     Live {
         ws_url: String,
@@ -181,8 +204,8 @@ impl PollSource for EmptyWire {
 /// back to an empty wire with the reason (feed-down reads as stale).
 fn build_wire(kind: WireKind) -> Result<(Box<dyn PollSource>, String), String> {
     match kind {
-        WireKind::Http(url) => HttpPoll::new(&url)
-            .map(|h| (Box::new(h) as Box<dyn PollSource>, format!("HTTP {url}")))
+        WireKind::Mock(url) => MockPoll::new(&url)
+            .map(|h| (Box::new(h) as Box<dyn PollSource>, format!("mock {url}")))
             .map_err(|e| e),
         WireKind::Replay(path) => FileReplay::from_file(&path)
             .map(|r| (Box::new(r) as Box<dyn PollSource>, format!("replay {path}")))
@@ -200,8 +223,28 @@ fn build_wire(kind: WireKind) -> Result<(Box<dyn PollSource>, String), String> {
         WireKind::Empty => Ok((Box::new(EmptyWire) as Box<dyn PollSource>, "empty".to_string())),
     }
 }
+/// One parsed history journal, loaded off-thread: entries plus
+/// the units/players seen plus the replay events. The island renders
+/// this, never the disk.
+#[derive(Debug, Clone)]
+struct LogViewData {
+    entries: Vec<LogLine>,
+    units: Vec<String>,
+    players: Vec<String>,
+    replay: Vec<ReplayEvent>,
+}
+
+/// Finished log work (blocking ticket): a journal parsed, or the
+/// session transcript tail. Failures report and keep the old view.
+enum LogOut {
+    Files(Vec<std::path::PathBuf>),
+    View(std::path::PathBuf, LogViewData),
+    Transcript(Vec<String>),
+}
+
 /// One parsed history line: display text plus its actor and ships for
 /// the unit/player filters (task #41).
+#[derive(Debug, Clone)]
 struct LogLine {
     text: String,
     actor: String,
@@ -210,6 +253,7 @@ struct LogLine {
 
 /// One placement-affecting journal entry (task #41): take-control adds
 /// the ghost, release removes it. Parsed from Command payloads.
+#[derive(Debug, Clone)]
 struct ReplayEvent {
     game_ts: String,
     ship: String,
@@ -243,31 +287,38 @@ struct ShipMarker {
     old_data: bool,
     source: FixSource,
     trail: Vec<(f64, f64)>,
+    /// Course, shortest-arc blended across the poll interval so a
+    /// turn does not spin a thumbnail the long way round. None when
+    /// the fix carries no course — the marker then draws neutral and
+    /// says so, rather than assuming north.
+    heading_deg: Option<f32>,
+    /// Taxonomy-derived far-map glyph. Unknown always draws, so a
+    /// missing visual, image, texture, or taxonomy cannot make the
+    /// unit disappear.
+    map_symbol: tfg::store::MapSymbol,
+    latitude: f64,
+    label: String,
+    lod: UnitLod,
+    visual: Option<UnitVisual>,
 }
 
 /// One drill row label (setup-overhaul picker): id_name first (grill
 /// decision), English subtitle when it differs, next-level count.
 /// Truncated to one line so long taxonomy names never stretch the column.
-fn drill_label(o: &tfg::store::TaxRow) -> String {
-    const MAX: usize = 28;
-    let cut = |s: &str| {
-        let mut out: String = s.chars().take(MAX).collect();
-        if s.chars().count() > MAX {
-            out.push('…');
-        }
-        out
-    };
-    if o.name.is_empty() || o.name == o.id_name {
-        format!("{} ({})", cut(&o.id_name), o.count)
+/// Status ink (harden): success reads green, failure red, idle gray.
+/// Every `*_status` line goes through this so state is never gray-on-gray.
+/// Trimmed text, or None when blank: filter drafts pass through as
+/// absent, never as empty strings the server would have to interpret.
+fn nonempty(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        None
     } else {
-        format!("{} · {} ({})", cut(&o.id_name), cut(&o.name), o.count)
+        Some(t.to_string())
     }
 }
 
-/// Status ink (harden): success reads green, failure red, idle gray.
-/// Every `*_status` line goes through this so state is never gray-on-gray.
-fn status_ink(msg: &str) -> egui::Color32 {
-    let m = msg.to_lowercase();
+fn status_ink(msg: &str) -> egui::Color32 {    let m = msg.to_lowercase();
     if m.contains("fail")
         || m.contains("refused")
         || m.contains("error")
@@ -300,80 +351,339 @@ fn warn_line(ui: &mut egui::Ui, msg: String) {
     ui.label(egui::RichText::new(format!("⚠ {msg}")).color(egui::Color32::YELLOW));
 }
 
-/// Player/group/unit names: trimmed, capped so translations and long
-/// designations never break island rows. Returns None when blank.
-fn clean_name(s: &str) -> Option<String> {
-    const MAX_NAME: usize = 40;
-    let t = s.trim();
-    if t.is_empty() {
+/// Onboarding backdrop (ticket #77): one vertical wash — console
+/// night down into deep well — so States A/B read as a clean slate,
+/// no map, islands, or wizard. Two triangles: vertex colors
+/// interpolate in the tessellator, no band loop.
+fn paint_gradient(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    top: egui::Color32,
+    bottom: egui::Color32,
+) {
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bottom);
+    mesh.colored_vertex(rect.left_bottom(), bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(mesh);
+}
+
+/// Temporary display scale for a hull whose real LOA and beam are not
+/// published yet. This is deliberately a screen-space presentation
+/// budget, not a physical measurement; it will be replaced by the
+/// Minos geometry as soon as those fields arrive.
+const FALLBACK_UNIT_LENGTH_PX: f64 = 36.0;
+
+fn fallback_unit_geometry(visual: &UnitVisual) -> (f64, f64) {
+    let beam = visual
+        .width_px
+        .zip(visual.height_px)
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .map(|(w, h)| FALLBACK_UNIT_LENGTH_PX * h as f64 / w as f64)
+        .unwrap_or(10.0)
+        .clamp(4.0, 24.0);
+    (FALLBACK_UNIT_LENGTH_PX, beam)
+}
+
+/// The small vocabulary the far map can draw. Every stable map symbol
+/// maps to exactly one geometry, so a new symbol cannot silently reuse
+/// the old anonymous dot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MapSymbolShape {
+    Dot,
+    Destroyer,
+    Frigate,
+    Corvette,
+    Auxiliary,
+    Landing,
+    Submarine,
+    Plane,
+    Tank,
+    Port,
+}
+
+fn map_symbol_shape(symbol: tfg::store::MapSymbol) -> MapSymbolShape {
+    use tfg::store::MapSymbol;
+    match symbol {
+        MapSymbol::UnknownShip => MapSymbolShape::Dot,
+        MapSymbol::Destroyer => MapSymbolShape::Destroyer,
+        MapSymbol::Frigate => MapSymbolShape::Frigate,
+        MapSymbol::Corvette => MapSymbolShape::Corvette,
+        MapSymbol::Auxiliary => MapSymbolShape::Auxiliary,
+        MapSymbol::Landing => MapSymbolShape::Landing,
+        MapSymbol::Submarine => MapSymbolShape::Submarine,
+        MapSymbol::Plane => MapSymbolShape::Plane,
+        MapSymbol::GroundUnit => MapSymbolShape::Tank,
+        MapSymbol::Port => MapSymbolShape::Port,
+    }
+}
+
+fn regular_polygon(
+    center: egui::Pos2,
+    radius: f32,
+    sides: usize,
+    rotation: f32,
+) -> Vec<egui::Pos2> {
+    (0..sides)
+        .map(|i| {
+            let angle = rotation + i as f32 * std::f32::consts::TAU / sides as f32;
+            center + egui::vec2(angle.cos() * radius, angle.sin() * radius)
+        })
+        .collect()
+}
+
+fn map_symbol_label(symbol: tfg::store::MapSymbol) -> &'static str {
+    use tfg::store::MapSymbol;
+    match symbol {
+        MapSymbol::UnknownShip => "generic ship",
+        MapSymbol::Destroyer => "destroyer",
+        MapSymbol::Frigate => "frigate",
+        MapSymbol::Corvette => "corvette",
+        MapSymbol::Auxiliary => "auxiliary",
+        MapSymbol::Landing => "landing",
+        MapSymbol::Submarine => "submarine",
+        MapSymbol::Plane => "plane",
+        MapSymbol::GroundUnit => "ground unit",
+        MapSymbol::Port => "port",
+    }
+}
+
+fn map_symbol_accent(shape: MapSymbolShape) -> egui::Color32 {
+    match shape {
+        MapSymbolShape::Dot => egui::Color32::LIGHT_GRAY,
+        MapSymbolShape::Destroyer => egui::Color32::from_rgb(0xFF, 0x6B, 0x6B),
+        MapSymbolShape::Frigate => egui::Color32::from_rgb(0x6B, 0x9D, 0xFF),
+        MapSymbolShape::Corvette => egui::Color32::from_rgb(0x35, 0xD0, 0xE8),
+        MapSymbolShape::Auxiliary => egui::Color32::from_rgb(0xF5, 0xC2, 0x4B),
+        MapSymbolShape::Landing => egui::Color32::from_rgb(0x72, 0xD6, 0x72),
+        MapSymbolShape::Submarine => egui::Color32::from_rgb(0xB4, 0x8C, 0xE8),
+        MapSymbolShape::Plane => egui::Color32::from_rgb(0xE8, 0xF0, 0xFF),
+        MapSymbolShape::Tank => egui::Color32::from_rgb(0xA8, 0xB5, 0x62),
+        MapSymbolShape::Port => egui::Color32::from_rgb(0xE8, 0x79, 0xD1),
+    }
+}
+
+/// Blend the live side color with a stable type accent. The circle
+/// still carries side identity; the glyph's hue and outline make a
+/// known type distinguishable without replacing either channel.
+fn map_symbol_fill(
+    base: egui::Color32,
+    shape: MapSymbolShape,
+    stale: bool,
+) -> egui::Color32 {
+    if stale {
+        return egui::Color32::GRAY;
+    }
+    let accent = map_symbol_accent(shape);
+    let mix = |base: u8, accent: u8| {
+        (base as f32 * 0.68 + accent as f32 * 0.32)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    egui::Color32::from_rgb(
+        mix(base.r(), accent.r()),
+        mix(base.g(), accent.g()),
+        mix(base.b(), accent.b()),
+    )
+}
+
+/// Paint the universal far-map fallback. The existing radius-8 circle
+/// remains underneath; this smaller glyph sits inside its white
+/// outline, and every branch terminates in a shape.
+fn paint_map_symbol(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    symbol: tfg::store::MapSymbol,
+    base: egui::Color32,
+    stale: bool,
+) {
+    let shape = map_symbol_shape(symbol);
+    let fill = map_symbol_fill(base, shape, stale);
+    let polygon = |points: Vec<egui::Pos2>| {
+        painter.add(egui::Shape::convex_polygon(
+            points,
+            fill,
+            egui::Stroke::NONE,
+        ));
+    };
+    match shape {
+        MapSymbolShape::Dot => {
+            painter.circle_filled(center, 3.0, fill);
+        }
+        MapSymbolShape::Destroyer => {
+            polygon(regular_polygon(center, 5.5, 3, -std::f32::consts::FRAC_PI_2));
+        }
+        MapSymbolShape::Frigate => {
+            polygon(regular_polygon(center, 5.2, 4, 0.0));
+        }
+        MapSymbolShape::Corvette => {
+            polygon(regular_polygon(
+                center,
+                4.5,
+                4,
+                std::f32::consts::FRAC_PI_4,
+            ));
+        }
+        MapSymbolShape::Auxiliary => {
+            painter.rect_filled(
+                egui::Rect::from_center_size(center, egui::vec2(9.0, 3.0)),
+                1.0,
+                fill,
+            );
+            painter.rect_filled(
+                egui::Rect::from_center_size(center, egui::vec2(3.0, 9.0)),
+                1.0,
+                fill,
+            );
+        }
+        MapSymbolShape::Landing => {
+            polygon(regular_polygon(
+                center,
+                5.5,
+                5,
+                -std::f32::consts::FRAC_PI_2,
+            ));
+        }
+        MapSymbolShape::Submarine => {
+            let points = regular_polygon(center, 1.0, 16, 0.0)
+                .into_iter()
+                .map(|point| {
+                    center + egui::vec2((point.x - center.x) * 1.5, (point.y - center.y) * 0.65)
+                })
+                .collect();
+            polygon(points);
+        }
+        MapSymbolShape::Plane => {
+            polygon(vec![
+                center + egui::vec2(6.0, 0.0),
+                center + egui::vec2(-4.0, -4.5),
+                center + egui::vec2(-4.0, 4.5),
+            ]);
+        }
+        MapSymbolShape::Tank => {
+            painter.rect_filled(
+                egui::Rect::from_center_size(center + egui::vec2(-4.0, 0.0), egui::vec2(1.5, 8.0)),
+                1.0,
+                fill,
+            );
+            painter.rect_filled(
+                egui::Rect::from_center_size(center + egui::vec2(4.0, 0.0), egui::vec2(1.5, 8.0)),
+                1.0,
+                fill,
+            );
+            painter.rect_filled(
+                egui::Rect::from_center_size(center, egui::vec2(6.0, 4.0)),
+                1.0,
+                fill,
+            );
+        }
+        MapSymbolShape::Port => {
+            painter.circle_stroke(center, 5.0, egui::Stroke::new(2.0, fill));
+            painter.circle_filled(center, 1.5, fill);
+        }
+    }
+}
+
+fn paint_unit_image(
+    painter: &egui::Painter,
+    marker: &ShipMarker,
+    zoom: f64,
+    pixels_per_point: f32,
+    origin: egui::Pos2,
+) -> Option<Vec<egui::Pos2>> {
+    if marker.lod == UnitLod::Far {
         return None;
     }
-    let mut out: String = t.chars().take(MAX_NAME).collect();
-    if t.chars().count() > MAX_NAME {
-        out.push('…');
+    let Some(visual) = marker.visual.as_ref().filter(|v| v.is_map_renderable()) else {
+        return None;
+    };
+    let mut geometry =
+        projected_unit_geometry(marker.latitude, zoom, visual.loa_m, visual.beam_m);
+    if geometry.has_scale {
+        let ppp = pixels_per_point.max(0.1) as f64;
+        geometry.length_px /= ppp;
+        geometry.beam_px /= ppp;
     }
-    Some(out)
+    let (length_px, beam_px) = if geometry.has_scale {
+        (geometry.length_px, geometry.beam_px)
+    } else {
+        // Backend geometry is still in development. Until it arrives,
+        // use the explicit screen-space fallback requested for visual
+        // verification; this never claims to be true-to-scale.
+        fallback_unit_geometry(visual)
+    };
+    let center = (
+        (origin.x + marker.x as f32) as f64,
+        (origin.y + marker.y as f32) as f64,
+    );
+    let Some(quad) = rotated_unit_quad_with_forward_heading(
+        center,
+        length_px,
+        beam_px,
+        marker.heading_deg,
+        visual.forward_heading_deg,
+    ) else {
+        return None;
+    };
+    let texture = visual.texture.expect("renderable visual has a texture");
+    let points: Vec<egui::Pos2> = quad
+        .corners
+        .iter()
+        .map(|(x, y)| egui::pos2(*x as f32, *y as f32))
+        .collect();
+    let tint = if marker.stale {
+        egui::Color32::GRAY
+    } else {
+        egui::Color32::WHITE
+    };
+    let mut mesh = egui::Mesh::with_texture(texture.id);
+    // The source bow is the image's +X edge, so the bow corners use
+    // the right-hand UVs and the stern corners the left-hand UVs.
+    let uvs = [
+        egui::pos2(1.0, 0.0),
+        egui::pos2(1.0, 1.0),
+        egui::pos2(0.0, 1.0),
+        egui::pos2(0.0, 0.0),
+    ];
+    for (point, uv) in points.iter().zip(uvs) {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: *point,
+            uv,
+            color: tint,
+        });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(mesh);
+    Some(points)
 }
 
-/// Fifth miller column (dnd ticket): hulls of the picked class beside
-/// the taxonomy. Row tap picks for click-placement, drag starts a map
-/// drop; placed hulls show a check and stay out of the way.
-fn units_col(
-    ui: &mut egui::Ui,
-    leaf: &[PickerRow],
-    placed: &std::collections::HashSet<String>,
-    pick: &mut Option<String>,
-    press: &mut Option<(String, String, egui::Pos2)>,
-    drag: &mut Option<(String, String)>,
-) {
-    ui.vertical(|ui| {
-        ui.set_min_width(MILLER_COL_WIDTH);
-        ui.set_max_width(MILLER_COL_WIDTH);
-        ui.strong(format!("Units ({})", leaf.len()));
-        egui::ScrollArea::vertical()
-            .id_salt("drill-units")
-            .auto_shrink([false, false])
-            .max_height(MILLER_COL_HEIGHT)
-            .show(ui, |ui| {
-                ui.set_min_width(MILLER_COL_WIDTH - 16.0);
-                if leaf.is_empty() {
-                    ui.weak("None yet");
-                } else {
-                    for u in leaf {
-                        if placed.contains(&u.id) {
-                            ui.label(format!("✓ {} ({})", u.name, u.hull));
-                        } else {
-                            let resp = ui.selectable_value(
-                                pick,
-                                Some(u.id.clone()),
-                                format!("{} ({})", u.name, u.hull),
-                            );
-                            if resp.is_pointer_button_down_on() && drag.is_none() && press.is_none() {
-                                if let Some(start) = resp.interact_pointer_pos() {
-                                    *press = Some((u.id.clone(), u.name.clone(), start));
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-    });
-    ui.separator();
-}
-
-/// One pickable hull row, from either picker source (cutover ticket):
-/// asset seeds carry their catalog class; register rows resolve the
-/// Minos class name to sim stats, or to None (loud refusal, never
-/// invented abilities).
-struct PickerRow {
-    id: String,
-    name: String,
-    hull: String,
-    class_name: String,
-    stat_class: Option<String>,
-    /// Drill breadcrumb (setup-overhaul picker): empty in column mode,
-    /// "branch / category / type" in whole-tree search mode.
-    trail: String,
+/// Two-line label for the State B mode cards (ticket #77): title over
+/// a muted one-line promise, both painted inside one button.
+fn mode_card_text(title: &str, sub: &str) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        title,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(16.0),
+            color: egui::Color32::from_rgb(0xE2, 0xE8, 0xF0),
+            ..Default::default()
+        },
+    );
+    job.append(
+        &format!("\n{sub}"),
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(12.0),
+            color: egui::Color32::from_gray(150),
+            ..Default::default()
+        },
+    );
+    job
 }
 
 /// One desktop's order draft (slice iv, grill #25): pending waypoint,
@@ -487,6 +797,630 @@ fn pad_hull(pts: &[(f64, f64)], pad: f64) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// One blocking REST action off the egui thread (M7): the worker runs
+/// the closure to completion; the UI harvests the result per frame and
+/// applies it. Errors cross as text — typed matching stays inside the
+/// worker where the variants exist. One op of each kind at a time:
+/// re-clicks while busy are refused loudly instead of piling threads.
+struct RestOp<T, E = String> {
+    label: &'static str,
+    rx: mpsc::Receiver<Result<T, E>>,
+}
+
+fn spawn_rest<T, E, F>(label: &'static str, f: F) -> RestOp<T, E>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    RestOp { label, rx }
+}
+
+impl<T, E> RestOp<T, E> {
+    /// Non-blocking harvest: Some(result) exactly once, when done.
+    /// A dead worker never resolves — loud in the terminal, and the
+    /// slot stays busy rather than reporting a fabricated result.
+    fn poll(&self) -> Option<Result<T, E>> {
+        match self.rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                eprintln!("{} worker died without answering", self.label);
+                None
+            }
+        }
+    }
+}
+
+/// Finished sign-in (M7): the worker ran login and the gate probe.
+/// `uid` is None when the courtesy flag short-circuits the probe or
+/// the probe itself failed (note); the pair is stored either way the
+/// login succeeded, mirroring the old inline flow.
+struct LoginDone {
+    user: String,
+    pair: tfg::backend::TokenPair,
+    uid: Option<i64>,
+    needs_change: bool,
+    probe_note: Option<String>,
+}
+
+/// Finished sync (M7): the store connection rides back (it moved
+/// into the worker); counts render the status line.
+struct SyncDone {
+    conn: rusqlite::Connection,
+    counts: Vec<(String, usize)>,
+}
+
+/// Finished spec backfill (M7): connection rides back; specs upsert
+/// into both catalogs on the UI thread.
+struct SpecDone {
+    conn: rusqlite::Connection,
+    specs: Vec<tfg::backend::HullSpec>,
+    fetched: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+/// One bundled held-game read: detail is authoritative and always
+/// applies; each subordinate rides its own Result so one staff-only
+/// 403 degrades to a labeled gap instead of failing the whole
+/// bundle. A refused subordinate keeps the last good list — never an
+/// empty list presented as truth.
+struct GameBundle {
+    detail: tfg::backend::GameDetail,
+    roster: Result<Vec<tfg::backend::Participant>, tfg::backend::BackendError>,
+    units: Result<Vec<tfg::backend::GameUnit>, tfg::backend::BackendError>,
+    placements: Result<tfg::backend::PlacementList, tfg::backend::BackendError>,
+}
+
+/// Deferred map drop for an async placement (#100): the local
+/// TakeControl follows a successful PUT, a frame later, so no
+/// phantom ship ever stands on a refused write.
+struct PlaceDrop {
+    pid: String,
+    name: String,
+    hull: String,
+    class_id: String,
+    la: f64,
+    lo: f64,
+}
+
+/// What kind of asset a visual carries.
+///
+/// Minos publishes this discriminator in the manifest so a future
+/// archive kind can be added without making old clients guess. The
+/// current `unit-images` bundle speaks `unit_image`; anything else is
+/// retained as unsupported and never drawn as a hull photograph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssetKind {
+    UnitImage,
+    Unsupported,
+    /// No asset for this unit in the active manifest version. This is
+    /// settled absence, not an unresolved fetch.
+    Unavailable,
+}
+
+impl AssetKind {
+    fn from_manifest(value: &str) -> Self {
+        match value {
+            "unit_image" => AssetKind::UnitImage,
+            _ => AssetKind::Unsupported,
+        }
+    }
+}
+
+/// Pause before asking again after a failed manifest or source read.
+/// A null presign does not erase a real manifest entry, and a refused
+/// request does not deserve an every-frame retry storm.
+const IMAGE_READ_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Re-read the manifest periodically so a picture added after the first
+/// read can enter the versioned visual cache without restarting the app.
+const MANIFEST_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Read the standard S3 presign lifetime from the source URI when it
+/// is present. A local archive path has no expiry and returns `None`.
+fn image_source_expires_at(source: &str) -> Option<Instant> {
+    let query = source.split_once('?')?.1;
+    let seconds = query
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .find(|(key, _)| *key == "X-Amz-Expires")?
+        .1
+        .parse::<u64>()
+        .ok()?;
+    Instant::now().checked_add(Duration::from_secs(seconds))
+}
+
+/// One unit's visual state: what it is drawn as, and everything the
+/// renderer needs to draw it true-to-scale.
+///
+/// Deliberately NOT a `HashMap<i64, Option<String>>`. That could not
+/// say whether a unit had no image or had not been fetched yet, could
+/// not carry the measurements that make a thumbnail honest, and could
+/// not survive a manifest change without a full rebuild. This is the
+/// whole visual truth for one hull, in one value.
+///
+/// `image_url` is a PRESIGNED, EXPIRY-BEARING address: it lives here
+/// in memory, never in SQLite, and `asset_version` (the manifest's
+/// ETag) is what identifies the asset, not the URL.
+#[derive(Clone)]
+struct UnitVisual {
+    unit_id: i64,
+    /// Temporary source URI, valid only while its presign lives (or
+    /// indefinitely for a later local archive path). None means no
+    /// address is currently held.
+    image_url: Option<String>,
+    /// When a presigned source is known to expire. The texture is the
+    /// durable result; the URL is only a way to obtain it.
+    image_url_expires_at: Option<Instant>,
+    /// A null presign is a failed read, not proof that the manifest
+    /// entry was imaginary. Retry after a pause rather than every frame.
+    image_url_retry_at: Option<Instant>,
+    /// Decoded, GPU-resident image identity once egui's loader has
+    /// produced it. `SizedTexture` is the renderer's actual result;
+    /// a `TextureHandle` is loader-internal and is not returned by
+    /// `try_load_texture`.
+    texture: Option<egui::load::SizedTexture>,
+    /// Intrinsic dimensions as Minos measured them, before decoding.
+    width_px: Option<u32>,
+    height_px: Option<u32>,
+    /// The manifest's declared media type. It is diagnostic metadata,
+    /// not a second source: the map and Inspector both decode the same
+    /// presigned object URL.
+    content_type: String,
+    /// Real-world measurements, straight from the published spec.
+    /// None means unpublished; the renderer must not substitute.
+    loa_m: Option<f64>,
+    beam_m: Option<f64>,
+    draft_m: Option<f64>,
+    /// Which way this unit's image points, in compass degrees.
+    /// The client constant today; backend metadata overrides it when
+    /// Minos publishes orientation.
+    forward_heading_deg: f32,
+    /// The manifest ETag this visual was resolved against.
+    /// A change invalidates the picture, not the unit's identity.
+    asset_version: String,
+    asset_kind: AssetKind,
+    map_symbol: tfg::store::MapSymbol,
+}
+
+impl std::fmt::Debug for UnitVisual {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keep the source address redacted even though the decoded
+        // texture identity is safe to name.
+        f.debug_struct("UnitVisual")
+            .field("unit_id", &self.unit_id)
+            .field("image_url", &self.image_url.as_ref().map(|_| "<source>"))
+            .field("url_expired", &self.image_url_expires_at.is_some_and(|at| at <= Instant::now()))
+            .field("url_retry_pending", &self.image_url_retry_at)
+            .field("texture", &self.texture.as_ref().map(|_| "<tex>"))
+            .field("size_px", &(self.width_px, self.height_px))
+            .field("content_type", &self.content_type)
+            .field("loa_m", &self.loa_m)
+            .field("beam_m", &self.beam_m)
+            .field("forward_heading_deg", &self.forward_heading_deg)
+            .field("asset_version", &self.asset_version)
+            .field("asset_kind", &self.asset_kind)
+            .field("map_symbol", &self.map_symbol)
+            .finish()
+    }
+}
+
+impl UnitVisual {
+    /// A unit with no image: it draws a symbol, and the cache records
+    /// that as a settled fact rather than an unanswered question.
+    ///
+    /// It still belongs to a manifest version. A hull that has no
+    /// picture in v1 may have one in v2, so "absent" is versioned just
+    /// like "present"; it is not a permanent property of the unit.
+    fn unavailable(
+        unit_id: i64,
+        asset_version: &str,
+        symbol: tfg::store::MapSymbol,
+    ) -> Self {
+        UnitVisual {
+            unit_id,
+            image_url: None,
+            image_url_expires_at: None,
+            image_url_retry_at: None,
+            texture: None,
+            width_px: None,
+            height_px: None,
+            content_type: String::new(),
+            loa_m: None,
+            beam_m: None,
+            draft_m: None,
+            forward_heading_deg: tfg::map_render::IMAGE_FORWARD_HEADING_DEG,
+            asset_version: asset_version.to_string(),
+            asset_kind: AssetKind::Unavailable,
+            map_symbol: symbol,
+        }
+    }
+
+    /// From a manifest entry, before any bytes are fetched. Intrinsic
+    /// image dimensions and optional physical measurements are already
+    /// known here and are carried exactly as Minos published them.
+    fn from_entry(
+        entry: &tfg::backend::UnitImageEntry,
+        asset_version: &str,
+        symbol: tfg::store::MapSymbol,
+    ) -> Self {
+        UnitVisual {
+            unit_id: entry.unit_id,
+            image_url: None,
+            image_url_expires_at: None,
+            image_url_retry_at: None,
+            texture: None,
+            width_px: entry.width_px,
+            height_px: entry.height_px,
+            content_type: entry.content_type.clone(),
+            loa_m: entry.loa_m,
+            beam_m: entry.beam_m,
+            draft_m: None,
+            forward_heading_deg: tfg::map_render::IMAGE_FORWARD_HEADING_DEG,
+            asset_version: asset_version.to_string(),
+            asset_kind: AssetKind::from_manifest(&entry.asset_kind),
+            map_symbol: symbol,
+        }
+    }
+
+    /// True when this unit may be drawn as a map thumbnail. Requires
+    /// a supported unit-image asset and a decoded texture — a
+    /// renderer reaching a unit mid-fetch gets a symbol instead of a
+    /// hole.
+    fn is_map_renderable(&self) -> bool {
+        self.asset_kind == AssetKind::UnitImage && self.texture.is_some()
+    }
+}
+
+/// Cache key: the unit plus the manifest ETag that says
+/// what its picture is. The URL is deliberately absent — a presigned
+/// address expires and changes without changing the asset.
+type VisualKey = (i64, String);
+
+/// Every unit's visual state for every asset version still held.
+///
+/// ONE cache serves both delivery modes: online it holds presigned
+/// URLs, and the archive reader will later put extracted local paths
+/// into the same entries. The key is `(unit_id, asset_version)`, so
+/// the same hull under a new manifest can never inherit an old
+/// picture by accident.
+#[derive(Default)]
+struct VisualCache {
+    units: std::collections::HashMap<VisualKey, UnitVisual>,
+    /// The manifest ETag currently selected by `get` and
+    /// mutation helpers. A separate bool records that a manifest was
+    /// read: an absent backend ETag must not become an invitation to
+    /// fetch the manifest forever.
+    asset_version: String,
+    manifest_loaded: bool,
+}
+
+impl VisualCache {
+    fn active_key(&self, unit_id: i64) -> VisualKey {
+        (unit_id, self.asset_version.clone())
+    }
+
+    /// The visual for a unit at the active manifest version, if one
+    /// has been resolved.
+    fn get(&self, unit_id: i64) -> Option<&UnitVisual> {
+        self.units.get(&self.active_key(unit_id))
+    }
+
+    /// True when the unit's state is settled. An absent picture is a
+    /// real `UnitVisual` with `AssetKind::Unavailable`, so this also
+    /// distinguishes "the manifest says no" from "not fetched yet".
+    fn is_settled(&self, unit_id: i64) -> bool {
+        self.units.contains_key(&self.active_key(unit_id))
+    }
+
+    /// True while this visual can still benefit from acquiring its
+    /// unit-image source. Timing (live, retrying, or due) is separate.
+    fn expects_source(&self, unit_id: i64) -> bool {
+        self.get(unit_id).is_some_and(|v| {
+            v.asset_kind == AssetKind::UnitImage && v.texture.is_none()
+        })
+    }
+
+    /// Bound retries after a transport failure without changing the
+    /// manifest's claim that this unit has a picture.
+    fn defer_source(&mut self, unit_id: i64) {
+        if let Some(v) = self.units.get_mut(&self.active_key(unit_id)) {
+            v.image_url_retry_at = Some(Instant::now() + IMAGE_READ_RETRY_DELAY);
+        }
+    }
+
+    /// True when a unit-image still needs a usable source address.
+    /// A loaded texture needs no URL, unsupported and absent assets do
+    /// not, and a null presign waits for a bounded retry.
+    fn needs_url(&self, unit_id: i64) -> bool {
+        let Some(visual) = self.get(unit_id) else {
+            return false;
+        };
+        if visual.asset_kind != AssetKind::UnitImage || visual.texture.is_some() {
+            return false;
+        }
+        if visual
+            .image_url_retry_at
+            .is_some_and(|retry_at| retry_at > Instant::now())
+        {
+            return false;
+        }
+        match &visual.image_url {
+            Some(_) => visual
+                .image_url_expires_at
+                .is_some_and(|expires_at| expires_at <= Instant::now()),
+            None => true,
+        }
+    }
+
+    /// Record a unit as having no picture in the active manifest.
+    /// Cached under that version, so the manifest is not re-asked on
+    /// every frame for a hull that will never have one.
+    fn mark_absent(&mut self, unit_id: i64, symbol: tfg::store::MapSymbol) {
+        let version = self.asset_version.clone();
+        let mut visual = UnitVisual::unavailable(unit_id, &version, symbol);
+        if let Some(previous) = self.get(unit_id) {
+            // The specification did not change merely because the
+            // image did. Preserve unpublished-versus-published truth.
+            visual.loa_m = previous.loa_m;
+            visual.beam_m = previous.beam_m;
+            visual.draft_m = previous.draft_m;
+        }
+        self.units.insert((unit_id, version), visual);
+    }
+
+    /// Install the manifest: every listed unit gets a visual seeded
+    /// from its entry, and the version stamps them all.
+    ///
+    /// Returns the units whose URL still needs reading. Re-installing
+    /// the same version is idempotent, including live URLs and loaded
+    /// textures. A version change starts every picture again, while
+    /// preserving the physical measurements, which belong to the unit
+    /// specification rather than to the photograph.
+    fn install_manifest(
+        &mut self,
+        manifest: &tfg::backend::ImageManifest,
+        symbol_of: impl Fn(i64) -> tfg::store::MapSymbol,
+    ) -> Vec<i64> {
+        let same_version = self.manifest_loaded
+            && !manifest.version.is_empty()
+            && self.asset_version == manifest.version;
+        // Snapshot before clearing: measurements belong to the unit,
+        // so they survive a picture-version change even though URLs and
+        // textures do not.
+        let previous: std::collections::HashMap<i64, UnitVisual> =
+            if self.manifest_loaded && !same_version {
+                self.units
+                    .iter()
+                    .filter_map(|((id, _), visual)| Some((*id, visual.clone())))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+        if !same_version {
+            // Old pictures and old absence are facts about another
+            // asset version. Do not let a lookup by unit id find them.
+            self.units.clear();
+        }
+        self.asset_version = manifest.version.clone();
+        self.manifest_loaded = true;
+
+        let mut needing_url = Vec::new();
+        for entry in &manifest.entries {
+            let key = (entry.unit_id, manifest.version.clone());
+            if self.units.contains_key(&key) {
+                // Same content version: keep the live URL, texture,
+                // and dimensions. Re-reading the manifest is not a
+                // reason to refetch every picture.
+                continue;
+            }
+            let mut visual =
+                UnitVisual::from_entry(entry, &manifest.version, symbol_of(entry.unit_id));
+            if let Some(old) = previous.get(&entry.unit_id) {
+                // A manifest may carry the active physical measurements
+                // even when the local specification mirror does not. A
+                // missing value in the new manifest must not erase the
+                // last known value across an asset-version refresh.
+                visual.loa_m = visual.loa_m.or(old.loa_m);
+                visual.beam_m = visual.beam_m.or(old.beam_m);
+                visual.draft_m = visual.draft_m.or(old.draft_m);
+            }
+            let needs_source = visual.asset_kind == AssetKind::UnitImage;
+            self.units.insert(key, visual);
+            if needs_source {
+                needing_url.push(entry.unit_id);
+            }
+        }
+        needing_url
+    }
+
+    /// Merge the unit facts that come from the local mirror. These
+    /// are not picture bytes: measurements, taxonomy-derived symbol,
+    /// and their version. A unit absent from the manifest gets a real
+    /// `Unavailable` visual rather than a side-table exception, so all
+    /// three renderer states travel through one model.
+    fn set_unit_facts(
+        &mut self,
+        unit_id: i64,
+        symbol: tfg::store::MapSymbol,
+        loa_m: Option<f64>,
+        beam_m: Option<f64>,
+        draft_m: Option<f64>,
+    ) {
+        if !self.manifest_loaded {
+            return;
+        }
+        let key = self.active_key(unit_id);
+        let version = self.asset_version.clone();
+        let visual = self
+            .units
+            .entry(key)
+            .or_insert_with(|| UnitVisual::unavailable(unit_id, &version, symbol));
+        visual.map_symbol = symbol;
+        // The manifest is the current Minos truth when it carries a
+        // measurement; the local mirror only fills a gap. A stale local
+        // spec must not overwrite a value that arrived with this asset
+        // version. A missing local row is not evidence that Minos
+        // withdrew the manifest's measurement.
+        if visual.loa_m.is_none() {
+            visual.loa_m = loa_m;
+        }
+        if visual.beam_m.is_none() {
+            visual.beam_m = beam_m;
+        }
+        if draft_m.is_some() {
+            visual.draft_m = draft_m;
+        }
+    }
+
+    /// Replace a unit's temporary URL, keeping every other fact. This
+    /// is the presigned-expiry path: the same asset, a new address.
+    fn set_url(&mut self, unit_id: i64, url: Option<String>) {
+        if let Some(v) = self.units.get_mut(&self.active_key(unit_id)) {
+            v.image_url_expires_at = url.as_deref().and_then(image_source_expires_at);
+            v.image_url_retry_at = url
+                .is_none()
+                .then(|| Instant::now() + IMAGE_READ_RETRY_DELAY);
+            v.image_url = url;
+        }
+    }
+
+    /// Install a decoded texture.
+    fn set_texture(&mut self, unit_id: i64, tex: egui::load::SizedTexture) {
+        if let Some(v) = self.units.get_mut(&self.active_key(unit_id)) {
+            v.texture = Some(tex);
+        }
+    }
+
+    /// Drop everything. Called on sign-out, user change, new session
+    /// and a held-game change: no image, texture, URL, or measurement
+    /// from one user's exercise may survive into the next one's.
+    fn clear(&mut self) {
+        self.units.clear();
+        self.asset_version.clear();
+        self.manifest_loaded = false;
+    }
+}
+
+/// Refresh kinds waiting on the setup slot (#100).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingRefresh {
+    Games,
+    Directory,
+    Game,
+    Tree,
+}
+
+/// What the in-flight picture slot is waiting for. Kept beside the
+/// worker so a transport failure can be retried against the same
+/// manifest or unit rather than restarting the wrong request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageRequest {
+    Manifest,
+    Url(i64),
+}
+
+/// One hull picture resolution (images ticket): the manifest once
+/// per session, then one temporary URL per pictured hull. Both ride
+/// a dedicated slot so picture fetches never queue behind setup.
+enum ImageOut {
+    Manifest(tfg::backend::ImageManifest),
+    Url(i64, Option<String>),
+}
+
+/// One Minos order inside a batch (#100): the address plus its
+/// outcome. Speeds stay f32 like the order drafts; the worker widens
+/// to f64 at the POST.
+struct OrderOut {
+    ship: String,
+    heading: f64,
+    speed: f32,
+    result: Result<tfg::backend::GameFix, String>,
+}
+
+/// Every setup-flow read/write result (#100): one slot serializes
+/// setup writes (no concurrent conflicting writes) and one pump arm
+/// applies them. Notes render on the status line; multi-step reads
+/// bundle like SyncDone carries its connection.
+enum SetupDone {
+    Games(Vec<tfg::backend::GameRow>),
+    /// The game list needs a staff read the account lacks: not an
+    /// error to retry loudly, but the player-flow signal — room key
+    /// first, staff steps aside.
+    GamesDenied,
+    Users(Vec<tfg::backend::BackendUser>),
+    Bundle(GameBundle),
+    Roster(Vec<tfg::backend::Participant>, String),
+    Units(Vec<tfg::backend::GameUnit>, String),
+    Assign(Vec<tfg::backend::GameUnit>, String, i64),
+    Unassign(Vec<tfg::backend::GameUnit>, String, i64),
+    Place(tfg::backend::PlacementList, PlaceDrop),
+    Lift(tfg::backend::PlacementList, String, i64),
+    Game(String, tfg::backend::GameRow),
+    GameCreate(tfg::backend::GameRow, String),
+    /// Admin game writes: the update answer is the re-read detail
+    /// (applied like any bundle detail); a delete drops the hold,
+    /// which then reads exactly like a vanished game.
+    GameUpdated(tfg::backend::GameDetail),
+    GameDeleted(i64, String),
+    /// A refused transition (to, error, forbidden): the verdict waits    /// for the bundle re-read — maybe somebody else already moved the
+    /// game. `forbidden` is typed at the call site (never sniffed from
+    /// text): only the game's own Game Master advances it, and the bar
+    /// must say so instead of repeating a bare 403.
+    GameFailed(String, String, bool),
+    Join(tfg::backend::JoinResult, String),
+    /// A join refusal with its own next action: seatless 403 vs
+    /// unknown-key 404 never share a line (audit item).
+    JoinFailed(String),
+    Clock(tfg::backend::GameClock, String),
+    /// A refused clock write (pause/resume/factor): no probe endpoint
+    /// exists — the 403 IS the capability answer, learned per hold
+    /// like the transition verdict. Buttons gate on it, never on
+    /// role names (judges may hold the grant, Game Masters may not).
+    ClockDenied,
+    FixBatch(Vec<OrderOut>),
+    /// A loaded timeline page: replace or append. Failures keep the
+    /// last good list and report loudly.
+    Timeline(tfg::backend::TimelinePage, bool),
+    /// Closure judgements: a loaded list, or a recorded mark (which
+    /// chains into a reload like a sent message does).
+    Judgements(Vec<tfg::backend::Judgement>),
+    JudgementSent(tfg::backend::Judgement),
+    /// Closure reviews: a loaded list, a filed document, or a revised
+    /// one — the writes chain into a reload like sent messages do.
+    Reviews(Vec<tfg::backend::Review>),
+    ReviewSent(tfg::backend::Review),
+    ReviewRevised(tfg::backend::Review),
+    /// The task-organisation forest, or its read refusal. Forbidden
+    /// degrades to a labeled gap; anything else reports and keeps.
+    Hierarchy(Result<Vec<tfg::backend::HierarchyNode>, tfg::backend::BackendError>),
+    /// One inbox page with navigation (messages ticket): replaces
+    /// the list; failures keep the last good page loudly.
+    MsgPage(tfg::backend::InboxPage),
+    /// An opened message's detail, or a deleted one's id (the page
+    /// reloads behind it so counts stay the server's).
+    MsgOpen(tfg::backend::InboxMsg),
+    MsgDeleted(i64),
+    MsgSent(tfg::backend::InboxMsg),
+    Roles(Vec<tfg::backend::ScenarioRole>),
+    ReadDone(tfg::backend::InboxMsg),
+}
+
+/// Finished password change (M7): staged outcomes because each stage
+/// applies differently — a changed password clears the form, a failed
+/// re-entry signs out, a shut gate only reports.
+enum PwResult {
+    Changed(LoginDone),
+    ChangeFailed(String),
+    ReentryFailed(String),
+    GateShut(String),
+}
+
 struct ShipApp {
     map_tex: Option<egui::TextureHandle>,
     /// What the current texture was rendered for: the canvas translates
@@ -520,15 +1454,23 @@ struct ShipApp {
     session_log_path: std::path::PathBuf,
     session_seq: usize,
     transcript: Vec<String>,
-    /// Islands (islands grill, #27): floating panels over the fullscreen
-    /// map. Run-local visibility; phase decides what may show.
-    show_session: bool,
+    /// Execution windows (roster/orders/log): run-local visibility,
+    /// opened by the start path, never by toolbar toggles.
     show_roster: bool,
     show_orders: bool,
     show_log: bool,
-    /// Wizard (islands grill, #27): stepped Setup, dismissed on Live.
-    wizard_step: usize,
-    wizard_done: bool,
+    /// Onboarding (ticket #77): boots to State A (Login), through
+    /// State B (Mode), into the shell — C for Presentation, D for
+    /// Simulation. This is the one directing layer at first run.
+    onboard: Onboard,
+    /// Simulation four-phase gate (ticket #77): Planning → Persiapan
+    /// is this flag; Eksekusi/Evaluasi ride the existing phase.
+    sim_ready: bool,
+    /// State C card (ticket #77): shown until dismissed or connected.
+    connect_card: bool,
+    /// Phase-bar refusal note (ticket #77): the start verb reports
+    /// here because the event feed only renders Live.
+    phase_note: Option<String>,
     /// Event feed for the Log island: capped human lines drained from
     /// sim events (arrivals, refusals, overrides, blockages).
     event_feed: VecDeque<String>,
@@ -556,64 +1498,132 @@ struct ShipApp {
     /// Unit taxonomy (grill #18): class chosen at take-control.
     catalog: Catalog,
     selected_class: usize,
-    /// Fleet picker (task #29): organizer hull seeds from
-    /// assets/fleet.json, filtered by category/class/text, placed by hand
-    /// on the map — never automatically.
+    /// Fleet seeds (task #29): organizer hulls from assets/fleet.json
+    /// plus the synced register fallback (placement_seed) — placed by
+    /// hand on the map, never automatically.
     fleet: Fleet,
-    show_fleet: bool,
-    fleet_cat: usize,
-    fleet_class: Option<String>,
-    fleet_query: String,
+    /// Map placement pick: a register hull awaiting its map click.
     fleet_pick: Option<String>,
-    /// Drill selections (setup-overhaul prototype): branch > category >
-    /// type > class ids from the synced taxonomy; leaf units list below.
-    drill_branch: Option<i64>,
-    drill_category: Option<i64>,
-    drill_type: Option<i64>,
-    drill_class: Option<i64>,
-    /// Active fleet-row drag (setup-overhaul dnd): press candidate with
-    /// origin until it moves past the click threshold, then a live drag
-    /// (hull id + name) until release (drop places) or cancel.
-    /// Click-sense rows never report drag_started, so the gesture is
-    /// tracked from the press origin instead.
-    drag_press: Option<(String, String, egui::Pos2)>,
-    drag_unit: Option<(String, String)>,
+    /// Exercise setup flow (#79): Planning in four steps — game,
+    /// players, fleet, ready. One step renders at a time; the backend
+    /// game in users_game is what every step reads and writes.
+    setup_step: usize,
+    /// Closure assessment workspace: selected slot tab — summary,
+    /// timeline, judgements, reviews, transcript. Reset on new
+    /// session and sign-out.
+    assessment_tab: usize,
+    /// New-game form (step 1): name is required, the rest optional.
+    /// Mode is always maneuver (the only mode this release).
+    setup_name: String,    setup_description: String,
+    setup_purpose: String,
+    setup_target: String,
+    setup_area: String,
+    setup_map_tag: String,
+    /// Held-game edit form (admin ticket): blank means leave alone
+    /// (absent on the wire) — the detail carries no text fields to
+    /// prefill from. Separate drafts from create; delete arms on
+    /// second click. Both hide without the staff read.
+    edit_open: bool,
+    delete_armed: bool,
+    edit_name: String,
+    edit_description: String,
+    edit_purpose: String,
+    edit_target: String,
+    edit_area: String,
+    edit_map_tag: String,
+    /// Register filter + assignment commander (step 3): hulls come
+    /// from the synced store; each assign seats the picked commander.
+    setup_reg_search: String,
+    /// Fleet render cache (blocking ticket): register rows plus
+    /// branch mapping + names, reloaded on sync and first show —
+    /// never queried per frame. SQLite leaves the render path.
+    fleet_cache: Vec<tfg::store::StoreUnit>,
+    fleet_branches: std::collections::HashMap<i64, i64>,
+    fleet_branch_names: std::collections::HashMap<i64, String>,
+    fleet_loaded: bool,
+    setup_commander: Option<i64>,
     /// Session users (build ticket): memory-held game plus live lists —
     /// directory and game reads are blocking operator actions, the role
     /// vocabulary comes from the synced helpers mirror.
-    show_users: bool,
     users_game: Option<(i64, String)>,
+    /// Authoritative state of the held game (H1): the last `GET
+    /// /games/{id}` state — planning, preparation, execution, closure.
+    /// Every select/refresh re-reads it and projects the local stage;
+    /// the `sim_ready` flag never leads, it follows this read.
+    users_game_state: Option<String>,
+    /// Scenario clock, Minos-owned (H2): the last GameClock answer
+    /// (pause/resume/factor writes are the only reads — there is no
+    /// clock GET) plus the chosen rate off the detail anchor. The
+    /// local engine ratio seeds from the factor, never from windows,
+    /// for connected games; `factor_draft` is the bar's edit box.
+    minos_clock: Option<tfg::backend::GameClock>,
+    minos_time_factor: Option<f64>,
+    factor_draft: f64,
+    /// The held session's room key, from the detail read. Present
+    /// from preparation onward — that is the share-out the Game
+    /// Master hands personnel out of band; the client never invents
+    /// one and never enumerates keys.
+    minos_room_key: Option<String>,
+    /// Clock-control denial: a 403 on pause/resume/factor means the
+    /// hold's grant excludes the caller — learned per hold, cleared
+    /// on success, hold change, drop, and sign-out. Gates the bar
+    /// controls with the reason; never set from role names.
+    clock_denied: bool,
     users_games: Vec<tfg::backend::GameRow>,
+    /// Game-list gap: the account lacks the staff read, so the picker
+    /// is empty by permission, not by absence. Drives the room-key
+    /// guidance; cleared on success, reset on sign-out.
+    games_gap: bool,
     users_list: Vec<tfg::backend::BackendUser>,
     users_search: String,
     users_role: Option<i64>,
     users_roles: Vec<(i64, String, String, bool)>,
     users_roster: Vec<tfg::backend::Participant>,
     users_gunits: Vec<tfg::backend::GameUnit>,
+    /// The caller's own pieces from the last join/readiness answer:
+    /// the order authority when the staff unit list is gapped. Never
+    /// merged into users_gunits — a partial list must never pose as
+    /// the full order of battle.
+    commanded_hulls: Vec<tfg::backend::GameUnit>,
+    /// Staff-gap flags: a 403 on the matching subread means "access
+    /// refused", distinct from an empty authoritative list. Set on
+    /// Forbidden, cleared on success, left alone on transient errors.
+    /// The player-view ticket renders these; the status line names
+    /// them from the bundle apply.
+    roster_gap: bool,
+    units_gap: bool,
+    placements_gap: bool,
+    /// Server setup view of the held game's map (C2): placements plus
+    /// the gate's placement arithmetic — never recomputed client-side.
+    users_placements: Vec<tfg::backend::GamePlacement>,
+    placement_unplaced: i64,
+    placement_ready: bool,
+    /// Room-key entry (C2): joining needs no game id — the key is the
+    /// only input, and the answer says which game was entered.
+    join_key: String,
     users_status: String,
+    /// Directory filters (latest Minos): resolved from the helpers
+    /// mirror (`user_statuses`, `app_roles`), sent as `id_user_status`
+    /// / `id_app_role` only when set. Nothing re-fetches on change —
+    /// the `find` button runs the query.
+    users_filter_status: Option<i64>,
+    users_statuses: Vec<(i64, String, String, bool)>,
+    users_filter_role: Option<i64>,
+    users_approles: Vec<(i64, String, String, bool)>,
     upress: Option<(i64, String, egui::Pos2)>,
     udrag: Option<(i64, String)>,
     placed_fleet: HashSet<String>,
     /// Labels captured at placement (both picker sources), so register
     /// hulls keep their name + hull after the picker moves on.
     placed_labels: HashMap<String, (String, String)>,
-    /// Setup slice (ii): WIB-entered windows, local roster, seat drafts.
-    /// Times are entered in WIB and stored as UTC; the roster names assignees.
+    /// Setup slice (ii): WIB-entered windows, stored as UTC.
     time_real_start: String,
     time_real_end: String,
     time_game_start: String,
     time_game_end: String,
-    roster: Vec<String>,
-    roster_input: String,
-    /// Helm per placed unit (unit_id -> user). Commander seats for
-    /// Unit commanders draft here; groups wait for the groups island.
+    /// Helm per placed unit (unit_id -> user): commander seats draft here.
     helm: HashMap<String, String>,
     unit_commander: HashMap<String, String>,
-    /// Invites (slice v): local records (source of truth) mirrored to the
-    /// mock backend when connected.
-    invites: Vec<Invite>,
-    invite_seq: usize,
-    invite_status: String,
     /// Minos auth state (login ticket): REST base, island fields, and the
     /// session — identifier plus in-memory access token with issue time +
     /// TTL. The refresh token lives in the OS keyring (memory fallback
@@ -623,6 +1633,10 @@ struct ShipApp {
     login_identifier: String,
     login_password: String,
     auth_user: Option<String>,
+    /// Caller id from the `GET /users/me` probe (C2): roster rows key
+    /// on `id_user` and the login identifier is not it. Set on sign-in
+    /// and confirmed by every join/readiness answer; cleared on sign-out.
+    auth_user_id: Option<i64>,
     auth_token: Option<String>,
     auth_issued_at: Option<Instant>,
     auth_ttl_secs: u64,
@@ -648,11 +1662,14 @@ struct ShipApp {
     /// Slowest follow re-request instant (task #45).
     last_track_req: Instant,
     zoom_dirty: bool,
+    /// User-facing text scaling (field ticket): session pref over
+    /// the OS pixels-per-point, captured once so re-applying never
+    /// compounds. Field laptops and glare-heavy displays get Larger
+    /// without touching layout code.
+    text_scale: f32,
+    base_ppp: Option<f32>,
     /// Top-level mode (task #39): session only in Simulation.
     app_mode: AppMode,
-    /// Connection island state: control channel for wire swaps (the
-    /// wires themselves come from the environment, boot-owned).
-    show_connection: bool,
     wire_ctl_tx: Option<Sender<WireKind>>,
     /// Live-wire fast lane: the socket actor pings this per publication;
     /// the poll thread cuts its sleep short. One channel for the app's
@@ -664,8 +1681,154 @@ struct ShipApp {
     live_cmd_tx: Option<Sender<LiveCmd>>,
     live_evt_rx: Option<Receiver<LiveEvent>>,
     live_status: String,
+    /// First-connect marker: the actor's Connected fires per
+    /// (re)connect, and only a repeat while a game is held triggers
+    /// the held-game reconciliation (games list → split bundle + plot
+    /// pull). Clock running-state has no read endpoint — the bundle
+    /// re-marks the factor; held/running resumes from answers.
+    live_connected_once: bool,
+    /// Off-thread REST slots (M7): at most one op of each kind in
+    /// flight; the frame pump harvests and applies results.
+    login_op: Option<RestOp<LoginDone>>,
+    refresh_op: Option<RestOp<tfg::backend::TokenPair>>,
+    sync_op: Option<RestOp<SyncDone>>,
+    spec_op: Option<RestOp<SpecDone>>,
+    pw_op: Option<RestOp<PwResult, PwResult>>,
+    plot_op: Option<RestOp<tfg::backend::PositionList>>,
+    /// Serialized setup-flow results (#100): at most one setup read or
+    /// write in flight; the frame pump applies it.
+    setup_op: Option<RestOp<SetupDone>>,
+    /// Queued setup refreshes (#100): refresh clicks that land while
+    /// the slot is busy wait here (deduped) instead of dropping — the
+    /// pump dispatches one per applied op.
+    pending_setup: Vec<PendingRefresh>,
+    /// Transition awaiting its verdict (#100): (to, error, forbidden).
+    /// Set when a transition write fails; the bundle re-read consumes
+    /// it — the authoritative state decides whether the game already
+    /// moved or the refusal stands.
+    pending_transition: Option<(String, String, bool)>,
+    /// Steady plot cadence (#98): last spawn, last success, and the
+    /// consecutive-failure streak driving backoff.
+    last_plot_try: Option<Instant>,
+    last_plot_ok: Option<Instant>,
+    plot_fails: usize,
+    /// Last authoritative bundle apply (context strip): how stale the
+    /// held game's projection is. Stamped on detail success even when
+    /// every subordinate gaps — the detail is the sync.
+    last_game_sync: Option<Instant>,
     /// Session-log history view (task #40): selected past journal.
     log_view_path: Option<std::path::PathBuf>,
+    /// Log work state (blocking ticket): directory listing cached
+    /// once per open (never per frame), the parsed view, and the
+    /// parse worker. Disk reads leave the frame.
+    log_files: Vec<std::path::PathBuf>,
+    log_files_loaded: bool,
+    log_view: Option<LogViewData>,
+    log_op: Option<RestOp<LogOut>>,
+    /// Game messages as socket events carry them (H11): broadcast on
+    /// `game:<id>`, addressed on `personal:<user>`. Newest last, capped
+    /// — the event is a notification with body, not the inbox (sending
+    /// and thread reads stay HTTP, later slice).
+    game_messages: VecDeque<GameMsg>,
+    show_messages: bool,
+    /// HTTP inbox (#99): thread reads with read state, plus the compose
+    /// form. Socket arrivals (above) notify; this is the readable,
+    /// sendable record. Inbox ops run off-thread like everything in
+    /// pump_rest_ops.
+    inbox: Vec<tfg::backend::InboxMsg>,
+    inbox_mine_only: bool,
+    /// Inbox pager (messages ticket): the page the island shows plus
+    /// its navigation block; the open message's detail pane.
+    inbox_page_no: u64,
+    inbox_total: u64,
+    inbox_pages: u64,
+    inbox_has_next: bool,
+    inbox_has_prev: bool,
+    msg_open: Option<tfg::backend::InboxMsg>,
+    /// Closure timeline (assessment ticket): loaded events in server
+    /// order (never re-sorted), the cursor block, and filter drafts.
+    /// A failed page keeps the last good list.
+    timeline_events: Vec<tfg::backend::TimelineEvent>,
+    timeline_cursor: Option<String>,
+    timeline_has_more: bool,
+    timeline_source: Option<String>,
+    timeline_personnel: String,
+    timeline_unit: String,
+    timeline_from: String,
+    timeline_to: String,
+    /// Closure judgements (assessment ticket): the exercise's marks,
+    /// the compose drafts, and the subject picker. Append-only by
+    /// contract — the UI offers no edit, correction is a new mark.
+    judgements: Vec<tfg::backend::Judgement>,
+    judge_subject: Option<i64>,
+    judge_subject_id: String,
+    judge_score: String,
+    /// Closure reviews (assessment ticket): the exercise's documents,
+    /// compose drafts, and the revision under edit. Author-owned by
+    /// contract — edit renders on own rows only, delete nowhere.
+    reviews: Vec<tfg::backend::Review>,
+    review_subject: Option<i64>,
+    review_body: String,
+    review_editing: Option<i64>,
+    review_mine_only: bool,
+    /// Minos task organisation (hierarchy ticket): the forest as
+    /// read, plus its staff gap. Rendered, never edited here — node
+    /// and assignment writes are a later slice. The local Groups
+    /// model is sandbox-only and draws nowhere near this.
+    minos_tree: Vec<tfg::backend::HierarchyNode>,
+    tree_gap: bool,
+    /// Every unit's visual state: measurements, picture availability,
+    /// intrinsic dimensions, orientation, symbol, and the decoded
+    /// texture. Keyed by `(unit_id, asset_version)`, so an expiring
+    /// presigned URL is replaced without the asset losing identity,
+    /// and a manifest change cannot hand one version's picture to
+    /// another. Memory only: presigned URLs never reach SQLite, and
+    /// the texture dies with the process.
+    visuals: VisualCache,
+    /// Taxonomy symbols resolved independently of the image manifest,
+    /// so the far map is useful before picture bytes arrive. The
+    /// VisualCache copies these into each versioned UnitVisual.
+    unit_symbols: HashMap<i64, tfg::store::MapSymbol>,
+    /// Stable type ids and display names for the selected-unit map
+    /// symbol editor. The name is shown to the operator; resolution
+    /// itself only ever reads the id-keyed assignment table.
+    unit_type_ids: HashMap<i64, i64>,
+    unit_type_names: HashMap<i64, String>,
+    unit_type_symbols: HashMap<i64, tfg::store::MapSymbol>,
+    /// Last selected LOD per unit, kept across frames so the Near
+    /// threshold has hysteresis instead of oscillating on zoom jitter.
+    unit_lods: HashMap<String, UnitLod>,
+    /// Operator-only visual heading override. It rotates the thumbnail
+    /// without rewriting the authoritative Minos fix.
+    heading_overrides: HashMap<String, f32>,
+    /// Units whose temporary URL still needs reading, in priority
+    /// order. Drained one per pump slot so a large manifest cannot
+    /// open a burst of parallel requests.
+    pending_image_urls: Vec<i64>,
+    image_op: Option<RestOp<ImageOut>>,
+    image_request: Option<ImageRequest>,
+    /// A failed manifest read is retried after a pause, not every
+    /// frame. A successful read clears this in `apply_image`.
+    manifest_retry_at: Option<Instant>,
+    /// Next scheduled manifest read after a successful load. The first
+    /// read is immediate; later reads discover images added mid-session.
+    manifest_refresh_at: Option<Instant>,
+    msg_kind: String,
+    msg_class: String,
+    msg_content: String,
+    msg_callsign: String,
+    msg_sending_note: String,
+    msg_group: String,
+    msg_per: String,
+    msg_regnum: String,
+    msg_to: HashSet<i64>,
+    msg_cc: HashSet<i64>,
+    msg_degree: Option<i64>,
+    msg_degrees: Vec<(i64, String, String, bool)>,
+    msg_assumed: Option<i64>,
+    msg_reply_to: Option<i64>,
+    scenario_roles: Vec<tfg::backend::ScenarioRole>,
+    new_role_name: String,
     /// Replay (task #41): placement events, slider position, map ghosts,
     /// unit/player filter.
     log_events: Vec<ReplayEvent>,
@@ -678,17 +1841,8 @@ struct ShipApp {
     map_view: (f64, f64),
     last_desired_px: (u32, u32),
     /// Session groups: unified group forest (Satuan Tugas of units,
-    /// Gugus of groups) + drafts.
+    /// Gugus of groups), drawn on the map.
     groups: Groups,
-    show_groups: bool,
-    group_seq: usize,
-    satgas_name: String,
-    satgas_commander: Option<String>,
-    satgas_members: HashSet<String>,
-    gugus_name: String,
-    gugus_commander: Option<String>,
-    gugus_members: HashSet<String>,
-    group_error: Option<String>,
     /// Desktops (slice iv, grill #25): act-as identity + scope tabs.
     /// No identity = organizer with the merged All desktop.
     acting_as: Option<String>,
@@ -733,7 +1887,7 @@ impl ShipApp {
     }
 
     /// Drain pending poll rounds, then derive marker geometry for this frame.
-    fn markers(&mut self) -> Vec<ShipMarker> {
+    fn markers(&mut self, pixels_per_point: f32) -> Vec<ShipMarker> {
         let mut rounds = 0;
         // The glide clock restarts only on genuinely new data (see below):
         // the live wire replays the whole picture every tick, and duplicate
@@ -800,6 +1954,9 @@ impl ShipApp {
                     let why = match reason {
                         OrderRefusal::LandWaypoint => "waypoint is on land",
                         OrderRefusal::LandBetween => "path crosses land",
+                        OrderRefusal::UnknownClass => {
+                            "unknown class — sync Minos specs first"
+                        }
                     };
                     self.feed(format!("refused {ship_id}: {why}"));
                     self.order_warning = Some(format!("{ship_id}: {why}"));
@@ -850,6 +2007,19 @@ impl ShipApp {
                 LiveEvent::Connected { client_id } => {
                     self.live_status = format!("connected ({client_id})");
                     self.feed(format!("live connected ({client_id})"));
+                    // Reconnect reconciliation: the actor already
+                    // re-read the position picture itself; the exercise
+                    // state (detail always, subordinates as permitted,
+                    // then the plot) goes through the split reads so a
+                    // fresh map never sits on stale game state. Queued
+                    // when the slot is busy, skipped with no hold.
+                    let reconnected = self.live_connected_once;
+                    self.live_connected_once = true;
+                    if reconnected && self.users_game.is_some() {
+                        self.feed("reconnected — resyncing held game".to_string());
+                        self.users_refresh_games();
+                        self.pull_minos_positions();
+                    }
                 }
                 LiveEvent::Announced(list) => {
                     let n = list.len();
@@ -877,6 +2047,22 @@ impl ShipApp {
                 LiveEvent::RefreshDue => {
                     self.feed("live token expired (109): refreshing".to_string());
                     self.refresh_now();
+                }
+                LiveEvent::Message(m) => {
+                    // H11: broadcast or addressed — drawn, filed, and
+                    // the island opens itself once for the new mail.
+                    let scope = if m.broadcast { "broadcast" } else { "addressed" };
+                    let text: String = m.content.chars().take(160).collect();
+                    let trail = if m.content.chars().count() > 160 { "…" } else { "" };
+                    self.feed(format!(
+                        "[session {}] {} {} from {} ({scope}): {text}{trail}",
+                        m.game_id, m.kind, m.class_label, m.sender
+                    ));
+                    self.game_messages.push_back(m);
+                    while self.game_messages.len() > 50 {
+                        self.game_messages.pop_front();
+                    }
+                    self.show_messages = true;
                 }
                 LiveEvent::SocketError(e) => {
                     self.live_status = format!("socket error: {e}");
@@ -920,7 +2106,63 @@ impl ShipApp {
                     .map(|p| project_mercator(p.latitude, p.longitude, center, self.zoom, mw, mh))
                     .collect();
                 let old_data = s.source == FixSource::Wire && s.latest.is_old_data(now_epoch);
-                ShipMarker { id: s.ship_id.clone(), x, y, stale: s.stale, old_data, source: s.source, trail }
+                // Course rides the same blend fraction as position, so
+                // the image turns with the hull rather than snapping
+                // to each new fix. Minos game positions and live-feed
+                // course both already land on Fix.heading_deg.
+                let heading_deg = self
+                    .heading_overrides
+                    .get(&s.ship_id)
+                    .copied()
+                    .or_else(|| self.registry.blend_heading(&s.ship_id, frac));
+                let unit_id = s.ship_id.parse::<i64>().ok();
+                let visual = unit_id.and_then(|unit_id| self.visuals.get(unit_id).cloned());
+                let mut geometry = visual.as_ref().map_or_else(ProjectedUnitGeometry::default, |v| {
+                    projected_unit_geometry(pos.latitude, self.zoom, v.loa_m, v.beam_m)
+                });
+                if geometry.has_scale {
+                    let ppp = pixels_per_point.max(0.1) as f64;
+                    geometry.length_px /= ppp;
+                    geometry.beam_px /= ppp;
+                }
+                if !geometry.has_scale
+                    && visual.as_ref().is_some_and(|v| v.asset_kind == AssetKind::UnitImage)
+                {
+                    // Temporary presentation-only footprint while the
+                    // backend geometry fields are still in development.
+                    if let Some(v) = visual.as_ref() {
+                        let (length_px, beam_px) = fallback_unit_geometry(v);
+                        geometry.length_px = length_px;
+                        geometry.beam_px = beam_px;
+                    }
+                }
+                let current_lod = self.unit_lods.get(&s.ship_id).copied();
+                let lod = select_unit_lod(&geometry, current_lod);
+                self.unit_lods.insert(s.ship_id.clone(), lod);
+                let map_symbol = visual
+                    .as_ref()
+                    .map(|visual| visual.map_symbol)
+                    .or_else(|| unit_id.and_then(|unit_id| self.unit_symbols.get(&unit_id).copied()))
+                    .unwrap_or(tfg::store::MapSymbol::UnknownShip);
+                ShipMarker {
+                    id: s.ship_id.clone(),
+                    x,
+                    y,
+                    stale: s.stale,
+                    old_data,
+                    source: s.source,
+                    trail,
+                    heading_deg,
+                    map_symbol,
+                    latitude: pos.latitude,
+                    label: self.map_label(
+                        &s.ship_id,
+                        s.latest.name.as_deref(),
+                        s.latest.hull_number.as_deref(),
+                    ),
+                    lod,
+                    visual,
+                }
             })
             .collect()
     }
@@ -939,87 +2181,157 @@ impl ShipApp {
         self.recentering = None;
         if mode == AppMode::Presentation {
             self.mode.armed.store(false, Ordering::SeqCst);
-            self.show_session = false;
             self.show_roster = false;
-            self.show_fleet = false;
             self.show_orders = false;
-            self.show_groups = false;
-            self.show_users = false;
-            self.show_connection = true;
         } else {
-            // Simulation arms the engine (setup-overhaul pass): the old
-            // session-island checkbox was this switch wearing a disguise.
+            // Simulation arms the engine; the setup flow owns Planning.
             self.mode.armed.store(true, Ordering::SeqCst);
-            self.show_connection = false;
         }
         eprintln!("mode: {mode:?}");
     }
 
-    /// Connection island: the live feed only (setup-overhaul pass).
-    /// Wires come from the environment (`.env`, boot); the island shows
-    /// a status indicator plus one connect toggle — no endpoint text,
-    /// no manual backend swapping.
-    fn connection_island(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Live feed");
-        let ink = if self.live_status.starts_with("connected") {
-            egui::Color32::from_rgb(0x4A, 0xDE, 0x80)
-        } else if self.live_status.starts_with("connecting") {
-            egui::Color32::from_rgb(0xFA, 0xBF, 0x69)
-        } else if self.live_status.starts_with("refused")
-            || self.live_status.starts_with("socket error")
-        {
-            egui::Color32::from_rgb(0xF8, 0x71, 0x71)
-        } else {
-            egui::Color32::GRAY
-        };
-        ui.label(egui::RichText::new(format!("live: {}", self.live_status)).color(ink));
-        // Single toggle (was connect/stop pair): token-gated swap onto
-        // the socket, or back to the boot wire. Snapshot failure lands
-        // back with the reason; fatal refusals arrive as status below.
-        let ws_url = Self::ws_url_for(&self.minos_base);
-        let live_on = self.live_cmd_tx.is_some();
-        let authed = self.auth_token.is_some();
-        let label = if live_on { "stop live" } else { "connect live" };
-        if ui.add_enabled(authed || live_on, egui::Button::new(label)).clicked() {
-            if live_on {
-                if let Some(tx) = &self.wire_ctl_tx {
-                    let _ = tx.send(WireKind::Empty);
-                    self.live_cmd_tx = None;
-                    self.live_evt_rx = None;
-                    self.live_status = "idle".to_string();
-                    eprintln!("wire: live stopped");
-                }
-            } else {
-                let token = self.auth_token.clone().unwrap_or_default();
-                let rest_base = self.minos_base.clone();
-                let (cmd_tx, cmd_rx) = mpsc::channel();
-                let (event_tx, event_rx) = mpsc::channel();
-                if let Some(tx) = &self.wire_ctl_tx {
-                    let _ = tx.send(WireKind::Live {
-                        ws_url: ws_url.clone(),
-                        rest_base,
-                        token,
-                        cmd_tx: cmd_tx.clone(),
-                        cmd_rx,
-                        event_tx,
-                        wake_tx: self.wire_wake_tx.clone(),
-                    });
-                    self.live_cmd_tx = Some(cmd_tx);
-                    self.live_evt_rx = Some(event_rx);
-                    self.live_status = "connecting…".to_string();
-                    eprintln!("wire: live {ws_url}");
-                }
+    /// M6: hold sim motion for Setup. The engine stays armed (planning
+    /// markers need TakeControl), but the clock and legs freeze — Setup
+    /// has no movement by product definition. Live entry unfreezes.
+    fn hold_sim_for_setup(&mut self) {
+        if let Some(tx) = &self.sim_cmd_tx {
+            let _ = tx.send(SimCommand::SetPaused { paused: true });
+        }
+    }
+
+    /// M6: release every locally controlled ship. A new exercise starts
+    /// with no ghost legs from the previous session's sim.
+    fn release_all_local(&mut self) {
+        let ids: Vec<String> = self.controlled.iter().cloned().collect();
+        for id in &ids {
+            self.release_hull(id);
+        }
+        self.pending_waypoint = None;
+        self.placing = false;
+    }
+
+    /// Hand-off from State B (onboarding ticket, #77): the shell
+    /// replaces the old boot clutter — this machine directs first run
+    /// now. Presentation starts on its State C connect card, Simulation
+    /// opens Planning on the Exercise setup flow.
+    fn enter_shell(&mut self, mode: AppMode) {
+        self.onboard = Onboard::App;
+        self.set_app_mode(mode);
+        match mode {
+            AppMode::Presentation => {
+                self.connect_card = true;
+            }
+            AppMode::Simulation => {
+                // Planning opens on step 1 with a fresh game list (#79).
+                self.setup_step = 0;
+                self.connect_card = false;
+                self.users_refresh_games();
+                // #101: arm here, not only on mode switch — booting
+                // straight into Simulation early-returns set_app_mode
+                // (already the default) and placement stays refused.
+                self.mode.armed.store(true, Ordering::SeqCst);
+                // M6: Setup has no movement — freeze legs and clock.
+                self.hold_sim_for_setup();
             }
         }
-        if !authed && !live_on {
-            ui.label("Sign in through the Login island first.");
+    }
+
+    /// Four-phase read (ticket #77): Planning and Ready share
+    /// `Phase::Setup` (the ready flag gates Persiapan), Eksekusi is
+    /// Live, Evaluasi is Closed. Derived, so `UiMode` stays the
+    /// single writer of the underlying phase.
+    fn sim_stage(&self) -> SimStage {
+        match self.mode.phase {
+            Phase::Setup => {
+                if self.sim_ready {
+                    SimStage::Ready
+                } else {
+                    SimStage::Planning
+                }
+            }
+            Phase::Live => SimStage::Live,
+            Phase::Closed => SimStage::Eval,
         }
+    }
+
+
+    /// Connect/stop the live socket: token-gated swap onto the
+    /// socket, or back to the boot wire. Snapshot failure lands back
+    /// with the reason; fatal refusals arrive as status. One verb for
+    /// the Connection island and the onboarding State C card (#77).
+    fn toggle_live(&mut self) {
+        let ws_url = Self::ws_url_for(&self.minos_base);
+        if self.live_cmd_tx.is_some() {
+            if let Some(tx) = &self.wire_ctl_tx {
+                let _ = tx.send(WireKind::Empty);
+                self.live_cmd_tx = None;
+                self.live_evt_rx = None;
+                self.live_status = "idle".to_string();
+                eprintln!("wire: live stopped");
+            }
+        } else {
+            let token = self.auth_token.clone().unwrap_or_default();
+            let rest_base = self.minos_base.clone();
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::channel();
+            if let Some(tx) = &self.wire_ctl_tx {
+                let _ = tx.send(WireKind::Live {
+                    ws_url: ws_url.clone(),
+                    rest_base,
+                    token,
+                    cmd_tx: cmd_tx.clone(),
+                    cmd_rx,
+                    event_tx,
+                    wake_tx: self.wire_wake_tx.clone(),
+                });
+                self.live_cmd_tx = Some(cmd_tx);
+                self.live_evt_rx = Some(event_rx);
+                self.live_status = "connecting…".to_string();
+                eprintln!("wire: live {ws_url}");
+                // H11: a fresh actor watches nothing — re-declare the
+                // held game and the session's personal channel.
+                self.watch_game_channel();
+                self.watch_personal_channel();
+            }
+        }
+    }
+
+    /// Clear the in-memory visual boundary. Presigned URLs and decoded
+    /// textures belong to one authenticated user and one held
+    /// exercise; a new one starts with none of them.
+    fn clear_visual_cache(&mut self) {
+        self.visuals.clear();
+        self.unit_lods.clear();
+        self.heading_overrides.clear();
+        self.pending_image_urls.clear();
+        self.image_op = None;
+        self.image_request = None;
+        self.manifest_retry_at = None;
+        self.manifest_refresh_at = None;
+    }
+
+    /// Change the held game through one boundary. Refreshing the same
+    /// game keeps its visuals; moving to another game (or releasing
+    /// it) drops them before the new hold becomes observable.
+    fn set_held_game(&mut self, game: Option<(i64, String)>) {
+        let old_id = self.users_game.as_ref().map(|(id, _)| *id);
+        let new_id = game.as_ref().map(|(id, _)| *id);
+        if old_id != new_id {
+            self.clear_visual_cache();
+        }
+        self.users_game = game;
     }
 
     /// Stash a fresh pair: access token in memory with a fresh issue
     /// time, refresh token to the keyring (memory fallback, flagged).
     /// Rotations push down to the live actor when one runs.
     fn store_pair(&mut self, user: String, pair: TokenPair) {
+        // A token rotation for the same user keeps visuals. Logging in
+        // as somebody else is a user boundary even if the previous UI
+        // forgot to sign out cleanly.
+        if self.auth_user.as_deref() != Some(user.as_str()) {
+            self.clear_visual_cache();
+        }
         if let Some(rt) = pair.refresh_token.clone() {
             if tfg::backend::keyring_save(&user, &rt).is_err() {
                 self.auth_refresh_memory = Some(rt);
@@ -1029,6 +2341,8 @@ impl ShipApp {
                 self.auth_degraded = false;
             }
         }
+        // M3: remember whose refresh token to wake with next launch.
+        tfg::backend::last_user_save(&user);
         self.auth_user = Some(user);
         self.auth_token = Some(pair.access_token.clone());
         self.auth_issued_at = Some(Instant::now());
@@ -1038,12 +2352,46 @@ impl ShipApp {
         }
     }
 
-    /// Sign out everywhere: keyring entry best-effort first, then memory.
+    /// Sign out everywhere: refresh session revoked server-side first
+    /// (H9), then keyring entry best-effort, then memory. The socket
+    /// actor holds the access token, so it is shut down explicitly
+    /// instead of left polling on a dead session. Server refusal is
+    /// loud but never blocks the local sign-out.
     fn sign_out(&mut self, why: &str) {
         if let Some(user) = self.auth_user.clone() {
+            // H9: revoke while the token is still held. Keyring first,
+            // memory fallback — the same order the refresh path reads.
+            // M7: fire-and-forget — sign-out never stalls on a server
+            // round-trip (best effort by H9's design).
+            let stored = match tfg::backend::keyring_load(&user) {
+                Ok(Some(rt)) => Some(rt),
+                _ => self.auth_refresh_memory.clone(),
+            };
+            if let Some(rt) = stored {
+                let base = self.minos_base.clone();
+                std::thread::spawn(move || {
+                    match tfg::backend::MinosAuth::new(&base)
+                        .and_then(|a| a.logout(Some(&rt)))
+                    {
+                        Ok(()) => eprintln!("signed out: refresh session revoked"),
+                        Err(e) => eprintln!("signed out: server logout refused ({e})"),
+                    }
+                });
+            }
             let _ = tfg::backend::keyring_clear(&user);
         }
+        // M3: no session, no wake record — the next launch starts cold.
+        tfg::backend::last_user_clear();
+        if let Some(tx) = self.live_cmd_tx.take() {
+            let _ = tx.send(LiveCmd::Shutdown);
+        }
+        self.live_evt_rx = None;
+        self.live_status = "idle".to_string();
+        // A new sign-in's first Connected is a first connect, never a
+        // reconnect — the next hold starts cold.
+        self.live_connected_once = false;
         self.auth_user = None;
+        self.auth_user_id = None;
         self.auth_token = None;
         self.auth_issued_at = None;
         self.auth_ttl_secs = 0;
@@ -1052,57 +2400,187 @@ impl ShipApp {
         self.login_password.clear();
         self.pw_current.clear();
         self.pw_new.clear();
+        // Full session boundary: nothing from this user or exercise
+        // survives for the next sign-in. Abandoned op slots harvest
+        // nothing (a dead harvest never applies); hull halves go
+        // through the unified release; the next shell entry re-arms
+        // and re-defaults from scratch.
+        self.login_op = None;
+        self.sync_op = None;
+        self.spec_op = None;
+        self.pw_op = None;
+        self.plot_op = None;
+        self.setup_op = None;
+        self.pending_setup.clear();
+        self.pending_transition = None;
+        self.release_all_local();
+        self.registry = Registry::new(TrailBound::default());
+        self.deselect();
+        self.following = None;
+        self.users_game = None;
+        self.users_game_state = None;
+        self.users_games.clear();
+        self.games_gap = false;
+        self.users_roster.clear();
+        self.users_gunits.clear();
+        self.commanded_hulls.clear();
+        self.roster_gap = false;
+        self.units_gap = false;
+        self.placements_gap = false;
+        self.users_placements.clear();
+        self.placement_unplaced = 0;
+        self.placement_ready = false;
+        self.users_list.clear();
+        self.users_role = None;
+        self.users_status.clear();
+        self.join_key.clear();
+        self.inbox.clear();
+        self.game_messages.clear();
+        self.inbox_page_no = 1;
+        self.msg_open = None;
+        self.minos_tree.clear();
+        self.tree_gap = false;
+        // Session boundary: no URL, texture, measurement, or
+        // association from the previous user's exercise survives.
+        self.clear_visual_cache();
+        self.judgements.clear();
+        self.judge_score.clear();
+        self.reviews.clear();
+        self.review_body.clear();
+        self.review_editing = None;
+        self.timeline_events.clear();
+        self.timeline_cursor = None;
+        self.timeline_has_more = false;
+        self.msg_content.clear();
+        self.msg_callsign.clear();
+        self.msg_sending_note.clear();
+        self.msg_group.clear();
+        self.msg_per.clear();
+        self.msg_regnum.clear();
+        self.msg_to.clear();
+        self.msg_cc.clear();
+        self.msg_degree = None;
+        self.msg_assumed = None;
+        self.msg_reply_to = None;
+        self.scenario_roles.clear();
+        self.new_role_name.clear();
+        self.minos_clock = None;
+        self.minos_time_factor = None;
+        self.minos_room_key = None;
+        self.clock_denied = false;
+        self.factor_draft = 1.0;
+        self.last_seen.clear();
+        self.fix_count.clear();
+        self.last_game_sync = None;
+        self.game_elapsed_secs = None;
+        self.game_ratio = 1.0;
+        self.game_paused = false;
+        self.real_ts = None;
+        self.game_ts = None;
+        self.order_warning = None;
+        self.acting_as = None;
+        self.mode.reset();
+        self.sim_ready = false;
+        self.phase_note = None;
+        self.assessment_tab = 0;
         self.auth_status = format!("signed out ({why})");
         eprintln!("signed out ({why})");
     }
 
-    /// Run one sign-in attempt with the island's credentials: store the
-    /// pair, then probe the gate (200 green, 403 must-change-password).
+    /// Run one sign-in attempt with the island's credentials (M7): the
+    /// login + gate probe run off-thread; the frame pump stores the
+    /// pair and syncs on completion. Re-clicks while busy are refused.
     fn attempt_sign_in(&mut self) {
+        if self.login_op.is_some() {
+            self.auth_status = "sign-in already running…".to_string();
+            return;
+        }
         let base = self.minos_base.clone();
         let id = self.login_identifier.trim().to_string();
         if id.is_empty() {
             self.auth_status = "sign-in failed: identifier is empty".to_string();
             return;
         }
-        let client = match MinosAuth::new(&base) {
-            Ok(c) => c,
-            Err(e) => {
-                self.auth_status = format!("sign-in failed: {e}");
-                return;
+        let password = self.login_password.clone();
+        self.auth_status = format!("signing in as {id}…");
+        self.login_op = Some(spawn_rest("sign-in", move || {
+            let client =
+                MinosAuth::new(&base).map_err(|e| format!("sign-in failed: {e}"))?;
+            let pair = client
+                .login(&id, &password)
+                .map_err(|e| format!("sign-in failed: {e}"))?;
+            // M2: the courtesy flag routes straight to the change form.
+            if pair.must_change_password {
+                return Ok(LoginDone {
+                    user: id,
+                    pair,
+                    uid: None,
+                    needs_change: true,
+                    probe_note: None,
+                });
             }
-        };
-        match client.login(&id, &self.login_password) {
-            Ok(pair) => {
-                self.store_pair(id.clone(), pair);
-                self.login_password.clear();
-                match client.me(self.auth_token.as_deref().unwrap_or("")) {
-                    Ok(()) => {
-                        self.auth_needs_password_change = false;
-                        self.auth_status = format!("signed in as {id}");
-                        // Login syncs (master-data ticket): the working
-                        // copy refreshes on every entry.
-                        self.sync_now();
-                    }
-                    Err(tfg::backend::BackendError::Forbidden { .. }) => {
-                        self.auth_needs_password_change = true;
-                        self.auth_status =
-                            format!("signed in as {id} · must change password");
-                    }
-                    Err(e) => {
-                        self.auth_status = format!("signed in as {id} · probe: {e}");
-                    }
-                }
+            let token = pair.access_token.clone();
+            match client.me(&token) {
+                Ok(uid) => Ok(LoginDone {
+                    user: id,
+                    pair,
+                    uid: Some(uid),
+                    needs_change: false,
+                    probe_note: None,
+                }),
+                Err(tfg::backend::BackendError::Forbidden { .. }) => Ok(LoginDone {
+                    user: id,
+                    pair,
+                    uid: None,
+                    needs_change: true,
+                    probe_note: None,
+                }),
+                Err(e) => Ok(LoginDone {
+                    user: id.clone(),
+                    pair,
+                    uid: None,
+                    needs_change: false,
+                    probe_note: Some(format!("signed in as {id} · probe: {e}")),
+                }),
             }
-            Err(e) => {
-                self.auth_status = format!("sign-in failed: {e}");
+        }));
+    }
+
+    /// Apply a finished sign-in on the UI thread: store, probe outcome,
+    /// then sync (which spawns its own op — never blocks here).
+    fn apply_login(&mut self, done: LoginDone) {
+        self.login_password.clear();
+        self.store_pair(done.user.clone(), done.pair);
+        if done.needs_change {
+            self.auth_needs_password_change = true;
+            self.auth_status = format!("signed in as {} · must change password", done.user);
+            return;
+        }
+        match done.uid {
+            Some(uid) => {
+                self.auth_user_id = Some(uid);
+                self.watch_personal_channel();
+                self.auth_needs_password_change = false;
+                self.auth_status = format!("signed in as {}", done.user);
+                // Login syncs (master-data ticket): the working copy
+                // refreshes on every entry, off-thread.
+                self.sync_now();
+            }
+            None => {
+                self.auth_status = done.probe_note.unwrap_or_else(|| format!("signed in as {}", done.user));
             }
         }
     }
 
-    /// One refresh attempt, now (proactive tick and 109 path share it):
-    /// keyring first, memory fallback, loud sign-out when rotation fails.
+    /// One refresh attempt, now (M7: off-thread — the proactive tick
+    /// and the 109 path share it, and neither may stall frames).
+    /// Keyring first, memory fallback, loud sign-out when rotation
+    /// fails. Re-calls while busy are ignored: the in-flight rotation
+    /// is the freshest ask.
     fn refresh_now(&mut self) {
+        if self.refresh_op.is_some() {
+            return;
+        }
         let Some(user) = self.auth_user.clone() else {
             return;
         };
@@ -1116,130 +2594,259 @@ impl ShipApp {
             }
         };
         match stored {
-            Some(rt) => match MinosAuth::new(&base).and_then(|a| a.refresh(&rt)) {
-                Ok(pair) => {
-                    self.store_pair(user.clone(), pair);
-                    self.auth_status = format!("signed in as {user} · refreshed");
-                    eprintln!("auth refreshed for {user}");
-                }
-                Err(e) => {
-                    self.sign_out(&format!("refresh failed: {e}"));
-                }
-            },
+            Some(rt) => {
+                self.refresh_op = Some(spawn_rest("refresh", move || {
+                    MinosAuth::new(&base)
+                        .and_then(|a| a.refresh(&rt))
+                        .map_err(|e| e.to_string())
+                }));
+            }
             None => {
                 self.sign_out("refresh token missing");
             }
         }
     }
 
-    /// Full master-data sync (server wins, whole-table replace):
-    /// helpers, hierarchy, taxonomy, units. Runs after sign-in and on
-    /// the Sync button; failures report loudly, never half-applied
-    /// silently (replace_all commits per table, counts recorded).
-    fn sync_now(&mut self) {
-        let Some(tok) = self.auth_token.clone() else {
-            self.sync_status = "sign in first".to_string();
-            return;
-        };
-        let base = self.minos_base.clone();
-        let Some(conn) = self.store.as_mut() else {
-            self.sync_status = "store unavailable".to_string();
-            return;
-        };
-        match tfg::backend::MinosMaster::new(&base) {
-            Ok(master) => match tfg::store::sync_from(&master, &tok, conn) {
-                Ok(counts) => {
-                    let total: usize = counts.iter().map(|(_, n)| n).sum();
-                    let detail: Vec<String> =
-                        counts.iter().map(|(t, n)| format!("{t} {n}")).collect();
-                    self.sync_status = format!("synced {total} rows: {}", detail.join(", "));
-                    eprintln!("sync ok: {}", self.sync_status);
-                }
-                Err(e) => {
-                    self.sync_status = format!("sync failed: {e}");
-                    eprintln!("sync failed: {e}");
-                }
-            },
+    /// Apply a finished rotation: store, or sign out loudly on failure
+    /// (unchanged semantics — only the thread moved). The pump clears
+    /// the slot before calling.
+    fn apply_refresh(&mut self, user: String, res: Result<tfg::backend::TokenPair, String>) {
+        match res {
+            Ok(pair) => {
+                self.store_pair(user.clone(), pair);
+                self.auth_status = format!("signed in as {user} · refreshed");
+                eprintln!("auth refreshed for {user}");
+            }
             Err(e) => {
-                self.sync_status = format!("sync failed: {e}");
+                self.sign_out(&format!("refresh failed: {e}"));
             }
         }
     }
 
-    /// Bulk spec backfill (spec-sync ticket): every register hull
-    /// without stored figures gets one detail fetch. Skips what is
-    /// known (versions are immutable, refetch buys nothing). Blocking
-    /// and loud — this is an operator action, not a background task.
-    fn sync_specs_now(&mut self) {
+    /// Wake the last session at launch (M3): the recorded identifier's
+    /// keyring refresh token rotates into a live pair, the gate probe
+    /// confirms the id, and the working copy syncs — the same entry
+    /// path as a fresh sign-in. Silent when there is nothing to wake
+    /// (cold launch asks for login). A refused rotation clears the
+    /// wake record so one revoked token cannot fail every launch; an
+    /// unreachable backend keeps it for later.
+    fn restore_session(&mut self) {
+        let Some(user) = tfg::backend::last_user_load() else {
+            return;
+        };
+        let stored = match tfg::backend::keyring_load(&user) {
+            Ok(Some(rt)) => rt,
+            _ => return,
+        };
+        let base = self.minos_base.clone();
+        let client = match MinosAuth::new(&base) {
+            Ok(c) => c,
+            Err(e) => {
+                self.auth_status = format!("session restore failed: {e}");
+                return;
+            }
+        };
+        match client.refresh(&stored) {
+            Ok(pair) => {
+                let must_change = pair.must_change_password;
+                self.store_pair(user.clone(), pair);
+                if must_change {
+                    self.auth_needs_password_change = true;
+                    self.auth_status =
+                        format!("resumed as {user} · must change password");
+                    return;
+                }
+                match client.me(self.auth_token.as_deref().unwrap_or("")) {
+                    Ok(uid) => {
+                        self.auth_user_id = Some(uid);
+                        self.auth_needs_password_change = false;
+                        self.auth_status = format!("resumed session as {user}");
+                        eprintln!("session restored for {user}");
+                        self.sync_now();
+                    }
+                    Err(tfg::backend::BackendError::Forbidden { .. }) => {
+                        self.auth_needs_password_change = true;
+                        self.auth_status =
+                            format!("resumed as {user} · must change password");
+                    }
+                    Err(e) => {
+                        self.auth_status = format!("resumed as {user} · probe: {e}");
+                    }
+                }
+            }
+            Err(tfg::backend::BackendError::Transport(_)) => {
+                // Offline, not revoked: keep the record and stay cold.
+                eprintln!("session restore: backend unreachable, staying signed out");
+            }
+            Err(e) => {
+                eprintln!("session restore refused ({e}); clearing wake record");
+                tfg::backend::last_user_clear();
+                let _ = tfg::backend::keyring_clear(&user);
+            }
+        }
+    }
+
+    /// Full master-data sync, off-thread (M7: server wins, whole-table
+    /// replace). Runs after sign-in and on the Sync button; failures
+    /// report loudly, never half-applied silently (replace_all commits
+    /// per table, counts recorded). The connection moves into the
+    /// worker and rides back in the result.
+    fn sync_now(&mut self) {
+        if self.sync_op.is_some() {
+            self.sync_status = "sync already running…".to_string();
+            return;
+        }
         let Some(tok) = self.auth_token.clone() else {
             self.sync_status = "sign in first".to_string();
             return;
         };
         let base = self.minos_base.clone();
-        let Some(conn) = self.store.as_ref() else {
+        let Some(conn) = self.store.take() else {
             self.sync_status = "store unavailable".to_string();
             return;
         };
-        let master = match MinosMaster::new(&base) {
-            Ok(m) => m,
+        self.sync_status = "syncing…".to_string();
+        self.sync_op = Some(spawn_rest("sync", move || {
+            let master =
+                tfg::backend::MinosMaster::new(&base).map_err(|e| e.to_string())?;
+            let mut conn = conn;
+            let counts = tfg::store::sync_from(&master, &tok, &mut conn)?;
+            Ok(SyncDone { conn, counts })
+        }));
+    }
+
+    /// Apply a finished sync: hand the connection back, render counts.
+    /// Offline failure keeps the old working copy (nothing cleared).
+    fn apply_sync(&mut self, res: Result<SyncDone, String>) {
+        match res {
+            Ok(done) => {
+                self.store = Some(done.conn);
+                // The mirror moved — the Fleet cache follows it now,
+                // not on the next render. Any already-active visual
+                // version also gets its taxonomy-derived symbol again.
+                self.reload_fleet_cache();
+                self.reload_unit_symbols();
+                self.hydrate_visual_facts();
+                // A register sync is an explicit operator action; use it
+                // as a prompt to check the manifest too, so a newly
+                // uploaded hull picture does not wait for the cadence.
+                self.manifest_refresh_at = Some(Instant::now());
+                let total: usize = done.counts.iter().map(|(_, n)| n).sum();
+                let detail: Vec<String> =
+                    done.counts.iter().map(|(t, n)| format!("{t} {n}")).collect();
+                self.sync_status = format!("synced {total} rows: {}", detail.join(", "));
+                eprintln!("sync ok: {}", self.sync_status);
+            }
             Err(e) => {
-                self.sync_status = format!("spec sync failed: {e}");
-                return;
-            }
-        };
-        let ids = match tfg::store::unit_ids(conn) {
-            Ok(ids) => ids,
-            Err(e) => {
-                self.sync_status = format!("spec sync failed: {e}");
-                return;
-            }
-        };
-        let mut fetched = 0usize;
-        let mut skipped = 0usize;
-        let mut failed = 0usize;
-        for (i, uid) in ids.iter().enumerate() {
-            match tfg::store::spec_versions(conn, *uid) {
-                Ok(v) if !v.is_empty() => {
-                    skipped += 1;
-                    continue;
-                }
-                Err(e) => {
-                    self.sync_status = format!("spec sync failed: {e}");
-                    return;
-                }
-                _ => {}
-            }
-            match master.sync_spec(&tok, conn, *uid) {
-                Ok(spec) => {
-                    fetched += 1;
-                    if let Some(speed) = spec.speed_kn {
-                        self.catalog.upsert_runtime_class(
-                            spec.class_id,
-                            spec.class_name.clone(),
-                            speed,
-                            spec.cruise_kn.unwrap_or(0.0),
-                            spec.range_nm.unwrap_or(0.0),
-                        );
-                    }
-                    if fetched % 10 == 0 {
-                        eprintln!("spec sync: {fetched} fetched (hull {i})");
-                    }
-                }
-                Err(e) => {
-                    failed += 1;
-                    eprintln!("spec sync: hull {uid} failed: {e}");
-                }
+                // Connection rides back only on success — on failure the
+                // worker consumed it. Reopen so later syncs can retry.
+                self.store = tfg::store::open(&tfg::store::local_db_path()).ok();
+                self.sync_status = format!("sync failed: {e}");
+                eprintln!("sync failed: {e}");
             }
         }
-        self.sync_status = format!(
-            "specs: {fetched} fetched, {skipped} already known, {failed} failed"
-        );
-        eprintln!("spec sync done: {}", self.sync_status);
+    }
+
+    /// Bulk spec backfill, off-thread (M7): every register hull
+    /// without stored figures gets one detail fetch. Skips what is
+    /// known (versions are immutable, refetch buys nothing). The
+    /// figures upsert into both catalogs on apply.
+    fn sync_specs_now(&mut self) {
+        if self.spec_op.is_some() {
+            self.sync_status = "spec fetch already running…".to_string();
+            return;
+        }
+        let Some(tok) = self.auth_token.clone() else {
+            self.sync_status = "sign in first".to_string();
+            return;
+        };
+        let base = self.minos_base.clone();
+        let Some(conn) = self.store.take() else {
+            self.sync_status = "store unavailable".to_string();
+            return;
+        };
+        self.sync_status = "fetching hull specs…".to_string();
+        self.spec_op = Some(spawn_rest("specs", move || {
+            let master = tfg::backend::MinosMaster::new(&base).map_err(|e| e.to_string())?;
+            let ids = tfg::store::unit_ids(&conn)?;
+            let mut specs = Vec::new();
+            let (mut fetched, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+            for uid in ids {
+                match tfg::store::spec_versions(&conn, uid) {
+                    Ok(v) if !v.is_empty() => {
+                        skipped += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(format!("spec sync failed: {e}")),
+                    _ => {}
+                }
+                match master.sync_spec(&tok, &conn, uid) {
+                    Ok(spec) => {
+                        fetched += 1;
+                        if spec.speed_kn.is_some() {
+                            specs.push(spec);
+                        }
+                        if fetched % 10 == 0 {
+                            eprintln!("spec sync: {fetched} fetched");
+                        }
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("spec sync: hull {uid} failed: {e}");
+                    }
+                }
+            }
+            Ok(SpecDone { conn, specs, fetched, skipped, failed })
+        }));
+    }
+
+    /// Apply finished specs: connection back, figures into the UI
+    /// catalog and pushed down to the sim's own catalog (H10).
+    fn apply_specs(&mut self, res: Result<SpecDone, String>) {
+        match res {
+            Ok(done) => {
+                self.store = Some(done.conn);
+                for spec in &done.specs {
+                    let speed = spec.speed_kn.unwrap_or(0.0);
+                    self.catalog.upsert_runtime_class(
+                        spec.class_id,
+                        spec.class_name.clone(),
+                        spec.version,
+                        speed,
+                        spec.cruise_kn.unwrap_or(0.0),
+                        spec.range_nm.unwrap_or(0.0),
+                    );
+                    if let Some(tx) = &self.sim_cmd_tx {
+                        let _ = tx.send(SimCommand::UpsertClass {
+                            minos_class_id: spec.class_id,
+                            name: spec.class_name.clone(),
+                            version: spec.version,
+                            speed_kn: speed,
+                            cruise_kn: spec.cruise_kn.unwrap_or(0.0),
+                            range_nm: spec.range_nm.unwrap_or(0.0),
+                        });
+                    }
+                }
+                // Published physical measurements feed the visual
+                // model even when the asset version did not move.
+                self.hydrate_visual_facts();
+                self.sync_status = format!(
+                    "specs: {} fetched, {} already known, {} failed",
+                    done.fetched, done.skipped, done.failed
+                );
+                eprintln!("spec sync done: {}", self.sync_status);
+            }
+            Err(e) => {
+                self.store = tfg::store::open(&tfg::store::local_db_path()).ok();
+                self.sync_status = format!("spec sync failed: {e}");
+            }
+        }
     }
 
     /// Session-users client (build ticket): env-owned endpoint plus the
     /// in-memory access token. Every call below is a blocking operator
-    /// action with a loud status line — never a background poll.
+    /// action — callers spawn it onto a RestOp worker (#100) and apply
+    /// the result in pump_rest_ops, never on the egui thread.
     fn users_client(&self) -> Result<(MinosMaster, String), tfg::backend::BackendError> {
         let tok = self
             .auth_token
@@ -1249,28 +2856,178 @@ impl ShipApp {
         Ok((master, tok))
     }
 
-    fn users_refresh_games(&mut self) {
-        match self.users_client().and_then(|(m, t)| m.games_list(&t)) {
-            Ok(games) => {
-                self.users_games = games;
-                // A held game may have closed or vanished: drop it loudly.
-                if let Some((gid, _)) = self.users_game.clone() {
-                    if !self.users_games.iter().any(|g| g.id == gid) {
-                        self.users_game = None;
-                        self.users_status = "held game is gone — pick another".to_string();
-                        return;
-                    }
-                }
-                self.users_status = format!("{} game(s)", self.users_games.len());
-            }
-            Err(e) => self.users_status = format!("games failed: {e}"),
+    /// Judge-side test for commander assignment: the contract is that
+    /// the judge side never commands (a piece commanded by a judge is
+    /// a player wearing a referee's shirt). The roster row's flag is
+    /// primary, and the synced `game_roles` mirror backs it — that
+    /// lookup is the authority on `is_judge_side`, and a flag that
+    /// failed to parse must never read as "not a judge".
+    fn users_is_judge(&self, p: &tfg::backend::Participant) -> bool {
+        p.judge
+            || self
+                .users_roles
+                .iter()
+                .any(|(id, _, _, judge)| *id == p.role_id && *judge)
+    }
+
+    /// #100: one setup op at a time — queue refreshes, refuse writes.
+    /// Reads that land while busy wait their turn (deduped); writes
+    /// refuse loudly instead of piling conflicting writes.
+    fn setup_busy(&mut self, what: &str) -> bool {
+        if self.setup_op.is_some() {
+            self.users_status = format!("{what} already running…");
+            true
+        } else {
+            false
         }
     }
 
+    /// Queue a refresh kind for the pump to dispatch once the slot
+    /// frees (#100). Writes never queue — only reads repeat safely.
+    fn queue_refresh(&mut self, kind: PendingRefresh) {
+        if !self.pending_setup.contains(&kind) {
+            self.pending_setup.push(kind);
+        }
+    }
+
+    /// Dispatch one queued refresh when the slot is free. Called by
+    /// the pump after every applied setup op.
+    fn dispatch_queued_refresh(&mut self) {
+        if self.setup_op.is_some() {
+            return;
+        }
+        let Some(kind) = self.pending_setup.first().cloned() else {
+            return;
+        };
+        self.pending_setup.remove(0);
+        match kind {
+            PendingRefresh::Games => self.users_refresh_games(),
+            PendingRefresh::Directory => self.users_refresh_directory(),
+            PendingRefresh::Game => self.users_refresh_game(),
+            PendingRefresh::Tree => self.load_minos_tree(),
+        }
+    }
+
+    fn users_refresh_games(&mut self) {
+        if self.setup_op.is_some() {
+            self.queue_refresh(PendingRefresh::Games);
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("games failed: {e}");
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("games", move || {
+            // Typed inside the worker: a Forbidden list is the
+            // player-flow signal, never a fabricate-nothing error.
+            match master.games_list(&tok) {
+                Ok(g) => Ok(SetupDone::Games(g)),
+                Err(tfg::backend::BackendError::Forbidden { .. }) => {
+                    Ok(SetupDone::GamesDenied)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }));
+    }
+
+    /// Apply a finished game list: hold the vanished-game drop and the
+    /// count line on the UI thread. A surviving hold chains into the
+    /// bundle (detail + roster + units + placements) — refreshes that
+    /// need both lists funnel through here, never past a busy slot.
+    fn apply_games(&mut self, games: Vec<tfg::backend::GameRow>) {
+        self.users_games = games;
+        self.games_gap = false;
+        // A held game may have closed or vanished: drop it loudly.
+        if let Some((gid, _)) = self.users_game.clone() {
+            if !self.users_games.iter().any(|g| g.id == gid) {
+                self.drop_hold("held session is gone — pick another");
+                return;
+            }
+        }
+        self.users_status = format!("{} game(s)", self.users_games.len());
+        if self.users_game.is_some() {
+            // Subsumes any queued Game refresh — one bundle, not two.
+            self.pending_setup.retain(|k| *k != PendingRefresh::Game);
+            self.spawn_bundle();
+        }
+    }
+
+    /// Drop the hold with its per-game state: roster, pieces, tree,
+    /// placements, gaps, clock. Shared by the vanished-game drop and
+    /// the delete apply — a deleted game reads exactly like a
+    /// vanished one. Gap flags clear: they described the old hold's
+    /// reads, and the bundle re-marks them.
+    fn drop_hold(&mut self, why: &str) {
+        self.users_game = None;
+        self.users_game_state = None;
+        self.minos_clock = None;
+        self.minos_time_factor = None;
+        self.minos_room_key = None;
+        self.clock_denied = false;
+        self.watch_game_channel();
+        self.users_roster.clear();
+        self.users_gunits.clear();
+        self.commanded_hulls.clear();
+        self.minos_tree.clear();
+        self.tree_gap = false;
+        self.users_placements.clear();
+        self.placement_unplaced = 0;
+        self.placement_ready = false;
+        self.roster_gap = false;
+        self.units_gap = false;
+        self.placements_gap = false;
+        self.edit_open = false;
+        self.delete_armed = false;
+        // The pictures belonged to the exercise just released: their
+        // URLs, textures, and measurements do not follow a new hold.
+        self.clear_visual_cache();
+        self.users_status = why.to_string();
+    }
+
+    /// Spawn the bundled held-game read (detail + roster + units +
+    /// setup view). Shared by refreshes and apply chains. A busy slot
+    /// queues the Game refresh instead of dropping it.
+    fn spawn_bundle(&mut self) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        if self.setup_op.is_some() {
+            self.queue_refresh(PendingRefresh::Game);
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("game refresh failed: {e}");
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("game", move || {
+            // Detail is authoritative: its failure aborts the bundle
+            // (nothing applies, verdict stays pending for the retry).
+            // Each subordinate degrades independently below.
+            let detail = master
+                .game_detail(&tok, gid)
+                .map_err(|e| format!("session state unread: {e}"))?;
+            let roster = master.game_participants(&tok, gid);
+            let units = master.game_units_list(&tok, gid);
+            let placements = master.placements_list(&tok, gid);
+            Ok(SetupDone::Bundle(GameBundle { detail, roster, units, placements }))
+        }));
+    }
+
     fn users_refresh_directory(&mut self) {
-        // Role vocabulary rides the synced helpers mirror (cheap, always).
+        // Vocabularies ride the synced helpers mirror (cheap, always):
+        // game roles for seating, statuses + app roles for filters,
+        // message degrees ([7.7] Derajat) for the compose form.
         if let Some(conn) = self.store.as_ref() {
             self.users_roles = tfg::store::helper_list(conn, "game_roles").unwrap_or_default();
+            self.users_statuses = tfg::store::helper_list(conn, "user_statuses").unwrap_or_default();
+            self.users_approles = tfg::store::helper_list(conn, "app_roles").unwrap_or_default();
+            self.msg_degrees = tfg::store::helper_list(conn, "message_degrees").unwrap_or_default();
             if self.users_role.is_none() {
                 self.users_role = self
                     .users_roles
@@ -1280,88 +3037,344 @@ impl ShipApp {
             }
         }
         let query = self.users_search.clone();
-        match self.users_client().and_then(|(m, t)| m.users_list(&t, &query)) {
-            Ok(users) => {
-                self.users_list = users;
-                self.users_status = format!("directory: {} account(s)", self.users_list.len());
-            }
+        let status = self.users_filter_status;
+        let app_role = self.users_filter_role;
+        if self.setup_op.is_some() {
+            self.queue_refresh(PendingRefresh::Directory);
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
             Err(e) => {
                 self.users_list.clear();
                 self.users_status =
                     format!("directory unavailable (needs read on /system/users): {e}");
+                return;
             }
+        };
+        self.setup_op = Some(spawn_rest("directory", move || {
+            master
+                .users_list(&tok, &query, status, app_role)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::Users)
+        }));
+    }
+
+    /// Apply a finished directory page. Failures keep the last good
+    /// list when one exists; the 403 fallback message is unchanged.
+    fn apply_users(&mut self, users: Vec<tfg::backend::BackendUser>) {
+        self.users_list = users;
+        self.users_status = format!("directory: {} account(s)", self.users_list.len());
+    }
+
+
+    /// H1: move the local machine to the authoritative state. Guards on
+    /// the current phase keep steady-state refreshes (seating, assigns
+    /// during preparation; ticks during execution) no-ops: only a
+    /// mismatch moves anything.
+    fn users_project_stage(&mut self, state: &str) {
+        match state {
+            "planning" => {
+                self.sim_ready = false;
+                if self.mode.phase != Phase::Setup {
+                    self.mode.reset();
+                    self.close_working_islands();
+                    self.setup_step = 0;
+                    self.phase_note = None;
+                    // #101: reset disarms — re-arm for the new Setup,
+                    // like shell entry does.
+                    self.mode.armed.store(true, Ordering::SeqCst);
+                    // M6: a different game means Setup — freeze.
+                    self.hold_sim_for_setup();
+                }
+            }
+            "preparation" => {
+                self.sim_ready = true;
+                if self.mode.phase != Phase::Setup {
+                    self.mode.reset();
+                    self.close_working_islands();
+                    self.setup_step = 0;
+                    self.phase_note = None;
+                    // #101: reset disarms — re-arm for the new Setup,
+                    // like shell entry does.
+                    self.mode.armed.store(true, Ordering::SeqCst);
+                    // M6: a different game means Setup — freeze.
+                    self.hold_sim_for_setup();
+                }
+            }
+            "execution" => {
+                self.sim_ready = true;
+                // C3: Minos drives game pieces from here — release local
+                // legs first so no ghost track diverges, then plot the
+                // authoritative markers (even when the engine refuses).
+                self.release_game_pieces();
+                // #98: fresh streak per entry — past failures belong to
+                // the previous execution.
+                self.plot_fails = 0;
+                self.last_plot_ok = None;
+                if self.mode.phase != Phase::Live {
+                    self.start_session();
+                    if self.mode.phase != Phase::Live {
+                        self.phase_note = Some(
+                            "Minos says execution but the local engine refused to start (see log)".to_string(),
+                        );
+                    } else {
+                        self.phase_note = None;
+                    }
+                }
+                self.pull_minos_positions();
+            }
+            "closure" => {
+                self.sim_ready = false;
+                if self.mode.phase != Phase::Closed {
+                    self.end_session();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// H11: tell the socket actor which game broadcast channel to
+    /// watch. Best-effort — no actor means nothing to watch, and
+    /// re-sending the held id is a no-op actor-side.
+    fn watch_game_channel(&self) {
+        if let Some(tx) = &self.live_cmd_tx {
+            let _ = tx.send(LiveCmd::WatchGame(self.users_game.as_ref().map(|(id, _)| *id)));
+        }
+    }
+
+    /// H11: tell the socket actor which personal channel to watch.
+    fn watch_personal_channel(&self) {
+        if let Some(tx) = &self.live_cmd_tx {
+            let _ = tx.send(LiveCmd::WatchPersonal(self.auth_user_id));
         }
     }
 
     fn users_refresh_game(&mut self) {
-        let Some((gid, _)) = self.users_game.clone() else {
+        // H11: the watched broadcast channel follows the hold —
+        // including to None, which unsubscribes.
+        self.watch_game_channel();
+        if self.users_game.is_none() {
             self.users_roster.clear();
             self.users_gunits.clear();
+            self.commanded_hulls.clear();
+            self.users_placements.clear();
+            self.placement_unplaced = 0;
+            self.placement_ready = false;
+            self.roster_gap = false;
+            self.units_gap = false;
+            self.placements_gap = false;
             return;
-        };
-        match self.users_client().and_then(|(m, t)| m.game_participants(&t, gid)) {
-            Ok(r) => self.users_roster = r,
-            Err(e) => {
-                self.users_status = format!("roster failed: {e}");
-                return;
-            }
         }
-        match self.users_client().and_then(|(m, t)| m.game_units_list(&t, gid)) {
+        // Detail + roster + units + setup view in one worker trip; the
+        // H1 projection runs on apply, so a transition another client
+        // made still lands instead of disagreeing. Subordinates degrade
+        // independently — a staff-only 403 marks a gap, never moves the
+        // stage, never empties a list.
+        self.spawn_bundle();
+    }
+
+    /// Apply a finished bundle: detail first (hold, lists seed from the
+    /// projection), verdict against the fresh state, then each
+    /// subordinate degrades independently — a staff-only 403 keeps the
+    /// last good list behind a gap flag, never an empty list as truth.
+    fn apply_bundle(&mut self, b: GameBundle) {
+        let d = b.detail;
+        self.set_held_game(Some((d.id, d.name.clone())));
+        self.users_game_state = Some(d.state.clone());
+        // H2: the chosen rate rides the detail — a mid-exercise select
+        // learns the clock it is joining.
+        self.minos_time_factor =
+            if d.time_factor > 0.0 { Some(d.time_factor) } else { None };
+        // The room key rides the detail from preparation onward — the
+        // Game Master's share-out to personnel.
+        self.minos_room_key = d.room_key.clone();
+        self.users_project_stage(&d.state);
+        // #100: a refused transition left a pending verdict — the fresh
+        // state above decides it.
+        self.apply_transition_verdict();
+        // The detail is the sync: stamp even when subordinates gap.
+        self.last_game_sync = Some(Instant::now());
+        let roster_seg = match b.roster {
+            Ok(r) => {
+                self.users_roster = r;
+                self.roster_gap = false;
+                format!("roster: {}", self.users_roster.len())
+            }
+            Err(tfg::backend::BackendError::Forbidden { .. }) => {
+                self.roster_gap = true;
+                "roster: staff access unavailable".to_string()
+            }
+            Err(e) => format!("roster failed: {e}"),
+        };
+        let units_seg = match b.units {
             Ok(u) => {
                 self.users_gunits = u;
-                self.users_status = format!(
-                    "roster: {} · units: {}",
-                    self.users_roster.len(),
-                    self.users_gunits.len()
-                );
+                self.units_gap = false;
+                format!("units: {}", self.users_gunits.len())
             }
-            Err(e) => self.users_status = format!("game units failed: {e}"),
-        }
+            Err(tfg::backend::BackendError::Forbidden { .. }) => {
+                self.units_gap = true;
+                "units: staff access unavailable".to_string()
+            }
+            Err(e) => format!("units failed: {e}"),
+        };
+        let placements_seg = match b.placements {
+            Ok(view) => {
+                self.apply_placements(view);
+                self.placements_gap = false;
+                format!(
+                    "placements: {} placed, {} to go",
+                    self.users_placements.len(),
+                    self.placement_unplaced
+                )
+            }
+            Err(tfg::backend::BackendError::Forbidden { .. }) => {
+                self.placements_gap = true;
+                "placements: staff access unavailable".to_string()
+            }
+            Err(e) => format!("placements failed: {e}"),
+        };
+        self.users_status = format!(
+            "session synced ({}) · {roster_seg} · {units_seg} · {placements_seg}",
+            d.state
+        );
     }
 
     fn users_add(&mut self, user_id: i64) {
         let Some((gid, _)) = self.users_game.clone() else {
-            self.users_status = "pick a game first".to_string();
+            self.users_status = "hold a session first".to_string();
             return;
         };
         let Some(role) = self.users_role else {
             self.users_status = "pick a role first".to_string();
             return;
         };
-        match self
-            .users_client()
-            .and_then(|(m, t)| m.add_participant(&t, gid, user_id, role))
-        {
-            Ok(()) => {
-                self.users_status = format!("seated {user_id} in game {gid}");
-                self.users_refresh_game();
-            }
-            Err(e) => self.users_status = format!("add failed: {e}"),
+        if self.setup_busy("seat") {
+            return;
         }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("add failed: {e}");
+                return;
+            }
+        };
+        // The seat response IS the roster — no read-after-write.
+        let note = format!("seated {user_id} in game {gid}");
+        self.setup_op = Some(spawn_rest("seat", move || {
+            master
+                .add_participant(&tok, gid, user_id, role)
+                .map_err(|e| e.to_string())
+                .map(|r| SetupDone::Roster(r, note))
+        }));
+    }
+
+    /// Move a seated person to another game role. The write clears that
+    /// seat's readiness, so the status line says so out loud.
+    fn users_change_role(&mut self, user_id: i64, role_id: i64) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let who = self
+            .users_roster
+            .iter()
+            .find(|p| p.user_id == user_id)
+            .map(|p| p.user_name.clone())
+            .unwrap_or_else(|| format!("user {user_id}"));
+        let role = self
+            .users_roles
+            .iter()
+            .find(|(id, _, _, _)| *id == role_id)
+            .map(|(_, n, _, _)| n.clone())
+            .unwrap_or_else(|| format!("role {role_id}"));
+        if self.setup_busy("role change") {
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("role change failed: {e}");
+                return;
+            }
+        };
+        let note = format!("{who} → {role} (readiness cleared)");
+        self.setup_op = Some(spawn_rest("role", move || {
+            master
+                .set_participant_role(&tok, gid, user_id, role_id)
+                .map_err(|e| e.to_string())
+                .map(|r| SetupDone::Roster(r, note))
+        }));
+    }
+
+    /// Take a person off the roster. Removal of an absent seat is not
+    /// an error upstream (idempotent), so the button never lies.
+    fn users_remove(&mut self, user_id: i64) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let who = self
+            .users_roster
+            .iter()
+            .find(|p| p.user_id == user_id)
+            .map(|p| p.user_name.clone())
+            .unwrap_or_else(|| format!("user {user_id}"));
+        if self.setup_busy("remove") {
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("remove failed: {e}");
+                return;
+            }
+        };
+        let note = format!("removed {who} from game {gid}");
+        self.setup_op = Some(spawn_rest("unseat", move || {
+            master
+                .remove_participant(&tok, gid, user_id)
+                .map_err(|e| e.to_string())
+                .map(|r| SetupDone::Roster(r, note))
+        }));
     }
 
     fn users_command(&mut self, unit_id: i64, commander_id: i64) {
         let Some((gid, _)) = self.users_game.clone() else {
-            self.users_status = "pick a game first".to_string();
+            self.users_status = "hold a session first".to_string();
             return;
         };
-        match self
-            .users_client()
-            .and_then(|(m, t)| m.set_unit_commander(&t, gid, unit_id, commander_id))
-        {
-            Ok(()) => {
-                self.users_status = format!("unit {unit_id} now commanded by {commander_id}");
-                self.users_refresh_game();
-            }
-            Err(e) => self.users_status = format!("command failed: {e}"),
+        if self.setup_busy("command") {
+            return;
         }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("command failed: {e}");
+                return;
+            }
+        };
+        // The commander response IS the refreshed units array.
+        let note = format!("unit {unit_id} now commanded by {commander_id}");
+        self.setup_op = Some(spawn_rest("command", move || {
+            master
+                .set_unit_commander(&tok, gid, unit_id, commander_id)
+                .map_err(|e| e.to_string())
+                .map(|u| SetupDone::Units(u, note))
+        }));
     }
 
     /// Session-users island (build ticket): game picker, live directory
     /// with role pick + add, roster, and per-unit commander assigns.
     /// Layout thesis: heading → game → status → directory → roster →
     /// units, each separated, nav-free (one screen, no steps).
-    fn users_island(&mut self, ui: &mut egui::Ui) {
+    /// Setup flow step 2, directory half (#79): live account search
+    /// with filters, seat-as role, and add. Split out of the old
+    /// session-users island — the game picker moved to step 1, the
+    /// pieces list to step 3. Dragging a row still seats commanders
+    /// onto map markers.
+    fn users_directory_ui(&mut self, ui: &mut egui::Ui) {
         // User-drag gesture (same press-origin pattern as hull rows):
         // candidate until past the click threshold, then a live drag.
         if let Some(start) = self.upress.as_ref().map(|(_, _, s)| *s) {
@@ -1383,32 +3396,6 @@ impl ShipApp {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             ui.label(format!("moving {name} — release over a unit marker or group flag"));
         }
-        ui.heading("Session users");
-        ui.horizontal(|ui| {
-            let picked = self
-                .users_game
-                .clone()
-                .map(|(_, n)| n)
-                .unwrap_or_else(|| "pick a game".to_string());
-            egui::ComboBox::from_label("game")
-                .selected_text(picked)
-                .show_ui(ui, |ui| {
-                    for g in &self.users_games {
-                        ui.selectable_value(
-                            &mut self.users_game,
-                            Some((g.id, g.name.clone())),
-                            format!("{} ({})", g.name, g.state),
-                        );
-                    }
-                });
-            if ui.small_button("refresh").clicked() {
-                self.users_refresh_games();
-                self.users_refresh_directory();
-                self.users_refresh_game();
-            }
-        });
-        status_line(ui, &self.users_status.clone());
-        ui.separator();
         ui.strong("Directory");
         ui.horizontal(|ui| {
             ui.label("search:");
@@ -1416,13 +3403,45 @@ impl ShipApp {
             if ui.small_button("find").clicked() {
                 self.users_refresh_directory();
             }
-            let role_name = self
+        });
+        // Filters resolve from the helpers mirror and arm the next
+        // `find` — nothing re-queries on change (blocking reads stay
+        // explicit operator actions). "seat as" is the game role the
+        // add button will use; status / app role are account filters.
+        ui.horizontal(|ui| {
+            let status_name = self
+                .users_filter_status
+                .and_then(|s| self.users_statuses.iter().find(|(id, _, _, _)| *id == s))
+                .map(|(_, n, _, _)| n.clone())
+                .unwrap_or_else(|| "any".to_string());
+            egui::ComboBox::from_label("status")
+                .selected_text(status_name)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.users_filter_status, None, "any");
+                    for (id, name, _, _) in &self.users_statuses {
+                        ui.selectable_value(&mut self.users_filter_status, Some(*id), name);
+                    }
+                });
+            let app_name = self
+                .users_filter_role
+                .and_then(|r| self.users_approles.iter().find(|(id, _, _, _)| *id == r))
+                .map(|(_, n, _, _)| n.clone())
+                .unwrap_or_else(|| "any".to_string());
+            egui::ComboBox::from_label("app role")
+                .selected_text(app_name)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.users_filter_role, None, "any");
+                    for (id, name, _, _) in &self.users_approles {
+                        ui.selectable_value(&mut self.users_filter_role, Some(*id), name);
+                    }
+                });
+            let seat_role = self
                 .users_role
                 .and_then(|r| self.users_roles.iter().find(|(id, _, _, _)| *id == r))
                 .map(|(_, n, _, _)| n.clone())
-                .unwrap_or_else(|| "role".to_string());
-            egui::ComboBox::from_label("role")
-                .selected_text(role_name)
+                .unwrap_or_else(|| "pick".to_string());
+            egui::ComboBox::from_label("seat as")
+                .selected_text(seat_role)
                 .show_ui(ui, |ui| {
                     for (id, name, _, _) in &self.users_roles {
                         ui.selectable_value(&mut self.users_role, Some(*id), name);
@@ -1438,8 +3457,7 @@ impl ShipApp {
                 }
                 for u in &self.users_list {
                     ui.horizontal(|ui| {
-                        let resp =
-                            ui.selectable_label(false, format!("{} ({})", u.name, u.username));
+                        let resp = ui.selectable_label(false, u.name.clone());
                         if resp.is_pointer_button_down_on()
                             && self.udrag.is_none()
                             && self.upress.is_none()
@@ -1448,50 +3466,1573 @@ impl ShipApp {
                                 self.upress = Some((u.id, u.name.clone(), start));
                             }
                         }
+                        // Status chip: green only for the seeded Active
+                        // row — anything else stays quiet but visible.
+                        if !u.status_name.is_empty() {
+                            let txt = egui::RichText::new(format!("[{}]", u.status_name)).small();
+                            ui.label(if u.status_name.eq_ignore_ascii_case("active") {
+                                txt.color(egui::Color32::from_rgb(0x4A, 0xDE, 0x80))
+                            } else {
+                                txt.weak()
+                            });
+                        }
                         if ui.small_button("add").clicked() {
                             seating.push(u.id);
                         }
                     });
+                    // Identity line: what tells two same-named accounts
+                    // apart (username · rank · unit · position).
+                    let detail: Vec<&str> = [
+                        u.username.as_str(),
+                        u.pangkat.as_str(),
+                        u.satuan.as_str(),
+                        u.jabatan.as_str(),
+                    ]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                    if !detail.is_empty() {
+                        ui.label(egui::RichText::new(detail.join(" · ")).weak().small());
+                    }
                 }
             },
         );
         for uid in seating {
             self.users_add(uid);
         }
-        ui.separator();
+    }
+
+    /// Setup flow step 2, roster half (#79): who holds which seat,
+    /// role changes (each clears readiness), and removals.
+    fn users_roster_ui(&mut self, ui: &mut egui::Ui) {
         ui.strong("Roster");
         if self.users_game.is_none() {
-            ui.weak("Pick a game to see its roster.");
+            ui.weak("Pick a session to see its roster.");
         } else if self.users_roster.is_empty() {
             ui.weak("Nobody seated yet.");
         } else {
+            ui.weak("one role per person — a role change clears readiness");
+            // Collect first, apply after the loop: every write answers
+            // with the whole roster, so one pass per action is enough.
+            let mut role_changes: Vec<(i64, i64)> = Vec::new();
+            let mut removals: Vec<i64> = Vec::new();
             for p in &self.users_roster {
-                ui.label(format!(
-                    "{} — {}{}",
-                    p.user_name,
-                    p.role_name,
-                    if p.judge { " (judge)" } else { "" }
-                ));
+                ui.horizontal(|ui| {
+                    ui.label(p.user_name.clone());
+                    // Re-picking the current role is a no-op, so it
+                    // never renders as an option.
+                    let mut tmp = p.role_id;
+                    egui::ComboBox::from_id_salt(("roster-role", p.user_id))
+                        .selected_text(p.role_name.clone())
+                        .show_ui(ui, |ui| {
+                            for (id, name, _, _) in &self.users_roles {
+                                if *id != p.role_id
+                                    && ui.selectable_value(&mut tmp, *id, name).clicked()
+                                {
+                                    role_changes.push((p.user_id, *id));
+                                }
+                            }
+                        });
+                    if p.judge {
+                        ui.label(egui::RichText::new("(judge)").weak().small());
+                    } else if p.ready {
+                        ui.label(
+                            egui::RichText::new("✓ ready")
+                                .small()
+                                .color(egui::Color32::from_rgb(0x4A, 0xDE, 0x80)),
+                        );
+                    } else {
+                        ui.label(egui::RichText::new("not ready").weak().small());
+                    }
+                    if ui.small_button("remove").clicked() {
+                        removals.push(p.user_id);
+                    }
+                });
+            }
+            for (uid, role_id) in role_changes {
+                self.users_change_role(uid, role_id);
+            }
+            for uid in removals {
+                self.users_remove(uid);
+            }
+        }
+    }
+
+    /// Setup flow actions (#79): game lifecycle writes. Every write
+    /// answers with the collection it changed — no read-after-write.
+    /// Players seat before fleet assigns: a piece IS a hull commanded
+    /// by a participant of the game, never judge-side.
+
+    /// Step 1 write: create the game session (born in `planning`),
+    /// hold it, load its empty roster and pieces, move to step 2.
+    fn setup_create_game(&mut self) {
+        let name = self.setup_name.trim().to_string();
+        if name.is_empty() {
+            self.users_status = "name the game first".to_string();
+            return;
+        }
+        if self.setup_busy("create") {
+            return;
+        }
+        let desc = self.setup_description.clone();
+        let purp = self.setup_purpose.clone();
+        let targ = self.setup_target.clone();
+        let area = self.setup_area.clone();
+        let tag = self.setup_map_tag.clone();
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("create failed: {e}");
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("create", move || {
+            master
+                .create_game(&tok, &name, &desc, &purp, &targ, &area, &tag)
+                .map_err(|e| e.to_string())
+                .map(|g| {
+                    let note = format!("created {} (planning)", g.name);
+                    SetupDone::GameCreate(g, note)
+                })
+        }));
+    }
+
+    /// Apply a created game: hold it, seed planning honesty, reload,
+    /// clear the form, move to step 2.
+    fn apply_created_game(&mut self, g: tfg::backend::GameRow, note: String) {
+        self.users_status = note;
+        self.users_refresh_games();
+        self.set_held_game(Some((g.id, g.name)));
+        self.minos_clock = None;
+        self.minos_room_key = None;
+        self.clock_denied = false;  // new hold, unknown grant
+        // Born in planning by contract: seed the state so the
+        // projection below starts honest even before it runs.
+        self.users_game_state = Some("planning".to_string());
+        self.users_refresh_game();
+        self.setup_name.clear();
+        self.setup_description.clear();
+        self.setup_purpose.clear();
+        self.setup_target.clear();
+        self.setup_area.clear();
+        self.setup_map_tag.clear();
+        self.setup_step = 1;
+    }
+
+    /// Step 3 write: put a register hull into the game under the
+    /// picked commander. Mirrors the hull to the map engine as a
+    /// placement pick — click the map to drop it.
+    fn setup_assign_unit(&mut self, unit_id: i64, unit_name: &str) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let Some(cmdr) = self.setup_commander else {
+            self.users_status = "pick a commander first".to_string();
+            return;
+        };
+        if self.setup_busy("assign") {
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("assign failed: {e}");
+                return;
+            }
+        };
+        let name = unit_name.to_string();
+        self.setup_op = Some(spawn_rest("assign", move || {
+            master
+                .assign_unit(&tok, gid, unit_id, cmdr)
+                .map_err(|e| e.to_string())
+                .map(|u| {
+                    SetupDone::Assign(
+                        u,
+                        format!("{name} assigned — click the map to place it"),
+                        unit_id,
+                    )
+                })
+        }));
+        // Arm the map click for placement (the click handler only
+        // stands hulls up while the Place tool is active). The pick
+        // itself lands on apply, once the piece exists server-side.
+        self.mode.tool = SetupTool::Place;
+    }
+
+    /// Step 3 write: take a hull back out of the game (idempotent).
+    fn setup_remove_unit(&mut self, unit_id: i64, unit_name: &str) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        if self.setup_busy("remove") {
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("remove failed: {e}");
+                return;
+            }
+        };
+        let name = unit_name.to_string();
+        self.setup_op = Some(spawn_rest("unassign", move || {
+            master
+                .remove_unit(&tok, gid, unit_id)
+                .map_err(|e| e.to_string())
+                .map(|u| SetupDone::Unassign(u, format!("{name} removed from the session"), unit_id))
+        }));
+    }
+
+    /// Gate arithmetic for step 4 and the Persiapan bar: exercise-side
+    /// seats and how many of them are ready. Judges are exempt.
+    fn setup_gate_counts(&self) -> (usize, usize) {
+        let mut side = 0;
+        let mut ready = 0;
+        for p in &self.users_roster {
+            if !self.users_is_judge(p) {
+                side += 1;
+                if p.ready {
+                    ready += 1;
+                }
+            }
+        }
+        (side, ready)
+    }
+
+    /// Non-judge roster members: the only people who may command.
+    fn setup_crew(&self) -> Vec<(i64, String)> {
+        self.users_roster
+            .iter()
+            .filter(|p| !self.users_is_judge(p))
+            .map(|p| (p.user_id, p.user_name.clone()))
+            .collect()
+    }
+
+    /// Step 4 write: planning → preparation needs no gate (the Game
+    /// Master decides planning is done). Flips the local stage too.
+    fn setup_advance_prep(&mut self) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        if self.setup_busy("advance") {
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.phase_note = Some(format!("advance refused: {e}"));
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("advance", move || {
+            Ok(match master.transition_game(&tok, gid, "preparation") {
+                Ok(g) => SetupDone::Game("preparation".to_string(), g),
+                Err(tfg::backend::BackendError::Forbidden { .. }) => SetupDone::GameFailed(
+                    "preparation".to_string(),
+                    "forbidden".to_string(),
+                    true,
+                ),
+                Err(e) => SetupDone::GameFailed("preparation".to_string(), e.to_string(), false),
+            })
+        }));
+    }
+
+    /// Persiapan bar write: preparation → execution runs the gate
+    /// (pieces, exercise-side seats, every one ready — the refusal
+    /// names all of them). The bundle inside the refresh projects the
+    /// execution state onto Live; the guarded start below is only the
+    /// fallback for a failed detail read after a successful transition.
+    fn setup_advance_execution(&mut self) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.phase_note = Some("hold a session first".to_string());
+            return;
+        };
+        if self.setup_busy("execution") {
+            self.phase_note = Some("execution already running…".to_string());
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.phase_note = Some(format!("execution refused: {e}"));
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("execution", move || {
+            Ok(match master.transition_game(&tok, gid, "execution") {
+                Ok(g) => SetupDone::Game("execution".to_string(), g),
+                Err(tfg::backend::BackendError::Forbidden { .. }) => SetupDone::GameFailed(
+                    "execution".to_string(),
+                    "forbidden".to_string(),
+                    true,
+                ),
+                Err(e) => SetupDone::GameFailed("execution".to_string(), e.to_string(), false),
+            })
+        }));
+    }
+
+    /// Eksekusi bar write (H1): execution → closure moves the backend
+    /// first, then the local machine follows. A refusal keeps the
+    /// session Live and says why — ending locally while Minos still
+    /// runs is exactly the disagreement this ticket removes. When the
+    /// backend is already closed (another client closed it), the
+    /// resync projects Eval and the local end follows honestly.
+    fn close_game(&mut self) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.phase_note = Some("hold a session first".to_string());
+            return;
+        };
+        if self.setup_busy("closure") {
+            self.phase_note = Some("closure already running…".to_string());
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.phase_note = Some(format!("closure refused: {e}"));
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("closure", move || {
+            Ok(match master.transition_game(&tok, gid, "closure") {
+                Ok(g) => SetupDone::Game("closure".to_string(), g),
+                Err(tfg::backend::BackendError::Forbidden { .. }) => SetupDone::GameFailed(
+                    "closure".to_string(),
+                    "forbidden".to_string(),
+                    true,
+                ),
+                Err(e) => SetupDone::GameFailed("closure".to_string(), e.to_string(), false),
+            })
+        }));
+    }
+
+    /// Apply a finished transition: the bundle refreshes project the
+    /// new state (guarded local start/end ride along as before).
+    /// Success clears any pending refusal verdict.
+    fn apply_transition(&mut self, to: &str, g: tfg::backend::GameRow) {
+        self.pending_transition = None;        match to {
+            "preparation" => {
+                self.sim_ready = true;
+                self.phase_note = None;
+                self.users_status = format!("{} → {}", g.name, g.state);
+                self.users_refresh_games();
+                self.users_refresh_game();
+            }
+            "execution" => {
+                self.phase_note = None;
+                self.users_status = format!("{} → {}", g.name, g.state);
+                self.users_refresh_games();
+                self.users_refresh_game();
+                if !self.session_live() {
+                    self.start_session();
+                }
+            }
+            "closure" => {
+                self.phase_note = None;
+                self.users_status = format!("{} → {}", g.name, g.state);
+                self.users_refresh_games();
+                self.users_refresh_game();
+                if !self.session_closed() {
+                    self.end_session();
+                }
+            }
+            _ => {
+                self.users_status = format!("{} → {}", g.name, g.state);
+            }
+        }
+    }
+
+    /// Apply a refused transition: re-read first, verdict on arrival.
+    /// The bundle apply consumes the pending verdict against the
+    /// authoritative state.
+    fn apply_transition_failed(&mut self, to: String, e: String, forbidden: bool) {
+        self.pending_transition = Some((to, e, forbidden));
+        self.users_refresh_games();
+        self.users_refresh_game();
+    }
+
+    /// Verdict for a refused transition, read off authoritative state:
+    /// already-moved folds into the projection's outcome, otherwise
+    /// the refusal stands on the bar.
+    fn apply_transition_verdict(&mut self) {
+        let Some((to, e, forbidden)) = self.pending_transition.take() else {
+            return;
+        };
+        let state = self.users_game_state.clone();
+        match (to.as_str(), state.as_deref()) {
+            ("closure", Some("closure")) => {
+                self.phase_note = Some("closed on Minos by another client".to_string());
+                if !self.session_closed() {
+                    self.end_session();
+                }
+            }
+            ("execution", Some("execution")) => {
+                self.phase_note = Some("executing on Minos already".to_string());
+                if !self.session_live() {
+                    self.start_session();
+                }
+            }
+            ("preparation", Some("preparation")) => {
+                self.sim_ready = true;
+                self.phase_note = None;
+            }
+            _ if forbidden => {
+                // #102: advancing is the game-domain grant of this
+                // game's Game Master — application admin rights never
+                // apply, and the backend's bare 403 explains nothing.
+                // Seating is actionable today (step 2 seats any role),
+                // so name it, split by whether the caller is seated.
+                let seated = self.own_roster_row().is_some();
+                self.phase_note = Some(if seated {
+                    "Only this session's Game Master advances it — being app admin is not enough. Seat yourself as Game Master in step 2, then retry.".to_string()
+                } else {
+                    "Only this session's Game Master advances it — you hold no seat in it. Seat yourself (Game Master role) in step 2, then retry.".to_string()
+                });
+            }
+            _ => {
+                let verb = match to.as_str() {
+                    "closure" => "closure",
+                    "execution" => "execution",
+                    _ => "advance",
+                };
+                self.phase_note = Some(format!("{verb} refused: {e}"));
+            }
+        }
+    }
+
+    /// C2: apply a placement setup view to local state. Counts ride
+    /// along — the gate arithmetic is the server's, never recomputed.
+    fn apply_placements(&mut self, view: tfg::backend::PlacementList) {
+        self.users_placements = view.placements;
+        self.placement_unplaced = view.unplaced;
+        self.placement_ready = view.ready;
+    }
+
+    /// C2: the caller's own roster row, matched by the probed user id —
+    /// never by name (the login identifier is not the display name).
+    fn own_roster_row(&self) -> Option<tfg::backend::Participant> {
+        let uid = self.auth_user_id?;
+        self.users_roster
+            .iter()
+            .find(|p| p.user_id == uid)
+            .cloned()
+    }
+
+    /// C2: declare or withdraw the CALLER's own readiness. Nobody can
+    /// declare for somebody else — there is no user id in the request.
+    /// The roster reloads afterwards so the badge shown is the row the
+    /// database decided, not an optimistic flip.
+    fn set_own_readiness(&mut self, ready: bool) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        if self.setup_busy("readiness") {
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("readiness failed: {e}");
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("readiness", move || {
+            master
+                .set_readiness(&tok, gid, ready)
+                .map_err(|e| e.to_string())
+                .map(|j| {
+                    let note = if ready {
+                        format!("{} declared ready ({} · {})", j.user_name, j.role_name, j.game_name)
+                    } else {
+                        format!("{} withdrew readiness", j.user_name)
+                    };
+                    SetupDone::Join(j, note)
+                })
+        }));
+    }
+
+    /// Apply a finished join/readiness answer: confirm identity, hold
+    /// or badge from it, then reload through the bundle.
+    fn apply_join(&mut self, j: tfg::backend::JoinResult, note: String) {
+        self.auth_user_id = Some(j.user_id);
+        self.watch_personal_channel();
+        // A join answer carries the game; a readiness answer echoes the
+        // held one. Either way the hold follows the answer — and a
+        // changed hold drops the old game's clock read.
+        let held = self.users_game.as_ref().map(|(id, _)| *id);
+        if held != Some(j.game_id) {
+            self.minos_clock = None;
+            self.minos_room_key = None;
+            self.clock_denied = false;  // new hold, unknown grant
+            // A new hold means unknown gaps — the bundle re-marks them.
+            self.roster_gap = false;
+            self.units_gap = false;
+            self.placements_gap = false;
+            // …and a new tree: queued behind the bundle, never refused
+            // past a busy slot. Readiness echoes skip this entirely.
+            self.minos_tree.clear();
+            self.tree_gap = false;
+            self.queue_refresh(PendingRefresh::Tree);
+        }
+        self.set_held_game(Some((j.game_id, j.game_name.clone())));
+        self.users_game_state = Some(j.game_state.clone());
+        // Atomic seat landing: the answer's participant row upserts the
+        // local roster (a later staff bundle overwrites with the full
+        // list; a gapped one leaves this row standing), and the
+        // commanded hulls become the order authority — no successful
+        // join ends in "you hold no seat".
+        let row = tfg::backend::Participant {
+            user_id: j.user_id,
+            user_name: j.user_name.clone(),
+            role_id: j.role_id,
+            role_name: j.role_name.clone(),
+            judge: j.judge,
+            ready: j.ready,
+        };
+        match self.users_roster.iter_mut().find(|p| p.user_id == j.user_id) {
+            Some(slot) => *slot = row,
+            None => self.users_roster.push(row),
+        }
+        self.commanded_hulls = j.commanded_units.clone();
+        self.users_status = note;
+        self.users_refresh_games();
+        self.users_refresh_game();
+    }
+
+    /// C2: enter a game room with its key. The key is the only input;
+    /// the answer carries the game, so the hold is set from it and the
+    /// H1 resync inside the refresh projects the stage. Unknown key is
+    /// 404, a valid key without a seat is 403 (ask the Game Master).
+    fn join_with_key(&mut self) {
+        let key = self.join_key.trim().to_string();
+        if key.is_empty() {
+            self.users_status = "enter the room key first".to_string();
+            return;
+        }
+        if self.setup_busy("join") {
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("join failed: {e}");
+                return;
+            }
+        };
+        self.join_key.clear();
+        self.setup_op = Some(spawn_rest("join", move || {
+            // Typed in the worker: 403 is a valid key without a seat
+            // (ask the Game Master), 404 an unknown key (check the
+            // code) — different next actions, so they never share a
+            // line. Everything else is a loud transport failure.
+            let res = match master.join_game(&tok, &key) {
+                Ok(j) => {
+                    let note = format!(
+                        "joined {} as {} ({})",
+                        j.game_name, j.user_name, j.role_name
+                    );
+                    Ok(SetupDone::Join(j, note))
+                }
+                Err(tfg::backend::BackendError::Forbidden { .. }) => {
+                    Ok(SetupDone::JoinFailed(
+                        "valid room key, but you hold no seat in that session — ask the Game Master to seat you".to_string(),
+                    ))
+                }
+                Err(tfg::backend::BackendError::Api { status: 404, .. }) => {
+                    Ok(SetupDone::JoinFailed(
+                        "unknown room key — check the code with the organizer".to_string(),
+                    ))
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            res
+        }));
+    }
+
+    /// C2: lift a hull off the map (placement DELETE, idempotent). The
+    /// piece stays in the exercise and in the task organisation.
+    fn lift_placement(&mut self, unit_id: i64, unit_name: &str) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        if self.setup_busy("lift") {
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("lift failed: {e}");
+                return;
+            }
+        };
+        let name = unit_name.to_string();
+        self.setup_op = Some(spawn_rest("lift", move || {
+            master
+                .clear_placement(&tok, gid, unit_id)
+                .map_err(|e| e.to_string())
+                .map(|view| SetupDone::Lift(view, format!("{name} lifted off the map"), unit_id))
+        }));
+    }
+
+    /// C3: the held game's piece for this ship, if the caller commands
+    /// it in an executing game. Authority is the join answer's
+    /// commanded hulls first (the only list a participant always sees),
+    /// the staff unit list second. Anything else stays on the local
+    /// (sandbox) order path.
+    fn minos_order_target(&self, ship_id: &str) -> Option<i64> {
+        if self.users_game_state.as_deref() != Some("execution") {
+            return None;
+        }
+        let uid = ship_id.parse::<i64>().ok()?;
+        let me = self.auth_user_id?;
+        if self.commanded_hulls.iter().any(|g| g.unit_id == uid) {
+            return Some(uid);
+        }
+        self.users_gunits
+            .iter()
+            .find(|g| g.unit_id == uid && g.commander_id == Some(me))
+            .map(|g| g.unit_id)
+    }
+
+    /// C3: order a commanded piece through Minos. Heading derives from
+    /// the waypoint against the ship's latest known position (the same
+    /// equirectangular bearing the sim steers by); the server owns the
+    /// fix chain, assumed time, clamping, and history. No local
+    /// SetOrder follows — dual authority is what this ticket removes.
+    /// Refusals (paused clock, wrong commander) stay loud and local.
+    /// Orders batch (#100): one op carries every commanded leg, so a
+    /// fan-out never collides with the serialized slot.
+    fn order_via_minos(&mut self, ship_id: &str, waypoint: (f64, f64), speed_kn: f32) {
+        let Some(leg) = self.minos_leg(ship_id, waypoint) else {
+            return;
+        };
+        self.spawn_order_batch(vec![(leg.0, leg.1, leg.2, speed_kn)]);
+    }
+
+    /// C3: resolve one ship to a Minos order leg (unit, ship, heading),
+    /// or refuse loudly when there is no position to steer from.
+    fn minos_leg(&mut self, ship_id: &str, waypoint: (f64, f64)) -> Option<(i64, String, f64)> {
+        let Some(uid) = self.minos_order_target(ship_id) else {
+            return None;
+        };
+        let Some(own) = self
+            .registry
+            .ships()
+            .iter()
+            .find(|s| s.ship_id == ship_id)
+            .map(|s| s.latest.position.clone())
+        else {
+            let msg = format!("order refused: no position for {ship_id} — plot first");
+            self.feed(msg.clone());
+            self.users_status = msg;
+            return None;
+        };
+        let heading = own.bearing_deg_to(&GeoPosition {
+            latitude: waypoint.0,
+            longitude: waypoint.1,
+        });
+        Some((uid, ship_id.to_string(), heading))
+    }
+
+    /// #100: fire one batch op carrying every (unit, ship, heading,
+    /// speed) leg. The worker fills each outcome; the apply reports
+    /// them all and pulls the plot once.
+    fn spawn_order_batch(&mut self, legs: Vec<(i64, String, f64, f32)>) {
+        if legs.is_empty() {
+            return;
+        }
+        if self.setup_busy("order") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = format!("order refused: Minos says {e}");
+                self.feed(msg.clone());
+                self.users_status = msg;
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("order", move || {
+            let mut outs = Vec::with_capacity(legs.len());
+            for (uid, ship, heading, speed) in legs {
+                let result = master
+                    .order_unit(&tok, gid, uid, heading, f64::from(speed))
+                    .map_err(|e| e.to_string());
+                outs.push(OrderOut { ship, heading, speed, result });
+            }
+            Ok(SetupDone::FixBatch(outs))
+        }));
+    }
+
+    /// Apply finished Minos orders: one feed line per leg, status names
+    /// the count, then the plot refreshes once for all of them.
+    fn apply_fix_batch(&mut self, outs: Vec<OrderOut>) {
+        let mut ok = 0;
+        for out in outs {
+            match out.result {
+                Ok(fix) => {
+                    ok += 1;
+                    let clamp = match fix.requested_speed {
+                        Some(asked) if fix.clamped => {
+                            format!(" · clamped {asked:.0}→{:.0} kn", fix.speed)
+                        }
+                        _ => String::new(),
+                    };
+                    self.feed(format!(
+                        "Minos order {}: {:.0}° @ {:.0} kn{clamp} · fix @ ({:.4}, {:.4}) {}",
+                        out.ship,
+                        out.heading,
+                        out.speed,
+                        fix.latitude,
+                        fix.longitude,
+                        fix.assumed_time
+                    ));
+                }
+                Err(e) => {
+                    self.feed(format!("order refused for {}: Minos says {e}", out.ship));
+                }
+            }
+        }
+        self.users_status = format!("Minos orders: {ok} applied");
+        self.pull_minos_positions();
+    }
+
+    /// C3: read the authoritative plot and ingest it as game fixes —
+    /// the marker source for Minos-driven hulls. Local ghosts for those
+    /// hulls are released on execution entry, so nothing flaps. Game
+    /// fixes are scenario-stamped: they glide without the jitter guard
+    /// and never wall-age (see `FixSource::Game`).
+    /// C3 + M7: read the authoritative plot off-thread and ingest it
+    /// as game fixes on apply — the marker source for Minos-driven
+    /// hulls. Re-pulls while busy are ignored: the in-flight picture
+    /// is the freshest ask.
+    fn pull_minos_positions(&mut self) {
+        if self.plot_op.is_some() {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        // #98: every attempt (manual or cadence) restarts the wait —
+        // stamped before the auth check so a missing token backs off
+        // instead of rebuilding the client every frame.
+        self.last_plot_try = Some(Instant::now());
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        self.plot_op = Some(spawn_rest("plot", move || {
+            master.positions(&tok, gid, None, None).map_err(|e| e.to_string())
+        }));
+    }
+
+    /// Apply a finished plot: ingest as game fixes (scenario-stamped —
+    /// glide without the jitter guard, never wall-age). Success resets
+    /// the cadence streak; failure grows it (see the pump).
+    fn apply_plot(&mut self, res: Result<tfg::backend::PositionList, String>) {
+        match res {
+            Ok(plot) => {
+                self.last_plot_ok = Some(Instant::now());
+                self.plot_fails = 0;
+                let fixes: Vec<Fix> = plot
+                    .positions
+                    .iter()
+                    .map(|p| {
+                        let (name, hull) = self
+                            .users_gunits
+                            .iter()
+                            .find(|g| g.unit_id == p.unit_id)
+                            .map(|g| {
+                                (
+                                    Some(g.unit_name.clone()),
+                                    Some(g.hull_number.clone()),
+                                )
+                            })
+                            .unwrap_or((None, None));
+                        Fix {
+                            ship_id: p.unit_id.to_string(),
+                            position: GeoPosition {
+                                latitude: p.latitude,
+                                longitude: p.longitude,
+                            },
+                            ts: p.assumed_time.clone(),
+                            received_at: None,
+                            heading_deg: Some(p.heading as f32),
+                            speed_kn: Some(p.speed as f32),
+                            accuracy_m: None,
+                            name,
+                            hull_number: hull,
+                            backfilled: false,
+                            source: FixSource::Game,
+                            // Plot positions are scenario-stamped: no
+                            // server age to retain.
+                            age_secs: None,
+                            seq: 0,
+                        }
+                    })
+                    .collect();
+                let n = fixes.len();
+                for f in &fixes {
+                    self.last_seen.insert(f.ship_id.clone(), Instant::now());
+                    *self.fix_count.entry(f.ship_id.clone()).or_insert(0) += 1;
+                }
+                self.registry.poll(fixes);
+                self.users_status =
+                    format!("Minos plot: {n} hull(s) @ {}", plot.assumed_time);
+            }
+            Err(e) => {
+                self.plot_fails = self.plot_fails.saturating_add(1);
+                self.users_status = format!("plot failed: {e}");
+            }
+        }
+    }
+
+    /// C3: release local sim control of held-game pieces. Runs on
+    /// execution entry: from here Minos drives these hulls, and a local
+    /// leg would be a ghost track diverging from the fix chain. The
+    /// plot pull right after gives them their authoritative markers.
+    fn release_game_pieces(&mut self) {
+        let ids: Vec<String> = self
+            .controlled
+            .iter()
+            .filter(|id| {
+                id.parse::<i64>()
+                    .is_ok_and(|uid| self.users_gunits.iter().any(|g| g.unit_id == uid))
+            })
+            .cloned()
+            .collect();
+        for id in &ids {
+            self.release_hull(id);
+        }
+        if !ids.is_empty() {
+            eprintln!("released {} game piece(s) to Minos", ids.len());
+        }
+    }
+
+    /// C3: order section for a caller-commanded piece in an executing
+    /// game. Released ships carry no local control, so this renders
+    /// instead of the take-control panel: waypoint + speed, ordered
+    /// through Minos, markers refreshed from the plot after.
+    fn minos_order_ui(&mut self, ui: &mut egui::Ui, id: &str) {
+        ui.label(format!(
+            "Minos piece — ordered through the exercise (unit {id})"
+        ));
+        ui.horizontal(|ui| {
+            ui.label("speed:");
+            // Uncapped locally: the server clamps to the published spec
+            // and says so on the fix it answers with.
+            ui.add(
+                egui::DragValue::new(&mut self.order_speed)
+                    .speed(1.0)
+                    .range(0.0..=60.0)
+                    .suffix(" kn"),
+            ).on_hover_text("ordered speed (server clamps to spec)");
+        });
+        if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
+            self.placing = !self.placing;
+        }
+        let can_commit = self.waypoint_water();
+        if self.pending_waypoint.is_some() && !can_commit {
+            warn_line(ui, "waypoint on land — pick water".to_string());
+        }
+        if ui.add_enabled(can_commit, egui::Button::new("order via Minos")).clicked() {
+            if let Some((la, lo)) = self.pending_waypoint {
+                // The plot refresh rides the order apply (#100).
+                self.order_via_minos(id, (la, lo), self.order_speed);
+                self.pending_waypoint = None;
+                self.placing = false;
+            }
+        }
+    }
+
+    /// C3: waypoint-over-water check shared by the local and Minos
+    /// order sections (land data absent means committable).
+    fn waypoint_water(&self) -> bool {
+        self.pending_waypoint.is_some_and(|(la, lo)| {
+            self.land
+                .as_ref()
+                .map(|l| {
+                    l.is_water(&GeoPosition {
+                        latitude: la,
+                        longitude: lo,
+                    })
+                })
+                .unwrap_or(true)
+        })
+    }
+
+    /// H2: apply a GameClock answer to local state. The chosen rate is
+    /// kept for the engine seeding; the local display hold follows the
+    /// scenario hold so the two never disagree on screen. Refusals
+    /// never reach here — they stay on the caller.
+    fn apply_clock(&mut self, clock: tfg::backend::GameClock, verb: &str) {
+        self.minos_time_factor = Some(clock.time_factor);
+        self.factor_draft = clock.time_factor;
+        // An answer proves the grant — the denial was for an older
+        // hold or a since-changed matrix.
+        self.clock_denied = false;
+        let line = format!(
+            "Minos {verb}: assumed {} · {} · {} · {factor}x",
+            clock.assumed_now.as_deref().unwrap_or("—"),
+            if clock.running { "running" } else { "held" },
+            if clock.accepting_actions {
+                "accepting orders"
+            } else {
+                "orders closed"
+            },
+            factor = clock.time_factor,
+        );
+        self.feed(line.clone());
+        self.users_status = line;
+        // Connected execution: the local display clock follows the
+        // scenario hold. (A blackout runs with orders closed — the
+        // local sim has no blackout state, so running wins.)
+        if self.users_game_state.as_deref() == Some("execution") {
+            if let Some(tx) = &self.sim_cmd_tx {
+                // The answer is the only clock read: push its pace
+                // down, or the sim keeps a stale ratio forever.
+                let _ = tx.send(SimCommand::SetClockRatio { ratio: clock.time_factor });
+                // Anchor the display epoch on scenario time instead of
+                // the wall-clock first tick. Idempotent per seed
+                // contract; skipped when the answer carries no start.
+                if let Some(anchor) = clock.assumed_start.as_deref() {
+                    let _ = tx.send(SimCommand::SeedClockStart { ts: anchor.to_string() });
+                }
+                let _ = tx.send(SimCommand::SetPaused {
+                    paused: !clock.running,
+                });
+            }
+        }
+        self.minos_clock = Some(clock);
+    }
+
+    /// H2: pause or resume the scenario clock through Minos, following
+    /// the last known clock state (held → resume, otherwise pause).
+    /// Unknown clock attempts pause — the write answers the clock
+    /// either way, so unknown resolves itself loudly.
+    fn pause_or_resume_minos(&mut self) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        if self.clock_denied {
+            self.users_status = "clock control needs the control grant in this session — ask the Game Master".to_string();
+            return;
+        }
+        if self.setup_busy("clock") {
+            return;
+        }
+        let resume = self.minos_clock.as_ref().is_some_and(|c| !c.running);
+        let verb = if resume { "resume" } else { "pause" };
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("Minos {verb} refused: {e}");
+                return;
+            }
+        };
+        let verb_owned = verb.to_string();
+        self.setup_op = Some(spawn_rest("clock", move || {
+            let res = if resume {
+                master.resume_game(&tok, gid)
+            } else {
+                master.pause_game(&tok, gid)
+            };
+            // Typed inside the worker: Forbidden is the capability
+            // answer, everything else a loud transport failure.
+            match res {
+                Ok(c) => Ok(SetupDone::Clock(c, verb_owned)),
+                Err(tfg::backend::BackendError::Forbidden { .. }) => {
+                    Ok(SetupDone::ClockDenied)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }));
+    }
+
+    /// H2: set the scenario rate through Minos (must be > 0 — zero is
+    /// a pause through its own endpoint). Applies at once while
+    /// running; while held only the chosen rate is stored.
+    fn set_minos_factor(&mut self, factor: f64) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        if self.clock_denied {
+            self.users_status = "clock control needs the control grant in this session — ask the Game Master".to_string();
+            return;
+        }
+        if self.setup_busy("factor") {
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("Minos factor refused: {e}");
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("factor", move || {
+            match master.set_time_factor(&tok, gid, factor) {
+                Ok(c) => Ok(SetupDone::Clock(c, format!("factor {factor}x"))),
+                Err(tfg::backend::BackendError::Forbidden { .. }) => {
+                    Ok(SetupDone::ClockDenied)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }));
+    }
+
+    /// Held-game edit form (admin ticket): six blank-means-unchanged
+    /// rows; at least one filled to send. Empty area/map_tag clears
+    /// (nullable columns); past planning the server refuses loudly.
+    fn edit_game_ui(&mut self, ui: &mut egui::Ui, gid: i64) {
+        ui.separator();
+        ui.strong("Edit session (blank leaves alone)");
+        ui.horizontal(|ui| {
+            ui.label("name:");
+            ui.text_edit_singleline(&mut self.edit_name);
+        });
+        ui.horizontal(|ui| {
+            ui.label("description:");
+            ui.text_edit_singleline(&mut self.edit_description);
+        });
+        ui.horizontal(|ui| {
+            ui.label("purpose:");
+            ui.text_edit_singleline(&mut self.edit_purpose);
+        });
+        ui.horizontal(|ui| {
+            ui.label("target:");
+            ui.text_edit_singleline(&mut self.edit_target);
+        });
+        ui.horizontal(|ui| {
+            ui.label("area:");
+            ui.text_edit_singleline(&mut self.edit_area);
+        });
+        ui.horizontal(|ui| {
+            ui.label("map tag:");
+            ui.text_edit_singleline(&mut self.edit_map_tag);
+        });
+        ui.weak("empty area / map tag clears the field.");
+        ui.horizontal(|ui| {
+            if ui.small_button("save").clicked() {
+                self.save_game_edit(gid);
+            }
+            if ui.small_button("cancel").clicked() {
+                self.edit_open = false;
+            }
+        });
+    }
+
+    /// Send the held-game edit off-thread. All-blank refuses before
+    /// any request; the answer applies like a bundle detail.
+    fn save_game_edit(&mut self, gid: i64) {
+        if self.setup_busy("update") {
+            return;
+        }
+        let opt = |s: &str| {
+            let t = s.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        };
+        let upd = tfg::backend::GameUpdate {
+            name: opt(&self.edit_name.clone()),
+            description: opt(&self.edit_description.clone()),
+            purpose: opt(&self.edit_purpose.clone()),
+            target: opt(&self.edit_target.clone()),
+            area: opt(&self.edit_area.clone()),
+            map_tag: opt(&self.edit_map_tag.clone()),
+        };
+        if upd.name.is_none()
+            && upd.description.is_none()
+            && upd.purpose.is_none()
+            && upd.target.is_none()
+            && upd.area.is_none()
+            && upd.map_tag.is_none()
+        {
+            self.users_status = "fill at least one field to update".to_string();
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("update failed: {e}");
+                return;
+            }
+        };
+        self.edit_open = false;
+        self.setup_op = Some(spawn_rest("update", move || {
+            master
+                .update_game(&tok, gid, &upd)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::GameUpdated)
+        }));
+    }
+
+    /// Delete the held game off-thread (second click got here): the
+    /// apply drops the hold, which reads like a vanished game.
+    fn delete_game(&mut self, gid: i64) {
+        if self.setup_busy("delete") {
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("delete failed: {e}");
+                return;
+            }
+        };
+        let name = self
+            .users_game
+            .clone()
+            .map(|(_, n)| n)
+            .unwrap_or_else(|| format!("session {gid}"));
+        self.setup_op = Some(spawn_rest("delete", move || {
+            master
+                .delete_game(&tok, gid)
+                .map_err(|e| e.to_string())
+                .map(|_| SetupDone::GameDeleted(gid, name))
+        }));
+    }
+
+    /// Setup flow step 1 (#79): hold a game — pick a listed one or
+    /// create a session. Only `name` is required; blank optionals are
+    /// omitted, never sent empty.
+    fn setup_game_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("1 · Session");
+        // Player flow: no game list by permission means the room key
+        // IS the invitation — lead with it, not the empty picker.
+        if self.games_gap && self.users_game.is_none() {
+            ui.label(egui::RichText::new(
+                "The session list needs a staff read your account lacks. \
+                 Ask your organizer for the room key and enter it below — \
+                 no list needed.",
+            ).strong());
+            ui.separator();
+        }
+        ui.horizontal(|ui| {
+            let picked = self
+                .users_game
+                .clone()
+                .map(|(_, n)| n)
+                .unwrap_or_else(|| "pick a session".to_string());
+            let prev = self.users_game.clone();
+            egui::ComboBox::from_label("session")
+                .selected_text(picked)
+                .show_ui(ui, |ui| {
+                    for g in &self.users_games {
+                        ui.selectable_value(
+                            &mut self.users_game,
+                            Some((g.id, g.name.clone())),
+                            format!("{} ({})", g.name, g.state),
+                        );
+                    }
+                });
+            if ui.small_button("refresh").clicked() {
+                self.users_refresh_games();
+                self.users_refresh_directory();
+                self.users_refresh_game();
+            }
+            if self.users_game != prev {
+                // A newly held game takes its stage from Minos, never
+                // from a local default: the resync inside the refresh
+                // projects Planning/Ready/Live/Eval off the detail read.
+                // The clock read belongs to the old hold — writes will
+                // re-read it for the new one.
+                self.minos_clock = None;
+                self.minos_room_key = None;
+                self.clock_denied = false;  // new hold, unknown grant
+                self.delete_armed = false;
+                self.edit_open = false;
+                self.users_refresh_game();
+            }
+        });
+        // Admin writes: staff-granted, planning-only. Hidden without
+        // the staff read (a player would only 403); past planning the
+        // server refuses loudly instead.
+        if !self.games_gap {
+            if let Some((gid, _)) = self.users_game.clone() {
+                let planning = self.users_game_state.as_deref() == Some("planning");
+                ui.horizontal(|ui| {
+                    if ui.small_button("Edit session (blank leaves alone)").clicked() {
+                        self.edit_open = !self.edit_open;
+                    }
+                    if planning {
+                        let label = if self.delete_armed {
+                            "confirm delete"
+                        } else {
+                            "delete"
+                        };
+                        if ui.small_button(label).clicked() {
+                            if self.delete_armed {
+                                self.delete_armed = false;
+                                self.delete_game(gid);
+                            } else {
+                                self.delete_armed = true;
+                            }
+                        }
+                    }
+                });
+                if self.delete_armed {
+                    ui.weak("Delete discards the session and revokes every seat — click again to confirm.");
+                }
+                if self.edit_open {
+                    self.edit_game_ui(ui, gid);
+                }
+            }
+        }
+        status_line(ui, &self.users_status.clone());
+        ui.separator();
+        // C2: room-key join. The key is the only input — the answer
+        // says which game was entered, and the hold + stage follow it.
+        // The held session's key is read out HERE, above the input:
+        // this is where the Game Master stands when personnel arrive
+        // without it, so it is where the share-out belongs.
+        ui.strong("Join with room key");
+        match self.minos_room_key.clone() {
+            Some(key) => {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&key).monospace().strong());
+                    if ui.small_button("copy").on_hover_text("copy the room key").clicked() {
+                        ui.ctx().copy_text(key.clone());
+                        self.users_status = "room key copied".to_string();
+                    }
+                });
+                ui.weak("the held session's key — share it with your personnel; they type it below.");
+            }
+            None => {
+                let planning = self.users_game_state.as_deref() == Some("planning");
+                ui.weak(if planning {
+                    "no key yet — Minos mints one when the session enters preparation (step 4)."
+                } else {
+                    "no key on the held session — ask its Game Master."
+                });
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label("room key:");
+            ui.text_edit_singleline(&mut self.join_key);
+            if ui.small_button("join").clicked() {
+                self.join_with_key();
+            }
+        });
+        ui.weak("joining needs a seat first — a valid key without one is refused (ask the Game Master).");
+        // Planning → preparation carries no gate (the Game Master
+        // decides planning is done), and it is what mints the key —
+        // so the action sits beside the key it produces, not behind
+        // step 4's piece lock.
+        if self.users_game_state.as_deref() == Some("planning") {
+            if ui.button("Enter preparation →").on_hover_text("mint the room key, invite personnel in").clicked() {
+                self.setup_advance_prep();
             }
         }
         ui.separator();
-        ui.strong("Units");
+        if self.games_gap {
+            ui.weak("Creating sessions needs a staff read your account lacks — join with the room key above.");
+        } else {
+            ui.strong("New session");
+            ui.horizontal(|ui| {
+                ui.label("name:");
+                ui.text_edit_singleline(&mut self.setup_name);
+                if ui.small_button("create").clicked() {
+                    self.setup_create_game();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("description:");
+                ui.text_edit_singleline(&mut self.setup_description);
+            });
+            ui.horizontal(|ui| {
+                ui.label("purpose:");
+                ui.text_edit_singleline(&mut self.setup_purpose);
+            });
+            ui.horizontal(|ui| {
+                ui.label("target:");
+                ui.text_edit_singleline(&mut self.setup_target);
+            });
+            ui.horizontal(|ui| {
+                ui.label("area:");
+                ui.text_edit_singleline(&mut self.setup_area);
+            });
+            ui.horizontal(|ui| {
+                ui.label("map tag:");
+                ui.text_edit_singleline(&mut self.setup_map_tag);
+            });
+            ui.weak("mode is always maneuver — the only mode this release.");
+        }
+    }
+
+    /// Setup flow step 2 (#79): seat accounts into game roles. One
+    /// role per person; a role change clears readiness.
+    fn setup_players_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("2 · Players");
         if self.users_game.is_none() {
-            ui.weak("Pick a game to command its units.");
-        } else if self.users_gunits.is_empty() {
-            ui.weak("No pieces in this game yet.");
+            ui.weak("Pick or create a session in step 1 first.");
+            return;
+        }
+        // Player flow: seating is staff-only — the seat arrives with
+        // the room key, and the caller's own row shows in step 4.
+        // A directory/role surface here would 403 one panel at a time.
+        if self.roster_gap {
+            ui.weak(
+                "Seating this session needs a staff read your account lacks. \
+                 Your seat arrived with the room key — it shows, with your \
+                 readiness, in step 4.",
+            );
+            status_line(ui, &self.users_status.clone());
+            return;
+        }
+        self.users_directory_ui(ui);
+        ui.separator();
+        self.users_roster_ui(ui);
+        status_line(ui, &self.users_status.clone());
+    }
+
+    /// Reload the Fleet render cache from the mirror: rows, branch
+    /// mapping counts, branch display names. Called on sync apply
+    /// and first show — the render path only clones the cache.
+    fn reload_fleet_cache(&mut self) {
+        let Some(conn) = self.store.as_ref() else {
+            self.fleet_cache.clear();
+            self.fleet_branches.clear();
+            self.fleet_branch_names.clear();
+            self.fleet_loaded = true;
+            return;
+        };
+        self.fleet_cache = tfg::store::fleet_units(conn).unwrap_or_default();
+        self.fleet_branches = tfg::store::branch_mapped_counts(conn);
+        self.fleet_branch_names.clear();
+        let mut bids: Vec<i64> = self.fleet_branches.keys().cloned().collect();
+        for r in &self.fleet_cache {
+            if let Some(b) = r.branch_id {
+                if !bids.contains(&b) {
+                    bids.push(b);
+                }
+            }
+        }
+        for bid in bids {
+            if let Some((n, idn)) = tfg::store::branch_label(conn, bid) {
+                let label = if idn.is_empty() || idn == n { n } else { format!("{n} / {idn}") };
+                self.fleet_branch_names.insert(bid, label);
+            }
+        }
+        self.fleet_loaded = true;
+    }
+
+    /// Setup flow step 3 (#79): assign register hulls as commanded
+    /// pieces. The commander must already be seated (step 2) and never
+    /// judge-side — the contract refuses anything else.
+    fn setup_fleet_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("3 · Fleet");
+        if self.users_game.is_none() {
+            ui.weak("Pick or create a session in step 1 first.");
+            return;
+        }
+        // Player flow: the full fleet is staff-only — but the join
+        // answer's commanded hulls are the caller's own, with placed
+        // state from the setup view. Assigning stays staff-side.
+        if self.units_gap {
+            ui.weak(
+                "The full fleet needs a staff read your account lacks. \
+                 Your hulls arrived with the room key — place them by \
+                 clicking the map.",
+            );
+            if self.commanded_hulls.is_empty() {
+                ui.weak("No hulls commanded — ask the Game Master for a command.");
+            } else {
+                let mut lifts: Vec<(i64, String)> = Vec::new();
+                for gu in self.commanded_hulls.clone() {
+                    ui.horizontal(|ui| {
+                        let mut label = gu.unit_name.clone();
+                        if !gu.hull_number.is_empty() {
+                            label += &format!(" ({})", gu.hull_number);
+                        }
+                        ui.label(label);
+                        // Placed state is the setup view's — gapped, it
+                        // says so instead of calling hulls unplaced.
+                        if self.placements_gap {
+                            ui.label(
+                                egui::RichText::new("placement state unavailable")
+                                    .weak()
+                                    .small(),
+                            );
+                            return;
+                        }
+                        let placed = self
+                            .users_placements
+                            .iter()
+                            .any(|p| p.unit_id == gu.unit_id);
+                        if placed {
+                            ui.label(egui::RichText::new("placed ✓").weak().small());
+                            if ui.small_button("lift").clicked() {
+                                lifts.push((gu.unit_id, gu.unit_name.clone()));
+                            }
+                        } else {
+                            ui.label(egui::RichText::new("unplaced").weak().small());
+                        }
+                    });
+                }
+                for (unit, name) in lifts {
+                    self.lift_placement(unit, &name);
+                }
+            }
+            status_line(ui, &self.users_status.clone());
+            return;
+        }
+        ui.horizontal(|ui| {
+            if ui.small_button("sync register").clicked() {
+                self.sync_now();
+                self.users_refresh_directory();
+            }
+            ui.label("search:");
+            ui.text_edit_singleline(&mut self.setup_reg_search);
+        });
+        status_line(ui, &self.sync_status.clone());
+        // Assignment commander: whoever the next assigns will seat.
+        let crew = self.setup_crew();
+        if self.setup_commander.is_none() {
+            self.setup_commander = crew.first().map(|(id, _)| *id);
+        }
+        ui.horizontal(|ui| {
+            let cmdr_name = self
+                .setup_commander
+                .and_then(|c| crew.iter().find(|(id, _)| *id == c))
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| "pick".to_string());
+            egui::ComboBox::from_label("commander")
+                .selected_text(cmdr_name)
+                .show_ui(ui, |ui| {
+                    for (id, name) in &crew {
+                        ui.selectable_value(&mut self.setup_commander, Some(*id), name);
+                    }
+                });
+        });
+        if crew.is_empty() {
+            ui.weak("no eligible commander — seat a non-judge participant in step 2");
+        }
+        let query = self.setup_reg_search.to_lowercase();
+        // Render cache, loaded once — the mirror reads happen in
+        // reload_fleet_cache, never per frame.
+        if !self.fleet_loaded {
+            self.reload_fleet_cache();
+        }
+        let rows: Vec<tfg::store::StoreUnit> = self
+            .fleet_cache
+            .clone()
+            .into_iter()
+            .filter(|r| {
+                query.is_empty()
+                    || r.name.to_lowercase().contains(&query)
+                    || r.hull.to_lowercase().contains(&query)
+                    || r.class_name.to_lowercase().contains(&query)
+            })
+            .collect();
+        if rows.is_empty() {
+            ui.weak("Register is empty — sync it first.");
+        }
+        // Unmapped-branch fence: hulls under a branch with no mapped
+        // categories label it openly — the branch is incomplete, the
+        // hull is real, assignment stays the server's call. Matched
+        // by mapping count, never by branch name.
+        let branch_maps = self.fleet_branches.clone();
+        let branch_names = self.fleet_branch_names.clone();
+        let any_unmapped = rows.iter().any(|r| {
+            r.branch_id.is_some_and(|b| branch_maps.get(&b).copied().unwrap_or(0) == 0)
+        });
+        if any_unmapped {
+            ui.weak(
+                "Some hulls sit under branches with no mapped categories — \
+                 the branch awaits CMS mapping, not your fix. They assign normally.",
+            );
+        }
+        let mut assigning: Vec<(i64, String)> = Vec::new();
+        egui::ScrollArea::vertical()
+            .id_salt("setup-register")
+            .max_height(200.0)
+            .show(ui, |ui| {
+                for r in &rows {
+                    let assigned = self
+                        .users_gunits
+                        .iter()
+                        .any(|g| g.unit_id.to_string() == r.id);
+                    ui.horizontal(|ui| {
+                        let mut label = r.name.clone();
+                        if !r.hull.is_empty() {
+                            label += &format!(" ({})", r.hull);
+                        }
+                        if !r.class_name.is_empty() {
+                            label += &format!(" · {}", r.class_name);
+                        }
+                        ui.label(label);
+                        if let Some(bid) = r.branch_id {
+                            let mapped = branch_maps.get(&bid).copied().unwrap_or(0);
+                            if mapped == 0 {
+                                let bname = branch_names
+                                    .get(&bid)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("branch {bid}"));
+                                ui.label(
+                                    egui::RichText::new(format!("{bname} · unmapped"))
+                                        .weak()
+                                        .small(),
+                                );
+                            }
+                        }
+                        if assigned {
+                            ui.label(egui::RichText::new("assigned ✓").weak().small());
+                        } else if ui.small_button("assign").clicked() {
+                            match r.id.parse::<i64>() {
+                                Ok(hull) => assigning.push((hull, r.name.clone())),
+                                Err(_) => {
+                                    self.users_status =
+                                        format!("assign refused: {} is not a register hull", r.id)
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        for (hull, name) in assigning {
+            self.setup_assign_unit(hull, &name);
+        }
+        ui.separator();
+        ui.strong("Pieces");
+        if self.users_gunits.is_empty() {
+            ui.weak("No pieces yet — assign register hulls above.");
         } else {
             let mut commanding: Vec<(i64, i64)> = Vec::new();
-            let crew: Vec<(i64, String)> = self
-                .users_roster
-                .iter()
-                .filter(|p| !p.judge)
-                .map(|p| (p.user_id, p.user_name.clone()))
-                .collect();
+            let mut removals: Vec<(i64, String)> = Vec::new();
+            let mut lifts: Vec<(i64, String)> = Vec::new();
             for gu in &self.users_gunits {
                 ui.horizontal(|ui| {
-                    ui.label(&gu.unit_name);
-                    egui::ComboBox::from_id_salt(("ucmd", gu.unit_id))
+                    let mut label = gu.unit_name.clone();
+                    if !gu.hull_number.is_empty() {
+                        label += &format!(" ({})", gu.hull_number);
+                    }
+                    ui.label(label);
+                    // C2: Minos placement state per piece — the gate's
+                    // unplaced count is the server's, this only renders it.
+                    let placed = self
+                        .users_placements
+                        .iter()
+                        .any(|p| p.unit_id == gu.unit_id);
+                    if placed {
+                        ui.label(egui::RichText::new("placed ✓").weak().small());
+                        if ui.small_button("lift").clicked() {
+                            lifts.push((gu.unit_id, gu.unit_name.clone()));
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("unplaced").weak().small());
+                    }
+                    let mut tmp = gu.commander_id;
+                    egui::ComboBox::from_id_salt(("piece-cmd", gu.unit_id))
                         .selected_text(if gu.commander_name.is_empty() {
                             "—".to_string()
                         } else {
@@ -1499,23 +5040,1070 @@ impl ShipApp {
                         })
                         .show_ui(ui, |ui| {
                             for (uid, name) in &crew {
-                                // Re-picking the current commander is a
-                                // no-op, not a re-assignment (PUT closes
-                                // and reopens the assignment each time).
-                                if gu.commander_id != Some(*uid) {
-                                    let mut tmp = gu.commander_id;
-                                    if ui.selectable_value(&mut tmp, Some(*uid), name).clicked()
-                                    {
-                                        commanding.push((gu.unit_id, *uid));
-                                    }
+                                if gu.commander_id != Some(*uid)
+                                    && ui.selectable_value(&mut tmp, Some(*uid), name).clicked()
+                                {
+                                    commanding.push((gu.unit_id, *uid));
                                 }
                             }
                         });
+                    if ui.small_button("remove").clicked() {
+                        removals.push((gu.unit_id, gu.unit_name.clone()));
+                    }
                 });
             }
             for (unit, cmdr) in commanding {
                 self.users_command(unit, cmdr);
             }
+            for (unit, name) in removals {
+                self.setup_remove_unit(unit, &name);
+            }
+            for (unit, name) in lifts {
+                self.lift_placement(unit, &name);
+            }
+        }
+        status_line(ui, &self.users_status.clone());
+    }
+
+    /// C2: the caller's readiness row — declare/withdraw for the
+    /// exercise side, an exemption note for judges, a not-seated note
+    /// otherwise. Anything invalid is refused loudly by the server.
+    fn readiness_ui(&mut self, ui: &mut egui::Ui) {
+        match self.own_roster_row() {
+            Some(p) if p.judge => {
+                ui.weak(format!(
+                    "{} · {} — judge side is exempt from readiness",
+                    p.user_name, p.role_name
+                ));
+            }
+            Some(p) if p.ready => {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} · {} — ready ✓", p.user_name, p.role_name));
+                    if ui.small_button("withdraw").clicked() {
+                        self.set_own_readiness(false);
+                    }
+                });
+            }
+            Some(p) => {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} · {}", p.user_name, p.role_name));
+                    if ui.button("declare ready").clicked() {
+                        self.set_own_readiness(true);
+                    }
+                });
+            }
+            None => {
+                ui.weak("you hold no seat in this session — join with the room key or ask the Game Master");
+            }
+        }
+    }
+
+    /// Setup flow step 4 (#79): review the gate, then advance
+    /// planning → preparation. The Game Master decides planning is
+    /// done — this step carries no gate of its own.
+    fn setup_ready_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("4 · Review");
+        let game = self
+            .users_game
+            .clone()
+            .map(|(_, n)| n)
+            .unwrap_or_else(|| "no session".to_string());
+        ui.label(format!("session: {game}"));
+        // The room key is the invitation. Minos issues it on entry to
+        // preparation and sends it to every seated caller — the Game
+        // Master reads it here and shares it out of band; personnel
+        // type it into step 1. The client never invents a key and
+        // never enumerates them (no route exists, by design).
+        match self.minos_room_key.clone() {
+            Some(key) => {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("room key:").strong());
+                    ui.label(egui::RichText::new(&key).monospace().strong());
+                    if ui.small_button("copy").clicked() {
+                        ui.ctx().copy_text(key.clone());
+                        self.users_status = "room key copied".to_string();
+                    }
+                });
+                ui.weak("share this with your personnel — they enter it in step 1 to join the room.");
+            }
+            None => {
+                // Planning: the key does not exist yet, and entering
+                // preparation is what mints it. Say the consequence.
+                let phase = self.users_game_state.as_deref().unwrap_or("—");
+                ui.weak(match phase {
+                    "planning" => {
+                        "no room key in planning — advance to preparation, then read it here"
+                    }
+                    _ => "no room key on this session — ask the Game Master",
+                });
+            }
+        }
+        // Gapped counts are permission, not absence: say so instead of
+        // drawing zeros as the force. The caller's own readiness below
+        // still counts — it is participant-authorized either way.
+        if self.roster_gap {
+            ui.weak("staff counts unavailable for your account — your readiness below still counts.");
+        } else {
+            let (side, ready) = self.setup_gate_counts();
+            ui.label(format!("{side} exercise-side seat(s), {ready} ready"));
+        }
+        if self.units_gap {
+            ui.label(format!(
+                "{} hull(s) commanded (full fleet is staff-only)",
+                self.commanded_hulls.len()
+            ));
+        } else {
+            ui.label(format!("{} piece(s) assigned", self.users_gunits.len()));
+        }
+        // C2: the gate's placement arithmetic, straight from Minos —
+        // placed + unplaced is the size of the force.
+        ui.label(format!(
+            "Minos placements: {} placed · {} to go{}",
+            self.users_placements.len(),
+            self.placement_unplaced,
+            if self.placement_ready { " · ready ✓" } else { "" },
+        ));
+        ui.separator();
+        // The checklist names every blocker; the button names its
+        // consequence. The server still gates the advance itself.
+        ui.strong("Checklist");
+        let blockers = self.setup_checklist();
+        if blockers.is_empty() {
+            ui.label(egui::RichText::new("clear — ready to enter preparation").strong());
+        } else {
+            for b in &blockers {
+                ui.label(format!("• {b}"));
+            }
+        }
+        ui.separator();
+        self.readiness_ui(ui);
+        if let Some(note) = self.phase_note.clone() {
+            warn_line(ui, note);
+        }
+        status_line(ui, &self.users_status.clone());
+        // Only while planning — after the advance the backend refuses
+        // it, and the step's own content is the readiness gate.
+        if self.users_game_state.as_deref() == Some("planning")
+            && ui.button("Enter preparation →").clicked()
+        {
+            self.setup_advance_prep();
+        }
+    }
+
+    /// Setup gate: steps unlock in order — game, then seats, then
+    /// pieces, then review. A locked step names its missing
+    /// prerequisite; the server still refuses bad advances loudly.
+    fn setup_step_lock(&self, step: usize) -> Option<String> {
+        if self.users_game.is_none() {
+            return if step == 0 {
+                None
+            } else {
+                Some("hold a session in step 1 first".to_string())
+            };
+        }
+        match step {
+            0 | 1 => None,
+            2 => {
+                if self.users_roster.is_empty() {
+                    Some("seat someone in step 2 first".to_string())
+                } else {
+                    None
+                }
+            }
+            _ => {
+                if self.users_gunits.is_empty() && self.commanded_hulls.is_empty() {
+                    Some("assign pieces in step 3 first".to_string())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Readiness checklist: every blocker named, empty means clear.
+    /// Counts come from the server's arithmetic and the roster; a
+    /// gapped roster falls back to the caller's own seat and hulls.
+    fn setup_checklist(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+        let pieces = self.users_gunits.len().max(self.commanded_hulls.len());
+        if pieces == 0 {
+            blockers.push("no pieces assigned yet (step 3)".to_string());
+        }
+        if self.placement_unplaced > 0 {
+            blockers.push(format!(
+                "{} unit(s) are not placed",
+                self.placement_unplaced
+            ));
+        }
+        if self.roster_gap {
+            match self.own_roster_row() {
+                Some(p) if p.judge => {}
+                Some(p) if p.ready => {}
+                Some(_) => blockers.push("you have not declared readiness".to_string()),
+                None => blockers.push(
+                    "you hold no seat — join with the room key (step 1)".to_string(),
+                ),
+            }
+        } else {
+            let (side, ready) = self.setup_gate_counts();
+            if side == 0 {
+                blockers.push("no exercise-side seats (step 2)".to_string());
+            } else if ready < side {
+                let waiting: Vec<String> = self
+                    .users_roster
+                    .iter()
+                    .filter(|p| !self.users_is_judge(p) && !p.ready)
+                    .map(|p| p.user_name.clone())
+                    .collect();
+                blockers.push(format!(
+                    "{} participant(s) not ready: {}",
+                    side - ready,
+                    waiting.join(", ")
+                ));
+            }
+        }
+        blockers
+    }
+
+    /// Exercise setup panel (#79): Planning's whole UI in one place —
+    /// game, players, fleet, ready. Visible while Planning lasts; the
+    /// phase bar owns Persiapan onward.
+    fn setup_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("exercise-setup")
+            .resizable(true)
+            .default_size(340.0)
+            .show(ui, |ui| {
+                ui.heading("Setup");
+                ui.horizontal(|ui| {
+                    for (i, label) in
+                        ["1 Session", "2 Players", "3 Fleet", "4 Review"]
+                            .iter()
+                            .enumerate()
+                    {
+                        let lock = self.setup_step_lock(i);
+                        if ui
+                            .add_enabled(
+                                lock.is_none(),
+                                egui::Button::new(*label).selected(self.setup_step == i),
+                            )
+                            .clicked()
+                        {
+                            self.setup_step = i;
+                        }
+                        if i < 3 {
+                            ui.label(egui::RichText::new("→").weak());
+                        }
+                    }
+                });
+                // The first locked step explains itself — navigation is
+                // never a dead click.
+                if let Some(reason) =
+                    (0..4).filter_map(|i| self.setup_step_lock(i)).next()
+                {
+                    ui.weak(format!("Steps unlock in order — {reason}."));
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // A hold dropped under a deep step shows the lock,
+                        // never stale content for a game no longer held.
+                        if let Some(reason) = self.setup_step_lock(self.setup_step) {
+                            ui.weak(format!("Locked — {reason}."));
+                        } else {
+                            match self.setup_step {
+                                0 => self.setup_game_ui(ui),
+                                1 => self.setup_players_ui(ui),
+                                2 => self.setup_fleet_ui(ui),
+                                _ => self.setup_ready_ui(ui),
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(self.setup_step > 0, egui::Button::new("← Back"))
+                        .clicked()
+                    {
+                        self.setup_step -= 1;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.setup_step < 3
+                                && self.setup_step_lock(self.setup_step + 1).is_none(),
+                            egui::Button::new("Next →"),
+                        )
+                        .clicked()
+                    {
+                        self.setup_step += 1;
+                    }
+                });
+            });
+    }
+
+    /// New session from Closure: starts a NEW exercise from the
+    /// picker — the closed game stays closed on Minos, so the hold is
+    /// released instead of pretending the backend moved backward.
+    /// M6: the new exercise starts frozen with no ghost legs from the
+    /// old sim. Called from the assessment workspace, never the bar.
+    fn new_session(&mut self) {
+        self.mode.reset();
+        self.sim_ready = false;
+        self.phase_note = None;
+        self.release_all_local();
+        // #101: reset disarms — a new exercise still needs placement.
+        self.mode.armed.store(true, Ordering::SeqCst);
+        self.hold_sim_for_setup();
+        self.users_game = None;
+        self.users_game_state = None;
+        self.minos_clock = None;
+        self.minos_time_factor = None;
+        self.minos_room_key = None;
+        self.clock_denied = false;
+        self.watch_game_channel();
+        self.users_roster.clear();
+        self.users_gunits.clear();
+        // The caller's pieces belonged to the released hold — the next
+        // join re-deals them, with the tree. Gap flags are
+        // account-level and stay.
+        self.commanded_hulls.clear();
+        self.minos_tree.clear();
+        self.tree_gap = false;
+        self.fleet_pick = None;
+        self.users_placements.clear();
+        self.placement_unplaced = 0;
+        self.placement_ready = false;
+        // Pictures belong to the ended exercise, not the new one.
+        self.clear_visual_cache();
+        // Back to step 1 of the setup flow (#79).
+        self.setup_step = 0;
+        self.assessment_tab = 0;
+    }
+
+    /// Closure assessment workspace: summary, timeline, judgements,
+    /// reviews, transcript beside the frozen map. Timeline, judgements,
+    /// and reviews plug into their slots in their own tickets; this
+    /// shell owns summary, snapshot (the map behind it), transcript,
+    /// export, and the new-session action.
+    fn assessment_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("assessment")
+            .resizable(true)
+            .default_size(340.0)
+            .show(ui, |ui| {
+                ui.heading("Assessment");
+                ui.horizontal(|ui| {
+                    for (i, label) in ["Summary", "Timeline", "Judgements", "Reviews", "Transcript"]
+                        .iter()
+                        .enumerate()
+                    {
+                        if ui
+                            .selectable_label(self.assessment_tab == i, *label)
+                            .clicked()
+                        {
+                            self.assessment_tab = i;
+                        }
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.assessment_tab {
+                        1 => self.timeline_ui(ui),
+                        2 => self.judgements_ui(ui),
+                        3 => self.reviews_ui(ui),
+                        4 => self.transcript_ui(ui),
+                        _ => self.assessment_summary_ui(ui),
+                    });
+            });
+    }
+
+    /// Assessment slot: session summary + export + new session.
+    fn assessment_summary_ui(&mut self, ui: &mut egui::Ui) {
+        let game = self
+            .users_game
+            .clone()
+            .map(|(_, n)| n)
+            .unwrap_or_else(|| "no session".to_string());
+        ui.label(format!("session: {game}"));
+        ui.label(format!(
+            "Minos state: {}",
+            self.users_game_state.as_deref().unwrap_or("—")
+        ));
+        if self.roster_gap {
+            ui.weak("seats: staff counts unavailable for your account");
+        } else {
+            let (side, ready) = self.setup_gate_counts();
+            ui.label(format!("{side} exercise-side seat(s), {ready} ready"));
+        }
+        if self.units_gap {
+            ui.label(format!("{} hull(s) commanded", self.commanded_hulls.len()));
+        } else {
+            ui.label(format!("{} piece(s)", self.users_gunits.len()));
+        }
+        ui.label(format!(
+            "placements: {} placed · {} to go",
+            self.users_placements.len(),
+            self.placement_unplaced
+        ));
+        if let Some(f) = self.minos_time_factor {
+            ui.label(format!("clock factor: {f}x"));
+        }
+        ui.label(format!("transcript: {} line(s)", self.transcript.len()));
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Open debrief →").clicked() {
+                self.assessment_tab = 4;
+            }
+            if ui.button("Export session").clicked() {
+                let line = format!("session log: {}", self.session_log_path.display());
+                self.feed(line.clone());
+                self.users_status = line;
+            }
+            if ui.button("New session").clicked() {
+                self.new_session();
+            }
+        });
+        status_line(ui, &self.users_status.clone());
+    }
+
+    /// Assessment slot: Closure timeline (event stream, filters,
+    /// cursor paging). Content arrives in its own ticket.
+    fn timeline_ui(&mut self, ui: &mut egui::Ui) {
+        if self.users_game.is_none() {
+            ui.weak("Hold a session first — the timeline reads one exercise.");
+            return;
+        }
+        // Source filter: all five streams or one. Changing it reloads
+        // from the first page — cursors never cross a filter change.
+        ui.horizontal(|ui| {
+            ui.label("source:");
+            let mut picked = self.timeline_source.clone();
+            ui.selectable_value(&mut picked, None, "All");
+            for s in ["transition", "clock", "order", "message", "judgement"] {
+                ui.selectable_value(&mut picked, Some(s.to_string()), s);
+            }
+            if picked != self.timeline_source {
+                self.timeline_source = picked;
+                self.load_timeline(false);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("personnel:");
+            ui.text_edit_singleline(&mut self.timeline_personnel);
+            ui.label("unit:");
+            ui.text_edit_singleline(&mut self.timeline_unit);
+        });
+        ui.horizontal(|ui| {
+            ui.label("from:");
+            ui.text_edit_singleline(&mut self.timeline_from);
+            ui.label("to:");
+            ui.text_edit_singleline(&mut self.timeline_to);
+        });
+        ui.horizontal(|ui| {
+            if ui.small_button("apply + reload").clicked() {
+                self.load_timeline(false);
+            }
+            if ui.small_button("reload").clicked() {
+                self.load_timeline(false);
+            }
+        });
+        ui.weak("ids are numeric; windows are RFC 3339, empty means the whole exercise.");
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .show(ui, |ui| {
+                if self.timeline_events.is_empty() {
+                    ui.weak("No events yet — reload to read the exercise.");
+                }
+                for e in self.timeline_events.clone() {
+                    ui.label(Self::timeline_line(&e));
+                }
+            });
+        if self.timeline_has_more && ui.button("load more →").clicked() {
+            self.load_timeline(true);
+        }
+        status_line(ui, &self.users_status.clone());
+    }
+
+    /// Load the timeline page off-thread: first page or the cursor's
+    /// next. Numeric filters parse here; a bad id refuses before any
+    /// request, a bad window fails loudly from the server naming it.
+    fn load_timeline(&mut self, append: bool) {
+        if self.setup_busy("timeline") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("timeline failed: {e}");
+                return;
+            }
+        };
+        let parse_id = |raw: &str, what: &str| -> Result<Option<i64>, String> {
+            let t = raw.trim();
+            if t.is_empty() {
+                return Ok(None);
+            }
+            t.parse::<i64>()
+                .map(Some)
+                .map_err(|_| format!("{what} must be a numeric id"))
+        };
+        let personnel = match parse_id(&self.timeline_personnel.clone(), "personnel") {
+            Ok(p) => p,
+            Err(e) => {
+                self.users_status = e;
+                return;
+            }
+        };
+        let unit = match parse_id(&self.timeline_unit.clone(), "unit") {
+            Ok(u) => u,
+            Err(e) => {
+                self.users_status = e;
+                return;
+            }
+        };
+        let from = nonempty(&self.timeline_from);
+        let to = nonempty(&self.timeline_to);
+        let source = self.timeline_source.clone();
+        let cursor = if append { self.timeline_cursor.clone() } else { None };
+        self.setup_op = Some(spawn_rest("timeline", move || {
+            master
+                .timeline_page(
+                    &tok,
+                    gid,
+                    source.as_deref(),
+                    personnel,
+                    unit,
+                    from.as_deref(),
+                    to.as_deref(),
+                    cursor.as_deref(),
+                    50,
+                )
+                .map_err(|e| e.to_string())
+                .map(|page| SetupDone::Timeline(page, append))
+        }));
+    }
+
+    /// One timeline event on one line: scenario instant plus the
+    /// source's own facts. Order positions ride the payload (the fix
+    /// proof), so no playback renderer is needed for the debrief —
+    /// the map snapshot behind the panel is the picture.
+    fn timeline_line(e: &tfg::backend::TimelineEvent) -> String {
+        let t = e
+            .assumed_at
+            .split('T')
+            .nth(1)
+            .and_then(|s| s.strip_suffix('Z').or(Some(s)))
+            .unwrap_or(&e.assumed_at);
+        let d = &e.data;
+        let str_of = |k: &str| d[k].as_str().unwrap_or("").to_string();
+        let num = |k: &str| d[k].as_f64().unwrap_or(0.0);
+        match e.etype.as_str() {
+            "transition" => format!(
+                "{t} {} → {} (by {})",
+                str_of("from_state"),
+                str_of("to_state"),
+                d["changed_by"].as_i64().unwrap_or(0)
+            ),
+            "clock" => {
+                let note = str_of("note");
+                let note_seg = if note.is_empty() { String::new() } else { format!(" · {note}") };
+                let by_seg = match d["changed_by"].as_i64().unwrap_or(0) {
+                    0 => String::new(),
+                    by => format!(" (by {by})"),
+                };
+                format!("{t} clock → {}x{note_seg}{by_seg}", num("factor"))
+            }
+            "order" => format!(
+                "{t} order {} {:.0}° @ {:.0} kn{} @ ({:.4}, {:.4})",
+                str_of("unit_name"),
+                num("heading_deg"),
+                num("speed_kn"),
+                if d["was_clamped"].as_bool().unwrap_or(false) {
+                    " · clamped"
+                } else {
+                    ""
+                },
+                num("latitude"),
+                num("longitude")
+            ),
+            "message" => {
+                let text: String = str_of("content").chars().take(120).collect();
+                format!("{t} msg {}: {text}", str_of("sender_name"))
+            }
+            "judgement" => {
+                let cited = str_of("cited_unit_name");
+                format!(
+                    "{t} judgement {} score {} by {}{}",
+                    str_of("personnel_name"),
+                    d["score"].as_i64().unwrap_or(0),
+                    str_of("judge_name"),
+                    if cited.is_empty() { String::new() } else { format!(" · on {cited}") }
+                )
+            }
+            other => format!("{t} {other}"),
+        }
+    }
+
+    /// Assessment slot: judge-side judgements (append-only). Content
+    /// arrives in its own ticket.
+    fn judgements_ui(&mut self, ui: &mut egui::Ui) {
+        if self.users_game.is_none() {
+            ui.weak("Hold a session first — judgements read one exercise.");
+            return;
+        }
+        let judge_seat = self.own_roster_row().is_some_and(|p| p.judge);
+        if !judge_seat {
+            ui.weak("Judging needs a judge-side seat — the list below still reads.");
+        }
+        ui.separator();
+        ui.strong("Record");
+        // Subject: roster picker minus the caller (self-judging fails
+        // loudly server-side; the picker refuses it first). A gapped
+        // roster falls back to a numeric personnel id.
+        let mut subjects: Vec<(i64, String)> = self
+            .users_roster
+            .iter()
+            .filter(|p| Some(p.user_id) != self.auth_user_id)
+            .map(|p| (p.user_id, p.user_name.clone()))
+            .collect();
+        subjects.sort_by(|a, b| a.1.cmp(&b.1));
+        if subjects.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("personnel id:");
+                ui.text_edit_singleline(&mut self.judge_subject_id);
+            });
+        } else {
+            if self.judge_subject.is_none_or(|s| !subjects.iter().any(|(id, _)| *id == s)) {
+                self.judge_subject = subjects.first().map(|(id, _)| *id);
+            }
+            let current = self.judge_subject.unwrap_or(0);
+            let label = subjects
+                .iter()
+                .find(|(id, _)| *id == current)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| "pick".to_string());
+            egui::ComboBox::from_label("subject")
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    for (id, name) in &subjects {
+                        ui.selectable_value(&mut self.judge_subject, Some(*id), name);
+                    }
+                });
+        }
+        ui.horizontal(|ui| {
+            ui.label("score:");
+            ui.text_edit_singleline(&mut self.judge_score);
+        });
+        ui.weak("score is free text. No action citation — no public fix-list route exists.");
+        if ui
+            .add_enabled(judge_seat, egui::Button::new("record judgement"))
+            .clicked()
+        {
+            self.record_judgement();
+        }
+        ui.separator();
+        ui.strong("Marks");
+        ui.weak("Append-only: a mark can never be edited or deleted — correct it with a new one.");
+        if ui.small_button("reload").clicked() {
+            self.load_judgements();
+        }
+        egui::ScrollArea::vertical()
+            .max_height(280.0)
+            .show(ui, |ui| {
+                if self.judgements.is_empty() {
+                    ui.weak("No marks yet.");
+                }
+                for j in self.judgements.clone() {
+                    let cited = j
+                        .cited_unit
+                        .map(|u| format!(" · on {u}"))
+                        .unwrap_or_default();
+                    ui.label(format!(
+                        "{}: {}{} — by {}",
+                        j.personnel_name, j.score, cited, j.judge_name
+                    ));
+                }
+            });
+        status_line(ui, &self.users_status.clone());
+    }
+
+    /// Load the judgements page off-thread. Failures keep the last
+    /// good list and report loudly.
+    fn load_judgements(&mut self) {
+        if self.setup_busy("judgements") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("judgements failed: {e}");
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("judgements", move || {
+            master
+                .judgements_list(&tok, gid, None)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::Judgements)
+        }));
+    }
+
+    /// Record the composed judgement off-thread: subject from the
+    /// picker (or the numeric fallback), non-empty free-text score.
+    /// Self-judging is refused before any request; the server judges
+    /// the rest loudly (non-judge caller, unknown subject).
+    fn record_judgement(&mut self) {
+        if self.setup_busy("judgement") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let subject = if self.users_roster.is_empty() {
+            match self.judge_subject_id.trim().parse::<i64>() {
+                Ok(id) => id,
+                Err(_) => {
+                    self.users_status = "personnel id must be numeric".to_string();
+                    return;
+                }
+            }
+        } else {
+            match self.judge_subject {
+                Some(s) => s,
+                None => {
+                    self.users_status = "pick a subject first".to_string();
+                    return;
+                }
+            }
+        };
+        if Some(subject) == self.auth_user_id {
+            self.users_status = "cannot judge yourself".to_string();
+            return;
+        }
+        if self.judge_score.trim().is_empty() {
+            self.users_status = "write the score first".to_string();
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("judgement failed: {e}");
+                return;
+            }
+        };
+        let score = self.judge_score.trim().to_string();
+        self.setup_op = Some(spawn_rest("judgement", move || {
+            master
+                .record_judgement(&tok, gid, subject, &score)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::JudgementSent)
+        }));
+    }
+
+    /// Assessment slot: author-owned reviews. Content arrives in its
+    /// own ticket.
+    fn reviews_ui(&mut self, ui: &mut egui::Ui) {
+        if self.users_game.is_none() {
+            ui.weak("Hold a session first — reviews read one exercise.");
+            return;
+        }
+        ui.separator();
+        ui.strong(if self.review_editing.is_some() { "Revise" } else { "File" });
+        // Subject is fixed at filing: the picker shows on file, the
+        // row's subject on revise. No author field — the caller is it.
+        if self.review_editing.is_none() {
+            let mut subjects: Vec<(i64, String)> = self
+                .users_roster
+                .iter()
+                .map(|p| (p.user_id, p.user_name.clone()))
+                .collect();
+            subjects.sort_by(|a, b| a.1.cmp(&b.1));
+            if subjects.is_empty() {
+                ui.weak("No roster — filing needs a subject id the staff list owns.");
+            } else {
+                if self.review_subject.is_none_or(|s| !subjects.iter().any(|(id, _)| *id == s)) {
+                    self.review_subject = subjects.first().map(|(id, _)| *id);
+                }
+                let current = self.review_subject.unwrap_or(0);
+                let label = subjects
+                    .iter()
+                    .find(|(id, _)| *id == current)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_else(|| "pick".to_string());
+                egui::ComboBox::from_label("subject")
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        for (id, name) in &subjects {
+                            ui.selectable_value(&mut self.review_subject, Some(*id), name);
+                        }
+                    });
+            }
+        }
+        ui.add(
+            egui::TextEdit::multiline(&mut self.review_body)
+                .desired_rows(4)
+                .hint_text("the conclusion, in words"),
+        );
+        ui.horizontal(|ui| {
+            if self.review_editing.is_some() {
+                if ui.button("save revision").clicked() {
+                    self.revise_review();
+                }
+                if ui.small_button("cancel").clicked() {
+                    self.review_editing = None;
+                    self.review_body.clear();
+                }
+            } else if ui.button("file review").clicked() {
+                self.file_review();
+            }
+        });
+        ui.separator();
+        ui.strong("Documents");
+        ui.weak("Author-owned: edit renders on your own rows only, and there is no delete — filed reviews stay.");
+        ui.horizontal(|ui| {
+            if ui.small_button("reload").clicked() {
+                self.load_reviews();
+            }
+            // The narrow applies on reload, like the inbox filter.
+            if ui.checkbox(&mut self.review_mine_only, "mine only").changed() {
+                self.load_reviews();
+            }
+        });
+        egui::ScrollArea::vertical()
+            .max_height(280.0)
+            .show(ui, |ui| {
+                if self.reviews.is_empty() {
+                    ui.weak("No documents yet.");
+                }
+                let mut edits: Vec<(i64, String)> = Vec::new();
+                for r in self.reviews.clone() {
+                    ui.strong(format!(
+                        "{} — by {}{}",
+                        r.personnel_name,
+                        r.author_name,
+                        if r.revised { " · revised" } else { " · filed" }
+                    ));
+                    ui.weak(format!("{} → {}", r.created_at, r.updated_at));
+                    ui.label(r.body.clone());
+                    let mine = Some(r.author_id) == self.auth_user_id;
+                    if mine && ui.small_button("edit").clicked() {
+                        edits.push((r.id, r.body.clone()));
+                    }
+                    ui.separator();
+                }
+                for (id, body) in edits {
+                    self.review_editing = Some(id);
+                    self.review_body = body;
+                }
+            });
+        status_line(ui, &self.users_status.clone());
+    }
+
+    /// Load the reviews page off-thread (mine-narrow when checked).
+    /// Failures keep the last good list and report loudly.
+    fn load_reviews(&mut self) {
+        if self.setup_busy("reviews") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("reviews failed: {e}");
+                return;
+            }
+        };
+        let author = if self.review_mine_only { self.auth_user_id } else { None };
+        self.setup_op = Some(spawn_rest("reviews", move || {
+            master
+                .reviews_list(&tok, gid, None, author)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::Reviews)
+        }));
+    }
+
+    /// File the composed review off-thread: subject plus non-empty
+    /// body. Permission (update grant) fails loudly server-side.
+    fn file_review(&mut self) {
+        if self.setup_busy("review") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let Some(subject) = self.review_subject else {
+            self.users_status = "pick a subject first".to_string();
+            return;
+        };
+        if self.review_body.trim().is_empty() {
+            self.users_status = "write the review first".to_string();
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("review failed: {e}");
+                return;
+            }
+        };
+        let body = self.review_body.trim().to_string();
+        self.setup_op = Some(spawn_rest("review", move || {
+            master
+                .file_review(&tok, gid, subject, &body)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::ReviewSent)
+        }));
+    }
+
+    /// Revise the row under edit off-thread: words only, subject
+    /// fixed. Anyone-but-author fails with the explicit 403, which
+    /// the status carries instead of a pre-hidden button.
+    fn revise_review(&mut self) {
+        if self.setup_busy("review") {
+            return;
+        }
+        let Some(rid) = self.review_editing else {
+            self.users_status = "nothing under revision".to_string();
+            return;
+        };
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        if self.review_body.trim().is_empty() {
+            self.users_status = "write the revision first".to_string();
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("revision failed: {e}");
+                return;
+            }
+        };
+        let body = self.review_body.trim().to_string();
+        self.setup_op = Some(spawn_rest("review", move || {
+            master
+                .revise_review(&tok, gid, rid, &body)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::ReviewRevised)
+        }));
+    }
+
+    /// Assessment slot: the frozen local trace tail. The map snapshot
+    /// is the frozen map behind this panel.
+    fn transcript_ui(&mut self, ui: &mut egui::Ui) {
+        if self.transcript.is_empty() {
+            ui.weak("No transcript — the session left no local trace.");
+            return;
+        }
+        for line in self.transcript.clone() {
+            ui.label(line);
+        }
+    }
+
+    /// Load the task-organisation forest off-thread. A gapped read
+    /// keeps the last good tree; a hold change queues it behind the
+    /// bundle instead of refusing.
+    fn load_minos_tree(&mut self) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        if self.setup_op.is_some() {
+            self.queue_refresh(PendingRefresh::Tree);
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("task organisation failed: {e}");
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("hierarchy", move || {
+            Ok(SetupDone::Hierarchy(master.game_hierarchy(&tok, gid)))
+        }));
+    }
+
+    /// One forest node plus the pieces sitting under it, indented by
+    /// depth. Units come from the staff list with commanded hulls
+    /// filling the gaps; node ids ride both parses.
+    fn tree_node_ui(
+        &self,
+        ui: &mut egui::Ui,
+        node: &tfg::backend::HierarchyNode,
+        depth: usize,
+        units: &[(i64, String, Option<i64>)],
+    ) {
+        let pad = "  ".repeat(depth);
+        let mut head = format!("{pad}{} ({})", node.name, node.echelon_name);
+        if !node.icon.is_empty() {
+            head += &format!(" {}", node.icon);
+        }
+        ui.label(egui::RichText::new(head).strong());
+        for (uid, name, _) in units.iter().filter(|(_, _, n)| *n == Some(node.id)) {
+            let _ = uid;
+            ui.label(format!("{pad}  · {name}"));
+        }
+        for child in &node.children {
+            self.tree_node_ui(ui, child, depth + 1, units);
+        }
+    }
+
+    /// Task-organisation section: the Minos forest with assigned
+    /// pieces, or its gap. Staff-gated like roster and pieces — a
+    /// participant sees the labeled gap, never an empty tree as
+    /// truth. Sandbox Groups draw nowhere here by rule.
+    fn task_org_ui(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong("Task organisation (Minos)");
+            if ui.small_button("reload").clicked() {
+                self.load_minos_tree();
+            }
+        });
+        if self.tree_gap {
+            ui.weak("task organisation: staff access unavailable");
+            return;
+        }
+        if self.minos_tree.is_empty() {
+            ui.weak("No nodes yet — the tree is built during planning and preparation.");
+            return;
+        }
+        let mut units: Vec<(i64, String, Option<i64>)> = self
+            .users_gunits
+            .iter()
+            .map(|g| (g.unit_id, g.unit_name.clone(), g.hierarchy_node))
+            .collect();
+        for g in &self.commanded_hulls {
+            if !units.iter().any(|(id, _, _)| *id == g.unit_id) {
+                units.push((g.unit_id, g.unit_name.clone(), g.hierarchy_node));
+            }
+        }
+        for node in self.minos_tree.clone() {
+            self.tree_node_ui(ui, &node, 0, &units);
+        }
+        let unassigned: Vec<String> = units
+            .iter()
+            .filter(|(_, _, n)| n.is_none())
+            .map(|(_, name, _)| name.clone())
+            .collect();
+        if !unassigned.is_empty() {
+            ui.weak(format!("Unassigned: {}", unassigned.join(", ")));
         }
     }
 
@@ -1544,79 +6132,26 @@ impl ShipApp {
                 ui.separator();
                 ui.heading("Change password");
                 ui.label("The backend shuts every door until this is done.");
-                ui.horizontal(|ui| {
-                    ui.label("current:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.pw_current).password(true),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("new (12+):");
-                    ui.add(egui::TextEdit::singleline(&mut self.pw_new).password(true));
-                });
-                if ui.button("change and re-enter").clicked() {
-                    // Client-side length gate (harden): the backend enforces
-                    // 12+, so refuse locally with a specific message first.
-                    if self.pw_new.len() < 12 {
-                        self.auth_status =
-                            "change refused: new password needs 12+ characters".to_string();
-                        return;
-                    }
-                    let base = self.minos_base.clone();
-                    let tok = self.auth_token.clone().unwrap_or_default();
-                    let cur = self.pw_current.clone();
-                    let new = self.pw_new.clone();
-                    match MinosAuth::new(&base)
-                        .and_then(|a| a.change_password(&tok, &cur, &new))
-                    {
-                        Ok(()) => {
-                            self.pw_current.clear();
-                            self.pw_new.clear();
-                            // Password change invalidates other refresh
-                            // tokens: re-enter with the new password.
-                            match MinosAuth::new(&base)
-                                .and_then(|a| a.login(&user, &new))
-                            {
-                                Ok(pair) => {
-                                    self.store_pair(user.clone(), pair);
-                                    match MinosAuth::new(&base).and_then(|a| {
-                                        a.me(self.auth_token.as_deref().unwrap_or(""))
-                                    }) {
-                                        Ok(()) => {
-                                            self.auth_needs_password_change = false;
-                                            self.auth_status =
-                                                format!("signed in as {user}");
-                                            self.sync_now();
-                                        }
-                                        Err(e) => {
-                                            self.auth_status = format!(
-                                                "re-entered, gate still shut: {e}"
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    self.auth_status =
-                                        format!("changed, re-entry failed: {e}");
-                                    self.sign_out("re-entry failed");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            self.auth_status = format!("change failed: {e}");
-                        }
-                    }
-                }
+                self.change_password_ui(ui);
             }
         } else {
             ui.horizontal(|ui| {
                 ui.label("identifier:");
-                ui.text_edit_singleline(&mut self.login_identifier);
+                ui.add_sized(
+                    [ui.available_width(), AUTH_FIELD_H],
+                    egui::TextEdit::singleline(&mut self.login_identifier)
+                        .min_size(egui::vec2(0.0, AUTH_FIELD_H))
+                        .vertical_align(egui::Align::Center),
+                );
             });
             ui.horizontal(|ui| {
                 ui.label("password:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.login_password).password(true),
+                ui.add_sized(
+                    [ui.available_width(), AUTH_FIELD_H],
+                    egui::TextEdit::singleline(&mut self.login_password)
+                        .password(true)
+                        .min_size(egui::vec2(0.0, AUTH_FIELD_H))
+                        .vertical_align(egui::Align::Center),
                 );
             });
             if ui.button("sign in").clicked() {
@@ -1647,30 +6182,968 @@ impl ShipApp {
         status_line(ui, &self.sync_status.clone());
     }
 
+    /// Blocking must-change-password form (login ticket), shared by
+    /// the Login island and the onboarding State A card (#77): the
+    /// backend refuses every door until this lands, then re-enters
+    /// with the new password.
+    fn change_password_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(user) = self.auth_user.clone() else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label("current:");
+            ui.add_sized(
+                [ui.available_width(), AUTH_FIELD_H],
+                egui::TextEdit::singleline(&mut self.pw_current)
+                    .password(true)
+                    .min_size(egui::vec2(0.0, AUTH_FIELD_H))
+                    .vertical_align(egui::Align::Center),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("new (12+):");
+            ui.add_sized(
+                [ui.available_width(), AUTH_FIELD_H],
+                egui::TextEdit::singleline(&mut self.pw_new)
+                    .password(true)
+                    .min_size(egui::vec2(0.0, AUTH_FIELD_H))
+                    .vertical_align(egui::Align::Center),
+            );
+        });
+        if ui.button("change and re-enter").clicked() {
+            // Client-side length gate (harden): the backend enforces
+            // 12+, so refuse locally with a specific message first.
+            if self.pw_new.len() < 12 {
+                self.auth_status =
+                    "change refused: new password needs 12+ characters".to_string();
+                return;
+            }
+            let base = self.minos_base.clone();
+            let tok = self.auth_token.clone().unwrap_or_default();
+            let cur = self.pw_current.clone();
+            let new = self.pw_new.clone();
+            if self.pw_op.is_some() {
+                self.auth_status = "password change already running…".to_string();
+                return;
+            }
+            self.auth_status = "changing password…".to_string();
+            // M7: change + re-entry + gate probe run off-thread; the
+            // frame pump applies the staged outcome.
+            self.pw_op = Some(spawn_rest("password", move || {
+                let client =
+                    MinosAuth::new(&base).map_err(|e| PwResult::ChangeFailed(format!("change failed: {e}")))?;
+                client
+                    .change_password(&tok, &cur, &new)
+                    .map_err(|e| PwResult::ChangeFailed(format!("change failed: {e}")))?;
+                // Password change invalidates other refresh tokens:
+                // re-enter with the new password.
+                let pair = client
+                    .login(&user, &new)
+                    .map_err(|e| PwResult::ReentryFailed(format!("changed, re-entry failed: {e}")))?;
+                let token = pair.access_token.clone();
+                match client.me(&token) {
+                    Ok(uid) => Ok(PwResult::Changed(LoginDone {
+                        user,
+                        pair,
+                        uid: Some(uid),
+                        needs_change: false,
+                        probe_note: None,
+                    })),
+                    Err(e) => Ok(PwResult::GateShut(format!(
+                        "re-entered, gate still shut: {e}"
+                    ))),
+                }
+            }));
+        }
+    }
+
+    /// Apply a finished password change on the UI thread.
+    fn apply_password(&mut self, res: PwResult) {
+        match res {
+            PwResult::Changed(done) => {
+                self.pw_current.clear();
+                self.pw_new.clear();
+                self.store_pair(done.user.clone(), done.pair);
+                self.auth_user_id = done.uid;
+                self.watch_personal_channel();
+                self.auth_needs_password_change = false;
+                self.auth_status = format!("signed in as {}", done.user);
+                self.sync_now();
+            }
+            PwResult::ChangeFailed(e) => {
+                self.auth_status = e;
+            }
+            PwResult::ReentryFailed(_) => {
+                self.sign_out("re-entry failed");
+            }
+            PwResult::GateShut(e) => {
+                self.auth_status = e;
+            }
+        }
+    }
+
+    /// Frame pump for off-thread REST (M7): harvest finished ops and
+    /// apply them on the UI thread. Slots clear as they resolve, so a
+    /// failed op never wedges its button — the status line says why.
+    fn pump_rest_ops(&mut self) {
+        if let Some(res) = self.login_op.as_ref().and_then(|op| op.poll()) {
+            self.login_op = None;
+            match res {
+                Ok(done) => self.apply_login(done),
+                Err(e) => self.auth_status = e,
+            }
+        }
+        if let Some(res) = self.refresh_op.as_ref().and_then(|op| op.poll()) {
+            self.refresh_op = None;
+            let user = self.auth_user.clone().unwrap_or_default();
+            self.apply_refresh(user, res);
+        }
+        if let Some(res) = self.sync_op.as_ref().and_then(|op| op.poll()) {
+            self.sync_op = None;
+            self.apply_sync(res);
+        }
+        if let Some(res) = self.spec_op.as_ref().and_then(|op| op.poll()) {
+            self.spec_op = None;
+            self.apply_specs(res);
+        }
+        if let Some(res) = self.pw_op.as_ref().and_then(|op| op.poll()) {
+            self.pw_op = None;
+            // The worker always resolves into a staged outcome; unwrap
+            // either side into it.
+            self.apply_password(res.unwrap_or_else(|e| e));
+        }
+        if let Some(res) = self.plot_op.as_ref().and_then(|op| op.poll()) {
+            self.plot_op = None;
+            self.apply_plot(res);
+        }
+        // Pictures ride their own slot (never queued behind setup):
+        // manifest once, then one temporary URL per pictured hull.
+        if let Some(res) = self.image_op.as_ref().and_then(|op| op.poll()) {
+            self.image_op = None;
+            let request = self.image_request.take();
+            match res {
+                Ok(out) => self.apply_image(out),
+                Err(e) => {
+                    match request {
+                        Some(ImageRequest::Manifest) => {
+                            self.manifest_retry_at =
+                                Some(Instant::now() + IMAGE_READ_RETRY_DELAY);
+                        }
+                        Some(ImageRequest::Url(unit_id)) => {
+                            self.visuals.defer_source(unit_id);
+                            if self.visuals.expects_source(unit_id)
+                                && !self.pending_image_urls.contains(&unit_id)
+                            {
+                                self.pending_image_urls.push(unit_id);
+                            }
+                        }
+                        None => {}
+                    }
+                    self.users_status = format!("pictures failed: {e}");
+                }
+            }
+        }
+        // Log work (journal parses, transcript tail, directory scan)
+        // harvests here; failures report and keep the old view.
+        if let Some(res) = self.log_op.as_ref().and_then(|op| op.poll()) {
+            self.log_op = None;
+            match res {
+                Ok(LogOut::Files(files)) => {
+                    self.log_files = files;
+                }
+                Ok(LogOut::View(path, view)) => {
+                    if self.log_view_path == Some(path) {
+                        self.log_events = view.replay.clone();
+                        self.replay_pos = self.log_events.len();
+                        self.log_filter = "all".to_string();
+                        self.log_view = Some(view);
+                    }
+                }
+                Ok(LogOut::Transcript(lines)) => {
+                    self.transcript = lines;
+                }
+                Err(e) => self.users_status = format!("log failed: {e}"),
+            }
+        }
+        self.maybe_resolve_hull_image();
+        // #100: the serialized setup slot. One arm applies every
+        // setup read/write; failures feed + report loudly and keep
+        // every old list (nothing clears on failure). Queued refreshes
+        // dispatch once the slot frees.
+        let setup_label = self.setup_op.as_ref().map(|op| op.label);
+        if let Some(res) = self.setup_op.as_ref().and_then(|op| op.poll()) {
+            self.setup_op = None;
+            match res {
+                Ok(done) => self.apply_setup(done),
+                Err(e) => {
+                    let line = match setup_label {
+                        Some(l) => format!("{l} failed: {e}"),
+                        None => format!("setup failed: {e}"),
+                    };
+                    self.feed(line.clone());
+                    self.users_status = line;
+                }
+            }
+            self.dispatch_queued_refresh();
+        }
+        // #98: steady plot cadence during connected execution. 15 s
+        // base (exercise plots move slowly in real time, and every pull
+        // is exact at its answered instant), doubling per consecutive
+        // failure to a 120 s cap, paused outside Live Simulation
+        // execution. A busy op never piles — the pull guards itself.
+        if self.plot_op.is_none()
+            && self.session_live()
+            && self.app_mode == AppMode::Simulation
+            && self.users_game_state.as_deref() == Some("execution")
+            && self.users_game.is_some()
+        {
+            let wait =
+                15u64.saturating_mul(1u64 << self.plot_fails.min(3)).min(120);
+            let due = self
+                .last_plot_try
+                .is_none_or(|t| t.elapsed().as_secs() >= wait);
+            if due {
+                self.pull_minos_positions();
+            }
+        }
+    }
+
+    /// Apply any finished setup result (#100): lists replace, notes
+    /// render, side effects (projection, watches, chained refreshes)
+    /// run on the UI thread where the engine lives.
+    fn apply_setup(&mut self, done: SetupDone) {
+        match done {
+            SetupDone::Games(games) => self.apply_games(games),
+            SetupDone::GamesDenied => {
+                self.games_gap = true;
+                self.users_status =
+                    "session list needs a staff read — join with the room key below".to_string();
+            }
+            SetupDone::Users(users) => self.apply_users(users),
+            SetupDone::Bundle(b) => self.apply_bundle(b),
+            SetupDone::Roster(roster, note) => {
+                self.users_roster = roster;
+                self.users_status = note;
+            }
+            SetupDone::Units(units, note) => {
+                self.users_gunits = units;
+                self.users_status = note;
+            }
+            SetupDone::Assign(units, note, pick) => {
+                self.users_gunits = units;
+                self.fleet_pick = Some(pick.to_string());
+                self.users_status = note;
+            }
+            SetupDone::Unassign(units, note, removed) => {
+                self.users_gunits = units;
+                // Out of the game entirely: the local half goes too.
+                self.release_hull(&removed.to_string());
+                self.users_status = note;
+            }
+            SetupDone::Place(view, drop_) => self.apply_placed(view, drop_),
+            SetupDone::Lift(view, note, lifted) => {
+                self.apply_placements(view);
+                self.release_hull(&lifted.to_string());
+                self.users_status = note;
+            }
+            SetupDone::Game(to, row) => self.apply_transition(&to, row),
+            SetupDone::GameUpdated(d) => {
+                self.set_held_game(Some((d.id, d.name.clone())));
+                self.users_game_state = Some(d.state.clone());
+                self.minos_time_factor =
+                    if d.time_factor > 0.0 { Some(d.time_factor) } else { None };
+                self.users_project_stage(&d.state);
+                self.users_status = format!("updated {} ({})", d.name, d.state);
+                self.users_refresh_games();
+                self.users_refresh_game();
+            }
+            SetupDone::GameDeleted(gid, name) => {
+                if self.users_game.as_ref().is_some_and(|(id, _)| *id == gid) {
+                    self.drop_hold(&format!("deleted {name}"));
+                } else {
+                    self.users_status = format!("deleted {name}");
+                }
+                self.users_refresh_games();
+            }
+            SetupDone::GameCreate(row, note) => self.apply_created_game(row, note),
+            SetupDone::GameFailed(to, e, forbidden) => self.apply_transition_failed(to, e, forbidden),
+            SetupDone::Join(join, note) => self.apply_join(join, note),
+            SetupDone::JoinFailed(why) => {
+                self.users_status = format!("join refused — {why}");
+            }
+            SetupDone::Clock(clock, verb) => self.apply_clock(clock, &verb),
+            SetupDone::ClockDenied => {
+                self.clock_denied = true;
+                self.users_status =
+                    "clock control needs the control grant in this session — \
+                     Game Master or an entrusted judge-side role (app admin is not enough)"
+                        .to_string();
+            }
+            SetupDone::FixBatch(outs) => self.apply_fix_batch(outs),
+            SetupDone::Timeline(page, append) => {
+                if append {
+                    self.timeline_events.extend(page.events);
+                } else {
+                    self.timeline_events = page.events;
+                }
+                self.timeline_cursor = page.next_cursor;
+                self.timeline_has_more = page.has_more;
+                self.users_status = format!(
+                    "timeline: {} event(s){}",
+                    self.timeline_events.len(),
+                    if page.has_more { " · more below" } else { "" }
+                );
+            }
+            SetupDone::Judgements(list) => {
+                self.judgements = list;
+                self.users_status =
+                    format!("judgements: {} mark(s)", self.judgements.len());
+            }
+            SetupDone::JudgementSent(view) => {
+                self.judge_score.clear();
+                self.users_status =
+                    format!("recorded #{} · reloading judgements", view.id);
+                self.load_judgements();
+            }
+            SetupDone::Reviews(list) => {
+                self.reviews = list;
+                self.users_status =
+                    format!("reviews: {} document(s)", self.reviews.len());
+            }
+            SetupDone::ReviewSent(view) => {
+                self.review_body.clear();
+                self.review_subject = None;
+                self.users_status =
+                    format!("filed #{} · reloading reviews", view.id);
+                self.load_reviews();
+            }
+            SetupDone::ReviewRevised(view) => {
+                self.review_editing = None;
+                self.review_body.clear();
+                self.users_status =
+                    format!("revised #{} · reloading reviews", view.id);
+                self.load_reviews();
+            }
+            SetupDone::Hierarchy(res) => match res {
+                Ok(tree) => {
+                    self.minos_tree = tree;
+                    self.tree_gap = false;
+                    self.users_status = "task organisation synced".to_string();
+                }
+                Err(tfg::backend::BackendError::Forbidden { .. }) => {
+                    self.tree_gap = true;
+                    self.users_status =
+                        "task organisation: staff access unavailable".to_string();
+                }
+                Err(e) => self.users_status = format!("task organisation failed: {e}"),
+            },
+            SetupDone::MsgPage(page) => {
+                self.inbox = page.messages;
+                self.inbox_total = page.total_records;
+                self.inbox_pages = page.total_pages.max(1);
+                self.inbox_page_no = page.current_page.max(1);
+                self.inbox_has_next = page.has_next;
+                self.inbox_has_prev = page.has_prev;
+                self.users_status = format!(
+                    "inbox: page {} of {} · {} total",
+                    self.inbox_page_no, self.inbox_pages, self.inbox_total
+                );
+            }
+            SetupDone::MsgOpen(msg) => {
+                self.msg_open = Some(msg);
+            }
+            SetupDone::MsgDeleted(mid) => {
+                if self.msg_open.as_ref().is_some_and(|m| m.id == mid) {
+                    self.msg_open = None;
+                }
+                self.users_status = format!("deleted #{mid} · reloading inbox");
+                self.refresh_inbox();
+            }
+            SetupDone::MsgSent(sent) => {
+                self.msg_content.clear();
+                self.msg_reply_to = None;
+                self.users_status = format!("sent #{} · reloading inbox", sent.id);
+                self.refresh_inbox();
+            }
+            SetupDone::Roles(roles) => {
+                self.scenario_roles = roles;
+                self.new_role_name.clear();
+                self.users_status =
+                    format!("roles: {} identit(ies)", self.scenario_roles.len());
+            }
+            SetupDone::ReadDone(msg) => {
+                if let Some(slot) = self.inbox.iter_mut().find(|m| m.id == msg.id) {
+                    *slot = msg;
+                }
+                self.users_status = "marked read".to_string();
+            }
+        }
+    }
+
+    /// Persistent context strip: source → identity → session →
+    /// backend phase → capability → next action, plus sync freshness.
+    /// Rendered on the toolbar of every island. Role names display
+    /// as-is (authorable backend-side); capability derives from the
+    /// seat row and commanded hulls, never from name comparison.
+    fn context_strip(&self) -> String {
+        let source = if self.auth_token.is_some() { "Minos" } else { "local" };
+        let session = self
+            .users_game
+            .as_ref()
+            .map(|(_, n)| n.clone())
+            .unwrap_or_else(|| "—".to_string());
+        let phase = self.users_game_state.as_deref().unwrap_or("—");
+        let who = self.auth_user.as_deref().unwrap_or("—");
+        let seat = match self.own_roster_row() {
+            None => "no seat".to_string(),
+            Some(p) if p.judge => format!("{} · judge-side", p.role_name),
+            Some(p) => {
+                let n = self.commanded_hulls.len();
+                if n == 0 {
+                    p.role_name.clone()
+                } else {
+                    format!("{} · {n} hull{}", p.role_name, if n == 1 { "" } else { "s" })
+                }
+            }
+        };
+        let age = |t: Option<Instant>| match t {
+            Some(t) => format!("{}s", t.elapsed().as_secs()),
+            None => "—".to_string(),
+        };
+        format!(
+            "{source} · Session: {session} · {phase} · {who} ({seat}) · sync {} · plot {} · next: {}",
+            age(self.last_game_sync),
+            age(self.last_plot_ok),
+            self.next_action_hint(),
+        )
+    }
+
+    /// The one action the strip points at: auth → hold → phase gate →
+    /// orders → assessment. Hints only; gates still refuse loudly.
+    fn next_action_hint(&self) -> &str {
+        if self.auth_token.is_none() {
+            return "sign in";
+        }
+        if self.users_game.is_none() {
+            return "hold a session — room key or picker";
+        }
+        match self.users_game_state.as_deref() {
+            Some("planning") => "seat, assign, place",
+            Some("preparation") => "readiness → execution",
+            Some("execution") => "orders via Minos",
+            Some("closure") => "assessment",
+            _ => "sync the game",
+        }
+    }
+
+    /// Resolve the selected hull's picture, one fetch at a time:
+    /// manifest first (no request for hulls without pictures), then
+    /// the hull's temporary URL, cached for the session. Runs from
+    /// the frame pump, never the render path.
+    fn maybe_resolve_hull_image(&mut self) {
+        if self.image_op.is_some() || self.auth_token.is_none() {
+            return;
+        }
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        // Read the first manifest immediately, then re-read it on a
+        // bounded cadence. The manifest is the only place that can turn
+        // a previously settled Unavailable visual into a UnitImage, so
+        // a one-shot read would never notice a picture uploaded later in
+        // the same session.
+        let now = Instant::now();
+        let manifest_due = !self.visuals.manifest_loaded
+            || self
+                .manifest_refresh_at
+                .is_none_or(|refresh_at| refresh_at <= now);
+        if manifest_due {
+            if self
+                .manifest_retry_at
+                .is_some_and(|retry_at| retry_at > now)
+            {
+                return;
+            }
+            self.image_request = Some(ImageRequest::Manifest);
+            self.image_op = Some(spawn_rest("pictures", move || {
+                master
+                    .unit_image_manifest(&tok)
+                    .map_err(|e| e.to_string())
+                    .map(ImageOut::Manifest)
+            }));
+            return;
+        }
+        // The SELECTED unit jumps the queue: it is the one the
+        // operator is looking at right now.
+        let selected = match self.selection.clone() {
+            Some(Selection::Ship(id)) => id.parse::<i64>().ok(),
+            _ => None,
+        };
+        if let Some(uid) = selected {
+            if self.visuals.needs_url(uid) {
+                self.spawn_url_read(uid, master, tok);
+                return;
+            }
+            if !self.visuals.is_settled(uid) {
+                // The manifest is in force and does not list this
+                // unit: cached absence, never re-asked. It is still a
+                // visual, carrying the symbol and measurements.
+                let symbol = self.symbol_for_unit(uid);
+                self.visuals.mark_absent(uid, symbol);
+                return;
+            }
+        }
+        // Then the rest, one per pump slot. Successful sources remain
+        // watched until their texture is decoded; failed sources stay
+        // watched but do not block healthy ids during retry delay.
+        self.pending_image_urls
+            .retain(|unit_id| self.visuals.expects_source(*unit_id));
+        if let Some(uid) = self
+            .pending_image_urls
+            .iter()
+            .copied()
+            .find(|unit_id| self.visuals.needs_url(*unit_id))
+        {
+            self.spawn_url_read(uid, master, tok);
+        }
+    }
+
+    /// One URL read on the picture worker. The URL is temporary, so
+    /// this can be re-run for the same unit whenever it expires.
+    fn spawn_url_read(&mut self, uid: i64, master: MinosMaster, tok: String) {
+        self.pending_image_urls.retain(|u| *u != uid);
+        self.image_request = Some(ImageRequest::Url(uid));
+        self.image_op = Some(spawn_rest("picture", move || {
+            master
+                .hull_image_url(&tok, uid)
+                .map_err(|e| e.to_string())
+                .map(|url| ImageOut::Url(uid, url))
+        }));
+    }
+
+    /// Apply a finished picture fetch: the manifest (seeding every
+    /// listed unit's visual, and dropping stale pictures when the
+    /// version moved) or one unit's temporary URL. Failures report and
+    /// keep whatever the session already resolved.
+    fn apply_image(&mut self, out: ImageOut) {
+        match out {
+            ImageOut::Manifest(manifest) => {
+                // One taxonomy read per manifest, not per entry: keep
+                // the SQLite fan-out proportional to the fleet, not
+                // to the number of files in the manifest.
+                let resolver = self.symbol_resolver();
+                let rows: std::collections::HashMap<i64, tfg::store::UnitTaxonomy> = self
+                    .store
+                    .as_ref()
+                    .and_then(|c| tfg::store::fleet_units(c).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|u| u.id.parse::<i64>().ok().map(|id| (id, u.taxonomy())))
+                    .collect();
+                let needing =
+                    self.visuals
+                        .install_manifest(&manifest, |uid| match rows.get(&uid) {
+                            Some(tax) => resolver.resolve(*tax),
+                            // Not in the mirror: still drawable, as the
+                            // generic ship.
+                            None => resolver.resolve(tfg::store::UnitTaxonomy::default()),
+                        });
+                // URLs are read one at a time by the pump, newest
+                // selection first; the prefetch ticket widens this.
+                // Keep a same-version re-read from discarding work
+                // already queued, and drop ids the new ETag removed.
+                self.pending_image_urls
+                    .retain(|unit_id| self.visuals.expects_source(*unit_id));
+                for unit_id in needing {
+                    if !self.pending_image_urls.contains(&unit_id) {
+                        self.pending_image_urls.push(unit_id);
+                    }
+                }
+                self.manifest_retry_at = None;
+                self.manifest_refresh_at =
+                    Some(Instant::now() + MANIFEST_REFRESH_INTERVAL);
+                // Seed the versioned visual for every mirrored hull,
+                // not just the ones the manifest listed. Measurements
+                // and symbols belong to units without pictures too.
+                self.hydrate_visual_facts();
+                // Coverage reads honestly: listed images, and how many
+                // live hulls still have none.
+                self.users_status = format!(
+                    "pictures: {} hull(s) listed, {} without",
+                    manifest.entries.len(),
+                    manifest.units_without_image
+                );
+            }
+            ImageOut::Url(uid, url) => {
+                self.visuals.set_url(uid, url);
+                if self.visuals.expects_source(uid)
+                    && !self.pending_image_urls.contains(&uid)
+                {
+                    // Keep the source in the watch list until its
+                    // texture is decoded. If the presign expires
+                    // first, this same id is re-read rather than
+                    // becoming a permanent symbol.
+                    self.pending_image_urls.push(uid);
+                }
+            }
+        }
+    }
+
+    /// The id-keyed symbol resolver, built from the mirrored
+    /// assignment table. An unreadable table yields an empty resolver,
+    /// which still draws every unit as the generic ship.
+    fn symbol_resolver(&self) -> tfg::store::SymbolResolver {
+        let Some(conn) = self.store.as_ref() else {
+            return tfg::store::SymbolResolver::default();
+        };
+        let by_type = tfg::store::unit_type_symbols(conn).unwrap_or_default();
+        let by_category = tfg::store::unit_category_symbols(conn).unwrap_or_default();
+        let by_domain = tfg::store::unit_movement_domain_symbols(conn).unwrap_or_default();
+        tfg::store::SymbolResolver::new(by_type, by_category, by_domain)
+    }
+
+    /// Rebuild the image-independent symbol lookup after the taxonomy
+    /// mirror changes. This is what lets far symbols render before the
+    /// picture manifest has arrived.
+    fn reload_unit_symbols(&mut self) {
+        self.unit_symbols.clear();
+        self.unit_type_ids.clear();
+        self.unit_type_names.clear();
+        self.unit_type_symbols.clear();
+        let Some(conn) = self.store.as_ref() else {
+            return;
+        };
+        let by_type = tfg::store::unit_type_symbols(conn).unwrap_or_default();
+        let by_category = tfg::store::unit_category_symbols(conn).unwrap_or_default();
+        let by_domain = tfg::store::unit_movement_domain_symbols(conn).unwrap_or_default();
+        let resolver = tfg::store::SymbolResolver::new(
+            by_type.clone(),
+            by_category,
+            by_domain,
+        );
+        self.unit_type_symbols = by_type.into_iter().collect();
+        self.unit_type_names = tfg::store::unit_type_names(conn)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let units = tfg::store::fleet_units(conn).unwrap_or_default();
+        self.unit_symbols = units
+            .iter()
+            .filter_map(|unit| {
+                let unit_id = unit.id.parse::<i64>().ok()?;
+                if let Some(type_id) = unit.type_id {
+                    self.unit_type_ids.insert(unit_id, type_id);
+                }
+                Some((unit_id, resolver.resolve(unit.taxonomy())))
+            })
+            .collect();
+    }
+
+    /// Rotate the selected thumbnail without changing Minos' reported
+    /// course. This is an operator display override, cleared with the
+    /// visual session boundary.
+    fn heading_editor(&mut self, ui: &mut egui::Ui, ship_id: &str, reported: Option<f32>) {
+        let mut value = self
+            .heading_overrides
+            .get(ship_id)
+            .copied()
+            .or(reported)
+            .unwrap_or(0.0)
+            .rem_euclid(360.0);
+        ui.horizontal(|ui| {
+            ui.label("thumbnail heading");
+            if ui.small_button("−15°").clicked() {
+                value = (value - 15.0).rem_euclid(360.0);
+                self.heading_overrides.insert(ship_id.to_string(), value);
+            }
+            if ui.small_button("+15°").clicked() {
+                value = (value + 15.0).rem_euclid(360.0);
+                self.heading_overrides.insert(ship_id.to_string(), value);
+            }
+            if self.heading_overrides.contains_key(ship_id) && ui.small_button("clear").clicked() {
+                self.heading_overrides.remove(ship_id);
+            }
+        });
+        let had_override = self.heading_overrides.contains_key(ship_id);
+        let slider = ui.add(egui::Slider::new(&mut value, 0.0..=360.0).suffix("°"));
+        if had_override || slider.changed() {
+            self.heading_overrides.insert(ship_id.to_string(), value);
+        }
+        if let Some(reported) = reported {
+            ui.weak(format!("reported course: {reported:.0}°"));
+        } else {
+            ui.weak("reported course: unknown — override controls the thumbnail");
+        }
+    }
+
+    /// Assign the selected hull's stable unit type to a far-map
+    /// symbol. The display name is only a label; the write is keyed
+    /// by `unit_type.id`, so renaming a type never changes its shape.
+    fn map_symbol_editor(&mut self, ui: &mut egui::Ui, ship_id: &str) {
+        let Ok(unit_id) = ship_id.parse::<i64>() else {
+            return;
+        };
+        let Some(type_id) = self.unit_type_ids.get(&unit_id).copied() else {
+            return;
+        };
+        let current = self.unit_type_symbols.get(&type_id).copied();
+        let type_name = self
+            .unit_type_names
+            .get(&type_id)
+            .cloned()
+            .unwrap_or_else(|| format!("type #{type_id}"));
+        let mut selected = current;
+        egui::ComboBox::from_id_salt(("unit-map-symbol", type_id))
+            .selected_text(
+                current
+                    .map(map_symbol_label)
+                    .unwrap_or("category/domain fallback"),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut selected, None, "category/domain fallback");
+                for symbol in tfg::store::MapSymbol::ALL {
+                    ui.selectable_value(
+                        &mut selected,
+                        Some(symbol),
+                        map_symbol_label(symbol),
+                    );
+                }
+            });
+        if selected != current {
+            self.set_unit_type_symbol(type_id, selected);
+        }
+        ui.weak(format!("far symbol · {type_name} (type #{type_id})"));
+    }
+
+    fn set_unit_type_symbol(&mut self, type_id: i64, symbol: Option<tfg::store::MapSymbol>) {
+        let Some(mut conn) = self.store.take() else {
+            self.users_status = "map symbol assignment needs the local store".to_string();
+            return;
+        };
+        let result = tfg::store::set_unit_type_symbol(&mut conn, type_id, symbol);
+        self.store = Some(conn);
+        match result {
+            Ok(()) => {
+                self.reload_unit_symbols();
+                self.hydrate_visual_facts();
+                self.users_status = match symbol {
+                    Some(symbol) => format!("map symbol: {}", map_symbol_label(symbol)),
+                    None => "map symbol: category/domain fallback".to_string(),
+                };
+            }
+            Err(e) => self.users_status = format!("map symbol assignment failed: {e}"),
+        }
+    }
+
+    /// Resolve one mirrored hull's far-map symbol from stable taxonomy
+    /// ids. An unmirrored hull still gets the generic ship.
+    fn symbol_for_unit(&self, unit_id: i64) -> tfg::store::MapSymbol {
+        if let Some(symbol) = self.unit_symbols.get(&unit_id) {
+            return *symbol;
+        }
+        let tax = self
+            .store
+            .as_ref()
+            .and_then(|conn| tfg::store::fleet_unit(conn, &unit_id.to_string()).ok())
+            .flatten()
+            .map(|u| u.taxonomy())
+            .unwrap_or_default();
+        self.symbol_resolver().resolve(tax)
+    }
+
+    /// Merge local unit facts into the active asset version. This is
+    /// safe to call after a sync, a spec backfill, or a manifest read:
+    /// it updates measurements and symbols without disturbing URLs or
+    /// textures already resolved for that same version.
+    fn hydrate_visual_facts(&mut self) {
+        if !self.visuals.manifest_loaded {
+            return;
+        }
+        let Some(conn) = self.store.as_ref() else {
+            return;
+        };
+        let resolver = self.symbol_resolver();
+        let units = tfg::store::fleet_units(conn).unwrap_or_default();
+        let figures: std::collections::HashMap<i64, tfg::store::StoredFigures> =
+            tfg::store::current_figures(conn)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|facts| (facts.unit_id, facts))
+                .collect();
+        for unit in units {
+            let Ok(unit_id) = unit.id.parse::<i64>() else {
+                continue;
+            };
+            let symbol = resolver.resolve(unit.taxonomy());
+            let facts = figures.get(&unit_id);
+            self.visuals.set_unit_facts(
+                unit_id,
+                symbol,
+                facts.and_then(|f| f.loa_m),
+                facts.and_then(|f| f.beam_m),
+                facts.and_then(|f| f.draft_m),
+            );
+        }
+    }
+
+    /// Ask egui for a source texture and keep its renderable identity
+    /// in the versioned visual. Presigned addresses are acquisition
+    /// steps, not durable identity: once decoded, the texture outlives
+    /// the URL that obtained it.
+    fn show_visual_source(
+        &mut self,
+        ui: &mut egui::Ui,
+        unit_id: i64,
+        source: &str,
+        width_px: Option<u32>,
+    ) {
+        let hint = width_px
+            .filter(|width| *width > 0)
+            .map(egui::load::SizeHint::Width)
+            .unwrap_or_else(|| egui::load::SizeHint::Scale(1.0.into()));
+        match ui.ctx().try_load_texture(
+            source,
+            egui::TextureOptions::LINEAR,
+            hint,
+        ) {
+            Ok(egui::load::TexturePoll::Ready { texture }) => {
+                self.visuals.set_texture(unit_id, texture);
+                ui.image(texture);
+            }
+            Ok(egui::load::TexturePoll::Pending { .. }) | Err(_) => {
+                // The loader owns the retry and loading state. A
+                // second request under the same URI is deduplicated.
+                ui.image(source.to_string());
+            }
+        }
+    }
+
+    /// Start texture loads for Middle/Near markers. This is a loader
+    /// hand-off only: the map itself still paints through `Painter`
+    /// meshes and never calls `ui.image` on the map path.
+    fn load_marker_textures(&mut self, ctx: &egui::Context, markers: &[ShipMarker]) {
+        for marker in markers {
+            if marker.lod == UnitLod::Far {
+                continue;
+            }
+            let Ok(unit_id) = marker.id.parse::<i64>() else {
+                continue;
+            };
+            let Some(visual) = self.visuals.get(unit_id) else {
+                continue;
+            };
+            if visual.texture.is_some() || visual.asset_kind != AssetKind::UnitImage {
+                continue;
+            }
+            let Some(source) = visual.image_url.clone() else {
+                continue;
+            };
+            if visual
+                .image_url_retry_at
+                .is_some_and(|retry_at| retry_at > Instant::now())
+                || visual
+                    .image_url_expires_at
+                    .is_some_and(|expires_at| expires_at <= Instant::now())
+            {
+                continue;
+            }
+            let hint = visual
+                .width_px
+                .filter(|width| *width > 0)
+                .map(egui::load::SizeHint::Width)
+                .unwrap_or_else(|| egui::load::SizeHint::Scale(1.0.into()));
+            if let Ok(egui::load::TexturePoll::Ready { texture }) =
+                ctx.try_load_texture(&source, egui::TextureOptions::LINEAR, hint)
+            {
+                self.visuals.set_texture(unit_id, texture);
+            }
+        }
+    }
+
     /// Display size in points: what overlays project against. The
     /// renderer works in physical pixels; both derive per frame.
     fn map_dims(&self) -> (f64, f64) {
         self.map_view
     }
 
+    /// Pointer-free map path (blocking ticket): cycle ships and
+    /// groups, follow, waypoint-at-center, island toggles, deselect.
+    /// Runs inside the focus contract — never while typing. Commit
+    /// stays on the (Tab-reachable) order button by design: the key
+    /// aims, the button fires, and the water check still refuses.
+    fn keyboard_map_path(&mut self, ctx: &egui::Context) {
+        let mut ids: Vec<String> = self
+            .markers(ctx.pixels_per_point())
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        ids.sort();
+        let step = if ctx.input(|i| i.key_pressed(egui::Key::OpenBracket)) {
+            Some(-1i64)
+        } else if ctx.input(|i| i.key_pressed(egui::Key::CloseBracket)) {
+            Some(1i64)
+        } else {
+            None
+        };
+        if let (Some(dir), true) = (step, !ids.is_empty()) {
+            let cur = match &self.selection {
+                Some(Selection::Ship(id)) => ids.iter().position(|x| x == id).unwrap_or(0),
+                _ => {
+                    if dir < 0 {
+                        0
+                    } else {
+                        ids.len() - 1
+                    }
+                }
+            };
+            let next = (cur as i64 + dir).rem_euclid(ids.len() as i64) as usize;
+            // Selecting opens the Inspector like a marker click.
+            self.select_ship(ids[next].clone());
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::G)) {
+            let mut gids: Vec<String> =
+                self.groups.group_list().iter().map(|g| g.id.clone()).collect();
+            gids.sort();
+            if !gids.is_empty() {
+                let cur = match &self.selection {
+                    Some(Selection::Group(id)) => {
+                        gids.iter().position(|x| x == id).unwrap_or(0)
+                    }
+                    _ => gids.len() - 1,
+                };
+                self.select_group(gids[(cur + 1) % gids.len()].clone());
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F)) {
+            if let Some(Selection::Ship(id)) = self.selection.clone() {
+                self.following = Some(id);
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::W)) {
+            // Waypoint at the view center — the order button commits.
+            self.pending_waypoint = Some(self.center);
+            self.placing = false;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::O)) {
+            self.show_orders = true;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+            self.show_roster = !self.show_roster;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.deselect();
+        }
+    }
+
+
     /// Apply finished map frames (last-writer-wins by sequence). The
     /// camera stays authoritative: the texture only records what it was
     /// rendered for (center/zoom/size) so the canvas can translate it
     /// while a fresher tile is in flight. One texture, updated in place.
     fn drain_map(&mut self, ctx: &egui::Context) {
-        for (seq, center, zoom, size, rgba) in self.map_resp_rx.try_iter() {
+        for (seq, center, zoom, size, img) in self.map_resp_rx.try_iter() {
             if seq == self.map_seq {
-                let img = if LiveMap::is_premultiplied() {
-                    egui::ColorImage::from_rgba_premultiplied(
-                        [size.0 as usize, size.1 as usize],
-                        &rgba,
-                    )
-                } else {
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        [size.0 as usize, size.1 as usize],
-                        &rgba,
-                    )
-                };
                 match &mut self.map_tex {
                     Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
                     None => {
@@ -1813,17 +7286,45 @@ impl ShipApp {
             .unwrap_or_else(|| id.to_string())
     }
 
+    /// Map labels prefer a human unit name, then its hull number, and
+    /// use the raw id only when both are absent.
+    fn map_label(
+        &self,
+        id: &str,
+        live_name: Option<&str>,
+        live_hull: Option<&str>,
+    ) -> String {
+        let (fallback_name, fallback_hull) = self
+            .placed_labels
+            .get(id)
+            .cloned()
+            .or_else(|| self.fleet.get(id).map(|u| (u.name.clone(), u.hull.clone())))
+            .unwrap_or_default();
+        live_name
+            .and_then(nonempty)
+            .or_else(|| nonempty(&fallback_name))
+            .or_else(|| live_hull.and_then(nonempty))
+            .or_else(|| nonempty(&fallback_hull))
+            .unwrap_or_else(|| id.to_string())
+    }
+
     /// Resolve a picked hull to (name, hull, catalog class id for sim
-    /// stats). Asset seeds carry their class; register rows resolve the
-    /// Minos class name against the catalog — None means no sim stats,
-    /// and placement refuses loudly rather than inventing abilities.
+    /// stats). Asset seeds carry their class; register rows resolve by
+    /// the Minos class id first (H10: a bundled asset sharing the name
+    /// must never shadow synced figures), falling back to the name
+    /// match for unsynced hulls. None means no sim stats, and placement
+    /// refuses loudly rather than inventing abilities.
     fn placement_seed(&self, id: &str) -> Option<(String, String, Option<String>)> {
         if let Some(u) = self.fleet.get(id) {
             return Some((u.name.clone(), u.hull.clone(), Some(u.class_id.clone())));
         }
         let conn = self.store.as_ref()?;
         let row = tfg::store::fleet_unit(conn, id).ok()??;
-        let class = self.catalog.find_class_by_name(&row.class_name).map(|c| c.id.clone());
+        let class = self
+            .catalog
+            .find_runtime_class(row.class_id)
+            .map(|c| c.id.clone())
+            .or_else(|| self.catalog.find_class_by_name(&row.class_name).map(|c| c.id.clone()));
         Some((row.name, row.hull, class))
     }
 
@@ -1836,6 +7337,7 @@ impl ShipApp {
         }
         if !self.mode.armed.load(Ordering::SeqCst) {
             self.feed("place refused: engine disarmed".to_string());
+            self.users_status = "place refused: engine disarmed".to_string();
             return None;
         }
         if self.acting_as.is_some() {
@@ -1849,56 +7351,147 @@ impl ShipApp {
         match class_id {
             Some(class_id) => {
                 let id = pid.clone();
-                if let Some(tx) = &self.sim_cmd_tx {
-                    let _ = tx.send(SimCommand::TakeControl {
-                        ship_id: id.clone(),
-                        pos: GeoPosition { latitude: la, longitude: lo },
+                // C2 + #100: a held game owns the starting position —
+                // the PUT runs off-thread and the local drop follows on
+                // success, a frame later. A refusal (frozen execution
+                // legs, unassigned hull, bad water) leaves no phantom
+                // ship on the map. With no game held the drop stays a
+                // local sandbox act, applied at once below.
+                if let Some((gid, _)) = self.users_game.clone() {
+                    let Ok(uid) = pid.parse::<i64>() else {
+                        let msg = format!("place refused: {name} is not a register hull");
+                        self.feed(msg.clone());
+                        self.users_status = msg;
+                        return None;
+                    };
+                    if !self.users_gunits.iter().any(|g| g.unit_id == uid) {
+                        let msg = format!("place refused: assign {name} in step 3 first");
+                        self.feed(msg.clone());
+                        self.users_status = msg;
+                        return None;
+                    }
+                    if self.setup_busy("place") {
+                        return None;
+                    }
+                    let (master, tok) = match self.users_client() {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let msg = format!("place refused: Minos says {e}");
+                            self.feed(msg.clone());
+                            self.users_status = msg;
+                            return None;
+                        }
+                    };
+                    let drop_ = PlaceDrop {
+                        pid: pid.clone(),
+                        name: name.clone(),
+                        hull: hull.clone(),
                         class_id: class_id.clone(),
-                    });
+                        la,
+                        lo,
+                    };
+                    self.users_status = format!("placing {name}…");
+                    self.setup_op = Some(spawn_rest("place", move || {
+                        master
+                            .set_placement(&tok, gid, uid, la, lo)
+                            .map_err(|e| e.to_string())
+                            .map(|view| SetupDone::Place(view, drop_))
+                    }));
+                    return None;
                 }
-                // Placed units arrive owned (Q3): the gesture is the
-                // take-control, no second step.
-                self.controlled.insert(id.clone());
-                self.select_ship(id.clone());
-                self.placed_labels.insert(id.clone(), (name.clone(), hull.clone()));
-                self.placed_fleet.insert(id);
-                self.fleet_pick = None;
-                self.feed(format!("placed {name} ({hull}) at ({la:.4}, {lo:.4})"));
+                self.apply_local_drop(&id, &pid, &name, &hull, &class_id, la, lo);
                 Some(pid)
             }
             None => {
-                self.feed(format!("place refused: no sim stats for {name}"));
+                let msg = format!("place refused: no sim stats for {name}");
+                self.feed(msg.clone());
+                self.users_status = msg;
                 None
             }
         }
     }
 
-    /// Seat labels for one roster user: helm, unit command, group command.
-    fn seat_labels(&self, user: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        for (u, h) in &self.helm {
-            if h == user {
-                out.push(format!("helm {}", self.unit_label(u)));
-            }
+    /// The local half of a placement (shared by the sandbox drop and
+    /// the deferred Minos drop): TakeControl, ownership, labels, and
+    /// the status line with its spec authority.
+    fn apply_local_drop(
+        &mut self,
+        id: &str,
+        pid: &str,
+        name: &str,
+        hull: &str,
+        class_id: &str,
+        la: f64,
+        lo: f64,
+    ) {
+        if let Some(tx) = &self.sim_cmd_tx {
+            let _ = tx.send(SimCommand::TakeControl {
+                ship_id: id.to_string(),
+                pos: GeoPosition { latitude: la, longitude: lo },
+                class_id: class_id.to_string(),
+            });
         }
-        for (u, c) in &self.unit_commander {
-            if c == user {
-                out.push(format!("cmdr {}", self.unit_label(u)));
-            }
-        }
-        for g in self.groups.group_list() {
-            if g.commander.as_deref() == Some(user) {
-                out.push(format!("cmdr {}", g.name));
-            }
-        }
-        out.sort();
-        out
+        // Placed units arrive owned (Q3): the gesture is the
+        // take-control, no second step.
+        self.controlled.insert(id.to_string());
+        self.select_ship(id.to_string());
+        self.placed_labels.insert(id.to_string(), (name.to_string(), hull.to_string()));
+        self.placed_fleet.insert(pid.to_string());
+        self.fleet_pick = None;
+        // The event feed only renders in an execution window;
+        // the setup flow owns its own status line too. The spec
+        // source rides the message (H10): Minos figures name
+        // their version, bundled rows name the asset.
+        let authority = self
+            .catalog
+            .class(class_id)
+            .map(|c| {
+                if c.version > 0 {
+                    format!("{} v{}", Catalog::class_source(c), c.version)
+                } else {
+                    Catalog::class_source(c).to_string()
+                }
+            })
+            .unwrap_or_else(|| "unknown class".to_string());
+        let msg = format!(
+            "placed {name} ({hull}) at ({la:.4}, {lo:.4}) · {authority} · Minos: {} placed, {} to go",
+            self.users_placements.len(),
+            self.placement_unplaced,
+        );
+        self.feed(msg.clone());
+        self.users_status = msg;
     }
 
-    /// Backend base URL when the mock/real backend is connected (same env
-    /// as the poll source).
-    fn backend_base() -> Option<String> {
-        std::env::var("TFG_BACKEND_URL").ok()
+    /// Drop one hull's local half: sim ship, control, orders view,
+    /// labels, fleet membership, pick, selection, and follow. Every
+    /// removal path funnels here so the map never shows a controllable
+    /// hull Minos calls unplaced.
+    fn release_hull(&mut self, id: &str) {
+        if let Some(tx) = &self.sim_cmd_tx {
+            let _ = tx.send(SimCommand::Release { ship_id: id.to_string() });
+        }
+        self.controlled.remove(id);
+        self.order_views.remove(id);
+        self.placed_labels.remove(id);
+        self.placed_fleet.remove(id);
+        if self.fleet_pick.as_deref() == Some(id) {
+            self.fleet_pick = None;
+        }
+        if self.selection == Some(Selection::Ship(id.to_string())) {
+            self.deselect();
+        }
+        if self.following.as_deref() == Some(id) {
+            self.following = None;
+        }
+    }
+
+    /// Apply a finished placement PUT: setup view first, then the
+    /// deferred local drop (whose message carries the Minos counts).
+    /// A refusal leaves nothing behind.
+    fn apply_placed(&mut self, view: tfg::backend::PlacementList, drop_: PlaceDrop) {
+        self.apply_placements(view);
+        let pid = drop_.pid.clone();
+        self.apply_local_drop(&pid, &pid, &drop_.name, &drop_.hull, &drop_.class_id, drop_.la, drop_.lo);
     }
 
     /// Socket URL for a Minos REST base (live-wire ticket): same host,
@@ -1946,56 +7539,7 @@ impl ShipApp {
         }
     }
 
-    /// Push every local invite record to the mock (client codes win).
-    fn sync_invites(&mut self) {
-        let Some(base) = Self::backend_base() else {
-            self.invite_status = "no backend connected".to_string();
-            return;
-        };
-        let client = match InviteClient::new(&base) {
-            Ok(c) => c,
-            Err(e) => {
-                self.invite_status = format!("mock unreachable: {e}");
-                return;
-            }
-        };
-        let mut n = 0;
-        for inv in &self.invites {
-            match client.issue(&inv.user, &inv.seat, &inv.code) {
-                Ok(_) => {
-                    n += 1;
-                }
-                Err(e) => {
-                    self.invite_status = format!("sync stopped at {}: {e}", inv.code);
-                    return;
-                }
-            }
-        }
-        self.invite_status = format!("synced {n} invite(s) to mock");
-    }
 
-    /// Pull the mock list; local redeemed flags follow by code.
-    fn refresh_invites(&mut self) {
-        let Some(base) = Self::backend_base() else {
-            self.invite_status = "no backend connected".to_string();
-            return;
-        };
-        match InviteClient::new(&base).and_then(|c| c.list()) {
-            Ok(remote) => {
-                let mut n = 0;
-                for inv in &mut self.invites {
-                    if !inv.redeemed && remote.iter().any(|r| r.code == inv.code && r.redeemed) {
-                        inv.redeemed = true;
-                        n += 1;
-                    }
-                }
-                self.invite_status = format!("refreshed from mock ({n} redeemed)");
-            }
-            Err(e) => {
-                self.invite_status = format!("mock unreachable: {e}");
-            }
-        }
-    }
 
     /// Stash the current draft under the current desktop.
     fn save_draft(&mut self) {
@@ -2022,19 +7566,6 @@ impl ShipApp {
         self.desktop = id;
         if self.is_observer() {
             self.show_orders = false;
-        }
-    }
-
-    /// Default desktop for the acting identity: All, or the first scope.
-    fn default_desktop(&self) -> String {
-        match &self.acting_as {
-            None => "all".to_string(),
-            Some(user) => self
-                .groups
-                .scopes_for(user, &self.unit_commander, &self.helm)
-                .first()
-                .map(|s| s.id.clone())
-                .unwrap_or_else(|| "all".to_string()),
         }
     }
 
@@ -2107,8 +7638,7 @@ impl ShipApp {
         }
     }
 
-    /// Start action shared by the Session island and the wizard:
-    /// default windows, fresh per-session journal, 24:1 clock, armed.
+    /// Start action: default windows, fresh per-session journal, 24:1 clock, armed.
     fn start_session(&mut self) {
         // Going live is organizer-only (slice iv).
         if self.acting_as.is_some() {
@@ -2132,8 +7662,15 @@ impl ShipApp {
             gs.format(fmt).to_string(),
             ge.format(fmt).to_string(),
         ));
-        // Ratio derived from windows (grill #23): game span over real span.
-        let ratio = (ge - gs).num_seconds() as f64 / (re - rs).num_seconds() as f64;
+        // Ratio derived from windows (grill #23): game span over real
+        // span — for the sandbox. A connected execution seeds from the
+        // Minos rate instead (H2): the windows never armed a Minos
+        // clock, and an independent local ratio would drift the display
+        // from the assumed times the server stamps.
+        let ratio = match (self.users_game_state.as_deref(), self.minos_time_factor) {
+            (Some("execution"), Some(f)) => f,
+            _ => (ge - gs).num_seconds() as f64 / (re - rs).num_seconds() as f64,
+        };
         self.session_ratio = ratio;
         self.session_seq += 1;
         let path = std::path::PathBuf::from(format!(
@@ -2144,17 +7681,39 @@ impl ShipApp {
         if let Some(tx) = &self.sim_cmd_tx {
             let _ = tx.send(SimCommand::RotateJournal { path: path.clone() });
             let _ = tx.send(SimCommand::SetClockRatio { ratio });
+            // M6: Live entry unfreezes the Setup hold.
+            let _ = tx.send(SimCommand::SetPaused { paused: false });
         }
         self.session_log_path = path;
         self.mode.start();
-        self.wizard_done = true;
-        // Going live needs the working islands; the Fleet picker stays
-        // available for Live reinforcements, so it is left as-is. The
-        // Inspector opens on first selection, not here.
-        self.show_roster = true;
-        self.show_orders = true;
-        self.show_log = true;
+        // Going live opens map + strip + ONE contextual island; the
+        // rest stay available but closed. The Inspector still opens on
+        // first selection, new mail still pops Messages once.
+        self.show_roster = false;
+        self.show_orders = false;
+        self.show_log = false;
+        self.show_messages = false;
+        self.live_default_islands();
         eprintln!("session live at {ratio:.1}x");
+    }
+
+    /// Live entry's single island, from the seat — never from role
+    /// names (authorable backend-side). Judge-side watches the
+    /// record; hull commanders get orders; everyone else (organizer,
+    /// observer, unseated) gets the roster with readiness control.
+    fn live_default_islands(&mut self) {
+        let judge = self.own_roster_row().is_some_and(|p| p.judge);
+        let commands = !self.commanded_hulls.is_empty()
+            || self.users_gunits.iter().any(|g| {
+                self.auth_user_id.is_some_and(|me| g.commander_id == Some(me))
+            });
+        if judge {
+            self.show_log = true;
+        } else if commands {
+            self.show_orders = true;
+        } else {
+            self.show_roster = true;
+        }
     }
 
     /// A session exists once started (task #40): working islands unlock
@@ -2163,18 +7722,50 @@ impl ShipApp {
         self.mode.phase == Phase::Live
     }
 
+    /// H1: the Eval predicate, so closure writes can guard the local end.
+    fn session_closed(&self) -> bool {
+        self.mode.phase == Phase::Closed
+    }
+
     /// Lock the working islands (task #40).
     fn close_working_islands(&mut self) {
         self.show_roster = false;
-        self.show_fleet = false;
         self.show_orders = false;
         self.show_log = false;
-        self.show_groups = false;
+        self.show_messages = false;
+    }
+
+    /// Directory scan off-thread: the target/ listing leaves the
+    /// frame; the loaded flag sets at spawn so one scan runs per
+    /// open, and refresh re-arms it.
+    fn refresh_log_files(&mut self) -> bool {
+        if self.log_op.is_some() {
+            self.users_status = "log scan already running…".to_string();
+            return false;
+        }
+        self.log_op = Some(spawn_rest("logdir", || Ok(LogOut::Files(Self::session_log_files()))));
+        true
+    }
+
+    /// Journal parse off-thread: full read + structured parse +
+    /// replay events in one worker trip. The path pins at spawn; a
+    /// changed selection drops the stale arrival.
+    fn load_log_view(&mut self, path: std::path::PathBuf) {
+        if self.log_op.is_some() {
+            self.users_status = "log parse already running…".to_string();
+            return;
+        }
+        self.log_view_path = Some(path.clone());
+        self.log_view = None;
+        self.log_op = Some(spawn_rest("log", move || {
+            let (entries, units, players) = Self::read_log_view(&path);
+            let replay = Self::parse_replay(&path);
+            Ok(LogOut::View(path, LogViewData { entries, units, players, replay }))
+        }));
     }
 
     /// Past session journals on disk, oldest first.
-    fn session_log_files() -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
+    fn session_log_files() -> Vec<std::path::PathBuf> {        let mut out = Vec::new();
         if let Ok(dir) = std::fs::read_dir(format!("{}/target", env!("CARGO_MANIFEST_DIR"))) {
             for e in dir.flatten() {
                 let p = e.path();
@@ -2310,383 +7901,30 @@ impl ShipApp {
         out
     }
 
-    /// End action: disarm into Closed, lock working islands, and freeze
-    /// the transcript tail.
+    /// End action: disarm into Closed, lock working islands, and
+    /// freeze the transcript tail — the tail read leaves the frame
+    /// on the log worker and lands a moment later.
     fn end_session(&mut self) {
         self.mode.end();
         self.close_working_islands();
         // Closed clears selection: the map freezes under its transcript,
         // clicks go inert, the Inspector shuts.
         self.deselect();
-        if let Ok(text) = std::fs::read_to_string(&self.session_log_path) {
-            let lines: Vec<String> =
-                text.lines().map(|s| s.to_string()).collect();
-            let n = lines.len();
-            self.transcript =
-                lines.into_iter().skip(n.saturating_sub(200)).collect();
+        self.transcript.clear();
+        let path = self.session_log_path.clone();
+        if self.log_op.is_none() {
+            self.log_op = Some(spawn_rest("transcript", move || {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+                let n = lines.len();
+                Ok(LogOut::Transcript(
+                    lines.into_iter().skip(n.saturating_sub(200)).collect(),
+                ))
+            }));
         }
         eprintln!("session ended");
     }
 
-    /// Session island: phase and the per-phase controls. Arming follows
-    /// the app mode (Simulation arms, Presentation disarms) — no separate
-    /// engine toggle. Reads UiMode; writes only through start()/end()/reset().
-    fn session_island(&mut self, ui: &mut egui::Ui) {
-        let phase = self.mode.phase;
-        ui.label(format!("phase: {phase:?}"));
-        match phase {
-            Phase::Setup => {
-                // Setup editing is organizer-only (slice iv): acting
-                // players keep the read-only summary.
-                if self.acting_as.is_some() {
-                    ui.label("Setup is organizer-only: switch identity to Organizer to edit.");
-                    ui.label(format!("placed: {} unit(s) · {} player(s)", self.placed_fleet.len(), self.roster.len()));
-                    return;
-                }
-                ui.heading("Session logs");
-                if let Some(path) = self.log_view_path.clone() {
-                    let (entries, units, players) = Self::read_log_view(&path);
-                    ui.horizontal(|ui| {
-                        if ui.small_button("← all logs").clicked() {
-                            self.log_view_path = None;
-                        }
-                        ui.label(
-                            path.file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("?"),
-                        );
-                    });
-                    ui.label(format!(
-                        "units: {} · players: {}",
-                        if units.is_empty() { "—".to_string() } else { units.join(", ") },
-                        if players.is_empty() { "—".to_string() } else { players.join(", ") },
-                    ));
-                    egui::ComboBox::from_label("show")
-                        .selected_text(&self.log_filter)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.log_filter,
-                                "all".to_string(),
-                                "all events",
-                            );
-                            for u in &units {
-                                ui.selectable_value(
-                                    &mut self.log_filter,
-                                    format!("unit:{u}"),
-                                    format!("unit {u}"),
-                                );
-                            }
-                            for p in &players {
-                                ui.selectable_value(
-                                    &mut self.log_filter,
-                                    format!("player:{p}"),
-                                    format!("player {p}"),
-                                );
-                            }
-                        });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.show_replay, "show on map");
-                        let max = self.log_events.len();
-                        if self.replay_pos > max {
-                            self.replay_pos = max;
-                        }
-                        ui.add(egui::Slider::new(&mut self.replay_pos, 0..=max).text("replay"));
-                    });
-                    if let Some(e) = self.log_events.get(self.replay_pos.saturating_sub(1)) {
-                        ui.label(format!("replay @ {}", e.game_ts));
-                    } else {
-                        ui.label("replay @ start");
-                    }
-                    let filter = self.log_filter.clone();
-                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                        for e in entries.iter().rev().take(200) {
-                            let show = if filter == "all" {
-                                true
-                            } else if let Some(u) = filter.strip_prefix("unit:") {
-                                e.ships.iter().any(|s| s == u)
-                            } else if let Some(p) = filter.strip_prefix("player:") {
-                                e.actor == p
-                            } else {
-                                true
-                            };
-                            if show {
-                                ui.label(&e.text);
-                            }
-                        }
-                    });
-                } else {
-                    let files = Self::session_log_files();
-                    if files.is_empty() {
-                        ui.label("no past sessions yet");
-                    }
-                    // Cap the list (harden): journals accumulate per Start.
-                    for f in files.iter().take(20) {
-                        let name = f
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("?")
-                            .to_string();
-                        if ui.small_button(&name).clicked() {
-                            self.log_events = Self::parse_replay(f);
-                            self.replay_pos = self.log_events.len();
-                            self.log_filter = "all".to_string();
-                            self.log_view_path = Some(f.clone());
-                        }
-                    }
-                    if files.len() > 20 {
-                        ui.weak(format!("…and {} older", files.len() - 20));
-                    }
-                }
-                ui.separator();
-                ui.heading("Time windows (WIB)");
-                ui.horizontal(|ui| {
-                    ui.label("real:");
-                    ui.text_edit_singleline(&mut self.time_real_start);
-                    ui.label("→");
-                    ui.text_edit_singleline(&mut self.time_real_end);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("game:");
-                    ui.text_edit_singleline(&mut self.time_game_start);
-                    ui.label("→");
-                    ui.text_edit_singleline(&mut self.time_game_end);
-                });
-                let windows = parse_windows(
-                    &self.time_real_start,
-                    &self.time_real_end,
-                    &self.time_game_start,
-                    &self.time_game_end,
-                );
-                let windows_ok = windows.is_some();
-                match windows {
-                    Some((rs, re, gs, ge)) => {
-                        let ratio = (ge - gs).num_seconds() as f64 / (re - rs).num_seconds() as f64;
-                        ui.label(format!("ratio {ratio:.1}x · stored {}", rs.format("%Y-%m-%d %H:%M UTC")));
-                    }
-                    None => {
-                        ui.label("Windows must be YYYY-MM-DD HH:MM with end after start.");
-                    }
-                }
-                ui.separator();
-                ui.heading("Players");
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.roster_input);
-                    if ui.small_button("add").clicked() {
-                        // Capped + trimmed (harden): duplicates refuse loudly.
-                        match clean_name(&self.roster_input) {
-                            Some(name) if !self.roster.contains(&name) => {
-                                self.roster.push(name);
-                                self.roster_input.clear();
-                            }
-                            Some(_) => {
-                                self.feed("roster refused: duplicate name".to_string());
-                            }
-                            None => {}
-                        }
-                    }
-                });
-                // Pre-collect: rows mutate seat maps while the roster
-                // borrow would still be live (E0502 pattern).
-                let roster: Vec<String> = self.roster.clone();
-                for name in &roster {
-                    ui.horizontal(|ui| {
-                        ui.label(name);
-                        if ui.small_button("remove").clicked() {
-                            self.roster.retain(|n| n != name);
-                            self.helm.retain(|_, v| v != name);
-                            self.unit_commander.retain(|_, v| v != name);
-                        }
-                    });
-                }
-                ui.separator();
-                ui.heading("Seats");
-                let mut units: Vec<(String, String)> = self
-                    .placed_fleet
-                    .iter()
-                    .map(|id| {
-                        let label = self.unit_label(id);
-                        (id.clone(), label)
-                    })
-                    .collect();
-                units.sort();
-                if units.is_empty() {
-                    ui.weak("No units placed yet — pick hulls in Fleet first.");
-                }
-                for (uid, label) in &units {
-                    ui.horizontal(|ui| {
-                        ui.label(label);
-                        let helm_cur = self.helm.get(uid).cloned();
-                        egui::ComboBox::from_id_salt(format!("helm-{uid}"))
-                            .selected_text(helm_cur.as_deref().unwrap_or("helm: —"))
-                            .show_ui(ui, |ui| {
-                                if ui.selectable_label(helm_cur.is_none(), "—").clicked() {
-                                    self.helm.remove(uid);
-                                }
-                                for name in &roster {
-                                    if ui
-                                        .selectable_label(helm_cur.as_deref() == Some(name.as_str()), name)
-                                        .clicked()
-                                    {
-                                        self.helm.insert(uid.clone(), name.clone());
-                                    }
-                                }
-                            });
-                        let cmdr_cur = self.unit_commander.get(uid).cloned();
-                        egui::ComboBox::from_id_salt(format!("cmdr-{uid}"))
-                            .selected_text(cmdr_cur.as_deref().unwrap_or("commander: —"))
-                            .show_ui(ui, |ui| {
-                                if ui.selectable_label(cmdr_cur.is_none(), "—").clicked() {
-                                    self.unit_commander.remove(uid);
-                                }
-                                for name in &roster {
-                                    if ui
-                                        .selectable_label(cmdr_cur.as_deref() == Some(name.as_str()), name)
-                                        .clicked()
-                                    {
-                                        self.unit_commander.insert(uid.clone(), name.clone());
-                                    }
-                                }
-                            });
-                    });
-                }
-                ui.separator();
-                ui.separator();
-                ui.heading("Invites");
-                ui.label("Codes bind players to seats. Local records rule; the mock mirrors when connected.");
-                for name in &roster {
-                    ui.horizontal(|ui| {
-                        let seats = self.seat_labels(name);
-                        ui.label(format!(
-                            "{} — {}",
-                            name,
-                            if seats.is_empty() { "no seat".to_string() } else { seats.join(", ") }
-                        ));
-                        if let Some(code) = self
-                            .invites
-                            .iter()
-                            .find(|i| i.user == *name && !i.redeemed)
-                            .map(|i| i.code.clone())
-                        {
-                            ui.label(format!("code: {code}"));
-                            if ui.small_button("redeem").clicked() {
-                                if let Some(inv) = self.invites.iter_mut().find(|i| i.code == code) {
-                                    inv.redeemed = true;
-                                }
-                                if let Some(base) = Self::backend_base() {
-                                    match InviteClient::new(&base).and_then(|c| c.redeem(&code)) {
-                                        Ok(_) => {
-                                            self.invite_status = format!("redeemed {code} (mock mirrored)");
-                                        }
-                                        Err(e) => {
-                                            self.invite_status = format!("redeemed {code} locally; mock: {e}");
-                                        }
-                                    }
-                                } else {
-                                    self.invite_status = format!("redeemed {code} locally");
-                                }
-                            }
-                        } else if ui.small_button("issue code").clicked() {
-                            let code = format!("TFG-{:04}", self.invite_seq);
-                            self.invite_seq += 1;
-                            let seat = seats.join(", ");
-                            self.invites.push(Invite {
-                                code: code.clone(),
-                                user: name.clone(),
-                                seat: seat.clone(),
-                                redeemed: false,
-                            });
-                            if let Some(base) = Self::backend_base() {
-                                match InviteClient::new(&base).and_then(|c| c.issue(name, &seat, &code)) {
-                                    Ok(rec) => {
-                                        self.invite_status = format!("issued {} (mock mirrored)", rec.code);
-                                    }
-                                    Err(e) => {
-                                        self.invite_status = format!("issued {code} locally; mock: {e}");
-                                    }
-                                }
-                            } else {
-                                self.invite_status = format!("issued {code} locally (no backend)");
-                            }
-                        }
-                    });
-                }
-                ui.horizontal(|ui| {
-                    if ui.small_button("sync to mock").clicked() {
-                        self.sync_invites();
-                    }
-                    if ui.small_button("refresh from mock").clicked() {
-                        self.refresh_invites();
-                    }
-                    status_line(ui, &self.invite_status.clone());
-                });
-                ui.separator();
-                // Warn-not-block go-live (grill #23): gaps are listed,
-                // only unparseable windows refuse to start. Unhelmed units
-                // stay playable: the organizer commands all.
-                let mut warnings = Vec::new();
-                if units.is_empty() {
-                    warnings.push("no units placed".to_string());
-                }
-                if roster.is_empty() {
-                    warnings.push("roster is empty".to_string());
-                }
-                for (uid, label) in &units {
-                    if !self.helm.contains_key(uid) {
-                        warnings.push(format!("{label}: no helm (organizer retains command)"));
-                    }
-                }
-                for w in &warnings {
-                    warn_line(ui, w.clone());
-                }
-                ui.horizontal(|ui| {
-                    if ui.small_button("open fleet picker").clicked() {
-                        self.show_fleet = true;
-                    }
-                    if ui.small_button("open groups").clicked() {
-                        self.show_groups = true;
-                    }
-                    ui.label(format!("placed: {} unit(s) · {} player(s)", units.len(), roster.len()));
-                });
-                if ui
-                    .add_enabled(windows_ok, egui::Button::new("start session (prototype)"))
-                    .clicked()
-                {
-                    self.start_session();
-                }
-            }
-            Phase::Live => {
-                if let Some((rs, re, gs, ge)) = &self.session_windows {
-                    ui.label(format!("real {rs} → {re}"));
-                    ui.label(format!("game {gs} → {ge} ({:.1}x)", self.session_ratio));
-                }
-                if ui.small_button("end session").clicked() {
-                    self.end_session();
-                }
-            }
-            Phase::Closed => {
-                ui.label(format!("log: {}", self.session_log_path.display()));
-                if ui.small_button("new setup").clicked() {
-                    self.mode.reset();
-                    self.close_working_islands();
-                    self.selection = None;
-                    self.placed_fleet.clear();
-                    self.placed_labels.clear();
-                    self.fleet_pick = None;
-                    self.helm.clear();
-                    self.unit_commander.clear();
-                    self.groups = Groups::default();
-                    self.group_seq = 1;
-                    self.satgas_members.clear();
-                    self.gugus_members.clear();
-                    self.group_error = None;
-                    self.invites.clear();
-                    self.invite_seq = 1;
-                    self.invite_status = "local records".to_string();
-                    eprintln!("back to setup");
-                }
-            }
-        }
-    }
 
     /// Zone + flag geometry for this frame (slice iii, grill #24): live
     /// hulls over member markers in the per-rank palette, single-unit
@@ -2769,881 +8007,979 @@ impl ShipApp {
         (zones, flags)
     }
 
-    /// Groups island: the organizer builds Satuan Tugas (units +
-    /// commander) and Gugus (groups + commander) from the roster. Editing
-    /// runs in Setup and Live (reorganization mid-session); Closed is read-only.
-    fn groups_island(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Groups");
-        ui.label("Satuan Tugas of units, Gugus of groups. Commanders from the roster.");
-        let editable =
-            (self.mode.phase == Phase::Setup || self.mode.phase == Phase::Live) && self.acting_as.is_none();
-        let roster: Vec<String> = self.roster.clone();
-        if editable {
-            ui.separator();
-            ui.heading("New Satgas");
-            ui.horizontal(|ui| {
-                ui.label("name:");
-                ui.text_edit_singleline(&mut self.satgas_name);
-            });
-            let cmdr = self.satgas_commander.clone();
-            ui.horizontal(|ui| {
-                ui.label("commander:");
-                egui::ComboBox::from_id_salt("satgas-commander")
-                    .selected_text(cmdr.as_deref().unwrap_or("—"))
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(cmdr.is_none(), "—").clicked() {
-                            self.satgas_commander = None;
-                        }
-                        for name in &roster {
-                            if ui.selectable_label(cmdr.as_deref() == Some(name.as_str()), name).clicked() {
-                                self.satgas_commander = Some(name.clone());
-                            }
-                        }
-                    });
-            });
-            let mut placed: Vec<(String, String)> = self
-                .placed_fleet
-                .iter()
-                .map(|id| {
-                    let label = self.unit_label(id);
-                    (id.clone(), label)
-                })
-                .collect();
-            placed.sort();
-            for (uid, label) in &placed {
-                let owner = self.groups.group_of_unit(uid).map(|g| g.name.clone());
-                let mut member = self.satgas_members.contains(uid);
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut member, "").changed() {
-                        if member {
-                            self.satgas_members.insert(uid.clone());
-                        } else {
-                            self.satgas_members.remove(uid);
-                        }
-                    }
-                    match owner {
-                        Some(o) => {
-                            ui.label(format!("{label} (in {o})"));
-                        }
-                        None => {
-                            ui.label(label);
-                        }
-                    }
-                });
-            }
-            if ui.small_button("create satgas").clicked() {
-                let id = format!("satgas-{}", self.group_seq);
-                let members: Vec<String> = self.satgas_members.iter().cloned().collect();
-                match self.groups.add_group(
-                    id.clone(),
-                    self.satgas_name.trim().to_string(),
-                    GroupKind::SatuanTugas,
-                    members,
-                    Vec::new(),
-                    cmdr,
-                ) {
-                    Ok(()) => {
-                        self.group_seq += 1;
-                        self.satgas_name.clear();
-                        self.satgas_commander = None;
-                        self.satgas_members.clear();
-                        self.group_error = None;
-                        eprintln!("created satgas {id}");
-                    }
-                    Err(e) => {
-                        self.group_error = Some(e.clone());
-                        self.feed(format!("satgas rejected: {e}"));
-                    }
-                }
-            }
-        }
-        let satgas: Vec<(String, String, Option<String>, usize)> = self
-            .groups
-            .group_list()
-            .iter()
-            .filter(|g| g.kind == GroupKind::SatuanTugas)
-            .map(|g| (g.id.clone(), g.name.clone(), g.commander.clone(), g.units.len()))
-            .collect();
-        for (id, name, commander, n) in &satgas {
-            ui.horizontal(|ui| {
-                let mark = if self.selection == Some(Selection::Group(id.clone())) { " ●" } else { "" };
-                ui.label(format!("{} — {} · {} unit(s){mark}", name, commander.as_deref().unwrap_or("no commander"), n));
-                if ui.small_button("select").clicked() {
-                    self.select_group(id.clone());
-                    self.show_orders = true;
-                }
-                if editable && ui.small_button("remove").clicked() {
-                    self.groups.remove_group(id);
-                }
-            });
-        }
-        if editable {
-            ui.separator();
-            ui.heading("New Gugus");
-            ui.horizontal(|ui| {
-                ui.label("name:");
-                ui.text_edit_singleline(&mut self.gugus_name);
-            });
-            let cmdr = self.gugus_commander.clone();
-            ui.horizontal(|ui| {
-                ui.label("commander:");
-                egui::ComboBox::from_id_salt("gugus-commander")
-                    .selected_text(cmdr.as_deref().unwrap_or("—"))
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(cmdr.is_none(), "—").clicked() {
-                            self.gugus_commander = None;
-                        }
-                        for name in &roster {
-                            if ui.selectable_label(cmdr.as_deref() == Some(name.as_str()), name).clicked() {
-                                self.gugus_commander = Some(name.clone());
-                            }
-                        }
-                    });
-            });
-            for (id, name, _, n) in &satgas {
-                let mut member = self.gugus_members.contains(id);
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut member, "").changed() {
-                        if member {
-                            self.gugus_members.insert(id.clone());
-                        } else {
-                            self.gugus_members.remove(id);
-                        }
-                    }
-                    ui.label(format!("{name} · {n} unit(s)"));
-                });
-            }
-            if ui.small_button("create gugus").clicked() {
-                let id = format!("gugus-{}", self.group_seq);
-                let members: Vec<String> = self.gugus_members.iter().cloned().collect();
-                match self.groups.add_group(
-                    id.clone(),
-                    self.gugus_name.trim().to_string(),
-                    GroupKind::Gugus,
-                    Vec::new(),
-                    members,
-                    cmdr,
-                ) {
-                    Ok(()) => {
-                        self.group_seq += 1;
-                        self.gugus_name.clear();
-                        self.gugus_commander = None;
-                        self.gugus_members.clear();
-                        self.group_error = None;
-                        eprintln!("created gugus {id}");
-                    }
-                    Err(e) => {
-                        self.group_error = Some(e.clone());
-                        self.feed(format!("gugus rejected: {e}"));
-                    }
-                }
-            }
-        }
-        let gugus: Vec<(String, String, Option<String>, usize)> = self
-            .groups
-            .group_list()
-            .iter()
-            .filter(|g| g.kind == GroupKind::Gugus)
-            .map(|g| (g.id.clone(), g.name.clone(), g.commander.clone(), self.groups.group_units(&g.id).len()))
-            .collect();
-        for (id, name, commander, n) in &gugus {
-            ui.horizontal(|ui| {
-                let mark = if self.selection == Some(Selection::Group(id.clone())) { " ●" } else { "" };
-                ui.label(format!("{} — {} · {} unit(s){mark}", name, commander.as_deref().unwrap_or("no commander"), n));
-                if ui.small_button("select").clicked() {
-                    self.select_group(id.clone());
-                    self.show_orders = true;
-                }
-                if editable && ui.small_button("remove").clicked() {
-                    self.groups.remove_group(id);
-                }
-            });
-        }
-        if self.groups.group_list().is_empty() {
-            ui.weak("No groups yet — name a Satgas, muster units, create.");
-        }
-        if let Some(e) = self.group_error.clone() {
-            warn_line(ui, e);
-        }
-    }
 
-    /// Fleet island (task #29): organizer hull picker. Filter the 125
-    /// seeds by category, class, and type/name/hull text, pick one hull,
-    /// then place it by hand with a map click. Nothing places itself.
-    fn fleet_island(&mut self, ui: &mut egui::Ui) {
-        const CAT_OPTS: [Option<Category>; 5] = [
-            None,
-            Some(Category::Ship),
-            Some(Category::Plane),
-            Some(Category::Tank),
-            Some(Category::Port),
-        ];
-        const CAT_LABELS: [&str; 5] = ["All", "Ship", "Plane", "Tank", "Port"];
-        ui.heading("Fleet picker");
-        ui.label("Organizer: filter, pick one hull, place it on the map by hand.");
-        // Drag gesture (dnd ticket): a press on a row is a candidate
-        // until it moves past the click threshold, then a live drag.
-        // Plain clicks never promote, so selection is unaffected.
-        if let Some(start) = self.drag_press.as_ref().map(|(_, _, s)| *s) {
-            let (down, dist) = ui.ctx().input(|i| {
-                (
-                    i.pointer.any_down(),
-                    i.pointer.hover_pos().map_or(0.0, |p| p.distance(start)),
-                )
-            });
-            if !down {
-                self.drag_press = None;
-            } else if dist > 6.0 {
-                if let Some((id, name, _)) = self.drag_press.take() {
-                    self.drag_unit = Some((id, name));
-                }
-            }
-        }
-        // Drag state: grabbing cursor plus the drop hint while a hull is
-        // mid-drag; release outside the map cancels.
-        if let Some((_, name)) = &self.drag_unit {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-            ui.label(format!("moving {name} — release over the map to place"));
-        }
-        // Source switch (cutover ticket): the synced register wins, the
-        // bundled assets seed. Minos categories don't map to the Category
-        // enum, so the category filter is asset-only; fleet_class holds a
-        // catalog class id for assets, a Minos class name for the register.
-        let register_n = self
-            .store
-            .as_ref()
-            .and_then(|c| tfg::store::units_count(c).ok())
-            .unwrap_or(0);
-        let from_register = register_n > 0;
-        ui.label(if from_register {
-            format!("source: synced register ({register_n} hulls)")
-        } else {
-            format!("source: bundled assets ({} hulls — sync to refresh)", self.fleet.len())
-        });
-        // Drill cutover (setup-overhaul prototype): synced taxonomy
-        // renders branch > category > type > class columns with the
-        // unit leaf below; unsynced stores keep the flat pickers.
-        let has_tax = self
-            .store
-            .as_ref()
-            .and_then(|c| tfg::store::has_taxonomy(c).ok())
-            .unwrap_or(false);
-        if has_tax {
-            let (rows, show_list) = self.drill_rows_ui(ui);
-            self.picker_tail(ui, &rows, show_list);
-            return;
-        }
-        // Collect options first: the combos mutate self while the
-        // catalog borrows would still be live (E0502 pattern).
-        let class_opts: Vec<(String, String)> = if from_register {
-            self.store
-                .as_ref()
-                .and_then(|c| tfg::store::unit_class_names(c).ok())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(_, name)| (name.clone(), name))
-                .collect()
-        } else {
-            self.catalog
-                .ship_classes()
-                .iter()
-                .map(|c| (c.id.clone(), c.name.clone()))
-                .collect()
-        };
-        ui.horizontal(|ui| {
-            if !from_register {
-                egui::ComboBox::from_label("category")
-                    .selected_text(CAT_LABELS[self.fleet_cat])
-                    .show_ui(ui, |ui| {
-                        for (i, label) in CAT_LABELS.iter().enumerate() {
-                            ui.selectable_value(&mut self.fleet_cat, i, *label);
-                        }
-                    });
-            }
-            let class_label = self
-                .fleet_class
-                .as_ref()
-                .and_then(|id| class_opts.iter().find(|(cid, _)| cid == id))
-                .map(|(_, name)| name.as_str())
-                .unwrap_or("All classes");
-            egui::ComboBox::from_label("class")
-                .selected_text(class_label)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.fleet_class, None, "All classes");
-                    for (id, name) in &class_opts {
-                        ui.selectable_value(&mut self.fleet_class, Some(id.clone()), name);
-                    }
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.label("type / name / hull:");
-            ui.text_edit_singleline(&mut self.fleet_query);
-            if ui.small_button("clear").clicked() {
-                self.fleet_query.clear();
-                self.fleet_class = None;
-                self.fleet_cat = 0;
-            }
-        });
-        let query = self.fleet_query.to_lowercase();
-        let rows: Vec<PickerRow> = if from_register {
-            let mut out = Vec::new();
-            if let Some(conn) = &self.store {
-                if let Ok(units) = tfg::store::fleet_units(conn) {
-                    for u in units {
-                        if let Some(ref want) = self.fleet_class {
-                            if &u.class_name != want {
-                                continue;
-                            }
-                        }
-                        if !query.is_empty()
-                            && !format!("{} {} {}", u.name, u.hull, u.class_name)
-                                .to_lowercase()
-                                .contains(&query)
-                        {
-                            continue;
-                        }
-                        let stat_class = self
-                            .catalog
-                            .find_class_by_name(&u.class_name)
-                            .map(|c| c.id.clone());
-                        out.push(PickerRow {
-                            id: u.id,
-                            name: u.name,
-                            hull: u.hull,
-                            class_name: u.class_name,
-                            stat_class,
-                            trail: String::new(),
-                        });
-                    }
-                }
-            }
-            out
-        } else {
-            self.fleet
-                .units()
-                .iter()
-                .filter(|u| {
-                    if CAT_OPTS[self.fleet_cat] != self.catalog.class(&u.class_id).map(|c| c.category) {
-                        return false;
-                    }
-                    if let Some(ref cid) = self.fleet_class {
-                        if &u.class_id != cid {
-                            return false;
-                        }
-                    }
-                    if !query.is_empty() {
-                        let class_name = self
-                            .catalog
-                            .class(&u.class_id)
-                            .map(|c| c.name.as_str())
-                            .unwrap_or("");
-                        let hay = format!(
-                            "{} {} {} {} {} {}",
-                            u.name, u.hull, u.role, class_name, u.satuan, u.pangkalan
-                        )
-                        .to_lowercase();
-                        if !hay.contains(&query) {
-                            return false;
-                        }
-                    }
-                    true
-                })
-                .map(|u| {
-                    let class_name = self
-                        .catalog
-                        .class(&u.class_id)
-                        .map(|c| c.name.clone())
-                        .unwrap_or_default();
-                    PickerRow {
-                        id: u.id.clone(),
-                        name: u.name.clone(),
-                        hull: u.hull.clone(),
-                        class_name,
-                        stat_class: Some(u.class_id.clone()),
-                        trail: String::new(),
-                    }
-                })
-                .collect()
-        };
-        self.picker_tail(ui, &rows, true);
-    }
 
-    /// Drill picker (setup-overhaul prototype): branch > category >
-    /// type > class columns from the sqlite mirror, whole-tree search
-    /// with breadcrumb jump, leaf units as shared picker rows plus a
-    /// fifth Units column. Returns the rows with whether the tail
-    /// renders its own list (search mode) or the column does.
-    fn drill_rows_ui(&mut self, ui: &mut egui::Ui) -> (Vec<PickerRow>, bool) {
-        ui.horizontal(|ui| {
-            ui.label("search all hulls:");
-            ui.text_edit_singleline(&mut self.fleet_query);
-            if ui.small_button("clear").clicked() {
-                self.fleet_query.clear();
-                self.drill_branch = None;
-                self.drill_category = None;
-                self.drill_type = None;
-                self.drill_class = None;
-            }
-        });
-        let query = self.fleet_query.to_lowercase();
-        // Whole-tree search (setup-overhaul grill): flat matches with
-        // breadcrumb trails, jumping past the columns.
-        if !query.is_empty() {
-            let mut out = Vec::new();
-            if let Some(conn) = self.store.as_ref() {
-                if let Ok(hits) = tfg::store::tax_search(conn, &query) {
-                    for h in hits {
-                        let stat_class = self
-                            .catalog
-                            .find_class_by_name(&h.class_name)
-                            .map(|c| c.id.clone());
-                        let trail = h.trail();
-                        out.push(PickerRow {
-                            id: h.id,
-                            name: h.name,
-                            hull: h.hull,
-                            class_name: h.class_name,
-                            stat_class,
-                            trail,
-                        });
-                    }
-                }
-            }
-            return (out, true);
-        }
-        // Selections first (Copy): option fetches borrow the store,
-        // the column UI mutates drill state — never both live (E0502).
-        let (b, c, t) = (self.drill_branch, self.drill_category, self.drill_type);
-        let (branches, categories, types, classes) = match self.store.as_ref() {
-            Some(conn) => (
-                tfg::store::tax_branches(conn).unwrap_or_default(),
-                b.map(|id| tfg::store::tax_categories(conn, id).unwrap_or_default())
-                    .unwrap_or_default(),
-                c.map(|id| tfg::store::tax_types(conn, id).unwrap_or_default())
-                    .unwrap_or_default(),
-                t.map(|id| tfg::store::tax_classes(conn, id).unwrap_or_default())
-                    .unwrap_or_default(),
-            ),
-            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-        };
-        // Miller columns (layout fix): branch | category | type |
-        // class stay visible side by side so the hierarchy reads left
-        // to right. A parent change clears the levels below it; the
-        // breadcrumb above is the jump-back affordance. Narrow islands
-        // scroll horizontally instead of squeezing the columns.
-        let crumb = |opts: &[tfg::store::TaxRow], id: Option<i64>| {
-            id.and_then(|w| opts.iter().find(|o| o.id == w))
-                .map(|o| o.id_name.clone())
-        };
-        let crumbs: Vec<(String, usize)> = [
-            crumb(&branches, self.drill_branch).map(|s| (s, 1)),
-            crumb(&categories, self.drill_category).map(|s| (s, 2)),
-            crumb(&types, self.drill_type).map(|s| (s, 3)),
-            crumb(&classes, self.drill_class).map(|s| (s, 4)),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        let mut keep_depth: Option<usize> = None;
-        ui.horizontal_wrapped(|ui| {
-            if ui.small_button("Fleet").clicked() {
-                keep_depth = Some(0);
-            }
-            for (label, depth) in &crumbs {
-                ui.label("/");
-                if ui.small_button(label).clicked() {
-                    keep_depth = Some(*depth);
-                }
-            }
-        });
-        if let Some(d) = keep_depth {
-            if d < 1 {
-                self.drill_branch = None;
-            }
-            if d < 2 {
-                self.drill_category = None;
-            }
-            if d < 3 {
-                self.drill_type = None;
-            }
-            if d < 4 {
-                self.drill_class = None;
-            }
-        }
-        if self.drill_branch != b {
-            self.drill_category = None;
-            self.drill_type = None;
-            self.drill_class = None;
-        }
-        if self.drill_category != c {
-            self.drill_type = None;
-            self.drill_class = None;
-        }
-        if self.drill_type != t {
-            self.drill_class = None;
-        }
-        // Leaf hulls first (dnd ticket): the fifth column renders them
-        // beside the taxonomy when a class is picked.
-        let mut out = Vec::new();
-        if let (Some(conn), Some(class_id)) = (self.store.as_ref(), self.drill_class) {
-            if let Ok(units) = tfg::store::tax_units(conn, class_id) {
-                for u in units {
-                    let stat_class = self
-                        .catalog
-                        .find_class_by_name(&u.class_name)
-                        .map(|cc| cc.id.clone());
-                    out.push(PickerRow {
-                        id: u.id,
-                        name: u.name,
-                        hull: u.hull,
-                        class_name: u.class_name,
-                        stat_class,
-                        trail: String::new(),
-                    });
-                }
-            }
-        }
-        egui::ScrollArea::horizontal()
-            .id_salt("drill-miller")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    // One column per hierarchy level. A column activates
-                    // once its parent is picked; deeper columns show the
-                    // prompt instead of stale options.
-                    let levels: [(&str, &[tfg::store::TaxRow], bool); 4] = [
-                        ("Branch", &branches, true),
-                        ("Category", &categories, self.drill_branch.is_some()),
-                        ("Type", &types, self.drill_category.is_some()),
-                        ("Class", &classes, self.drill_type.is_some()),
-                    ];
-                    for (depth, (title, opts, active)) in levels.iter().enumerate() {
-                        ui.vertical(|ui| {
-                            ui.set_min_width(MILLER_COL_WIDTH);
-                            ui.set_max_width(MILLER_COL_WIDTH);
-                            ui.strong(format!("{title} ({})", opts.len()));
-                            egui::ScrollArea::vertical()
-                                .id_salt(("drill", *title))
-                                .auto_shrink([false, false])
-                                .max_height(MILLER_COL_HEIGHT)
-                                .show(ui, |ui| {
-                                    ui.set_min_width(MILLER_COL_WIDTH - 16.0);
-                                    if !active {
-                                        ui.weak("Pick ← first");
-                                    } else if opts.is_empty() {
-                                        ui.weak("None yet");
-                                    } else {
-                                        for o in opts.iter() {
-                                            match depth {
-                                                0 => {
-                                                    ui.selectable_value(
-                                                        &mut self.drill_branch,
-                                                        Some(o.id),
-                                                        drill_label(o),
-                                                    );
-                                                }
-                                                1 => {
-                                                    ui.selectable_value(
-                                                        &mut self.drill_category,
-                                                        Some(o.id),
-                                                        drill_label(o),
-                                                    );
-                                                }
-                                                2 => {
-                                                    ui.selectable_value(
-                                                        &mut self.drill_type,
-                                                        Some(o.id),
-                                                        drill_label(o),
-                                                    );
-                                                }
-                                                _ => {
-                                                    ui.selectable_value(
-                                                        &mut self.drill_class,
-                                                        Some(o.id),
-                                                        drill_label(o),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-                        });
-                        ui.separator();
-                    }
-                    // Fifth column (dnd ticket): hulls of the picked class
-                    // sit beside the taxonomy instead of below it. Row tap
-                    // picks for click-placement; drag starts a map drop.
-                    if self.drill_class.is_some() {
-                        units_col(
-                            ui,
-                            &out,
-                            &self.placed_fleet,
-                            &mut self.fleet_pick,
-                            &mut self.drag_press,
-                            &mut self.drag_unit,
-                        );
-                    }
-                });
-            });
-        // Column mode (a class is picked): hulls live in the fifth
-        // column, so the tail skips its own list but keeps the count
-        // and the placement block.
-        let column_mode = self.drill_class.is_some();
-        if !column_mode {
-            ui.label("Select a class to list its hulls.");
-        }
-        (out, !column_mode)
-    }
 
-    /// Shared picker tail (setup-overhaul prototype): row list plus the
-    /// placement block, identical for flat and drill sources. Drill
-    /// column mode hides the list (the fifth column shows the hulls)
-    /// but keeps the count and placement.
-    fn picker_tail(&mut self, ui: &mut egui::Ui, rows: &[PickerRow], show_list: bool) {
-        ui.label(format!(
-            "{} shown · {} placed",
-            rows.len(),
-            self.placed_fleet.len()
-        ));
-        // Salted: the drill level lists above share the screen, and bare
-        // pairs take the same auto ID.
-        if show_list {
-            egui::ScrollArea::vertical().id_salt("picker-rows").max_height(200.0).show(ui, |ui| {
-                for u in rows {
-                    if self.placed_fleet.contains(&u.id) {
-                        ui.label(format!("✓ {} ({}) — placed", u.name, u.hull));
-                    } else {
-                        let resp = ui.selectable_value(
-                            &mut self.fleet_pick,
-                            Some(u.id.clone()),
-                            if u.trail.is_empty() {
-                                format!("{} ({}) · {}", u.name, u.hull, u.class_name)
-                            } else {
-                                format!(
-                                    "{} ({}) · {} — {}",
-                                    u.name, u.hull, u.class_name, u.trail
-                                )
-                            },
-                        );
-                        if resp.is_pointer_button_down_on()
-                            && self.drag_unit.is_none()
-                            && self.drag_press.is_none()
-                        {
-                            // Press origin, not drag_started: click-sense
-                            // rows never report drags (see struct docs).
-                            if let Some(start) = resp.interact_pointer_pos() {
-                                self.drag_press = Some((u.id.clone(), u.name.clone(), start));
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        let pick_placed = self.fleet_pick.as_ref().map_or(false, |id| self.placed_fleet.contains(id));
-        // The sim is not polled while disarmed, so a TakeControl sent
-        // with the engine off would sit in the queue invisibly. Gate
-        // arming placement on the engine, with a one-click arm here.
-        // Placement runs in Setup (initial fleet) and Live
-        // (reinforcements); Closed is read-only.
-        let armed = self.mode.armed.load(Ordering::SeqCst);
-        if self.mode.phase == Phase::Closed {
-            ui.label("Placement is unavailable once the session is closed.");
-        } else if !armed {
-            ui.label("Engine is presentation-only: placed hulls stay invisible until it runs.");
-            if ui.small_button("arm engine").clicked() {
-                self.mode.armed.store(true, Ordering::SeqCst);
-                eprintln!("sim armed");
-            }
-        } else if self.acting_as.is_some() {
-            ui.label("Placement is organizer-only.");
-        } else if pick_placed {
-            ui.label("Already placed — pick another hull.");
-        } else if let Some(pick) = self.fleet_pick.clone() {
-            // Resolve against the rendered rows (owned copy first: the
-            // arm below mutates self).
-            let seed = rows
-                .iter()
-                .find(|r| r.id == pick)
-                .map(|r| (r.name.clone(), r.class_name.clone(), r.stat_class.clone()));
-            match seed {
-                Some((name, _, Some(_))) => {
-                    let placing = self.mode.tool == SetupTool::Place;
-                    if ui
-                        .small_button(if placing {
-                            format!("click the map to place {name}…")
-                        } else {
-                            format!("place {name}")
-                        })
-                        .clicked()
-                    {
-                        self.mode.tool = if placing { SetupTool::Select } else { SetupTool::Place };
-                        self.placing = false;
-                    }
-                }
-                Some((name, class_name, None)) => {
-                    ui.label(format!(
-                        "No sim stats for {name} (class '{class_name}' not in catalog)."
-                    ));
-                    // Lazy spec fetch (spec-sync ticket): one hull's
-                    // figures become a runtime catalog class; unknown
-                    // speed refuses (null means unknown, not zero).
-                    let fetchable =
-                        pick.parse::<i64>().is_ok() && self.auth_token.is_some();
-                    if fetchable && ui.small_button("fetch sim stats").clicked() {
-                        let uid = pick.parse::<i64>().unwrap_or(0);
-                        let base = self.minos_base.clone();
-                        let tok = self.auth_token.clone().unwrap_or_default();
-                        let result = self.store.as_ref().map(|conn| {
-                            MinosMaster::new(&base).and_then(|m| m.sync_spec(&tok, conn, uid))
-                        });
-                        match result {
-                            Some(Ok(spec)) => match spec.speed_kn {
-                                Some(speed) => {
-                                    self.catalog.upsert_runtime_class(
-                                        spec.class_id,
-                                        spec.class_name.clone(),
-                                        speed,
-                                        spec.cruise_kn.unwrap_or(0.0),
-                                        spec.range_nm.unwrap_or(0.0),
-                                    );
-                                    self.feed(format!(
-                                        "stats v{} stored for {name}",
-                                        spec.version
-                                    ));
-                                }
-                                None => {
-                                    self.feed(format!(
-                                        "stats for {name} carry no surface speed — cannot drive"
-                                    ));
-                                }
-                            },
-                            Some(Err(e)) => {
-                                self.feed(format!("stats fetch failed: {e}"));
-                            }
-                            None => {
-                                self.feed("stats fetch failed: store unavailable".to_string());
-                            }
-                        }
-                    } else if !fetchable {
-                        ui.label("sign in to fetch from the register");
-                    }
-                }
-                None => {
-                    // Stale pick (source switched under it): drop it.
-                    ui.label("Pick a hull above to arm placement.");
-                    self.fleet_pick = None;
-                }
-            }
-        } else {
-            ui.label("Pick a hull above to arm placement.");
-        }
-    }
 
     /// Log island: current warning plus the capped sim event feed.
     /// Empty feed names the next action instead of showing a blank box.
+    /// #99: load the inbox page off-thread (harvested in the pump).
+    /// Page 20 at a time with server-bound prev/next; the mine filter
+    /// resets to page 1. Failures keep the last good page loudly.
+    fn refresh_inbox(&mut self) {
+        if self.setup_busy("inbox") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let Ok((master, tok)) = self.users_client() else {
+            self.users_status = "sign in first".to_string();
+            return;
+        };
+        let mine = self.inbox_mine_only;
+        let page = self.inbox_page_no.max(1);
+        self.setup_op = Some(spawn_rest("inbox", move || {
+            master
+                .inbox_page(&tok, gid, None, mine, page, 20)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::MsgPage)
+        }));
+    }
+
+    /// Open one message's detail off-thread, or delete one (sender
+    /// withdraws for all, recipient hides their own view — a merely
+    /// seen broadcast refuses loudly). The page reloads behind a
+    /// delete so counts stay the server's.
+    fn open_message(&mut self, mid: i64) {
+        if self.setup_busy("message") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let Ok((master, tok)) = self.users_client() else {
+            self.users_status = "sign in first".to_string();
+            return;
+        };
+        self.setup_op = Some(spawn_rest("message", move || {
+            master
+                .get_message(&tok, gid, mid)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::MsgOpen)
+        }));
+    }
+
+    /// Delete one message off-thread (see open_message for whose view
+    /// goes). The page reloads behind it.
+    fn delete_message(&mut self, mid: i64) {
+        if self.setup_busy("delete") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let Ok((master, tok)) = self.users_client() else {
+            self.users_status = "sign in first".to_string();
+            return;
+        };
+        self.setup_op = Some(spawn_rest("delete", move || {
+            master
+                .delete_message(&tok, gid, mid)
+                .map_err(|e| e.to_string())
+                .map(|m| SetupDone::MsgDeleted(m.id))
+        }));
+    }
+
+    /// #99: send the composed message off-thread. Degree is required
+    /// by contract ([7.7]); an empty audience sends a broadcast.
+    fn send_composed(&mut self) {
+        if self.setup_busy("send") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let Ok((master, tok)) = self.users_client() else {
+            self.users_status = "sign in first".to_string();
+            return;
+        };
+        if self.msg_content.trim().is_empty() {
+            self.users_status = "write the message first".to_string();
+            return;
+        }
+        let Some(degree) = self.msg_degree else {
+            self.users_status = "pick a degree (Derajat) — required".to_string();
+            return;
+        };
+        let mut to: Vec<i64> = self.msg_to.iter().cloned().collect();
+        to.sort();
+        let mut cc: Vec<i64> = self.msg_cc.iter().cloned().collect();
+        cc.sort();
+        let draft = tfg::backend::MsgDraft {
+            kind: self.msg_kind.clone(),
+            classification: self.msg_class.clone(),
+            content: self.msg_content.trim().to_string(),
+            to,
+            cc,
+            assumed_role: self.msg_assumed,
+            reply_to: self.msg_reply_to,
+            degree,
+            msg_type: None,
+            callsign: self.msg_callsign.trim().to_string(),
+            sending_note: self.msg_sending_note.trim().to_string(),
+            group_name: self.msg_group.trim().to_string(),
+            per: self.msg_per.trim().to_string(),
+            registration_number: self.msg_regnum.trim().to_string(),
+        };
+        self.setup_op = Some(spawn_rest("send", move || {
+            master
+                .send_message(&tok, gid, &draft)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::MsgSent)
+        }));
+    }
+
+    /// #99: refresh the send-as identities off-thread.
+    fn refresh_roles(&mut self) {
+        if self.setup_busy("roles") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let Ok((master, tok)) = self.users_client() else {
+            self.users_status = "sign in first".to_string();
+            return;
+        };
+        self.setup_op = Some(spawn_rest("roles", move || {
+            master
+                .scenario_roles(&tok, gid)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::Roles)
+        }));
+    }
+
+    /// #99: author a send-as identity, then reload the list in the
+    /// same worker so the picker shows it at once.
+    fn create_role(&mut self) {
+        if self.setup_busy("roles") {
+            return;
+        }
+        let name = self.new_role_name.trim().to_string();
+        if name.is_empty() {
+            self.users_status = "name the role first".to_string();
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let Ok((master, tok)) = self.users_client() else {
+            self.users_status = "sign in first".to_string();
+            return;
+        };
+        self.setup_op = Some(spawn_rest("roles", move || {
+            master.create_scenario_role(&tok, gid, &name).map_err(|e| e.to_string())?;
+            master
+                .scenario_roles(&tok, gid)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::Roles)
+        }));
+    }
+
+    /// #99: record the caller's read receipt off-thread. Broadcasts
+    /// carry none — the server refuses those loudly.
+    fn mark_message_read(&mut self, mid: i64) {
+        if self.setup_busy("mark-read") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let Ok((master, tok)) = self.users_client() else {
+            self.users_status = "sign in first".to_string();
+            return;
+        };
+        self.setup_op = Some(spawn_rest("read", move || {
+            master
+                .mark_read(&tok, gid, mid)
+                .map_err(|e| e.to_string())
+                .map(SetupDone::ReadDone)
+        }));
+    }
+
+    /// #99: the caller's unread badge for one inbox row — addressed to
+    /// me with no receipt. Never name-matched: roster identity is the
+    /// probed user id.
+    fn msg_is_unread(&self, m: &tfg::backend::InboxMsg) -> bool {
+        let Some(me) = self.auth_user_id else {
+            return false;
+        };
+        m.recipients.iter().any(|r| r.user_id == me && r.read_at.is_none())
+    }
+
+    /// Messages island (H11): socket-arrived game mail, newest first.
+    /// Sending, inbox reads, and receipts stay HTTP (later slice) —
+    /// this draws what the channels delivered.
+    fn messages_island(&mut self, ui: &mut egui::Ui) {
+        // #99: inbox first (readable, actionable), socket arrivals
+        // below (as-delivered), compose last.
+        ui.heading("Inbox");
+        ui.horizontal(|ui| {
+            if ui.small_button("refresh").clicked() {
+                self.inbox_page_no = 1;
+                self.refresh_inbox();
+            }
+            // The narrow resets to page 1 — a later page may not
+            // exist under it.
+            if ui.checkbox(&mut self.inbox_mine_only, "addressed to me").changed() {
+                self.inbox_page_no = 1;
+                self.refresh_inbox();
+            }
+            if ui
+                .add_enabled(self.inbox_has_prev, egui::Button::new("← prev"))
+                .clicked()
+            {
+                self.inbox_page_no = self.inbox_page_no.saturating_sub(1).max(1);
+                self.refresh_inbox();
+            }
+            if ui
+                .add_enabled(self.inbox_has_next, egui::Button::new("next →"))
+                .clicked()
+            {
+                self.inbox_page_no += 1;
+                self.refresh_inbox();
+            }
+            ui.weak(format!(
+                "page {} of {} · {} total",
+                self.inbox_page_no, self.inbox_pages, self.inbox_total
+            ));
+        });
+        status_line(ui, &self.users_status.clone());
+        // Open message detail: the single-get pane above the thread.
+        // No edit exists by contract, so none renders.
+        if let Some(open) = self.msg_open.clone() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.strong(format!("msg #{}", open.id));
+                ui.label(format!("from {}", open.sender));
+                if ui.small_button("close").clicked() {
+                    self.msg_open = None;
+                }
+            });
+            ui.label(format!("session {} · {}", open.game_id, open.created_at));
+            if !open.callsign.is_empty() {
+                ui.label(format!("callsign: {}", open.callsign));
+            }
+            ui.label(&open.content);
+            ui.separator();
+        }
+        if self.inbox.is_empty() {
+            ui.weak("Inbox empty — refresh to load the thread.");
+        } else {
+            let mut read_ids: Vec<i64> = Vec::new();
+            let mut reply_id: Option<i64> = None;
+            let mut open_id: Option<i64> = None;
+            let mut delete_id: Option<i64> = None;
+            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                for m in self.inbox.clone() {
+                    ui.horizontal(|ui| {
+                        ui.strong(&m.kind);
+                        ui.label(&m.class_label);
+                        ui.label(format!("from {}", m.sender));
+                        if m.broadcast {
+                            ui.label(egui::RichText::new("broadcast").weak());
+                        } else if self.msg_is_unread(&m) {
+                            ui.label(egui::RichText::new("UNREAD").strong());
+                        }
+                    });
+                    ui.label(format!("session {} · msg {} · {}", m.game_id, m.id, m.created_at));
+                    if !m.callsign.is_empty() {
+                        ui.label(format!("callsign: {}", m.callsign));
+                    }
+                    ui.label(&m.content);
+                    ui.horizontal(|ui| {
+                        if !m.broadcast && self.msg_is_unread(&m) && ui.small_button("mark read").clicked() {
+                            read_ids.push(m.id);
+                        }
+                        if ui.small_button("open").clicked() {
+                            open_id = Some(m.id);
+                        }
+                        if ui.small_button("reply").clicked() {
+                            reply_id = Some(m.id);
+                        }
+                        // Sender withdraws for all, recipient hides
+                        // their own view — the server decides which
+                        // and refuses the rest loudly.
+                        if ui.small_button("delete").clicked() {
+                            delete_id = Some(m.id);
+                        }
+                    });
+                    ui.separator();
+                }
+            });
+            for mid in read_ids {
+                self.mark_message_read(mid);
+            }
+            if let Some(mid) = open_id {
+                self.open_message(mid);
+            }
+            if let Some(mid) = delete_id {
+                self.delete_message(mid);
+            }
+            if let Some(mid) = reply_id {
+                self.msg_reply_to = Some(mid);
+                self.users_status = format!("replying to #{mid}");
+            }
+        }
+        ui.separator();
+        ui.heading("Live arrivals");
+        if self.game_messages.is_empty() {
+            ui.weak("No socket mail yet — broadcasts and addressed pushes land here.");
+        } else {
+            let mut live_reads: Vec<i64> = Vec::new();
+            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                for m in self.game_messages.iter().rev().cloned() {
+                    ui.horizontal(|ui| {
+                        ui.strong(&m.kind);
+                        ui.label(&m.class_label);
+                        ui.label(format!("from {}", m.sender));
+                        if m.broadcast {
+                            ui.label(egui::RichText::new("broadcast").weak());
+                        } else if m.event == "personal.message_sent"
+                            && ui.small_button("mark read").clicked()
+                        {
+                            live_reads.push(m.id);
+                        }
+                    });
+                    ui.label(format!("session {} · msg {} · {}", m.game_id, m.id, m.created_at));
+                    ui.label(&m.content);
+                    ui.separator();
+                }
+            });
+            for mid in live_reads {
+                self.mark_message_read(mid);
+            }
+        }
+        ui.separator();
+        self.compose_ui(ui);
+        status_line(ui, &self.users_status.clone());
+    }
+
+    /// #99: the send form — kind, marking, audience, grade, identity,
+    /// extra boxes, reply target. Sends off-thread; the inbox reloads
+    /// on success.
+    fn compose_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("New message");
+        if self.users_game.is_none() {
+            ui.weak("Hold a session first — mail belongs to the exercise.");
+            return;
+        }
+        if let Some(rid) = self.msg_reply_to {
+            ui.horizontal(|ui| {
+                ui.label(format!("replying to #{rid}"));
+                if ui.small_button("×").on_hover_text("drop reply target").clicked() {
+                    self.msg_reply_to = None;
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.label("kind:");
+            egui::ComboBox::from_id_salt("msg-kind")
+                .selected_text(&self.msg_kind)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.msg_kind, "telegram".to_string(), "telegram");
+                    ui.selectable_value(&mut self.msg_kind, "administrative".to_string(), "administrative");
+                });
+            ui.label("marking:");
+            egui::ComboBox::from_id_salt("msg-class")
+                .selected_text(&self.msg_class)
+                .show_ui(ui, |ui| {
+                    for c in ["TERBUKA", "TERBATAS", "RAHASIA"] {
+                        ui.selectable_value(&mut self.msg_class, c.to_string(), c);
+                    }
+                });
+        });
+        ui.label("content:");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.msg_content)
+                .desired_rows(3)
+                .hint_text("message text…"),
+        );
+        // Audience: roster seats toggle into to/cc. Nobody picked is a
+        // broadcast by contract — the form says so, not the server.
+        ui.horizontal(|ui| {
+            ui.weak("audience (none picked = broadcast):");
+        });
+        if self.users_roster.is_empty() {
+            ui.weak("no roster loaded — seat players first, or send broadcast.");
+        } else {
+            let mut toggles: Vec<(i64, bool)> = Vec::new();
+            egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
+                for p in self.users_roster.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} · {}", p.user_name, p.role_name));
+                        let to_on = self.msg_to.contains(&p.user_id);
+                        let cc_on = self.msg_cc.contains(&p.user_id);
+                        if ui.small_button(if to_on { "to ✓" } else { "to" }).clicked() {
+                            toggles.push((p.user_id, true));
+                        }
+                        if ui.small_button(if cc_on { "cc ✓" } else { "cc" }).clicked() {
+                            toggles.push((p.user_id, false));
+                        }
+                    });
+                }
+            });
+            for (uid, is_to) in toggles {
+                let set = if is_to { &mut self.msg_to } else { &mut self.msg_cc };
+                if !set.remove(&uid) {
+                    set.insert(uid);
+                }
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label("degree:");
+            let deg_name = self
+                .msg_degree
+                .and_then(|d| self.msg_degrees.iter().find(|(id, _, _, _)| *id == d))
+                .map(|(_, n, _, _)| n.clone())
+                .unwrap_or_else(|| "pick".to_string());
+            egui::ComboBox::from_id_salt("msg-degree")
+                .selected_text(deg_name)
+                .show_ui(ui, |ui| {
+                    for (id, name, _, _) in self.msg_degrees.clone() {
+                        ui.selectable_value(&mut self.msg_degree, Some(id), name);
+                    }
+                });
+            if self.msg_degrees.is_empty() {
+                ui.weak("(sync helpers for grades)");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("send as:");
+            let role_name = self
+                .msg_assumed
+                .and_then(|r| self.scenario_roles.iter().find(|s| s.id == r))
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| "self".to_string());
+            egui::ComboBox::from_id_salt("msg-role")
+                .selected_text(role_name)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.msg_assumed, None, "self");
+                    for s in self.scenario_roles.clone() {
+                        ui.selectable_value(&mut self.msg_assumed, Some(s.id), &s.name);
+                    }
+                });
+            if ui.small_button("roles ↻").clicked() {
+                self.refresh_roles();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("new role:");
+            ui.text_edit_singleline(&mut self.new_role_name);
+            if ui.small_button("create").clicked() {
+                self.create_role();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("callsign:");
+            ui.text_edit_singleline(&mut self.msg_callsign);
+        });
+        ui.horizontal(|ui| {
+            ui.label("note:");
+            ui.text_edit_singleline(&mut self.msg_sending_note);
+            ui.label("group:");
+            ui.text_edit_singleline(&mut self.msg_group);
+        });
+        ui.horizontal(|ui| {
+            ui.label("per:");
+            ui.text_edit_singleline(&mut self.msg_per);
+            ui.label("regnum:");
+            ui.text_edit_singleline(&mut self.msg_regnum);
+        });
+        if ui.button("send").clicked() {
+            self.send_composed();
+        }
+    }
+
     fn log_island(&mut self, ui: &mut egui::Ui) {
         if let Some(w) = self.order_warning.clone() {
             warn_line(ui, w);
         }
         if self.event_feed.is_empty() {
             ui.weak("No events yet — orders and arrivals land here.");
-            return;
+        } else {
+            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                for line in &self.event_feed {
+                    ui.monospace(line);
+                }
+            });
         }
-        egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-            for line in &self.event_feed {
-                ui.monospace(line);
+        ui.separator();
+        // Session history (moved out of the deleted Session island):
+        // past journals plus the replay slider that drives map ghosts.
+        ui.heading("Session logs");
+        if let Some(path) = self.log_view_path.clone() {
+            let (entries, units, players) = match &self.log_view {
+                Some(v) => (v.entries.clone(), v.units.clone(), v.players.clone()),
+                None => {
+                    ui.weak("Parsing journal — a moment…");
+                    (Vec::new(), Vec::new(), Vec::new())
+                }
+            };
+            ui.horizontal(|ui| {
+                if ui.small_button("← all logs").clicked() {
+                    self.log_view_path = None;
+                }
+                ui.label(
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("?"),
+                );
+            });
+            ui.label(format!(
+                "units: {} · players: {}",
+                if units.is_empty() { "—".to_string() } else { units.join(", ") },
+                if players.is_empty() { "—".to_string() } else { players.join(", ") },
+            ));
+            egui::ComboBox::from_label("show")
+                .selected_text(&self.log_filter)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.log_filter,
+                        "all".to_string(),
+                        "all events",
+                    );
+                    for u in &units {
+                        ui.selectable_value(
+                            &mut self.log_filter,
+                            format!("unit:{u}"),
+                            format!("unit {u}"),
+                        );
+                    }
+                    for p in &players {
+                        ui.selectable_value(
+                            &mut self.log_filter,
+                            format!("player:{p}"),
+                            format!("player {p}"),
+                        );
+                    }
+                });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.show_replay, "show on map");
+                let max = self.log_events.len();
+                if self.replay_pos > max {
+                    self.replay_pos = max;
+                }
+                ui.add(egui::Slider::new(&mut self.replay_pos, 0..=max).text("replay")).on_hover_text("journal replay position (ghosts, not live)");
+            });
+            if let Some(e) = self.log_events.get(self.replay_pos.saturating_sub(1)) {
+                ui.label(format!("replay @ {}", e.game_ts));
+            } else {
+                ui.label("replay @ start");
             }
+            let filter = self.log_filter.clone();
+            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                for e in entries.iter().rev().take(200) {
+                    let show = if filter == "all" {
+                        true
+                    } else if let Some(u) = filter.strip_prefix("unit:") {
+                        e.ships.iter().any(|s| s == u)
+                    } else if let Some(p) = filter.strip_prefix("player:") {
+                        e.actor == p
+                    } else {
+                        true
+                    };
+                    if show {
+                        ui.label(&e.text);
+                    }
+                }
+            });
+        } else {
+            // Directory scan runs once per open on the log worker —
+            // never per frame — with a manual refresh beside it.
+            if !self.log_files_loaded && self.refresh_log_files() {
+                self.log_files_loaded = true;
+            }
+            let files = self.log_files.clone();
+            ui.horizontal(|ui| {
+                if ui.small_button("refresh").clicked() {
+                    self.log_files_loaded = false;
+                }
+                if files.is_empty() {
+                    ui.weak("no past sessions yet");
+                }
+            });
+            // Cap the list (harden): journals accumulate per Start.
+            for f in files.iter().take(20) {
+                let name = f
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                if ui.small_button(&name).clicked() {
+                    self.load_log_view(f.clone());
+                }
+            }
+            if files.len() > 20 {
+                ui.weak(format!("…and {} older", files.len() - 20));
+            }
+        }
+    }
+
+
+    /// First-run screen (onboarding ticket, #77): a clean gradient
+    /// with one card — no toolbar, islands, or wizard — holding State
+    /// A (Login) then State B (Mode Selection). The map keeps loading
+    /// underneath so C/D open onto it already drawn.
+    fn onboard_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+            let rect = ui.max_rect();
+            paint_gradient(ui.painter(), rect, ONBOARD_TOP, ONBOARD_BOTTOM);
+            egui::Area::new(egui::Id::new("onboard"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style())
+                        // Roomier card (polish pass): the default menu
+                        // margin hugged the fields.
+                        .inner_margin(egui::Margin {
+                            left: 26,
+                            right: 26,
+                            top: 22,
+                            bottom: 24,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(400.0);
+                            match self.onboard {
+                                Onboard::Login => self.onboard_login(ui),
+                                Onboard::Mode => self.onboard_mode(ui),
+                                Onboard::App => {}
+                            }
+                        });
+                });
         });
     }
 
-    /// Wizard island (islands grill, #27): stepped Setup that dismisses
-    /// on Live. Points at the working islands; never duplicates them.
-    fn wizard_island(&mut self, ui: &mut egui::Ui) {
-        // Layout fix: claim the island width so the window never
-        // collapses to the longest label and border drags resize content,
-        // not just the background.
-        ui.set_min_width(WIZARD_MIN_WIDTH);
-        ui.heading("Command center setup");
-        ui.label("Four steps to a live game. Skip any time; the islands stay.");
-        match self.wizard_step {
-            0 => {
-                ui.label("Welcome: command simulated ships on a live map. Setup places your fleet, Live plays it.");
-                ui.horizontal(|ui| {
-                    if ui.button("Begin setup →").clicked() {
-                        self.wizard_step = 1;
-                        self.show_session = true;
-                    }
-                    if ui.button("Skip tour").clicked() {
-                        self.wizard_done = true;
-                    }
-                });
-            }
-            1 => {
-                ui.label("Session: pick a mode, then start. Defaults play 7 hours as 7 days.");
-                // Mode switch lives here too (setup-overhaul pass): the
-                // switch is the arm — Simulation arms, Presentation
-                // disarms — so the wizard never needs an engine toggle.
-                ui.horizontal(|ui| {
-                    let mut mode = self.app_mode;
-                    ui.selectable_value(&mut mode, AppMode::Presentation, "Presentation");
-                    ui.selectable_value(&mut mode, AppMode::Simulation, "Simulation");
-                    if mode != self.app_mode {
-                        self.set_app_mode(mode);
-                    }
-                });
-                if self.mode.phase == Phase::Setup && ui.button("Start session").clicked() {
-                    self.start_session();
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("← Back").clicked() {
-                        self.wizard_step = 0;
-                    }
-                    if ui.button("Next →").clicked() {
-                        self.wizard_step = 2;
-                        self.show_session = true;
-                        self.show_roster = true;
-                        self.show_fleet = true;
-                        self.show_groups = true;
-                    }
-                });
-            }
-            2 => {
-                ui.label("Fleet: pick a hull in the Fleet island, then click the map to place it.");
-                ui.label(format!("placed: {} unit(s)", self.placed_fleet.len()));
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("← Back").clicked() {
-                        self.wizard_step = 1;
-                    }
-                    if ui.button("Next →").clicked() {
-                        self.wizard_step = 3;
-                        self.show_roster = true;
-                    }
-                });
-            }
-            _ => {
-                let placed = self.placed_fleet.len();
-                ui.label(format!(
-                    "Review: {placed} placed, {} owned, {} players.",
-                    self.controlled.len(),
-                    self.roster.len()
-                ));
-                ui.label("Gaps are fine: unowned units sail as traffic.");
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("← Back").clicked() {
-                        self.wizard_step = 2;
-                    }
-                    if self.mode.phase == Phase::Setup && ui.button("Go live").clicked() {
-                        self.start_session();
-                    }
-                    if ui.button("Finish").clicked() {
-                        self.wizard_done = true;
-                    }
-                });
+    /// State A (ticket #77): sign-in on the clean card. The
+    /// must-change-password gate blocks here too; a signed-in pair
+    /// advances to Mode Selection, and the backend-optional path
+    /// (PRODUCT: air-gapped) walks past without one.
+    fn onboard_login(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new("ARCONS")
+                .size(28.0)
+                .strong()
+                .color(ONBOARD_ACCENT),
+        );
+        ui.label(egui::RichText::new("Command Center").size(14.0).weak());
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+        if self.auth_user.is_some() && self.auth_needs_password_change {
+            ui.heading("Change password");
+            ui.label("The backend shuts every door until this is done.");
+            self.change_password_ui(ui);
+        } else if self.auth_user.is_none() {
+            ui.heading("Sign in");
+            // One height for fields and button (AUTH_FIELD_H), text
+            // middle-aligned — the singleline default read as a
+            // hairline slot on this card.
+            let id = ui.add_sized(
+                [ui.available_width(), AUTH_FIELD_H],
+                egui::TextEdit::singleline(&mut self.login_identifier)
+                    .hint_text("identifier")
+                    .min_size(egui::vec2(0.0, AUTH_FIELD_H))
+                    .vertical_align(egui::Align::Center),
+            );
+            let pw = ui.add_sized(
+                [ui.available_width(), AUTH_FIELD_H],
+                egui::TextEdit::singleline(&mut self.login_password)
+                    .password(true)
+                    .hint_text("password")
+                    .min_size(egui::vec2(0.0, AUTH_FIELD_H))
+                    .vertical_align(egui::Align::Center),
+            );
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let submitted = ui
+                .add_sized(
+                    [ui.available_width(), AUTH_FIELD_H],
+                    egui::Button::new(
+                        egui::RichText::new("Sign in").strong().color(ONBOARD_INK),
+                    )
+                    .fill(ONBOARD_ACCENT),
+                )
+                .clicked();
+            if submitted || (enter && (id.has_focus() || pw.has_focus())) {
+                self.attempt_sign_in();
             }
         }
+        // No always-on "signed out" readout on this card (polish pass);
+        // a real refusal still reports.
+        let status = self.auth_status.clone();
+        if status != "signed out" && !status.starts_with("signed in") {
+            status_line(ui, &status);
+        }
+        // Signed in this frame (or the password gate just lifted):
+        // advance to Mode Selection.
+        if self.auth_user.is_some() && !self.auth_needs_password_change {
+            self.onboard = Onboard::Mode;
+        }
+    }
+
+    /// State B (ticket #77): Presentation (→ State C) or Simulation
+    /// (→ State D / Planning), same clean card.
+    fn onboard_mode(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new("ARCONS")
+                .size(28.0)
+                .strong()
+                .color(ONBOARD_ACCENT),
+        );
+        ui.heading("Choose a mode");
+        ui.label(
+            "Presentation watches the live feed. Simulation plans and runs an exercise.",
+        );
+        ui.add_space(12.0);
+        let w = ui.available_width();
+        if ui
+            .add_sized(
+                [w, 64.0],
+                egui::Button::new(mode_card_text(
+                    "📡 Presentation",
+                    "Live backend feed on the map",
+                )),
+            )
+            .clicked()
+        {
+            self.enter_shell(AppMode::Presentation);
+        }
+        if ui
+            .add_sized(
+                [w, 64.0],
+                egui::Button::new(mode_card_text(
+                    "🎮 Simulation",
+                    "Perencanaan → Persiapan → Eksekusi → Evaluasi",
+                )),
+            )
+            .clicked()
+        {
+            self.enter_shell(AppMode::Simulation);
+        }
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new("Either way, the map loads under this screen. Switch any time from the toolbar.")
+                .weak()
+                .size(11.0),
+        );
+    }
+
+    /// Phase bar (State D, ticket #77): the four simulation phases
+    /// with their advance verb, floating over the loaded map. Planning
+    /// carries the picks (Simulation Mode, Scenario) and points at the
+    /// setup islands underneath; each verb drives the existing state
+    /// machine — nothing here writes the phase directly.
+    fn sim_phase_bar(&mut self, ui: &mut egui::Ui) {
+        let stage = self.sim_stage();
+        egui::Window::new("simulation phases")
+            .title_bar(false)
+            .collapsible(false)
+            .movable(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, PHASE_BAR_TOP))
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    let steps = [
+                        (SimStage::Planning, "1 Perencanaan"),
+                        (SimStage::Ready, "2 Persiapan"),
+                        (SimStage::Live, "3 Eksekusi"),
+                        (SimStage::Eval, "4 Evaluasi"),
+                    ];
+                    for (i, (s, label)) in steps.iter().enumerate() {
+                        if i > 0 {
+                            ui.label(egui::RichText::new("→").weak());
+                        }
+                        ui.label(if *s == stage {
+                            egui::RichText::new(*label)
+                                .strong()
+                                .color(ONBOARD_ACCENT)
+                        } else {
+                            egui::RichText::new(*label).weak()
+                        });
+                    }
+                });
+                ui.separator();
+                match stage {
+                    SimStage::Planning => {
+                        // Slim status only: the Exercise setup panel on the
+                        // left owns every verb (game → players → fleet).
+                        let game = self
+                            .users_game
+                            .clone()
+                            .map(|(_, n)| n)
+                            .unwrap_or_else(|| "no game selected".to_string());
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "Perencanaan — session: {game} · Minos: {}",
+                                self.users_game_state.as_deref().unwrap_or("?"),
+                            ));
+                            ui.label(
+                                egui::RichText::new("steps 1–4 in the setup panel")
+                                    .weak(),
+                            );
+                        });
+                        if let Some(note) = self.phase_note.clone() {
+                            warn_line(ui, note);
+                        }
+                    }
+                    SimStage::Ready => {
+                        // Backend readiness, not local windows: the gate
+                        // counts exercise-side seats, their Ready flags,
+                        // and assigned pieces. Advance is the transition
+                        // plus the local engine start, refused loudly.
+                        // H1: no local way back — Minos is forward-only,
+                        // so preparation never re-renders as Planning.
+                        // The resync re-reads the detail (another client
+                        // may have moved the game meanwhile).
+                        let (side, ready) = self.setup_gate_counts();
+                        ui.label(format!(
+                            "Persiapan — {side} exercise-side · {ready} ready · {} pieces · {} placed · {} to go · Minos: {}",
+                            self.users_gunits.len(),
+                            self.users_placements.len(),
+                            self.placement_unplaced,
+                            self.users_game_state.as_deref().unwrap_or("?"),
+                        ));
+                        // The room key is minted on entry to
+                        // preparation — which is exactly why it reads
+                        // here: the Setup panel is planning-only, so
+                        // the phase bar is the sole surface on screen
+                        // at the moment the key exists, and the Game
+                        // Master is standing right here to share it
+                        // with the personnel declaring readiness
+                        // below.
+                        match self.minos_room_key.clone() {
+                            Some(key) => {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("room key:").strong());
+                                    ui.label(egui::RichText::new(&key).monospace().strong());
+                                    if ui.small_button("copy").on_hover_text("copy the room key").clicked() {
+                                        ui.ctx().copy_text(key.clone());
+                                        self.users_status = "room key copied".to_string();
+                                    }
+                                });
+                                ui.weak("share this with your personnel — they enter it in setup step 1 to join the room.");
+                            }
+                            None => {
+                                ui.weak("no room key on the held session — ask its Game Master.");
+                            }
+                        }
+                        // C2: the caller declares here too, so one client
+                        // alone can walk the gate: place, declare, advance.
+                        self.readiness_ui(ui);
+                        if let Some(note) = self.phase_note.clone() {
+                            warn_line(ui, note);
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("↻ resync").clicked() {
+                                self.users_refresh_games();
+                                self.users_refresh_game();
+                            }
+                            if ui.button("Mulai eksekusi →").clicked() {
+                                self.setup_advance_execution();
+                            }
+                        });
+                    }
+                    SimStage::Live => {
+                        // #98: plot health rides the bar — last success
+                        // age, or the failure streak backing the cadence.
+                        let plot_health = match (self.last_plot_ok, self.plot_fails) {
+                            (_, f) if f > 0 => format!("plot failed ×{f}"),
+                            (Some(t), _) => {
+                                format!("plot {}s ago", t.elapsed().as_secs())
+                            }
+                            _ => "plot never".to_string(),
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "Eksekusi — session {} · {} · Minos: {} · {plot_health}",
+                                self.game_ts.as_deref().unwrap_or("—"),
+                                if self.game_paused { "PAUSED" } else { "running" },
+                                self.users_game_state.as_deref().unwrap_or("?"),
+                            ));
+                            // C3: pull the authoritative plot on demand.
+                            // Continuous polling is a later slice: no
+                            // position channel is published yet.
+                            if ui.button("plot").clicked() {
+                                self.pull_minos_positions();
+                            }
+                            if ui.button("End session →").clicked() {
+                                self.close_game();
+                            }
+                        });
+                        // H2-H3: the scenario clock, Minos-owned. Writes
+                        // are reads — pause/resume/factor answer the
+                        // clock, because no clock GET exists.
+                        ui.horizontal(|ui| {
+                            // Learned denial gates the controls with
+                            // its reason — never role names, since
+                            // judges may hold the grant and Game
+                            // Masters may lack it.
+                            if self.clock_denied {
+                                ui.weak("clock control needs the control grant in this session — ask the Game Master");
+                            } else {
+                                match self.minos_clock.clone() {
+                                    Some(c) => {
+                                        ui.label(format!(
+                                            "scenario {} · {} · {} · {}x",
+                                            c.assumed_now.as_deref().unwrap_or("—"),
+                                            if c.running { "running" } else { "held" },
+                                            if c.accepting_actions {
+                                                "accepting"
+                                            } else {
+                                                "orders closed"
+                                            },
+                                            c.time_factor,
+                                        ));
+                                        let verb = if c.running { "pause" } else { "resume" };
+                                        if ui.button(verb).clicked() {
+                                            self.pause_or_resume_minos();
+                                        }
+                                    }
+                                    None => {
+                                        ui.label("scenario clock: unread");
+                                        if ui.button("pause").clicked() {
+                                            self.pause_or_resume_minos();
+                                        }
+                                    }
+                                }
+                                ui.label("factor:");
+                                // No backend upper bound by contract; the box
+                                // caps at a day-in-ten-minutes for sanity.
+                                ui.add(
+                                    egui::DragValue::new(&mut self.factor_draft)
+                                        .speed(0.5)
+                                        .range(0.1..=144.0)
+                                        .suffix("x"),
+                                ).on_hover_text("scenario rate through Minos");
+                                if ui.small_button("set").clicked() {
+                                    let f = self.factor_draft;
+                                    self.set_minos_factor(f);
+                                }
+                            }
+                        });
+                    }
+                    SimStage::Eval => {
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "Evaluasi — assessment ready · Minos: {} · transcript {} line(s).",
+                                self.users_game_state.as_deref().unwrap_or("?"),
+                                self.transcript.len()
+                            ));
+                            // The workspace panel beside the map owns
+                            // the actions; the bar only jumps to them.
+                            if ui.button("Open debrief →").clicked() {
+                                self.assessment_tab = 4;
+                            }
+                        });
+                    }
+                }
+            });
     }
 }
 
@@ -3666,6 +9002,17 @@ impl eframe::App for ShipApp {
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_map(ui.ctx());
+        // M7: harvest off-thread REST before rendering, so statuses
+        // and lists are a frame fresh at most.
+        self.pump_rest_ops();
+        // Text scale (field ticket): OS base captured once, pref
+        // multiplied on top — idempotent per frame, never compounding.
+        if self.base_ppp.is_none() {
+            self.base_ppp = Some(ui.ctx().pixels_per_point());
+        }
+        if let Some(base) = self.base_ppp {
+            ui.ctx().set_pixels_per_point(base * self.text_scale);
+        }
         // Flush a trailing seamless-zoom step (task #43): the last tick
         // inside the throttle window still gets its frame.
         if self.zoom_dirty && self.last_zoom_req.elapsed() >= Duration::from_millis(250) {
@@ -3673,7 +9020,8 @@ impl eframe::App for ShipApp {
             self.last_zoom_req = Instant::now();
             self.refresh_map();
         }
-        let markers = self.markers();
+        let markers = self.markers(ui.ctx().pixels_per_point());
+        self.load_marker_textures(ui.ctx(), &markers);
         // Proactive refresh (auth resolution): at 80% of TTL, on our
         // terms so the map never blanks on a timer. See refresh_now
         // (shared with the socket 109 path).
@@ -3689,40 +9037,63 @@ impl eframe::App for ShipApp {
         let (zones, flags) = self.group_geometry(&markers);
         ui.ctx().request_repaint_after(Duration::from_millis(100));
 
-        // Space toggles pause: a full hold (ADR-0004). The sim enforces it
-        // tick-wise; the UI just forwards the verb.
-        if ui.ctx().input(|i| i.key_pressed(egui::Key::Space)) {
-            if let Some(tx) = &self.sim_cmd_tx {
-                let paused = !self.game_paused;
-                let _ = tx.send(SimCommand::SetPaused { paused });
-                eprintln!("{}", if paused { "pause" } else { "resume" });
-            }
+        // Onboarding (ticket #77): States A/B — login and mode
+        // selection on a clean gradient — draw no toolbar, islands,
+        // or map. The shell (C presentation / D simulation) takes
+        // over the frame the moment mode selection hands off.
+        if self.onboard != Onboard::App {
+            self.onboard_ui(ui);
+            return;
         }
-        // Number keys switch desktop tabs (grill #25); the camera stays.
-        let num_keys = [
-            egui::Key::Num1,
-            egui::Key::Num2,
-            egui::Key::Num3,
-            egui::Key::Num4,
-            egui::Key::Num5,
-            egui::Key::Num6,
-            egui::Key::Num7,
-            egui::Key::Num8,
-            egui::Key::Num9,
-        ];
-        for (i, key) in num_keys.iter().enumerate() {
-            if ui.ctx().input(|inp| inp.key_pressed(*key)) {
-                let tabs = self.desktop_tabs();
-                if let Some((id, _, _)) = tabs.get(i) {
-                    let id = id.clone();
-                    self.switch_desktop(id);
+
+        // Focus contract (blocking ticket): global keys never fire
+        // while a text field owns the keyboard — typing a space must
+        // not pause the exercise, nor a digit switch desktops.
+        if !ui.ctx().egui_wants_keyboard_input() {
+            // Space toggles pause: a full hold (ADR-0004). The sim enforces it
+            // tick-wise; the UI just forwards the verb. H2: a connected
+            // execution pauses through Minos instead — the scenario hold
+            // follows back onto the local display via apply_clock.
+            if ui.ctx().input(|i| i.key_pressed(egui::Key::Space)) {
+                if self.users_game_state.as_deref() == Some("execution")
+                    && self.users_game.is_some()
+                {
+                    self.pause_or_resume_minos();
+                } else if let Some(tx) = &self.sim_cmd_tx {
+                    let paused = !self.game_paused;
+                    let _ = tx.send(SimCommand::SetPaused { paused });
+                    eprintln!("{}", if paused { "pause" } else { "resume" });
                 }
-                break;
             }
+            // Number keys switch desktop tabs (grill #25); the camera stays.
+            let num_keys = [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+                egui::Key::Num6,
+                egui::Key::Num7,
+                egui::Key::Num8,
+                egui::Key::Num9,
+            ];
+            for (i, key) in num_keys.iter().enumerate() {
+                if ui.ctx().input(|inp| inp.key_pressed(*key)) {
+                    let tabs = self.desktop_tabs();
+                    if let Some((id, _, _)) = tabs.get(i) {
+                        let id = id.clone();
+                        self.switch_desktop(id);
+                    }
+                    break;
+                }
+            }
+            self.keyboard_map_path(ui.ctx());
         }
 
         // Toolbar (islands grill, #27): island toggles + the clock block.
         // The dock is dead; every flow below is a floating island.
+        // Keys: Space pause · 1-9 desktops · [ ] ships · G groups ·
+        // F follow · W waypoint-at-center · O orders · R roster · Esc drop.
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Top-level mode (task #39): session lives in
@@ -3734,7 +9105,6 @@ impl eframe::App for ShipApp {
                     self.set_app_mode(mode);
                 }
                 ui.separator();
-                ui.toggle_value(&mut self.show_connection, "Connection");
                 // Auth is cross-mode: the token feeds both Presentation
                 // watching and Simulation play.
                 ui.toggle_value(&mut self.show_login, "Login");
@@ -3742,75 +9112,35 @@ impl eframe::App for ShipApp {
                     // No Inspector toggle: selection drives it (a marker or
                     // roster click opens it, deselect closes it).
                     ui.toggle_value(&mut self.show_log, "Log");
+                    ui.toggle_value(&mut self.show_messages, "Messages");
                 }
-                if self.app_mode == AppMode::Simulation {
-                    ui.toggle_value(&mut self.show_session, "Session");
-                    // Fleet spans Setup (initial placement) and Live
-                    // (reinforcements); Groups likewise (setup + mid-session
-                    // reorganization). The rest unlock once live (task #40).
-                    ui.toggle_value(&mut self.show_fleet, "Fleet");
-                    ui.toggle_value(&mut self.show_groups, "Groups");
-                    ui.toggle_value(&mut self.show_users, "Users");
-                    // Working islands unlock once a session exists (task
-                    // #40): pre-session the lobby is Session + Fleet + Groups + Connection.
-                    if self.session_live() {
-                        ui.toggle_value(&mut self.show_roster, "Roster");
-                        ui.toggle_value(&mut self.show_orders, "Orders");
-                        ui.toggle_value(&mut self.show_log, "Log");
-                    }
-                }
+                // Simulation has no island toggles: the Exercise setup
+                // panel owns Planning, execution auto-shows its windows.
                 ui.separator();
-                if ui.small_button("−").clicked() {
+                if ui.small_button("−").on_hover_text("zoom out").clicked() {
                     self.zoom_by(-1.0);
                 }
-                ui.label(format!("z{:.0}", self.zoom));
-                if ui.small_button("+").clicked() {
+                ui.label(format!("z{:.0}", self.zoom)).on_hover_text("zoom level");
+                if ui.small_button("+").on_hover_text("zoom in").clicked() {
                     self.zoom_by(1.0);
                 }
-            });
-            // Identity + desktops (slice iv, grill #25): simulation-only
-            // (task #39) — there is nobody to act as in Presentation.
-            if self.app_mode == AppMode::Simulation {
-            ui.horizontal(|ui| {
-                let roster: Vec<String> = self.roster.clone();
-                let mut act_idx = match &self.acting_as {
-                    None => 0,
-                    Some(u) => roster.iter().position(|n| n == u).map(|i| i + 1).unwrap_or(0),
-                };
-                egui::ComboBox::from_label("act")
-                    .selected_text(self.acting_as.as_deref().unwrap_or("Organizer"))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut act_idx, 0, "Organizer");
-                        for (i, name) in roster.iter().enumerate() {
-                            ui.selectable_value(&mut act_idx, i + 1, name);
+                ui.menu_button("Aa", |ui| {
+                    for (label, scale) in
+                        [("Smaller", 0.875), ("Default", 1.0), ("Larger", 1.15)]
+                    {
+                        if ui
+                            .selectable_label(
+                                (self.text_scale - scale).abs() < 0.001,
+                                label,
+                            )
+                            .on_hover_text("text size for this session")
+                            .clicked()
+                        {
+                            self.text_scale = scale;
                         }
-                    });
-                let new_acting =
-                    if act_idx == 0 { None } else { roster.get(act_idx - 1).cloned() };
-                if new_acting != self.acting_as {
-                    self.save_draft();
-                    self.acting_as = new_acting;
-                    let def = self.default_desktop();
-                    self.load_draft(&def);
-                    self.desktop = def;
-                    if self.is_observer() {
-                        self.show_orders = false;
                     }
-                    eprintln!("acting as {}", self.acting_as.as_deref().unwrap_or("organizer"));
-                }
-                ui.separator();
-                let tabs = self.desktop_tabs();
-                for (i, (id, label, n)) in tabs.iter().enumerate() {
-                    let mut tab = format!("{label} ({n})");
-                    if i < 9 {
-                        tab = format!("[{}] {tab}", i + 1);
-                    }
-                    if ui.selectable_label(&self.desktop == id, tab).clicked() {
-                        self.switch_desktop(id.clone());
-                    }
-                }
+                });
             });
-            }
             // Clock block: real + derived game time, humane format
             // (grill #17, ADR-0004). Both readings come from the sim.
             ui.horizontal(|ui| {
@@ -3826,60 +9156,102 @@ impl eframe::App for ShipApp {
             ui.horizontal(|ui| {
                 let elapsed = self.game_elapsed_secs.unwrap_or(0);
                 let g = self.game_ts.as_deref().unwrap_or("—");
+                // Source on the face: a connected execution shows the
+                // Minos projection (epoch + pace from answers), anything
+                // else is an explicitly local sandbox clock.
+                let source = if self.users_game_state.as_deref() == Some("execution")
+                    && self.users_game.is_some()
+                {
+                    "Minos"
+                } else {
+                    "local"
+                };
                 ui.label(format!(
-                    "GAME {g} · G+{:02}:{:02} ({:.0}×)",
+                    "GAME {g} · G+{:02}:{:02} ({source} {:.0}×)",
                     elapsed / 60,
                     elapsed % 60,
                     self.game_ratio
                 ));
             });
+            // Context strip: the operating model on one line, every
+            // island, every frame. Weak ink — status lines above it
+            // still carry the loud news.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(self.context_strip()).weak().small());
+            });
         });
-        // Wizard: stepped Setup, dismissed on Live or skip.
-        if self.mode.phase == Phase::Setup && !self.wizard_done {
-            let mut wiz_open = true;
-            egui::Window::new("Command center setup")
-                .default_pos(egui::pos2(330.0, 140.0))
-                .default_size([WIZARD_MIN_WIDTH + 40.0, 300.0])
-                .min_width(WIZARD_MIN_WIDTH)
-                .min_height(220.0)
-                .resizable(true)
-                .movable(true)
+        // State C (onboarding ticket, #77): Presentation's first
+        // action is one prominent connect card over the loaded map —
+        // it hides once live is up or the operator dismisses it.
+        if self.app_mode == AppMode::Presentation
+            && self.connect_card
+            && self.live_cmd_tx.is_none()
+        {
+            egui::Window::new("presentation")
+                .title_bar(false)
                 .collapsible(false)
-                .open(&mut wiz_open)
+                .movable(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 40.0))
                 .show(ui.ctx(), |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .max_height(ISLAND_SCROLL_MAX)
-                        .show(ui, |ui| {
-                            self.wizard_island(ui);
-                        });
+                    ui.set_min_width(380.0);
+                    ui.label(
+                        egui::RichText::new("Presentation mode").strong().size(18.0),
+                    );
+                    ui.label(
+                        "The map is loaded. Connect to stream positions from the backend.",
+                    );
+                    ui.add_space(4.0);
+                    status_line(ui, &self.live_status.clone());
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let authed = self.auth_token.is_some();
+                        if ui
+                            .add_enabled(
+                                authed,
+                                egui::Button::new(
+                                    egui::RichText::new("Connect live →")
+                                        .strong()
+                                        .color(ONBOARD_INK),
+                                )
+                                .fill(ONBOARD_ACCENT),
+                            )
+                            .clicked()
+                        {
+                            self.toggle_live();
+                            self.connect_card = false;
+                        }
+                        if ui.button("Not now").clicked() {
+                            self.connect_card = false;
+                        }
+                    });
+                    if self.auth_token.is_none() {
+                        ui.label(
+                            egui::RichText::new(
+                                "No sign-in yet: use Login in the toolbar first (offline setups can still watch the wire).",
+                            )
+                            .weak()
+                            .size(11.0),
+                        );
+                    }
                 });
-            if !wiz_open {
-                self.wizard_done = true;
+        }
+        // State D (onboarding ticket, #77): the four-phase bar over
+        // the loaded map — Planning shows the setup panel beside it,
+        // Evaluasi the assessment workspace.
+        if self.app_mode == AppMode::Simulation {
+            self.sim_phase_bar(ui);
+            if self.sim_stage() == SimStage::Planning {
+                self.setup_panel(ui);
+            } else if self.sim_stage() == SimStage::Eval {
+                self.assessment_panel(ui);
             }
         }
-        if self.show_session {
-            let mut open = self.show_session;
-            egui::Window::new("Session").movable(true).default_pos(egui::pos2(8.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
-                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
-                self.session_island(ui);
-                });
-            });
-            self.show_session = open;
-        }
-        if self.show_users && self.app_mode == AppMode::Simulation {
-            let mut open = self.show_users;
-            egui::Window::new("Session users").movable(true).resizable(true).default_pos(egui::pos2(560.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
-                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
-                self.users_island(ui);
-                });
-            });
-            self.show_users = open;
-        }
+
         let mut follow_req: Option<(String, (f64, f64))> = None;
         if self.show_roster && self.session_live() {
             let mut open = self.show_roster;
-            egui::Window::new("Roster").movable(true).default_pos(egui::pos2(816.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
+            egui::Window::new("Roster").movable(true).default_size([300.0, 360.0]).default_pos(egui::pos2(816.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
             ui.label(format!("{} ships — click a name to follow", markers.len()));
             if markers.is_empty() {
                 ui.weak("No ships in view — place hulls from Fleet, or check the feed.");
@@ -3898,7 +9270,7 @@ impl eframe::App for ShipApp {
             for m in &markers {
                 ui.horizontal(|ui| {
                     let mut shown = !self.hidden.contains(&m.id);
-                    if ui.checkbox(&mut shown, "").changed() {
+                    if ui.checkbox(&mut shown, "").on_hover_text(format!("show {} on map", m.id)).changed() {
                         if shown {
                             self.hidden.remove(&m.id);
                         } else {
@@ -3918,6 +9290,9 @@ impl eframe::App for ShipApp {
                     }
                     if m.source == FixSource::Sim {
                         label += " (sim)";
+                    }
+                    if m.source == FixSource::Game {
+                        label += " (game)";
                     }
                     if ui.selectable_value(&mut self.following, Some(m.id.clone()), label).clicked()
                     {
@@ -3950,37 +9325,53 @@ impl eframe::App for ShipApp {
             if ui.small_button("unfollow").clicked() {
                 self.following = None;
             }
+            // Minos task org runs under the marker list — the tree the
+            // command centre groups by, read live, never the sandbox
+            // Groups model.
+            self.task_org_ui(ui);
+            // Map legend (field ticket): every painted state in words.
+            // Roster rows carry the same states as text, so color is
+            // never the only channel.
+            ui.collapsing("Legend", |ui| {
+                ui.label("● per-ship color — live track (gray when stale, ~6s silence)");
+                ui.label(
+                    "center glyph — taxonomy: dot unknown, triangle destroyer, diamond frigate, square corvette, cross auxiliary, pentagon landing, oval submarine, aircraft plane, tracked ground unit, ring port",
+                );
+                ui.label("amber ring — old (backfilled) data, not live");
+                ui.label("yellow ring — camera follows this hull");
+                ui.label("blue ring — selected, open in Inspector");
+                ui.label("dotted trail — recent fixes, Live only");
+                ui.label("○ flag — collapsed group, click or zoom to expand");
+                ui.label("hollow amber — journal replay ghost, not live");
+                ui.weak("sync + plot ages ride the toolbar strip.");
+            });
+            // Keys + model (audit item): the working set made
+            // discoverable, and the operating model in one breath —
+            // Minos owns state, the client projects, the sandbox is
+            // its own world. Keys never fire while typing.
+            ui.collapsing("Keys & model", |ui| {
+                ui.label("Space — pause / resume (Minos while connected)");
+                ui.label("1–9 — desktops");
+                ui.label("[ / ] — cycle ships (opens the Inspector)");
+                ui.label("G — cycle groups");
+                ui.label("F — follow selection · W — waypoint at map center");
+                ui.label("O — orders · R — roster · Esc — drop selection");
+                ui.weak("commit an order with the Order button (the water check refuses on land).");
+                ui.separator();
+                ui.label("Minos owns state, clock, orders, fixes, positions, and messages; this client is its projection and control surface. A local run without a session is an explicitly separate sandbox.");
+                ui.weak("the toolbar strip — source · session · phase · seat · freshness · next — is the same everywhere.");
+            });
             ui.separator();
             });
             self.show_roster = open;
-        }
-        if self.show_fleet && self.mode.phase != Phase::Closed {
-            let mut open = self.show_fleet;
-            egui::Window::new("Fleet").movable(true).resizable(true).default_pos(egui::pos2(8.0, 300.0)).default_size([900.0, 520.0]).min_width(FLEET_MIN_WIDTH).min_height(320.0).open(&mut open).show(ui.ctx(), |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
-                self.fleet_island(ui);
-                });
-            });
-            self.show_fleet = open;
-        }
-        if self.show_groups && self.mode.phase != Phase::Closed {
-            let mut open = self.show_groups;
-            egui::Window::new("Groups").movable(true).default_pos(egui::pos2(240.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
-                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
-                self.groups_island(ui);
-                });
-            });
-            self.show_groups = open;
         }
         // Inspector: selection-driven (Inspector-model ticket). The window
         // exists iff a selection exists; closing it deselects. Ships get
         // the live readout, groups get members/commander/authority plus
         // command + focus actions.
-        if self.selection.is_some()
-            && (self.session_live() || self.app_mode == AppMode::Presentation)
-        {
+        if self.selection.is_some() {
             let mut open = true;
-            egui::Window::new("Inspector").movable(true).default_pos(egui::pos2(816.0, 300.0)).open(&mut open).show(ui.ctx(), |ui| {
+            egui::Window::new("Inspector").movable(true).default_size([300.0, 320.0]).default_pos(egui::pos2(816.0, 440.0)).open(&mut open).show(ui.ctx(), |ui| {
             ui.heading("Inspector");
             let mut follow_selected: Option<(String, (f64, f64))> = None;
             let mut focus_group: Option<(String, (f64, f64))> = None;
@@ -3991,8 +9382,91 @@ impl eframe::App for ShipApp {
                 Some(Selection::Ship(id)) => {
             match self.registry.ships().iter().find(|s| s.ship_id == id).map(|s| (s.latest.clone(), s.stale, s.trail.len())) {
                 Some((fix, stale, trail_len)) => {
-                    let sim_badge = if fix.source == FixSource::Sim { " (sim)" } else { "" };
+                    let sim_badge = if fix.source == FixSource::Sim {
+                        " (sim)"
+                    } else if fix.source == FixSource::Game {
+                        " (game)"
+                    } else {
+                        ""
+                    };
                     ui.label(format!("ship: {}{sim_badge}{}", self.unit_label(&id), if stale { " (stale)" } else { "" }));
+                    self.map_symbol_editor(ui, &id);
+                    let reported_heading = self.registry.blend_heading(&id, 1.0);
+                    self.heading_editor(ui, &id, reported_heading);
+                    // Hull picture (images ticket): the decoded
+                    // versioned texture when available, otherwise the
+                    // temporary source through egui's loader. Both are
+                    // memory-only; the presigned URL is never mirrored.
+                    if let Ok(uid) = id.parse::<i64>() {
+                        let picture = self.visuals.get(uid).map(|v| {
+                            (
+                                v.image_url.clone(),
+                                v.asset_kind,
+                                v.width_px,
+                                v.texture.clone(),
+                                v.image_url_expires_at,
+                                v.image_url_retry_at,
+                            )
+                        });
+                        match picture {
+                            Some((Some(_), AssetKind::UnitImage, width, Some(texture), _, _)) => {
+                                ui.image(texture);
+                                let size = texture.size;
+                                ui.weak(format!(
+                                    "image decoded · manifest width {} px · texture {:.0}×{:.0} px",
+                                    width.unwrap_or(0),
+                                    size.x,
+                                    size.y
+                                ));
+                            }
+                            Some((Some(_), AssetKind::UnitImage, _, None, expires_at, _))
+                                if expires_at.is_some_and(|at| at <= Instant::now()) =>
+                            {
+                                ui.weak("refreshing picture source…");
+                            }
+                            Some((Some(source), AssetKind::UnitImage, width, None, _, _)) => {
+                                self.show_visual_source(ui, uid, &source, width);
+                            }
+                            Some((None, AssetKind::UnitImage, _, _, _, Some(retry_at)))
+                                if retry_at > Instant::now() =>
+                            {
+                                ui.weak("picture source unavailable — retrying");
+                            }
+                            Some((None, AssetKind::UnitImage, _, _, _, _)) => {
+                                ui.weak("loading picture…");
+                            }
+                            None => {
+                                ui.weak("visual: not resolved (manifest or unit not loaded)");
+                            }
+                            Some((_, AssetKind::Unsupported, _, _, _, _)) => {
+                                ui.weak("unsupported asset kind");
+                            }
+                            Some((_, AssetKind::Unavailable, _, _, _, _)) => {
+                                ui.weak("no picture");
+                            }
+                        }
+                        if let Some(v) = self.visuals.get(uid) {
+                            let content_type = if v.content_type.is_empty() {
+                                "unknown".to_string()
+                            } else {
+                                v.content_type.clone()
+                            };
+                            ui.weak(format!("asset type: {content_type}"));
+                        }
+                        // Physical measurements, when Minos published
+                        // them. Unpublished reads as unknown rather
+                        // than as zero metres.
+                        if let Some(v) = self.visuals.get(uid) {
+                            match (v.loa_m, v.beam_m) {
+                                (Some(loa), Some(beam)) => {
+                                    ui.label(format!("loa {loa:.1} m · beam {beam:.1} m"));
+                                }
+                                _ => {
+                                    ui.weak("no published measurements");
+                                }
+                            }
+                        }
+                    }
                     ui.label(format!(
                         "pos: {:.6} {:.6}",
                         fix.position.latitude, fix.position.longitude
@@ -4018,7 +9492,9 @@ impl eframe::App for ShipApp {
                             Some(a) => {
                                 ui.label(format!("data age: {a}s"));
                             }
-                            None => {}
+                            None => {
+                                ui.weak("data age unknown");
+                            }
                         }
                     }
                     ui.horizontal(|ui| {
@@ -4152,7 +9628,7 @@ impl eframe::App for ShipApp {
         // Orders island: Live-only; observers get no orders pane at all.
         if self.show_orders && self.mode.live() && !self.is_observer() {
             let mut open = self.show_orders;
-            egui::Window::new("Orders").movable(true).default_pos(egui::pos2(576.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
+            egui::Window::new("Orders").movable(true).default_size([380.0, 360.0]).default_pos(egui::pos2(500.0, 250.0)).open(&mut open).show(ui.ctx(), |ui| {
             // Orders (prototype sim loop): take control, place waypoint,
             // commit speed order; sim advances the ship, inspector shows it.
             ui.heading("Orders");
@@ -4272,7 +9748,11 @@ impl eframe::App for ShipApp {
                 if !allowed {
                     ui.label("Outside your jurisdiction — view only.");
                 }
-                if self.controlled.contains(&id) {
+                // C3: a caller-commanded piece in an executing game is
+                // ordered through Minos, never taken over locally.
+                if self.minos_order_target(&id).is_some() {
+                    self.minos_order_ui(ui, &id);
+                } else if self.controlled.contains(&id) {
                     if let Some(v) = self.order_views.get(&id) {
                         let state = match v.state {
                             OrderState::EnRoute => "en route",
@@ -4332,7 +9812,12 @@ impl eframe::App for ShipApp {
                     if ui.add_enabled(can_commit && allowed, egui::Button::new("order")).clicked() {
                         self.order_warning = None;
                         if let Some((la, lo)) = self.pending_waypoint {
-                            if let Some(tx) = &self.sim_cmd_tx {
+                            // C3: a commanded piece in an executing game
+                            // goes through Minos — no local SetOrder, or
+                            // the hull would steer two truths at once.
+                            if self.minos_order_target(&id).is_some() {
+                                self.order_via_minos(&id, (la, lo), self.order_speed);
+                            } else if let Some(tx) = &self.sim_cmd_tx {
                                 let _ = tx.send(SimCommand::SetOrder {
                                     ship_id: id.clone(),
                                     waypoint: GeoPosition { latitude: la, longitude: lo },
@@ -4365,7 +9850,42 @@ impl eframe::App for ShipApp {
                     {
                         self.order_warning = None;
                         if let Some((la, lo)) = self.pending_waypoint {
-                            if let Some(tx) = &self.sim_cmd_tx {
+                            // C3: in an executing game the fan-out goes
+                            // through Minos, one order per commanded
+                            // piece (the server clamps each); hulls that
+                            // are not the caller's pieces are skipped
+                            // loudly, never steered locally.
+                            if self.users_game_state.as_deref() == Some("execution")
+                                && self.users_game.is_some()
+                            {
+                                // #100: one batch op for the whole fan-out.
+                                let mut legs = Vec::new();
+                                let mut skipped = 0;
+                                for ship in controlled.clone() {
+                                    match self.minos_leg(&ship, (la, lo)) {
+                                        Some((uid, ship, heading)) => {
+                                            legs.push((uid, ship, heading, self.order_speed));
+                                        }
+                                        None => {
+                                            skipped += 1;
+                                        }
+                                    }
+                                }
+                                if legs.is_empty() {
+                                    let msg = format!(
+                                        "Minos order all: 0 ordered · {skipped} skipped (not your pieces)"
+                                    );
+                                    self.feed(msg.clone());
+                                    self.users_status = msg;
+                                } else {
+                                    if skipped > 0 {
+                                        self.feed(format!(
+                                            "{skipped} skipped (not your pieces)"
+                                        ));
+                                    }
+                                    self.spawn_order_batch(legs);
+                                }
+                            } else if let Some(tx) = &self.sim_cmd_tx {
                                 let waypoint = GeoPosition { latitude: la, longitude: lo };
                                 let legs: Vec<Leg> = controlled
                                     .iter()
@@ -4422,19 +9942,43 @@ impl eframe::App for ShipApp {
                 } else {
                     // Take-control with a class selector (grill #18): the
                     // chosen class's stats drive the unit from then on.
+                    // Options name their authority (H10): Minos rows
+                    // carry the spec version, bundled rows the asset.
                     let ships = self.catalog.ship_classes();
-                    let names: Vec<&str> = ships.iter().map(|c| c.name.as_str()).collect();
+                    let names: Vec<String> = ships
+                        .iter()
+                        .map(|c| {
+                            if c.version > 0 {
+                                format!("{} · {} v{}", c.name, Catalog::class_source(c), c.version)
+                            } else {
+                                format!("{} · {}", c.name, Catalog::class_source(c))
+                            }
+                        })
+                        .collect();
                     egui::ComboBox::from_label("")
                         .selected_text(
-                            names.get(self.selected_class).copied().unwrap_or("—"),
+                            names.get(self.selected_class).map(|s| s.as_str()).unwrap_or("—"),
                         )
                         .show_ui(ui, |ui| {
                             for (i, name) in names.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_class, i, *name);
+                                ui.selectable_value(&mut self.selected_class, i, name.as_str());
                             }
                         });
                     if allowed && ui.small_button("take control").clicked() {
-                        if let Some(s) = self.registry.ships().iter().find(|s| s.ship_id == id) {
+                        // C3: Minos drives its pieces in execution — a
+                        // local takeover would be the ghost this ticket
+                        // removes. Order them through Minos instead.
+                        if self.users_game_state.as_deref() == Some("execution")
+                            && id.parse::<i64>().is_ok_and(|uid| {
+                                self.users_gunits.iter().any(|g| g.unit_id == uid)
+                            })
+                        {
+                            let msg =
+                                "take control refused: Minos drives this hull in execution"
+                                    .to_string();
+                            self.feed(msg.clone());
+                            self.users_status = msg;
+                        } else if let Some(s) = self.registry.ships().iter().find(|s| s.ship_id == id) {
                             if let Some(tx) = &self.sim_cmd_tx {
                                 let class_id = ships
                                     .get(self.selected_class)
@@ -4457,13 +10001,6 @@ impl eframe::App for ShipApp {
             });
             self.show_orders = open;
         }
-        if self.show_connection {
-            let mut open = self.show_connection;
-            egui::Window::new("Connection").movable(true).default_pos(egui::pos2(8.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
-                self.connection_island(ui);
-            });
-            self.show_connection = open;
-        }
         if self.show_login {
             let mut open = self.show_login;
             egui::Window::new("Login").movable(true).default_pos(egui::pos2(8.0, 120.0)).open(&mut open).show(ui.ctx(), |ui| {
@@ -4475,10 +10012,19 @@ impl eframe::App for ShipApp {
         }
         if self.show_log && (self.session_live() || self.app_mode == AppMode::Presentation) {
             let mut open = self.show_log;
-            egui::Window::new("Log").movable(true).default_pos(egui::pos2(8.0, 478.0)).open(&mut open).show(ui.ctx(), |ui| {
+            egui::Window::new("Log").movable(true).default_size([420.0, 260.0]).default_pos(egui::pos2(8.0, 480.0)).open(&mut open).show(ui.ctx(), |ui| {
                 self.log_island(ui);
             });
             self.show_log = open;
+        }
+        // Messages island (H11): socket-arrived game mail. Visible in
+        // both modes once mail exists or the session opens it.
+        if self.show_messages {
+            let mut open = self.show_messages;
+            egui::Window::new("Messages").movable(true).default_size([420.0, 300.0]).default_pos(egui::pos2(8.0, 170.0)).open(&mut open).show(ui.ctx(), |ui| {
+                self.messages_island(ui);
+            });
+            self.show_messages = open;
         }
         if let Some((ship, at)) = follow_req {
             self.request_frame(&ship, at);
@@ -4674,10 +10220,30 @@ impl eframe::App for ShipApp {
                 // User drop (session-users ticket): onto a unit marker to
                 // command that piece, onto a group flag for a bulk assign
                 // across its hulls. Same release frame as hull drops; only
-                // one drag is ever active.
+                // one drag is ever active. Only seated non-judges take
+                // command — refused below before any write fires.
                 if self.udrag.is_some() && ui.ctx().input(|i| i.pointer.any_released()) {
                     let drop = ui.ctx().input(|i| i.pointer.interact_pos());
                     let (uid, uname) = self.udrag.clone().unwrap_or((0, String::new()));
+                    // The judge side never commands, and only seated
+                    // people do — refused here so a group drop cannot fire
+                    // one 400 per hull. With no game picked there is
+                    // nothing to seat against, and the match below says so.
+                    let refusal = match self.users_game.as_ref() {
+                        None => None,
+                        Some(_) => match self.users_roster.iter().find(|p| p.user_id == uid) {
+                            None => Some(format!(
+                                "drop refused: {uname} is not in this session's roster"
+                            )),
+                            Some(p) if self.users_is_judge(p) => Some(format!(
+                                "drop refused: {uname} is on the judge side — judges do not command"
+                            )),
+                            Some(_) => None,
+                        },
+                    };
+                    if let Some(reason) = refusal {
+                        self.feed(reason);
+                    } else {
                     match (drop, self.users_game.clone()) {
                         (Some(p), Some((gid, _))) if rect.contains(p) => {
                             let px = (p.x - rect.min.x) as f64;
@@ -4711,7 +10277,10 @@ impl eframe::App for ShipApp {
                                         for mid in members {
                                             match mid.parse::<i64>() {
                                                 Ok(hull) => match m.set_unit_commander(&t, gid, hull, uid) {
-                                                    Ok(()) => ok += 1,
+                                                    // Each write answers with the whole
+                                                    // units array; the loop's final re-sync
+                                                    // below settles both collections.
+                                                    Ok(_) => ok += 1,
                                                     Err(e) => {
                                                         fail += 1;
                                                         eprintln!("group drop: hull {hull} refused: {e}");
@@ -4736,34 +10305,13 @@ impl eframe::App for ShipApp {
                         }
                         _ => {
                             self.feed(
-                                "drop cancelled: pick a game, release over the map".to_string(),
+                                "drop cancelled: pick a hull, release over the map".to_string(),
                             );
                         }
                     }
+                    }
                     self.udrag = None;
                     self.upress = None;
-                }
-                // Drag-and-drop placement (setup-overhaul): a fleet-row
-                // drag released over the map places through the shared
-                // core. The press began outside the map, so the click and
-                // pan gestures above never fire for it — no conflict.
-                if self.drag_unit.is_some() && ui.ctx().input(|i| i.pointer.any_released()) {
-                    let drop = ui.ctx().input(|i| i.pointer.interact_pos());
-                    match drop {
-                        Some(p) if rect.contains(p) => {
-                            let px = (p.x - rect.min.x) as f64;
-                            let py = (p.y - rect.min.y) as f64;
-                            let (mw, mh) = self.map_dims();
-                            let (la, lo) =
-                                unproject_mercator(px, py, self.center, self.zoom, mw, mh);
-                            self.try_place_picked(la, lo);
-                        }
-                        _ => {
-                            self.feed("drop cancelled: release over the map to place".to_string());
-                        }
-                    }
-                    self.drag_unit = None;
-                    self.drag_press = None;
                 }
                 // Seamless zoom (task #43 + pan-zoom ticket): plain wheel
                 // joins shift+wheel and pinch; the point under the cursor
@@ -4851,26 +10399,84 @@ impl eframe::App for ShipApp {
                         MAP_INK,
                     );
                 }
+                let pixels_per_point = ui.ctx().pixels_per_point();
+                let mut image_quads: Vec<Option<Vec<egui::Pos2>>> =
+                    (0..markers.len()).map(|_| None).collect();
+                // Layer 1: all trails, so no later unit can paint over
+                // an earlier unit's status or label.
+                for m in &markers {
+                    if self.hidden.contains(&m.id) || !self.show_trail || !self.mode.in_live() {
+                        continue;
+                    }
+                    let color = if m.stale { egui::Color32::GRAY } else { Self::ship_color(&m.id) };
+                    for (tx, ty) in &m.trail {
+                        painter.circle_filled(
+                            rect.min + egui::vec2(*tx as f32, *ty as f32),
+                            2.0,
+                            color.linear_multiply(0.55),
+                        );
+                    }
+                }
+                // Layer 2: all symbol-or-image bodies. An eligible
+                // Middle/Near texture replaces the circle; otherwise
+                // the universal circle + taxonomy glyph remains.
+                for (index, m) in markers.iter().enumerate() {
+                    if self.hidden.contains(&m.id) {
+                        continue;
+                    }
+                    let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
+                    let color = if m.stale { egui::Color32::GRAY } else { Self::ship_color(&m.id) };
+                    image_quads[index] = paint_unit_image(
+                        &painter,
+                        m,
+                        self.zoom,
+                        pixels_per_point,
+                        rect.min,
+                    );
+                    if image_quads[index].is_none() {
+                        painter.circle_filled(c, 8.0, color);
+                        paint_map_symbol(&painter, c, m.map_symbol, color, m.stale);
+                    }
+                }
+                // Layer 3: symbol outlines. Image outlines are drawn
+                // after all image bodies; stale symbols use gray, not white.
+                for (index, m) in markers.iter().enumerate() {
+                    if self.hidden.contains(&m.id) {
+                        continue;
+                    }
+                    let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
+                    if let Some(points) = &image_quads[index] {
+                        let outline = if m.stale {
+                            egui::Color32::GRAY
+                        } else {
+                            egui::Color32::WHITE
+                        };
+                        // The image already supplies its own pixels. Do
+                        // not add a second polygon fill here: a
+                        // transparent fill is still a full quad on some
+                        // painter paths, and a PNG's transparent canvas
+                        // must remain transparent instead of becoming a
+                        // black rectangle. Draw only the outline.
+                        painter.add(egui::Shape::closed_line(
+                            points.clone(),
+                            egui::Stroke::new(1.5, outline),
+                        ));
+                    } else {
+                        let outline = if m.stale {
+                            egui::Color32::GRAY
+                        } else {
+                            egui::Color32::WHITE
+                        };
+                        painter.circle_stroke(c, 8.0, egui::Stroke::new(2.0, outline));
+                    }
+                }
+                // Layer 4: all state rings over every body, in the
+                // prescribed selected → follow → old-data order.
                 for m in &markers {
                     if self.hidden.contains(&m.id) {
                         continue;
                     }
-                    let color = if m.stale { egui::Color32::GRAY } else { Self::ship_color(&m.id) };
-                    if self.show_trail && self.mode.in_live() {
-                        for (tx, ty) in &m.trail {
-                            painter.circle_filled(
-                                rect.min + egui::vec2(*tx as f32, *ty as f32),
-                                2.0,
-                                color.linear_multiply(0.55),
-                            );
-                        }
-                    }
                     let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
-                    painter.circle_filled(c, 8.0, color);
-                    painter.circle_stroke(c, 8.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
-                    if Some(&m.id) == self.following.as_ref() {
-                        painter.circle_stroke(c, 12.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
-                    }
                     if self.selection == Some(Selection::Ship(m.id.clone())) {
                         painter.circle_stroke(
                             c,
@@ -4878,25 +10484,19 @@ impl eframe::App for ShipApp {
                             egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE),
                         );
                     }
-                    // Old-data indication (backfilled ticket): amber ring
-                    // over stale-gray; data age, not feed state.
-                    if m.old_data && !m.stale {
+                    if Some(&m.id) == self.following.as_ref() {
+                        painter.circle_stroke(c, 14.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
+                    }
+                    if m.old_data {
                         painter.circle_stroke(
                             c,
-                            12.0,
+                            16.0,
                             egui::Stroke::new(
                                 2.0,
                                 egui::Color32::from_rgb(0xF5, 0x9E, 0x0B),
                             ),
                         );
                     }
-                    painter.text(
-                        c + egui::vec2(10.0, -10.0),
-                        egui::Align2::LEFT_TOP,
-                        &m.id,
-                        egui::FontId::proportional(12.0),
-                        MAP_INK,
-                    );
                 }
                 // Log replay ghosts (task #41): hollow amber units as
                 // placed up to the slider, from the journal — not live.
@@ -4977,6 +10577,21 @@ impl eframe::App for ShipApp {
                         color,
                     );
                 }
+                // Layer 5: labels last, after replay and waypoint
+                // overlays, so every unit label remains readable.
+                for m in &markers {
+                    if self.hidden.contains(&m.id) {
+                        continue;
+                    }
+                    let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
+                    painter.text(
+                        c + egui::vec2(10.0, -10.0),
+                        egui::Align2::LEFT_TOP,
+                        &m.label,
+                        egui::FontId::proportional(12.0),
+                        MAP_INK,
+                    );
+                }
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.label("loading map scene…");
@@ -5023,13 +10638,27 @@ fn apply_ops_theme(ctx: &egui::Context) {
 /// against night water, not against paper.
 const MAP_INK: egui::Color32 = egui::Color32::from_rgb(0xE2, 0xE8, 0xF0);
 
+/// Onboarding palette (ticket #77): the clean States A/B canvas —
+/// console night into deep well, Radar Cyan as the one signal, deep
+/// well as ink on cyan fills (The One Signal Rule, DESIGN.md).
+const ONBOARD_TOP: egui::Color32 = egui::Color32::from_rgb(0x0F, 0x17, 0x2A);
+const ONBOARD_BOTTOM: egui::Color32 = egui::Color32::from_rgb(0x02, 0x06, 0x17);
+const ONBOARD_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x22, 0xD3, 0xEE);
+const ONBOARD_INK: egui::Color32 = egui::Color32::from_rgb(0x02, 0x06, 0x17);
+/// Auth field/button height (ticket #77 polish): one height for the
+/// sign-in card's inputs and its primary button, text centered.
+const AUTH_FIELD_H: f32 = 34.0;
+/// Phase bar sits under the toolbar (three rows in Simulation ≈ 112px).
+const PHASE_BAR_TOP: f32 = 116.0;
+
 fn main() -> eframe::Result<()> {
     // Endpoints live in `.env` (setup-overhaul pass), never in UI
     // fields: load first so every env read below sees the file.
     ShipApp::load_dotenv();
     // Poll thread owns the backend source; the UI owns the registry.
-    // TFG_BACKEND_URL=http://host:port selects HTTP, else file replay.
-    // The sim joins every round via MergeSource (disarmed = wire only).
+    // TFG_BACKEND_URL=http://host:port selects the explicit mock, else
+    // file replay. The sim joins every round via MergeSource (disarmed
+    // = wire only).
     let shutdown = std::sync::Arc::new(AtomicBool::new(false));
     let (poll_tx, poll_rx) = mpsc::channel();
     let (sim_cmd_tx, sim_cmd_rx) = mpsc::channel::<SimCommand>();
@@ -5047,11 +10676,12 @@ fn main() -> eframe::Result<()> {
     let (wire_wake_tx, wire_wake_rx) = mpsc::channel::<()>();
     let ui_wire_wake_tx = wire_wake_tx;
     let poll_handle = std::thread::spawn(move || {
-        // Boot wire (task #39): env picks HTTP vs replay; the Connection
-        // island can swap it later without restarting the sim.
+        // Boot wire (task #39, M10): TFG_BACKEND_URL points at the
+        // explicit mock (examples/mock_backend.rs) — never at Minos,
+        // which is the Live wire below. File replay otherwise.
         let empty = format!("{}/scenarios/empty.json", env!("CARGO_MANIFEST_DIR"));
         let boot_kind = match std::env::var("TFG_BACKEND_URL") {
-            Ok(url) => WireKind::Http(url),
+            Ok(url) => WireKind::Mock(url),
             Err(_) => WireKind::Replay(match std::env::var("TFG_SCENARIO") {
                 // `surge` for the traffic demo; default is the clear canvas.
                 Ok(name) => format!("{}/scenarios/{name}.json", env!("CARGO_MANIFEST_DIR")),
@@ -5141,7 +10771,19 @@ fn main() -> eframe::Result<()> {
             scene.pump(pump);
             let rgba = scene.frame_rgba();
             eprintln!("map frame {seq}: {}ms (pump {pump})", t0.elapsed().as_millis());
-            if map_resp_tx.send((seq, at, zoom, size, rgba)).is_err() {
+            // Convert off the UI thread: the pump uploads, never swizzles.
+            let img = if LiveMap::is_premultiplied() {
+                egui::ColorImage::from_rgba_premultiplied(
+                    [size.0 as usize, size.1 as usize],
+                    &rgba,
+                )
+            } else {
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [size.0 as usize, size.1 as usize],
+                    &rgba,
+                )
+            };
+            if map_resp_tx.send((seq, at, zoom, size, img)).is_err() {
                 break; // UI gone
             }
         }
@@ -5179,10 +10821,22 @@ fn main() -> eframe::Result<()> {
                                 catalog.upsert_runtime_class(
                                     f.class_id,
                                     f.class_name.clone(),
+                                    f.version,
                                     f.speed_kn.unwrap_or(0.0),
                                     f.cruise_kn.unwrap_or(0.0),
                                     f.range_nm.unwrap_or(0.0),
                                 );
+                                // H10: the sim owns a catalog of its own —
+                                // restored figures drive it too, or every
+                                // restored hull would refuse takeover.
+                                let _ = ui_sim_cmd_tx.send(SimCommand::UpsertClass {
+                                    minos_class_id: f.class_id,
+                                    name: f.class_name.clone(),
+                                    version: f.version,
+                                    speed_kn: f.speed_kn.unwrap_or(0.0),
+                                    cruise_kn: f.cruise_kn.unwrap_or(0.0),
+                                    range_nm: f.range_nm.unwrap_or(0.0),
+                                });
                             }
                         }
                         if !figs.is_empty() {
@@ -5192,7 +10846,7 @@ fn main() -> eframe::Result<()> {
                     Err(e) => eprintln!("spec restore failed: {e}"),
                 }
             }
-            Ok(Box::new(ShipApp {
+            let mut app = ShipApp {
                 map_tex: None,
                 tex_center: CENTER,
                 tex_zoom: ZOOM,
@@ -5217,13 +10871,15 @@ fn main() -> eframe::Result<()> {
                 mode: UiMode::new(sim_armed.clone()),
                 session_windows: None,
                 session_log_path: tfg::log::Journal::prototype_path(),
-                session_seq: 0,
+                session_seq: tfg::log::next_session_seq(),
                 transcript: Vec::new(),
                 show_roster: false,
                 show_orders: false,
                 show_log: false,
-                wizard_step: 0,
-                wizard_done: false,
+                onboard: Onboard::Login,
+                sim_ready: false,
+                connect_card: false,
+                phase_note: None,
                 event_feed: VecDeque::new(),
                 selection: None,
                 last_seen: HashMap::new(),
@@ -5240,27 +10896,57 @@ fn main() -> eframe::Result<()> {
                 catalog,
                 selected_class: 0,
                 fleet: Fleet::from_default_asset().expect("fleet asset valid"),
-                show_fleet: false,
-                fleet_cat: 0,
-                fleet_class: None,
-                fleet_query: String::new(),
                 fleet_pick: None,
-                drill_branch: None,
-                drill_category: None,
-                drill_type: None,
-                drill_class: None,
-                drag_press: None,
-                drag_unit: None,
-                show_users: false,
+                setup_step: 0,
+                assessment_tab: 0,
+                setup_name: String::new(),
+                setup_description: String::new(),
+                setup_purpose: String::new(),
+                setup_target: String::new(),
+                setup_area: String::new(),
+                setup_map_tag: String::new(),
+                edit_open: false,
+                delete_armed: false,
+                edit_name: String::new(),
+                edit_description: String::new(),
+                edit_purpose: String::new(),
+                edit_target: String::new(),
+                edit_area: String::new(),
+                edit_map_tag: String::new(),
+                setup_reg_search: String::new(),
+                fleet_cache: Vec::new(),
+                fleet_branches: std::collections::HashMap::new(),
+                fleet_branch_names: std::collections::HashMap::new(),
+                fleet_loaded: false,
+                setup_commander: None,
                 users_game: None,
+                users_game_state: None,
+                minos_clock: None,
+                minos_time_factor: None,
+                minos_room_key: None,
+                clock_denied: false,
+                factor_draft: 1.0,
                 users_games: Vec::new(),
+                games_gap: false,
                 users_list: Vec::new(),
                 users_search: String::new(),
                 users_role: None,
                 users_roles: Vec::new(),
                 users_roster: Vec::new(),
                 users_gunits: Vec::new(),
-                users_status: "pick a game".to_string(),
+                commanded_hulls: Vec::new(),
+                roster_gap: false,
+                units_gap: false,
+                placements_gap: false,
+                users_placements: Vec::new(),
+                placement_unplaced: 0,
+                placement_ready: false,
+                join_key: String::new(),
+                users_status: "hold a session".to_string(),
+                users_filter_status: None,
+                users_statuses: Vec::new(),
+                users_filter_role: None,
+                users_approles: Vec::new(),
                 upress: None,
                 udrag: None,
                 placed_fleet: HashSet::new(),
@@ -5269,13 +10955,8 @@ fn main() -> eframe::Result<()> {
                 time_real_end: (Utc::now() + chrono::Duration::hours(14)).format("%Y-%m-%d %H:%M").to_string(),
                 time_game_start: "2026-11-01 00:00".to_string(),
                 time_game_end: "2026-11-07 00:00".to_string(),
-                roster: Vec::new(),
-                roster_input: String::new(),
                 helm: HashMap::new(),
                 unit_commander: HashMap::new(),
-                invites: Vec::new(),
-                invite_seq: 1,
-                invite_status: "local records".to_string(),
                 // Minos REST base: full URL wins, else host with derived
                 // :8080/api/v1 (transport ticket), else the hosted dev.
                 minos_base: match std::env::var("TFG_MINOS_HOST") {
@@ -5290,6 +10971,7 @@ fn main() -> eframe::Result<()> {
                 login_identifier: String::new(),
                 login_password: String::new(),
                 auth_user: None,
+                auth_user_id: None,
                 auth_token: None,
                 auth_issued_at: None,
                 auth_ttl_secs: 0,
@@ -5306,31 +10988,96 @@ fn main() -> eframe::Result<()> {
                 last_zoom_req: Instant::now(),
                 last_track_req: Instant::now(),
                 zoom_dirty: false,
+                text_scale: 1.0,
+                base_ppp: None,
                 app_mode: AppMode::Simulation,
-                show_connection: false,
-                // Boot is the lobby (task #40): the mode toggle plus the
-                // Simulation start wizard. Everything working opens later.
-                show_session: true,
+                // Boot is the lobby: the mode toggle plus the setup flow.
                 wire_ctl_tx: Some(ui_wire_ctl_tx),
                 wire_wake_tx: ui_wire_wake_tx,
                 live_cmd_tx: None,
                 live_evt_rx: None,
+                live_connected_once: false,
                 live_status: "idle".to_string(),
+                login_op: None,
+                refresh_op: None,
+                sync_op: None,
+                spec_op: None,
+                pw_op: None,
+                plot_op: None,
+                setup_op: None,
+                pending_setup: Vec::new(),
+                pending_transition: None,
+                last_plot_try: None,
+                last_game_sync: None,
+                last_plot_ok: None,
+                plot_fails: 0,
                 log_view_path: None,
+                log_files: Vec::new(),
+                log_files_loaded: false,
+                log_view: None,
+                log_op: None,
+                game_messages: VecDeque::new(),
+                show_messages: false,
+                inbox: Vec::new(),
+                inbox_mine_only: false,
+                inbox_page_no: 1,
+                inbox_total: 0,
+                inbox_pages: 1,
+                inbox_has_next: false,
+                inbox_has_prev: false,
+                msg_open: None,
+                timeline_events: Vec::new(),
+                timeline_cursor: None,
+                timeline_has_more: false,
+                timeline_source: None,
+                timeline_personnel: String::new(),
+                timeline_unit: String::new(),
+                timeline_from: String::new(),
+                timeline_to: String::new(),
+                judgements: Vec::new(),
+                judge_subject: None,
+                judge_subject_id: String::new(),
+                judge_score: String::new(),
+                reviews: Vec::new(),
+                review_subject: None,
+                review_body: String::new(),
+                review_editing: None,
+                review_mine_only: false,
+                minos_tree: Vec::new(),
+                tree_gap: false,
+                visuals: VisualCache::default(),
+                unit_symbols: HashMap::new(),
+                unit_type_ids: HashMap::new(),
+                unit_type_names: HashMap::new(),
+                unit_type_symbols: HashMap::new(),
+                unit_lods: HashMap::new(),
+                heading_overrides: HashMap::new(),
+                pending_image_urls: Vec::new(),
+                image_op: None,
+                image_request: None,
+                manifest_retry_at: None,
+                manifest_refresh_at: None,
+                msg_kind: "telegram".to_string(),
+                msg_class: "TERBUKA".to_string(),
+                msg_content: String::new(),
+                msg_callsign: String::new(),
+                msg_sending_note: String::new(),
+                msg_group: String::new(),
+                msg_per: String::new(),
+                msg_regnum: String::new(),
+                msg_to: HashSet::new(),
+                msg_cc: HashSet::new(),
+                msg_degree: None,
+                msg_degrees: Vec::new(),
+                msg_assumed: None,
+                msg_reply_to: None,
+                scenario_roles: Vec::new(),
+                new_role_name: String::new(),
                 log_events: Vec::new(),
                 replay_pos: 0,
                 show_replay: true,
                 log_filter: "all".to_string(),
                 groups: Groups::default(),
-                show_groups: false,
-                group_seq: 1,
-                satgas_name: String::new(),
-                satgas_commander: None,
-                satgas_members: HashSet::new(),
-                gugus_name: String::new(),
-                gugus_commander: None,
-                gugus_members: HashSet::new(),
-                group_error: None,
                 acting_as: None,
                 desktop: "all".to_string(),
                 drafts: HashMap::new(),
@@ -5339,7 +11086,350 @@ fn main() -> eframe::Result<()> {
                 game_paused: false,
                 real_ts: None,
                 game_ts: None,
-            }))
-        }),
+            };
+            app.reload_unit_symbols();
+            // M3: wake the last session when its refresh token survived
+            // in the keyring — a cold launch otherwise asks for login.
+            app.restore_session();
+            Ok(Box::new(app))        }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(unit_id: i64, w: Option<u32>, h: Option<u32>) -> tfg::backend::UnitImageEntry {
+        tfg::backend::UnitImageEntry {
+            asset_kind: "unit_image".to_string(),
+            unit_id,
+            name: format!("hull {unit_id}"),
+            hull_number: None,
+            file_name: format!("images/{unit_id}.png"),
+            content_type: "image/png".to_string(),
+            size_bytes: 1024,
+            width_px: w,
+            height_px: h,
+            loa_m: None,
+            beam_m: None,
+        }
+    }
+
+    fn manifest(version: &str, entries: Vec<tfg::backend::UnitImageEntry>) -> tfg::backend::ImageManifest {
+        tfg::backend::ImageManifest {
+            version: version.to_string(),
+            entry_count: entries.len(),
+            units_without_image: 0,
+            entries,
+        }
+    }
+
+    fn symbol(_: i64) -> tfg::store::MapSymbol {
+        tfg::store::MapSymbol::Corvette
+    }
+
+    /// Every map symbol owns a distinct far geometry. This is the
+    /// visual half of the universal-fallback contract: adding a
+    /// symbol without a shape cannot silently leave another anonymous
+    /// dot behind.
+    #[test]
+    fn every_map_symbol_has_a_distinct_shape_and_fill() {
+        let identities: std::collections::HashSet<_> = tfg::store::MapSymbol::ALL
+            .into_iter()
+            .map(|symbol| {
+                let shape = map_symbol_shape(symbol);
+                (shape, map_symbol_accent(shape).to_array())
+            })
+            .collect();
+        assert_eq!(identities.len(), tfg::store::MapSymbol::ALL.len());
+        assert_eq!(map_symbol_shape(tfg::store::MapSymbol::UnknownShip), MapSymbolShape::Dot);
+    }
+
+    /// The manifest's discriminator is the asset kind. Pixel size is
+    /// carried honestly but does not silently invent a second kind in
+    /// this model ticket; thumbnail validation belongs to the archive
+    /// reader's own contract.
+    #[test]
+    fn manifest_asset_kind_is_preserved_without_guessing() {
+        let normal = UnitVisual::from_entry(&entry(1, Some(512), Some(256)), "v1", symbol(1));
+        assert_eq!(normal.asset_kind, AssetKind::UnitImage);
+        assert_eq!(normal.width_px, Some(512));
+        assert_eq!(normal.height_px, Some(256));
+        assert!(!normal.is_map_renderable(), "dimensions alone are not a texture");
+
+        let mut future = entry(2, Some(1), Some(1));
+        future.asset_kind = "account_portrait".to_string();
+        let unsupported = UnitVisual::from_entry(&future, "v1", symbol(2));
+        assert_eq!(unsupported.asset_kind, AssetKind::Unsupported);
+        assert_eq!(unsupported.width_px, Some(1), "size is still reported as sent");
+    }
+
+    /// Physical measurements can arrive in the manifest even when the
+    /// local spec mirror has not been populated. The manifest is a
+    /// complete visual input; hydration must supplement it, never erase
+    /// it with a missing local value.
+    #[test]
+    fn manifest_measurements_survive_local_hydration() {
+        let mut published = entry(1, Some(512), Some(256));
+        published.loa_m = Some(120.5);
+        published.beam_m = Some(16.2);
+        let mut c = VisualCache::default();
+        c.install_manifest(&manifest("v1", vec![published]), symbol);
+        c.set_unit_facts(1, tfg::store::MapSymbol::Corvette, None, None, None);
+
+        let visual = c.get(1).expect("visual");
+        assert_eq!(visual.loa_m, Some(120.5));
+        assert_eq!(visual.beam_m, Some(16.2));
+    }
+
+    /// A local mirror fills a manifest gap, but does not overwrite a
+    /// current value that Minos already published in the manifest.
+    #[test]
+    fn local_measurements_fill_only_manifest_gaps() {
+        let mut published = entry(1, Some(512), Some(256));
+        published.loa_m = Some(120.5);
+        let mut c = VisualCache::default();
+        c.install_manifest(&manifest("v1", vec![published]), symbol);
+        c.set_unit_facts(1, tfg::store::MapSymbol::Corvette, Some(130.0), Some(18.0), None);
+
+        let visual = c.get(1).expect("visual");
+        assert_eq!(visual.loa_m, Some(120.5), "manifest is authoritative");
+        assert_eq!(visual.beam_m, Some(18.0), "local mirror fills the missing beam");
+    }
+
+    /// A listed unit image needs a source; a future asset kind and a
+    /// versioned absence do not. A null presign waits before retrying
+    /// rather than hammering the API every frame, and an expired AWS
+    /// presign becomes eligible again.
+    #[test]
+    fn source_resolution_distinguishes_absent_failed_and_expired() {
+        let mut c = VisualCache::default();
+        let mut future = entry(2, Some(32), Some(32));
+        future.asset_kind = "account_portrait".to_string();
+        let queued = c.install_manifest(
+            &manifest("v1", vec![entry(1, Some(512), Some(256)), future]),
+            symbol,
+        );
+        assert_eq!(queued, vec![1], "future kinds never enter the source queue");
+        c.mark_absent(3, tfg::store::MapSymbol::Submarine);
+        assert!(c.needs_url(1));
+        assert!(!c.needs_url(2), "an unsupported future kind is not a hull image");
+        assert!(!c.needs_url(3), "absence has no file to address");
+
+        c.set_url(1, None);
+        assert!(!c.needs_url(1), "a null presign waits for the retry delay");
+        c.set_url(1, Some("https://objects/one.png?X-Amz-Expires=60".into()));
+        assert!(!c.needs_url(1), "a live presign needs no retry");
+        c.set_url(1, Some("https://objects/one.png?X-Amz-Expires=0".into()));
+        assert!(c.needs_url(1), "an expired presign is read again");
+    }
+
+    /// A unit with no image, a unit not yet fetched, and a unit whose
+    /// bytes are still arriving are three different states. The old
+    /// Option<String> map could not tell them apart.
+    #[test]
+    fn settled_absence_differs_from_unfetched() {
+        let mut c = VisualCache::default();
+        assert!(!c.is_settled(7), "manifest not read yet");
+        c.install_manifest(&manifest("v1", vec![]), symbol);
+        assert!(!c.is_settled(7), "manifest read, unit not resolved");
+        c.mark_absent(7, tfg::store::MapSymbol::Auxiliary);
+        assert!(c.is_settled(7), "asked, and the answer was no image");
+        let absent = c.get(7).expect("absence is a real visual");
+        assert_eq!(absent.asset_kind, AssetKind::Unavailable);
+        assert_eq!(absent.map_symbol, tfg::store::MapSymbol::Auxiliary);
+        assert_eq!(absent.asset_version, "v1", "absence is versioned too");
+        assert!(!c.is_settled(8), "a different unit is still open");
+    }
+
+    /// A new URL is the same asset. Identity is the unit and the
+    /// version, never the address, so an expiring presigned URL is
+    /// replaced without disturbing anything else.
+    #[test]
+    fn url_replacement_preserves_the_asset() {
+        let mut c = VisualCache::default();
+        c.install_manifest(&manifest("v1", vec![entry(1, Some(512), Some(256))]), symbol);
+        c.set_unit_facts(
+            1,
+            tfg::store::MapSymbol::Corvette,
+            Some(120.0),
+            Some(16.0),
+            Some(4.0),
+        );
+        c.set_url(1, Some("https://objects/one?sig=a".into()));
+        let before = c.get(1).expect("visual");
+        assert_eq!(before.asset_version, "v1");
+        assert_eq!(before.loa_m, Some(120.0));
+
+        c.set_url(1, Some("https://objects/one?sig=b".into()));
+        let after = c.get(1).expect("visual");
+        assert_eq!(after.image_url.as_deref(), Some("https://objects/one?sig=b"));
+        assert_eq!(after.asset_version, "v1", "version is not the URL's job");
+        assert_eq!(after.loa_m, Some(120.0), "measurements survive the swap");
+        assert_eq!(after.map_symbol, tfg::store::MapSymbol::Corvette);
+    }
+
+    /// A manifest version change means the assets themselves moved.
+    /// Pictures are re-resolved; the unit ids and their identity are
+    /// untouched, because the units did not change.
+    #[test]
+    fn version_change_invalidates_pictures_not_units() {
+        let mut c = VisualCache::default();
+        c.install_manifest(&manifest("v1", vec![entry(1, Some(512), Some(256))]), symbol);
+        c.set_url(1, Some("https://objects/one?sig=a".into()));
+        assert_eq!(c.get(1).expect("v1 visual").asset_version, "v1");
+
+        // Same units, new version: the old URL is not carried over.
+        let needing = c.install_manifest(&manifest("v2", vec![entry(1, Some(640), Some(320))]), symbol);
+        assert_eq!(needing, vec![1], "the URL must be re-read for v2");
+        let v2 = c.get(1).expect("v2 visual");
+        assert_eq!(v2.asset_version, "v2");
+        assert_eq!(v2.image_url, None, "a v1 URL does not describe a v2 asset");
+        assert_eq!(v2.width_px, Some(640), "new dimensions applied");
+        assert!(!c.units.contains_key(&(1, "v1".to_string())));
+        assert!(c.units.contains_key(&(1, "v2".to_string())));
+    }
+
+    /// A unit that had a picture in one version and is omitted from
+    /// the next is not silently absent: it becomes unresolved under
+    /// v2, so selection can record fresh versioned absence rather than
+    /// inheriting the v1 answer.
+    #[test]
+    fn omission_in_a_new_version_clears_old_absence() {
+        let mut c = VisualCache::default();
+        c.install_manifest(&manifest("v1", vec![]), symbol);
+        c.mark_absent(7, tfg::store::MapSymbol::Destroyer);
+        assert!(c.is_settled(7));
+
+        c.install_manifest(&manifest("v2", vec![]), symbol);
+        assert!(!c.is_settled(7), "v1 absence cannot answer for v2");
+        assert!(!c.units.contains_key(&(7, "v1".to_string())));
+    }
+
+    /// The backend's ETag may be absent. That still records that a
+    /// manifest was loaded, but an unknown version never claims cache
+    /// identity or preserves a URL across a repeated read.
+    #[test]
+    fn empty_content_stamp_is_still_a_loaded_version() {
+        let mut c = VisualCache::default();
+        c.install_manifest(
+            &manifest("", vec![entry(1, Some(512), Some(256))]),
+            symbol,
+        );
+        assert!(c.manifest_loaded);
+        assert!(c.is_settled(1));
+        assert_eq!(c.get(1).expect("visual").asset_version, "");
+        c.set_url(1, Some("https://objects/one".into()));
+        let needing = c.install_manifest(
+            &manifest("", vec![entry(1, Some(512), Some(256))]),
+            symbol,
+        );
+        assert_eq!(needing, vec![1], "an unknown version cannot claim cache identity");
+        assert_eq!(c.get(1).expect("visual").image_url, None);
+    }
+
+    /// Installing the same version twice is idempotent and asks for
+    /// nothing, so a re-read does not re-fetch every URL.
+    #[test]
+    fn reinstalling_the_same_version_asks_for_nothing() {
+        let mut c = VisualCache::default();
+        c.install_manifest(&manifest("v1", vec![entry(1, Some(512), Some(256))]), symbol);
+        c.set_url(1, Some("https://objects/one?sig=a".into()));
+        let needing = c.install_manifest(&manifest("v1", vec![entry(1, Some(512), Some(256))]), symbol);
+        assert!(needing.is_empty(), "same version, no new URLs wanted");
+        assert_eq!(
+            c.get(1).expect("visual").image_url.as_deref(),
+            Some("https://objects/one?sig=a"),
+            "and the live URL is kept"
+        );
+    }
+
+    /// Measurements live alongside pictures, not inside them, and
+    /// survive an asset change because the specification did not
+    /// change with the photograph.
+    #[test]
+    fn dimensions_outlive_the_picture() {
+        let mut c = VisualCache::default();
+        c.install_manifest(&manifest("v1", vec![entry(1, Some(512), Some(256))]), symbol);
+        c.set_unit_facts(
+            1,
+            tfg::store::MapSymbol::Corvette,
+            Some(120.5),
+            Some(16.2),
+            Some(4.1),
+        );
+        c.install_manifest(&manifest("v2", vec![entry(1, Some(512), Some(256))]), symbol);
+        let v = c.get(1).expect("visual");
+        assert_eq!(v.loa_m, Some(120.5));
+        assert_eq!(v.beam_m, Some(16.2));
+        assert_eq!(v.draft_m, Some(4.1));
+    }
+
+    /// A picture added after the first manifest read replaces the
+    /// versioned absence and enters the source queue.
+    #[test]
+    fn later_manifest_promotes_unavailable_to_a_picture() {
+        let mut c = VisualCache::default();
+        c.install_manifest(&manifest("v1", vec![]), symbol);
+        c.mark_absent(351, tfg::store::MapSymbol::Destroyer);
+        assert!(!c.needs_url(351));
+
+        let needing = c.install_manifest(
+            &manifest("v2", vec![entry(351, Some(512), Some(256))]),
+            symbol,
+        );
+        assert_eq!(needing, vec![351]);
+        assert_eq!(c.get(351).expect("new visual").asset_kind, AssetKind::UnitImage);
+        assert!(c.needs_url(351));
+    }
+
+    /// Unpublished measurements stay unpublished, so the renderer can
+    /// tell "unknown" from "zero metres".
+    #[test]
+    fn unpublished_measurements_read_as_unknown() {
+        let mut c = VisualCache::default();
+        c.install_manifest(&manifest("v1", vec![entry(1, Some(512), Some(256))]), symbol);
+        c.set_unit_facts(1, tfg::store::MapSymbol::Corvette, None, None, None);
+        let v = c.get(1).expect("visual");
+        assert_eq!(v.loa_m, None);
+        assert_eq!(v.beam_m, None);
+        // …and a hull with no image is still drawable, as a symbol.
+        let absent = UnitVisual::unavailable(99, "v1", tfg::store::MapSymbol::Auxiliary);
+        assert_eq!(absent.asset_kind, AssetKind::Unavailable);
+        assert_eq!(absent.map_symbol, tfg::store::MapSymbol::Auxiliary);
+    }
+
+    /// The session boundary: nothing survives it. This is the
+    /// sign-out / user-change guarantee.
+    #[test]
+    fn clear_leaves_nothing_behind() {
+        let mut c = VisualCache::default();
+        c.install_manifest(&manifest("v1", vec![entry(1, Some(512), Some(256))]), symbol);
+        c.set_url(1, Some("https://objects/one".into()));
+        c.set_unit_facts(
+            1,
+            tfg::store::MapSymbol::Corvette,
+            Some(120.0),
+            Some(16.0),
+            None,
+        );
+        c.mark_absent(2, tfg::store::MapSymbol::Destroyer);
+        c.clear();
+        assert!(c.units.is_empty(), "no unit keeps a URL or measurement");
+        assert!(c.asset_version.is_empty(), "no version survives");
+        assert!(!c.manifest_loaded, "the next session must read its manifest");
+    }
+
+    /// A map thumbnail needs BOTH a supported unit-image asset and a
+    /// decoded texture. A unit mid-fetch is not renderable, so a
+    /// renderer reaching it draws a symbol rather than a hole.
+    #[test]
+    fn map_renderability_needs_a_texture() {
+        let v = UnitVisual::from_entry(&entry(1, Some(512), Some(256)), "v1", symbol(1));
+        assert!(!v.is_map_renderable(), "metadata alone are not a texture");
+        let mut future = entry(2, Some(512), Some(256));
+        future.asset_kind = "account_portrait".to_string();
+        let unsupported = UnitVisual::from_entry(&future, "v1", symbol(2));
+        assert!(!unsupported.is_map_renderable(), "a future kind is not a hull image");
+    }
 }

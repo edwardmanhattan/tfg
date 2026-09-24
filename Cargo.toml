@@ -9,9 +9,11 @@ image = "0.25"
 chrono = "0.4.45"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# Typed backend errors (already in the tree via the socket SDK).
+thiserror = "2"
 egui = "0.36.2"
 eframe = "0.36.2"
-egui_extras = { version = "0.36.2", features = ["image"] }
+egui_extras = { version = "0.36.2", features = ["image", "http"] }
 reqwest = { version = "0.13.5", features = ["blocking", "json"] }
 tiny_http = "0.12.0"
 # Live socket (transport resolution): pinned exact, own thread + own
@@ -25,3 +27,13 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # no async runtime needed. Secret Service on Linux (this host has a daemon;
 # daemon-less machines degrade to a visible memory fallback, never silently).
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+# Token-shape diagnosis (transport ticket): payload inspection for the
+# no-expiry refusal rule (§3). Already in the tree transitively.
+base64 = "0.22"
+
+# Vendored socket SDK (see vendor/tokio-centrifuge): upstream 0.2.6 cannot
+# set the connect command's `data`, which is where Minos reads our token
+# (§2, literal), and drops handshake refusal codes (H5: surfaced through
+# on_disconnected by patch). Pinned version must match the dependency below.
+[patch.crates-io]
+tokio-centrifuge = { path = "vendor/tokio-centrifuge" }

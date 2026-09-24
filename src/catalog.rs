@@ -53,6 +53,11 @@ pub struct Class {
     pub stats: HashMap<String, f64>,
     #[serde(default)]
     pub types: Vec<String>,
+    /// Minos spec version this class was synced from (H10). Zero for
+    /// bundled asset classes — the asset carries no version, and a zero
+    /// version never compares as newer than anything.
+    #[serde(default)]
+    pub version: i64,
 }
 
 impl Class {
@@ -123,6 +128,27 @@ impl Catalog {
         self.classes.iter().find(|c| c.name.to_lowercase() == want)
     }
 
+    /// Minos-synced class by the register's class id (H10): the
+    /// namespaced `minos-<id>` row. Prefer this over
+    /// [`find_class_by_name`](Self::find_class_by_name) whenever the
+    /// id is known — a bundled asset class sharing the name must never
+    /// shadow the synced figures.
+    pub fn find_runtime_class(&self, minos_class_id: i64) -> Option<&Class> {
+        let id = format!("minos-{minos_class_id}");
+        self.classes.iter().find(|c| c.id == id)
+    }
+
+    /// Where a class's figures come from (H10): Minos spec versions
+    /// ride runtime rows, bundled rows carry the asset. Recorded per
+    /// class so placement and order surfaces can name their authority.
+    pub fn class_source(class: &Class) -> &'static str {
+        if class.id.starts_with("minos-") {
+            "Minos spec"
+        } else {
+            "bundled asset"
+        }
+    }
+
     /// A class stat value; falls back to `default` when the key is
     /// absent (optional keys, or schemas without the stat).
     pub fn stat(class: &Class, key: &str, default: f64) -> f64 {
@@ -132,11 +158,13 @@ impl Catalog {
     /// Register a runtime class from synced spec figures (spec-sync
     /// ticket): a Minos hull's own numbers as a sim-drivable class.
     /// Id is namespaced (`minos-<class id>`) so register classes never
-    /// collide with asset ids; re-fetch overwrites in place.
+    /// collide with asset ids; re-fetch overwrites in place. The spec
+    /// version rides along as the class's authority record (H10).
     pub fn upsert_runtime_class(
         &mut self,
         minos_class_id: i64,
         name: String,
+        version: i64,
         speed_kn: f64,
         cruise_kn: f64,
         range_nm: f64,
@@ -152,6 +180,7 @@ impl Catalog {
                 ("range_nm".to_string(), range_nm),
             ]),
             types: Vec::new(),
+            version,
         };
         match self.classes.iter_mut().find(|c| c.id == id) {
             Some(slot) => *slot = class,
@@ -212,15 +241,41 @@ mod tests {
     fn runtime_class_registers_and_overwrites() {
         let mut cat = Catalog::from_default_asset().expect("asset parses");
         let n = cat.ship_classes().len();
-        cat.upsert_runtime_class(7, "Ahmad Yani".into(), 28.0, 18.0, 4000.0);
+        cat.upsert_runtime_class(7, "Ahmad Yani".into(), 3, 28.0, 18.0, 4000.0);
         assert_eq!(cat.ship_classes().len(), n + 1);
         let c = cat.class("minos-7").expect("runtime class");
         assert_eq!(Catalog::stat(c, "speed_kn", 0.0), 28.0);
+        assert_eq!(c.version, 3, "spec version rides the class");
+        assert_eq!(Catalog::class_source(c), "Minos spec");
         // Name match hits the runtime row for register resolution.
         assert_eq!(cat.find_class_by_name("ahmad yani").map(|c| &c.id), Some(&c.id));
-        cat.upsert_runtime_class(7, "Ahmad Yani".into(), 30.0, 18.0, 4000.0);
+        cat.upsert_runtime_class(7, "Ahmad Yani".into(), 4, 30.0, 18.0, 4000.0);
         assert_eq!(cat.ship_classes().len(), n + 1, "overwrite, no duplicate");
         assert_eq!(Catalog::stat(cat.class("minos-7").unwrap(), "speed_kn", 0.0), 30.0);
+    }
+
+    #[test]
+    fn runtime_id_beats_bundled_name() {
+        // H10: a bundled asset sharing the Minos class name must not
+        // shadow the synced figures — resolve by namespaced id first.
+        let mut cat = Catalog::from_default_asset().expect("asset parses");
+        let bundled_name = "Martadinata / SIGMA 10514 PKR";
+        let bundled_id = cat
+            .find_class_by_name(bundled_name)
+            .map(|c| c.id.clone())
+            .expect("bundled row with this name");
+        let bundled_speed = Catalog::stat(cat.class(&bundled_id).unwrap(), "speed_kn", 0.0);
+        cat.upsert_runtime_class(9, bundled_name.into(), 2, bundled_speed + 10.0, 10.0, 1000.0);
+        // Name lookup now hits one of the two same-named rows — the
+        // namespaced id is the unambiguous one, and it carries Minos.
+        let rt = cat.find_runtime_class(9).expect("namespaced lookup");
+        assert_eq!(Catalog::stat(rt, "speed_kn", 0.0), bundled_speed + 10.0);
+        assert_eq!(rt.version, 2);
+        assert_eq!(Catalog::class_source(rt), "Minos spec");
+        assert_eq!(
+            Catalog::class_source(cat.class(&bundled_id).unwrap()),
+            "bundled asset"
+        );
     }
 
     #[test]
