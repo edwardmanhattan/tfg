@@ -1,0 +1,26 @@
+# Redocly configuration for linting the Minos API description.
+#
+#   npx --yes @redocly/cli@latest lint --config docs/openapi/redocly.yaml docs/openapi/minos-api.yaml
+#
+# Committed so that the two frontend teams, the backend, and CI all lint against the
+# same ruleset. A spec that validates in one place and not another is worse than no
+# linting, because it trains people to ignore the output.
+
+extends:
+  - recommended
+
+rules:
+  # The recommended set flags any server URL pointing at localhost. Here localhost is
+  # not a placeholder someone forgot to replace — it is a real, intended development
+  # server that the frontend teams run against, and it has to be in the document so
+  # that a generated client has a working default locally.
+  #
+  # The deployment addresses are supplied at generation time via the `host` server
+  # variable, so there is no risk of a client shipping pointed at localhost.
+  no-server-example.com: off
+
+  # This rule requires a licence `url` or `identifier`. Both are wrong here: the
+  # deliverable is proprietary, so there is no terms URL to link to, and `identifier`
+  # is an OpenAPI 3.1 field that is not valid in the 3.0.3 document this API is
+  # written in. `name` alone satisfies the base info-license rule.
+  info-license-strict: off

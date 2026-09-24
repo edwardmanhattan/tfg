@@ -23,7 +23,7 @@ _Avoid_: path, route, breadcrumbs
 ## Simulation
 
 **Source**:
-The provenance of a Fix: wire (backend report) or sim (synthetic, emitted from orders).
+The provenance of a Fix: wire (backend report), sim (synthetic, emitted from orders), or game (authoritative Minos exercise position, computed by the server — noiseless like sim, scenario-stamped, never wall-aged).
 _Avoid_: origin, type
 
 **Order**:
@@ -45,10 +45,12 @@ _Avoid_: destination, target
 **Game time**:
 The session clock, derived from real time through a fixed ratio (ADR-0004): `game_now = game_start + elapsed_real × ratio`. Quoted as `game_ts` readings and `G+mm:ss` elapsed; never stored on fixes.
 _Avoid_: sim time, virtual time, compressed time
+_For a connected execution the ratio seeds from the Minos `time_factor` and the display follows Minos pause/resume (ADR-0009); the scenario integral itself is never recomputed client-side._
 
 **Pause**:
 A full hold of game time: motion, game_now, and the log clock freeze while the real wall clock runs on. Enforced tick-wise by the sim; session datetimes are never edited.
 _Avoid_: freeze (that is the effect, not the verb), stop
+_A connected execution pauses through Minos (`POST /games/{id}/pause`), which also closes the exercise to orders; the local hold follows the scenario hold._
 
 **Category**:
 What a unit is in the world (Ship, Plane, Tank, Port). Determines which stat keys exist — the schema, not the values.
@@ -114,6 +116,7 @@ _Avoid_: joint operation (that's the exercise, not the group)
 **Session**:
 One organized play instance: time windows, players, units with placements, groups with commanders. Runs setup → live → closed.
 _Avoid_: game (that's the model, not the instance), mission
+_When connected, the held game's stage is read from Minos (`GET /games/{id}`) and the local machine follows it; local Back/Replan never move the backend, which is forward-only._
 
 **Seat**:
 One command slot in a session: helm of a unit, or commander of a unit or group. Users are bound to seats; one user may hold several.

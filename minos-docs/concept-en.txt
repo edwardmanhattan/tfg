@@ -1,0 +1,140 @@
+Project Minos - Tactical Board Game (Backend)
+
+1. Features
+    1. Content Management System (CMS)
+        1. Master Data User
+        2. Master Data Units
+        3. Master Data Unit Classification
+            1. Category
+            2. Class
+            3. Type / Role 
+        4. Master Data Role
+            1. Application Role
+            2. Game Role
+        5. Master Data Unit Hierarchy
+        6. Master Data Game Judge
+    2. Game List
+        1. Create Game (Along with the Core Concepts)
+        2. View Game History
+        
+
+Core Concepts :
+Each game is divided into 4 States / Status :
+1. Planning
+2. Preparation
+3. Execution
+4. Closure
+
+1. Planning
+    Planning is where the "Game Master" creates the "Game" or "Operation", a "Game" consists of :
+        1. Description (Input Box) - defined by the "Game Master"
+        2. Time - Actual Time and Asumpted Time and Time Factor. Time Factor are used to "Scale" the Actual Time of the "Game"
+        3. Area - Where the "Game" is going to be executed on. No need for geofence, only use General Area so it is all right if multiple "Area" crossed with each other (Input Box)
+        4. Purpose (Input Box) & Target - Why the "Game" is made, for what purpose. Defined by the "Game Master"
+        5. Map Tag (Input Box) - Will be displayed on the Map and will be Hidden in other "Stage" of the "Game"
+        6. Judges[5] - Personnels who will perform Performance Analysis and give "Points" to a Personnel based on the "Gameplay"
+        7. Units[2] - The "Game Piece" that will be commanded by the Commando assigned to it
+        8. Unit Leader - Commando which is given the ability to "Steer" or "Move" the Unit it is assigned to
+        9. Unit Personnels - Personnels Personnels who works under the Leader
+        10. Hierarchy of the Units[1] - Units and Commando are the smallest "Object" in the "Game". Each hierarchy can have it's own Icon so they are easily identified
+        11. Mode of the "Game" - Currently there are only "Maneuver" and "Static"
+        12. Scenario Role - "Game Master" can create Scencario Role (eg. Panglima TNI). This can be used to send Telegram Message while in Execution Phase
+        13. Hierarchy Assignment - Directly related to the value assigned in (10)
+2. Preparation
+    Preparation is where the assigned Personnels (Commando, Unit Personnels, and Judges) are required to login into the "Game Room" using the System Generated Room Key
+        1. Each Personnels (Excluding the Judges) are required "State" that they are ready to perform (Via "Ready Button" or something)
+        2. The "Game Master" will be required to place the Unit in the Map. The Commando and its Personnels does not know where the "Game Area" is until it is Executed (Stage after this)
+        3. Once all Personnels are "Ready" then and only then can the "Game Master" move on to the next "State"
+3. Execution
+    Execution is where the Personnels will perform various "Task" given by the "Game Master" and "Judges".
+        1. Commando can "Maneuver" their Unit; Speed (knots) and Heading (in degrees)
+        2. Commando can "See" the distance between their own Unit with other selected Unit (even in other Hierarchy) including their Bearings
+        3. "Game Master" and "Judges" can send "Messages"[6] to the Units / "Objects"
+        4. "Game Master" and "Judges" can change the "Time Factor" of the Execution Phase (this will be logged and is a global value for the "Game"). The change only affect the Asumpted Time
+        5. "Game Master" and "Judges" can "Pause" the "Game". During pause all actions are disregarded by the System (excluding Range Calculation).
+        6. "Game Master" and "Judges" are able to give "Judgement" for every actions that are taken by each Personnels. (Turning the Bearings, Adjusting the Speed, Route Taken, etc)
+        7. "Game Master" and "Judges" are able to "Simulate" random events during this Phase (Natural Disasters, Synthetic Disasters, Orders from the Higher Up, etc)
+        8. "Game Master" and "Judges" are allowed to give "Warning" to each Personnels if they are determined to "Breach" certain aspect (Moved to far from the "Game Area", Not Responding, etc)
+4. Closure
+    Closure is where the "Game Master" and "Judges" analyze the "Game Play". In this phase they can view each action taken by each Personnels with playback-like feature (slider or some sort).
+    The closure phase is only accessible by the "Game Master" and "Judges". The "Game Master" and "Judges" are also able to give additional reviews in this phase.
+    Personnels are not allowed to see this Phase so they will be taken back to the "Home Menu" after the "Game" reached this "Stage"
+
+
+[1] Hierarchy
+        Unsur -> Lowest
+        Satuan Tugas
+        Gugus
+        Operasi Gabungan -> Highest
+
+[2] Unit Details
+        Category
+        Type
+        Class
+        Individiual
+        Spec - Separate Log
+
+    Example :   KRI Ahmad Yani
+                Category -> Frigate / Frigat
+                Class -> Ahmad Yani / Van Speijk
+                Type -> Frigate / Frigat Multipurpose / ASW
+                Individual -> KRI Ahmad Yani
+                Spec -> Nomor Lambung, Sourced Nation, Sourced Shipyard, Year Registered, Dimension, Arsenal, etc
+
+[4] There are 2 types of Roles in the System
+    1. App Role -> Operator / Admin
+    2. Game Role -> Commando, Game Master (Penyelenggara), Deputi, etc
+
+
+[5] Judges Role
+        1. Deputi
+        2. Wasit
+        3. Pengendali
+        4. Peninjau
+        5. Penilai
+        6. Peran Lainnya
+    "Game Master" is called Director (Direktur)
+
+[6] Message Types
+    1. Telegram Message (Berita Telegram) 
+        Official Messages that is used to sent News between Personnels or "Actor". If "Game Master" and or Judges wants to send Telegram News
+        then they are required to "Act" as some kind of a Commando (can be Higher, Same, Lower Hierarchy)
+    2. Administrative Message (Berita Administratif)
+        Administrative News that is used between Judges and "Game Master"
+
+[7] Telegram Message Format
+    1. "Game Name" (Nama Operasi) eg. Operasi Batu Malang
+    2. Registration Number - Manual Input or System Generated (TBD)
+    3. Form Title - FORMULIR BERITA (set by Frontend)
+    4. Panggilan (Petunjuk PAHUB) - ?
+    5. Type (Jenis) - Manual Input or Dropdown (TBD)
+    6. Number (Nomor) - Could this be related to (2) ?, By default the value is "Otomatis" or "Automatic"
+    7. Degree (Derajat) - Manual Input or Dropdown (TBD) eg. Segera
+    8. Sender Instruction (Instr. Mengirim) - ?
+    9. Tgl / Waktu Pengunjukan (What?) - Time with 'DD/MM/YYYY, HH:mm:ss' format, can be saved in the System using RFC3339 Format
+    10. Tanda Dinas (What ?)
+    11. Group (Grup) - ?
+    12. Content - Encased in a border that changes color depending on the Classification. Red for Classifed (Rahasia) and Black for the other
+        1. From
+        2. To - Can be > 1
+        3. CC (Tembusan) - Can be > 1
+        4. Number (Nomor) - Same as (6)
+        5. Telegram New Content - Manual Input Box by the User
+        6. Tgl / Waktu Pembikinan - Time with 'DD/MM/YYYY, HH:mm:ss' format, can be saved in the System using RFC3339 Format
+        7. Sender Signature
+        8. Degree - ?
+            1. Action - ?
+            2. CC (Tembusan) - Could this be the same as (12.3) ?
+    13. Time
+            Received 
+            CC
+    14. Per (What ?)
+    15. Signature (Whose ?)
+
+[8] Administrative Message Format
+    1. No
+    2. Kepada
+    3. Dari
+    4. Pesan
+    5. Waktu (YYYY-MM-DD HH:mm:ss) -> could be improved with TimeZoning but will still be saved using RFC3339 in the DB
+    6. Aksi (Balas / Reply, Hapus / Delete)
