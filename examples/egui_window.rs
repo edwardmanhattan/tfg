@@ -6962,7 +6962,6 @@ impl ShipApp {
         if !game_stream_fresh
             && self.plot_op.is_none()
             && self.session_live()
-            && self.app_mode == AppMode::Simulation
             && self.users_game_state.as_deref() == Some("execution")
             && self.users_game.is_some()
         {
