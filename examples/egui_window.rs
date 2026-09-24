@@ -2067,7 +2067,7 @@ impl ShipApp {
                     };
                     self.helm_submissions.remove(&ship_id);
                     self.order_result
-                        .insert(ship_id.clone(), HelmOrderUiResult::Refused(why.clone()));
+                        .insert(ship_id.clone(), HelmOrderUiResult::Refused(why.to_string()));
                     self.feed(format!("refused {ship_id}: {why}"));
                     self.order_warning = Some(format!("{ship_id}: {why}"));
                 }
@@ -2094,7 +2094,7 @@ impl ShipApp {
                     };
                     self.helm_submissions.remove(&ship_id);
                     self.order_result
-                        .insert(ship_id.clone(), HelmOrderUiResult::Refused(why.clone()));
+                        .insert(ship_id.clone(), HelmOrderUiResult::Refused(why.to_string()));
                     self.feed(format!("command refused ({ship_id}): {why}"));
                     self.order_warning = Some(format!("{ship_id}: {why}"));
                 }
@@ -4589,7 +4589,9 @@ impl ShipApp {
         );
         if let Some(result) = self.order_result.get(id) {
             match result {
-                HelmOrderUiResult::Draft => ui.weak("draft · not submitted"),
+                HelmOrderUiResult::Draft => {
+                    ui.weak("draft · not submitted");
+                }
                 HelmOrderUiResult::Pending => {
                     ui.weak("pending — waiting for MinOS GameFix");
                 }
@@ -4608,7 +4610,9 @@ impl ShipApp {
                 HelmOrderUiResult::Refused(reason) => {
                     warn_line(ui, format!("refused: {reason}"));
                 }
-                HelmOrderUiResult::Superseded => ui.weak("superseded by a newer intent"),
+                HelmOrderUiResult::Superseded => {
+                    ui.weak("superseded by a newer intent");
+                }
             }
         }
         if matches!(self.order_result.get(id), Some(HelmOrderUiResult::Draft))
@@ -4758,7 +4762,10 @@ impl ShipApp {
                 id.to_string(),
                 HelmOrderUiResult::Refused("no local speed limit is published".into()),
             );
-            warn_line(ui, "local refusal: no speed limit is published for this class");
+            warn_line(
+                ui,
+                "local refusal: no speed limit is published for this class".to_string(),
+            );
             return;
         }
         let reported = self
@@ -4818,8 +4825,12 @@ impl ShipApp {
         );
         if let Some(result) = self.order_result.get(id) {
             match result {
-                HelmOrderUiResult::Draft => ui.weak("local draft · not submitted"),
-                HelmOrderUiResult::Pending => ui.weak("pending local sandbox command…"),
+                HelmOrderUiResult::Draft => {
+                    ui.weak("local draft · not submitted");
+                }
+                HelmOrderUiResult::Pending => {
+                    ui.weak("pending local sandbox command…");
+                }
                 HelmOrderUiResult::Accepted => {
                     ui.label(egui::RichText::new("accepted by local sandbox").color(egui::Color32::GREEN));
                 }
@@ -4828,7 +4839,9 @@ impl ShipApp {
                 }
                 HelmOrderUiResult::Unknown(reason) => warn_line(ui, format!("local outcome unknown: {reason}")),
                 HelmOrderUiResult::Refused(reason) => warn_line(ui, format!("local refusal: {reason}")),
-                HelmOrderUiResult::Superseded => ui.weak("local draft superseded"),
+                HelmOrderUiResult::Superseded => {
+                    ui.weak("local draft superseded");
+                }
             }
         }
         if matches!(self.order_result.get(id), Some(HelmOrderUiResult::Draft))
@@ -10195,7 +10208,7 @@ impl eframe::App for ShipApp {
             ui.heading("Helm");
             // Group selection is inspectable here, but the first slice
             // deliberately avoids a multi-unit helm fan-out.
-            if let Some(Selection::Group(gid)) = self.selection.clone() {
+            if let Some(Selection::Group(_gid)) = self.selection.clone() {
                 ui.collapsing("Legacy waypoint navigation (compatibility)", |ui| {
             if let Some(Selection::Group(gid)) = self.selection.clone() {
                 match self.group_info(&gid) {
