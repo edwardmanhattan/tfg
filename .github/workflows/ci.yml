@@ -1,0 +1,128 @@
+name: Cross-platform build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  MLN_PRECOMPILE: "0"
+  MLN_CORE_LIBRARY_USE_AMALGAM: "0"
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+            binary: tfg
+            maplibre_feature: maplibre_native/vulkan
+            timeout: 60
+          - os: macos-15
+            platform: macos
+            binary: tfg
+            maplibre_feature: maplibre_native/metal
+            timeout: 90
+          - os: windows-2022
+            platform: windows
+            binary: tfg.exe
+            maplibre_feature: maplibre_native/opengl
+            timeout: 120
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            glslang-dev \
+            glslang-tools \
+            libcurl4-openssl-dev \
+            libfontconfig-dev \
+            libicu-dev \
+            libjpeg-turbo8-dev \
+            libpng-dev \
+            libuv1-dev \
+            libwebp-dev \
+            libz-dev \
+            ninja-build \
+            pkg-config
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install \
+            cmake \
+            curl \
+            jpeg-turbo \
+            libpng \
+            libuv \
+            ninja \
+            webp \
+            zlib
+
+      - name: Enable long Windows paths
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
+      - name: Check out MapLibre Native source
+        if: runner.os == 'Windows'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: maplibre/maplibre-native
+          ref: core-a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b
+          path: target/maplibre-native
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install Windows MapLibre dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "${{ github.workspace }}\target\maplibre-native\platform\windows\Get-VendorPackages.ps1" -Triplet x64-windows -Renderer OpenGL -With-ICU
+          "MLN_LOCAL_REPOSITORY=${{ github.workspace }}\target\maplibre-native" >> $env:GITHUB_ENV
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build release binary
+        run: cargo build --release --locked --features ${{ matrix.maplibre_feature }}
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tfg-${{ matrix.platform }}-${{ runner.arch }}
+          path: target/release/${{ matrix.binary }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
