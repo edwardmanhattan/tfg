@@ -168,14 +168,14 @@ best effort and is published after commit: [publish path](https://github.com/Vox
   sends no position or timestamp.
 - `apply_fix_batch` logs the returned fix and then refreshes
   `GET /games/{id}/positions`; it does not install a second local sim order
-  for a connected piece: [order application](../../examples/egui_window.rs#L4137-L4242).
+  for a connected piece: [order application](../../src/main.rs#L4137-L4242).
 - The plot path maps MinOS positions to `FixSource::Game`, keeps the
   per-position scenario stamp, and bypasses the wire-only jitter guard through
-  the existing registry: [plot mapping](../../examples/egui_window.rs#L4244-L4331),
+  the existing registry: [plot mapping](../../src/main.rs#L4244-L4331),
   [registry blend](../../src/geo/track.rs#L345-L384).
 - Execution releases identifiable local game pieces before the MinOS plot is
   pulled, so the connected path does not deliberately run two movement
-  authorities: [release path](../../examples/egui_window.rs#L4333-L4350).
+  authorities: [release path](../../src/main.rs#L4333-L4350).
 
 ### Seams that constrain later implementation
 
@@ -193,7 +193,7 @@ best effort and is published after commit: [publish path](https://github.com/Vox
    leg in force, not the query instant. The API documents this explicitly:
    [position schema](https://github.com/Voxtmault/minos/blob/49cd4c2c559674a3ccc5eefa93de3d75072774b2/docs/openapi/minos-api.yaml#L8606-L8634).
    `apply_plot` currently puts the per-position leg stamp into `Fix.ts` and
-   ignores the list-level instant: [plot mapping](../../examples/egui_window.rs#L4275-L4315).
+   ignores the list-level instant: [plot mapping](../../src/main.rs#L4275-L4315).
    Because `Registry` drops equal/older timestamps, repeated snapshots of one
    leg are not distinct animation samples under the current mapping. This is
    a factual seam to carry into the animation decision, not a change made by
@@ -215,12 +215,12 @@ best effort and is published after commit: [publish path](https://github.com/Vox
 6. **The existing UI still derives a heading from a waypoint before posting**
    (`minos_leg`), while the backend itself accepts heading directly. That is
    current legacy UI shape, not a statement that MinOS needs a waypoint: [UI
-   seam](../../examples/egui_window.rs#L4152-L4175).
+   seam](../../src/main.rs#L4152-L4175).
 7. **Typed refusal information is lost in the order worker.** The worker maps
    `BackendError` to `String` before returning `OrderOut`; later result-state
    work cannot distinguish 403/409 from transport failures without restoring
    the typed seam. The typed transport/error mapping itself is already
-   present: [order batch](../../examples/egui_window.rs#L4197-L4208),
+   present: [order batch](../../src/main.rs#L4197-L4208),
    [error mapping](../../src/backend/error.rs#L56-L96).
 
 ## Bottom line for the map's later tickets

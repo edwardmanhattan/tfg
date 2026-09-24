@@ -109,8 +109,9 @@ slice (currently local/mock).
 - `assets/fleet.json`, `assets/catalog.json`, `assets/ne_50m_land.json`,
   `assets/tiles-cache.seed.sqlite`.
 - `scenarios/{empty,surge,ghost,dark}.json`, `tests/fixtures/tracks.json`.
-- `examples/` — `egui_window`, `mock_backend`, `map_spike`,
-  `calibrate_projection`, `seed_cache`, `offline_check`.
+- `src/main.rs` — the packaged `tfg` command-center application.
+- `examples/` — `mock_backend`, `map_spike`, `calibrate_projection`,
+  `seed_cache`, `offline_check`.
 
 Absences future work must not fabricate: no testimonials, customers,
 benchmarks, press, pricing, or licensing evidence exists in this repo.

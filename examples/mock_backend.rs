@@ -25,7 +25,7 @@
 //! - `dark`: backend alive, nothing reporting (all-stale demo)
 //!
 //! Run: `cargo run --example mock_backend -- [scenario]`
-//! Then: `TFG_BACKEND_URL=http://127.0.0.1:3000 scripts/run-egui-window.sh`
+//! Then: `TFG_BACKEND_URL=http://127.0.0.1:3000 cargo run`
 
 use std::io::Read;
 use std::sync::{Arc, Mutex};
