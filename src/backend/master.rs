@@ -821,15 +821,61 @@ impl MinosMaster {
             &format!("/games/{game_id}/units/{unit_id}/order"),
             serde_json::json!({ "heading_deg": heading_deg, "speed_kn": speed_kn }),
         )?;
+        let malformed = |field: &str| {
+            BackendError::Other(format!(
+                "malformed Minos order response: missing or invalid {field}"
+            ))
+        };
+        let response_unit = data["id_unit"].as_i64().ok_or_else(|| malformed("id_unit"))?;
+        if response_unit != unit_id {
+            return Err(BackendError::Other(format!(
+                "malformed Minos order response: id_unit {response_unit} does not match path {unit_id}"
+            )));
+        }
+        let assumed_time = data["assumed_time"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| malformed("assumed_time"))?
+            .to_string();
+        let latitude = data["latitude"]
+            .as_f64()
+            .ok_or_else(|| malformed("latitude"))?;
+        let longitude = data["longitude"]
+            .as_f64()
+            .ok_or_else(|| malformed("longitude"))?;
+        let applied_heading = data["heading_deg"]
+            .as_f64()
+            .ok_or_else(|| malformed("heading_deg"))?;
+        let applied_speed = data["speed_kn"]
+            .as_f64()
+            .ok_or_else(|| malformed("speed_kn"))?;
+        let clamped = data["clamped"]
+            .as_bool()
+            .ok_or_else(|| malformed("clamped"))?;
+        let requested_speed = match data.get("requested_speed_kn") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_f64()
+                    .ok_or_else(|| malformed("requested_speed_kn"))?,
+            ),
+        };
+        if clamped != requested_speed.is_some() {
+            return Err(BackendError::Other(
+                "malformed Minos order response: clamped and requested_speed_kn disagree".into(),
+            ));
+        }
         Ok(GameFix {
-            unit_id: data["id_unit"].as_i64().unwrap_or(unit_id),
-            assumed_time: data["assumed_time"].as_str().unwrap_or("").to_string(),
-            latitude: data["latitude"].as_f64().unwrap_or(0.0),
-            longitude: data["longitude"].as_f64().unwrap_or(0.0),
-            heading: data["heading_deg"].as_f64().unwrap_or(heading_deg),
-            speed: data["speed_kn"].as_f64().unwrap_or(speed_kn),
-            requested_speed: data["requested_speed_kn"].as_f64(),
-            clamped: data["clamped"].as_bool().unwrap_or(false),
+            unit_id: response_unit,
+            assumed_time,
+            latitude,
+            longitude,
+            heading: applied_heading,
+            speed: applied_speed,
+            requested_speed,
+            clamped,
+            created_at: data["created_at"].as_str().map(str::to_string),
+            created_by: data["created_by"].as_i64(),
         })
     }
 
@@ -857,24 +903,49 @@ impl MinosMaster {
             format!("/games/{game_id}/positions?{}", qs.join("&"))
         };
         let data = self.get(token, &path)?;
-        Ok(PositionList {
-            assumed_time: data["assumed_time"].as_str().unwrap_or("").to_string(),
-            positions: data["positions"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|p| {
-                    Some(GameHullPos {
-                        unit_id: p["id_unit"].as_i64()?,
-                        latitude: p["latitude"].as_f64().unwrap_or(0.0),
-                        longitude: p["longitude"].as_f64().unwrap_or(0.0),
-                        heading: p["heading_deg"].as_f64().unwrap_or(0.0),
-                        speed: p["speed_kn"].as_f64().unwrap_or(0.0),
-                        assumed_time: p["assumed_time"].as_str().unwrap_or("").to_string(),
-                    })
+        let malformed = |field: &str| {
+            BackendError::Other(format!(
+                "malformed Minos positions response: missing or invalid {field}"
+            ))
+        };
+        let assumed_time = data["assumed_time"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| malformed("assumed_time"))?
+            .to_string();
+        let rows = data["positions"]
+            .as_array()
+            .ok_or_else(|| malformed("positions"))?;
+        let positions = rows
+            .iter()
+            .map(|p| {
+                Ok(GameHullPos {
+                    unit_id: p["id_unit"]
+                        .as_i64()
+                        .ok_or_else(|| malformed("id_unit"))?,
+                    latitude: p["latitude"]
+                        .as_f64()
+                        .ok_or_else(|| malformed("latitude"))?,
+                    longitude: p["longitude"]
+                        .as_f64()
+                        .ok_or_else(|| malformed("longitude"))?,
+                    heading: p["heading_deg"]
+                        .as_f64()
+                        .ok_or_else(|| malformed("heading_deg"))?,
+                    speed: p["speed_kn"]
+                        .as_f64()
+                        .ok_or_else(|| malformed("speed_kn"))?,
+                    assumed_time: p["assumed_time"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| malformed("assumed_time"))?
+                        .to_string(),
                 })
-                .collect(),
+            })
+            .collect::<Result<Vec<_>, BackendError>>()?;
+        Ok(PositionList {
+            assumed_time,
+            positions,
         })
     }
 
@@ -1788,6 +1859,11 @@ pub struct GameFix {
     pub speed: f64,
     pub requested_speed: Option<f64>,
     pub clamped: bool,
+    /// Audit metadata emitted by MinOS' Go DTO but not required by the
+    /// older OpenAPI schema. Keep it when present; never use it to fill a
+    /// required movement field.
+    pub created_at: Option<String>,
+    pub created_by: Option<i64>,
 }
 
 /// One hull's computed position at the answered instant (C3): the leg

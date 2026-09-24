@@ -44,6 +44,16 @@ pub struct Order {
     pub state: OrderState,
 }
 
+/// A local sandbox HelmOrder. It is deliberately separate from the
+/// legacy waypoint Order so the sandbox can preserve old scenarios while
+/// exposing the new persistent heading/speed contract.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HelmOrder {
+    pub heading_deg: f32,
+    pub speed_kn: f32,
+    pub blocked: bool,
+}
+
 /// UI -> sim.
 #[derive(Debug, Clone)]
 pub enum SimCommand {
@@ -66,6 +76,9 @@ pub enum SimCommand {
     },
     Release { ship_id: String },
     SetOrder { ship_id: String, waypoint: GeoPosition, speed_kn: f32 },
+    /// Persistent local helm setpoint. Unlike legacy SetOrder, this has
+    /// no waypoint and remains in force until replaced.
+    SetHelm { ship_id: String, heading_deg: f32, speed_kn: f32 },
     CancelOrder { ship_id: String },
     /// Multi-unit move (precedence grill, #19): fanned out to per-ship
     /// orders under grant + authority checks. The sim never sees commands
@@ -119,6 +132,9 @@ pub enum OrderRefusal {
     /// Takeover named a class the sim does not know (H10): no stats,
     /// no ship. Sync specs first — the sim invents no abilities.
     UnknownClass,
+    /// A HelmOrder was requested for a class with no usable local speed
+    /// bound. The sandbox fails closed rather than inventing a maximum.
+    NoSpeedLimit,
 }
 
 /// UI <- sim: why an OrderMove leg was refused (precedence grill, #19).
@@ -138,6 +154,15 @@ pub enum SimEvent {
     Arrival { ship_id: String },
     /// A SetOrder was rejected (land waypoint / land between).
     OrderRefused { ship_id: String, reason: OrderRefusal },
+    /// A local HelmOrder was applied after the command was accepted by
+    /// the sandbox. The UI uses this to leave Pending without guessing
+    /// that a queued channel send was an authoritative commit.
+    HelmApplied {
+        ship_id: String,
+        heading_deg: f32,
+        requested_speed_kn: f32,
+        accepted_speed_kn: f32,
+    },
     /// An OrderMove leg was refused (precedence grill, #19): lower
     /// authority or a failing grant. The future Log's entry kind.
     CommandRefused { ship_id: String, reason: CommandRefusal },
@@ -158,6 +183,7 @@ struct SimShip {
     pos: GeoPosition,
     heading_deg: f32,
     order: Option<Order>,
+    helm_order: Option<HelmOrder>,
     /// Catalog class backing this unit (grill #18): holds its abilities.
     class: Class,
     /// Who currently holds the ship (precedence grill, #19): only an
@@ -248,6 +274,7 @@ impl SimSource {
             // class; orders cannot exceed capability. A missing cap
             // reads as no speed (H10) — failing closed, never infinite.
             let max = Catalog::stat(&s.class, "speed_kn", 0.0) as f32;
+            s.helm_order = None;
             s.order = Some(Order {
                 waypoint,
                 speed_kn: speed_kn.min(max),
@@ -294,6 +321,7 @@ impl SimSource {
                         pos,
                         heading_deg: 0.0,
                         order: None,
+                        helm_order: None,
                         class,
                         held_by: Authority::UNIT,
                     });
@@ -420,9 +448,59 @@ impl SimSource {
                         }
                     }
                 }
+                SimCommand::SetHelm { ship_id, heading_deg, speed_kn } => {
+                    let Some(ship) = self.ships.get(&ship_id) else {
+                        continue;
+                    };
+                    let max = Catalog::stat(&ship.class, "speed_kn", 0.0) as f32;
+                    if max <= 0.0 {
+                        let reason = OrderRefusal::NoSpeedLimit;
+                        let _ = self.evt_tx.send(SimEvent::OrderRefused {
+                            ship_id: ship_id.clone(),
+                            reason,
+                        });
+                        self.journal.append(
+                            self.clock.game_now_ts(),
+                            "sim",
+                            LogKind::OrderRefused,
+                            serde_json::json!({"ship": ship_id, "reason": "NoSpeedLimit"}),
+                        );
+                        continue;
+                    }
+                    let heading = heading_deg.rem_euclid(360.0);
+                    let accepted_speed = speed_kn.clamp(0.0, max);
+                    self.journal.append(
+                        self.clock.game_now_ts(),
+                        "sim",
+                        LogKind::Command,
+                        serde_json::json!({
+                            "event": "set-helm",
+                            "ship": ship_id.clone(),
+                            "heading_deg": heading,
+                            "requested_speed_kn": speed_kn,
+                            "accepted_speed_kn": accepted_speed,
+                        }),
+                    );
+                    if let Some(ship) = self.ships.get_mut(&ship_id) {
+                        ship.order = None;
+                        ship.heading_deg = heading;
+                        ship.helm_order = Some(HelmOrder {
+                            heading_deg: heading,
+                            speed_kn: accepted_speed,
+                            blocked: false,
+                        });
+                    }
+                    let _ = self.evt_tx.send(SimEvent::HelmApplied {
+                        ship_id: ship_id.clone(),
+                        heading_deg: heading,
+                        requested_speed_kn: speed_kn,
+                        accepted_speed_kn: accepted_speed,
+                    });
+                }
                 SimCommand::CancelOrder { ship_id } => {
                     if let Some(s) = self.ships.get_mut(&ship_id) {
                         s.order = None;
+                        s.helm_order = None;
                     }
                 }
                 SimCommand::SetPaused { paused } => {
@@ -454,33 +532,47 @@ impl SimSource {
         let mut out: Vec<OrderView> = self
             .ships
             .iter()
-            .map(|(id, s)| match &s.order {
-                Some(o) => {
-                    let dist = s.pos.distance_m(&o.waypoint);
-                    // Game seconds to waypoint: motion covers dist at
-                    // speed over GAME time (ADR-0004).
-                    let eta = (dist / (o.speed_kn as f64 * 0.514_444)) as u64;
-                    OrderView {
+            .map(|(id, s)| {
+                if let Some(helm) = &s.helm_order {
+                    return OrderView {
                         ship_id: id.clone(),
-                        waypoint: Some(o.waypoint),
-                        ordered_speed_kn: Some(o.speed_kn),
-                        state: o.state,
-                        eta_secs: Some(eta),
+                        waypoint: None,
+                        ordered_speed_kn: Some(helm.speed_kn),
+                        state: OrderState::Holding,
+                        eta_secs: None,
                         class_id: s.class.id.clone(),
                         type_label: s.class.display_type().to_string(),
                         max_speed_kn: Catalog::stat(&s.class, "speed_kn", 0.0) as f32,
-                    }
+                    };
                 }
-                None => OrderView {
-                    ship_id: id.clone(),
-                    waypoint: None,
-                    ordered_speed_kn: None,
-                    state: OrderState::Holding,
-                    eta_secs: None,
-                    class_id: s.class.id.clone(),
-                    type_label: s.class.display_type().to_string(),
-                    max_speed_kn: Catalog::stat(&s.class, "speed_kn", 0.0) as f32,
-                },
+                match &s.order {
+                    Some(o) => {
+                        let dist = s.pos.distance_m(&o.waypoint);
+                        // Game seconds to waypoint: motion covers dist at
+                        // speed over GAME time (ADR-0004).
+                        let eta = (dist / (o.speed_kn as f64 * 0.514_444)) as u64;
+                        OrderView {
+                            ship_id: id.clone(),
+                            waypoint: Some(o.waypoint),
+                            ordered_speed_kn: Some(o.speed_kn),
+                            state: o.state,
+                            eta_secs: Some(eta),
+                            class_id: s.class.id.clone(),
+                            type_label: s.class.display_type().to_string(),
+                            max_speed_kn: Catalog::stat(&s.class, "speed_kn", 0.0) as f32,
+                        }
+                    }
+                    None => OrderView {
+                        ship_id: id.clone(),
+                        waypoint: None,
+                        ordered_speed_kn: None,
+                        state: OrderState::Holding,
+                        eta_secs: None,
+                        class_id: s.class.id.clone(),
+                        type_label: s.class.display_type().to_string(),
+                        max_speed_kn: Catalog::stat(&s.class, "speed_kn", 0.0) as f32,
+                    },
+                }
             })
             .collect();
         out.sort_by(|a, b| a.ship_id.cmp(&b.ship_id));
@@ -515,7 +607,23 @@ impl SimSource {
         // Sim speed fix reports the CLASS capability when there is no
         // order (traffic-style readout), else the ordered speed.
         for (id, s) in self.ships.iter_mut() {
-            if let Some(o) = s.order.as_mut() {
+            if let Some(helm) = s.helm_order.as_mut() {
+                if !helm.blocked && helm.speed_kn > 0.0 {
+                    let next = s.pos.dead_reckon(helm.heading_deg, helm.speed_kn, game_dt);
+                    let clear = self
+                        .land
+                        .as_ref()
+                        .map(|l| l.path_is_water(&s.pos, &next))
+                        .unwrap_or(true);
+                    if clear {
+                        s.pos = next;
+                    } else {
+                        helm.blocked = true;
+                        helm.speed_kn = 0.0;
+                        blocked.push(id.clone());
+                    }
+                }
+            } else if let Some(o) = s.order.as_mut() {
                 if o.state == OrderState::EnRoute {
                     let dist = s.pos.distance_m(&o.waypoint);
                     if dist <= ARRIVAL_M {
@@ -556,9 +664,10 @@ impl SimSource {
                 received_at: None,
                 heading_deg: Some(s.heading_deg),
                 speed_kn: s
-                    .order
+                    .helm_order
                     .as_ref()
-                    .map(|o| o.speed_kn)
+                    .map(|h| h.speed_kn)
+                    .or_else(|| s.order.as_ref().map(|o| o.speed_kn))
                     .or(Some(Catalog::stat(&s.class, "speed_kn", 0.0) as f32)),
                 accuracy_m: None,
                 name: None,

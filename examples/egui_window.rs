@@ -23,7 +23,7 @@ use tfg::backend::{BackendError, FileReplay, GameMsg, LiveCmd, LiveEvent, LiveWi
 use tfg::catalog::Catalog;
 use tfg::fleet::Fleet;
 use tfg::groups::{GroupKind, Groups};
-use tfg::command::{Authority, Grant, GrantDenial, Leg, MoveCommand, Verb};
+use tfg::command::{Authority, GrantDenial};
 use tfg::geo::track::{Fix, FixSource, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
@@ -1364,6 +1364,23 @@ enum ImageOut {
     Url(i64, Option<String>),
 }
 
+/// A command result kept in the Inspector/Orders surface. The transport
+/// worker classifies failures before they reach the UI; no raw error
+/// string is mistaken for an accepted HelmOrder.
+#[derive(Debug, Clone, PartialEq)]
+enum HelmOrderUiResult {
+    Pending,
+    Accepted,
+    Clamped { requested: f64, accepted: f64 },
+    Unknown(String),
+    Refused(String),
+}
+
+enum OrderFailure {
+    Refused(String),
+    Unknown(String),
+}
+
 /// One Minos order inside a batch (#100): the address plus its
 /// outcome. Speeds stay f32 like the order drafts; the worker widens
 /// to f64 at the POST.
@@ -1371,7 +1388,7 @@ struct OrderOut {
     ship: String,
     heading: f64,
     speed: f32,
-    result: Result<tfg::backend::GameFix, String>,
+    result: Result<tfg::backend::GameFix, OrderFailure>,
 }
 
 /// Every setup-flow read/write result (#100): one slot serializes
@@ -1517,10 +1534,17 @@ struct ShipApp {
     sim_cmd_tx: Option<Sender<SimCommand>>,
     sim_evt_rx: Receiver<SimEvent>,
     order_views: HashMap<String, OrderView>,
+    /// Latest visible result for each ship. This is a UI projection,
+    /// not a second authority; the MinOS response or local sim event
+    /// replaces it.
+    order_result: HashMap<String, HelmOrderUiResult>,
     controlled: HashSet<String>,
     pending_waypoint: Option<(f64, f64)>,
     placing: bool,
     order_speed: f32,
+    /// Helm heading draft; `None` means the next selected ship's
+    /// authoritative heading seeds the control.
+    order_heading: Option<f32>,
     /// Land test for order validation (ticket #22): land waypoints are
     /// rejected in the UI before they ever reach the sim.
     land: Option<Land>,
@@ -1985,14 +2009,33 @@ impl ShipApp {
                     self.game_ts = game_ts;
                     self.game_paused = paused;
                 }
+                SimEvent::HelmApplied {
+                    ship_id,
+                    heading_deg: _,
+                    requested_speed_kn,
+                    accepted_speed_kn,
+                } => {
+                    let result = if requested_speed_kn > accepted_speed_kn {
+                        HelmOrderUiResult::Clamped {
+                            requested: requested_speed_kn as f64,
+                            accepted: accepted_speed_kn as f64,
+                        }
+                    } else {
+                        HelmOrderUiResult::Accepted
+                    };
+                    self.order_result.insert(ship_id, result);
+                }
                 SimEvent::OrderRefused { ship_id, reason } => {
                     let why = match reason {
                         OrderRefusal::LandWaypoint => "waypoint is on land",
                         OrderRefusal::LandBetween => "path crosses land",
+                        OrderRefusal::NoSpeedLimit => "no local speed limit",
                         OrderRefusal::UnknownClass => {
                             "unknown class — sync Minos specs first"
                         }
                     };
+                    self.order_result
+                        .insert(ship_id.clone(), HelmOrderUiResult::Refused(why.clone()));
                     self.feed(format!("refused {ship_id}: {why}"));
                     self.order_warning = Some(format!("{ship_id}: {why}"));
                 }
@@ -2343,6 +2386,8 @@ impl ShipApp {
         self.image_request = None;
         self.manifest_retry_at = None;
         self.manifest_refresh_at = None;
+        self.order_result.clear();
+        self.order_heading = None;
     }
 
     /// Change the held game through one boundary. Refreshing the same
@@ -4134,44 +4179,24 @@ impl ShipApp {
             .map(|g| g.unit_id)
     }
 
-    /// C3: order a commanded piece through Minos. Heading derives from
-    /// the waypoint against the ship's latest known position (the same
-    /// equirectangular bearing the sim steers by); the server owns the
-    /// fix chain, assumed time, clamping, and history. No local
-    /// SetOrder follows — dual authority is what this ticket removes.
-    /// Refusals (paused clock, wrong commander) stay loud and local.
-    /// Orders batch (#100): one op carries every commanded leg, so a
-    /// fan-out never collides with the serialized slot.
-    fn order_via_minos(&mut self, ship_id: &str, waypoint: (f64, f64), speed_kn: f32) {
-        let Some(leg) = self.minos_leg(ship_id, waypoint) else {
-            return;
-        };
-        self.spawn_order_batch(vec![(leg.0, leg.1, leg.2, speed_kn)]);
-    }
-
-    /// C3: resolve one ship to a Minos order leg (unit, ship, heading),
-    /// or refuse loudly when there is no position to steer from.
-    fn minos_leg(&mut self, ship_id: &str, waypoint: (f64, f64)) -> Option<(i64, String, f64)> {
+    /// C3: order one commanded piece through MinOS using the direct
+    /// heading/speed HelmOrder contract. The server owns the position,
+    /// scenario time, clamping, and accepted Fix; no local SetOrder
+    /// follows. Refusals (paused clock, wrong commander) stay loud and
+    /// local. The draft is marked pending before the worker starts.
+    fn order_via_minos(&mut self, ship_id: &str, heading_deg: f32, speed_kn: f32) {
         let Some(uid) = self.minos_order_target(ship_id) else {
-            return None;
-        };
-        let Some(own) = self
-            .registry
-            .ships()
-            .iter()
-            .find(|s| s.ship_id == ship_id)
-            .map(|s| s.latest.position.clone())
-        else {
-            let msg = format!("order refused: no position for {ship_id} — plot first");
+            let msg = format!("order refused: {ship_id} is not your MinOS piece");
             self.feed(msg.clone());
             self.users_status = msg;
-            return None;
+            return;
         };
-        let heading = own.bearing_deg_to(&GeoPosition {
-            latitude: waypoint.0,
-            longitude: waypoint.1,
-        });
-        Some((uid, ship_id.to_string(), heading))
+        self.spawn_order_batch(vec![(
+            uid,
+            ship_id.to_string(),
+            f64::from(heading_deg),
+            speed_kn,
+        )]);
     }
 
     /// #100: fire one batch op carrying every (unit, ship, heading,
@@ -4196,12 +4221,31 @@ impl ShipApp {
                 return;
             }
         };
+        for (_, ship, _, _) in &legs {
+            self.order_result
+                .insert(ship.clone(), HelmOrderUiResult::Pending);
+        }
         self.setup_op = Some(spawn_rest("order", move || {
             let mut outs = Vec::with_capacity(legs.len());
             for (uid, ship, heading, speed) in legs {
-                let result = master
-                    .order_unit(&tok, gid, uid, heading, f64::from(speed))
-                    .map_err(|e| e.to_string());
+                let result = match master.order_unit(&tok, gid, uid, heading, f64::from(speed)) {
+                    Ok(fix) => Ok(fix),
+                    Err(error) => {
+                        let unknown = match &error {
+                            tfg::backend::BackendError::Transport(_)
+                            | tfg::backend::BackendError::Decode(_)
+                            | tfg::backend::BackendError::Other(_) => true,
+                            tfg::backend::BackendError::Api { status, .. } => *status >= 500,
+                            _ => false,
+                        };
+                        let message = error.to_string();
+                        if unknown {
+                            Err(OrderFailure::Unknown(message))
+                        } else {
+                            Err(OrderFailure::Refused(message))
+                        }
+                    }
+                };
                 outs.push(OrderOut { ship, heading, speed, result });
             }
             Ok(SetupDone::FixBatch(outs))
@@ -4216,6 +4260,15 @@ impl ShipApp {
             match out.result {
                 Ok(fix) => {
                     ok += 1;
+                    let result = if fix.clamped {
+                        HelmOrderUiResult::Clamped {
+                            requested: fix.requested_speed.unwrap_or(out.speed as f64),
+                            accepted: fix.speed,
+                        }
+                    } else {
+                        HelmOrderUiResult::Accepted
+                    };
+                    self.order_result.insert(out.ship.clone(), result);
                     let clamp = match fix.requested_speed {
                         Some(asked) if fix.clamped => {
                             format!(" · clamped {asked:.0}→{:.0} kn", fix.speed)
@@ -4232,8 +4285,18 @@ impl ShipApp {
                         fix.assumed_time
                     ));
                 }
-                Err(e) => {
+                Err(OrderFailure::Refused(e)) => {
+                    self.order_result
+                        .insert(out.ship.clone(), HelmOrderUiResult::Refused(e.clone()));
                     self.feed(format!("order refused for {}: Minos says {e}", out.ship));
+                }
+                Err(OrderFailure::Unknown(e)) => {
+                    self.order_result
+                        .insert(out.ship.clone(), HelmOrderUiResult::Unknown(e.clone()));
+                    self.feed(format!(
+                        "order outcome unknown for {}: {e} — verify before retrying",
+                        out.ship
+                    ));
                 }
             }
         }
@@ -4298,7 +4361,12 @@ impl ShipApp {
                                 latitude: p.latitude,
                                 longitude: p.longitude,
                             },
-                            ts: p.assumed_time.clone(),
+                            // The list-level stamp is the authoritative
+                            // plot instant. A position's own stamp is
+                            // the leg in force and may repeat across
+                            // snapshots; using it as Fix.ts makes the
+                            // Registry discard valid coordinate updates.
+                            ts: plot.assumed_time.clone(),
                             received_at: None,
                             heading_deg: Some(p.heading as f32),
                             speed_kn: Some(p.speed as f32),
@@ -4352,56 +4420,227 @@ impl ShipApp {
         }
     }
 
-    /// C3: order section for a caller-commanded piece in an executing
-    /// game. Released ships carry no local control, so this renders
-    /// instead of the take-control panel: waypoint + speed, ordered
-    /// through Minos, markers refreshed from the plot after.
+    /// Direct helm control for a caller-commanded piece in an executing
+    /// MinOS game. The server receives only heading and speed; the
+    /// authoritative GameFix and next plot update the marker.
     fn minos_order_ui(&mut self, ui: &mut egui::Ui, id: &str) {
         ui.label(format!(
-            "Minos piece — ordered through the exercise (unit {id})"
+            "Minos piece — direct helm control (unit {id})"
         ));
+        let reported = self
+            .registry
+            .ships()
+            .iter()
+            .find(|ship| ship.ship_id == id)
+            .map(|ship| (ship.latest.heading_deg, ship.latest.speed_kn));
+        let (reported_heading, reported_speed) = reported
+            .map(|(heading, speed)| (heading.unwrap_or(0.0), speed))
+            .unwrap_or((0.0, None));
+        let mut heading = self.order_heading.unwrap_or(reported_heading).rem_euclid(360.0);
+        let mut speed = if self.order_result.contains_key(id) {
+            self.order_speed
+        } else {
+            reported_speed.unwrap_or(self.order_speed)
+        }
+        .max(0.0);
         ui.horizontal(|ui| {
-            ui.label("speed:");
-            // Uncapped locally: the server clamps to the published spec
-            // and says so on the fix it answers with.
+            ui.label("heading");
             ui.add(
-                egui::DragValue::new(&mut self.order_speed)
+                egui::DragValue::new(&mut heading)
+                    .speed(1.0)
+                    .range(0.0..=359.0)
+                    .suffix("°"),
+            );
+            ui.label("speed");
+            ui.add(
+                egui::DragValue::new(&mut speed)
                     .speed(1.0)
                     .range(0.0..=60.0)
                     .suffix(" kn"),
-            ).on_hover_text("ordered speed (server clamps to spec)");
+            )
+            .on_hover_text("requested speed; MinOS applies its own limit");
         });
-        if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
-            self.placing = !self.placing;
+        self.order_heading = Some(heading);
+        self.order_speed = speed;
+        let pending = matches!(
+            self.order_result.get(id),
+            Some(HelmOrderUiResult::Pending)
+        );
+        if let Some(result) = self.order_result.get(id) {
+            match result {
+                HelmOrderUiResult::Pending => {
+                    ui.weak("pending — waiting for MinOS GameFix");
+                }
+                HelmOrderUiResult::Accepted => {
+                    ui.label(egui::RichText::new("accepted by MinOS").color(egui::Color32::GREEN));
+                }
+                HelmOrderUiResult::Clamped { requested, accepted } => {
+                    warn_line(
+                        ui,
+                        format!("requested {requested:.0} kn · accepted {accepted:.0} kn · clamped by MinOS"),
+                    );
+                }
+                HelmOrderUiResult::Unknown(reason) => {
+                    warn_line(ui, format!("outcome unknown: {reason}"));
+                }
+                HelmOrderUiResult::Refused(reason) => {
+                    warn_line(ui, format!("refused: {reason}"));
+                }
+            }
         }
-        let can_commit = self.waypoint_water();
-        if self.pending_waypoint.is_some() && !can_commit {
-            warn_line(ui, "waypoint on land — pick water".to_string());
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!pending, egui::Button::new("Set helm"))
+                .clicked()
+            {
+                self.order_via_minos(id, heading, speed);
+            }
+            if ui
+                .add_enabled(!pending, egui::Button::new("Hold position"))
+                .clicked()
+            {
+                self.order_via_minos(id, heading, 0.0);
+                self.order_speed = 0.0;
+            }
+        });
+        ui.weak("No waypoint: heading and speed remain in force until replaced.");
+    }
+
+    /// Direct heading/speed control for the local sandbox. It mirrors
+    /// the MinOS surface but labels local clamping as sandbox authority.
+    fn local_helm_order_ui(&mut self, ui: &mut egui::Ui, id: &str) {
+        let Some(view) = self.order_views.get(id) else {
+            ui.weak("waiting for the local sim…");
+            return;
+        };
+        if view.max_speed_kn <= 0.0 {
+            self.order_result.insert(
+                id.to_string(),
+                HelmOrderUiResult::Refused("no local speed limit is published".into()),
+            );
+            warn_line(ui, "local refusal: no speed limit is published for this class");
+            return;
         }
-        if ui.add_enabled(can_commit, egui::Button::new("order via Minos")).clicked() {
-            if let Some((la, lo)) = self.pending_waypoint {
-                // The plot refresh rides the order apply (#100).
-                self.order_via_minos(id, (la, lo), self.order_speed);
+        let reported = self
+            .registry
+            .ships()
+            .iter()
+            .find(|ship| ship.ship_id == id)
+            .map(|ship| (ship.latest.heading_deg, ship.latest.speed_kn));
+        let (reported_heading, reported_speed) = reported
+            .map(|(heading, speed)| (heading.unwrap_or(0.0), speed))
+            .unwrap_or((0.0, None));
+        let mut heading = self.order_heading.unwrap_or(reported_heading).rem_euclid(360.0);
+        let mut speed = if self.order_result.contains_key(id) {
+            self.order_speed
+        } else {
+            reported_speed.unwrap_or(self.order_speed)
+        }
+        .max(0.0);
+        ui.label("local sandbox · persistent HelmOrder");
+        ui.horizontal(|ui| {
+            ui.label("heading");
+            ui.add(
+                egui::DragValue::new(&mut heading)
+                    .speed(1.0)
+                    .range(0.0..=359.0)
+                    .suffix("°"),
+            );
+            ui.label("speed");
+            ui.add(
+                egui::DragValue::new(&mut speed)
+                    .speed(1.0)
+                    .range(0.0..=view.max_speed_kn as f64)
+                    .suffix(" kn"),
+            );
+        });
+        self.order_heading = Some(heading);
+        self.order_speed = speed;
+        let pending = matches!(
+            self.order_result.get(id),
+            Some(HelmOrderUiResult::Pending)
+        );
+        if let Some(result) = self.order_result.get(id) {
+            match result {
+                HelmOrderUiResult::Pending => ui.weak("pending local sandbox command…"),
+                HelmOrderUiResult::Accepted => {
+                    ui.label(egui::RichText::new("accepted by local sandbox").color(egui::Color32::GREEN));
+                }
+                HelmOrderUiResult::Clamped { requested, accepted } => {
+                    warn_line(ui, format!("local clamp · requested {requested:.0} kn · accepted {accepted:.0} kn"));
+                }
+                HelmOrderUiResult::Unknown(reason) => warn_line(ui, format!("local outcome unknown: {reason}")),
+                HelmOrderUiResult::Refused(reason) => warn_line(ui, format!("local refusal: {reason}")),
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!pending, egui::Button::new("Set helm"))
+                .clicked()
+            {
+                self.order_result
+                    .insert(id.to_string(), HelmOrderUiResult::Pending);
+                if let Some(tx) = &self.sim_cmd_tx {
+                    if tx
+                        .send(SimCommand::SetHelm {
+                            ship_id: id.to_string(),
+                            heading_deg: heading,
+                            speed_kn: speed,
+                        })
+                        .is_err()
+                    {
+                        self.order_result.insert(
+                            id.to_string(),
+                            HelmOrderUiResult::Unknown("local command channel closed".into()),
+                        );
+                    }
+                } else {
+                    self.order_result.insert(
+                        id.to_string(),
+                        HelmOrderUiResult::Unknown("local command channel unavailable".into()),
+                    );
+                }
+            }
+            if ui
+                .add_enabled(!pending, egui::Button::new("Hold position"))
+                .clicked()
+            {
+                self.order_result
+                    .insert(id.to_string(), HelmOrderUiResult::Pending);
+                if let Some(tx) = &self.sim_cmd_tx {
+                    if tx
+                        .send(SimCommand::SetHelm {
+                            ship_id: id.to_string(),
+                            heading_deg: heading,
+                            speed_kn: 0.0,
+                        })
+                        .is_err()
+                    {
+                        self.order_result.insert(
+                            id.to_string(),
+                            HelmOrderUiResult::Unknown("local command channel closed".into()),
+                        );
+                    }
+                } else {
+                    self.order_result.insert(
+                        id.to_string(),
+                        HelmOrderUiResult::Unknown("local command channel unavailable".into()),
+                    );
+                }
+                self.order_speed = 0.0;
+            }
+            if ui.button("Release local control").clicked() {
+                if let Some(tx) = &self.sim_cmd_tx {
+                    let _ = tx.send(SimCommand::Release { ship_id: id.to_string() });
+                }
+                self.controlled.remove(id);
+                self.order_views.remove(id);
+                self.order_result.remove(id);
                 self.pending_waypoint = None;
                 self.placing = false;
             }
-        }
-    }
-
-    /// C3: waypoint-over-water check shared by the local and Minos
-    /// order sections (land data absent means committable).
-    fn waypoint_water(&self) -> bool {
-        self.pending_waypoint.is_some_and(|(la, lo)| {
-            self.land
-                .as_ref()
-                .map(|l| {
-                    l.is_water(&GeoPosition {
-                        latitude: la,
-                        longitude: lo,
-                    })
-                })
-                .unwrap_or(true)
-        })
+        });
+        ui.weak("No waypoint or ETA: the local sim emits Sim Fixes from this setpoint.");
     }
 
     /// H2: apply a GameClock answer to local state. The chosen rate is
@@ -7287,6 +7526,7 @@ impl ShipApp {
 
     /// Select a ship: clears any group selection and opens the Inspector.
     fn select_ship(&mut self, id: String) {
+        self.order_heading = None;
         self.selection = Some(Selection::Ship(id));
     }
 
@@ -7298,6 +7538,7 @@ impl ShipApp {
     /// Deselect: the Inspector shuts with the selection. Follow (camera)
     /// is independent and untouched.
     fn deselect(&mut self) {
+        self.order_heading = None;
         self.selection = None;
     }
 
@@ -9715,109 +9956,18 @@ impl eframe::App for ShipApp {
         if self.show_orders && self.mode.live() && !self.is_observer() {
             let mut open = self.show_orders;
             egui::Window::new("Orders").movable(true).default_size([380.0, 360.0]).default_pos(egui::pos2(500.0, 250.0)).open(&mut open).show(ui.ctx(), |ui| {
-            // Orders (prototype sim loop): take control, place waypoint,
-            // commit speed order; sim advances the ship, inspector shows it.
-            ui.heading("Orders");
-            // Group command: a zone/flag click (or the Groups island)
-            // selects the group; whoever holds authority fans one
-            // waypoint out to every unit in jurisdiction. The waypoint
-            // draft is shared with single-ship orders.
+            // Direct HelmOrder surface: one selected unit at a time,
+            // with MinOS authority in Live mode and a labelled local
+            // sandbox projection in Simulation mode.
+            ui.heading("Helm");
+            // Group selection is inspectable here, but the first slice
+            // deliberately avoids a multi-unit helm fan-out.
             if let Some(Selection::Group(gid)) = self.selection.clone() {
                 match self.group_info(&gid) {
                     Some((name, members)) => {
-                        let allowed: Vec<String> = members
-                            .iter()
-                            .filter(|u| self.action_allows(u))
-                            .cloned()
-                            .collect();
-                        let auth = self.command_authority(&allowed);
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label(format!("group: {name} · {} unit(s)", members.len()));
-                            if ui.small_button("✕").clicked() {
-                                self.deselect();
-                            }
-                        });
-                        match auth {
-                            Some(a) if !allowed.is_empty() => {
-                                ui.label(format!(
-                                    "authority: {} · {} in jurisdiction",
-                                    Self::authority_label(a),
-                                    allowed.len()
-                                ));
-                                if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
-                                    self.placing = !self.placing;
-                                }
-                                let can_commit = self
-                                    .pending_waypoint
-                                    .is_some_and(|(la, lo)| {
-                                        self.land
-                                            .as_ref()
-                                            .map(|l| {
-                                                l.is_water(&GeoPosition {
-                                                    latitude: la,
-                                                    longitude: lo,
-                                                })
-                                            })
-                                            .unwrap_or(true)
-                                    });
-                                if self.pending_waypoint.is_some() && !can_commit {
-                                    warn_line(ui, "waypoint on land — pick water".to_string());
-                                }
-                                if ui
-                                    .add_enabled(
-                                        can_commit,
-                                        egui::Button::new(format!("order group ({})", allowed.len())),
-                                    )
-                                    .clicked()
-                                {
-                                    if let Some((la, lo)) = self.pending_waypoint {
-                                        if let Some(tx) = &self.sim_cmd_tx {
-                                            let waypoint = GeoPosition {
-                                                latitude: la,
-                                                longitude: lo,
-                                            };
-                                            let legs: Vec<Leg> = allowed
-                                                .iter()
-                                                .map(|ship| {
-                                                    let max = self
-                                                        .order_views
-                                                        .get(ship)
-                                                        .map(|v| v.max_speed_kn)
-                                                        .unwrap_or(self.order_speed);
-                                                    Leg {
-                                                        ship_id: ship.clone(),
-                                                        waypoint,
-                                                        speed_kn: self.order_speed.min(max),
-                                                    }
-                                                })
-                                                .collect();
-                                            let _ = tx.send(SimCommand::OrderMove {
-                                                command: MoveCommand {
-                                                    legs,
-                                                    default_speed_kn: Some(self.order_speed),
-                                                    authority: a,
-                                                    grant: Grant {
-                                                        units: allowed.clone(),
-                                                        expires_game_secs: u64::MAX,
-                                                        verbs: vec![Verb::Move],
-                                                    },
-                                                },
-                                            });
-                                            eprintln!(
-                                                "order group {name} -> ({la:.4}, {lo:.4})"
-                                            );
-                                        }
-                                        self.pending_waypoint = None;
-                                        self.placing = false;
-                                    }
-                                }
-                            }
-                            _ => {
-                                ui.label("Outside your jurisdiction — view only.");
-                            }
-                        }
-                        ui.separator();
+                        ui.label(format!("group: {name} · {} unit(s)", members.len()));
+                        ui.weak("select a ship for direct helm control");
+                        ui.weak("group helm fan-out and waypoint commands are not part of this surface");
                     }
                     None => {
                         ui.label("group removed.");
@@ -9833,198 +9983,10 @@ impl eframe::App for ShipApp {
                 let allowed = self.action_allows(&id);
                 if !allowed {
                     ui.label("Outside your jurisdiction — view only.");
-                }
-                // C3: a caller-commanded piece in an executing game is
-                // ordered through Minos, never taken over locally.
-                if self.minos_order_target(&id).is_some() {
+                } else if self.minos_order_target(&id).is_some() {
                     self.minos_order_ui(ui, &id);
                 } else if self.controlled.contains(&id) {
-                    if let Some(v) = self.order_views.get(&id) {
-                        let state = match v.state {
-                            OrderState::EnRoute => "en route",
-                            OrderState::Blocked => "BLOCKED (land)",
-                            OrderState::Arrived => "arrived",
-                            OrderState::Holding => "holding",
-                        };
-                        ui.label(format!("order: {state}"));
-                        if let Some(eta) = v.eta_secs {
-                            // Game seconds (ADR-0004): motion covers the
-                            // distance over game time, so ETA quotes game time.
-                            ui.label(format!("eta: G+{}:{:02}", eta / 60, eta % 60));
-                        }
-                    }
-                    // Taxonomy readout (grill #18) + class-capped speed.
-                    if let Some((class_id, type_label, max_speed)) = self
-                        .order_views
-                        .get(&id)
-                        .map(|v| (v.class_id.clone(), v.type_label.clone(), v.max_speed_kn))
-                    {
-                        ui.label(format!(
-                            "{} · {} · max {:.0} kn",
-                            class_id, type_label, max_speed
-                        ));
-                        self.order_speed = self.order_speed.min(max_speed);
-                        ui.add(
-                            egui::DragValue::new(&mut self.order_speed)
-                                .speed(1.0)
-                                .range(0.0..=max_speed as f64)
-                                .suffix(" kn"),
-                        );
-                    } else {
-                        ui.label("waiting for sim…");
-                        ui.add(
-                            egui::DragValue::new(&mut self.order_speed)
-                                .speed(1.0)
-                                .suffix(" kn"),
-                        );
-                    }
-                    if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
-                        self.placing = !self.placing;
-                    }
-                    let can_commit = self
-                        .pending_waypoint
-                        .is_some_and(|(la, lo)| {
-                            self.land
-                                .as_ref()
-                                .map(|l| l.is_water(&GeoPosition { latitude: la, longitude: lo }))
-                                .unwrap_or(true)
-                        });
-                    if self.pending_waypoint.is_some() && !can_commit {
-                        warn_line(ui, "waypoint on land — pick water".to_string());
-                    }
-                    if let Some(w) = self.order_warning.clone() {
-                        warn_line(ui, w);
-                    }
-                    if ui.add_enabled(can_commit && allowed, egui::Button::new("order")).clicked() {
-                        self.order_warning = None;
-                        if let Some((la, lo)) = self.pending_waypoint {
-                            // C3: a commanded piece in an executing game
-                            // goes through Minos — no local SetOrder, or
-                            // the hull would steer two truths at once.
-                            if self.minos_order_target(&id).is_some() {
-                                self.order_via_minos(&id, (la, lo), self.order_speed);
-                            } else if let Some(tx) = &self.sim_cmd_tx {
-                                let _ = tx.send(SimCommand::SetOrder {
-                                    ship_id: id.clone(),
-                                    waypoint: GeoPosition { latitude: la, longitude: lo },
-                                    speed_kn: self.order_speed,
-                                });
-                                eprintln!("order {id} -> ({la:.4}, {lo:.4}) @ {} kn", self.order_speed);
-                            }
-                            self.pending_waypoint = None;
-                            self.placing = false;
-                        }
-                    }
-                    // Group order (precedence core): one muster waypoint
-                    // fanned out to every controlled ship, each leg capped
-                    // by its class max. The local player acts as organizer
-                    // until seats land (setup grill, #23).
-                    let mut controlled: Vec<String> =
-                        self.controlled.iter().cloned().collect();
-                    controlled.sort();
-                    // Order-all fans out inside jurisdiction only (slice iv).
-                    if let Some(scope) = self.action_units() {
-                        controlled.retain(|u| scope.contains(u));
-                    }
-                    if controlled.len() > 1
-                        && ui
-                            .add_enabled(
-                                can_commit && allowed,
-                                egui::Button::new(format!("order all ({})", controlled.len())),
-                            )
-                            .clicked()
-                    {
-                        self.order_warning = None;
-                        if let Some((la, lo)) = self.pending_waypoint {
-                            // C3: in an executing game the fan-out goes
-                            // through Minos, one order per commanded
-                            // piece (the server clamps each); hulls that
-                            // are not the caller's pieces are skipped
-                            // loudly, never steered locally.
-                            if self.users_game_state.as_deref() == Some("execution")
-                                && self.users_game.is_some()
-                            {
-                                // #100: one batch op for the whole fan-out.
-                                let mut legs = Vec::new();
-                                let mut skipped = 0;
-                                for ship in controlled.clone() {
-                                    match self.minos_leg(&ship, (la, lo)) {
-                                        Some((uid, ship, heading)) => {
-                                            legs.push((uid, ship, heading, self.order_speed));
-                                        }
-                                        None => {
-                                            skipped += 1;
-                                        }
-                                    }
-                                }
-                                if legs.is_empty() {
-                                    let msg = format!(
-                                        "Minos order all: 0 ordered · {skipped} skipped (not your pieces)"
-                                    );
-                                    self.feed(msg.clone());
-                                    self.users_status = msg;
-                                } else {
-                                    if skipped > 0 {
-                                        self.feed(format!(
-                                            "{skipped} skipped (not your pieces)"
-                                        ));
-                                    }
-                                    self.spawn_order_batch(legs);
-                                }
-                            } else if let Some(tx) = &self.sim_cmd_tx {
-                                let waypoint = GeoPosition { latitude: la, longitude: lo };
-                                let legs: Vec<Leg> = controlled
-                                    .iter()
-                                    .map(|ship| {
-                                        let max = self
-                                            .order_views
-                                            .get(ship)
-                                            .map(|v| v.max_speed_kn)
-                                            .unwrap_or(self.order_speed);
-                                        Leg {
-                                            ship_id: ship.clone(),
-                                            waypoint,
-                                            speed_kn: self.order_speed.min(max),
-                                        }
-                                    })
-                                    .collect();
-                                let _ = tx.send(SimCommand::OrderMove {
-                                    command: MoveCommand {
-                                        legs,
-                                        default_speed_kn: Some(self.order_speed),
-                                        authority: Authority::ORGANIZER,
-                                        grant: Grant {
-                                            units: controlled.clone(),
-                                            expires_game_secs: u64::MAX,
-                                            verbs: vec![Verb::Move],
-                                        },
-                                    },
-                                });
-                                eprintln!(
-                                    "order all {} -> ({la:.4}, {lo:.4})",
-                                    controlled.join(",")
-                                );
-                            }
-                            self.pending_waypoint = None;
-                            self.placing = false;
-                        }
-                    }
-                    ui.horizontal(|ui| {
-                        if allowed && ui.small_button("cancel").clicked() {
-                            if let Some(tx) = &self.sim_cmd_tx {
-                                let _ = tx.send(SimCommand::CancelOrder { ship_id: id.clone() });
-                            }
-                        }
-                        if allowed && ui.small_button("release").clicked() {
-                            if let Some(tx) = &self.sim_cmd_tx {
-                                let _ = tx.send(SimCommand::Release { ship_id: id.clone() });
-                            }
-                            self.controlled.remove(&id);
-                            self.order_views.remove(&id);
-                            self.pending_waypoint = None;
-                            self.placing = false;
-                        }
-                    });
+                    self.local_helm_order_ui(ui, &id);
                 } else {
                     // Take-control with a class selector (grill #18): the
                     // chosen class's stats drive the unit from then on.
@@ -10973,10 +10935,12 @@ fn main() -> eframe::Result<()> {
                 sim_cmd_tx: Some(ui_sim_cmd_tx),
                 sim_evt_rx,
                 order_views: HashMap::new(),
+                order_result: HashMap::new(),
                 controlled: HashSet::new(),
                 pending_waypoint: None,
                 placing: false,
                 order_speed: 20.0,
+                order_heading: None,
                 land: Land::from_default_asset().ok(),
                 order_warning: None,
                 catalog,
