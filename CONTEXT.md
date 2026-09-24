@@ -5,7 +5,7 @@ The client-side view of live ships on a real-world tile map. Presentation mode s
 ## Language
 
 **Fix**:
-One accepted position report for a ship: latitude, longitude, and timestamp, with optional heading and speed.
+One accepted position report for a ship: latitude, longitude, and timestamp, with optional heading and speed. The client may interpolate between accepted Fixes for display only; interpolation never creates a Fix or a trail sample.
 _Avoid_: ping, update, coordinate
 
 **Ship**:
@@ -17,7 +17,7 @@ The ordered history of accepted Fixes for one ship, newest last.
 _Avoid_: log, history
 
 **Trail**:
-The rendered recent portion of a Track, bounded to the last 60 fixes (about 2 minutes at a 2-second poll).
+The rendered recent portion of a Track, bounded to the last 60 accepted Fixes (about 2 minutes at a 2-second poll). It contains observed Fix positions, never interpolated samples.
 _Avoid_: path, route, breadcrumbs
 
 ## Simulation
