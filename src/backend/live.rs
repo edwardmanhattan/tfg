@@ -9,7 +9,7 @@
 
 use crate::geo::track::Fix;
 
-use super::{BackendError, FeedEvent, GameFix, GameMsg, MinosRest, PollSource, parse_message_event, parse_order_event};
+use super::{BackendError, FeedEvent, GameFix, GameMsg, MinosRest, PollSource, PositionList, parse_message_event, parse_order_event, parse_positions_event};
 
 /// Backoff for socket retries (transport ticket): base 1 s, cap 30 s,
 /// full jitter. Tunable here, applied in the actor loop.
@@ -115,6 +115,9 @@ pub enum LiveEvent {
     /// Best-effort committed-order publication. The HTTP 201 remains
     /// authoritative; this can only reconcile an existing Unknown result.
     OrderIssued(GameFix),
+    /// One authoritative MinOS game-position snapshot. This is the
+    /// per-game movement stream used for smooth presentation.
+    GamePositions(PositionList),
     SocketError(String),
 }
 
@@ -125,6 +128,9 @@ pub enum LiveCmd {
     /// Watch a game's broadcast channel (H11): `game:<id>`, or
     /// unsubscribe with None. Re-sending the held id is a no-op.
     WatchGame(Option<i64>),
+    /// Watch the authoritative per-game position stream:
+    /// `game:<id>:positions`.
+    WatchGamePositions(Option<i64>),
     /// Watch the caller's personal channel (H11): `personal:<user>`,
     /// or unsubscribe with None.
     WatchPersonal(Option<i64>),
@@ -146,7 +152,9 @@ fn watch_subscription(
         let event_tx = event_tx.clone();
         let channel = channel.to_string();
         sub.on_publication(move |p: tokio_centrifuge::protocol::Publication| {
-            if let Some(fix) = parse_order_event(&p.data) {
+            if let Some(plot) = parse_positions_event(&p.data) {
+                let _ = event_tx.send(LiveEvent::GamePositions(plot));
+            } else if let Some(fix) = parse_order_event(&p.data) {
                 let _ = event_tx.send(LiveEvent::OrderIssued(fix));
             } else {
                 match parse_message_event(&p.data) {
@@ -588,6 +596,8 @@ fn run_actor(
         let mut backoff_wait: Option<u64> = None;
         let mut game_channel: Option<String> = None;
         let mut game_sub: Option<tokio_centrifuge::subscription::Subscription> = None;
+        let mut positions_channel: Option<String> = None;
+        let mut positions_sub: Option<tokio_centrifuge::subscription::Subscription> = None;
         let mut personal_channel: Option<String> = None;
         let mut personal_sub: Option<tokio_centrifuge::subscription::Subscription> = None;
         // Swap one watched channel for another (or drop it): unsubscribe
@@ -614,6 +624,25 @@ fn run_actor(
                 None => eprintln!("[LIVE-dbg] unwatching {prefix}"),
             }
         };
+        let rewatch_positions = |client: &tokio_centrifuge::client::Client,
+                                  event_tx: &std::sync::mpsc::Sender<LiveEvent>,
+                                  slot_channel: &mut Option<String>,
+                                  slot_sub: &mut Option<tokio_centrifuge::subscription::Subscription>,
+                                  id: Option<i64>| {
+            let want = id.map(|i| format!("game:{i}:positions"));
+            if want == *slot_channel {
+                return;
+            }
+            if let Some(old) = slot_sub.take() {
+                let _ = old.unsubscribe();
+            }
+            *slot_channel = want.clone();
+            *slot_sub = want.map(|ch| watch_subscription(client, event_tx, &ch));
+            match slot_channel {
+                Some(ch) => eprintln!("[LIVE-dbg] watching {ch}"),
+                None => eprintln!("[LIVE-dbg] unwatching game positions"),
+            }
+        };
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             match cmd_rx.try_recv() {
@@ -626,6 +655,15 @@ fn run_actor(
                 }
                 Ok(LiveCmd::WatchGame(id)) => {
                     rewatch(&client, &event_tx, &mut game_channel, &mut game_sub, "game", id);
+                }
+                Ok(LiveCmd::WatchGamePositions(id)) => {
+                    rewatch_positions(
+                        &client,
+                        &event_tx,
+                        &mut positions_channel,
+                        &mut positions_sub,
+                        id,
+                    );
                 }
                 Ok(LiveCmd::WatchPersonal(id)) => {
                     rewatch(

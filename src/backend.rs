@@ -26,7 +26,7 @@ pub use master::{BackendUser, GameClock, GameClockSegment, GameDetail, GameFix, 
 pub use replay::{FileReplay, now_ts};
 // Shared with live.rs and the tests below; not public API.
 pub(crate) use feed::FeedEvent;
-pub(crate) use feed::{parse_message_event, parse_order_event};
+pub(crate) use feed::{parse_message_event, parse_order_event, parse_positions_event};
 
 use serde::{Deserialize, Serialize};
 

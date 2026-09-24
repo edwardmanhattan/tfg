@@ -271,6 +271,10 @@ struct ReplayEvent {
 
 /// v0 poll cadence, in seconds.
 const POLL_SECS: f64 = 2.0;
+/// MinOS publishes game position snapshots about once per second. The
+/// presentation clock matches that stream; it does not predict beyond
+/// the latest accepted Fix.
+const GAME_PLOT_ANIMATION_SECS: f64 = 1.0;
 /// Pumped frames per map request, by kind (task #45): jumps rebuild
 /// the view (6), zoom steps split the difference (4), follow tracking
 /// turns over fast on near-neighbor tiles (2). Fewer pumps = fresher
@@ -1504,6 +1508,10 @@ struct ShipApp {
     poll_handle: Option<JoinHandle<()>>,
     map_handle: Option<JoinHandle<()>>,
     last_poll: Instant,
+    /// Presentation-only interpolation start per accepted ship. Keeping
+    /// this per ship prevents an unrelated source or unit from resetting
+    /// everyone else's glide.
+    fix_animation_started: HashMap<String, Instant>,
     hidden: HashSet<String>,
     following: Option<String>,
     show_trail: bool,
@@ -1994,6 +2002,10 @@ impl ShipApp {
             // out-of-order arrivals leave it alone, so one move animates
             // exactly once no matter how often the picture replays.
             if !acked.is_empty() {
+                for (ship_id, _) in &acked {
+                    self.fix_animation_started
+                        .insert(ship_id.clone(), Instant::now());
+                }
                 advanced = true;
             }
             // Ingest acks (Log grill, #20): report stamped seqs back to
@@ -2187,6 +2199,9 @@ impl ShipApp {
                     }
                     self.show_messages = true;
                 }
+                LiveEvent::GamePositions(plot) => {
+                    self.ingest_game_positions(plot);
+                }
                 LiveEvent::OrderIssued(fix) => {
                     let ship_id = fix.unit_id.to_string();
                     if matches!(
@@ -2233,7 +2248,6 @@ impl ShipApp {
         if advanced {
             self.last_poll = Instant::now();
         }
-        let frac = (self.last_poll.elapsed().as_secs_f64() / POLL_SECS).clamp(0.0, 1.0);
         let center = self.center;
         let (mw, mh) = self.map_dims();
         // Wall clock for the old-data badge (wire sources only: sim
@@ -2243,6 +2257,18 @@ impl ShipApp {
             .ships()
             .iter()
             .map(|s| {
+                let animation_started = self
+                    .fix_animation_started
+                    .get(&s.ship_id)
+                    .copied()
+                    .unwrap_or(self.last_poll);
+                let animation_secs = if s.source == FixSource::Game {
+                    GAME_PLOT_ANIMATION_SECS
+                } else {
+                    POLL_SECS
+                };
+                let frac = (animation_started.elapsed().as_secs_f64() / animation_secs)
+                    .clamp(0.0, 1.0);
                 let pos = self.registry.blend(&s.ship_id, frac).unwrap_or(s.latest.position);
                 let (x, y) = project_mercator(pos.latitude, pos.longitude, center, self.zoom, mw, mh);
                 let trail = s
@@ -2457,6 +2483,7 @@ impl ShipApp {
         self.helm_submissions.clear();
         self.helm_drafts.clear();
         self.helm_warnings.clear();
+        self.fix_animation_started.clear();
     }
 
     /// Change the held game through one boundary. Refreshing the same
@@ -3283,12 +3310,14 @@ impl ShipApp {
         }
     }
 
-    /// H11: tell the socket actor which game broadcast channel to
-    /// watch. Best-effort — no actor means nothing to watch, and
-    /// re-sending the held id is a no-op actor-side.
+    /// Tell the socket actor which game channels to watch. The broadcast
+    /// channel carries messages/order events; the positions channel carries
+    /// the authoritative movement snapshot stream.
     fn watch_game_channel(&self) {
         if let Some(tx) = &self.live_cmd_tx {
-            let _ = tx.send(LiveCmd::WatchGame(self.users_game.as_ref().map(|(id, _)| *id)));
+            let game_id = self.users_game.as_ref().map(|(id, _)| *id);
+            let _ = tx.send(LiveCmd::WatchGame(game_id));
+            let _ = tx.send(LiveCmd::WatchGamePositions(game_id));
         }
     }
 
@@ -4437,64 +4466,16 @@ impl ShipApp {
         }));
     }
 
-    /// Apply a finished plot: ingest as game fixes (scenario-stamped —
-    /// glide without the jitter guard, never wall-age). Success resets
-    /// the cadence streak; failure grows it (see the pump).
+    /// Apply a finished REST plot. The same ingest path is used by the
+    /// WebSocket position stream; only cadence/status bookkeeping differs.
     fn apply_plot(&mut self, res: Result<tfg::backend::PositionList, String>) {
         match res {
             Ok(plot) => {
                 self.last_plot_ok = Some(Instant::now());
                 self.plot_fails = 0;
-                let fixes: Vec<Fix> = plot
-                    .positions
-                    .iter()
-                    .map(|p| {
-                        let (name, hull) = self
-                            .users_gunits
-                            .iter()
-                            .find(|g| g.unit_id == p.unit_id)
-                            .map(|g| {
-                                (
-                                    Some(g.unit_name.clone()),
-                                    Some(g.hull_number.clone()),
-                                )
-                            })
-                            .unwrap_or((None, None));
-                        Fix {
-                            ship_id: p.unit_id.to_string(),
-                            position: GeoPosition {
-                                latitude: p.latitude,
-                                longitude: p.longitude,
-                            },
-                            // The list-level stamp is the authoritative
-                            // plot instant. A position's own stamp is
-                            // the leg in force and may repeat across
-                            // snapshots; using it as Fix.ts makes the
-                            // Registry discard valid coordinate updates.
-                            ts: plot.assumed_time.clone(),
-                            received_at: None,
-                            heading_deg: Some(p.heading as f32),
-                            speed_kn: Some(p.speed as f32),
-                            accuracy_m: None,
-                            name,
-                            hull_number: hull,
-                            backfilled: false,
-                            source: FixSource::Game,
-                            // Plot positions are scenario-stamped: no
-                            // server age to retain.
-                            age_secs: None,
-                            seq: 0,
-                        }
-                    })
-                    .collect();
-                let n = fixes.len();
-                for f in &fixes {
-                    self.last_seen.insert(f.ship_id.clone(), Instant::now());
-                    *self.fix_count.entry(f.ship_id.clone()).or_insert(0) += 1;
-                }
-                self.registry.poll(fixes);
-                self.users_status =
-                    format!("Minos plot: {n} hull(s) @ {}", plot.assumed_time);
+                let assumed_time = plot.assumed_time.clone();
+                let n = self.ingest_game_positions(plot);
+                self.users_status = format!("Minos plot: {n} hull(s) @ {assumed_time}");
             }
             Err(e) => {
                 self.plot_fails = self.plot_fails.saturating_add(1);
@@ -4502,6 +4483,60 @@ impl ShipApp {
             }
         }
     }
+
+    /// Turn one authoritative MinOS position snapshot into accepted
+    /// Game fixes. Resetting `last_poll` here is essential: the REST path
+    /// does not pass through `poll_rx`, so without this the next 15 s
+    /// sample would be rendered at an already-expired fraction and jump.
+    fn ingest_game_positions(&mut self, plot: tfg::backend::PositionList) -> usize {
+        let n = plot.positions.len();
+        let fixes: Vec<Fix> = plot
+            .positions
+            .iter()
+            .map(|p| {
+                let (name, hull) = self
+                    .users_gunits
+                    .iter()
+                    .find(|g| g.unit_id == p.unit_id)
+                    .map(|g| (Some(g.unit_name.clone()), Some(g.hull_number.clone())))
+                    .unwrap_or((None, None));
+                Fix {
+                    ship_id: p.unit_id.to_string(),
+                    position: GeoPosition {
+                        latitude: p.latitude,
+                        longitude: p.longitude,
+                    },
+                    // The list-level stamp is the authoritative plot
+                    // instant. A position's own stamp is the leg in force.
+                    ts: plot.assumed_time.clone(),
+                    received_at: None,
+                    heading_deg: Some(p.heading as f32),
+                    speed_kn: Some(p.speed as f32),
+                    accuracy_m: None,
+                    name,
+                    hull_number: hull,
+                    backfilled: false,
+                    source: FixSource::Game,
+                    age_secs: None,
+                    seq: 0,
+                }
+            })
+            .collect();
+        for f in &fixes {
+            self.last_seen.insert(f.ship_id.clone(), Instant::now());
+            *self.fix_count.entry(f.ship_id.clone()).or_insert(0) += 1;
+        }
+        let acked = self.registry.poll(fixes);
+        if !acked.is_empty() {
+            for (ship_id, _) in &acked {
+                self.fix_animation_started
+                    .insert(ship_id.clone(), Instant::now());
+            }
+            self.last_poll = Instant::now();
+        }
+        n
+    }
+
 
     /// C3: release local sim control of held-game pieces. Runs on
     /// execution entry: from here Minos drives these hulls, and a local
@@ -8029,6 +8064,7 @@ impl ShipApp {
         }
         self.controlled.remove(id);
         self.order_views.remove(id);
+        self.fix_animation_started.remove(id);
         self.placed_labels.remove(id);
         self.placed_fleet.remove(id);
         if self.fleet_pick.as_deref() == Some(id) {
@@ -11253,6 +11289,7 @@ fn main() -> eframe::Result<()> {
                 poll_handle: Some(poll_handle),
                 map_handle: Some(map_handle),
                 last_poll: Instant::now(),
+                fix_animation_started: HashMap::new(),
                 hidden: HashSet::new(),
                 following: None,
                 show_trail: true,

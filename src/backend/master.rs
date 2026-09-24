@@ -1917,12 +1917,15 @@ pub struct GameFix {
 /// One hull's computed position at the answered instant (C3): the leg
 /// in force, so a client draws the arrow without a second call.
 /// Measure fields (`from_unit` queries) are a later slice.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct GameHullPos {
+    #[serde(rename = "id_unit")]
     pub unit_id: i64,
     pub latitude: f64,
     pub longitude: f64,
+    #[serde(rename = "heading_deg")]
     pub heading: f64,
+    #[serde(rename = "speed_kn")]
     pub speed: f64,
     /// Position clamp is separate from order-response speed clamping.
     pub clamped: bool,
@@ -1933,7 +1936,7 @@ pub struct GameHullPos {
 /// centre's plot. The instant is echoed back — with `at` omitted the
 /// client did not know what now was. Hulls with no leg at the instant
 /// are absent, never zeroed: no position before the origin exists.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Deserialize)]
 pub struct PositionList {
     pub assumed_time: String,
     pub positions: Vec<GameHullPos>,

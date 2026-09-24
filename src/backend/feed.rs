@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::geo::track::{Fix, FixSource};
 
-use super::{BackendError, GameFix, unwrap_envelope};
+use super::{BackendError, GameFix, PositionList, unwrap_envelope};
 
 /// Minos standing picture (REST mapping ticket): the initial picture the
 /// socket then keeps current. Vessels that never reported carry labels
@@ -195,6 +195,31 @@ pub(crate) struct FeedEvent {
     pub(crate) received_at: String,
     #[serde(default)]
     pub(crate) backfilled: bool,
+}
+
+/// Parse a `game:<id>:positions` snapshot. The publication payload is
+/// the PositionList DTO directly, not a `data` envelope.
+pub(crate) fn parse_positions_event(bytes: &[u8]) -> Option<PositionList> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    value["id_game"].as_i64()?;
+    value["final"].as_bool()?;
+    let plot: PositionList = serde_json::from_value(value).ok()?;
+    if plot.assumed_time.is_empty()
+        || plot.positions.iter().any(|position| {
+            position.assumed_time.is_empty()
+                || !position.heading.is_finite()
+                || !(0.0..360.0).contains(&position.heading)
+                || !position.speed.is_finite()
+                || position.speed < 0.0
+                || !position.latitude.is_finite()
+                || !(-90.0..=90.0).contains(&position.latitude)
+                || !position.longitude.is_finite()
+                || !(-180.0..=180.0).contains(&position.longitude)
+        })
+    {
+        return None;
+    }
+    Some(plot)
 }
 
 /// Parse the best-effort order publication. Unknown event types and
