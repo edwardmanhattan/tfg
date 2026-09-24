@@ -31,7 +31,6 @@ use tfg::map_render::{
     ProjectedUnitGeometry, UnitLod, anchor_center, project_mercator, projected_unit_geometry,
     rotated_unit_quad_with_forward_heading, select_unit_lod, unproject_mercator,
 };
-use tfg::overlay::hit_test;
 use tfg::land::Land;
 use tfg::sim::{
     CommandRefusal, MergeSource, OrderRefusal, OrderState, OrderView, SimCommand, SimEvent,
@@ -622,8 +621,7 @@ fn paint_map_symbol(
     }
 }
 
-fn paint_unit_image(
-    painter: &egui::Painter,
+fn unit_image_points(
     marker: &ShipMarker,
     zoom: f64,
     pixels_per_point: f32,
@@ -632,9 +630,7 @@ fn paint_unit_image(
     if marker.lod == UnitLod::Far {
         return None;
     }
-    let Some(visual) = marker.visual.as_ref().filter(|v| v.is_map_renderable()) else {
-        return None;
-    };
+    let visual = marker.visual.as_ref().filter(|v| v.is_map_renderable())?;
     let mut geometry =
         projected_unit_geometry(marker.latitude, zoom, visual.loa_m, visual.beam_m);
     if geometry.has_scale {
@@ -654,21 +650,45 @@ fn paint_unit_image(
         (origin.x + marker.x as f32) as f64,
         (origin.y + marker.y as f32) as f64,
     );
-    let Some(quad) = rotated_unit_quad_with_forward_heading(
+    let quad = rotated_unit_quad_with_forward_heading(
         center,
         length_px,
         beam_px,
         marker.heading_deg,
         visual.forward_heading_deg,
-    ) else {
-        return None;
-    };
-    let texture = visual.texture.expect("renderable visual has a texture");
-    let points: Vec<egui::Pos2> = quad
-        .corners
-        .iter()
-        .map(|(x, y)| egui::pos2(*x as f32, *y as f32))
-        .collect();
+    )?;
+    Some(
+        quad.corners
+            .iter()
+            .map(|(x, y)| egui::pos2(*x as f32, *y as f32))
+            .collect(),
+    )
+}
+
+fn marker_body_hit(
+    marker: &ShipMarker,
+    px: f64,
+    py: f64,
+    zoom: f64,
+    pixels_per_point: f32,
+) -> bool {
+    if let Some(points) = unit_image_points(marker, zoom, pixels_per_point, egui::pos2(0.0, 0.0)) {
+        let points: Vec<(f32, f32)> = points.iter().map(|point| (point.x, point.y)).collect();
+        return in_poly(px, py, &points);
+    }
+    ((marker.x - px).powi(2) + (marker.y - py).powi(2)).sqrt() <= 18.0
+}
+
+fn paint_unit_image(
+    painter: &egui::Painter,
+    marker: &ShipMarker,
+    zoom: f64,
+    pixels_per_point: f32,
+    origin: egui::Pos2,
+) -> Option<Vec<egui::Pos2>> {
+    let points = unit_image_points(marker, zoom, pixels_per_point, origin)?;
+    let visual = marker.visual.as_ref().expect("image points imply a visual");
+    let texture = visual.texture.as_ref().expect("renderable visual has a texture");
     let tint = if marker.stale {
         egui::Color32::GRAY
     } else {
@@ -1371,6 +1391,14 @@ enum ImageOut {
 /// A command result kept in the Inspector/Orders surface. The transport
 /// worker classifies failures before they reach the UI; no raw error
 /// string is mistaken for an accepted HelmOrder.
+#[derive(Debug, Clone)]
+struct UnitDrag {
+    id: String,
+    name: String,
+    start: egui::Pos2,
+    moved: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct HelmDraft {
     heading_deg: f32,
@@ -1484,7 +1512,7 @@ enum SetupDone {
 enum PwResult {
     Changed(LoginDone),
     ChangeFailed(String),
-    ReentryFailed(String),
+    ReentryFailed,
     GateShut(String),
 }
 
@@ -1567,6 +1595,9 @@ struct ShipApp {
     order_result: HashMap<String, HelmOrderUiResult>,
     helm_submissions: HashMap<String, HelmSubmission>,
     helm_drafts: HashMap<String, HelmDraft>,
+    /// Accepted helm intents stay visually pinned to the commander draft
+    /// until the authoritative position animation has completed.
+    helm_preview_pending: HashSet<String>,
     controlled: HashSet<String>,
     pending_waypoint: Option<(f64, f64)>,
     placing: bool,
@@ -1586,6 +1617,9 @@ struct ShipApp {
     fleet: Fleet,
     /// Map placement pick: a register hull awaiting its map click.
     fleet_pick: Option<String>,
+    /// A catalog Unit waiting for its GameUnit assignment to finish
+    /// before the requested map position is applied.
+    pending_placement: Option<(String, f64, f64)>,
     /// Exercise setup flow (#79): Planning in four steps — game,
     /// players, fleet, ready. One step renders at a time; the backend
     /// game in users_game is what every step reads and writes.
@@ -1622,6 +1656,11 @@ struct ShipApp {
     fleet_cache: Vec<tfg::store::StoreUnit>,
     fleet_branches: std::collections::HashMap<i64, i64>,
     fleet_branch_names: std::collections::HashMap<i64, String>,
+    fleet_category_names: std::collections::HashMap<i64, String>,
+    fleet_type_names: std::collections::HashMap<i64, String>,
+    picker_category: Option<i64>,
+    picker_class: Option<i64>,
+    picker_type: Option<i64>,
     fleet_loaded: bool,
     setup_commander: Option<i64>,
     /// Session users (build ticket): memory-held game plus live lists —
@@ -1694,6 +1733,9 @@ struct ShipApp {
     users_approles: Vec<(i64, String, String, bool)>,
     upress: Option<(i64, String, egui::Pos2)>,
     udrag: Option<(i64, String)>,
+    unit_drag: Option<UnitDrag>,
+    /// Selected map unit currently being rotated by its on-map handle.
+    map_heading_drag: Option<String>,
     placed_fleet: HashSet<String>,
     /// Labels captured at placement (both picker sources), so register
     /// hulls keep their name + hull after the picker moves on.
@@ -2062,6 +2104,16 @@ impl ShipApp {
                         HelmOrderUiResult::Accepted
                     };
                     self.helm_submissions.remove(&ship_id);
+                    if self.helm_drafts.contains_key(&ship_id) {
+                        self.helm_drafts.insert(
+                            ship_id.clone(),
+                            HelmDraft {
+                                heading_deg,
+                                speed_kn: accepted_speed_kn,
+                            },
+                        );
+                    }
+                    self.helm_preview_pending.insert(ship_id.clone());
                     self.helm_warnings.remove(&ship_id);
                     self.order_result.insert(ship_id, result);
                 }
@@ -2078,7 +2130,7 @@ impl ShipApp {
                         OrderRefusal::NoSpeedLimit => "no local speed limit",
                         OrderRefusal::InvalidHelm => "invalid heading or speed",
                         OrderRefusal::UnknownClass => {
-                            "unknown class — sync Minos specs first"
+                            "unknown class — sync the unit register first"
                         }
                     };
                     self.helm_submissions.remove(&ship_id);
@@ -2222,6 +2274,16 @@ impl ShipApp {
                             HelmOrderUiResult::Accepted
                         };
                         self.helm_submissions.remove(&ship_id);
+                        if self.helm_drafts.contains_key(&ship_id) {
+                            self.helm_drafts.insert(
+                                ship_id.clone(),
+                                HelmDraft {
+                                    heading_deg: fix.heading as f32,
+                                    speed_kn: fix.speed as f32,
+                                },
+                            );
+                        }
+                        self.helm_preview_pending.insert(ship_id.clone());
                         self.order_result.insert(ship_id.clone(), result);
                         self.feed(format!(
                             "order event reconciled {ship_id}: {:.0}° @ {:.0} kn",
@@ -2274,6 +2336,7 @@ impl ShipApp {
                 };
                 let frac = (animation_started.elapsed().as_secs_f64() / animation_secs)
                     .clamp(0.0, 1.0);
+                self.reconcile_helm_preview(&s.ship_id, frac);
                 let pos = self.registry.blend(&s.ship_id, frac).unwrap_or(s.latest.position);
                 let (x, y) = project_mercator(pos.latitude, pos.longitude, center, self.zoom, mw, mh);
                 let trail = s
@@ -2286,11 +2349,11 @@ impl ShipApp {
                 // the image turns with the hull rather than snapping
                 // to each new fix. Minos game positions and live-feed
                 // course both already land on Fix.heading_deg.
-                let heading_deg = self
-                    .heading_overrides
-                    .get(&s.ship_id)
-                    .copied()
-                    .or_else(|| self.registry.blend_heading(&s.ship_id, frac));
+                let authoritative_heading = self.registry.blend_heading(&s.ship_id, frac);
+                let heading_deg = self.map_preview_heading(
+                    &s.ship_id,
+                    authoritative_heading,
+                );
                 let unit_id = s.ship_id.parse::<i64>().ok();
                 let visual = unit_id.and_then(|unit_id| self.visuals.get(unit_id).cloned());
                 let mut geometry = visual.as_ref().map_or_else(ProjectedUnitGeometry::default, |v| {
@@ -2390,6 +2453,8 @@ impl ShipApp {
         }
         self.pending_waypoint = None;
         self.placing = false;
+        self.unit_drag = None;
+        self.map_heading_drag = None;
     }
 
     /// Hand-off from State B (onboarding ticket, #77): the shell
@@ -2493,9 +2558,12 @@ impl ShipApp {
         self.order_result.clear();
         self.helm_submissions.clear();
         self.helm_drafts.clear();
+        self.helm_preview_pending.clear();
         self.helm_warnings.clear();
         self.last_game_position_at = None;
         self.fix_animation_started.clear();
+        self.unit_drag = None;
+        self.map_heading_drag = None;
     }
 
     /// Change the held game through one boundary. Refreshing the same
@@ -3167,6 +3235,8 @@ impl ShipApp {
         self.roster_gap = false;
         self.units_gap = false;
         self.placements_gap = false;
+        self.fleet_pick = None;
+        self.pending_placement = None;
         self.edit_open = false;
         self.delete_armed = false;
         // The pictures belonged to the exercise just released: their
@@ -3304,7 +3374,7 @@ impl ShipApp {
                     self.start_session();
                     if self.mode.phase != Phase::Live {
                         self.phase_note = Some(
-                            "Minos says execution but the local engine refused to start (see log)".to_string(),
+                            "The exercise entered execution, but the local session could not start (see log)".to_string(),
                         );
                     } else {
                         self.phase_note = None;
@@ -4057,13 +4127,13 @@ impl ShipApp {
         let state = self.users_game_state.clone();
         match (to.as_str(), state.as_deref()) {
             ("closure", Some("closure")) => {
-                self.phase_note = Some("closed on Minos by another client".to_string());
+                self.phase_note = Some("closed by another client".to_string());
                 if !self.session_closed() {
                     self.end_session();
                 }
             }
             ("execution", Some("execution")) => {
-                self.phase_note = Some("executing on Minos already".to_string());
+                self.phase_note = Some("the exercise is already running".to_string());
                 if !self.session_live() {
                     self.start_session();
                 }
@@ -4299,7 +4369,7 @@ impl ShipApp {
     /// local. The draft is marked pending before the worker starts.
     fn order_via_minos(&mut self, ship_id: &str, heading_deg: f32, speed_kn: f32) {
         let Some(uid) = self.minos_order_target(ship_id) else {
-            let msg = format!("order refused: {ship_id} is not your MinOS piece");
+            let msg = format!("unit {ship_id} is not available for commands");
             self.feed(msg.clone());
             self.users_status = msg;
             return;
@@ -4328,7 +4398,7 @@ impl ShipApp {
         let (master, tok) = match self.users_client() {
             Ok(t) => t,
             Err(e) => {
-                let msg = format!("order refused: Minos says {e}");
+                let msg = format!("order refused: {e}");
                 self.feed(msg.clone());
                 self.users_status = msg;
                 return;
@@ -4410,6 +4480,16 @@ impl ShipApp {
                     } else {
                         HelmOrderUiResult::Accepted
                     };
+                    if self.helm_drafts.contains_key(&out.ship) {
+                        self.helm_drafts.insert(
+                            out.ship.clone(),
+                            HelmDraft {
+                                heading_deg: fix.heading as f32,
+                                speed_kn: fix.speed as f32,
+                            },
+                        );
+                    }
+                    self.helm_preview_pending.insert(out.ship.clone());
                     self.order_result.insert(out.ship.clone(), result);
                     let clamp = match fix.requested_speed {
                         Some(asked) if fix.clamped => {
@@ -4429,16 +4509,20 @@ impl ShipApp {
                 }
                 Err(OrderFailure::Refused { category, detail }) => {
                     self.helm_submissions.remove(&out.ship);
-                    let message = format!("{category}: {detail}");
                     self.order_result.insert(
                         out.ship.clone(),
-                        HelmOrderUiResult::Refused(message.clone()),
+                        HelmOrderUiResult::Refused(category.clone()),
                     );
-                    self.feed(format!("order refused for {}: {message}", out.ship));
+                    self.feed(format!(
+                        "order refused for {}: {category} ({detail})",
+                        out.ship
+                    ));
                 }
                 Err(OrderFailure::Unknown(e)) => {
-                    self.order_result
-                        .insert(out.ship.clone(), HelmOrderUiResult::Unknown(e.clone()));
+                    self.order_result.insert(
+                        out.ship.clone(),
+                        HelmOrderUiResult::Unknown("outcome unknown — see Log".into()),
+                    );
                     self.feed(format!(
                         "order outcome unknown for {}: {e} — verify before retrying",
                         out.ship
@@ -4446,7 +4530,7 @@ impl ShipApp {
                 }
             }
         }
-        self.users_status = format!("Minos orders: {ok} applied");
+        self.users_status = format!("Commands: {ok} accepted");
         self.pull_minos_positions();
     }
 
@@ -4487,7 +4571,7 @@ impl ShipApp {
                 self.plot_fails = 0;
                 let assumed_time = plot.assumed_time.clone();
                 let n = self.ingest_game_positions(plot);
-                self.users_status = format!("Minos plot: {n} hull(s) @ {assumed_time}");
+                self.users_status = format!("Exercise plot: {n} hull(s) @ {assumed_time}");
             }
             Err(e) => {
                 self.plot_fails = self.plot_fails.saturating_add(1);
@@ -4576,9 +4660,7 @@ impl ShipApp {
     /// MinOS game. The server receives only heading and speed; the
     /// authoritative GameFix and next plot update the marker.
     fn minos_order_ui(&mut self, ui: &mut egui::Ui, id: &str) {
-        ui.label(format!(
-            "Minos piece — direct helm control (unit {id})"
-        ));
+        ui.label(format!("Unit {id} · direct helm control"));
         let reported = self
             .registry
             .ships()
@@ -4595,33 +4677,25 @@ impl ShipApp {
             .rem_euclid(360.0);
         let mut speed = draft
             .map(|draft| draft.speed_kn)
-            .unwrap_or(reported_speed.unwrap_or(20.0))
+            .unwrap_or(reported_speed.unwrap_or(0.0))
             .max(0.0);
         ui.horizontal(|ui| {
-            ui.label("heading");
-            ui.add(
-                egui::DragValue::new(&mut heading)
-                    .speed(1.0)
-                    .range(0.0..=359.0)
-                    .suffix("°"),
-            );
-            ui.label("speed");
-            ui.add(
-                egui::DragValue::new(&mut speed)
-                    .speed(1.0)
-                    .suffix(" kn"),
-            )
-            .on_hover_text("requested speed; MinOS applies its own limit");
+            Self::helm_heading_input(ui, &mut heading, true);
+            Self::helm_speed_control(ui, &mut speed, None, true);
         });
         speed = speed.max(0.0);
         if draft.is_some_and(|draft| {
             (draft.heading_deg - heading).abs() > 0.01
                 || (draft.speed_kn - speed).abs() > 0.01
-        }) && matches!(self.order_result.get(id), Some(HelmOrderUiResult::Pending))
-        {
-            self.order_result
-                .insert(id.to_string(), HelmOrderUiResult::Superseded);
-            self.helm_submissions.remove(id);
+        }) {
+            if matches!(self.order_result.get(id), Some(HelmOrderUiResult::Pending)) {
+                self.order_result
+                    .insert(id.to_string(), HelmOrderUiResult::Superseded);
+                self.helm_submissions.remove(id);
+            } else {
+                self.order_result
+                    .insert(id.to_string(), HelmOrderUiResult::Draft);
+            }
         }
         self.helm_drafts.insert(
             id.to_string(),
@@ -4640,15 +4714,15 @@ impl ShipApp {
                     ui.weak("draft · not submitted");
                 }
                 HelmOrderUiResult::Pending => {
-                    ui.weak("pending — waiting for MinOS GameFix");
+                    ui.weak("Sending… · waiting for the exercise");
                 }
                 HelmOrderUiResult::Accepted => {
-                    ui.label(egui::RichText::new("accepted by MinOS").color(egui::Color32::GREEN));
+                    ui.label(egui::RichText::new("accepted by the exercise").color(egui::Color32::GREEN));
                 }
                 HelmOrderUiResult::Clamped { requested, accepted } => {
                     warn_line(
                         ui,
-                        format!("requested {requested:.0} kn · accepted {accepted:.0} kn · clamped by MinOS"),
+                        format!("requested {requested:.0} kn · accepted {accepted:.0} kn · speed adjusted by the exercise"),
                     );
                 }
                 HelmOrderUiResult::Unknown(reason) => {
@@ -4689,6 +4763,55 @@ impl ShipApp {
             }
         });
         ui.weak("No waypoint: heading and speed remain in force until replaced.");
+    }
+
+    fn helm_heading_input(ui: &mut egui::Ui, heading_deg: &mut f32, enabled: bool) {
+        ui.label("heading");
+        let input = egui::DragValue::new(heading_deg)
+            .speed(1.0)
+            .range(0.0..=359.0)
+            .suffix("°");
+        if enabled {
+            ui.add(input);
+        } else {
+            ui.add_enabled(false, input);
+        }
+        if !enabled {
+            ui.weak("View only");
+        }
+    }
+
+    fn helm_speed_control(
+        ui: &mut egui::Ui,
+        speed_kn: &mut f32,
+        max_kn: Option<f32>,
+        enabled: bool,
+    ) {
+        ui.label("speed");
+        let upper = max_kn
+            .filter(|max| *max > 0.0)
+            .unwrap_or_else(|| speed_kn.max(100.0))
+            .max(*speed_kn)
+            .max(1.0);
+        let slider = egui::Slider::new(speed_kn, 0.0..=upper)
+            .suffix(" kn")
+            .show_value(true);
+        let response = if enabled {
+            ui.add(slider)
+        } else {
+            ui.add_enabled(false, slider)
+        };
+        if enabled {
+            ui.add(egui::DragValue::new(speed_kn).suffix(" kn"));
+        } else {
+            ui.add_enabled(false, egui::DragValue::new(speed_kn).suffix(" kn"));
+        }
+        if max_kn.is_none() {
+            ui.weak("The exercise decides the accepted limit.");
+        }
+        if response.changed() {
+            *speed_kn = speed_kn.clamp(0.0, upper);
+        }
     }
 
     fn order_event_matches(&self, ship_id: &str, fix: &GameFix) -> bool {
@@ -4831,33 +4954,25 @@ impl ShipApp {
             .rem_euclid(360.0);
         let mut speed = draft
             .map(|draft| draft.speed_kn)
-            .unwrap_or(reported_speed.unwrap_or(20.0))
+            .unwrap_or(reported_speed.unwrap_or(0.0))
             .max(0.0);
         ui.label("local sandbox · persistent HelmOrder");
         ui.horizontal(|ui| {
-            ui.label("heading");
-            ui.add(
-                egui::DragValue::new(&mut heading)
-                    .speed(1.0)
-                    .range(0.0..=359.0)
-                    .suffix("°"),
-            );
-            ui.label("speed");
-            ui.add(
-                egui::DragValue::new(&mut speed)
-                    .speed(1.0)
-                    .range(0.0..=view.max_speed_kn as f64)
-                    .suffix(" kn"),
-            );
+            Self::helm_heading_input(ui, &mut heading, true);
+            Self::helm_speed_control(ui, &mut speed, Some(view.max_speed_kn), true);
         });
         if draft.is_some_and(|draft| {
             (draft.heading_deg - heading).abs() > 0.01
                 || (draft.speed_kn - speed).abs() > 0.01
-        }) && matches!(self.order_result.get(id), Some(HelmOrderUiResult::Pending))
-        {
-            self.order_result
-                .insert(id.to_string(), HelmOrderUiResult::Superseded);
-            self.helm_submissions.remove(id);
+        }) {
+            if matches!(self.order_result.get(id), Some(HelmOrderUiResult::Pending)) {
+                self.order_result
+                    .insert(id.to_string(), HelmOrderUiResult::Superseded);
+                self.helm_submissions.remove(id);
+            } else {
+                self.order_result
+                    .insert(id.to_string(), HelmOrderUiResult::Draft);
+            }
         }
         self.helm_drafts.insert(
             id.to_string(),
@@ -4946,7 +5061,7 @@ impl ShipApp {
         // hold or a since-changed matrix.
         self.clock_denied = false;
         let line = format!(
-            "Minos {verb}: assumed {} · {} · {} · {factor}x",
+            "Scenario clock {verb}: assumed {} · {} · {} · {factor}x",
             clock.assumed_now.as_deref().unwrap_or("—"),
             if clock.running { "running" } else { "held" },
             if clock.accepting_actions {
@@ -5001,7 +5116,7 @@ impl ShipApp {
         let (master, tok) = match self.users_client() {
             Ok(t) => t,
             Err(e) => {
-                self.users_status = format!("Minos {verb} refused: {e}");
+                self.users_status = format!("Scenario clock {verb} refused: {e}");
                 return;
             }
         };
@@ -5042,7 +5157,7 @@ impl ShipApp {
         let (master, tok) = match self.users_client() {
             Ok(t) => t,
             Err(e) => {
-                self.users_status = format!("Minos factor refused: {e}");
+                self.users_status = format!("Scenario rate refused: {e}");
                 return;
             }
         };
@@ -5276,7 +5391,7 @@ impl ShipApp {
             None => {
                 let planning = self.users_game_state.as_deref() == Some("planning");
                 ui.weak(if planning {
-                    "no key yet — Minos mints one when the session enters preparation (step 4)."
+                    "no key yet — the exercise creates one when the session enters preparation (step 4)."
                 } else {
                     "no key on the held session — ask its Game Master."
                 });
@@ -5369,11 +5484,21 @@ impl ShipApp {
             self.fleet_cache.clear();
             self.fleet_branches.clear();
             self.fleet_branch_names.clear();
+            self.fleet_category_names.clear();
+            self.fleet_type_names.clear();
             self.fleet_loaded = true;
             return;
         };
         self.fleet_cache = tfg::store::fleet_units(conn).unwrap_or_default();
         self.fleet_branches = tfg::store::branch_mapped_counts(conn);
+        self.fleet_category_names = tfg::store::unit_category_names(conn)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        self.fleet_type_names = tfg::store::unit_type_names(conn)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         self.fleet_branch_names.clear();
         let mut bids: Vec<i64> = self.fleet_branches.keys().cloned().collect();
         for r in &self.fleet_cache {
@@ -5390,6 +5515,274 @@ impl ShipApp {
             }
         }
         self.fleet_loaded = true;
+    }
+
+    fn unit_category_label(&self, id: Option<i64>) -> String {
+        id.and_then(|id| self.fleet_category_names.get(&id).cloned())
+            .unwrap_or_else(|| "Uncategorised".to_string())
+    }
+
+    fn unit_type_label(&self, id: Option<i64>) -> String {
+        id.and_then(|id| self.fleet_type_names.get(&id).cloned())
+            .unwrap_or_else(|| "Unspecified type".to_string())
+    }
+
+    fn load_picker_textures(&mut self, ctx: &egui::Context) {
+        for row in self.fleet_cache.clone() {
+            let Ok(unit_id) = row.id.parse::<i64>() else {
+                continue;
+            };
+            let Some(visual) = self.visuals.get(unit_id) else {
+                continue;
+            };
+            if visual.texture.is_some() || visual.asset_kind != AssetKind::UnitImage {
+                continue;
+            }
+            let Some(source) = visual.image_url.clone() else {
+                continue;
+            };
+            if visual
+                .image_url_retry_at
+                .is_some_and(|retry_at| retry_at > Instant::now())
+                || visual
+                    .image_url_expires_at
+                    .is_some_and(|expires_at| expires_at <= Instant::now())
+            {
+                continue;
+            }
+            let hint = visual
+                .width_px
+                .filter(|width| *width > 0)
+                .map(egui::load::SizeHint::Width)
+                .unwrap_or_else(|| egui::load::SizeHint::Scale(1.0.into()));
+            if let Ok(egui::load::TexturePoll::Ready { texture }) =
+                ctx.try_load_texture(&source, egui::TextureOptions::LINEAR, hint)
+            {
+                self.visuals.set_texture(unit_id, texture);
+            }
+        }
+    }
+
+    /// Small visual cell shared by picker rows and the drag ghost. A
+    /// usable image wins; the catalog symbol is the quiet fallback.
+    fn unit_thumbnail_ui(&self, ui: &mut egui::Ui, id: &str, size: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        let Ok(uid) = id.parse::<i64>() else {
+            return;
+        };
+        if let Some(texture) = self.visuals.get(uid).and_then(|visual| visual.texture.clone()) {
+            painter.image(
+                texture.id,
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            let symbol = self.symbol_for_unit(uid);
+            painter.circle_filled(
+                rect.center(),
+                size * 0.43,
+                egui::Color32::from_rgb(30, 58, 79),
+            );
+            paint_map_symbol(
+                &painter,
+                rect.center(),
+                symbol,
+                egui::Color32::LIGHT_BLUE,
+                false,
+            );
+        }
+    }
+
+    /// Two-pane taxonomy picker for the setup fleet step. The rows are
+    /// catalog Units; the map drop creates the session GameUnit.
+    fn unit_picker_ui(&mut self, ui: &mut egui::Ui, crew: &[(i64, String)]) -> Vec<(i64, String)> {
+        ui.horizontal(|ui| {
+            if ui.small_button("sync register").clicked() {
+                self.sync_now();
+                self.users_refresh_directory();
+            }
+            ui.label("search");
+            ui.text_edit_singleline(&mut self.setup_reg_search);
+        });
+        status_line(ui, &self.sync_status.clone());
+        let mut commander = self.setup_commander;
+        if commander.is_none() {
+            commander = crew.first().map(|(id, _)| *id);
+            self.setup_commander = commander;
+        }
+        ui.horizontal(|ui| {
+            let commander_name = commander
+                .and_then(|id| crew.iter().find(|(crew_id, _)| *crew_id == id))
+                .map(|(_, name)| name.clone())
+                .unwrap_or_else(|| "choose".to_string());
+            egui::ComboBox::from_label("commander")
+                .selected_text(commander_name)
+                .show_ui(ui, |ui| {
+                    for (id, name) in crew {
+                        ui.selectable_value(&mut self.setup_commander, Some(*id), name);
+                    }
+                });
+        });
+        if crew.is_empty() {
+            ui.weak("No eligible commander — seat someone in step 2 first.");
+        }
+        if !self.fleet_loaded {
+            self.reload_fleet_cache();
+        }
+        self.load_picker_textures(ui.ctx());
+        let query = self.setup_reg_search.to_lowercase();
+        let mut category = self.picker_category;
+        let mut class = self.picker_class;
+        let mut unit_type = self.picker_type;
+        let all_rows = self.fleet_cache.clone();
+        let categories: Vec<i64> = all_rows.iter().filter_map(|r| r.category_id).collect::<std::collections::HashSet<_>>().into_iter().collect();
+        let mut categories = categories;
+        categories.sort_by_key(|id| self.unit_category_label(Some(*id)));
+        let classes: Vec<i64> = all_rows
+            .iter()
+            .filter(|r| category.is_none_or(|id| r.category_id == Some(id)))
+            .map(|r| r.class_id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut classes = classes;
+        classes.sort_by_key(|id| {
+            all_rows.iter().find(|r| r.class_id == *id).map(|r| r.class_name.clone()).unwrap_or_default()
+        });
+        let types: Vec<i64> = all_rows
+            .iter()
+            .filter(|r| class.is_none_or(|id| r.class_id == id))
+            .filter_map(|r| r.type_id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut types = types;
+        types.sort_by_key(|id| self.unit_type_label(Some(*id)));
+        let rows: Vec<tfg::store::StoreUnit> = all_rows
+            .iter()
+            .filter(|r| {
+                category.is_none_or(|id| r.category_id == Some(id))
+                    && class.is_none_or(|id| r.class_id == id)
+                    && unit_type.is_none_or(|id| r.type_id == Some(id))
+                    && (query.is_empty()
+                        || format!(
+                            "{} {} {} {} {}",
+                            r.name,
+                            r.hull,
+                            r.class_name,
+                            self.unit_category_label(r.category_id),
+                            self.unit_type_label(r.type_id)
+                        )
+                            .to_lowercase()
+                            .contains(&query))
+            })
+            .cloned()
+            .collect();
+        ui.separator();
+        let mut assigning = Vec::new();
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.strong("Taxonomy");
+                if ui.selectable_label(category.is_none(), "All categories").clicked() {
+                    category = None;
+                    class = None;
+                    unit_type = None;
+                }
+                for id in categories {
+                    let label = self.unit_category_label(Some(id));
+                    let count = all_rows.iter().filter(|r| r.category_id == Some(id)).count();
+                    if ui.selectable_label(category == Some(id), format!("{label} · {count}")).clicked() {
+                        category = Some(id);
+                        class = None;
+                        unit_type = None;
+                    }
+                }
+                if category.is_some() {
+                    ui.separator();
+                    ui.strong("Class");
+                    if ui.selectable_label(class.is_none(), "All classes").clicked() {
+                        class = None;
+                        unit_type = None;
+                    }
+                    for id in classes {
+                        let label = all_rows.iter().find(|r| r.class_id == id).map(|r| r.class_name.clone()).unwrap_or_else(|| format!("Class {id}"));
+                        if ui.selectable_label(class == Some(id), label).clicked() {
+                            class = Some(id);
+                            unit_type = None;
+                        }
+                    }
+                }
+                if class.is_some() {
+                    ui.separator();
+                    ui.strong("Type");
+                    if ui.selectable_label(unit_type.is_none(), "All types").clicked() {
+                        unit_type = None;
+                    }
+                    for id in types {
+                        if ui.selectable_label(unit_type == Some(id), self.unit_type_label(Some(id))).clicked() {
+                            unit_type = Some(id);
+                        }
+                    }
+                }
+            });
+            ui.vertical(|ui| {
+                ui.strong(format!("Units · {}", rows.len()));
+                egui::ScrollArea::vertical().max_height(230.0).show(ui, |ui| {
+                    for row in &rows {
+                        let assigned = self.users_gunits.iter().any(|g| g.unit_id.to_string() == row.id);
+                        let mut assignment = None;
+                        let response = ui.horizontal(|ui| {
+                            self.unit_thumbnail_ui(ui, &row.id, 34.0);
+                            ui.vertical(|ui| {
+                                ui.label(row.name.clone());
+                                ui.weak(format!("{} · {} · {}", row.class_name, self.unit_category_label(row.category_id), self.unit_type_label(row.type_id)));
+                            });
+                            if assigned {
+                                ui.label(egui::RichText::new("assigned ✓").weak().small());
+                            } else if ui.small_button("assign").clicked() {
+                                assignment = row.id.parse::<i64>().ok().map(|id| (id, row.name.clone()));
+                            }
+                        });
+                        let row_response = ui.interact(
+                            response.response.rect,
+                            ui.id().with(("unit-row", row.id.as_str())),
+                            egui::Sense::click_and_drag(),
+                        );
+                        if row_response.is_pointer_button_down_on() && self.unit_drag.is_none() {
+                            self.fleet_pick = Some(row.id.clone());
+                            self.mode.tool = SetupTool::Place;
+                            if let Some(start) = row_response.interact_pointer_pos() {
+                                self.unit_drag = Some(UnitDrag { id: row.id.clone(), name: row.name.clone(), start, moved: false });
+                            }
+                        }
+                        if row_response.clicked() && assignment.is_none() {
+                            self.fleet_pick = Some(row.id.clone());
+                            self.mode.tool = SetupTool::Place;
+                            self.users_status = format!("{} selected · click the map to place", row.name);
+                        }
+                        if let Some((id, name)) = assignment {
+                            assigning.push((id, name));
+                        }
+                    }
+                });
+            });
+        });
+        if let Some(selected) = rows.iter().find(|row| self.fleet_pick.as_deref() == Some(row.id.as_str())) {
+            ui.horizontal(|ui| {
+                ui.weak(format!("Selected: {}", selected.name));
+                if ui.button("place at map center").clicked() {
+                    let (la, lo) = self.center;
+                    self.try_place_picked(la, lo);
+                    self.mode.tool = SetupTool::Select;
+                }
+            });
+        }
+        self.picker_category = category;
+        self.picker_class = class;
+        self.picker_type = unit_type;
+        assigning
     }
 
     /// Setup flow step 3 (#79): assign register hulls as commanded
@@ -5452,119 +5845,8 @@ impl ShipApp {
             status_line(ui, &self.users_status.clone());
             return;
         }
-        ui.horizontal(|ui| {
-            if ui.small_button("sync register").clicked() {
-                self.sync_now();
-                self.users_refresh_directory();
-            }
-            ui.label("search:");
-            ui.text_edit_singleline(&mut self.setup_reg_search);
-        });
-        status_line(ui, &self.sync_status.clone());
-        // Assignment commander: whoever the next assigns will seat.
         let crew = self.setup_crew();
-        if self.setup_commander.is_none() {
-            self.setup_commander = crew.first().map(|(id, _)| *id);
-        }
-        ui.horizontal(|ui| {
-            let cmdr_name = self
-                .setup_commander
-                .and_then(|c| crew.iter().find(|(id, _)| *id == c))
-                .map(|(_, n)| n.clone())
-                .unwrap_or_else(|| "pick".to_string());
-            egui::ComboBox::from_label("commander")
-                .selected_text(cmdr_name)
-                .show_ui(ui, |ui| {
-                    for (id, name) in &crew {
-                        ui.selectable_value(&mut self.setup_commander, Some(*id), name);
-                    }
-                });
-        });
-        if crew.is_empty() {
-            ui.weak("no eligible commander — seat a non-judge participant in step 2");
-        }
-        let query = self.setup_reg_search.to_lowercase();
-        // Render cache, loaded once — the mirror reads happen in
-        // reload_fleet_cache, never per frame.
-        if !self.fleet_loaded {
-            self.reload_fleet_cache();
-        }
-        let rows: Vec<tfg::store::StoreUnit> = self
-            .fleet_cache
-            .clone()
-            .into_iter()
-            .filter(|r| {
-                query.is_empty()
-                    || r.name.to_lowercase().contains(&query)
-                    || r.hull.to_lowercase().contains(&query)
-                    || r.class_name.to_lowercase().contains(&query)
-            })
-            .collect();
-        if rows.is_empty() {
-            ui.weak("Register is empty — sync it first.");
-        }
-        // Unmapped-branch fence: hulls under a branch with no mapped
-        // categories label it openly — the branch is incomplete, the
-        // hull is real, assignment stays the server's call. Matched
-        // by mapping count, never by branch name.
-        let branch_maps = self.fleet_branches.clone();
-        let branch_names = self.fleet_branch_names.clone();
-        let any_unmapped = rows.iter().any(|r| {
-            r.branch_id.is_some_and(|b| branch_maps.get(&b).copied().unwrap_or(0) == 0)
-        });
-        if any_unmapped {
-            ui.weak(
-                "Some hulls sit under branches with no mapped categories — \
-                 the branch awaits CMS mapping, not your fix. They assign normally.",
-            );
-        }
-        let mut assigning: Vec<(i64, String)> = Vec::new();
-        egui::ScrollArea::vertical()
-            .id_salt("setup-register")
-            .max_height(200.0)
-            .show(ui, |ui| {
-                for r in &rows {
-                    let assigned = self
-                        .users_gunits
-                        .iter()
-                        .any(|g| g.unit_id.to_string() == r.id);
-                    ui.horizontal(|ui| {
-                        let mut label = r.name.clone();
-                        if !r.hull.is_empty() {
-                            label += &format!(" ({})", r.hull);
-                        }
-                        if !r.class_name.is_empty() {
-                            label += &format!(" · {}", r.class_name);
-                        }
-                        ui.label(label);
-                        if let Some(bid) = r.branch_id {
-                            let mapped = branch_maps.get(&bid).copied().unwrap_or(0);
-                            if mapped == 0 {
-                                let bname = branch_names
-                                    .get(&bid)
-                                    .cloned()
-                                    .unwrap_or_else(|| format!("branch {bid}"));
-                                ui.label(
-                                    egui::RichText::new(format!("{bname} · unmapped"))
-                                        .weak()
-                                        .small(),
-                                );
-                            }
-                        }
-                        if assigned {
-                            ui.label(egui::RichText::new("assigned ✓").weak().small());
-                        } else if ui.small_button("assign").clicked() {
-                            match r.id.parse::<i64>() {
-                                Ok(hull) => assigning.push((hull, r.name.clone())),
-                                Err(_) => {
-                                    self.users_status =
-                                        format!("assign refused: {} is not a register hull", r.id)
-                                }
-                            }
-                        }
-                    });
-                }
-            });
+        let assigning = self.unit_picker_ui(ui, &crew);
         for (hull, name) in assigning {
             self.setup_assign_unit(hull, &name);
         }
@@ -5724,7 +6006,7 @@ impl ShipApp {
         // C2: the gate's placement arithmetic, straight from Minos —
         // placed + unplaced is the size of the force.
         ui.label(format!(
-            "Minos placements: {} placed · {} to go{}",
+            "Placements: {} placed · {} to go{}",
             self.users_placements.len(),
             self.placement_unplaced,
             if self.placement_ready { " · ready ✓" } else { "" },
@@ -5936,6 +6218,7 @@ impl ShipApp {
         self.minos_tree.clear();
         self.tree_gap = false;
         self.fleet_pick = None;
+        self.pending_placement = None;
         self.users_placements.clear();
         self.placement_unplaced = 0;
         self.placement_ready = false;
@@ -5992,7 +6275,7 @@ impl ShipApp {
             .unwrap_or_else(|| "no session".to_string());
         ui.label(format!("session: {game}"));
         ui.label(format!(
-            "Minos state: {}",
+            "Exercise state: {}",
             self.users_game_state.as_deref().unwrap_or("—")
         ));
         if self.roster_gap {
@@ -6637,7 +6920,7 @@ impl ShipApp {
     fn task_org_ui(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.horizontal(|ui| {
-            ui.strong("Task organisation (Minos)");
+            ui.strong("Task organisation");
             if ui.small_button("reload").clicked() {
                 self.load_minos_tree();
             }
@@ -6805,7 +7088,7 @@ impl ShipApp {
                 // re-enter with the new password.
                 let pair = client
                     .login(&user, &new)
-                    .map_err(|e| PwResult::ReentryFailed(format!("changed, re-entry failed: {e}")))?;
+                    .map_err(|_| PwResult::ReentryFailed)?;
                 let token = pair.access_token.clone();
                 match client.me(&token) {
                     Ok(uid) => Ok(PwResult::Changed(LoginDone {
@@ -6839,7 +7122,7 @@ impl ShipApp {
             PwResult::ChangeFailed(e) => {
                 self.auth_status = e;
             }
-            PwResult::ReentryFailed(_) => {
+            PwResult::ReentryFailed => {
                 self.sign_out("re-entry failed");
             }
             PwResult::GateShut(e) => {
@@ -6942,6 +7225,7 @@ impl ShipApp {
             match res {
                 Ok(done) => self.apply_setup(done),
                 Err(e) => {
+                    self.pending_placement = None;
                     let line = match setup_label {
                         Some(l) => format!("{l} failed: {e}"),
                         None => format!("setup failed: {e}"),
@@ -7000,6 +7284,9 @@ impl ShipApp {
                 self.users_gunits = units;
                 self.fleet_pick = Some(pick.to_string());
                 self.users_status = note;
+                if let Some((_, la, lo)) = self.pending_placement.take() {
+                    self.try_place_picked(la, lo);
+                }
             }
             SetupDone::Unassign(units, note, removed) => {
                 self.users_gunits = units;
@@ -7153,7 +7440,7 @@ impl ShipApp {
     /// as-is (authorable backend-side); capability derives from the
     /// seat row and commanded hulls, never from name comparison.
     fn context_strip(&self) -> String {
-        let source = if self.auth_token.is_some() { "Minos" } else { "local" };
+        let source = if self.auth_token.is_some() { "exercise" } else { "local" };
         let session = self
             .users_game
             .as_ref()
@@ -7669,6 +7956,122 @@ impl ShipApp {
         self.map_view
     }
 
+    fn update_unit_drag(&mut self, ui: &egui::Ui) {
+        let Some(drag) = self.unit_drag.as_mut() else {
+            return;
+        };
+        let pointer = ui.input(|input| input.pointer.interact_pos());
+        if ui.input(|input| input.pointer.any_down()) {
+            if let Some(pointer) = pointer {
+                if pointer.distance(drag.start) > 6.0 {
+                    drag.moved = true;
+                }
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+    }
+
+    fn reconcile_helm_preview(&mut self, id: &str, animation_fraction: f64) {
+        if !self.helm_preview_pending.contains(id) || animation_fraction < 1.0 {
+            return;
+        }
+        let Some(draft) = self.helm_drafts.get(id).map(|draft| draft.heading_deg) else {
+            self.helm_preview_pending.remove(id);
+            return;
+        };
+        let Some(latest) = self
+            .registry
+            .ships()
+            .iter()
+            .find(|ship| ship.ship_id == id)
+            .and_then(|ship| ship.latest.heading_deg)
+        else {
+            self.helm_preview_pending.remove(id);
+            return;
+        };
+        let delta = (draft - latest).rem_euclid(360.0);
+        if delta.min(360.0 - delta) <= 1.0 {
+            self.helm_preview_pending.remove(id);
+        }
+    }
+
+    fn map_preview_heading(
+        &self,
+        id: &str,
+        authoritative_heading: Option<f32>,
+    ) -> Option<f32> {
+        let accepted = matches!(
+            self.order_result.get(id),
+            Some(HelmOrderUiResult::Accepted | HelmOrderUiResult::Clamped { .. })
+        );
+        let draft = self.helm_drafts.get(id).map(|draft| draft.heading_deg);
+        if self.helm_preview_pending.contains(id) && self.action_allows(id) {
+            draft.or(authoritative_heading)
+        } else if accepted {
+            authoritative_heading.or(draft)
+        } else {
+            draft
+                .or_else(|| self.heading_overrides.get(id).copied())
+                .or(authoritative_heading)
+        }
+    }
+
+    fn map_heading_target(
+        &self,
+        markers: &[ShipMarker],
+        px: f64,
+        py: f64,
+        pixels_per_point: f32,
+    ) -> Option<String> {
+        let id = match self.selection.as_ref() {
+            Some(Selection::Ship(id)) => id,
+            _ => return None,
+        };
+        if !self.action_allows(id)
+            || !(self.controlled.contains(id) || self.minos_order_target(id).is_some())
+        {
+            return None;
+        }
+        markers
+            .iter()
+            .find(|marker| {
+                !self.hidden.contains(&marker.id)
+                    && marker.id == *id
+                    && marker_body_hit(marker, px, py, self.zoom, pixels_per_point)
+            })
+            .map(|marker| marker.id.clone())
+    }
+
+    fn update_map_heading_draft(&mut self, id: &str, heading_deg: f32) {
+        let speed_kn = self
+            .helm_drafts
+            .get(id)
+            .map(|draft| draft.speed_kn)
+            .or_else(|| {
+                self.registry
+                    .ships()
+                    .iter()
+                    .find(|ship| ship.ship_id == id)
+                    .and_then(|ship| ship.latest.speed_kn)
+            })
+            .unwrap_or(0.0);
+        self.helm_drafts.insert(
+            id.to_string(),
+            HelmDraft {
+                heading_deg: heading_deg.rem_euclid(360.0),
+                speed_kn,
+            },
+        );
+        if matches!(self.order_result.get(id), Some(HelmOrderUiResult::Pending)) {
+            self.order_result
+                .insert(id.to_string(), HelmOrderUiResult::Superseded);
+            self.helm_submissions.remove(id);
+        } else {
+            self.order_result
+                .insert(id.to_string(), HelmOrderUiResult::Draft);
+        }
+    }
+
     /// Pointer-free map path (blocking ticket): cycle ships and
     /// groups, follow, waypoint-at-center, island toggles, deselect.
     /// Runs inside the focus contract — never while typing. Commit
@@ -7734,7 +8137,15 @@ impl ShipApp {
             self.show_roster = !self.show_roster;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.deselect();
+            if self.unit_drag.take().is_some()
+                || (self.mode.tool == SetupTool::Place && self.fleet_pick.is_some())
+            {
+                self.fleet_pick = None;
+                self.mode.tool = SetupTool::Select;
+                self.users_status = "placement cancelled".to_string();
+            } else {
+                self.deselect();
+            }
         }
     }
 
@@ -7834,6 +8245,7 @@ impl ShipApp {
     /// is independent and untouched.
     fn deselect(&mut self) {
         self.selection = None;
+        self.map_heading_drag = None;
     }
 
     /// Group display name + member units for any group id.
@@ -7933,6 +8345,13 @@ impl ShipApp {
         Some((row.name, row.hull, class))
     }
 
+    fn placement_valid(&self, la: f64, lo: f64) -> bool {
+        self.land
+            .as_ref()
+            .map(|land| land.is_water(&GeoPosition { latitude: la, longitude: lo }))
+            .unwrap_or(true)
+    }
+
     /// Shared place core (click + drag-and-drop): the click path's
     /// guards, then TakeControl for a picked, unplaced hull with stats.
     /// Returns the placed id, if any.
@@ -7946,6 +8365,10 @@ impl ShipApp {
             return None;
         }
         if self.acting_as.is_some() {
+            return None;
+        }
+        if !self.placement_valid(la, lo) {
+            self.users_status = "placement needs water".to_string();
             return None;
         }
         let pid = self.fleet_pick.clone()?;
@@ -7970,9 +8393,18 @@ impl ShipApp {
                         return None;
                     };
                     if !self.users_gunits.iter().any(|g| g.unit_id == uid) {
-                        let msg = format!("place refused: assign {name} in step 3 first");
-                        self.feed(msg.clone());
-                        self.users_status = msg;
+                        if self.setup_op.is_some() {
+                            self.users_status = "finish the current setup action before placing".to_string();
+                        } else if self.setup_commander.is_none() {
+                            self.users_status = "pick a commander before placing".to_string();
+                        } else if let Err(e) = self.users_client() {
+                            self.users_status = format!("cannot create GameUnit: {e}");
+                        } else {
+                            self.pending_placement = Some((pid.clone(), la, lo));
+                            self.setup_assign_unit(uid, &name);
+                            self.mode.tool = SetupTool::Select;
+                            self.users_status = format!("creating GameUnit for {name}…");
+                        }
                         return None;
                     }
                     if self.setup_busy("place") {
@@ -7981,7 +8413,7 @@ impl ShipApp {
                     let (master, tok) = match self.users_client() {
                         Ok(t) => t,
                         Err(e) => {
-                            let msg = format!("place refused: Minos says {e}");
+                            let msg = format!("place refused: {e}");
                             self.feed(msg.clone());
                             self.users_status = msg;
                             return None;
@@ -8059,7 +8491,7 @@ impl ShipApp {
             })
             .unwrap_or_else(|| "unknown class".to_string());
         let msg = format!(
-            "placed {name} ({hull}) at ({la:.4}, {lo:.4}) · {authority} · Minos: {} placed, {} to go",
+            "placed {name} ({hull}) at ({la:.4}, {lo:.4}) · {authority} · exercise: {} placed, {} to go",
             self.users_placements.len(),
             self.placement_unplaced,
         );
@@ -8077,6 +8509,8 @@ impl ShipApp {
         }
         self.controlled.remove(id);
         self.order_views.remove(id);
+        self.helm_drafts.remove(id);
+        self.helm_preview_pending.remove(id);
         self.fix_animation_started.remove(id);
         self.placed_labels.remove(id);
         self.placed_fleet.remove(id);
@@ -9422,7 +9856,7 @@ impl ShipApp {
                             .unwrap_or_else(|| "no game selected".to_string());
                         ui.horizontal(|ui| {
                             ui.label(format!(
-                                "Perencanaan — session: {game} · Minos: {}",
+                                "Perencanaan — session: {game} · Exercise: {}",
                                 self.users_game_state.as_deref().unwrap_or("?"),
                             ));
                             ui.label(
@@ -9445,7 +9879,7 @@ impl ShipApp {
                         // may have moved the game meanwhile).
                         let (side, ready) = self.setup_gate_counts();
                         ui.label(format!(
-                            "Persiapan — {side} exercise-side · {ready} ready · {} pieces · {} placed · {} to go · Minos: {}",
+                            "Persiapan — {side} exercise-side · {ready} ready · {} pieces · {} placed · {} to go · Exercise: {}",
                             self.users_gunits.len(),
                             self.users_placements.len(),
                             self.placement_unplaced,
@@ -9503,7 +9937,7 @@ impl ShipApp {
                         };
                         ui.horizontal(|ui| {
                             ui.label(format!(
-                                "Eksekusi — session {} · {} · Minos: {} · {plot_health}",
+                                "Eksekusi — session {} · {} · Exercise: {} · {plot_health}",
                                 self.game_ts.as_deref().unwrap_or("—"),
                                 if self.game_paused { "PAUSED" } else { "running" },
                                 self.users_game_state.as_deref().unwrap_or("?"),
@@ -9573,7 +10007,7 @@ impl ShipApp {
                     SimStage::Eval => {
                         ui.horizontal(|ui| {
                             ui.label(format!(
-                                "Evaluasi — assessment ready · Minos: {} · transcript {} line(s).",
+                                "Evaluasi — assessment ready · Exercise: {} · transcript {} line(s).",
                                 self.users_game_state.as_deref().unwrap_or("?"),
                                 self.transcript.len()
                             ));
@@ -9611,6 +10045,7 @@ impl eframe::App for ShipApp {
         // M7: harvest off-thread REST before rendering, so statuses
         // and lists are a frame fresh at most.
         self.pump_rest_ops();
+        self.update_unit_drag(ui);
         // Text scale (field ticket): OS base captured once, pref
         // multiplied on top — idempotent per frame, never compounding.
         if self.base_ppp.is_none() {
@@ -9768,7 +10203,7 @@ impl eframe::App for ShipApp {
                 let source = if self.users_game_state.as_deref() == Some("execution")
                     && self.users_game.is_some()
                 {
-                    "Minos"
+                    "exercise"
                 } else {
                     "local"
                 };
@@ -9946,6 +10381,7 @@ impl eframe::App for ShipApp {
                 ui.label("amber ring — old (backfilled) data, not live");
                 ui.label("yellow ring — camera follows this hull");
                 ui.label("blue ring — selected, open in Inspector");
+                ui.label("selected thumbnail arrow — drag to set heading");
                 ui.label("dotted trail — recent fixes, Live only");
                 ui.label("○ flag — collapsed group, click or zoom to expand");
                 ui.label("hollow amber — journal replay ghost, not live");
@@ -9956,7 +10392,7 @@ impl eframe::App for ShipApp {
             // Minos owns state, the client projects, the sandbox is
             // its own world. Keys never fire while typing.
             ui.collapsing("Keys & model", |ui| {
-                ui.label("Space — pause / resume (Minos while connected)");
+                ui.label("Space — pause / resume (the exercise while connected)");
                 ui.label("1–9 — desktops");
                 ui.label("[ / ] — cycle ships (opens the Inspector)");
                 ui.label("G — cycle groups");
@@ -9964,7 +10400,7 @@ impl eframe::App for ShipApp {
                 ui.label("O — orders · R — roster · Esc — drop selection");
                 ui.weak("helm uses Set helm; legacy waypoint navigation remains under its compatibility section.");
                 ui.separator();
-                ui.label("Minos owns state, clock, orders, fixes, positions, and messages; this client is its projection and control surface. A local run without a session is an explicitly separate sandbox.");
+                ui.label("The exercise owns state, clock, orders, fixes, positions, and messages; this client is its projection and control surface. A local run without a session is a separate sandbox.");
                 ui.weak("the toolbar strip — source · session · phase · seat · freshness · next — is the same everywhere.");
             });
             ui.separator();
@@ -10411,7 +10847,7 @@ impl eframe::App for ShipApp {
                             })
                         {
                             let msg =
-                                "take control refused: Minos drives this hull in execution"
+                                "take control refused: the exercise is already driving this unit"
                                     .to_string();
                             self.feed(msg.clone());
                             self.users_status = msg;
@@ -10553,38 +10989,161 @@ impl eframe::App for ShipApp {
                         .sense(egui::Sense::click_and_drag()),
                 );
                 let rect = response.rect;
-                // Drag-to-pan (pan-zoom ticket): drags move the camera and
-                // break follow; egui only reports clicked() when the press
-                // never became a drag, so clicks keep their meaning with no
-                // extra threshold. Overlays track the center live; the
-                // texture follows through the 250ms throttle + flush.
-                // Closed is inert (Inspector-model ticket).
-                if self.mode.phase != Phase::Closed && response.dragged() {
-                    if response.drag_started() && self.following.is_some() {
-                        self.following = None;
-                        eprintln!("follow broken by drag");
-                    }
-                    let delta = response.drag_delta();
-                    if delta.x != 0.0 || delta.y != 0.0 {
-                        let (mw, mh) = self.map_dims();
-                        self.center = unproject_mercator(
-                            mw / 2.0 - delta.x as f64,
-                            mh / 2.0 - delta.y as f64,
-                            self.center,
-                            self.zoom,
-                            mw,
-                            mh,
-                        );
-                        self.zoom_dirty = true;
-                        // H1: keep repainting while the gesture runs; the
-                        // idle 100ms cadence resumes when it ends.
-                        ui.ctx().request_repaint();
-                        if self.last_zoom_req.elapsed() >= Duration::from_millis(250) {
-                            self.zoom_dirty = false;
-                            self.last_zoom_req = Instant::now();
-                            self.refresh_map_light();
+                let pixels_per_point = ui.ctx().pixels_per_point();
+                if ui.input(|input| input.pointer.any_released()) {
+                    if let Some(drag) = self.unit_drag.take() {
+                        if drag.moved {
+                            let drop = ui.input(|input| input.pointer.interact_pos());
+                            if let Some(pos) = drop.filter(|pos| rect.contains(*pos)) {
+                                let px = (pos.x - rect.min.x) as f64;
+                                let py = (pos.y - rect.min.y) as f64;
+                                let (mw, mh) = self.map_dims();
+                                let (la, lo) = unproject_mercator(
+                                    px, py, self.center, self.zoom, mw, mh,
+                                );
+                                self.fleet_pick = Some(drag.id);
+                                self.try_place_picked(la, lo);
+                                self.mode.tool = SetupTool::Select;
+                            } else {
+                                self.mode.tool = SetupTool::Select;
+                                self.users_status = format!(
+                                    "{} placement cancelled · release over the map",
+                                    drag.name
+                                );
+                            }
+                        } else {
+                            self.fleet_pick = Some(drag.id);
+                            self.mode.tool = SetupTool::Place;
+                            self.users_status = format!(
+                                "{} selected · click the map to place",
+                                drag.name
+                            );
                         }
                     }
+                }
+                if let (Some(drag), Some(pos)) = (
+                    self.unit_drag.as_ref(),
+                    ui.input(|input| input.pointer.interact_pos()),
+                ) {
+                    if rect.contains(pos) {
+                        let local = pos - rect.min.to_vec2();
+                        let (la, lo) = unproject_mercator(
+                            local.x as f64,
+                            local.y as f64,
+                            self.center,
+                            self.zoom,
+                            self.map_dims().0,
+                            self.map_dims().1,
+                        );
+                        let valid = self.placement_valid(la, lo);
+                        let tint = if valid {
+                            egui::Color32::from_rgb(74, 222, 128)
+                        } else {
+                            egui::Color32::from_rgb(246, 197, 107)
+                        };
+                        let ghost_rect =
+                            egui::Rect::from_center_size(local, egui::vec2(54.0, 54.0));
+                        let painter = ui.painter_at(rect);
+                        if let Ok(uid) = drag.id.parse::<i64>() {
+                            if let Some(texture) = self.visuals.get(uid).and_then(|v| v.texture.clone()) {
+                                painter.image(
+                                    texture.id,
+                                    ghost_rect,
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    egui::Color32::from_white_alpha(190),
+                                );
+                            } else {
+                                paint_map_symbol(
+                                    &painter,
+                                    local,
+                                    self.symbol_for_unit(uid),
+                                    egui::Color32::LIGHT_BLUE,
+                                    false,
+                                );
+                            }
+                        }
+                        painter.circle_stroke(
+                            local,
+                            27.0,
+                            egui::Stroke::new(2.0, tint),
+                        );
+                        painter.text(
+                            local + egui::vec2(32.0, 2.0),
+                            egui::Align2::LEFT_TOP,
+                            &drag.name,
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+                // The selected unit's map body is the primary heading
+                // handle. A drag that starts on that body changes the
+                // local draft; every other map drag keeps pan behavior.
+                if self.mode.phase != Phase::Closed
+                    && (response.is_pointer_button_down_on() || response.drag_started())
+                    && self.map_heading_drag.is_none()
+                {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let px = (pos.x - rect.min.x) as f64;
+                        let py = (pos.y - rect.min.y) as f64;
+                        self.map_heading_drag = self.map_heading_target(
+                            &markers,
+                            px,
+                            py,
+                            pixels_per_point,
+                        );
+                    }
+                }
+                let heading_drag = self.map_heading_drag.clone();
+                if self.mode.phase != Phase::Closed && response.dragged() {
+                    if let Some(id) = heading_drag {
+                        if let Some(pos) = ui.input(|input| input.pointer.interact_pos()) {
+                            if rect.contains(pos) {
+                                let marker = markers.iter().find(|marker| marker.id == id);
+                                if let Some(marker) = marker {
+                                    let center = rect.min
+                                        + egui::vec2(marker.x as f32, marker.y as f32);
+                                    let delta = pos - center;
+                                    if delta.length() > 4.0 {
+                                        let heading = (delta.y.atan2(delta.x).to_degrees()
+                                            + 90.0)
+                                            .rem_euclid(360.0);
+                                        self.update_map_heading_draft(&id, heading);
+                                        ui.ctx().request_repaint();
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        if response.drag_started() && self.following.is_some() {
+                            self.following = None;
+                            eprintln!("follow broken by drag");
+                        }
+                        let delta = response.drag_delta();
+                        if delta.x != 0.0 || delta.y != 0.0 {
+                            let (mw, mh) = self.map_dims();
+                            self.center = unproject_mercator(
+                                mw / 2.0 - delta.x as f64,
+                                mh / 2.0 - delta.y as f64,
+                                self.center,
+                                self.zoom,
+                                mw,
+                                mh,
+                            );
+                            self.zoom_dirty = true;
+                            // H1: keep repainting while the gesture runs; the
+                            // idle 100ms cadence resumes when it ends.
+                            ui.ctx().request_repaint();
+                            if self.last_zoom_req.elapsed() >= Duration::from_millis(250) {
+                                self.zoom_dirty = false;
+                                self.last_zoom_req = Instant::now();
+                                self.refresh_map_light();
+                            }
+                        }
+                    }
+                }
+                if ui.input(|input| input.pointer.any_released()) {
+                    self.map_heading_drag = None;
                 }
                 // Map click: stand up a catalog unit when placing, place
                 // a pending waypoint when arming, else select nearest.
@@ -10629,12 +11188,20 @@ impl eframe::App for ShipApp {
                             self.select_group(flag.0.clone());
                             self.request_frame(&flag.0, (flag.1, flag.2));
                         } else {
-                            let visible: Vec<(String, f64, f64)> = markers
+                            let hit = markers
                                 .iter()
                                 .filter(|m| !self.hidden.contains(&m.id))
-                                .map(|m| (m.id.clone(), m.x, m.y))
-                                .collect();
-                            if let Some(id) = hit_test(&visible, px, py, 12.0) {
+                                .find(|m| {
+                                    marker_body_hit(
+                                        m,
+                                        px,
+                                        py,
+                                        self.zoom,
+                                        pixels_per_point,
+                                    )
+                                })
+                                .map(|m| m.id.clone());
+                            if let Some(id) = hit {
                                 eprintln!("select {id}");
                                 self.select_ship(id);
                             } else if let Some(gid) = zones
@@ -10687,8 +11254,15 @@ impl eframe::App for ShipApp {
                             let py = (p.y - rect.min.y) as f64;
                             let near_marker = markers
                                 .iter()
+                                .filter(|m| !self.hidden.contains(&m.id))
                                 .find(|m| {
-                                    ((m.x - px).powi(2) + (m.y - py).powi(2)).sqrt() < 16.0
+                                    marker_body_hit(
+                                        m,
+                                        px,
+                                        py,
+                                        self.zoom,
+                                        pixels_per_point,
+                                    )
                                 })
                                 .map(|m| m.id.clone());
                             let near_flag = flags
@@ -10836,7 +11410,6 @@ impl eframe::App for ShipApp {
                         MAP_INK,
                     );
                 }
-                let pixels_per_point = ui.ctx().pixels_per_point();
                 let mut image_quads: Vec<Option<Vec<egui::Pos2>>> =
                     (0..markers.len()).map(|_| None).collect();
                 // Layer 1: all trails, so no later unit can paint over
@@ -10934,6 +11507,54 @@ impl eframe::App for ShipApp {
                             ),
                         );
                     }
+                }
+                // Selected on-map heading handle: the arrow sits on the
+                // thumbnail body and edits only the local helm draft.
+                for (index, marker) in markers.iter().enumerate() {
+                    if self.hidden.contains(&marker.id) {
+                        continue;
+                    }
+                    let selected_id = match self.selection.as_ref() {
+                        Some(Selection::Ship(id)) => id,
+                        _ => continue,
+                    };
+                    if selected_id != &marker.id
+                        || !self.action_allows(selected_id)
+                        || !(self.controlled.contains(selected_id)
+                            || self.minos_order_target(selected_id).is_some())
+                    {
+                        continue;
+                    }
+                    let center = rect.min + egui::vec2(marker.x as f32, marker.y as f32);
+                    let radius = image_quads[index]
+                        .as_ref()
+                        .and_then(|points| {
+                            points
+                                .iter()
+                                .map(|point| point.distance(center))
+                                .fold(None::<f32>, |max, distance| {
+                                    Some(max.map_or(distance, |value: f32| value.max(distance)))
+                                })
+                        })
+                        .map_or(18.0, |distance| distance * 0.78);
+                    let heading = self
+                        .helm_drafts
+                        .get(&marker.id)
+                        .map(|draft| draft.heading_deg)
+                        .or(marker.heading_deg)
+                        .unwrap_or(0.0);
+                    let angle = heading.to_radians();
+                    let tip = center + egui::vec2(angle.sin(), -angle.cos()) * radius;
+                    painter.circle_stroke(
+                        center,
+                        radius,
+                        egui::Stroke::new(1.5, egui::Color32::from_white_alpha(150)),
+                    );
+                    painter.line_segment(
+                        [center, tip],
+                        egui::Stroke::new(3.0, egui::Color32::LIGHT_BLUE),
+                    );
+                    painter.circle_filled(tip, 5.0, egui::Color32::LIGHT_BLUE);
                 }
                 // Log replay ghosts (task #41): hollow amber units as
                 // placed up to the slider, from the journal — not live.
@@ -11329,6 +11950,7 @@ fn main() -> eframe::Result<()> {
                 order_result: HashMap::new(),
                 helm_submissions: HashMap::new(),
                 helm_drafts: HashMap::new(),
+                helm_preview_pending: HashSet::new(),
                 controlled: HashSet::new(),
                 pending_waypoint: None,
                 placing: false,
@@ -11340,6 +11962,7 @@ fn main() -> eframe::Result<()> {
                 selected_class: 0,
                 fleet: Fleet::from_default_asset().expect("fleet asset valid"),
                 fleet_pick: None,
+                pending_placement: None,
                 setup_step: 0,
                 assessment_tab: 0,
                 setup_name: String::new(),
@@ -11360,6 +11983,11 @@ fn main() -> eframe::Result<()> {
                 fleet_cache: Vec::new(),
                 fleet_branches: std::collections::HashMap::new(),
                 fleet_branch_names: std::collections::HashMap::new(),
+                fleet_category_names: std::collections::HashMap::new(),
+                fleet_type_names: std::collections::HashMap::new(),
+                picker_category: None,
+                picker_class: None,
+                picker_type: None,
                 fleet_loaded: false,
                 setup_commander: None,
                 users_game: None,
@@ -11392,6 +12020,8 @@ fn main() -> eframe::Result<()> {
                 users_approles: Vec::new(),
                 upress: None,
                 udrag: None,
+                unit_drag: None,
+                map_heading_drag: None,
                 placed_fleet: HashSet::new(),
                 placed_labels: HashMap::new(),
                 time_real_start: (Utc::now() + chrono::Duration::hours(7)).format("%Y-%m-%d %H:%M").to_string(),

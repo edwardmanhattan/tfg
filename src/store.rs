@@ -758,6 +758,19 @@ pub fn unit_type_names(conn: &Connection) -> Result<Vec<(i64, String)>, String> 
         .map_err(|e| e.to_string())
 }
 
+/// Category names for the unit picker. They are operator-facing taxonomy
+/// labels; ids remain the stable identity used by joins and symbols.
+pub fn unit_category_names(conn: &Connection) -> Result<Vec<(i64, String)>, String> {
+    let mut raw = conn
+        .prepare("SELECT id, name FROM unit_categories ORDER BY name")
+        .map_err(|e| e.to_string())?;
+    let rows = raw
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
 /// Category fallbacks derived from stable ids: a category resolves
 /// only when every assigned type in it resolves to the same symbol. A
 /// mixed category stays silent and resolution continues to the domain
