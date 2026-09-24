@@ -34,6 +34,10 @@ _Avoid_: current helm directive, command (that's the multi-unit directive, see C
 One persistent directive for a single GameUnit: a compass heading and speed in knots. An accepted HelmOrder replaces the previous one; speed zero is Hold position and retains the last accepted heading. It is not a waypoint, route, or client-invented destination.
 _Avoid_: waypoint, move order, navigation plan, instruction
 
+**Command result**:
+The reconciliation state of a HelmOrder: Draft, Pending, Accepted, Clamped, Unknown, Refused, or Superseded. A command result is separate from connection freshness; a disconnected client does not downgrade an already accepted result.
+_Avoid_: optimistic acceptance, silent retry, raw error string
+
 **Owned**:
 A ship driven by the sim from a player's HelmOrders or legacy Orders.
 _Avoid_: ownship, friendly
