@@ -61,6 +61,13 @@ const ZONE_PAD_PX: f64 = 26.0;
 /// 640px viewport under the toolbar with room for window chrome; unbounded
 /// lists inside already-capped islands keep their own tighter cap.
 const ISLAND_SCROLL_MAX: f32 = 420.0;
+/// Inspector thumbnails are a view preference, not game state. Keep
+/// the default compact so a wide source PNG cannot expand the island;
+/// operators can still enlarge it without changing the asset or map.
+const INSPECTOR_IMAGE_DEFAULT_WIDTH: f32 = 280.0;
+const INSPECTOR_IMAGE_MIN_WIDTH: f32 = 160.0;
+const INSPECTOR_IMAGE_MAX_WIDTH: f32 = 640.0;
+const INSPECTOR_IMAGE_MAX_HEIGHT: f32 = 180.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Session stub pace (session flow): 7 real hours play 7 game days.
 /// Full windows UI lands with the organizer flow; the ratio is the load-
@@ -386,6 +393,30 @@ fn fallback_unit_geometry(visual: &UnitVisual) -> (f64, f64) {
         .unwrap_or(10.0)
         .clamp(4.0, 24.0);
     (FALLBACK_UNIT_LENGTH_PX, beam)
+}
+
+/// Fit an Inspector image inside the available width without letting a
+/// tall source consume the whole island. The requested width is a view
+/// preference; the fit is still bounded by the current Inspector layout.
+fn inspector_image_size(
+    texture_size: egui::Vec2,
+    requested_width: f32,
+    available_width: f32,
+) -> egui::Vec2 {
+    let available_width = available_width.max(1.0);
+    let width = requested_width
+        .clamp(INSPECTOR_IMAGE_MIN_WIDTH, INSPECTOR_IMAGE_MAX_WIDTH)
+        .min(available_width);
+    if texture_size.x <= 0.0 || texture_size.y <= 0.0 {
+        return egui::vec2(width, 0.0);
+    }
+    let aspect = texture_size.y / texture_size.x;
+    let height = width * aspect;
+    if height > INSPECTOR_IMAGE_MAX_HEIGHT {
+        egui::vec2((INSPECTOR_IMAGE_MAX_HEIGHT / aspect).min(width), INSPECTOR_IMAGE_MAX_HEIGHT)
+    } else {
+        egui::vec2(width, height)
+    }
 }
 
 /// The small vocabulary the far map can draw. Every stable map symbol
@@ -1785,6 +1816,10 @@ struct ShipApp {
     /// another. Memory only: presigned URLs never reach SQLite, and
     /// the texture dies with the process.
     visuals: VisualCache,
+    /// Global Inspector thumbnail width preference. This is deliberately
+    /// not cleared with the visual session: it is a view preference, not
+    /// a game or asset fact.
+    inspector_image_width: f32,
     /// Taxonomy symbols resolved independently of the image manifest,
     /// so the far map is useful before picture bytes arrive. The
     /// VisualCache copies these into each versioned UnitVisual.
@@ -6987,6 +7022,26 @@ impl ShipApp {
         }
     }
 
+    /// Compact, resizable Inspector image sizing. The width is global
+    /// for the session, while the actual draw size still follows the
+    /// current Inspector width and the source aspect ratio.
+    fn inspector_image_size_control(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("image width");
+            let mut width = self.inspector_image_width;
+            let response = ui.add(
+                egui::Slider::new(
+                    &mut width,
+                    INSPECTOR_IMAGE_MIN_WIDTH..=INSPECTOR_IMAGE_MAX_WIDTH,
+                )
+                .suffix(" pt"),
+            );
+            if response.changed() {
+                self.inspector_image_width = width;
+            }
+        });
+    }
+
     /// Ask egui for a source texture and keep its renderable identity
     /// in the versioned visual. Presigned addresses are acquisition
     /// steps, not durable identity: once decoded, the texture outlives
@@ -6997,11 +7052,16 @@ impl ShipApp {
         unit_id: i64,
         source: &str,
         width_px: Option<u32>,
+        height_px: Option<u32>,
     ) {
         let hint = width_px
             .filter(|width| *width > 0)
             .map(egui::load::SizeHint::Width)
             .unwrap_or_else(|| egui::load::SizeHint::Scale(1.0.into()));
+        let manifest_size = egui::vec2(
+            width_px.filter(|value| *value > 0).unwrap_or(1) as f32,
+            height_px.filter(|value| *value > 0).unwrap_or(1) as f32,
+        );
         match ui.ctx().try_load_texture(
             source,
             egui::TextureOptions::LINEAR,
@@ -7009,12 +7069,22 @@ impl ShipApp {
         ) {
             Ok(egui::load::TexturePoll::Ready { texture }) => {
                 self.visuals.set_texture(unit_id, texture);
-                ui.image(texture);
+                let display_size = inspector_image_size(
+                    texture.size,
+                    self.inspector_image_width,
+                    ui.available_width(),
+                );
+                ui.add(egui::Image::from_texture(texture).fit_to_exact_size(display_size));
             }
             Ok(egui::load::TexturePoll::Pending { .. }) | Err(_) => {
                 // The loader owns the retry and loading state. A
                 // second request under the same URI is deduplicated.
-                ui.image(source.to_string());
+                let display_size = inspector_image_size(
+                    manifest_size,
+                    self.inspector_image_width,
+                    ui.available_width(),
+                );
+                ui.add(egui::Image::from_uri(source).fit_to_exact_size(display_size));
             }
         }
     }
@@ -9410,7 +9480,15 @@ impl eframe::App for ShipApp {
                         });
                         match picture {
                             Some((Some(_), AssetKind::UnitImage, width, Some(texture), _, _)) => {
-                                ui.image(texture);
+                                let display_size = inspector_image_size(
+                                    texture.size,
+                                    self.inspector_image_width,
+                                    ui.available_width(),
+                                );
+                                ui.add(
+                                    egui::Image::from_texture(texture)
+                                        .fit_to_exact_size(display_size),
+                                );
                                 let size = texture.size;
                                 ui.weak(format!(
                                     "image decoded · manifest width {} px · texture {:.0}×{:.0} px",
@@ -9425,7 +9503,8 @@ impl eframe::App for ShipApp {
                                 ui.weak("refreshing picture source…");
                             }
                             Some((Some(source), AssetKind::UnitImage, width, None, _, _)) => {
-                                self.show_visual_source(ui, uid, &source, width);
+                                let height = self.visuals.get(uid).and_then(|v| v.height_px);
+                                self.show_visual_source(ui, uid, &source, width, height);
                             }
                             Some((None, AssetKind::UnitImage, _, _, _, Some(retry_at)))
                                 if retry_at > Instant::now() =>
@@ -9444,6 +9523,13 @@ impl eframe::App for ShipApp {
                             Some((_, AssetKind::Unavailable, _, _, _, _)) => {
                                 ui.weak("no picture");
                             }
+                        }
+                        if self
+                            .visuals
+                            .get(uid)
+                            .is_some_and(|v| v.asset_kind == AssetKind::UnitImage)
+                        {
+                            self.inspector_image_size_control(ui);
                         }
                         if let Some(v) = self.visuals.get(uid) {
                             let content_type = if v.content_type.is_empty() {
@@ -11046,6 +11132,7 @@ fn main() -> eframe::Result<()> {
                 minos_tree: Vec::new(),
                 tree_gap: false,
                 visuals: VisualCache::default(),
+                inspector_image_width: INSPECTOR_IMAGE_DEFAULT_WIDTH,
                 unit_symbols: HashMap::new(),
                 unit_type_ids: HashMap::new(),
                 unit_type_names: HashMap::new(),
@@ -11126,6 +11213,23 @@ mod tests {
 
     fn symbol(_: i64) -> tfg::store::MapSymbol {
         tfg::store::MapSymbol::Corvette
+    }
+
+    /// Inspector images stay compact by default, preserve their source
+    /// aspect ratio, and never grow taller than the compact preview cap.
+    #[test]
+    fn inspector_image_size_is_bounded_and_aspect_preserving() {
+        let wide = inspector_image_size(egui::vec2(900.0, 111.0), 280.0, 320.0);
+        assert!((wide.x - 280.0).abs() < 0.01);
+        assert!((wide.y - 111.0 / 900.0 * 280.0).abs() < 0.01);
+
+        let tall = inspector_image_size(egui::vec2(111.0, 900.0), 280.0, 320.0);
+        assert!((tall.y - INSPECTOR_IMAGE_MAX_HEIGHT).abs() < 0.01);
+        assert!(tall.x < 280.0);
+        assert!(tall.x > 0.0);
+
+        let narrow_panel = inspector_image_size(egui::vec2(900.0, 111.0), 280.0, 120.0);
+        assert!((narrow_panel.x - 120.0).abs() < 0.01);
     }
 
     /// Every map symbol owns a distinct far geometry. This is the
