@@ -1508,6 +1508,10 @@ struct ShipApp {
     poll_handle: Option<JoinHandle<()>>,
     map_handle: Option<JoinHandle<()>>,
     last_poll: Instant,
+    /// Last arrival from the authoritative game-position WebSocket. A
+    /// quiet stream falls back to the REST plot instead of leaving the
+    /// ship stale for the full backoff interval.
+    last_game_position_at: Option<Instant>,
     /// Presentation-only interpolation start per accepted ship. Keeping
     /// this per ship prevents an unrelated source or unit from resetting
     /// everyone else's glide.
@@ -2200,6 +2204,7 @@ impl ShipApp {
                     self.show_messages = true;
                 }
                 LiveEvent::GamePositions(plot) => {
+                    self.last_game_position_at = Some(Instant::now());
                     self.ingest_game_positions(plot);
                 }
                 LiveEvent::OrderIssued(fix) => {
@@ -2315,11 +2320,17 @@ impl ShipApp {
                     .map(|visual| visual.map_symbol)
                     .or_else(|| unit_id.and_then(|unit_id| self.unit_symbols.get(&unit_id).copied()))
                     .unwrap_or(tfg::store::MapSymbol::UnknownShip);
+                let stale = s.stale
+                    || (s.source == FixSource::Game
+                        && self
+                            .last_seen
+                            .get(&s.ship_id)
+                            .is_some_and(|at| at.elapsed() >= Duration::from_secs(5)));
                 ShipMarker {
                     id: s.ship_id.clone(),
                     x,
                     y,
-                    stale: s.stale,
+                    stale,
                     old_data,
                     source: s.source,
                     trail,
@@ -2483,6 +2494,7 @@ impl ShipApp {
         self.helm_submissions.clear();
         self.helm_drafts.clear();
         self.helm_warnings.clear();
+        self.last_game_position_at = None;
         self.fix_animation_started.clear();
     }
 
@@ -4485,9 +4497,9 @@ impl ShipApp {
     }
 
     /// Turn one authoritative MinOS position snapshot into accepted
-    /// Game fixes. Resetting `last_poll` here is essential: the REST path
-    /// does not pass through `poll_rx`, so without this the next 15 s
-    /// sample would be rendered at an already-expired fraction and jump.
+    /// Game fixes. Resetting the per-ship animation clock here is
+    /// essential: the REST path does not pass through `poll_rx`, so
+    /// without this the next sample would render at an expired fraction.
     fn ingest_game_positions(&mut self, plot: tfg::backend::PositionList) -> usize {
         let n = plot.positions.len();
         let fixes: Vec<Fix> = plot
@@ -6940,19 +6952,21 @@ impl ShipApp {
             }
             self.dispatch_queued_refresh();
         }
-        // #98: steady plot cadence during connected execution. 15 s
-        // base (exercise plots move slowly in real time, and every pull
-        // is exact at its answered instant), doubling per consecutive
-        // failure to a 120 s cap, paused outside Live Simulation
-        // execution. A busy op never piles — the pull guards itself.
-        if self.plot_op.is_none()
+        // The WebSocket position stream is the primary source. If it is
+        // quiet for five seconds, use REST once per second as a recovery
+        // path rather than allowing the marker to go stale between sparse
+        // samples. A busy op never piles — the pull guards itself.
+        let game_stream_fresh = self
+            .last_game_position_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(5));
+        if !game_stream_fresh
+            && self.plot_op.is_none()
             && self.session_live()
             && self.app_mode == AppMode::Simulation
             && self.users_game_state.as_deref() == Some("execution")
             && self.users_game.is_some()
         {
-            let wait =
-                15u64.saturating_mul(1u64 << self.plot_fails.min(3)).min(120);
+            let wait = 1u64.saturating_mul(1u64 << self.plot_fails.min(3)).min(120);
             let due = self
                 .last_plot_try
                 .is_none_or(|t| t.elapsed().as_secs() >= wait);
@@ -11289,6 +11303,7 @@ fn main() -> eframe::Result<()> {
                 poll_handle: Some(poll_handle),
                 map_handle: Some(map_handle),
                 last_poll: Instant::now(),
+                last_game_position_at: None,
                 fix_animation_started: HashMap::new(),
                 hidden: HashSet::new(),
                 following: None,

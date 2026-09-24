@@ -137,11 +137,11 @@ pub enum LiveCmd {
     Shutdown,
 }
 
-/// Subscribe one message channel (H11): game broadcasts or personal
-/// addressed traffic. Publications parse to message events — never to
-/// the Registry. The declaration rides the (re)handshake like the
-/// live-feed one, so watching works across reconnects with no extra
-/// re-arm: the SDK resubscribes every non-unsubscribed slot itself.
+/// Subscribe one live channel: the live feed, game event/position
+/// channels, or a personal addressed channel. The callback normalizes
+/// the publication into the appropriate LiveEvent. The declaration
+/// rides the (re)handshake, so watching works across reconnects with no
+/// extra re-arm: the SDK resubscribes every non-unsubscribed slot itself.
 fn watch_subscription(
     client: &tokio_centrifuge::client::Client,
     event_tx: &std::sync::mpsc::Sender<LiveEvent>,

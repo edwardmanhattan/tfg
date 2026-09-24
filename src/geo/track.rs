@@ -315,6 +315,12 @@ impl Registry {
             }
         }
         for (id, s) in self.ships.iter_mut() {
+            // Game fixes arrive on their own MinOS position stream, not
+            // through this poll's empty Wire/Sim rounds. Do not let an
+            // unrelated two-second poll mark a live game ship stale.
+            if s.latest.source == FixSource::Game {
+                continue;
+            }
             if !seen.contains(id) {
                 s.missed += 1;
                 if s.missed >= STALE_AFTER_MISSED {
