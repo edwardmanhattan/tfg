@@ -19,11 +19,11 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use chrono::{TimeZone, Utc};
-use tfg::backend::{BackendError, FileReplay, GameMsg, LiveCmd, LiveEvent, LiveWire, MinosAuth, MinosMaster, MinosRest, MockPoll, PollSource, TokenPair};
+use tfg::backend::{BackendError, FileReplay, GameFix, GameMsg, LiveCmd, LiveEvent, LiveWire, MinosAuth, MinosMaster, MinosRest, MockPoll, PollSource, TokenPair};
 use tfg::catalog::Catalog;
 use tfg::fleet::Fleet;
 use tfg::groups::{GroupKind, Groups};
-use tfg::command::{Authority, GrantDenial};
+use tfg::command::{Authority, Grant, GrantDenial, Leg, MoveCommand, Verb};
 use tfg::geo::track::{Fix, FixSource, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
@@ -1367,17 +1367,32 @@ enum ImageOut {
 /// A command result kept in the Inspector/Orders surface. The transport
 /// worker classifies failures before they reach the UI; no raw error
 /// string is mistaken for an accepted HelmOrder.
+#[derive(Debug, Clone, Copy)]
+struct HelmDraft {
+    heading_deg: f32,
+    speed_kn: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HelmSubmission {
+    heading_deg: f32,
+    speed_kn: f32,
+    requester_id: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum HelmOrderUiResult {
+    Draft,
     Pending,
     Accepted,
     Clamped { requested: f64, accepted: f64 },
     Unknown(String),
     Refused(String),
+    Superseded,
 }
 
 enum OrderFailure {
-    Refused(String),
+    Refused { category: String, detail: String },
     Unknown(String),
 }
 
@@ -1538,18 +1553,18 @@ struct ShipApp {
     /// not a second authority; the MinOS response or local sim event
     /// replaces it.
     order_result: HashMap<String, HelmOrderUiResult>,
+    helm_submissions: HashMap<String, HelmSubmission>,
+    helm_drafts: HashMap<String, HelmDraft>,
     controlled: HashSet<String>,
     pending_waypoint: Option<(f64, f64)>,
     placing: bool,
     order_speed: f32,
-    /// Helm heading draft; `None` means the next selected ship's
-    /// authoritative heading seeds the control.
-    order_heading: Option<f32>,
     /// Land test for order validation (ticket #22): land waypoints are
     /// rejected in the UI before they ever reach the sim.
     land: Option<Land>,
     /// Last order refusal from the sim, shown until the next attempt.
     order_warning: Option<String>,
+    helm_warnings: HashMap<String, String>,
     /// Unit taxonomy (grill #18): class chosen at take-control.
     catalog: Catalog,
     selected_class: usize,
@@ -2011,10 +2026,17 @@ impl ShipApp {
                 }
                 SimEvent::HelmApplied {
                     ship_id,
-                    heading_deg: _,
+                    heading_deg,
                     requested_speed_kn,
                     accepted_speed_kn,
                 } => {
+                    if !self.applied_submission_matches(
+                        &ship_id,
+                        heading_deg,
+                        requested_speed_kn,
+                    ) {
+                        continue;
+                    }
                     let result = if requested_speed_kn > accepted_speed_kn {
                         HelmOrderUiResult::Clamped {
                             requested: requested_speed_kn as f64,
@@ -2023,23 +2045,39 @@ impl ShipApp {
                     } else {
                         HelmOrderUiResult::Accepted
                     };
+                    self.helm_submissions.remove(&ship_id);
+                    self.helm_warnings.remove(&ship_id);
                     self.order_result.insert(ship_id, result);
                 }
                 SimEvent::OrderRefused { ship_id, reason } => {
+                    if matches!(
+                        self.order_result.get(&ship_id),
+                        Some(HelmOrderUiResult::Superseded)
+                    ) {
+                        continue;
+                    }
                     let why = match reason {
                         OrderRefusal::LandWaypoint => "waypoint is on land",
                         OrderRefusal::LandBetween => "path crosses land",
                         OrderRefusal::NoSpeedLimit => "no local speed limit",
+                        OrderRefusal::InvalidHelm => "invalid heading or speed",
                         OrderRefusal::UnknownClass => {
                             "unknown class — sync Minos specs first"
                         }
                     };
+                    self.helm_submissions.remove(&ship_id);
                     self.order_result
                         .insert(ship_id.clone(), HelmOrderUiResult::Refused(why.clone()));
                     self.feed(format!("refused {ship_id}: {why}"));
                     self.order_warning = Some(format!("{ship_id}: {why}"));
                 }
                 SimEvent::CommandRefused { ship_id, reason } => {
+                    if matches!(
+                        self.order_result.get(&ship_id),
+                        Some(HelmOrderUiResult::Superseded)
+                    ) {
+                        continue;
+                    }
                     let why = match reason {
                         CommandRefusal::LowerAuthority { held_rank, by_rank } => format!(
                             "overruled by higher authority (held {held_rank}, by {by_rank})"
@@ -2054,6 +2092,9 @@ impl ShipApp {
                             "verb not granted".to_string()
                         }
                     };
+                    self.helm_submissions.remove(&ship_id);
+                    self.order_result
+                        .insert(ship_id.clone(), HelmOrderUiResult::Refused(why.clone()));
                     self.feed(format!("command refused ({ship_id}): {why}"));
                     self.order_warning = Some(format!("{ship_id}: {why}"));
                 }
@@ -2067,6 +2108,10 @@ impl ShipApp {
                 }
                 SimEvent::ShipBlocked { ship_id } => {
                     self.feed(format!("blocked at coast: {ship_id}"));
+                    self.helm_warnings.insert(
+                        ship_id.clone(),
+                        "local HelmOrder blocked at land".to_string(),
+                    );
                 }
                 SimEvent::Arrival { ship_id } => {
                     self.feed(format!("arrived {ship_id}"));
@@ -2141,6 +2186,28 @@ impl ShipApp {
                         self.game_messages.pop_front();
                     }
                     self.show_messages = true;
+                }
+                LiveEvent::OrderIssued(fix) => {
+                    let ship_id = fix.unit_id.to_string();
+                    if matches!(
+                        self.order_result.get(&ship_id),
+                        Some(HelmOrderUiResult::Unknown(_))
+                    ) && self.order_event_matches(&ship_id, &fix) {
+                        let result = if fix.clamped {
+                            HelmOrderUiResult::Clamped {
+                                requested: fix.requested_speed.unwrap_or(fix.speed),
+                                accepted: fix.speed,
+                            }
+                        } else {
+                            HelmOrderUiResult::Accepted
+                        };
+                        self.helm_submissions.remove(&ship_id);
+                        self.order_result.insert(ship_id.clone(), result);
+                        self.feed(format!(
+                            "order event reconciled {ship_id}: {:.0}° @ {:.0} kn",
+                            fix.heading, fix.speed
+                        ));
+                    }
                 }
                 LiveEvent::SocketError(e) => {
                     self.live_status = format!("socket error: {e}");
@@ -2387,7 +2454,9 @@ impl ShipApp {
         self.manifest_retry_at = None;
         self.manifest_refresh_at = None;
         self.order_result.clear();
-        self.order_heading = None;
+        self.helm_submissions.clear();
+        self.helm_drafts.clear();
+        self.helm_warnings.clear();
     }
 
     /// Change the held game through one boundary. Refreshing the same
@@ -3269,7 +3338,6 @@ impl ShipApp {
         // The room key rides the detail from preparation onward — the
         // Game Master's share-out to personnel.
         self.minos_room_key = d.room_key.clone();
-        self.users_project_stage(&d.state);
         // #100: a refused transition left a pending verdict — the fresh
         // state above decides it.
         self.apply_transition_verdict();
@@ -3299,6 +3367,10 @@ impl ShipApp {
             }
             Err(e) => format!("units failed: {e}"),
         };
+        // Project execution only after the fresh unit rows are installed;
+        // otherwise release_game_pieces cannot see newly authoritative
+        // hulls and can leave a local sim authority alive.
+        self.users_project_stage(&d.state);
         let placements_seg = match b.placements {
             Ok(view) => {
                 self.apply_placements(view);
@@ -4221,9 +4293,8 @@ impl ShipApp {
                 return;
             }
         };
-        for (_, ship, _, _) in &legs {
-            self.order_result
-                .insert(ship.clone(), HelmOrderUiResult::Pending);
+        for (_, ship, heading, speed) in &legs {
+            self.mark_helm_pending(ship, *heading as f32, *speed);
         }
         self.setup_op = Some(spawn_rest("order", move || {
             let mut outs = Vec::with_capacity(legs.len());
@@ -4242,7 +4313,29 @@ impl ShipApp {
                         if unknown {
                             Err(OrderFailure::Unknown(message))
                         } else {
-                            Err(OrderFailure::Refused(message))
+                            let category = match &error {
+                                tfg::backend::BackendError::Unauthorized { .. } => "authentication refused",
+                                tfg::backend::BackendError::Forbidden { .. } => "not commander",
+                                tfg::backend::BackendError::NoSpec { .. } => {
+                                    "no applicable speed limit"
+                                }
+                                tfg::backend::BackendError::Api { status, .. }
+                                    if *status == 400 || *status == 422 =>
+                                {
+                                    "invalid request"
+                                }
+                                tfg::backend::BackendError::Api { status, .. } if *status == 404 => {
+                                    "stale game context"
+                                }
+                                tfg::backend::BackendError::Api { status, .. } if *status == 409 => {
+                                    "wrong phase or actions closed"
+                                }
+                                _ => "other refusal",
+                            };
+                            Err(OrderFailure::Refused {
+                                category: category.to_string(),
+                                detail: message,
+                            })
                         }
                     }
                 };
@@ -4257,9 +4350,17 @@ impl ShipApp {
     fn apply_fix_batch(&mut self, outs: Vec<OrderOut>) {
         let mut ok = 0;
         for out in outs {
+            if !self.submission_matches_values(&out.ship, out.heading, out.speed) {
+                self.feed(format!(
+                    "late Minos result ignored for {}: newer helm intent is active",
+                    out.ship
+                ));
+                continue;
+            }
             match out.result {
                 Ok(fix) => {
                     ok += 1;
+                    self.helm_submissions.remove(&out.ship);
                     let result = if fix.clamped {
                         HelmOrderUiResult::Clamped {
                             requested: fix.requested_speed.unwrap_or(out.speed as f64),
@@ -4285,10 +4386,14 @@ impl ShipApp {
                         fix.assumed_time
                     ));
                 }
-                Err(OrderFailure::Refused(e)) => {
-                    self.order_result
-                        .insert(out.ship.clone(), HelmOrderUiResult::Refused(e.clone()));
-                    self.feed(format!("order refused for {}: Minos says {e}", out.ship));
+                Err(OrderFailure::Refused { category, detail }) => {
+                    self.helm_submissions.remove(&out.ship);
+                    let message = format!("{category}: {detail}");
+                    self.order_result.insert(
+                        out.ship.clone(),
+                        HelmOrderUiResult::Refused(message.clone()),
+                    );
+                    self.feed(format!("order refused for {}: {message}", out.ship));
                 }
                 Err(OrderFailure::Unknown(e)) => {
                     self.order_result
@@ -4436,13 +4541,15 @@ impl ShipApp {
         let (reported_heading, reported_speed) = reported
             .map(|(heading, speed)| (heading.unwrap_or(0.0), speed))
             .unwrap_or((0.0, None));
-        let mut heading = self.order_heading.unwrap_or(reported_heading).rem_euclid(360.0);
-        let mut speed = if self.order_result.contains_key(id) {
-            self.order_speed
-        } else {
-            reported_speed.unwrap_or(self.order_speed)
-        }
-        .max(0.0);
+        let draft = self.helm_drafts.get(id).copied();
+        let mut heading = draft
+            .map(|draft| draft.heading_deg)
+            .unwrap_or(reported_heading)
+            .rem_euclid(360.0);
+        let mut speed = draft
+            .map(|draft| draft.speed_kn)
+            .unwrap_or(reported_speed.unwrap_or(20.0))
+            .max(0.0);
         ui.horizontal(|ui| {
             ui.label("heading");
             ui.add(
@@ -4455,19 +4562,34 @@ impl ShipApp {
             ui.add(
                 egui::DragValue::new(&mut speed)
                     .speed(1.0)
-                    .range(0.0..=60.0)
                     .suffix(" kn"),
             )
             .on_hover_text("requested speed; MinOS applies its own limit");
         });
-        self.order_heading = Some(heading);
-        self.order_speed = speed;
+        speed = speed.max(0.0);
+        if draft.is_some_and(|draft| {
+            (draft.heading_deg - heading).abs() > 0.01
+                || (draft.speed_kn - speed).abs() > 0.01
+        }) && matches!(self.order_result.get(id), Some(HelmOrderUiResult::Pending))
+        {
+            self.order_result
+                .insert(id.to_string(), HelmOrderUiResult::Superseded);
+            self.helm_submissions.remove(id);
+        }
+        self.helm_drafts.insert(
+            id.to_string(),
+            HelmDraft {
+                heading_deg: heading,
+                speed_kn: speed,
+            },
+        );
         let pending = matches!(
             self.order_result.get(id),
             Some(HelmOrderUiResult::Pending)
         );
         if let Some(result) = self.order_result.get(id) {
             match result {
+                HelmOrderUiResult::Draft => ui.weak("draft · not submitted"),
                 HelmOrderUiResult::Pending => {
                     ui.weak("pending — waiting for MinOS GameFix");
                 }
@@ -4486,7 +4608,13 @@ impl ShipApp {
                 HelmOrderUiResult::Refused(reason) => {
                     warn_line(ui, format!("refused: {reason}"));
                 }
+                HelmOrderUiResult::Superseded => ui.weak("superseded by a newer intent"),
             }
+        }
+        if matches!(self.order_result.get(id), Some(HelmOrderUiResult::Draft))
+            && ui.small_button("Cancel draft").clicked()
+        {
+            self.helm_drafts.remove(id);
         }
         ui.horizontal(|ui| {
             if ui
@@ -4499,11 +4627,123 @@ impl ShipApp {
                 .add_enabled(!pending, egui::Button::new("Hold position"))
                 .clicked()
             {
-                self.order_via_minos(id, heading, 0.0);
-                self.order_speed = 0.0;
+                self.order_via_minos(id, reported_heading, 0.0);
+                self.helm_drafts.insert(
+                    id.to_string(),
+                    HelmDraft {
+                        heading_deg: reported_heading,
+                        speed_kn: 0.0,
+                    },
+                );
             }
         });
         ui.weak("No waypoint: heading and speed remain in force until replaced.");
+    }
+
+    fn order_event_matches(&self, ship_id: &str, fix: &GameFix) -> bool {
+        let Some(submission) = self.helm_submissions.get(ship_id) else {
+            return false;
+        };
+        let Some(requester_id) = submission.requester_id else {
+            return false;
+        };
+        let heading_matches = (fix.heading as f32 - submission.heading_deg).abs() < 0.01;
+        let speed_matches = if fix.clamped {
+            fix.requested_speed.is_some_and(|requested| {
+                (requested as f32 - submission.speed_kn).abs() < 0.01
+                    && fix.speed <= submission.speed_kn as f64
+            })
+        } else {
+            (fix.speed as f32 - submission.speed_kn).abs() < 0.01
+        };
+        fix.created_by == Some(requester_id) && heading_matches && speed_matches
+    }
+
+    fn submission_matches_values(
+        &self,
+        ship_id: &str,
+        heading_deg: f64,
+        speed_kn: f32,
+    ) -> bool {
+        self.helm_submissions.get(ship_id).is_some_and(|submission| {
+            (submission.heading_deg as f64 - heading_deg).abs() < 0.01
+                && (submission.speed_kn - speed_kn).abs() < 0.01
+        })
+    }
+
+    fn applied_submission_matches(
+        &self,
+        ship_id: &str,
+        heading_deg: f32,
+        speed_kn: f32,
+    ) -> bool {
+        self.helm_submissions.get(ship_id).is_some_and(|submission| {
+            (submission.speed_kn - speed_kn).abs() < 0.01
+                && (speed_kn.abs() < 0.01
+                    || (submission.heading_deg - heading_deg).abs() < 0.01)
+        })
+    }
+
+    fn mark_helm_pending(&mut self, id: &str, heading_deg: f32, speed_kn: f32) {
+        if matches!(
+            self.order_result.get(id),
+            Some(HelmOrderUiResult::Pending)
+        ) {
+            self.order_result
+                .insert(id.to_string(), HelmOrderUiResult::Superseded);
+        }
+        self.helm_submissions.insert(
+            id.to_string(),
+            HelmSubmission {
+                heading_deg,
+                speed_kn,
+                requester_id: self.auth_user_id,
+            },
+        );
+        self.order_result
+            .insert(id.to_string(), HelmOrderUiResult::Pending);
+    }
+
+    fn send_local_helm(&mut self, id: &str, heading_deg: f32, speed_kn: f32) {
+        let unit = id.to_string();
+        let Some(authority) = self.command_authority(std::slice::from_ref(&unit)) else {
+            self.order_result.insert(
+                id.to_string(),
+                HelmOrderUiResult::Refused("no local command authority".into()),
+            );
+            return;
+        };
+        let grant = Grant {
+            units: vec![unit],
+            expires_game_secs: u64::MAX,
+            verbs: vec![Verb::SetHelm],
+        };
+        self.mark_helm_pending(id, heading_deg, speed_kn);
+        self.helm_warnings.remove(id);
+        let Some(tx) = &self.sim_cmd_tx else {
+            self.helm_submissions.remove(id);
+            self.order_result.insert(
+                id.to_string(),
+                HelmOrderUiResult::Unknown("local command channel unavailable".into()),
+            );
+            return;
+        };
+        if tx
+            .send(SimCommand::SetHelm {
+                ship_id: id.to_string(),
+                heading_deg,
+                speed_kn,
+                authority,
+                grant,
+            })
+            .is_err()
+        {
+            self.helm_submissions.remove(id);
+            self.order_result.insert(
+                id.to_string(),
+                HelmOrderUiResult::Unknown("local command channel closed".into()),
+            );
+        }
     }
 
     /// Direct heading/speed control for the local sandbox. It mirrors
@@ -4530,13 +4770,15 @@ impl ShipApp {
         let (reported_heading, reported_speed) = reported
             .map(|(heading, speed)| (heading.unwrap_or(0.0), speed))
             .unwrap_or((0.0, None));
-        let mut heading = self.order_heading.unwrap_or(reported_heading).rem_euclid(360.0);
-        let mut speed = if self.order_result.contains_key(id) {
-            self.order_speed
-        } else {
-            reported_speed.unwrap_or(self.order_speed)
-        }
-        .max(0.0);
+        let draft = self.helm_drafts.get(id).copied();
+        let mut heading = draft
+            .map(|draft| draft.heading_deg)
+            .unwrap_or(reported_heading)
+            .rem_euclid(360.0);
+        let mut speed = draft
+            .map(|draft| draft.speed_kn)
+            .unwrap_or(reported_speed.unwrap_or(20.0))
+            .max(0.0);
         ui.label("local sandbox · persistent HelmOrder");
         ui.horizontal(|ui| {
             ui.label("heading");
@@ -4554,14 +4796,29 @@ impl ShipApp {
                     .suffix(" kn"),
             );
         });
-        self.order_heading = Some(heading);
-        self.order_speed = speed;
+        if draft.is_some_and(|draft| {
+            (draft.heading_deg - heading).abs() > 0.01
+                || (draft.speed_kn - speed).abs() > 0.01
+        }) && matches!(self.order_result.get(id), Some(HelmOrderUiResult::Pending))
+        {
+            self.order_result
+                .insert(id.to_string(), HelmOrderUiResult::Superseded);
+            self.helm_submissions.remove(id);
+        }
+        self.helm_drafts.insert(
+            id.to_string(),
+            HelmDraft {
+                heading_deg: heading,
+                speed_kn: speed,
+            },
+        );
         let pending = matches!(
             self.order_result.get(id),
             Some(HelmOrderUiResult::Pending)
         );
         if let Some(result) = self.order_result.get(id) {
             match result {
+                HelmOrderUiResult::Draft => ui.weak("local draft · not submitted"),
                 HelmOrderUiResult::Pending => ui.weak("pending local sandbox command…"),
                 HelmOrderUiResult::Accepted => {
                     ui.label(egui::RichText::new("accepted by local sandbox").color(egui::Color32::GREEN));
@@ -4571,63 +4828,36 @@ impl ShipApp {
                 }
                 HelmOrderUiResult::Unknown(reason) => warn_line(ui, format!("local outcome unknown: {reason}")),
                 HelmOrderUiResult::Refused(reason) => warn_line(ui, format!("local refusal: {reason}")),
+                HelmOrderUiResult::Superseded => ui.weak("local draft superseded"),
             }
+        }
+        if matches!(self.order_result.get(id), Some(HelmOrderUiResult::Draft))
+            && ui.small_button("Cancel draft").clicked()
+        {
+            self.helm_drafts.remove(id);
+        }
+        if let Some(warning) = self.helm_warnings.get(id).cloned() {
+            warn_line(ui, warning);
         }
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(!pending, egui::Button::new("Set helm"))
                 .clicked()
             {
-                self.order_result
-                    .insert(id.to_string(), HelmOrderUiResult::Pending);
-                if let Some(tx) = &self.sim_cmd_tx {
-                    if tx
-                        .send(SimCommand::SetHelm {
-                            ship_id: id.to_string(),
-                            heading_deg: heading,
-                            speed_kn: speed,
-                        })
-                        .is_err()
-                    {
-                        self.order_result.insert(
-                            id.to_string(),
-                            HelmOrderUiResult::Unknown("local command channel closed".into()),
-                        );
-                    }
-                } else {
-                    self.order_result.insert(
-                        id.to_string(),
-                        HelmOrderUiResult::Unknown("local command channel unavailable".into()),
-                    );
-                }
+                self.send_local_helm(id, heading, speed);
             }
             if ui
                 .add_enabled(!pending, egui::Button::new("Hold position"))
                 .clicked()
             {
-                self.order_result
-                    .insert(id.to_string(), HelmOrderUiResult::Pending);
-                if let Some(tx) = &self.sim_cmd_tx {
-                    if tx
-                        .send(SimCommand::SetHelm {
-                            ship_id: id.to_string(),
-                            heading_deg: heading,
-                            speed_kn: 0.0,
-                        })
-                        .is_err()
-                    {
-                        self.order_result.insert(
-                            id.to_string(),
-                            HelmOrderUiResult::Unknown("local command channel closed".into()),
-                        );
-                    }
-                } else {
-                    self.order_result.insert(
-                        id.to_string(),
-                        HelmOrderUiResult::Unknown("local command channel unavailable".into()),
-                    );
-                }
-                self.order_speed = 0.0;
+                self.send_local_helm(id, reported_heading, 0.0);
+                self.helm_drafts.insert(
+                    id.to_string(),
+                    HelmDraft {
+                        heading_deg: reported_heading,
+                        speed_kn: 0.0,
+                    },
+                );
             }
             if ui.button("Release local control").clicked() {
                 if let Some(tx) = &self.sim_cmd_tx {
@@ -4636,6 +4866,8 @@ impl ShipApp {
                 self.controlled.remove(id);
                 self.order_views.remove(id);
                 self.order_result.remove(id);
+                self.helm_submissions.remove(id);
+                self.helm_warnings.remove(id);
                 self.pending_waypoint = None;
                 self.placing = false;
             }
@@ -7526,7 +7758,9 @@ impl ShipApp {
 
     /// Select a ship: clears any group selection and opens the Inspector.
     fn select_ship(&mut self, id: String) {
-        self.order_heading = None;
+        self.order_result
+            .entry(id.clone())
+            .or_insert(HelmOrderUiResult::Draft);
         self.selection = Some(Selection::Ship(id));
     }
 
@@ -7538,7 +7772,6 @@ impl ShipApp {
     /// Deselect: the Inspector shuts with the selection. Follow (camera)
     /// is independent and untouched.
     fn deselect(&mut self) {
-        self.order_heading = None;
         self.selection = None;
     }
 
@@ -9667,7 +9900,7 @@ impl eframe::App for ShipApp {
                 ui.label("G — cycle groups");
                 ui.label("F — follow selection · W — waypoint at map center");
                 ui.label("O — orders · R — roster · Esc — drop selection");
-                ui.weak("commit an order with the Order button (the water check refuses on land).");
+                ui.weak("helm uses Set helm; legacy waypoint navigation remains under its compatibility section.");
                 ui.separator();
                 ui.label("Minos owns state, clock, orders, fixes, positions, and messages; this client is its projection and control surface. A local run without a session is an explicitly separate sandbox.");
                 ui.weak("the toolbar strip — source · session · phase · seat · freshness · next — is the same everywhere.");
@@ -9963,11 +10196,103 @@ impl eframe::App for ShipApp {
             // Group selection is inspectable here, but the first slice
             // deliberately avoids a multi-unit helm fan-out.
             if let Some(Selection::Group(gid)) = self.selection.clone() {
+                ui.collapsing("Legacy waypoint navigation (compatibility)", |ui| {
+            if let Some(Selection::Group(gid)) = self.selection.clone() {
                 match self.group_info(&gid) {
                     Some((name, members)) => {
-                        ui.label(format!("group: {name} · {} unit(s)", members.len()));
-                        ui.weak("select a ship for direct helm control");
-                        ui.weak("group helm fan-out and waypoint commands are not part of this surface");
+                        let allowed: Vec<String> = members
+                            .iter()
+                            .filter(|u| self.action_allows(u))
+                            .cloned()
+                            .collect();
+                        let auth = self.command_authority(&allowed);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(format!("group: {name} · {} unit(s)", members.len()));
+                            if ui.small_button("✕").clicked() {
+                                self.deselect();
+                            }
+                        });
+                        match auth {
+                            Some(a) if !allowed.is_empty() => {
+                                ui.label(format!(
+                                    "authority: {} · {} in jurisdiction",
+                                    Self::authority_label(a),
+                                    allowed.len()
+                                ));
+                                if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
+                                    self.placing = !self.placing;
+                                }
+                                let can_commit = self
+                                    .pending_waypoint
+                                    .is_some_and(|(la, lo)| {
+                                        self.land
+                                            .as_ref()
+                                            .map(|l| {
+                                                l.is_water(&GeoPosition {
+                                                    latitude: la,
+                                                    longitude: lo,
+                                                })
+                                            })
+                                            .unwrap_or(true)
+                                    });
+                                if self.pending_waypoint.is_some() && !can_commit {
+                                    warn_line(ui, "waypoint on land — pick water".to_string());
+                                }
+                                if ui
+                                    .add_enabled(
+                                        can_commit,
+                                        egui::Button::new(format!("order group ({})", allowed.len())),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some((la, lo)) = self.pending_waypoint {
+                                        if let Some(tx) = &self.sim_cmd_tx {
+                                            let waypoint = GeoPosition {
+                                                latitude: la,
+                                                longitude: lo,
+                                            };
+                                            let legs: Vec<Leg> = allowed
+                                                .iter()
+                                                .map(|ship| {
+                                                    let max = self
+                                                        .order_views
+                                                        .get(ship)
+                                                        .map(|v| v.max_speed_kn)
+                                                        .unwrap_or(self.order_speed);
+                                                    Leg {
+                                                        ship_id: ship.clone(),
+                                                        waypoint,
+                                                        speed_kn: self.order_speed.min(max),
+                                                    }
+                                                })
+                                                .collect();
+                                            let _ = tx.send(SimCommand::OrderMove {
+                                                command: MoveCommand {
+                                                    legs,
+                                                    default_speed_kn: Some(self.order_speed),
+                                                    authority: a,
+                                                    grant: Grant {
+                                                        units: allowed.clone(),
+                                                        expires_game_secs: u64::MAX,
+                                                        verbs: vec![Verb::Move],
+                                                    },
+                                                },
+                                            });
+                                            eprintln!(
+                                                "order group {name} -> ({la:.4}, {lo:.4})"
+                                            );
+                                        }
+                                        self.pending_waypoint = None;
+                                        self.placing = false;
+                                    }
+                                }
+                            }
+                            _ => {
+                                ui.label("Outside your jurisdiction — view only.");
+                            }
+                        }
+                        ui.separator();
                     }
                     None => {
                         ui.label("group removed.");
@@ -9976,6 +10301,8 @@ impl eframe::App for ShipApp {
                         }
                     }
                 }
+            }
+                });
             }
             if let Some(Selection::Ship(id)) = self.selection.clone() {
                 // Scoped desktop (slice iv): command inside jurisdiction,
@@ -10936,13 +11263,15 @@ fn main() -> eframe::Result<()> {
                 sim_evt_rx,
                 order_views: HashMap::new(),
                 order_result: HashMap::new(),
+                helm_submissions: HashMap::new(),
+                helm_drafts: HashMap::new(),
                 controlled: HashSet::new(),
                 pending_waypoint: None,
                 placing: false,
                 order_speed: 20.0,
-                order_heading: None,
                 land: Land::from_default_asset().ok(),
                 order_warning: None,
+                helm_warnings: HashMap::new(),
                 catalog,
                 selected_class: 0,
                 fleet: Fleet::from_default_asset().expect("fleet asset valid"),

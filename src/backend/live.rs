@@ -9,7 +9,7 @@
 
 use crate::geo::track::Fix;
 
-use super::{BackendError, FeedEvent, GameMsg, MinosRest, PollSource, parse_message_event};
+use super::{BackendError, FeedEvent, GameFix, GameMsg, MinosRest, PollSource, parse_message_event, parse_order_event};
 
 /// Backoff for socket retries (transport ticket): base 1 s, cap 30 s,
 /// full jitter. Tunable here, applied in the actor loop.
@@ -112,6 +112,9 @@ pub enum LiveEvent {
     /// `game:<id>`, addressed on `personal:<user>`. Notification with
     /// body, not the inbox — the UI draws and files it.
     Message(GameMsg),
+    /// Best-effort committed-order publication. The HTTP 201 remains
+    /// authoritative; this can only reconcile an existing Unknown result.
+    OrderIssued(GameFix),
     SocketError(String),
 }
 
@@ -143,14 +146,18 @@ fn watch_subscription(
         let event_tx = event_tx.clone();
         let channel = channel.to_string();
         sub.on_publication(move |p: tokio_centrifuge::protocol::Publication| {
-            match parse_message_event(&p.data) {
-                Some(msg) => {
-                    let _ = event_tx.send(LiveEvent::Message(msg));
+            if let Some(fix) = parse_order_event(&p.data) {
+                let _ = event_tx.send(LiveEvent::OrderIssued(fix));
+            } else {
+                match parse_message_event(&p.data) {
+                    Some(msg) => {
+                        let _ = event_tx.send(LiveEvent::Message(msg));
+                    }
+                    None => eprintln!(
+                        "{channel}: ignoring non-message publication ({} bytes)",
+                        p.data.len()
+                    ),
                 }
-                None => eprintln!(
-                    "{channel}: ignoring non-message publication ({} bytes)",
-                    p.data.len()
-                ),
             }
         });
     }

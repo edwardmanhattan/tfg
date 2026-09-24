@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::geo::track::{Fix, FixSource};
 
-use super::{BackendError, unwrap_envelope};
+use super::{BackendError, GameFix, unwrap_envelope};
 
 /// Minos standing picture (REST mapping ticket): the initial picture the
 /// socket then keeps current. Vessels that never reported carry labels
@@ -195,6 +195,33 @@ pub(crate) struct FeedEvent {
     pub(crate) received_at: String,
     #[serde(default)]
     pub(crate) backfilled: bool,
+}
+
+/// Parse the best-effort order publication. Unknown event types and
+/// incomplete GameFix records return `None`; neither is allowed to
+/// reconcile an Unknown command result.
+pub(crate) fn parse_order_event(bytes: &[u8]) -> Option<GameFix> {
+    let envelope: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if envelope["type"].as_str() != Some("game.order_issued") {
+        return None;
+    }
+    let fix: GameFix = serde_json::from_value(envelope["data"].clone()).ok()?;
+    if fix.assumed_time.is_empty()
+        || !fix.heading.is_finite()
+        || !(0.0..360.0).contains(&fix.heading)
+        || !fix.speed.is_finite()
+        || fix.speed < 0.0
+        || !fix.latitude.is_finite()
+        || !(-90.0..=90.0).contains(&fix.latitude)
+        || !fix.longitude.is_finite()
+        || !(-180.0..=180.0).contains(&fix.longitude)
+        || fix.requested_speed.is_some_and(|requested| !requested.is_finite() || requested < 0.0)
+        || fix.clamped != fix.requested_speed.is_some()
+        || (fix.clamped && fix.requested_speed.is_some_and(|requested| requested <= fix.speed))
+    {
+        return None;
+    }
+    Some(fix)
 }
 
 impl FeedEvent {

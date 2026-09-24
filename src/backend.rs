@@ -26,7 +26,7 @@ pub use master::{BackendUser, GameClock, GameClockSegment, GameDetail, GameFix, 
 pub use replay::{FileReplay, now_ts};
 // Shared with live.rs and the tests below; not public API.
 pub(crate) use feed::FeedEvent;
-pub(crate) use feed::parse_message_event;
+pub(crate) use feed::{parse_message_event, parse_order_event};
 
 use serde::{Deserialize, Serialize};
 
@@ -797,7 +797,7 @@ mod tests {
                     assert!(v.get("latitude").is_none(), "orders carry no position");
                     (201, r#"{"status_code":201,"message":"Created","data":{"id_unit":13,"assumed_time":"2026-11-01T01:00:00Z","latitude":-6.0888,"longitude":106.9111,"heading_deg":45.0,"speed_kn":12.0,"requested_speed_kn":20.0,"clamped":true,"created_at":"2026-11-01T01:00:00Z","created_by":6}}"#)
                 } else if method == "GET" && url.ends_with("/positions") {
-                    (200, r#"{"status_code":200,"message":"Successfull","data":{"assumed_time":"2026-11-01T01:05:00Z","positions":[{"id_unit":13,"latitude":-6.08,"longitude":106.92,"heading_deg":45.0,"speed_kn":12.0,"assumed_time":"2026-11-01T01:00:00Z"}]}}"#)
+                    (200, r#"{"status_code":200,"message":"Successfull","data":{"assumed_time":"2026-11-01T01:05:00Z","positions":[{"id_unit":13,"latitude":-6.08,"longitude":106.92,"heading_deg":45.0,"speed_kn":12.0,"clamped":false,"assumed_time":"2026-11-01T01:00:00Z"}]}}"#)
                 } else {
                     (404, r#"{"status_code":404,"message":"Not Found","data":null}"#)
                 };

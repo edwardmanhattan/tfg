@@ -41,6 +41,8 @@ impl Authority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
     Move,
+    /// Set a persistent heading/speed HelmOrder.
+    SetHelm,
     Cancel,
     Hold,
 }

@@ -16,17 +16,56 @@ use std::time::Instant;
 use crate::backend::{BackendError, PollSource, now_ts};
 use crate::catalog::{Catalog, Class};
 use crate::clock::GameClock;
-use crate::command::{Authority, GrantDenial, MoveCommand, Verb};
+use crate::command::{Authority, Grant, GrantDenial, MoveCommand, Verb};
 use crate::log::{Journal, LogKind};
 use crate::geo::coordinates::GeoPosition;
 use crate::geo::track::{Fix, FixSource};
-use crate::land::Land;
+use crate::land::{Land, PATH_SAMPLE_M};
 
 /// Real seconds between sim rounds (the poll cadence). Motion itself
 /// advances by GAME time: game_dt = real_dt × ratio (grill #17, ADR-0004).
 pub const SIM_TICK_SECS: f64 = 2.0;
 /// Distance to a waypoint that counts as arrived.
 pub const ARRIVAL_M: f64 = 50.0;
+
+/// Stop at the first sampled land crossing instead of leaving a local
+/// helm at the previous tick position. The land model is polygonal, so
+/// the final short bisection is sandbox geometry, not a MinOS fact.
+fn stop_at_first_land(
+    land: &Land,
+    from: GeoPosition,
+    to: GeoPosition,
+    heading_deg: f32,
+    speed_kn: f32,
+    game_dt: f64,
+) -> GeoPosition {
+    if !land.is_water(&from) {
+        return from;
+    }
+    if land.path_is_water(&from, &to) {
+        return to;
+    }
+    let steps = (from.distance_m(&to) / PATH_SAMPLE_M).ceil().max(1.0) as usize;
+    for step in 1..=steps {
+        let fraction = step as f64 / steps as f64;
+        let probe = from.dead_reckon(heading_deg, speed_kn, game_dt * fraction);
+        if !land.is_water(&probe) {
+            let mut water = (step - 1) as f64 / steps as f64;
+            let mut landward = fraction;
+            for _ in 0..12 {
+                let middle = (water + landward) / 2.0;
+                let candidate = from.dead_reckon(heading_deg, speed_kn, game_dt * middle);
+                if land.is_water(&candidate) {
+                    water = middle;
+                } else {
+                    landward = middle;
+                }
+            }
+            return from.dead_reckon(heading_deg, speed_kn, game_dt * landward);
+        }
+    }
+    to
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OrderState {
@@ -78,7 +117,13 @@ pub enum SimCommand {
     SetOrder { ship_id: String, waypoint: GeoPosition, speed_kn: f32 },
     /// Persistent local helm setpoint. Unlike legacy SetOrder, this has
     /// no waypoint and remains in force until replaced.
-    SetHelm { ship_id: String, heading_deg: f32, speed_kn: f32 },
+    SetHelm {
+        ship_id: String,
+        heading_deg: f32,
+        speed_kn: f32,
+        authority: Authority,
+        grant: Grant,
+    },
     CancelOrder { ship_id: String },
     /// Multi-unit move (precedence grill, #19): fanned out to per-ship
     /// orders under grant + authority checks. The sim never sees commands
@@ -135,6 +180,8 @@ pub enum OrderRefusal {
     /// A HelmOrder was requested for a class with no usable local speed
     /// bound. The sandbox fails closed rather than inventing a maximum.
     NoSpeedLimit,
+    /// The local command did not satisfy the public HelmOrder range.
+    InvalidHelm,
 }
 
 /// UI <- sim: why an OrderMove leg was refused (precedence grill, #19).
@@ -448,10 +495,69 @@ impl SimSource {
                         }
                     }
                 }
-                SimCommand::SetHelm { ship_id, heading_deg, speed_kn } => {
+                SimCommand::SetHelm {
+                    ship_id,
+                    heading_deg,
+                    speed_kn,
+                    authority,
+                    grant,
+                } => {
+                    let now = self.clock.game_elapsed_secs();
+                    let game_ts = self.clock.game_now_ts();
+                    let actor = format!("authority:{}", authority.rank());
+                    if let Err(denial) = grant.covers(&ship_id, Verb::SetHelm, now) {
+                        let reason = CommandRefusal::Grant(denial);
+                        let _ = self.evt_tx.send(SimEvent::CommandRefused {
+                            ship_id: ship_id.clone(),
+                            reason: reason.clone(),
+                        });
+                        self.journal.append(
+                            game_ts,
+                            actor,
+                            LogKind::CommandRefused,
+                            serde_json::json!({"ship": ship_id, "reason": format!("{reason:?}")}),
+                        );
+                        continue;
+                    }
                     let Some(ship) = self.ships.get(&ship_id) else {
                         continue;
                     };
+                    let held = ship.held_by;
+                    if authority < held {
+                        let reason = CommandRefusal::LowerAuthority {
+                            held_rank: held.rank(),
+                            by_rank: authority.rank(),
+                        };
+                        let _ = self.evt_tx.send(SimEvent::CommandRefused {
+                            ship_id: ship_id.clone(),
+                            reason: reason.clone(),
+                        });
+                        self.journal.append(
+                            game_ts,
+                            actor,
+                            LogKind::CommandRefused,
+                            serde_json::json!({"ship": ship_id, "reason": format!("{reason:?}")}),
+                        );
+                        continue;
+                    }
+                    if !heading_deg.is_finite()
+                        || !(0.0..360.0).contains(&heading_deg)
+                        || !speed_kn.is_finite()
+                        || speed_kn < 0.0
+                    {
+                        let reason = OrderRefusal::InvalidHelm;
+                        let _ = self.evt_tx.send(SimEvent::OrderRefused {
+                            ship_id: ship_id.clone(),
+                            reason,
+                        });
+                        self.journal.append(
+                            game_ts,
+                            actor,
+                            LogKind::OrderRefused,
+                            serde_json::json!({"ship": ship_id, "reason": "InvalidHelm"}),
+                        );
+                        continue;
+                    }
                     let max = Catalog::stat(&ship.class, "speed_kn", 0.0) as f32;
                     if max <= 0.0 {
                         let reason = OrderRefusal::NoSpeedLimit;
@@ -460,8 +566,8 @@ impl SimSource {
                             reason,
                         });
                         self.journal.append(
-                            self.clock.game_now_ts(),
-                            "sim",
+                            game_ts,
+                            actor,
                             LogKind::OrderRefused,
                             serde_json::json!({"ship": ship_id, "reason": "NoSpeedLimit"}),
                         );
@@ -469,9 +575,14 @@ impl SimSource {
                     }
                     let heading = heading_deg.rem_euclid(360.0);
                     let accepted_speed = speed_kn.clamp(0.0, max);
+                    let applied_heading = if accepted_speed == 0.0 {
+                        ship.heading_deg
+                    } else {
+                        heading
+                    };
                     self.journal.append(
-                        self.clock.game_now_ts(),
-                        "sim",
+                        game_ts.clone(),
+                        actor.clone(),
                         LogKind::Command,
                         serde_json::json!({
                             "event": "set-helm",
@@ -483,16 +594,30 @@ impl SimSource {
                     );
                     if let Some(ship) = self.ships.get_mut(&ship_id) {
                         ship.order = None;
-                        ship.heading_deg = heading;
+                        ship.heading_deg = applied_heading;
                         ship.helm_order = Some(HelmOrder {
-                            heading_deg: heading,
+                            heading_deg: applied_heading,
                             speed_kn: accepted_speed,
                             blocked: false,
                         });
+                        ship.held_by = authority;
+                    }
+                    if authority > held {
+                        let _ = self.evt_tx.send(SimEvent::CommandOverridden {
+                            ship_id: ship_id.clone(),
+                            prev_rank: held.rank(),
+                            by_rank: authority.rank(),
+                        });
+                        self.journal.append(
+                            game_ts,
+                            actor,
+                            LogKind::CommandOverridden,
+                            serde_json::json!({"ship": ship_id, "prev_rank": held.rank(), "by_rank": authority.rank()}),
+                        );
                     }
                     let _ = self.evt_tx.send(SimEvent::HelmApplied {
-                        ship_id: ship_id.clone(),
-                        heading_deg: heading,
+                        ship_id,
+                        heading_deg: applied_heading,
                         requested_speed_kn: speed_kn,
                         accepted_speed_kn: accepted_speed,
                     });
@@ -618,6 +743,20 @@ impl SimSource {
                     if clear {
                         s.pos = next;
                     } else {
+                        s.pos = self
+                            .land
+                            .as_ref()
+                            .map(|land| {
+                                stop_at_first_land(
+                                    land,
+                                    s.pos,
+                                    next,
+                                    helm.heading_deg,
+                                    helm.speed_kn,
+                                    game_dt,
+                                )
+                            })
+                            .unwrap_or(s.pos);
                         helm.blocked = true;
                         helm.speed_kn = 0.0;
                         blocked.push(id.clone());

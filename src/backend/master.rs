@@ -289,6 +289,36 @@ impl MinosMaster {
         )
     }
 
+    /// A committed order is specifically HTTP 201. Other successful
+    /// statuses are not interchangeable with a GameFixRecord and become
+    /// an Unknown result at the command surface.
+    fn post_created(
+        &self,
+        token: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, BackendError> {
+        let response = self
+            .client
+            .post(&format!("{}{}", self.base_url, path))
+            .bearer_auth(token)
+            .json(&body)
+            .send()?;
+        let status = response.status();
+        if !status.is_success() {
+            let body: serde_json::Value = response.json().unwrap_or(serde_json::Value::Null);
+            return Err(BackendError::http_error(status.as_u16(), &body));
+        }
+        if status != reqwest::StatusCode::CREATED {
+            return Err(BackendError::Other(format!(
+                "Minos order response was HTTP {}, expected 201",
+                status.as_u16()
+            )));
+        }
+        let body: serde_json::Value = response.json()?;
+        Ok(body["data"].clone())
+    }
+
     fn patch(
         &self,
         token: &str,
@@ -816,7 +846,7 @@ impl MinosMaster {
         heading_deg: f64,
         speed_kn: f64,
     ) -> Result<GameFix, BackendError> {
-        let data = self.post(
+        let data = self.post_created(
             token,
             &format!("/games/{game_id}/units/{unit_id}/order"),
             serde_json::json!({ "heading_deg": heading_deg, "speed_kn": speed_kn }),
@@ -860,9 +890,20 @@ impl MinosMaster {
                     .ok_or_else(|| malformed("requested_speed_kn"))?,
             ),
         };
-        if clamped != requested_speed.is_some() {
+        if !applied_heading.is_finite()
+            || !(0.0..360.0).contains(&applied_heading)
+            || !applied_speed.is_finite()
+            || applied_speed < 0.0
+            || !latitude.is_finite()
+            || !(-90.0..=90.0).contains(&latitude)
+            || !longitude.is_finite()
+            || !(-180.0..=180.0).contains(&longitude)
+            || requested_speed.is_some_and(|requested| !requested.is_finite() || requested < 0.0)
+            || clamped != requested_speed.is_some()
+            || (clamped && requested_speed.is_some_and(|requested| requested <= applied_speed))
+        {
             return Err(BackendError::Other(
-                "malformed Minos order response: clamped and requested_speed_kn disagree".into(),
+                "malformed Minos order response: invalid authoritative GameFix values".into(),
             ));
         }
         Ok(GameFix {
@@ -935,6 +976,9 @@ impl MinosMaster {
                     speed: p["speed_kn"]
                         .as_f64()
                         .ok_or_else(|| malformed("speed_kn"))?,
+                    clamped: p["clamped"]
+                        .as_bool()
+                        .ok_or_else(|| malformed("clamped"))?,
                     assumed_time: p["assumed_time"]
                         .as_str()
                         .filter(|value| !value.is_empty())
@@ -1849,14 +1893,18 @@ pub struct TimelinePage {
 /// derived from the previous leg and elapsed assumed time. The client
 /// sends heading + speed only; position and time are the server's.
 /// `requested_speed` is present only when the order was clamped.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct GameFix {
+    #[serde(rename = "id_unit")]
     pub unit_id: i64,
     pub assumed_time: String,
     pub latitude: f64,
     pub longitude: f64,
+    #[serde(rename = "heading_deg")]
     pub heading: f64,
+    #[serde(rename = "speed_kn")]
     pub speed: f64,
+    #[serde(rename = "requested_speed_kn")]
     pub requested_speed: Option<f64>,
     pub clamped: bool,
     /// Audit metadata emitted by MinOS' Go DTO but not required by the
@@ -1876,6 +1924,8 @@ pub struct GameHullPos {
     pub longitude: f64,
     pub heading: f64,
     pub speed: f64,
+    /// Position clamp is separate from order-response speed clamping.
+    pub clamped: bool,
     pub assumed_time: String,
 }
 
