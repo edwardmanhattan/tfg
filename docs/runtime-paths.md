@@ -34,6 +34,7 @@ tfg --check-runtime
 ```
 
 The GitHub Actions matrix runs that command before packaging. The resulting
-bundles include generated dependency notices plus the MapLibre Native license
-and are attached to matching `v*` GitHub releases. They are also available as
-Actions artifacts for other builds.
+bundles include generated dependency notices plus the MapLibre Native license.
+The Linux build publishes both a portable tarball and an installable
+`amd64 .deb`; all bundles are attached to matching `v*` GitHub releases. They
+are also available as Actions artifacts for other builds.

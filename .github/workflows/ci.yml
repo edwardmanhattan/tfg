@@ -247,6 +247,34 @@ jobs:
           cp licenses/maplibre-native-LICENSE.md dist/package/MAPLIBRE-NATIVE-LICENSE.md
           cp docs/runtime-paths.md dist/package/README.md
           tar -C dist/package -czf dist/tfg-linux-x86_64.tar.gz .
+
+          package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          deb_dir="dist/deb/tfg"
+          rm -rf dist/deb
+          mkdir -p "$deb_dir/DEBIAN" "$deb_dir/usr/bin" "$deb_dir/usr/share/doc/tfg"
+          cp target/release/${{ matrix.binary }} "$deb_dir/usr/bin/tfg"
+          cp dist/THIRD-PARTY-NOTICES.html "$deb_dir/usr/share/doc/tfg/"
+          cp licenses/maplibre-native-LICENSE.md "$deb_dir/usr/share/doc/tfg/MAPLIBRE-NATIVE-LICENSE.md"
+          cp docs/runtime-paths.md "$deb_dir/usr/share/doc/tfg/README.md"
+          runtime_libs="$(ldd target/release/${{ matrix.binary }} | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\\//) print $i }')"
+          depends="$(for library in $runtime_libs; do dpkg-query -S "$library" 2>/dev/null | cut -d: -f1 | head -n 1 || true; done | sort -u | paste -sd, -)"
+          depends="${depends:+$depends,}ca-certificates,libgl1,libvulkan1,libwayland-client0,libx11-6,libxkbcommon0"
+          cat > "$deb_dir/DEBIAN/control" <<EOF
+          Package: tfg
+          Version: $package_version
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Crossnet
+          Description: ARCONS tactical command center
+           egui desktop application for live and simulation workflows.
+          Depends: $depends
+          EOF
+          dpkg-deb --build "$deb_dir" "dist/tfg_${package_version}_amd64.deb"
+          rm -rf "$RUNNER_TEMP/tfg-deb"
+          dpkg-deb --extract "dist/tfg_${package_version}_amd64.deb" "$RUNNER_TEMP/tfg-deb"
+          (cd "$RUNNER_TEMP/tfg-deb" && TFG_DATA_DIR="$RUNNER_TEMP/tfg-deb/data" ./usr/bin/tfg --check-runtime)
+
           rm -rf "$RUNNER_TEMP/tfg-bundle"
           mkdir -p "$RUNNER_TEMP/tfg-bundle"
           tar -C "$RUNNER_TEMP/tfg-bundle" -xzf dist/tfg-linux-x86_64.tar.gz
@@ -406,7 +434,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tfg-${{ matrix.platform }}-${{ runner.arch }}
-          path: dist/tfg-*.tar.gz
+          path: |
+            dist/tfg-*.tar.gz
+            dist/tfg-*.deb
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -447,7 +477,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t bundles < <(find release-artifacts -maxdepth 1 -type f -print | sort)
-          test "${#bundles[@]}" -eq 3
+          test "${#bundles[@]}" -eq 4
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "${bundles[@]}" \
               --repo "$GITHUB_REPOSITORY" \
