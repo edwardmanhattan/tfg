@@ -128,7 +128,7 @@ jobs:
             platform: windows
             binary: tfg.exe
             maplibre_feature: maplibre_native/opengl
-            native_cxxflags: "/std:c++20 /EHsc /wd4068"
+            native_cxxflags: "/std:c++20 /EHsc /D_USE_MATH_DEFINES /wd4068"
             timeout: 120
 
     steps:
