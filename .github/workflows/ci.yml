@@ -18,6 +18,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  SCCACHE_GHA_ENABLED: "true"
   MLN_PRECOMPILE: "0"
   MLN_CORE_LIBRARY_USE_AMALGAM: "0"
   MAPLIBRE_NATIVE_REF: core-a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b
@@ -187,6 +188,10 @@ jobs:
         with:
           arch: x64
 
+      - name: Enable sccache
+        if: runner.os == 'Windows'
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
       - name: Check out MapLibre Native source
         if: runner.os == 'Windows'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -221,11 +226,37 @@ jobs:
           }
           & $vendorScript @vendorArgs
           if ($LASTEXITCODE -ne 0) { throw "MapLibre vendor setup failed with exit code $LASTEXITCODE" }
-          $vendorRoot = "${{ github.workspace }}\.ci\maplibre-native\platform\windows\vendor\vcpkg"
-          if (-not (Test-Path "$vendorRoot\installed\x64-windows\include\curl\curl.h")) {
-            throw "MapLibre vendor setup did not install the expected x64-windows packages"
-          }
           "MLN_LOCAL_REPOSITORY=${{ github.workspace }}\.ci\maplibre-native" >> $env:GITHUB_ENV
+
+      - name: Verify Windows MapLibre dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $includeRoot = "${{ github.workspace }}\.ci\maplibre-native\platform\windows\vendor\vcpkg\installed\x64-windows\include"
+          $requiredHeaders = @(
+            "curl\curl.h",
+            "uv.h",
+            "jpeglib.h",
+            "png.h",
+            "webp\decode.h",
+            "zlib.h",
+            "unicode\numberformatter.h",
+            "unicode\ubidi.h",
+            "unicode\umachine.h",
+            "unicode\ustring.h",
+            "unicode\ushape.h",
+            "unicode\uvernum.h",
+            "GL\glcorearb.h",
+            "GL\wgl.h"
+          )
+          $missingHeaders = $requiredHeaders | Where-Object {
+            -not (Test-Path (Join-Path $includeRoot $_))
+          }
+          if ($missingHeaders) {
+            $missing = $missingHeaders -join ", "
+            throw "MapLibre vendor setup is missing required headers: $missing"
+          }
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -238,6 +269,7 @@ jobs:
       - name: Build release binary
         env:
           CXXFLAGS: ${{ matrix.native_cxxflags }}
+          MLN_CMAKE_CXX_LAUNCHER: ${{ runner.os == 'Windows' && 'sccache' || '' }}
         run: cargo build --release --locked --features ${{ matrix.maplibre_feature }} --timings
 
       - name: Upload Cargo timings on failure
