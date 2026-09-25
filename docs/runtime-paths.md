@@ -4,16 +4,16 @@ The release executable embeds the catalog, fleet, land, replay scenarios, and
 map seed. It does not need the source tree or Rust toolchain to run.
 
 The bundles are self-contained with respect to TFG's own resources. They are
-not portable across operating systems or CPU architectures, and they still
-use the host's native graphics, C/C++ runtime, and desktop services. Linux
-builds from Ubuntu 24.04 expect a compatible glibc and native OpenGL/Vulkan
-runtime; Windows and macOS use their respective system runtimes and desktop
-frameworks.
+not portable across operating systems or CPU architectures. Linux builds from
+Ubuntu 24.04 expect a compatible glibc and native OpenGL/Vulkan runtime;
+Windows uses its native desktop runtime. macOS bundles non-system dylibs in
+`ARCONS.app/Contents/Frameworks` and rewrites their load paths, while still
+using macOS system frameworks.
 
 Writable state is selected in this order:
 
 1. `TFG_DATA_DIR=/path/to/tfg-data`
-2. `TFG_PORTABLE=1` → `<executable>/data` (use only when that directory is writable)
+2. `TFG_PORTABLE=1` → `<executable>/data` (on macOS, the `data` directory next to `ARCONS.app`; use only when that directory is writable)
 3. Platform data directory:
    - Linux: `${XDG_DATA_HOME:-~/.local/share}/tfg`
    - macOS: `~/Library/Application Support/tfg`
@@ -34,5 +34,6 @@ tfg --check-runtime
 ```
 
 The GitHub Actions matrix runs that command before packaging. The resulting
-bundles are attached to `v*` GitHub releases and are also available as
+bundles include generated dependency notices plus the MapLibre Native license
+and are attached to matching `v*` GitHub releases. They are also available as
 Actions artifacts for other builds.

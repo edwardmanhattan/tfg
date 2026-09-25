@@ -11963,7 +11963,11 @@ fn runtime_self_check(paths: &AppPaths) -> Result<(), String> {
     let catalog = Catalog::from_default_asset()?;
     let fleet = Fleet::from_default_asset()?;
     Land::from_default_asset()?;
-    let scenario = std::env::var("TFG_SCENARIO").unwrap_or_else(|_| "empty".to_string());
+    let scenario = if std::env::var("TFG_BACKEND_URL").is_ok() {
+        "empty".to_string()
+    } else {
+        std::env::var("TFG_SCENARIO").unwrap_or_else(|_| "empty".to_string())
+    };
     for (name, json) in tfg::assets::BUILT_IN_SCENARIOS {
         FileReplay::from_json(json).map_err(|e| format!("embedded scenario {name}: {e}"))?;
     }

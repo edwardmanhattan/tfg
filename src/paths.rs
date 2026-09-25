@@ -55,10 +55,13 @@ fn resolve_data_dir() -> Result<PathBuf, String> {
     if env_flag("TFG_PORTABLE") {
         let exe =
             std::env::current_exe().map_err(|e| format!("executable path unavailable: {e}"))?;
-        let dir = exe
+        let executable_dir = exe
             .parent()
-            .ok_or_else(|| "executable has no parent directory".to_string())?
-            .join("data");
+            .ok_or_else(|| "executable has no parent directory".to_string())?;
+        #[cfg(target_os = "macos")]
+        let dir = portable_macos_dir(executable_dir);
+        #[cfg(not(target_os = "macos"))]
+        let dir = executable_dir.join("data");
         return absolute(dir);
     }
     platform_data_dir()
@@ -93,6 +96,25 @@ fn platform_data_dir() -> Result<PathBuf, String> {
     non_empty_env("LOCALAPPDATA")
         .map(|base| base.join("tfg"))
         .ok_or_else(|| "LOCALAPPDATA is not set".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn portable_macos_dir(executable_dir: &Path) -> PathBuf {
+    let is_app_binary = executable_dir
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new("MacOS"))
+        && executable_dir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == std::ffi::OsStr::new("Contents"));
+    if is_app_binary {
+        if let Some(bundle_dir) = executable_dir.parent().and_then(Path::parent) {
+            if let Some(package_dir) = bundle_dir.parent() {
+                return package_dir.join("data");
+            }
+        }
+    }
+    executable_dir.join("data")
 }
 
 #[cfg(target_os = "macos")]
