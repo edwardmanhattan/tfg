@@ -116,16 +116,19 @@ jobs:
             platform: linux
             binary: tfg
             maplibre_feature: maplibre_native/vulkan
+            native_cxxflags: ""
             timeout: 60
           - os: macos-15
             platform: macos
             binary: tfg
             maplibre_feature: maplibre_native/metal
+            native_cxxflags: ""
             timeout: 90
           - os: windows-2022
             platform: windows
             binary: tfg.exe
             maplibre_feature: maplibre_native/opengl
+            native_cxxflags: "/std:c++20 /EHsc /wd4068"
             timeout: 120
 
     steps:
@@ -233,6 +236,8 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build release binary
+        env:
+          CXXFLAGS: ${{ matrix.native_cxxflags }}
         run: cargo build --release --locked --features ${{ matrix.maplibre_feature }} --timings
 
       - name: Upload Cargo timings on failure
