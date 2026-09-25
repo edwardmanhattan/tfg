@@ -20,7 +20,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -56,10 +56,9 @@ pub struct LogEntry {
 /// Next per-session journal number (M9): one past the highest
 /// `tfg-session-log-<n>.jsonl` on disk, so a restart never truncates a
 /// previous session's file. Unparseable names are ignored, never fatal.
-pub fn next_session_seq() -> usize {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+pub fn next_session_seq(log_dir: &Path) -> usize {
     let mut max = 0usize;
-    if let Ok(entries) = std::fs::read_dir(dir) {
+    if let Ok(entries) = std::fs::read_dir(log_dir) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             if let Some(n) = name
@@ -86,12 +85,7 @@ impl Journal {
         Self { next_seq: 0, writer: None }
     }
 
-    /// Fixed prototype path until session setup (#23) supplies one.
     /// Truncates: opening starts a new session journal.
-    pub fn prototype_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tfg-session-log.jsonl")
-    }
-
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
         Ok(Self { next_seq: 0, writer: Some(BufWriter::new(File::create(path)?)) })
     }

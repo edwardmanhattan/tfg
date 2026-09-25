@@ -59,7 +59,13 @@ pub struct FileReplay {
 impl FileReplay {
     pub fn from_file(path: &str) -> Result<Self, String> {
         let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let fixture: Fixture = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        Self::from_json(&text)
+    }
+
+    /// Parse a fixture already held in memory, including one embedded in
+    /// the executable. Installed builds need no scenario sidecar files.
+    pub fn from_json(text: &str) -> Result<Self, String> {
+        let fixture: Fixture = serde_json::from_str(text).map_err(|e| e.to_string())?;
         let mut frames = Vec::with_capacity(fixture.frames.len());
         for (i, raw_frame) in fixture.frames.iter().enumerate() {
             frames.push(

@@ -9,14 +9,6 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// Local sqlite path, next to the session journals (same precedent).
-pub fn local_db_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(format!(
-        "{}/target/tfg-local.db",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-}
-
 /// Open (creating) and migrate the store.
 pub fn open(path: &std::path::Path) -> Result<Connection, String> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {

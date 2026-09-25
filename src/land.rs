@@ -120,13 +120,10 @@ impl Land {
         Ok(Self { rings })
     }
 
-    /// Load the committed Natural Earth asset.
+    /// Load the Natural Earth data embedded in the executable.
     pub fn from_default_asset() -> Result<Self, String> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("assets/ne_50m_land.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("land asset missing ({path:?}): {e}"))?;
-        Self::from_geojson(&text)
+        Self::from_geojson(crate::assets::LAND_JSON)
+            .map_err(|e| format!("embedded land asset invalid: {e}"))
     }
 
     /// True when the point is in the sea (or any water NE 50m models).

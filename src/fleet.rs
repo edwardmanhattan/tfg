@@ -70,12 +70,10 @@ impl Fleet {
         Ok(Self { units: doc.units })
     }
 
-    /// Load the committed fleet asset.
+    /// Load the fleet embedded in the executable.
     pub fn from_default_asset() -> Result<Self, String> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fleet.json");
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("fleet asset missing ({path:?}): {e}"))?;
-        Self::parse(&text)
+        Self::parse(crate::assets::FLEET_JSON)
+            .map_err(|e| format!("embedded fleet invalid: {e}"))
     }
 
     pub fn len(&self) -> usize {

@@ -9,6 +9,7 @@
 //!   markers/trails/roster are immediate-mode (ADR-0001/0002).
 //!
 //! Run: `cargo run` (or `scripts/run-egui-window.sh`)
+//! Installed bundles embed their read-only assets; see `docs/runtime-paths.md`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use tfg::command::{Authority, Grant, GrantDenial, Leg, MoveCommand, Verb};
 use tfg::geo::track::{Fix, FixSource, Registry, TrailBound, should_track};
 use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
+use tfg::paths::AppPaths;
 use tfg::map_render::{
     ProjectedUnitGeometry, UnitLod, anchor_center, project_mercator, projected_unit_geometry,
     rotated_unit_quad_with_forward_heading, select_unit_lod, unproject_mercator,
@@ -183,7 +185,9 @@ enum WireKind {
     /// Explicit mock source (M10): examples/mock_backend.rs over
     /// TFG_BACKEND_URL. Never a Minos route — Minos is Live below.
     Mock(String),
-    Replay(String),
+    /// A built-in scenario embedded in the executable. The value is the
+    /// scenario stem accepted by [`tfg::assets::scenario_json`].
+    EmbeddedReplay(String),
     Live {
         ws_url: String,
         rest_base: String,
@@ -213,9 +217,13 @@ fn build_wire(kind: WireKind) -> Result<(Box<dyn PollSource>, String), String> {
         WireKind::Mock(url) => MockPoll::new(&url)
             .map(|h| (Box::new(h) as Box<dyn PollSource>, format!("mock {url}")))
             .map_err(|e| e),
-        WireKind::Replay(path) => FileReplay::from_file(&path)
-            .map(|r| (Box::new(r) as Box<dyn PollSource>, format!("replay {path}")))
-            .map_err(|e| e),
+        WireKind::EmbeddedReplay(name) => {
+            let json = tfg::assets::scenario_json(&name)
+                .ok_or_else(|| format!("unknown built-in scenario {name}"))?;
+            FileReplay::from_json(json)
+                .map(|r| (Box::new(r) as Box<dyn PollSource>, format!("replay {name} (embedded)")))
+                .map_err(|e| format!("embedded scenario {name}: {e}"))
+        }
         WireKind::Live { ws_url, rest_base, token, cmd_tx, cmd_rx, event_tx, wake_tx } => {
             let rest = MinosRest::new(&rest_base).map_err(|e| e)?;
             match LiveWire::connect(&ws_url, &rest, &token, cmd_tx, cmd_rx, event_tx, wake_tx) {
@@ -1517,6 +1525,9 @@ enum PwResult {
 }
 
 struct ShipApp {
+    /// Installed/portable runtime locations. All mutable state is reached
+    /// through this one object; no caller rebuilds a data-directory path.
+    paths: AppPaths,
     map_tex: Option<egui::TextureHandle>,
     /// What the current texture was rendered for: the canvas translates
     /// (and scales, across zooms) it to the live camera while the fresh
@@ -2598,7 +2609,7 @@ impl ShipApp {
             }
         }
         // M3: remember whose refresh token to wake with next launch.
-        tfg::backend::last_user_save(&user);
+        tfg::backend::last_user_save(&self.paths.last_user, &user);
         self.auth_user = Some(user);
         self.auth_token = Some(pair.access_token.clone());
         self.auth_issued_at = Some(Instant::now());
@@ -2637,7 +2648,7 @@ impl ShipApp {
             let _ = tfg::backend::keyring_clear(&user);
         }
         // M3: no session, no wake record — the next launch starts cold.
-        tfg::backend::last_user_clear();
+        tfg::backend::last_user_clear(&self.paths.last_user);
         if let Some(tx) = self.live_cmd_tx.take() {
             let _ = tx.send(LiveCmd::Shutdown);
         }
@@ -2887,7 +2898,7 @@ impl ShipApp {
     /// wake record so one revoked token cannot fail every launch; an
     /// unreachable backend keeps it for later.
     fn restore_session(&mut self) {
-        let Some(user) = tfg::backend::last_user_load() else {
+        let Some(user) = tfg::backend::last_user_load(&self.paths.last_user) else {
             return;
         };
         let stored = match tfg::backend::keyring_load(&user) {
@@ -2936,7 +2947,7 @@ impl ShipApp {
             }
             Err(e) => {
                 eprintln!("session restore refused ({e}); clearing wake record");
-                tfg::backend::last_user_clear();
+                tfg::backend::last_user_clear(&self.paths.last_user);
                 let _ = tfg::backend::keyring_clear(&user);
             }
         }
@@ -2996,7 +3007,7 @@ impl ShipApp {
             Err(e) => {
                 // Connection rides back only on success — on failure the
                 // worker consumed it. Reopen so later syncs can retry.
-                self.store = tfg::store::open(&tfg::store::local_db_path()).ok();
+                self.store = tfg::store::open(&self.paths.local_db).ok();
                 self.sync_status = format!("sync failed: {e}");
                 eprintln!("sync failed: {e}");
             }
@@ -3093,7 +3104,7 @@ impl ShipApp {
                 eprintln!("spec sync done: {}", self.sync_status);
             }
             Err(e) => {
-                self.store = tfg::store::open(&tfg::store::local_db_path()).ok();
+                self.store = tfg::store::open(&self.paths.local_db).ok();
                 self.sync_status = format!("spec sync failed: {e}");
             }
         }
@@ -8550,32 +8561,41 @@ impl ShipApp {
         }
     }
 
-    /// Load `.env` from the working directory (setup-overhaul pass):
-    /// `KEY=VALUE` lines, `#` comments, matching quotes unwrapped.
-    /// Real environment variables always win — the file only fills gaps.
-    fn load_dotenv() {
-        let Ok(text) = std::fs::read_to_string(".env") else {
-            return;
-        };
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((k, v)) = line.split_once('=') else {
+    /// Load optional `.env` files: working directory first for developer
+    /// workflows, then the installed app data directory. Real environment
+    /// variables always win — files only fill gaps.
+    fn load_dotenv(paths: Option<&AppPaths>) {
+        let mut candidates = Vec::new();
+        if let Some(path) = std::env::current_dir().ok().map(|dir| dir.join(".env")) {
+            candidates.push(path);
+        }
+        if let Some(paths) = paths {
+            candidates.push(paths.data_dir.join(".env"));
+        }
+        for path in candidates {
+            let Ok(text) = std::fs::read_to_string(path) else {
                 continue;
             };
-            let (k, v) = (k.trim(), v.trim());
-            if k.is_empty() || std::env::var(k).is_ok() {
-                continue;
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let Some((k, v)) = line.split_once('=') else {
+                    continue;
+                };
+                let (k, v) = (k.trim(), v.trim());
+                if k.is_empty() || std::env::var(k).is_ok() {
+                    continue;
+                }
+                let v = v
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                    .unwrap_or(v);
+                // Tab: set_var is unsafe under edition 2024 (process-wide).
+                unsafe { std::env::set_var(k, v) };
             }
-            let v = v
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-                .unwrap_or(v);
-            // Tab: set_var is unsafe under edition 2024 (process-wide).
-            unsafe { std::env::set_var(k, v) };
         }
     }
 
@@ -8713,11 +8733,10 @@ impl ShipApp {
         };
         self.session_ratio = ratio;
         self.session_seq += 1;
-        let path = std::path::PathBuf::from(format!(
-            "{}/target/tfg-session-log-{}.jsonl",
-            env!("CARGO_MANIFEST_DIR"),
-            self.session_seq
-        ));
+        let path = self
+            .paths
+            .log_dir
+            .join(format!("tfg-session-log-{}.jsonl", self.session_seq));
         if let Some(tx) = &self.sim_cmd_tx {
             let _ = tx.send(SimCommand::RotateJournal { path: path.clone() });
             let _ = tx.send(SimCommand::SetClockRatio { ratio });
@@ -8775,15 +8794,18 @@ impl ShipApp {
         self.show_messages = false;
     }
 
-    /// Directory scan off-thread: the target/ listing leaves the
-    /// frame; the loaded flag sets at spawn so one scan runs per
-    /// open, and refresh re-arms it.
+    /// Directory scan off-thread: the data-directory listing leaves the
+    /// frame; the loaded flag sets at spawn so one scan runs per open,
+    /// and refresh re-arms it.
     fn refresh_log_files(&mut self) -> bool {
         if self.log_op.is_some() {
             self.users_status = "log scan already running…".to_string();
             return false;
         }
-        self.log_op = Some(spawn_rest("logdir", || Ok(LogOut::Files(Self::session_log_files()))));
+        let log_dir = self.paths.log_dir.clone();
+        self.log_op = Some(spawn_rest("logdir", move || {
+            Ok(LogOut::Files(Self::session_log_files(&log_dir)))
+        }));
         true
     }
 
@@ -8805,9 +8827,10 @@ impl ShipApp {
     }
 
     /// Past session journals on disk, oldest first.
-    fn session_log_files() -> Vec<std::path::PathBuf> {        let mut out = Vec::new();
-        if let Ok(dir) = std::fs::read_dir(format!("{}/target", env!("CARGO_MANIFEST_DIR"))) {
-            for e in dir.flatten() {
+    fn session_log_files(log_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(log_dir) {
+            for e in entries.flatten() {
                 let p = e.path();
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if name.starts_with("tfg-session-log") && p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
@@ -11709,10 +11732,70 @@ const AUTH_FIELD_H: f32 = 34.0;
 /// Phase bar sits under the toolbar (three rows in Simulation ≈ 112px).
 const PHASE_BAR_TOP: f32 = 116.0;
 
-fn main() -> eframe::Result<()> {
-    // Endpoints live in `.env` (setup-overhaul pass), never in UI
-    // fields: load first so every env read below sees the file.
-    ShipApp::load_dotenv();
+fn validate_map_seed(path: &std::path::Path) -> Result<(), String> {
+    tfg::map_render::validate_cache(path)
+}
+
+fn runtime_self_check(paths: &AppPaths) -> Result<(), String> {
+    let catalog = Catalog::from_default_asset()?;
+    let fleet = Fleet::from_default_asset()?;
+    Land::from_default_asset()?;
+    let scenario = std::env::var("TFG_SCENARIO").unwrap_or_else(|_| "empty".to_string());
+    for (name, json) in tfg::assets::BUILT_IN_SCENARIOS {
+        FileReplay::from_json(json).map_err(|e| format!("embedded scenario {name}: {e}"))?;
+    }
+    let replay = FileReplay::from_json(
+        tfg::assets::scenario_json(&scenario)
+            .ok_or_else(|| format!("unknown built-in scenario {scenario}"))?,
+    )?;
+    let embedded_seed = paths.data_dir.join(format!(
+        "maps/.tfg-seed-check-{}.sqlite",
+        std::process::id()
+    ));
+    std::fs::write(&embedded_seed, tfg::assets::MAP_SEED)
+        .map_err(|e| format!("embedded map seed check write failed: {e}"))?;
+    let embedded_result = validate_map_seed(&embedded_seed);
+    let _ = std::fs::remove_file(&embedded_seed);
+    embedded_result?;
+    let map_cache = tfg::map_render::prepare_runtime_cache(&paths.map_cache)?;
+    validate_map_seed(&map_cache)?;
+    let _store = tfg::store::open(&paths.local_db)?;
+    println!(
+        "tfg {} runtime ok: {} classes, {} fleet units, land loaded, {} replay frames",
+        env!("CARGO_PKG_VERSION"),
+        catalog.ship_classes().len(),
+        fleet.len(),
+        replay.frame_count(),
+    );
+    println!("data: {}", paths.data_dir.display());
+    println!("map cache: {}", map_cache.display());
+    Ok(())
+}
+
+fn main() -> Result<(), String> {
+    if std::env::args().any(|arg| arg == "--version") {
+        println!("tfg {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    // A working-directory .env may select the data directory before paths
+    // are resolved; the data-directory file is loaded immediately after.
+    ShipApp::load_dotenv(None);
+    let paths = AppPaths::discover()?;
+    // Endpoints live in optional env files, never UI fields. Load before
+    // reading backend/scenario configuration.
+    ShipApp::load_dotenv(Some(&paths));
+    if std::env::var("TFG_BACKEND_URL").is_err()
+        && let Ok(name) = std::env::var("TFG_SCENARIO")
+        && tfg::assets::scenario_json(&name).is_none()
+    {
+        return Err(format!("unknown built-in scenario {name}"));
+    }
+    if std::env::args().any(|arg| arg == "--check-runtime") {
+        return runtime_self_check(&paths);
+    }
+    let map_cache = tfg::map_render::prepare_runtime_cache(&paths.map_cache)?;
+    let initial_log = paths.initial_log.clone();
+    let session_seq = tfg::log::next_session_seq(&paths.log_dir);
     // Poll thread owns the backend source; the UI owns the registry.
     // TFG_BACKEND_URL=http://host:port selects the explicit mock, else
     // file replay. The sim joins every round via MergeSource (disarmed
@@ -11736,15 +11819,14 @@ fn main() -> eframe::Result<()> {
     let poll_handle = std::thread::spawn(move || {
         // Boot wire (task #39, M10): TFG_BACKEND_URL points at the
         // explicit mock (examples/mock_backend.rs) — never at Minos,
-        // which is the Live wire below. File replay otherwise.
-        let empty = format!("{}/scenarios/empty.json", env!("CARGO_MANIFEST_DIR"));
+        // which is the Live wire below. Replay data is embedded; an
+        // unknown scenario fails rather than reading a local file.
         let boot_kind = match std::env::var("TFG_BACKEND_URL") {
             Ok(url) => WireKind::Mock(url),
-            Err(_) => WireKind::Replay(match std::env::var("TFG_SCENARIO") {
-                // `surge` for the traffic demo; default is the clear canvas.
-                Ok(name) => format!("{}/scenarios/{name}.json", env!("CARGO_MANIFEST_DIR")),
-                Err(_) => empty,
-            }),
+            Err(_) => match std::env::var("TFG_SCENARIO") {
+                Ok(name) => WireKind::EmbeddedReplay(name),
+                Err(_) => WireKind::EmbeddedReplay("empty".to_string()),
+            },
         };
         let (wire, desc) = match build_wire(boot_kind) {
             Ok(w) => w,
@@ -11759,7 +11841,7 @@ fn main() -> eframe::Result<()> {
             SimSource::new_with_journal(
                 sim_cmd_rx,
                 sim_evt_tx,
-                tfg::log::Journal::open(tfg::log::Journal::prototype_path())
+                tfg::log::Journal::open(initial_log)
                     .unwrap_or_else(|e| {
                         eprintln!("session log disabled: {e}");
                         tfg::log::Journal::disabled()
@@ -11808,7 +11890,7 @@ fn main() -> eframe::Result<()> {
     let (map_resp_tx, map_resp_rx) = mpsc::channel::<MapResp>();
     let map_handle = std::thread::spawn(move || {
         let mut size = (MAP_W as u32, MAP_H as u32);
-        let mut scene = LiveMap::new(CENTER, ZOOM, size.0, size.1, STYLE, tfg::map_render::repo_cache_path());
+        let mut scene = LiveMap::new(CENTER, ZOOM, size.0, size.1, STYLE, map_cache.clone());
         while let Ok(first) = map_req_rx.recv() {
             // Newest-wins (task #43): a burst of scroll-zoom requests
             // renders once, so the texture never lags seconds behind.
@@ -11819,7 +11901,7 @@ fn main() -> eframe::Result<()> {
             let (seq, at, zoom, px, pump) = latest;
             if px != size {
                 // Window resize: rebuild the scene once at the new size.
-                scene = LiveMap::new(at, zoom, px.0.max(1), px.1.max(1), STYLE, tfg::map_render::repo_cache_path());
+                scene = LiveMap::new(at, zoom, px.0.max(1), px.1.max(1), STYLE, map_cache.clone());
                 size = px;
             }
             scene.set_center(at, zoom);
@@ -11856,7 +11938,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "tfg command center (egui)",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             // Required once: without image loaders, from_bytes fails.
             egui_extras::install_image_loaders(&cc.egui_ctx);
             apply_ops_theme(&cc.egui_ctx);
@@ -11864,7 +11946,7 @@ fn main() -> eframe::Result<()> {
             // runtime catalog classes before the first frame, so register
             // hulls placed last session drive again without refetching.
             let mut catalog = Catalog::from_default_asset().expect("catalog asset valid");
-            let store = match tfg::store::open(&tfg::store::local_db_path()) {
+            let store = match tfg::store::open(&paths.local_db) {
                 Ok(conn) => Some(conn),
                 Err(e) => {
                     eprintln!("local store unavailable: {e}");
@@ -11905,6 +11987,7 @@ fn main() -> eframe::Result<()> {
                 }
             }
             let mut app = ShipApp {
+                paths: paths.clone(),
                 map_tex: None,
                 tex_center: CENTER,
                 tex_zoom: ZOOM,
@@ -11930,8 +12013,8 @@ fn main() -> eframe::Result<()> {
                 show_trail: true,
                 mode: UiMode::new(sim_armed.clone()),
                 session_windows: None,
-                session_log_path: tfg::log::Journal::prototype_path(),
-                session_seq: tfg::log::next_session_seq(),
+                session_log_path: paths.initial_log.clone(),
+                session_seq,
                 transcript: Vec::new(),
                 show_roster: false,
                 show_orders: false,
@@ -12167,6 +12250,7 @@ fn main() -> eframe::Result<()> {
             app.restore_session();
             Ok(Box::new(app))        }),
     )
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

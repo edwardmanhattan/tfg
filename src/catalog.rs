@@ -101,13 +101,10 @@ impl Catalog {
         Ok(Self { schemas: doc.categories, classes: doc.classes })
     }
 
-    /// Load the committed catalog asset.
+    /// Load the catalog embedded in the executable.
     pub fn from_default_asset() -> Result<Self, String> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("assets/catalog.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("catalog asset missing ({path:?}): {e}"))?;
-        Self::parse(&text)
+        Self::parse(crate::assets::CATALOG_JSON)
+            .map_err(|e| format!("embedded catalog invalid: {e}"))
     }
 
     /// Ship classes, in catalog order (UI selector source).

@@ -12,7 +12,8 @@
 //! Paste the whole output back. Needs the seeded tile cache (default
 //! path); network only if tiles miss.
 
-use tfg::map_render::{LiveMap, project_mercator, repo_cache_path};
+use tfg::map_render::{LiveMap, prepare_runtime_cache, project_mercator};
+use tfg::paths::AppPaths;
 
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 const W: u32 = 800;
@@ -59,8 +60,8 @@ fn edge_x(frame: &[u8]) -> (i32, f32) {
     best
 }
 
-fn render(center: (f64, f64)) -> Vec<u8> {
-    let mut scene = LiveMap::new(center, ZOOM, W, H, STYLE, repo_cache_path());
+fn render(center: (f64, f64), cache_path: &std::path::Path) -> Vec<u8> {
+    let mut scene = LiveMap::new(center, ZOOM, W, H, STYLE, cache_path.to_path_buf());
     scene.pump(12);
     scene.frame_rgba()
 }
@@ -79,8 +80,10 @@ fn main() {
     // Latitude pan across the bay coast: middle column should cross it.
     let south = (-6.1300, 106.8700);
     let north = (-6.1100, 106.8700);
-    let fa = render(south);
-    let fb = render(north);
+    let paths = AppPaths::discover().expect("runtime paths");
+    let cache = prepare_runtime_cache(&paths.map_cache).expect("map cache");
+    let fa = render(south, &cache);
+    let fb = render(north, &cache);
     let (ya, sa) = coast_y(&fa);
     let (yb, sb) = coast_y(&fb);
     let measured_lat = (yb - ya) as f64;

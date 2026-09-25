@@ -9,10 +9,12 @@
 //! (prototype duplication of the map engine's projection, ADR-0001).
 
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use rusqlite::Connection;
 
 use maplibre_native::{
     CameraUpdate, Continuous, ImageRenderer, ImageRendererBuilder, LatLng, ResourceOptions,
@@ -21,31 +23,81 @@ use maplibre_native::{
 /// Pixel layout of [`LiveMap::frame_rgba`]. Flip if the map renders washed.
 const PREMULTIPLIED: bool = true;
 
-/// Repo-committed seed cache (written by `examples/seed_cache.rs`).
-/// Never opened writable by the app: runs copy it to [`runtime_cache_path`]
-/// first, so everyday map use never dirties the working tree.
-pub fn seed_cache_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/tiles-cache.seed.sqlite")
-}
-
-/// Writable runtime copy of the tile cache. Restored from the seed when
-/// missing (fresh clone, `cargo clean`), then refreshed by use.
-pub fn runtime_cache_path() -> PathBuf {
-    let runtime =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tfg-tiles-cache.sqlite");
-    if !runtime.is_file() {
-        if let Some(parent) = runtime.parent() {
-            std::fs::create_dir_all(parent).expect("target dir writable");
-        }
-        std::fs::copy(seed_cache_path(), &runtime).expect("seed cache present; run seed_cache");
+/// Validate a MapLibre cache as a self-contained SQLite seed/cache.
+pub fn validate_cache(path: &Path) -> Result<(), String> {
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("map cache is not SQLite ({}): {e}", path.display()))?;
+    let quick_check: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|e| format!("map cache integrity check failed: {e}"))?;
+    if quick_check != "ok" {
+        return Err(format!("map cache integrity check: {quick_check}"));
     }
-    runtime
+    for table in ["tiles", "resources"] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .map_err(|e| format!("map cache table {table} missing: {e}"))?;
+        if count == 0 {
+            return Err(format!("map cache table {table} is empty"));
+        }
+    }
+    Ok(())
 }
 
-/// Repo-committed ambient tile cache (seeded by `examples/seed_cache.rs`).
-/// The app boots from this without network; misses re-fetch and refresh it.
-pub fn repo_cache_path() -> PathBuf {
-    runtime_cache_path()
+fn cache_is_usable(path: &Path) -> bool {
+    validate_cache(path).is_ok()
+}
+
+/// Restore the embedded map seed at `runtime` when it is missing or
+/// corrupt, then return the writable cache path. The write is atomic so an
+/// interrupted first launch cannot leave a half-seeded SQLite file behind.
+pub fn prepare_runtime_cache(runtime: &Path) -> Result<PathBuf, String> {
+    if runtime.is_file() && !cache_is_usable(runtime) {
+        let backup = runtime.with_extension(format!(
+            "sqlite.corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::rename(runtime, backup).map_err(|e| {
+            format!("corrupt map cache could not be moved aside ({}): {e}", runtime.display())
+        })?;
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = runtime.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(sidecar));
+        }
+    }
+    if !runtime.is_file() {
+        let parent = runtime
+            .parent()
+            .ok_or_else(|| format!("map cache has no parent: {}", runtime.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("map cache directory unavailable ({}): {e}", parent.display()))?;
+        let temporary = runtime.with_extension(format!(
+            "sqlite.tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&temporary, crate::assets::MAP_SEED)
+            .map_err(|e| format!("map seed write failed ({}): {e}", temporary.display()))?;
+        if let Err(e) = std::fs::rename(&temporary, runtime) {
+            // Another first launch won the race. Its complete seed is the
+            // desired result; discard this process's temporary copy.
+            if runtime.is_file() {
+                let _ = std::fs::remove_file(&temporary);
+            } else {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(format!("map seed install failed ({}): {e}", runtime.display()));
+            }
+        }
+    }
+    Ok(runtime.to_path_buf())
 }
 
 /// A persistent map scene: build once, re-render for the process lifetime.

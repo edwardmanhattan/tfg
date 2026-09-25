@@ -11,7 +11,8 @@ use maplibre_native::{
     FileSourceType, RequestHandle, Responder, ResourceRequest,
     file_source::{ErrorReason, FileSource, Response, register_file_source},
 };
-use tfg::map_render::{LiveMap, repo_cache_path};
+use tfg::map_render::{LiveMap, prepare_runtime_cache};
+use tfg::paths::AppPaths;
 
 /// Fails everything the cache can't serve: no packets leave the host.
 struct DenyNetwork;
@@ -36,13 +37,15 @@ fn main() {
     // Must register before the scene exists: this replaces the network path.
     register_file_source(FileSourceType::Network, DenyNetwork);
     let t0 = std::time::Instant::now();
+    let paths = AppPaths::discover().expect("runtime paths");
+    let cache = prepare_runtime_cache(&paths.map_cache).expect("map cache");
     let mut scene = LiveMap::new(
         (-6.108, 106.910),
         11.0,
         800,
         600,
         "https://tiles.openfreemap.org/styles/liberty",
-        repo_cache_path(),
+        cache,
     );
     scene.pump(10);
     let (w, h) = scene.dims();

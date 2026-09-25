@@ -9,6 +9,8 @@
 //! substring-matched). The envelope unwrap lives in the parent until it
 //! moves into `error` with the next layers.
 
+use std::path::Path;
+
 use super::{BackendError, unwrap_envelope};
 
 /// Minos token pair (docs/minos-api.yaml): short-lived access token plus
@@ -227,33 +229,21 @@ pub fn keyring_clear(user: &str) -> Result<(), BackendError> {
     }
 }
 
-/// Last signed-in identifier (M3): the keyring holds one entry per
-/// identifier but cannot list them, so the launcher records whose
-/// refresh token to wake with. Plain identifier, never a secret, next
-/// to the journals and the mirror — a `cargo clean` wipes it and the
-/// next launch asks for login again, which is the honest outcome.
-fn last_user_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(format!(
-        "{}/target/tfg-last-user",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-}
-
 /// Remember who signed in (best effort — a missed write only costs
 /// the next launch a login form).
-pub fn last_user_save(user: &str) {
-    let _ = std::fs::write(last_user_path(), user.trim());
+pub fn last_user_save(path: &Path, user: &str) {
+    let _ = std::fs::write(path, user.trim());
 }
 
 /// Who signed in last, if the record survived.
-pub fn last_user_load() -> Option<String> {
-    std::fs::read_to_string(last_user_path())
+pub fn last_user_load(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
 /// Forget the last identifier (sign out).
-pub fn last_user_clear() {
-    let _ = std::fs::remove_file(last_user_path());
+pub fn last_user_clear(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
