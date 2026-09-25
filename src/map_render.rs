@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 use maplibre_native::{
     CameraUpdate, Continuous, ImageRenderer, ImageRendererBuilder, LatLng, ResourceOptions,
@@ -22,6 +22,31 @@ use maplibre_native::{
 
 /// Pixel layout of [`LiveMap::frame_rgba`]. Flip if the map renders washed.
 const PREMULTIPLIED: bool = true;
+
+/// The seed contains a complete offline style/resource set, but the source
+/// snapshot was captured with ordinary HTTP expiry timestamps. Pin the seed
+/// rows before MapLibre opens the cache: otherwise a fresh Windows install
+/// tries to revalidate the style over the network and can never report a
+/// style-loaded callback in an offline/CI environment.
+const OFFLINE_SEED_EXPIRY: i64 = 4_102_444_800; // 2100-01-01T00:00:00Z
+
+fn pin_offline_seed(path: &Path) -> Result<(), String> {
+    let connection = Connection::open(path)
+        .map_err(|e| format!("map cache expiry update open failed: {e}"))?;
+    connection
+        .execute(
+            "UPDATE resources SET expires = ?1",
+            params![OFFLINE_SEED_EXPIRY],
+        )
+        .map_err(|e| format!("map resource expiry update failed: {e}"))?;
+    connection
+        .execute(
+            "UPDATE tiles SET expires = ?1",
+            params![OFFLINE_SEED_EXPIRY],
+        )
+        .map_err(|e| format!("map tile expiry update failed: {e}"))?;
+    Ok(())
+}
 
 /// Validate a MapLibre cache as a self-contained SQLite seed/cache.
 pub fn validate_cache(path: &Path) -> Result<(), String> {
@@ -70,6 +95,12 @@ pub fn prepare_runtime_cache(runtime: &Path) -> Result<PathBuf, String> {
             let _ = std::fs::remove_file(PathBuf::from(sidecar));
         }
     }
+    if runtime.is_file() {
+        // A cache from an earlier launch may contain the same seed rows with
+        // the original HTTP expiry. Keep those rows offline-usable on every
+        // launch, not only on a first install.
+        pin_offline_seed(runtime)?;
+    }
     if !runtime.is_file() {
         let parent = runtime
             .parent()
@@ -86,6 +117,7 @@ pub fn prepare_runtime_cache(runtime: &Path) -> Result<PathBuf, String> {
         ));
         std::fs::write(&temporary, crate::assets::MAP_SEED)
             .map_err(|e| format!("map seed write failed ({}): {e}", temporary.display()))?;
+        pin_offline_seed(&temporary)?;
         if let Err(e) = std::fs::rename(&temporary, runtime) {
             // Another first launch won the race. Its complete seed is the
             // desired result; discard this process's temporary copy.
@@ -537,6 +569,41 @@ pub fn unproject_mercator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_seed_pins_resource_expiry_for_maplibre() {
+        let path = std::env::temp_dir().join(format!(
+            "tfg-map-cache-expiry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let connection = Connection::open(&path).expect("cache");
+        connection
+            .execute_batch(
+                "CREATE TABLE resources (expires INTEGER);
+                 CREATE TABLE tiles (expires INTEGER);
+                 INSERT INTO resources VALUES (0);
+                 INSERT INTO tiles VALUES (0);",
+            )
+            .expect("schema");
+        drop(connection);
+
+        pin_offline_seed(&path).expect("pin seed");
+        let connection = Connection::open(&path).expect("reopen");
+        let resource_expiry: i64 = connection
+            .query_row("SELECT expires FROM resources", [], |row| row.get(0))
+            .expect("resource expiry");
+        let tile_expiry: i64 = connection
+            .query_row("SELECT expires FROM tiles", [], |row| row.get(0))
+            .expect("tile expiry");
+        assert_eq!(resource_expiry, OFFLINE_SEED_EXPIRY);
+        assert_eq!(tile_expiry, OFFLINE_SEED_EXPIRY);
+        drop(connection);
+        std::fs::remove_file(path).ok();
+    }
 
     /// Each zoom level halves the ground a pixel covers, so four
     /// levels make it 16x finer. The LOD thresholds rest on this

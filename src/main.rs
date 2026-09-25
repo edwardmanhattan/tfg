@@ -95,6 +95,30 @@ enum SetupTool {
     Place,
 }
 
+/// The selected fleet pick is the placement intent. The UI tool is only a
+/// visual hint: it can be reset by a phase transition while the pick is still
+/// waiting for the operator's map click.
+fn placement_click_allowed(
+    phase: Phase,
+    pick: Option<&str>,
+    armed: bool,
+    acting_as: Option<&str>,
+) -> bool {
+    pick.is_some()
+        && (phase == Phase::Setup || phase == Phase::Live)
+        && armed
+        && acting_as.is_none()
+}
+
+/// Simulation keeps local fixes visible during Setup so placed units appear
+/// immediately. Presentation remains wire-first even when its local phase is
+/// not Live; a closed Simulation is frozen and accepts no movement.
+fn accepts_movement_fixes(app_mode: AppMode, phase: Phase) -> bool {
+    app_mode == AppMode::Presentation
+        || (app_mode == AppMode::Simulation
+            && (phase == Phase::Setup || phase == Phase::Live))
+}
+
 /// Unified selection (Inspector-model ticket): one selection, ship-or-group.
 /// Selecting either kind clears the other; Inspector visibility IS selection
 /// presence — select opens it, deselect closes it.
@@ -2059,8 +2083,7 @@ impl ShipApp {
         // the live wire replays the whole picture every tick, and duplicate
         // rounds must not replay the animation.
         let mut advanced = false;
-        let accept_movement =
-            self.app_mode == AppMode::Presentation || self.mode.phase == Phase::Live;
+        let accept_movement = accepts_movement_fixes(self.app_mode, self.mode.phase);
         let setup_sim_only =
             self.app_mode == AppMode::Simulation && self.mode.phase == Phase::Setup;
         for fixes in self.poll_rx.try_iter() {
@@ -3416,7 +3439,7 @@ impl ShipApp {
         self.roster_gap = false;
         self.units_gap = false;
         self.placements_gap = false;
-        self.fleet_pick = None;
+        self.clear_fleet_pick();
         self.pending_placement = None;
         self.edit_open = false;
         self.delete_armed = false;
@@ -4073,6 +4096,16 @@ impl ShipApp {
         self.setup_step = 1;
     }
 
+    fn arm_fleet_pick(&mut self, id: String) {
+        self.fleet_pick = Some(id);
+        self.mode.tool = SetupTool::Place;
+    }
+
+    fn clear_fleet_pick(&mut self) {
+        self.fleet_pick = None;
+        self.mode.tool = SetupTool::Select;
+    }
+
     /// Step 3 write: put a register hull into the game under the
     /// picked commander. Mirrors the hull to the map engine as a
     /// placement pick — click the map to drop it.
@@ -4111,8 +4144,7 @@ impl ShipApp {
         // Arm the map click for placement (the click handler only
         // stands hulls up while the Place tool is active). The pick
         // itself lands on apply, once the piece exists server-side.
-        self.fleet_pick = Some(unit_id.to_string());
-        self.mode.tool = SetupTool::Place;
+        self.arm_fleet_pick(unit_id.to_string());
     }
 
     /// Step 3 write: take a hull back out of the game (idempotent).
@@ -6145,8 +6177,7 @@ impl ShipApp {
                         egui::Sense::click_and_drag(),
                     );
                     if row_response.is_pointer_button_down_on() && self.unit_drag.is_none() {
-                        self.fleet_pick = Some(row.id.clone());
-                        self.mode.tool = SetupTool::Place;
+                        self.arm_fleet_pick(row.id.clone());
                         if let Some(start) = row_response.interact_pointer_pos() {
                             self.unit_drag = Some(UnitDrag {
                                 id: row.id.clone(),
@@ -6157,8 +6188,7 @@ impl ShipApp {
                         }
                     }
                     if row_response.clicked() && assignment.is_none() {
-                        self.fleet_pick = Some(row.id.clone());
-                        self.mode.tool = SetupTool::Place;
+                        self.arm_fleet_pick(row.id.clone());
                         self.users_status = format!("{} selected · click the map to place", row.name);
                     }
                     if let Some((id, name)) = assignment {
@@ -6188,17 +6218,18 @@ impl ShipApp {
                 let placing = self.mode.tool == SetupTool::Place;
                 if ui
                     .small_button(if placing {
-                        format!("click the map to place {}…", row.name)
+                        format!("cancel placing {}…", row.name)
                     } else {
                         format!("place {}", row.name)
                     })
                     .clicked()
                 {
-                    self.mode.tool = if placing {
-                        SetupTool::Select
+                    if placing {
+                        self.clear_fleet_pick();
+                        self.users_status = "placement cancelled".to_string();
                     } else {
-                        SetupTool::Place
-                    };
+                        self.arm_fleet_pick(pick.clone());
+                    }
                 }
                 if ui.button("place at map center").clicked() {
                     let (la, lo) = self.center;
@@ -6206,7 +6237,7 @@ impl ShipApp {
                     self.mode.tool = SetupTool::Select;
                 }
             } else {
-                self.fleet_pick = None;
+                self.clear_fleet_pick();
                 ui.label("Pick a unit above to arm placement.");
             }
         } else {
@@ -6647,7 +6678,7 @@ impl ShipApp {
         self.commanded_hulls.clear();
         self.minos_tree.clear();
         self.tree_gap = false;
-        self.fleet_pick = None;
+        self.clear_fleet_pick();
         self.pending_placement = None;
         self.users_placements.clear();
         self.placement_unplaced = 0;
@@ -7724,7 +7755,7 @@ impl ShipApp {
             }
             SetupDone::Assign(units, note, pick) => {
                 self.users_gunits = units;
-                self.fleet_pick = Some(pick.to_string());
+                self.arm_fleet_pick(pick.to_string());
                 self.users_status = note;
                 if let Some((_, la, lo)) = self.pending_placement.take() {
                     self.try_place_picked(la, lo);
@@ -8582,8 +8613,7 @@ impl ShipApp {
             if self.unit_drag.take().is_some()
                 || (self.mode.tool == SetupTool::Place && self.fleet_pick.is_some())
             {
-                self.fleet_pick = None;
-                self.mode.tool = SetupTool::Select;
+                self.clear_fleet_pick();
                 self.users_status = "placement cancelled".to_string();
             } else {
                 self.deselect();
@@ -8927,7 +8957,7 @@ impl ShipApp {
         self.select_ship(id.to_string());
         self.placed_labels.insert(id.to_string(), (name.to_string(), hull.to_string()));
         self.placed_fleet.insert(pid.to_string());
-        self.fleet_pick = None;
+        self.clear_fleet_pick();
         // The event feed only renders in an execution window;
         // the setup flow owns its own status line too. The spec
         // source rides the message (H10): Minos figures name
@@ -8968,7 +8998,7 @@ impl ShipApp {
         self.placed_labels.remove(id);
         self.placed_fleet.remove(id);
         if self.fleet_pick.as_deref() == Some(id) {
-            self.fleet_pick = None;
+            self.clear_fleet_pick();
         }
         if self.selection == Some(Selection::Ship(id.to_string())) {
             self.deselect();
@@ -11425,6 +11455,26 @@ impl eframe::App for ShipApp {
                 }
                 self.last_desired_px = desired;
             }
+            // Keep the canvas interactive while the first map frame is still
+            // rendering. The placeholder is replaced by drain_map as soon as
+            // the real texture arrives; without it, placement clicks are lost
+            // during the initial load.
+            if self.map_tex.is_none() {
+                let size = [
+                    avail.x.max(1.0) as usize,
+                    avail.y.max(1.0) as usize,
+                ];
+                let pixel_count = size[0].saturating_mul(size[1]);
+                let placeholder = egui::ColorImage::new(
+                    size,
+                    vec![egui::Color32::TRANSPARENT; pixel_count],
+                );
+                self.map_tex = Some(ui.ctx().load_texture(
+                    "map-placeholder",
+                    placeholder,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
             if let Some(tex) = &self.map_tex {
                 // Buttery canvas (smoothness pass): the camera is live but
                 // tiles lag it by a throttle tick, so draw the last texture
@@ -11469,19 +11519,18 @@ impl eframe::App for ShipApp {
                                 let (la, lo) = unproject_mercator(
                                     px, py, self.center, self.zoom, mw, mh,
                                 );
-                                self.fleet_pick = Some(drag.id);
+                                self.arm_fleet_pick(drag.id);
                                 self.try_place_picked(la, lo);
                                 self.mode.tool = SetupTool::Select;
                             } else {
-                                self.mode.tool = SetupTool::Select;
+                                self.clear_fleet_pick();
                                 self.users_status = format!(
                                     "{} placement cancelled · release over the map",
                                     drag.name
                                 );
                             }
                         } else {
-                            self.fleet_pick = Some(drag.id);
-                            self.mode.tool = SetupTool::Place;
+                            self.arm_fleet_pick(drag.id);
                             self.users_status = format!(
                                 "{} selected · click the map to place",
                                 drag.name
@@ -11622,11 +11671,12 @@ impl eframe::App for ShipApp {
                         let px = (pos.x - rect.min.x) as f64;
                         let py = (pos.y - rect.min.y) as f64;
                         let (mw, mh) = self.map_dims();
-                        if self.mode.tool == SetupTool::Place
-                            && (self.mode.phase == Phase::Setup || self.mode.phase == Phase::Live)
-                            && self.mode.armed.load(Ordering::SeqCst)
-                            && self.acting_as.is_none()
-                        {
+                        if placement_click_allowed(
+                            self.mode.phase,
+                            self.fleet_pick.as_deref(),
+                            self.mode.armed.load(Ordering::SeqCst),
+                            self.acting_as.as_deref(),
+                        ) {
                             let (la, lo) = unproject_mercator(
                                 px, py, self.center, self.zoom, mw, mh,
                             );
@@ -11680,7 +11730,7 @@ impl eframe::App for ShipApp {
                                 // Zone click (no ship hit): select the group.
                                 eprintln!("select group {gid}");
                                 self.select_group(gid);
-                            } else if self.mode.tool != SetupTool::Place && !self.placing {
+                            } else if self.fleet_pick.is_none() && !self.placing {
                                 // Empty water, nothing armed: deselect (the
                                 // Inspector shuts with the selection).
                                 eprintln!("deselect");
@@ -12740,6 +12790,28 @@ mod tests {
 
     fn symbol(_: i64) -> tfg::store::MapSymbol {
         tfg::store::MapSymbol::Corvette
+    }
+
+    /// Planning must show a local unit as soon as it is placed; the Sim filter
+    /// then keeps wire traffic out until the session is live.
+    #[test]
+    fn simulation_planning_accepts_local_movement_fixes() {
+        assert!(accepts_movement_fixes(AppMode::Simulation, Phase::Setup));
+        assert!(accepts_movement_fixes(AppMode::Simulation, Phase::Live));
+        assert!(!accepts_movement_fixes(AppMode::Simulation, Phase::Closed));
+        assert!(accepts_movement_fixes(AppMode::Presentation, Phase::Closed));
+    }
+
+    /// A selected fleet pick remains a valid map-placement intent even when
+    /// another UI state transition resets the visual tool hint.
+    #[test]
+    fn selected_fleet_pick_stays_map_clickable_after_tool_reset() {
+        assert!(placement_click_allowed(Phase::Setup, Some("unit-1"), true, None));
+        assert!(placement_click_allowed(Phase::Live, Some("unit-1"), true, None));
+        assert!(!placement_click_allowed(Phase::Setup, None, true, None));
+        assert!(!placement_click_allowed(Phase::Closed, Some("unit-1"), true, None));
+        assert!(!placement_click_allowed(Phase::Setup, Some("unit-1"), false, None));
+        assert!(!placement_click_allowed(Phase::Setup, Some("unit-1"), true, Some("observer")));
     }
 
     /// Inspector images stay compact by default, preserve their source
