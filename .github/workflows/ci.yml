@@ -448,7 +448,7 @@ jobs:
           name: tfg-${{ matrix.platform }}-${{ runner.arch }}
           path: |
             dist/tfg-*.tar.gz
-            dist/tfg-*.deb
+            dist/tfg_*.deb
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
