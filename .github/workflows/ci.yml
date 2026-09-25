@@ -447,13 +447,13 @@ jobs:
           retention-days: 14
 
   debian_package:
-    name: Build Debian 12 package
+    name: Build Debian 13 package
     needs: notices
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     container:
-      image: debian:bookworm
+      image: debian:trixie
     steps:
       - name: Install Debian build dependencies
         run: |
@@ -473,6 +473,7 @@ jobs:
             libicu-dev \
             libjpeg62-turbo-dev \
             libpng-dev \
+            libssl-dev \
             libuv1-dev \
             libwebp-dev \
             ninja-build \
@@ -544,7 +545,7 @@ jobs:
       - name: Upload Debian package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: tfg-debian12-amd64
+          name: tfg-debian13-amd64
           path: dist/tfg_*.deb
           if-no-files-found: error
           compression-level: 0
