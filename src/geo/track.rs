@@ -281,50 +281,111 @@ impl Registry {
     /// Returns the accepted fixes as (ship, seq) pairs for ingest acks
     /// (Log grill, #20); dropped out-of-order fixes consume seqs silently.
     pub fn poll(&mut self, fixes: Vec<Fix>) -> Vec<(String, u64)> {
+        self.poll_inner(fixes, true)
+    }
+
+    /// Ingest an authoritative game-position publication without letting
+    /// its independent stream affect Wire/Sim miss counters.
+    pub fn poll_game(&mut self, fixes: Vec<Fix>) -> Vec<(String, u64)> {
+        self.poll_inner(fixes, false)
+    }
+
+    fn poll_inner(&mut self, fixes: Vec<Fix>, count_misses: bool) -> Vec<(String, u64)> {
         let mut seen = std::collections::HashSet::new();
         let mut acked = Vec::with_capacity(fixes.len());
         for mut fix in fixes {
+            // An unparsable timestamp is not a position instant. Reject
+            // it before it can become epoch zero and poison ordering.
+            if fix.epoch_nanos() <= 0 {
+                continue;
+            }
             fix.seq = self.next_seq;
             self.next_seq += 1;
             let pair = (fix.ship_id.clone(), fix.seq);
-            seen.insert(fix.ship_id.clone());
             match self.ships.get_mut(&fix.ship_id) {
                 Some(s) => {
+                    // A connected exercise's authoritative Game source
+                    // owns the identity; a later wire measurement must not
+                    // overwrite it. Conversely, a Game publication is
+                    // authoritative even when its scenario timestamp is
+                    // earlier than a wall-clock measurement that happened
+                    // to share the unit id.
+                    if s.latest.source == FixSource::Game && fix.source != FixSource::Game {
+                        continue;
+                    }
+                    let game_takes_authority = fix.source == FixSource::Game
+                        && s.latest.source != FixSource::Game;
+                    if fix.backfilled
+                        && !game_takes_authority
+                        && fix.epoch_nanos() <= s.latest.epoch_nanos()
+                    {
+                        let inserted =
+                            s.track.iter().all(|old| old.epoch_nanos() != fix.epoch_nanos());
+                        if inserted {
+                            let at = s
+                                .track
+                                .iter()
+                                .position(|old| old.epoch_nanos() > fix.epoch_nanos())
+                                .unwrap_or(s.track.len());
+                            s.track.insert(at, fix);
+                            while s.track.len() > self.bound.max_fixes {
+                                s.track.pop_front();
+                            }
+                            acked.push(pair);
+                        }
+                        continue;
+                    }
                     // Instant order, not string order (mixed `Z`/offsets).
-                    if fix.epoch_nanos() <= s.latest.epoch_nanos() {
+                    if !game_takes_authority
+                        && fix.epoch_nanos() <= s.latest.epoch_nanos()
+                    {
                         continue; // out-of-order or duplicate: drop
                     }
-                    s.previous = Some(std::mem::replace(&mut s.latest, fix.clone()));
+                    let backfilled = fix.backfilled;
+                    let current_id = fix.ship_id.clone();
+                    let previous = std::mem::replace(&mut s.latest, fix.clone());
+                    s.previous = Some(previous);
                     s.track.push_back(fix);
                     while s.track.len() > self.bound.max_fixes {
                         s.track.pop_front();
+                    }
+                    if !backfilled {
+                        seen.insert(current_id);
                     }
                     s.missed = 0;
                     s.stale = false;
                     acked.push(pair);
                 }
                 None => {
+                    let current_id = fix.ship_id.clone();
+                    let backfilled = fix.backfilled;
                     let mut track = VecDeque::new();
                     track.push_back(fix.clone());
                     self.ships.insert(
-                        fix.ship_id.clone(),
+                        current_id.clone(),
                         ShipState { latest: fix, previous: None, track, missed: 0, stale: false },
                     );
+                    if !backfilled {
+                        seen.insert(current_id);
+                    }
                     acked.push(pair);
                 }
             }
         }
-        for (id, s) in self.ships.iter_mut() {
-            // Game fixes arrive on their own MinOS position stream, not
-            // through this poll's empty Wire/Sim rounds. Do not let an
-            // unrelated two-second poll mark a live game ship stale.
-            if s.latest.source == FixSource::Game {
-                continue;
-            }
-            if !seen.contains(id) {
-                s.missed += 1;
-                if s.missed >= STALE_AFTER_MISSED {
-                    s.stale = true;
+        if count_misses {
+            for (id, s) in self.ships.iter_mut() {
+                // Game fixes arrive on their own MinOS position stream,
+                // not through this poll's empty Wire/Sim rounds. Do not
+                // let an unrelated two-second poll mark a live game ship
+                // stale.
+                if s.latest.source == FixSource::Game {
+                    continue;
+                }
+                if !seen.contains(id) {
+                    s.missed += 1;
+                    if s.missed >= STALE_AFTER_MISSED {
+                        s.stale = true;
+                    }
                 }
             }
         }
@@ -340,12 +401,44 @@ impl Registry {
                 latest: s.latest.clone(),
                 stale: s.stale,
                 silent: false,
-                trail: s.track.iter().map(|f| f.position).collect(),
+                trail: {
+                    let mut trail = Vec::new();
+                    for fix in &s.track {
+                        if trail.last() != Some(&fix.position) {
+                            trail.push(fix.position);
+                        }
+                    }
+                    trail
+                },
                 source: s.latest.source,
             })
             .collect();
         out.sort_by(|a, b| a.ship_id.cmp(&b.ship_id));
         out
+    }
+
+    /// Whether the latest two accepted fixes form a normal display
+    /// interval. A reconnect/long gap must snap rather than animate an
+    /// unobserved route.
+    pub fn has_large_gap(&self, ship_id: &str, max_gap_secs: i64) -> bool {
+        let Some(s) = self.ships.get(ship_id) else { return true; };
+        let Some(previous) = s.previous.as_ref() else { return false; };
+        let gap = s.latest.epoch_secs() - previous.epoch_secs();
+        gap <= 0 || gap > max_gap_secs
+    }
+
+    /// Remove an operational wire ship after its authoritative snapshot
+    /// says it vanished. Sim/Game identities have separate authorities and
+    /// must not be reaped by a live-feed picture.
+    pub fn remove_ship(&mut self, ship_id: &str) {
+        if self
+            .ships
+            .get(ship_id)
+            .is_some_and(|ship| ship.latest.source == FixSource::Wire)
+        {
+            self.ships.remove(ship_id);
+        }
+        self.known.remove(ship_id);
     }
 
     /// Where to draw the marker at wall-clock `now_epoch`: lerp
@@ -496,6 +589,58 @@ mod tests {
         r.poll(vec![]);
         assert!(r.ships()[0].stale); // 3rd miss: stale, marker kept
         assert_eq!(r.ships().len(), 1);
+    }
+
+    #[test]
+    fn backfilled_history_enters_track_without_moving_latest() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![fix("a", 53.5, 9.9, "2026-09-12T00:00:10Z")]);
+        let mut historical = fix("a", 53.4, 9.9, "2026-09-12T00:00:00Z");
+        historical.backfilled = true;
+        r.poll(vec![historical]);
+        let ships = r.ships();
+        assert_eq!(ships[0].latest.position.latitude, 53.5);
+        assert_eq!(ships[0].trail.len(), 2);
+    }
+
+    #[test]
+    fn game_poll_does_not_increment_wire_misses() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![fix("wire", 53.5, 9.9, "2026-09-12T00:00:00Z")]);
+        for _ in 0..4 {
+            r.poll_game(vec![]);
+        }
+        assert!(!r.ships()[0].stale, "independent Game stream must not stale Wire");
+    }
+
+    #[test]
+    fn duplicate_coordinates_do_not_duplicate_trail() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![fix("a", 53.5, 9.9, "2026-09-12T00:00:00Z")]);
+        r.poll(vec![fix("a", 53.5, 9.9, "2026-09-12T00:00:02Z")]);
+        let ships = r.ships();
+        assert_eq!(ships[0].trail.len(), 1);
+        assert_eq!(ships[0].latest.ts, "2026-09-12T00:00:02Z");
+    }
+
+    #[test]
+    fn game_authority_is_not_overwritten_by_wire_timestamp() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![fix("a", 53.5, 9.9, "2026-09-12T00:00:10Z")]);
+        let mut game = fix("a", -6.0, 106.0, "2026-09-12T00:00:00Z");
+        game.source = FixSource::Game;
+        r.poll_game(vec![game]);
+        let mut wire = fix("a", 54.0, 10.0, "2026-09-12T00:00:20Z");
+        wire.source = FixSource::Wire;
+        r.poll(vec![wire]);
+        assert_eq!(r.ships()[0].latest.source, FixSource::Game);
+    }
+
+    #[test]
+    fn invalid_timestamps_are_rejected() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![fix("bad", 53.5, 9.9, "not-a-time")]);
+        assert!(r.ships().is_empty());
     }
 
     #[test]
