@@ -282,6 +282,7 @@ jobs:
           touch dist/data/.keep
           mkdir -p dist/ARCONS.app/Contents/Frameworks
           cp target/release/${{ matrix.binary }} dist/ARCONS.app/Contents/MacOS/tfg
+          chmod 755 dist/ARCONS.app/Contents/MacOS/tfg
           cp packaging/macos/Info.plist dist/ARCONS.app/Contents/Info.plist
           resolve_dependency() {
             local source_binary="$1"
@@ -395,12 +396,14 @@ jobs:
           cp dist/THIRD-PARTY-NOTICES.html dist/ARCONS.app/Contents/Resources/
           cp licenses/maplibre-native-LICENSE.md dist/ARCONS.app/Contents/Resources/MAPLIBRE-NATIVE-LICENSE.md
           cp docs/runtime-paths.md dist/ARCONS.app/Contents/Resources/README.md
+          find dist/ARCONS.app/Contents/Frameworks -type f -exec chmod 755 {} +
           codesign --force --deep --sign - dist/ARCONS.app
           codesign --verify --deep --strict --verbose=2 dist/ARCONS.app
           (cd dist && zip -qry tfg-macos-${{ runner.arch }}.zip ARCONS.app data)
           rm -rf "$RUNNER_TEMP/tfg-bundle"
           mkdir -p "$RUNNER_TEMP/tfg-bundle"
           unzip -q dist/tfg-macos-${{ runner.arch }}.zip -d "$RUNNER_TEMP/tfg-bundle"
+          test -x "$RUNNER_TEMP/tfg-bundle/ARCONS.app/Contents/MacOS/tfg"
           (cd "$RUNNER_TEMP/tfg-bundle" && TFG_DATA_DIR="$RUNNER_TEMP/tfg-bundle/data" ./ARCONS.app/Contents/MacOS/tfg --check-runtime)
           rm -rf "$RUNNER_TEMP/tfg-bundle/data"
           (cd "$RUNNER_TEMP/tfg-bundle" && TFG_PORTABLE=1 ./ARCONS.app/Contents/MacOS/tfg --check-runtime)
