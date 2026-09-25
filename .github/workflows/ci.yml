@@ -265,45 +265,6 @@ jobs:
           cp docs/runtime-paths.md dist/package/README.md
           tar -C dist/package -czf dist/tfg-linux-x86_64.tar.gz .
 
-          package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          deb_dir="dist/deb/tfg"
-          rm -rf dist/deb
-          mkdir -p "$deb_dir/DEBIAN" "$deb_dir/usr/bin" "$deb_dir/usr/share/doc/tfg"
-          cp target/release/${{ matrix.binary }} "$deb_dir/usr/bin/tfg"
-          cp dist/THIRD-PARTY-NOTICES.html "$deb_dir/usr/share/doc/tfg/"
-          cp licenses/maplibre-native-LICENSE.md "$deb_dir/usr/share/doc/tfg/MAPLIBRE-NATIVE-LICENSE.md"
-          cp docs/runtime-paths.md "$deb_dir/usr/share/doc/tfg/README.md"
-          runtime_libs="$(ldd target/release/${{ matrix.binary }} | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i }')"
-          # Resolve symlinks because Ubuntu reports some loader paths as diversions.
-          package_for_library() {
-            local resolved_library
-            resolved_library="$(readlink -f "$1")"
-            LC_ALL=C dpkg-query -S "$resolved_library" 2>/dev/null |
-              awk '!/^(diversion|local diversion) / {
-                sub(/: .*/, "")
-                gsub(/, */, " | ")
-                print
-                exit
-              }' || true
-          }
-          depends="$(for library in $runtime_libs; do package_for_library "$library"; done | sort -u | paste -sd, -)"
-          depends="${depends:+$depends,}ca-certificates,libgl1,libvulkan1,libwayland-client0,libx11-6,libxkbcommon0"
-          cat > "$deb_dir/DEBIAN/control" <<EOF
-          Package: tfg
-          Version: $package_version
-          Section: utils
-          Priority: optional
-          Architecture: amd64
-          Maintainer: Crossnet
-          Description: ARCONS tactical command center
-           egui desktop application for live and simulation workflows.
-          Depends: $depends
-          EOF
-          dpkg-deb --build --root-owner-group "$deb_dir" "dist/tfg_${package_version}_amd64.deb"
-          rm -rf "$RUNNER_TEMP/tfg-deb"
-          dpkg-deb --extract "dist/tfg_${package_version}_amd64.deb" "$RUNNER_TEMP/tfg-deb"
-          (cd "$RUNNER_TEMP/tfg-deb" && TFG_DATA_DIR="$RUNNER_TEMP/tfg-deb/data" ./usr/bin/tfg --check-runtime)
-
           rm -rf "$RUNNER_TEMP/tfg-bundle"
           mkdir -p "$RUNNER_TEMP/tfg-bundle"
           tar -C "$RUNNER_TEMP/tfg-bundle" -xzf dist/tfg-linux-x86_64.tar.gz
@@ -480,9 +441,111 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tfg-${{ matrix.platform }}-${{ runner.arch }}
-          path: |
-            dist/tfg-*.tar.gz
-            dist/tfg_*.deb
+          path: dist/tfg-*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  debian_package:
+    name: Build Debian 12 package
+    needs: notices
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: debian:bookworm
+    steps:
+      - name: Install Debian build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            dpkg-dev \
+            git \
+            glslang-dev \
+            glslang-tools \
+            libcurl4-openssl-dev \
+            libdbus-1-dev \
+            libfontconfig-dev \
+            libicu-dev \
+            libjpeg62-turbo-dev \
+            libpng-dev \
+            libuv1-dev \
+            libwebp-dev \
+            ninja-build \
+            pkg-config \
+            zlib1g-dev
+
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download dependency notices
+        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317 # v8.0.1
+        with:
+          name: third-party-notices
+          path: dist
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build Debian package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --features maplibre_native/vulkan
+
+          package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          shlib_root="$RUNNER_TEMP/tfg-dpkg"
+          deb_dir="dist/debian-package/tfg"
+          rm -rf "$shlib_root" dist/debian-package
+          mkdir -p "$shlib_root/debian" "$deb_dir/DEBIAN" "$deb_dir/usr/bin" "$deb_dir/usr/share/doc/tfg"
+          cat > "$shlib_root/debian/control" <<EOF
+          Source: tfg
+          Section: utils
+          Priority: optional
+          Maintainer: Crossnet
+          Standards-Version: 4.6.2
+          EOF
+          depends="$(cd "$shlib_root" && dpkg-shlibdeps --ignore-missing-info -O "$GITHUB_WORKSPACE/target/release/tfg" | sed -n 's/^shlibs:Depends=//p')"
+          depends="${depends:+$depends,}ca-certificates,libgl1,libsharpyuv0,libvulkan1,libwayland-client0,libx11-6,libxkbcommon0"
+          cp target/release/tfg "$deb_dir/usr/bin/tfg"
+          cp dist/THIRD-PARTY-NOTICES.html "$deb_dir/usr/share/doc/tfg/"
+          cp licenses/maplibre-native-LICENSE.md "$deb_dir/usr/share/doc/tfg/MAPLIBRE-NATIVE-LICENSE.md"
+          cp docs/runtime-paths.md "$deb_dir/usr/share/doc/tfg/README.md"
+          installed_size="$(du -sk "$deb_dir/usr" | cut -f1)"
+          cat > "$deb_dir/DEBIAN/control" <<EOF
+          Package: tfg
+          Version: $package_version
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Crossnet
+          Installed-Size: $installed_size
+          Description: ARCONS tactical command center
+           egui desktop application for live and simulation workflows.
+          Depends: $depends
+          EOF
+          dpkg-deb --build --root-owner-group "$deb_dir" "dist/tfg_${package_version}_amd64.deb"
+          dpkg-deb --info "dist/tfg_${package_version}_amd64.deb"
+          rm -rf "$RUNNER_TEMP/tfg-deb"
+          dpkg-deb --extract "dist/tfg_${package_version}_amd64.deb" "$RUNNER_TEMP/tfg-deb"
+          (cd "$RUNNER_TEMP/tfg-deb" && TFG_DATA_DIR="$RUNNER_TEMP/tfg-deb/data" ./usr/bin/tfg --check-runtime)
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tfg-debian12-amd64
+          path: dist/tfg_*.deb
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -490,7 +553,7 @@ jobs:
   release:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [notices, build]
+    needs: [notices, build, debian_package]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
