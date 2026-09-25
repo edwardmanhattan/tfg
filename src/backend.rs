@@ -22,11 +22,11 @@ pub use error::BackendError;
 pub use auth::{MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
 pub use feed::{GameMsg, MinosRest, Snapshot};
 pub use live::{LIVE_BACKOFF_BASE_SECS, LIVE_BACKOFF_CAP_SECS, LiveCmd, LiveEvent, LiveWire};
-pub use master::{BackendUser, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePlacement, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, Review, ScenarioRole, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
+pub use master::{BackendUser, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, Review, ScenarioRole, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
 pub use replay::{FileReplay, now_ts};
 // Shared with live.rs and the tests below; not public API.
 pub(crate) use feed::FeedEvent;
-pub(crate) use feed::{parse_message_event, parse_order_event, parse_positions_event};
+pub(crate) use feed::{parse_message_event, parse_order_event, parse_positions_event, parse_positions_event_for_game};
 
 use serde::{Deserialize, Serialize};
 

@@ -987,6 +987,18 @@ impl MinosMaster {
                 })
             })
             .collect::<Result<Vec<_>, BackendError>>()?;
+        if positions.iter().any(|position| {
+            !position.latitude.is_finite()
+                || !(-90.0..=90.0).contains(&position.latitude)
+                || !position.longitude.is_finite()
+                || !(-180.0..=180.0).contains(&position.longitude)
+                || !position.heading.is_finite()
+                || !(0.0..360.0).contains(&position.heading)
+                || !position.speed.is_finite()
+                || position.speed < 0.0
+        }) {
+            return Err(malformed("position values"));
+        }
         Ok(PositionList {
             assumed_time,
             positions,
@@ -1940,6 +1952,69 @@ pub struct GameHullPos {
 pub struct PositionList {
     pub assumed_time: String,
     pub positions: Vec<GameHullPos>,
+}
+
+/// A game-position sample normalized across the REST plot and the
+/// WebSocket publication. The REST contract always carries heading and
+/// speed; the socket contract may omit either one, so both remain
+/// optional here rather than being invented as zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GamePositionUpdate {
+    pub game_id: i64,
+    pub assumed_time: String,
+    pub positions: Vec<GamePositionFix>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GamePositionFix {
+    pub unit_id: i64,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub heading_deg: Option<f64>,
+    pub speed_kn: Option<f64>,
+    pub assumed_time: String,
+}
+
+impl GamePositionUpdate {
+    pub fn from_plot(game_id: i64, plot: PositionList) -> Self {
+        let PositionList { assumed_time, positions: rows } = plot;
+        let positions = rows
+            .into_iter()
+            .map(|p| GamePositionFix {
+                unit_id: p.unit_id,
+                latitude: p.latitude,
+                longitude: p.longitude,
+                heading_deg: Some(p.heading),
+                speed_kn: Some(p.speed),
+                assumed_time: p.assumed_time,
+            })
+            .collect();
+        Self { game_id, assumed_time, positions }
+    }
+
+    pub fn from_fix(game_id: i64, fix: GameFix) -> Self {
+        Self {
+            game_id,
+            assumed_time: fix.assumed_time.clone(),
+            positions: vec![GamePositionFix {
+                unit_id: fix.unit_id,
+                latitude: fix.latitude,
+                longitude: fix.longitude,
+                heading_deg: Some(fix.heading),
+                speed_kn: Some(fix.speed),
+                assumed_time: fix.assumed_time,
+            }],
+        }
+    }
+}
+
+/// The game identity is part of a position publication, not an
+/// incidental envelope field. Keeping it here prevents a late result
+/// from an old exercise entering the current Registry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameOrderEvent {
+    pub game_id: i64,
+    pub fix: GameFix,
 }
 
 /// One entry in an exercise's rate history (H2): the factor in force

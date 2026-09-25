@@ -9,7 +9,7 @@
 
 use crate::geo::track::Fix;
 
-use super::{BackendError, FeedEvent, GameFix, GameMsg, MinosRest, PollSource, PositionList, parse_message_event, parse_order_event, parse_positions_event};
+use super::{BackendError, FeedEvent, GameMsg, GameOrderEvent, GamePositionUpdate, MinosRest, PollSource, parse_message_event, parse_order_event, parse_positions_event_for_game};
 
 /// Backoff for socket retries (transport ticket): base 1 s, cap 30 s,
 /// full jitter. Tunable here, applied in the actor loop.
@@ -114,10 +114,13 @@ pub enum LiveEvent {
     Message(GameMsg),
     /// Best-effort committed-order publication. The HTTP 201 remains
     /// authoritative; this can only reconcile an existing Unknown result.
-    OrderIssued(GameFix),
-    /// One authoritative MinOS game-position snapshot. This is the
-    /// per-game movement stream used for smooth presentation.
-    GamePositions(PositionList),
+    OrderIssued(GameOrderEvent),
+    /// One authoritative MinOS game-position publication. The game id
+    /// travels with it so a late event cannot enter another exercise.
+    GamePositions(GamePositionUpdate),
+    /// The reconnect picture no longer names these operational vessels.
+    /// The UI removes them instead of leaving a permanently stale marker.
+    Vanished(Vec<String>),
     SocketError(String),
 }
 
@@ -152,10 +155,16 @@ fn watch_subscription(
         let event_tx = event_tx.clone();
         let channel = channel.to_string();
         sub.on_publication(move |p: tokio_centrifuge::protocol::Publication| {
-            if let Some(plot) = parse_positions_event(&p.data) {
+            let position_game_id = channel
+                .strip_prefix("game:")
+                .and_then(|rest| rest.strip_suffix(":positions"))
+                .and_then(|id| id.parse::<i64>().ok());
+            if let Some(game_id) = position_game_id
+                && let Some(plot) = parse_positions_event_for_game(&p.data, game_id)
+            {
                 let _ = event_tx.send(LiveEvent::GamePositions(plot));
-            } else if let Some(fix) = parse_order_event(&p.data) {
-                let _ = event_tx.send(LiveEvent::OrderIssued(fix));
+            } else if let Some(event) = parse_order_event(&p.data) {
+                let _ = event_tx.send(LiveEvent::OrderIssued(event));
             } else {
                 match parse_message_event(&p.data) {
                     Some(msg) => {
@@ -251,24 +260,33 @@ impl LiveShared {
     /// ship with a queued fix newer than the picture is live, not
     /// vanished, and the drain puts it into `known` ahead of the
     /// removal pass.
-    fn resync_snapshot(&self, picture: Vec<Fix>) {
+    fn resync_snapshot(&self, picture: Vec<Fix>) -> Vec<String> {
         let queued = self.drain_in_order();
-        self.merge_fixes(queued, "socket");
-        let ids: std::collections::HashSet<String> =
+        let queued_accepted = self.merge_fixes(queued, "socket");
+        let mut ids: std::collections::HashSet<String> =
             picture.iter().map(|f| f.ship_id.clone()).collect();
+        // A queued socket fix is proof of life. It must be included in
+        // the survivor set, otherwise the removal pass immediately
+        // deletes the very ship the drain just rescued.
+        ids.extend(queued_accepted.iter().map(|f| f.ship_id.clone()));
         self.merge_fixes(picture, "snapshot");
+        let mut gone = Vec::new();
         if let Ok(mut known) = self.known.lock() {
-            let gone: Vec<String> =
-                known.keys().filter(|id| !ids.contains(*id)).cloned().collect();
-            for id in gone {
+            gone = known
+                .keys()
+                .filter(|id| !ids.contains(*id))
+                .cloned()
+                .collect();
+            for id in &gone {
                 eprintln!("[LIVE-dbg] resync: unit={id} vanished from the picture");
-                known.remove(&id);
+                known.remove(id);
             }
         }
         // The new picture seeds the Registry once (H6): ships it names
         // get markers on the next poll; silence after that accrues
         // misses normally.
         self.seed.store(true, std::sync::atomic::Ordering::SeqCst);
+        gone
     }
 
     /// Consume a pending one-shot picture emission, if armed.
@@ -489,7 +507,10 @@ fn run_actor(
                         // Queued socket fixes drain first inside, so a
                         // ship live on the socket is never reaped by an
                         // older picture.
-                        shared.resync_snapshot(snap.fixes);
+                        let gone = shared.resync_snapshot(snap.fixes);
+                        if !gone.is_empty() {
+                            let _ = event_tx.send(LiveEvent::Vanished(gone));
+                        }
                     });
                 }
             });

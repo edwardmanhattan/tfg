@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::geo::track::{Fix, FixSource};
 
-use super::{BackendError, GameFix, PositionList, unwrap_envelope};
+use super::{BackendError, GameFix, GameOrderEvent, GamePositionFix, GamePositionUpdate, PositionList, unwrap_envelope};
 
 /// Minos standing picture (REST mapping ticket): the initial picture the
 /// socket then keeps current. Vessels that never reported carry labels
@@ -197,39 +197,87 @@ pub(crate) struct FeedEvent {
     pub(crate) backfilled: bool,
 }
 
-/// Parse a `game:<id>:positions` snapshot. The publication payload is
-/// the PositionList DTO directly, not a `data` envelope.
-pub(crate) fn parse_positions_event(bytes: &[u8]) -> Option<PositionList> {
+/// Parse a `game:<id>:positions` publication. The current contract is
+/// the flat §5 feed event, but the client also accepts the earlier
+/// PositionList-shaped publication so a server rollout can be drained
+/// without a flag day. The channel supplies the game id for the flat
+/// shape, which intentionally has no envelope of its own.
+pub(crate) fn parse_positions_event(bytes: &[u8]) -> Option<GamePositionUpdate> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    value["id_game"].as_i64()?;
-    value["final"].as_bool()?;
-    let plot: PositionList = serde_json::from_value(value).ok()?;
-    if plot.assumed_time.is_empty()
-        || plot.positions.iter().any(|position| {
-            position.assumed_time.is_empty()
-                || !position.heading.is_finite()
-                || !(0.0..360.0).contains(&position.heading)
-                || !position.speed.is_finite()
-                || position.speed < 0.0
-                || !position.latitude.is_finite()
-                || !(-90.0..=90.0).contains(&position.latitude)
-                || !position.longitude.is_finite()
-                || !(-180.0..=180.0).contains(&position.longitude)
-        })
+    let game_id = value["id_game"].as_i64()?;
+    parse_positions_event_for_game(bytes, game_id)
+}
+
+pub(crate) fn parse_positions_event_for_game(
+    bytes: &[u8],
+    game_id: i64,
+) -> Option<GamePositionUpdate> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if let Some(event_game_id) = value["id_game"].as_i64()
+        && event_game_id != game_id
     {
         return None;
     }
-    Some(plot)
+
+    // The original client-side shape: a direct REST PositionList with
+    // marker fields. Keep accepting it while the backend settles the
+    // publication contract.
+    if value["final"].as_bool().is_some() && value["positions"].is_array() {
+        let plot: PositionList = serde_json::from_value(value).ok()?;
+        if plot.assumed_time.is_empty()
+            || plot.positions.iter().any(|position| {
+                position.assumed_time.is_empty()
+                    || !position.heading.is_finite()
+                    || !(0.0..360.0).contains(&position.heading)
+                    || !position.speed.is_finite()
+                    || position.speed < 0.0
+                    || !position.latitude.is_finite()
+                    || !(-90.0..=90.0).contains(&position.latitude)
+                    || !position.longitude.is_finite()
+                    || !(-180.0..=180.0).contains(&position.longitude)
+            })
+        {
+            return None;
+        }
+        return Some(GamePositionUpdate::from_plot(game_id, plot));
+    }
+
+    // The documented §5 shape: one game position publication per unit.
+    let event: FeedEvent = serde_json::from_value(value).ok()?;
+    if event.recorded_at.is_empty()
+        || event.latitude.is_nan()
+        || !(-90.0..=90.0).contains(&event.latitude)
+        || event.longitude.is_nan()
+        || !(-180.0..=180.0).contains(&event.longitude)
+        || event.course_deg.is_some_and(|heading| !heading.is_finite() || !(0.0..360.0).contains(&heading))
+        || event.speed_kn.is_some_and(|speed| !speed.is_finite() || speed < 0.0)
+    {
+        return None;
+    }
+    let unit_id = i64::try_from(event.id_unit).ok()?;
+    Some(GamePositionUpdate {
+        game_id,
+        assumed_time: event.recorded_at.clone(),
+        positions: vec![GamePositionFix {
+            unit_id,
+            latitude: event.latitude,
+            longitude: event.longitude,
+            heading_deg: event.course_deg.map(f64::from),
+            speed_kn: event.speed_kn.map(f64::from),
+            assumed_time: event.recorded_at,
+        }],
+    })
 }
 
 /// Parse the best-effort order publication. Unknown event types and
 /// incomplete GameFix records return `None`; neither is allowed to
 /// reconcile an Unknown command result.
-pub(crate) fn parse_order_event(bytes: &[u8]) -> Option<GameFix> {
+pub(crate) fn parse_order_event(bytes: &[u8]) -> Option<GameOrderEvent> {
     let envelope: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     if envelope["type"].as_str() != Some("game.order_issued") {
         return None;
     }
+    let game_id = envelope["id_game"].as_i64()?;
     let fix: GameFix = serde_json::from_value(envelope["data"].clone()).ok()?;
     if fix.assumed_time.is_empty()
         || !fix.heading.is_finite()
@@ -246,7 +294,7 @@ pub(crate) fn parse_order_event(bytes: &[u8]) -> Option<GameFix> {
     {
         return None;
     }
-    Some(fix)
+    Some(GameOrderEvent { game_id, fix })
 }
 
 impl FeedEvent {
@@ -286,6 +334,30 @@ impl FeedEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flat_game_position_event_uses_channel_game_id() {
+        let update = parse_positions_event_for_game(
+            br#"{"id_unit":13,"name":"KRI Ahmad Yani","latitude":-6.08,"longitude":106.91,"course_deg":87.5,"speed_kn":14.2,"recorded_at":"2026-09-15T10:00:00Z","received_at":"2026-09-15T10:00:01Z"}"#,
+            7,
+        )
+        .expect("flat game position parses");
+        assert_eq!(update.game_id, 7);
+        assert_eq!(update.positions.len(), 1);
+        assert_eq!(update.positions[0].unit_id, 13);
+        assert_eq!(update.positions[0].heading_deg, Some(87.5));
+        assert_eq!(update.positions[0].speed_kn, Some(14.2));
+    }
+
+    #[test]
+    fn order_event_keeps_game_identity() {
+        let event = parse_order_event(
+            br#"{"type":"game.order_issued","id_game":9,"data":{"id_unit":13,"assumed_time":"2026-09-15T10:00:00Z","latitude":-6.08,"longitude":106.91,"heading_deg":45.0,"speed_kn":12.0,"requested_speed_kn":20.0,"clamped":true}}"#,
+        )
+        .expect("order event parses");
+        assert_eq!(event.game_id, 9);
+        assert_eq!(event.fix.unit_id, 13);
+    }
 
     #[test]
     fn message_events_parse_broadcast_and_addressed() {

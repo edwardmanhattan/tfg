@@ -134,6 +134,10 @@ pub enum SimCommand {
     /// Session clock pace (session flow): fixed-ratio mapping real to
     /// game seconds (ADR-0004). The organizer sets it at session start.
     SetClockRatio { ratio: f64 },
+    /// Reset the wall-time accumulator after the engine was disarmed.
+    /// The next armed tick starts a fresh interval; time spent in
+    /// Presentation must not become a catch-up movement.
+    ResetTick,
     /// Scenario epoch seed (participant-correct map): the Minos
     /// assumed_start, so the display readout anchors on scenario time
     /// instead of the wall-clock first tick. Idempotent — re-seeding
@@ -633,6 +637,9 @@ impl SimSource {
                 }
                 SimCommand::SetClockRatio { ratio } => {
                     self.clock.set_ratio(ratio);
+                }
+                SimCommand::ResetTick => {
+                    self.last_tick = None;
                 }
                 SimCommand::SeedClockStart { ts } => {
                     self.clock.begin(&ts);
