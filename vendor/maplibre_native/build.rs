@@ -544,6 +544,21 @@ fn configure_local_build(
     }
 }
 
+fn link_windows_vcpkg_library(lib_dir: &Path, candidates: &[&str]) {
+    let library = candidates
+        .iter()
+        .copied()
+        .find(|candidate| lib_dir.join(format!("{candidate}.lib")).is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "MapLibre Windows dependency is missing from {}; expected one of: {}",
+                lib_dir.display(),
+                candidates.join(", ")
+            )
+        });
+    println!("cargo:rustc-link-lib={library}");
+}
+
 fn build_local(
     respository_dir: &Path,
     name: &str,
@@ -752,6 +767,32 @@ fn build_mln() {
         }
     };
 
+    // CMake finds vcpkg's Windows libraries for the native build, but those
+    // search paths are not inherited by rustc when it links the Rust binary.
+    // Export the release vcpkg directory explicitly before emitting the
+    // dependency link directives below.
+    let windows_vcpkg_lib_dir = if target_os == "windows" {
+        let lib_dir = info
+            .cpp_root
+            .join("platform")
+            .join("windows")
+            .join("vendor")
+            .join("vcpkg")
+            .join("installed")
+            .join("x64-windows")
+            .join("lib");
+        assert!(
+            lib_dir.is_dir(),
+            "MapLibre Windows vcpkg library directory is missing: {}",
+            lib_dir.display()
+        );
+        println!("cargo:rerun-if-changed={}", lib_dir.display());
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        Some(lib_dir)
+    } else {
+        None
+    };
+
     let backend = GraphicsApi::from_selected_features();
     let source_core_uses_ndebug = match env::var("OPT_LEVEL").as_deref() {
         Ok("0") => false,
@@ -765,6 +806,13 @@ fn build_mln() {
         precompiled || source_core_uses_ndebug,
     );
     let is_apple = target_os == "macos" || target_os == "ios";
+    let link_dependency = |name: &str, windows_candidates: &[&str]| {
+        if let Some(lib_dir) = &windows_vcpkg_lib_dir {
+            link_windows_vcpkg_library(lib_dir, windows_candidates);
+        } else {
+            println!("cargo:rustc-link-lib={name}");
+        }
+    };
     if !amalgam_lib {
         // The dependent libs are not bundled in the core lib, so we have to link manually.
         println!("cargo:rustc-link-lib=mbgl-harfbuzz");
@@ -782,9 +830,9 @@ fn build_mln() {
             println!("cargo:rustc-link-lib=mbgl-vendor-nunicode");
             println!("cargo:rustc-link-lib=mbgl-vendor-sqlite");
             // println!("cargo:rustc-link-lib=utf8proc"); // sudo dnf install utf8proc-devel
-            println!("cargo:rustc-link-lib=icuuc"); //sudo dnf install libicu-devel
-            println!("cargo:rustc-link-lib=icudata"); //sudo dnf install libicu-devel
-            println!("cargo:rustc-link-lib=icui18n"); //sudo dnf install libicu-devel
+            link_dependency("icuuc", &["icuuc"]); // sudo dnf install libicu-devel
+            link_dependency("icudata", &["icudt", "icudata"]); // sudo dnf install libicu-devel
+            link_dependency("icui18n", &["icuin", "icui18n"]); // sudo dnf install libicu-devel
         }
         // Vulkan translates GLSL to SPIR-V at runtime via glslang; OpenGL/Metal don't.
         if backend == GraphicsApi::Vulkan {
@@ -796,15 +844,15 @@ fn build_mln() {
             println!("cargo:rustc-link-lib=SPIRV-Tools-opt"); //sudo dnf install  spirv-tools-devel // Required by glslang spirv-tools-devel
             println!("cargo:rustc-link-lib=SPIRV-Tools"); //sudo dnf install  spirv-tools-devel // Required by glslang spirv-tools-devel
         }
-        println!("cargo:rustc-link-lib=png"); // sudo dnf install libpng-devel
-        println!("cargo:rustc-link-lib=jpeg"); // sudo dnf install libjpeg-turbo-devel
-        println!("cargo:rustc-link-lib=webp"); // sudo dnf install libwebp-devel
+        link_dependency("png", &["libpng16", "png"]); // sudo dnf install libpng-devel
+        link_dependency("jpeg", &["jpeg"]); // sudo dnf install libjpeg-turbo-devel
+        link_dependency("webp", &["webp", "libwebp"]); // sudo dnf install libwebp-devel
     }
     if !is_apple {
-        println!("cargo:rustc-link-lib=uv"); // sudo dnf install libuv-devel
+        link_dependency("uv", &["uv", "libuv"]); // sudo dnf install libuv-devel
     }
-    println!("cargo:rustc-link-lib=curl");
-    println!("cargo:rustc-link-lib=z");
+    link_dependency("curl", &["libcurl", "curl"]);
+    link_dependency("z", &["zlib", "z"]);
 
     if is_apple {
         println!("cargo:rustc-link-lib=framework=Foundation");

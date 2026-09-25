@@ -258,6 +258,27 @@ jobs:
             throw "MapLibre vendor setup is missing required headers: $missing"
           }
 
+          $libRoot = "${{ github.workspace }}\.ci\maplibre-native\platform\windows\vendor\vcpkg\installed\x64-windows\lib"
+          $requiredLibraryGroups = @(
+            @("icuuc.lib"),
+            @("icudt.lib", "icudata.lib"),
+            @("icuin.lib", "icui18n.lib"),
+            @("libpng16.lib", "png.lib"),
+            @("jpeg.lib"),
+            @("webp.lib", "libwebp.lib"),
+            @("uv.lib", "libuv.lib"),
+            @("libcurl.lib", "curl.lib"),
+            @("zlib.lib", "z.lib")
+          )
+          $missingLibraryGroups = $requiredLibraryGroups | Where-Object {
+            $libraryGroup = $_
+            -not ($libraryGroup | Where-Object { Test-Path (Join-Path $libRoot $_) })
+          }
+          if ($missingLibraryGroups) {
+            $missing = $missingLibraryGroups | ForEach-Object { $_ -join " or " }
+            throw "MapLibre vendor setup is missing required libraries: $($missing -join ", ")"
+          }
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
