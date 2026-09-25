@@ -207,10 +207,10 @@ jobs:
         if: runner.os == 'Windows'
         uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca # v6.1.0
         with:
-          path: .ci/maplibre-native/platform/windows/vendor
-          key: windows-maplibre-${{ env.MAPLIBRE_NATIVE_REF }}-${{ hashFiles('Cargo.lock') }}
+          path: .ci/maplibre-native/platform/windows/vendor/vcpkg/installed
+          key: windows-maplibre-installed-${{ env.MAPLIBRE_NATIVE_REF }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            windows-maplibre-${{ env.MAPLIBRE_NATIVE_REF }}-
+            windows-maplibre-installed-${{ env.MAPLIBRE_NATIVE_REF }}-
 
       - name: Install Windows MapLibre dependencies
         if: runner.os == 'Windows'

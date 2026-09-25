@@ -388,6 +388,20 @@ pub fn projected_unit_geometry(
 /// metadata overrides this.
 pub const IMAGE_FORWARD_HEADING_DEG: f32 = 90.0;
 
+/// A deliberately round geographic interval for the map's quiet reference
+/// grid. It changes at zoom thresholds so the operator gets useful spacing
+/// without a dense thicket of lines or a grid that disappears when zoomed in.
+pub fn grid_spacing_deg(zoom: f64) -> f64 {
+    match zoom {
+        z if z < 8.0 => 1.0,
+        z if z < 10.0 => 0.5,
+        z if z < 12.0 => 0.1,
+        z if z < 14.0 => 0.05,
+        z if z < 16.0 => 0.02,
+        _ => 0.01,
+    }
+}
+
 /// The compass heading a unit image is drawn at, from the unit's own
 /// course and the image's forward axis.
 ///

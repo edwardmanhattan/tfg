@@ -30,8 +30,9 @@ use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
 use tfg::paths::AppPaths;
 use tfg::map_render::{
-    ProjectedUnitGeometry, UnitLod, anchor_center, project_mercator, projected_unit_geometry,
-    rotated_unit_quad_with_forward_heading, select_unit_lod, unproject_mercator,
+    ProjectedUnitGeometry, UnitLod, anchor_center, grid_spacing_deg, project_mercator,
+    projected_unit_geometry, rotated_unit_quad_with_forward_heading, select_unit_lod,
+    unproject_mercator,
 };
 use tfg::land::Land;
 use tfg::sim::{
@@ -70,7 +71,9 @@ const INSPECTOR_IMAGE_MIN_WIDTH: f32 = 160.0;
 const INSPECTOR_IMAGE_MAX_WIDTH: f32 = 640.0;
 const INSPECTOR_IMAGE_MAX_HEIGHT: f32 = 180.0;
 const MILLER_COL_WIDTH: f32 = 150.0;
-const MILLER_COL_HEIGHT: f32 = 300.0;
+const MILLER_COL_MIN_HEIGHT: f32 = 180.0;
+const MILLER_COL_MAX_HEIGHT: f32 = 420.0;
+const MILLER_COL_HEIGHT: f32 = 220.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Session stub pace (session flow): 7 real hours play 7 game days.
 /// Full windows UI lands with the organizer flow; the ratio is the load-
@@ -393,6 +396,34 @@ fn status_line(ui: &mut egui::Ui, msg: &str) {
 /// Warning line: names the problem; the adjacent control names the recovery.
 fn warn_line(ui: &mut egui::Ui, msg: String) {
     ui.label(egui::RichText::new(format!("⚠ {msg}")).color(egui::Color32::YELLOW));
+}
+
+/// Human-readable freshness for the context strip. A bare `162s` reads like
+/// a sensor dump; minutes and an explicit “never” are useful at a glance.
+fn human_age(at: Option<Instant>) -> String {
+    let Some(at) = at else { return "never".to_string() };
+    let seconds = at.elapsed().as_secs();
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 3_600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3_600)
+    } else {
+        format!("{}d ago", seconds / 86_400)
+    }
+}
+
+/// Strip fractional seconds and the date from an RFC3339 timestamp. The full
+/// wire value remains available in the log; the operator only needs “now”.
+fn short_timestamp(raw: Option<&str>) -> String {
+    let Some(raw) = raw else { return "—".to_string() };
+    if let Some((_, time)) = raw.split_once(' ') {
+        return time.to_string();
+    }
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|value| value.format("%H:%M:%SZ").to_string())
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 /// Onboarding backdrop (ticket #77): one vertical wash — console
@@ -1602,6 +1633,7 @@ struct ShipApp {
     hidden: HashSet<String>,
     following: Option<String>,
     show_trail: bool,
+    show_grid: bool,
     /// The UI state machine (state-machine grill, #26): the only flow
     /// state panels may read. Replaces session_live / placing_unit.
     mode: UiMode,
@@ -1710,6 +1742,7 @@ struct ShipApp {
     drill_category: Option<i64>,
     drill_type: Option<i64>,
     drill_class: Option<i64>,
+    miller_height: f32,
     /// Fleet render cache (blocking ticket): register rows plus
     /// branch mapping + names, reloaded on sync and first show —
     /// never queried per frame. SQLite leaves the render path.
@@ -6058,7 +6091,7 @@ impl ShipApp {
                             egui::ScrollArea::vertical()
                                 .id_salt(("drill", *title))
                                 .auto_shrink([false, false])
-                                .max_height(MILLER_COL_HEIGHT)
+                                .max_height(self.miller_height)
                                 .show(ui, |ui| {
                                     ui.set_min_width(MILLER_COL_WIDTH - 16.0);
                                     if !active {
@@ -6098,6 +6131,16 @@ impl ShipApp {
                     }
                 });
             });
+        ui.horizontal(|ui| {
+            ui.weak("Column height");
+            ui.add(
+                egui::Slider::new(
+                    &mut self.miller_height,
+                    MILLER_COL_MIN_HEIGHT..=MILLER_COL_MAX_HEIGHT,
+                )
+                .show_value(true),
+            );
+        });
 
         let mut rows = Vec::new();
         if let (Some(conn), Some(class_id)) = (self.store.as_ref(), self.drill_class) {
@@ -6133,7 +6176,7 @@ impl ShipApp {
         let mut assigning = Vec::new();
         egui::ScrollArea::vertical()
             .id_salt("picker-rows")
-            .max_height(300.0)
+            .max_height(240.0)
             .show(ui, |ui| {
                 for row in rows {
                     let assigned = self.users_gunits.iter().any(|unit| {
@@ -6320,45 +6363,61 @@ impl ShipApp {
             let mut removals: Vec<(i64, String)> = Vec::new();
             let mut lifts: Vec<(i64, String)> = Vec::new();
             for gu in &self.users_gunits {
-                ui.horizontal(|ui| {
-                    let mut label = gu.unit_name.clone();
-                    if !gu.hull_number.is_empty() {
-                        label += &format!(" ({})", gu.hull_number);
-                    }
-                    ui.label(label);
-                    // C2: Minos placement state per piece — the gate's
-                    // unplaced count is the server's, this only renders it.
-                    let placed = self
-                        .users_placements
-                        .iter()
-                        .any(|p| p.unit_id == gu.unit_id);
-                    if placed {
-                        ui.label(egui::RichText::new("placed ✓").weak().small());
-                        if ui.small_button("lift").clicked() {
-                            lifts.push((gu.unit_id, gu.unit_name.clone()));
-                        }
-                    } else {
-                        ui.label(egui::RichText::new("unplaced").weak().small());
-                    }
-                    let mut tmp = gu.commander_id;
-                    egui::ComboBox::from_id_salt(("piece-cmd", gu.unit_id))
-                        .selected_text(if gu.commander_name.is_empty() {
-                            "—".to_string()
-                        } else {
-                            gu.commander_name.clone()
-                        })
-                        .show_ui(ui, |ui| {
-                            for (uid, name) in &crew {
-                                if gu.commander_id != Some(*uid)
-                                    && ui.selectable_value(&mut tmp, Some(*uid), name).clicked()
-                                {
-                                    commanding.push((gu.unit_id, *uid));
-                                }
+                let placed = self
+                    .users_placements
+                    .iter()
+                    .any(|p| p.unit_id == gu.unit_id);
+                let unit_id = gu.unit_id.to_string();
+                ui.push_id(gu.unit_id, |ui| {
+                    ui.horizontal(|ui| {
+                        self.unit_thumbnail_ui(ui, &unit_id, 28.0);
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(gu.unit_name.as_str()).strong());
+                            if !gu.hull_number.is_empty() {
+                                ui.weak(format!("Hull {}", gu.hull_number));
                             }
                         });
-                    if ui.small_button("remove").clicked() {
-                        removals.push((gu.unit_id, gu.unit_name.clone()));
-                    }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("remove").clicked() {
+                                    removals.push((gu.unit_id, gu.unit_name.clone()));
+                                }
+                                if placed && ui.small_button("lift").clicked() {
+                                    lifts.push((gu.unit_id, gu.unit_name.clone()));
+                                }
+                            },
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        let state = if placed {
+                            egui::RichText::new("Placed")
+                                .color(egui::Color32::from_rgb(74, 222, 128))
+                        } else {
+                            egui::RichText::new("Unplaced").color(egui::Color32::GRAY)
+                        };
+                        ui.label(state.small());
+                        ui.weak("Commander");
+                        let mut tmp = gu.commander_id;
+                        egui::ComboBox::from_id_salt("commander")
+                            .selected_text(if gu.commander_name.is_empty() {
+                                "Unassigned".to_string()
+                            } else {
+                                gu.commander_name.clone()
+                            })
+                            .show_ui(ui, |ui| {
+                                for (uid, name) in &crew {
+                                    if gu.commander_id != Some(*uid)
+                                        && ui
+                                            .selectable_value(&mut tmp, Some(*uid), name)
+                                            .clicked()
+                                    {
+                                        commanding.push((gu.unit_id, *uid));
+                                    }
+                                }
+                            });
+                    });
+                    ui.separator();
                 });
             }
             for (unit, cmdr) in commanding {
@@ -6580,7 +6639,7 @@ impl ShipApp {
     fn setup_panel(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("exercise-setup")
             .resizable(true)
-            .default_size(340.0)
+            .default_size(760.0)
             .show(ui, |ui| {
                 ui.heading("Setup");
                 ui.horizontal(|ui| {
@@ -7913,14 +7972,24 @@ impl ShipApp {
     /// as-is (authorable backend-side); capability derives from the
     /// seat row and commanded hulls, never from name comparison.
     fn context_strip(&self) -> String {
-        let source = if self.auth_token.is_some() { "exercise" } else { "local" };
+        let source = if self.auth_token.is_some() {
+            "Connected exercise"
+        } else {
+            "Local sandbox"
+        };
         let session = self
             .users_game
             .as_ref()
             .map(|(_, n)| n.clone())
-            .unwrap_or_else(|| "—".to_string());
-        let phase = self.users_game_state.as_deref().unwrap_or("—");
-        let who = self.auth_user.as_deref().unwrap_or("—");
+            .unwrap_or_else(|| "No session selected".to_string());
+        let phase = match self.users_game_state.as_deref() {
+            Some("planning") => "Planning",
+            Some("preparation") => "Preparation",
+            Some("execution") => "Live",
+            Some("closure") => "Closed",
+            _ => "Not connected",
+        };
+        let who = self.auth_user.as_deref().unwrap_or("Not signed in");
         let seat = match self.own_roster_row() {
             None => "no seat".to_string(),
             Some(p) if p.judge => format!("{} · judge-side", p.role_name),
@@ -7933,14 +8002,14 @@ impl ShipApp {
                 }
             }
         };
-        let age = |t: Option<Instant>| match t {
-            Some(t) => format!("{}s", t.elapsed().as_secs()),
-            None => "—".to_string(),
+        let plot = if self.last_plot_ok.is_some() {
+            human_age(self.last_plot_ok)
+        } else {
+            "waiting".to_string()
         };
         format!(
-            "{source} · Session: {session} · {phase} · {who} ({seat}) · sync {} · plot {} · next: {}",
-            age(self.last_game_sync),
-            age(self.last_plot_ok),
+            "{source} · Session: {session} · Phase: {phase} · Signed in as {who} ({seat}) · Last sync: {} · Plot: {plot} · Next: {}",
+            human_age(self.last_game_sync),
             self.next_action_hint(),
         )
     }
@@ -7949,17 +8018,17 @@ impl ShipApp {
     /// orders → assessment. Hints only; gates still refuse loudly.
     fn next_action_hint(&self) -> &str {
         if self.auth_token.is_none() {
-            return "sign in";
+            return "Sign in to begin";
         }
         if self.users_game.is_none() {
-            return "hold a session — room key or picker";
+            return "Choose or join a session";
         }
         match self.users_game_state.as_deref() {
-            Some("planning") => "seat, assign, place",
-            Some("preparation") => "readiness → execution",
-            Some("execution") => "orders via Minos",
-            Some("closure") => "assessment",
-            _ => "sync the game",
+            Some("planning") => "Assign a commander, then place units",
+            Some("preparation") => "Declare readiness, then start the exercise",
+            Some("execution") => "Issue helm orders",
+            Some("closure") => "Review the assessment",
+            _ => "Refresh the session status",
         }
     }
 
@@ -8760,6 +8829,55 @@ impl ShipApp {
             "unsur"
         } else {
             "unit"
+        }
+    }
+
+    /// Draw a quiet geographic reference grid in map screen space. The map
+    /// engine remains tile-only; this is an overlay helper, not a style layer.
+    fn paint_map_grid(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let spacing = grid_spacing_deg(self.zoom);
+        let (mw, mh) = self.map_dims();
+        let west = unproject_mercator(0.0, 0.0, self.center, self.zoom, mw, mh).1;
+        let east = unproject_mercator(mw, 0.0, self.center, self.zoom, mw, mh).1;
+        let north = unproject_mercator(0.0, 0.0, self.center, self.zoom, mw, mh).0;
+        let south = unproject_mercator(0.0, mh, self.center, self.zoom, mw, mh).0;
+
+        let minor = egui::Color32::from_rgba_unmultiplied(100, 116, 139, 90);
+        let major = egui::Color32::from_rgba_unmultiplied(100, 116, 139, 150);
+        let first_lon = ((west / spacing).floor() as i64 - 1) as f64 * spacing;
+        let last_lon = (((east / spacing).ceil() as i64 + 1) as f64) * spacing;
+        let mut lon_index = (first_lon / spacing).round() as i64;
+        let mut lon = first_lon;
+        while lon <= last_lon {
+            let (px, _) = project_mercator(0.0, lon, self.center, self.zoom, mw, mh);
+            let color = if lon_index.rem_euclid(5) == 0 { major } else { minor };
+            painter.line_segment(
+                [
+                    rect.left_top() + egui::vec2(px as f32, 0.0),
+                    rect.left_top() + egui::vec2(px as f32, mh as f32),
+                ],
+                egui::Stroke::new(1.0, color),
+            );
+            lon += spacing;
+            lon_index += 1;
+        }
+
+        let first_lat = ((south / spacing).floor() as i64 - 1) as f64 * spacing;
+        let last_lat = (((north / spacing).ceil() as i64 + 1) as f64) * spacing;
+        let mut lat_index = (first_lat / spacing).round() as i64;
+        let mut lat = first_lat;
+        while lat <= last_lat {
+            let (_, py) = project_mercator(lat, 0.0, self.center, self.zoom, mw, mh);
+            let color = if lat_index.rem_euclid(5) == 0 { major } else { minor };
+            painter.line_segment(
+                [
+                    rect.left_top() + egui::vec2(0.0, py as f32),
+                    rect.left_top() + egui::vec2(mw as f32, py as f32),
+                ],
+                egui::Stroke::new(1.0, color),
+            );
+            lat += spacing;
+            lat_index += 1;
         }
     }
 
@@ -10663,7 +10781,9 @@ impl eframe::App for ShipApp {
                 if ui.small_button("+").on_hover_text("zoom in").clicked() {
                     self.zoom_by(1.0);
                 }
-                ui.menu_button("Aa", |ui| {
+                ui.checkbox(&mut self.show_grid, "Grid")
+                     .on_hover_text("show a geographic reference grid");
+                 ui.menu_button("Aa", |ui| {
                     for (label, scale) in
                         [("Smaller", 0.875), ("Default", 1.0), ("Larger", 1.15)]
                     {
@@ -10683,7 +10803,7 @@ impl eframe::App for ShipApp {
             // Clock block: real + derived game time, humane format
             // (grill #17, ADR-0004). Both readings come from the sim.
             ui.horizontal(|ui| {
-                ui.label(format!("UTC {}", self.real_ts.as_deref().unwrap_or("—")));
+                ui.label(format!("UTC {}", short_timestamp(self.real_ts.as_deref())));
                 if self.game_paused {
                     ui.label(
                         egui::RichText::new("PAUSED")
@@ -10694,7 +10814,7 @@ impl eframe::App for ShipApp {
             });
             ui.horizontal(|ui| {
                 let elapsed = self.game_elapsed_secs.unwrap_or(0);
-                let g = self.game_ts.as_deref().unwrap_or("—");
+                let g = short_timestamp(self.game_ts.as_deref());
                 // Source on the face: a connected execution shows the
                 // Minos projection (epoch + pace from answers), anything
                 // else is an explicitly local sandbox clock.
@@ -10706,7 +10826,7 @@ impl eframe::App for ShipApp {
                     "local"
                 };
                 ui.label(format!(
-                    "GAME {g} · G+{:02}:{:02} ({source} {:.0}×)",
+                    "Game {g} · G+{:02}:{:02} · {source} pace {:.0}×",
                     elapsed / 60,
                     elapsed % 60,
                     self.game_ratio
@@ -10715,7 +10835,7 @@ impl eframe::App for ShipApp {
             // Context strip: the operating model on one line, every
             // island, every frame. Weak ink — status lines above it
             // still carry the loud news.
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(self.context_strip()).weak().small());
             });
         });
@@ -11887,6 +12007,9 @@ impl eframe::App for ShipApp {
                     }
                 }
                 let painter = ui.painter_at(rect);
+                if self.show_grid {
+                    self.paint_map_grid(&painter, rect);
+                }
                 // Group zones under ships, flags above them (slice iii).
                 for z in &zones {
                     let pts: Vec<egui::Pos2> = z
@@ -11968,37 +12091,23 @@ impl eframe::App for ShipApp {
                         paint_map_symbol(&painter, c, m.map_symbol, color, m.stale);
                     }
                 }
-                // Layer 3: symbol outlines. Image outlines are drawn
-                // after all image bodies; stale symbols use gray, not white.
+                // Layer 3: symbol outlines only. Textured unit images keep
+                // their own photographic edge; a geometric white outline
+                // makes the image look like a pasted-on rectangle.
                 for (index, m) in markers.iter().enumerate() {
                     if self.hidden.contains(&m.id) {
                         continue;
                     }
-                    let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
-                    if let Some(points) = &image_quads[index] {
-                        let outline = if m.stale {
-                            egui::Color32::GRAY
-                        } else {
-                            egui::Color32::WHITE
-                        };
-                        // The image already supplies its own pixels. Do
-                        // not add a second polygon fill here: a
-                        // transparent fill is still a full quad on some
-                        // painter paths, and a PNG's transparent canvas
-                        // must remain transparent instead of becoming a
-                        // black rectangle. Draw only the outline.
-                        painter.add(egui::Shape::closed_line(
-                            points.clone(),
-                            egui::Stroke::new(1.5, outline),
-                        ));
-                    } else {
-                        let outline = if m.stale {
-                            egui::Color32::GRAY
-                        } else {
-                            egui::Color32::WHITE
-                        };
-                        painter.circle_stroke(c, 8.0, egui::Stroke::new(2.0, outline));
+                    if image_quads[index].is_some() {
+                        continue;
                     }
+                    let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
+                    let outline = if m.stale {
+                        egui::Color32::GRAY
+                    } else {
+                        egui::Color32::WHITE
+                    };
+                    painter.circle_stroke(c, 8.0, egui::Stroke::new(2.0, outline));
                 }
                 // Layer 4: all state rings over every body, in the
                 // prescribed selected → follow → old-data order.
@@ -12515,6 +12624,7 @@ fn main() -> Result<(), String> {
                 hidden: HashSet::new(),
                 following: None,
                 show_trail: true,
+                show_grid: true,
                 mode: UiMode::new(sim_armed.clone()),
                 session_windows: None,
                 session_log_path: paths.initial_log.clone(),
@@ -12572,6 +12682,7 @@ fn main() -> Result<(), String> {
                 drill_category: None,
                 drill_type: None,
                 drill_class: None,
+                miller_height: MILLER_COL_HEIGHT,
                 fleet_cache: Vec::new(),
                 fleet_branches: std::collections::HashMap::new(),
                 fleet_branch_names: std::collections::HashMap::new(),
