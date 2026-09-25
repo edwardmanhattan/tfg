@@ -203,7 +203,13 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          & "${{ github.workspace }}\target\maplibre-native\platform\windows\Get-VendorPackages.ps1" -Triplet "x64-windows" -Renderer "OpenGL" -With-ICU
+          $vendorScript = "${{ github.workspace }}\target\maplibre-native\platform\windows\Get-VendorPackages.ps1"
+          $vendorArgs = @{
+            Triplet = "x64-windows"
+            Renderer = "OpenGL"
+            "With-ICU" = $true
+          }
+          & $vendorScript @vendorArgs
           if ($LASTEXITCODE -ne 0) { throw "MapLibre vendor setup failed with exit code $LASTEXITCODE" }
           "MLN_LOCAL_REPOSITORY=${{ github.workspace }}\target\maplibre-native" >> $env:GITHUB_ENV
 
