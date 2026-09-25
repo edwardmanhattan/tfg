@@ -2,6 +2,7 @@
 name = "tfg"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 maplibre_native = "0.9"
