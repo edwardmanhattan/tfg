@@ -69,6 +69,8 @@ const INSPECTOR_IMAGE_DEFAULT_WIDTH: f32 = 280.0;
 const INSPECTOR_IMAGE_MIN_WIDTH: f32 = 160.0;
 const INSPECTOR_IMAGE_MAX_WIDTH: f32 = 640.0;
 const INSPECTOR_IMAGE_MAX_HEIGHT: f32 = 180.0;
+const MILLER_COL_WIDTH: f32 = 150.0;
+const MILLER_COL_HEIGHT: f32 = 300.0;
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Session stub pace (session flow): 7 real hours play 7 game days.
 /// Full windows UI lands with the organizer flow; the ratio is the load-
@@ -1407,6 +1409,16 @@ struct UnitDrag {
     moved: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PickerRow {
+    id: String,
+    name: String,
+    hull: String,
+    class_name: String,
+    stat_class: Option<String>,
+    trail: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct HelmDraft {
     heading_deg: f32,
@@ -1661,17 +1673,17 @@ struct ShipApp {
     /// Register filter + assignment commander (step 3): hulls come
     /// from the synced store; each assign seats the picked commander.
     setup_reg_search: String,
+    fleet_query: String,
+    drill_branch: Option<i64>,
+    drill_category: Option<i64>,
+    drill_type: Option<i64>,
+    drill_class: Option<i64>,
     /// Fleet render cache (blocking ticket): register rows plus
     /// branch mapping + names, reloaded on sync and first show —
     /// never queried per frame. SQLite leaves the render path.
     fleet_cache: Vec<tfg::store::StoreUnit>,
     fleet_branches: std::collections::HashMap<i64, i64>,
     fleet_branch_names: std::collections::HashMap<i64, String>,
-    fleet_category_names: std::collections::HashMap<i64, String>,
-    fleet_type_names: std::collections::HashMap<i64, String>,
-    picker_category: Option<i64>,
-    picker_class: Option<i64>,
-    picker_type: Option<i64>,
     fleet_loaded: bool,
     setup_commander: Option<i64>,
     /// Session users (build ticket): memory-held game plus live lists —
@@ -3931,6 +3943,7 @@ impl ShipApp {
         // Arm the map click for placement (the click handler only
         // stands hulls up while the Place tool is active). The pick
         // itself lands on apply, once the piece exists server-side.
+        self.fleet_pick = Some(unit_id.to_string());
         self.mode.tool = SetupTool::Place;
     }
 
@@ -5495,21 +5508,11 @@ impl ShipApp {
             self.fleet_cache.clear();
             self.fleet_branches.clear();
             self.fleet_branch_names.clear();
-            self.fleet_category_names.clear();
-            self.fleet_type_names.clear();
             self.fleet_loaded = true;
             return;
         };
         self.fleet_cache = tfg::store::fleet_units(conn).unwrap_or_default();
         self.fleet_branches = tfg::store::branch_mapped_counts(conn);
-        self.fleet_category_names = tfg::store::unit_category_names(conn)
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        self.fleet_type_names = tfg::store::unit_type_names(conn)
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
         self.fleet_branch_names.clear();
         let mut bids: Vec<i64> = self.fleet_branches.keys().cloned().collect();
         for r in &self.fleet_cache {
@@ -5526,16 +5529,6 @@ impl ShipApp {
             }
         }
         self.fleet_loaded = true;
-    }
-
-    fn unit_category_label(&self, id: Option<i64>) -> String {
-        id.and_then(|id| self.fleet_category_names.get(&id).cloned())
-            .unwrap_or_else(|| "Uncategorised".to_string())
-    }
-
-    fn unit_type_label(&self, id: Option<i64>) -> String {
-        id.and_then(|id| self.fleet_type_names.get(&id).cloned())
-            .unwrap_or_else(|| "Unspecified type".to_string())
     }
 
     fn load_picker_textures(&mut self, ctx: &egui::Context) {
@@ -5580,6 +5573,18 @@ impl ShipApp {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
         let painter = ui.painter_at(rect);
         let Ok(uid) = id.parse::<i64>() else {
+            painter.circle_filled(
+                rect.center(),
+                size * 0.43,
+                egui::Color32::from_rgb(30, 58, 79),
+            );
+            paint_map_symbol(
+                &painter,
+                rect.center(),
+                tfg::store::MapSymbol::UnknownShip,
+                egui::Color32::LIGHT_BLUE,
+                false,
+            );
             return;
         };
         if let Some(texture) = self.visuals.get(uid).and_then(|visual| visual.texture.clone()) {
@@ -5606,18 +5611,27 @@ impl ShipApp {
         }
     }
 
-    /// Two-pane taxonomy picker for the setup fleet step. The rows are
-    /// catalog Units; the map drop creates the session GameUnit.
+    /// Fleet picker for the setup step. The operator keeps the four
+    /// Miller columns visible; the result row is the only place a unit
+    /// is selected or dragged.
     fn unit_picker_ui(&mut self, ui: &mut egui::Ui, crew: &[(i64, String)]) -> Vec<(i64, String)> {
         ui.horizontal(|ui| {
             if ui.small_button("sync register").clicked() {
                 self.sync_now();
                 self.users_refresh_directory();
             }
-            ui.label("search");
-            ui.text_edit_singleline(&mut self.setup_reg_search);
+            ui.label("search all units");
+            ui.text_edit_singleline(&mut self.fleet_query);
+            if ui.small_button("clear").clicked() {
+                self.fleet_query.clear();
+                self.drill_branch = None;
+                self.drill_category = None;
+                self.drill_type = None;
+                self.drill_class = None;
+            }
         });
         status_line(ui, &self.sync_status.clone());
+
         let mut commander = self.setup_commander;
         if commander.is_none() {
             commander = crew.first().map(|(id, _)| *id);
@@ -5639,160 +5653,357 @@ impl ShipApp {
         if crew.is_empty() {
             ui.weak("No eligible commander — seat someone in step 2 first.");
         }
+
         if !self.fleet_loaded {
             self.reload_fleet_cache();
         }
         self.load_picker_textures(ui.ctx());
-        let query = self.setup_reg_search.to_lowercase();
-        let mut category = self.picker_category;
-        let mut class = self.picker_class;
-        let mut unit_type = self.picker_type;
-        let all_rows = self.fleet_cache.clone();
-        let categories: Vec<i64> = all_rows.iter().filter_map(|r| r.category_id).collect::<std::collections::HashSet<_>>().into_iter().collect();
-        let mut categories = categories;
-        categories.sort_by_key(|id| self.unit_category_label(Some(*id)));
-        let classes: Vec<i64> = all_rows
+        let has_taxonomy = self
+            .store
+            .as_ref()
+            .and_then(|conn| tfg::store::has_taxonomy(conn).ok())
+            .unwrap_or(false);
+        let rows = if has_taxonomy {
+            self.miller_rows_ui(ui)
+        } else {
+            self.asset_picker_rows()
+        };
+        self.picker_tail_ui(ui, &rows)
+    }
+
+    fn asset_picker_rows(&self) -> Vec<PickerRow> {
+        let query = self.fleet_query.to_lowercase();
+        self.fleet
+            .units()
             .iter()
-            .filter(|r| category.is_none_or(|id| r.category_id == Some(id)))
-            .map(|r| r.class_id)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        let mut classes = classes;
-        classes.sort_by_key(|id| {
-            all_rows.iter().find(|r| r.class_id == *id).map(|r| r.class_name.clone()).unwrap_or_default()
-        });
-        let types: Vec<i64> = all_rows
-            .iter()
-            .filter(|r| class.is_none_or(|id| r.class_id == id))
-            .filter_map(|r| r.type_id)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        let mut types = types;
-        types.sort_by_key(|id| self.unit_type_label(Some(*id)));
-        let rows: Vec<tfg::store::StoreUnit> = all_rows
-            .iter()
-            .filter(|r| {
-                category.is_none_or(|id| r.category_id == Some(id))
-                    && class.is_none_or(|id| r.class_id == id)
-                    && unit_type.is_none_or(|id| r.type_id == Some(id))
-                    && (query.is_empty()
-                        || format!(
-                            "{} {} {} {} {}",
-                            r.name,
-                            r.hull,
-                            r.class_name,
-                            self.unit_category_label(r.category_id),
-                            self.unit_type_label(r.type_id)
-                        )
-                            .to_lowercase()
-                            .contains(&query))
+            .filter(|unit| {
+                query.is_empty()
+                    || format!(
+                        "{} {} {} {} {} {}",
+                        unit.name,
+                        unit.hull,
+                        unit.role,
+                        unit.origin,
+                        unit.satuan,
+                        unit.pangkalan
+                    )
+                    .to_lowercase()
+                    .contains(&query)
             })
-            .cloned()
-            .collect();
-        ui.separator();
-        let mut assigning = Vec::new();
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.strong("Taxonomy");
-                if ui.selectable_label(category.is_none(), "All categories").clicked() {
-                    category = None;
-                    class = None;
-                    unit_type = None;
+            .map(|unit| {
+                let class_name = self
+                    .catalog
+                    .class(&unit.class_id)
+                    .map(|class| class.name.clone())
+                    .unwrap_or_else(|| unit.class_id.clone());
+                PickerRow {
+                    id: unit.id.clone(),
+                    name: unit.name.clone(),
+                    hull: unit.hull.clone(),
+                    class_name,
+                    stat_class: Some(unit.class_id.clone()),
+                    trail: String::new(),
                 }
-                for id in categories {
-                    let label = self.unit_category_label(Some(id));
-                    let count = all_rows.iter().filter(|r| r.category_id == Some(id)).count();
-                    if ui.selectable_label(category == Some(id), format!("{label} · {count}")).clicked() {
-                        category = Some(id);
-                        class = None;
-                        unit_type = None;
-                    }
-                }
-                if category.is_some() {
-                    ui.separator();
-                    ui.strong("Class");
-                    if ui.selectable_label(class.is_none(), "All classes").clicked() {
-                        class = None;
-                        unit_type = None;
-                    }
-                    for id in classes {
-                        let label = all_rows.iter().find(|r| r.class_id == id).map(|r| r.class_name.clone()).unwrap_or_else(|| format!("Class {id}"));
-                        if ui.selectable_label(class == Some(id), label).clicked() {
-                            class = Some(id);
-                            unit_type = None;
-                        }
-                    }
-                }
-                if class.is_some() {
-                    ui.separator();
-                    ui.strong("Type");
-                    if ui.selectable_label(unit_type.is_none(), "All types").clicked() {
-                        unit_type = None;
-                    }
-                    for id in types {
-                        if ui.selectable_label(unit_type == Some(id), self.unit_type_label(Some(id))).clicked() {
-                            unit_type = Some(id);
-                        }
-                    }
-                }
-            });
-            ui.vertical(|ui| {
-                ui.strong(format!("Units · {}", rows.len()));
-                egui::ScrollArea::vertical().max_height(230.0).show(ui, |ui| {
-                    for row in &rows {
-                        let assigned = self.users_gunits.iter().any(|g| g.unit_id.to_string() == row.id);
-                        let mut assignment = None;
-                        let response = ui.horizontal(|ui| {
-                            self.unit_thumbnail_ui(ui, &row.id, 34.0);
-                            ui.vertical(|ui| {
-                                ui.label(row.name.clone());
-                                ui.weak(format!("{} · {} · {}", row.class_name, self.unit_category_label(row.category_id), self.unit_type_label(row.type_id)));
-                            });
-                            if assigned {
-                                ui.label(egui::RichText::new("assigned ✓").weak().small());
-                            } else if ui.small_button("assign").clicked() {
-                                assignment = row.id.parse::<i64>().ok().map(|id| (id, row.name.clone()));
-                            }
+            })
+            .collect()
+    }
+
+    fn miller_rows_ui(&mut self, ui: &mut egui::Ui) -> Vec<PickerRow> {
+        let query = self.fleet_query.to_lowercase();
+        if !query.is_empty() {
+            let mut out = Vec::new();
+            if let Some(conn) = self.store.as_ref() {
+                if let Ok(hits) = tfg::store::tax_search(conn, &query) {
+                    for hit in hits {
+                        let class_name = hit.class_name.clone();
+                        let stat_class = self
+                            .catalog
+                            .find_class_by_name(&class_name)
+                            .map(|class| class.id.clone());
+                        let trail = hit.trail();
+                        out.push(PickerRow {
+                            id: hit.id,
+                            name: hit.name,
+                            hull: hit.hull,
+                            class_name,
+                            stat_class,
+                            trail,
                         });
-                        let row_response = ui.interact(
-                            response.response.rect,
-                            ui.id().with(("unit-row", row.id.as_str())),
-                            egui::Sense::click_and_drag(),
-                        );
-                        if row_response.is_pointer_button_down_on() && self.unit_drag.is_none() {
-                            self.fleet_pick = Some(row.id.clone());
-                            self.mode.tool = SetupTool::Place;
-                            if let Some(start) = row_response.interact_pointer_pos() {
-                                self.unit_drag = Some(UnitDrag { id: row.id.clone(), name: row.name.clone(), start, moved: false });
-                            }
-                        }
-                        if row_response.clicked() && assignment.is_none() {
-                            self.fleet_pick = Some(row.id.clone());
-                            self.mode.tool = SetupTool::Place;
-                            self.users_status = format!("{} selected · click the map to place", row.name);
-                        }
-                        if let Some((id, name)) = assignment {
-                            assigning.push((id, name));
-                        }
+                    }
+                }
+            }
+            return out;
+        }
+
+        let (branch, category, unit_type) =
+            (self.drill_branch, self.drill_category, self.drill_type);
+        let (branches, categories, types, classes) = match self.store.as_ref() {
+            Some(conn) => (
+                tfg::store::tax_branches(conn).unwrap_or_default(),
+                branch
+                    .map(|id| tfg::store::tax_categories(conn, id).unwrap_or_default())
+                    .unwrap_or_default(),
+                category
+                    .map(|id| tfg::store::tax_types(conn, id).unwrap_or_default())
+                    .unwrap_or_default(),
+                unit_type
+                    .map(|id| tfg::store::tax_classes(conn, id).unwrap_or_default())
+                    .unwrap_or_default(),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        };
+
+        let label = |row: &tfg::store::TaxRow| {
+            if row.id_name.is_empty() || row.id_name == row.name {
+                row.name.clone()
+            } else {
+                format!("{} ({})", row.name, row.id_name)
+            }
+        };
+        let crumb = |rows: &[tfg::store::TaxRow], id: Option<i64>| {
+            id.and_then(|selected| rows.iter().find(|row| row.id == selected))
+                .map(label)
+        };
+        let crumbs: Vec<String> = [
+            crumb(&branches, self.drill_branch),
+            crumb(&categories, self.drill_category),
+            crumb(&types, self.drill_type),
+            crumb(&classes, self.drill_class),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("Fleet").clicked() {
+                self.drill_branch = None;
+                self.drill_category = None;
+                self.drill_type = None;
+                self.drill_class = None;
+            }
+            for crumb in crumbs {
+                ui.label("/");
+                ui.label(crumb);
+            }
+        });
+
+        if self.drill_branch != branch {
+            self.drill_category = None;
+            self.drill_type = None;
+            self.drill_class = None;
+        }
+        if self.drill_category != category {
+            self.drill_type = None;
+            self.drill_class = None;
+        }
+        if self.drill_type != unit_type {
+            self.drill_class = None;
+        }
+
+        egui::ScrollArea::horizontal()
+            .id_salt("drill-miller")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    let levels: [(&str, &[tfg::store::TaxRow], bool); 4] = [
+                        ("Branch", &branches, true),
+                        ("Category", &categories, self.drill_branch.is_some()),
+                        ("Type", &types, self.drill_category.is_some()),
+                        ("Class", &classes, self.drill_type.is_some()),
+                    ];
+                    for (depth, (title, options, active)) in levels.iter().enumerate() {
+                        ui.vertical(|ui| {
+                            ui.set_min_width(MILLER_COL_WIDTH);
+                            ui.set_max_width(MILLER_COL_WIDTH);
+                            ui.strong(format!("{title} ({})", options.len()));
+                            egui::ScrollArea::vertical()
+                                .id_salt(("drill", *title))
+                                .auto_shrink([false, false])
+                                .max_height(MILLER_COL_HEIGHT)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(MILLER_COL_WIDTH - 16.0);
+                                    if !active {
+                                        ui.weak("Pick ← first");
+                                    } else if options.is_empty() {
+                                        ui.weak("None yet");
+                                    } else {
+                                        for option in options.iter() {
+                                            let text = label(option);
+                                            match depth {
+                                                0 => ui.selectable_value(
+                                                    &mut self.drill_branch,
+                                                    Some(option.id),
+                                                    text,
+                                                ),
+                                                1 => ui.selectable_value(
+                                                    &mut self.drill_category,
+                                                    Some(option.id),
+                                                    text,
+                                                ),
+                                                2 => ui.selectable_value(
+                                                    &mut self.drill_type,
+                                                    Some(option.id),
+                                                    text,
+                                                ),
+                                                _ => ui.selectable_value(
+                                                    &mut self.drill_class,
+                                                    Some(option.id),
+                                                    text,
+                                                ),
+                                            };
+                                        }
+                                    }
+                                });
+                        });
+                        ui.separator();
                     }
                 });
             });
-        });
-        if let Some(selected) = rows.iter().find(|row| self.fleet_pick.as_deref() == Some(row.id.as_str())) {
-            ui.horizontal(|ui| {
-                ui.weak(format!("Selected: {}", selected.name));
+
+        let mut rows = Vec::new();
+        if let (Some(conn), Some(class_id)) = (self.store.as_ref(), self.drill_class) {
+            if let Ok(units) = tfg::store::tax_units(conn, class_id) {
+                for unit in units {
+                    rows.push(PickerRow {
+                        id: unit.id,
+                        name: unit.name,
+                        hull: unit.hull,
+                        class_name: unit.class_name.clone(),
+                        stat_class: self
+                            .catalog
+                            .find_class_by_name(&unit.class_name)
+                            .map(|class| class.id.clone()),
+                        trail: String::new(),
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    fn picker_tail_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        rows: &[PickerRow],
+    ) -> Vec<(i64, String)> {
+        ui.label(format!(
+            "{} shown · {} placed",
+            rows.len(),
+            self.placed_fleet.len()
+        ));
+        let mut assigning = Vec::new();
+        egui::ScrollArea::vertical()
+            .id_salt("picker-rows")
+            .max_height(300.0)
+            .show(ui, |ui| {
+                for row in rows {
+                    let assigned = self.users_gunits.iter().any(|unit| {
+                        unit.unit_id.to_string() == row.id
+                    });
+                    let mut assignment = None;
+                    let response = ui.horizontal(|ui| {
+                        self.unit_thumbnail_ui(ui, &row.id, 34.0);
+                        ui.vertical(|ui| {
+                            ui.label(row.name.clone());
+                            let trail = if row.trail.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {}", row.trail)
+                            };
+                            ui.weak(format!(
+                                "{} ({}) · {}{trail} · {}",
+                                row.class_name,
+                                row.hull,
+                                row.name,
+                                if row.stat_class.is_some() {
+                                    "stats ready"
+                                } else {
+                                    "no sim stats"
+                                }
+                            ));
+                        });
+                        if assigned {
+                            ui.label(egui::RichText::new("assigned ✓").weak().small());
+                        } else if ui.small_button("assign").clicked() {
+                            assignment = row
+                                .id
+                                .parse::<i64>()
+                                .ok()
+                                .map(|id| (id, row.name.clone()));
+                        }
+                    });
+                    let row_response = ui.interact(
+                        response.response.rect,
+                        ui.id().with(("unit-row", row.id.as_str())),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if row_response.is_pointer_button_down_on() && self.unit_drag.is_none() {
+                        self.fleet_pick = Some(row.id.clone());
+                        self.mode.tool = SetupTool::Place;
+                        if let Some(start) = row_response.interact_pointer_pos() {
+                            self.unit_drag = Some(UnitDrag {
+                                id: row.id.clone(),
+                                name: row.name.clone(),
+                                start,
+                                moved: false,
+                            });
+                        }
+                    }
+                    if row_response.clicked() && assignment.is_none() {
+                        self.fleet_pick = Some(row.id.clone());
+                        self.mode.tool = SetupTool::Place;
+                        self.users_status = format!("{} selected · click the map to place", row.name);
+                    }
+                    if let Some((id, name)) = assignment {
+                        assigning.push((id, name));
+                    }
+                }
+            });
+
+        let armed = self.mode.armed.load(Ordering::SeqCst);
+        if self.mode.phase == Phase::Closed {
+            ui.label("Placement is unavailable once the session is closed.");
+        } else if !armed {
+            ui.label("Engine is presentation-only: placed units stay invisible until it runs.");
+            if ui.small_button("arm engine").clicked() {
+                self.mode.armed.store(true, Ordering::SeqCst);
+            }
+        } else if self.acting_as.is_some() {
+            ui.label("Placement is organizer-only.");
+        } else if self
+            .fleet_pick
+            .as_ref()
+            .is_some_and(|id| self.placed_fleet.contains(id))
+        {
+            ui.label("Already placed — pick another unit.");
+        } else if let Some(pick) = self.fleet_pick.clone() {
+            if let Some(row) = rows.iter().find(|row| row.id == pick) {
+                let placing = self.mode.tool == SetupTool::Place;
+                if ui
+                    .small_button(if placing {
+                        format!("click the map to place {}…", row.name)
+                    } else {
+                        format!("place {}", row.name)
+                    })
+                    .clicked()
+                {
+                    self.mode.tool = if placing {
+                        SetupTool::Select
+                    } else {
+                        SetupTool::Place
+                    };
+                }
                 if ui.button("place at map center").clicked() {
                     let (la, lo) = self.center;
                     self.try_place_picked(la, lo);
                     self.mode.tool = SetupTool::Select;
                 }
-            });
+            } else {
+                self.fleet_pick = None;
+                ui.label("Pick a unit above to arm placement.");
+            }
+        } else {
+            ui.label("Pick a unit above to arm placement.");
         }
-        self.picker_category = category;
-        self.picker_class = class;
-        self.picker_type = unit_type;
         assigning
     }
 
@@ -7246,6 +7457,7 @@ impl ShipApp {
                 }
             }
             self.dispatch_queued_refresh();
+            self.resume_pending_placement();
         }
         // The WebSocket position stream is the primary source. If it is
         // quiet for five seconds, use REST once per second as a recovery
@@ -8405,7 +8617,8 @@ impl ShipApp {
                     };
                     if !self.users_gunits.iter().any(|g| g.unit_id == uid) {
                         if self.setup_op.is_some() {
-                            self.users_status = "finish the current setup action before placing".to_string();
+                            self.pending_placement = Some((pid.clone(), la, lo));
+                            self.users_status = "placement queued behind the current setup action…".to_string();
                         } else if self.setup_commander.is_none() {
                             self.users_status = "pick a commander before placing".to_string();
                         } else if let Err(e) = self.users_client() {
@@ -8457,6 +8670,16 @@ impl ShipApp {
                 None
             }
         }
+    }
+
+    fn resume_pending_placement(&mut self) {
+        if self.setup_op.is_some() {
+            return;
+        }
+        let Some((_, la, lo)) = self.pending_placement.clone() else {
+            return;
+        };
+        self.try_place_picked(la, lo);
     }
 
     /// The local half of a placement (shared by the sandbox drop and
@@ -12063,14 +12286,14 @@ fn main() -> Result<(), String> {
                 edit_area: String::new(),
                 edit_map_tag: String::new(),
                 setup_reg_search: String::new(),
+                fleet_query: String::new(),
+                drill_branch: None,
+                drill_category: None,
+                drill_type: None,
+                drill_class: None,
                 fleet_cache: Vec::new(),
                 fleet_branches: std::collections::HashMap::new(),
                 fleet_branch_names: std::collections::HashMap::new(),
-                fleet_category_names: std::collections::HashMap::new(),
-                fleet_type_names: std::collections::HashMap::new(),
-                picker_category: None,
-                picker_class: None,
-                picker_type: None,
                 fleet_loaded: false,
                 setup_commander: None,
                 users_game: None,
