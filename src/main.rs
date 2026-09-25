@@ -728,7 +728,7 @@ fn paint_unit_image(
 
 /// Two-line label for the State B mode cards (ticket #77): title over
 /// a muted one-line promise, both painted inside one button.
-fn mode_card_text(title: &str, sub: &str) -> egui::text::LayoutJob {
+fn mode_card_text(title: &str) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     job.append(
         title,
@@ -736,15 +736,6 @@ fn mode_card_text(title: &str, sub: &str) -> egui::text::LayoutJob {
         egui::TextFormat {
             font_id: egui::FontId::proportional(16.0),
             color: egui::Color32::from_rgb(0xE2, 0xE8, 0xF0),
-            ..Default::default()
-        },
-    );
-    job.append(
-        &format!("\n{sub}"),
-        0.0,
-        egui::TextFormat {
-            font_id: egui::FontId::proportional(12.0),
-            color: egui::Color32::from_gray(150),
             ..Default::default()
         },
     );
@@ -909,6 +900,7 @@ struct LoginDone {
     user: String,
     pair: tfg::backend::TokenPair,
     uid: Option<i64>,
+    app_role_ids: Vec<i64>,
     needs_change: bool,
     probe_note: Option<String>,
 }
@@ -1718,6 +1710,9 @@ struct ShipApp {
     /// is empty by permission, not by absence. Drives the room-key
     /// guidance; cleared on success, reset on sign-out.
     games_gap: bool,
+    /// The game-list permission has been observed at least once. This
+    /// keeps organizer controls hidden during the first async read.
+    games_loaded: bool,
     users_list: Vec<tfg::backend::BackendUser>,
     users_search: String,
     users_role: Option<i64>,
@@ -1784,6 +1779,10 @@ struct ShipApp {
     /// on `id_user` and the login identifier is not it. Set on sign-in
     /// and confirmed by every join/readiness answer; cleared on sign-out.
     auth_user_id: Option<i64>,
+    /// Application-role ids from the same probe. An empty list is a
+    /// participant account: room-key join is available, session setup
+    /// administration is not.
+    auth_app_role_ids: Vec<i64>,
     auth_token: Option<String>,
     auth_issued_at: Option<Instant>,
     auth_ttl_secs: u64,
@@ -2671,6 +2670,7 @@ impl ShipApp {
         self.live_connected_once = false;
         self.auth_user = None;
         self.auth_user_id = None;
+        self.auth_app_role_ids.clear();
         self.auth_token = None;
         self.auth_issued_at = None;
         self.auth_ttl_secs = 0;
@@ -2700,6 +2700,7 @@ impl ShipApp {
         self.users_game_state = None;
         self.users_games.clear();
         self.games_gap = false;
+        self.games_loaded = false;
         self.users_roster.clear();
         self.users_gunits.clear();
         self.commanded_hulls.clear();
@@ -2794,16 +2795,18 @@ impl ShipApp {
                     user: id,
                     pair,
                     uid: None,
+                    app_role_ids: Vec::new(),
                     needs_change: true,
                     probe_note: None,
                 });
             }
             let token = pair.access_token.clone();
             match client.me(&token) {
-                Ok(uid) => Ok(LoginDone {
+                Ok(identity) => Ok(LoginDone {
                     user: id,
                     pair,
-                    uid: Some(uid),
+                    uid: Some(identity.id),
+                    app_role_ids: identity.app_role_ids,
                     needs_change: false,
                     probe_note: None,
                 }),
@@ -2811,6 +2814,7 @@ impl ShipApp {
                     user: id,
                     pair,
                     uid: None,
+                    app_role_ids: Vec::new(),
                     needs_change: true,
                     probe_note: None,
                 }),
@@ -2818,6 +2822,7 @@ impl ShipApp {
                     user: id.clone(),
                     pair,
                     uid: None,
+                    app_role_ids: Vec::new(),
                     needs_change: false,
                     probe_note: Some(format!("signed in as {id} · probe: {e}")),
                 }),
@@ -2830,6 +2835,7 @@ impl ShipApp {
     fn apply_login(&mut self, done: LoginDone) {
         self.login_password.clear();
         self.store_pair(done.user.clone(), done.pair);
+        self.auth_app_role_ids = done.app_role_ids;
         if done.needs_change {
             self.auth_needs_password_change = true;
             self.auth_status = format!("signed in as {} · must change password", done.user);
@@ -2935,9 +2941,11 @@ impl ShipApp {
                         format!("resumed as {user} · must change password");
                     return;
                 }
+                self.auth_app_role_ids.clear();
                 match client.me(self.auth_token.as_deref().unwrap_or("")) {
-                    Ok(uid) => {
-                        self.auth_user_id = Some(uid);
+                    Ok(identity) => {
+                        self.auth_user_id = Some(identity.id);
+                        self.auth_app_role_ids = identity.app_role_ids;
                         self.auth_needs_password_change = false;
                         self.auth_status = format!("resumed session as {user}");
                         eprintln!("session restored for {user}");
@@ -3219,6 +3227,7 @@ impl ShipApp {
     fn apply_games(&mut self, games: Vec<tfg::backend::GameRow>) {
         self.users_games = games;
         self.games_gap = false;
+        self.games_loaded = true;
         // A held game may have closed or vanished: drop it loudly.
         if let Some((gid, _)) = self.users_game.clone() {
             if !self.users_games.iter().any(|g| g.id == gid) {
@@ -5307,62 +5316,73 @@ impl ShipApp {
         }));
     }
 
+    /// The session browser and lifecycle writes are organizer-only.
+    /// Room-key join remains available to every authenticated account,
+    /// so a participant never has to see an unusable empty picker.
+    fn can_manage_sessions(&self) -> bool {
+        self.games_loaded && !self.games_gap && !self.auth_app_role_ids.is_empty()
+    }
+
     /// Setup flow step 1 (#79): hold a game — pick a listed one or
     /// create a session. Only `name` is required; blank optionals are
     /// omitted, never sent empty.
     fn setup_game_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("1 · Session");
-        // Player flow: no game list by permission means the room key
-        // IS the invitation — lead with it, not the empty picker.
-        if self.games_gap && self.users_game.is_none() {
-            ui.label(egui::RichText::new(
-                "The session list needs a staff read your account lacks. \
-                 Ask your organizer for the room key and enter it below — \
-                 no list needed.",
-            ).strong());
+        let can_manage_sessions = self.can_manage_sessions();
+        // Player flow: the room key is the invitation. Do not leave an
+        // organizer-only picker on screen for accounts that can only join.
+        if !can_manage_sessions && self.users_game.is_none() {
+            ui.label(
+                egui::RichText::new(
+                    "Only organizer accounts can browse or create sessions. \
+                     Ask your organizer for the room key and enter it below — \
+                     no list needed.",
+                )
+                .strong(),
+            );
             ui.separator();
         }
-        ui.horizontal(|ui| {
-            let picked = self
-                .users_game
-                .clone()
-                .map(|(_, n)| n)
-                .unwrap_or_else(|| "pick a session".to_string());
-            let prev = self.users_game.clone();
-            egui::ComboBox::from_label("session")
-                .selected_text(picked)
-                .show_ui(ui, |ui| {
-                    for g in &self.users_games {
-                        ui.selectable_value(
-                            &mut self.users_game,
-                            Some((g.id, g.name.clone())),
-                            format!("{} ({})", g.name, g.state),
-                        );
-                    }
-                });
-            if ui.small_button("refresh").clicked() {
-                self.users_refresh_games();
-                self.users_refresh_directory();
-                self.users_refresh_game();
-            }
-            if self.users_game != prev {
-                // A newly held game takes its stage from Minos, never
-                // from a local default: the resync inside the refresh
-                // projects Planning/Ready/Live/Eval off the detail read.
-                // The clock read belongs to the old hold — writes will
-                // re-read it for the new one.
-                self.minos_clock = None;
-                self.minos_room_key = None;
-                self.clock_denied = false;  // new hold, unknown grant
-                self.delete_armed = false;
-                self.edit_open = false;
-                self.users_refresh_game();
-            }
-        });
-        // Admin writes: staff-granted, planning-only. Hidden without
-        // the staff read (a player would only 403); past planning the
-        // server refuses loudly instead.
-        if !self.games_gap {
+        if can_manage_sessions {
+            ui.horizontal(|ui| {
+                let picked = self
+                    .users_game
+                    .clone()
+                    .map(|(_, n)| n)
+                    .unwrap_or_else(|| "pick a session".to_string());
+                let prev = self.users_game.clone();
+                egui::ComboBox::from_label("session")
+                    .selected_text(picked)
+                    .show_ui(ui, |ui| {
+                        for g in &self.users_games {
+                            ui.selectable_value(
+                                &mut self.users_game,
+                                Some((g.id, g.name.clone())),
+                                format!("{} ({})", g.name, g.state),
+                            );
+                        }
+                    });
+                if ui.small_button("refresh").clicked() {
+                    self.users_refresh_games();
+                    self.users_refresh_directory();
+                    self.users_refresh_game();
+                }
+                if self.users_game != prev {
+                    // A newly held game takes its stage from Minos, never
+                    // from a local default: the resync inside the refresh
+                    // projects Planning/Ready/Live/Eval off the detail read.
+                    // The clock read belongs to the old hold — writes will
+                    // re-read it for the new one.
+                    self.minos_clock = None;
+                    self.minos_room_key = None;
+                    self.clock_denied = false;  // new hold, unknown grant
+                    self.delete_armed = false;
+                    self.edit_open = false;
+                    self.users_refresh_game();
+                }
+            });
+            // Admin writes: staff-granted, planning-only. Hidden without
+            // the staff read (a player would only 403); past planning the
+            // server refuses loudly instead.
             if let Some((gid, _)) = self.users_game.clone() {
                 let planning = self.users_game_state.as_deref() == Some("planning");
                 ui.horizontal(|ui| {
@@ -5438,10 +5458,8 @@ impl ShipApp {
                 self.setup_advance_prep();
             }
         }
-        ui.separator();
-        if self.games_gap {
-            ui.weak("Creating sessions needs a staff read your account lacks — join with the room key above.");
-        } else {
+        if can_manage_sessions {
+            ui.separator();
             ui.strong("New session");
             ui.horizontal(|ui| {
                 ui.label("name:");
@@ -7313,10 +7331,11 @@ impl ShipApp {
                     .map_err(|_| PwResult::ReentryFailed)?;
                 let token = pair.access_token.clone();
                 match client.me(&token) {
-                    Ok(uid) => Ok(PwResult::Changed(LoginDone {
+                    Ok(identity) => Ok(PwResult::Changed(LoginDone {
                         user,
                         pair,
-                        uid: Some(uid),
+                        uid: Some(identity.id),
+                        app_role_ids: identity.app_role_ids,
                         needs_change: false,
                         probe_note: None,
                     })),
@@ -7336,6 +7355,7 @@ impl ShipApp {
                 self.pw_new.clear();
                 self.store_pair(done.user.clone(), done.pair);
                 self.auth_user_id = done.uid;
+                self.auth_app_role_ids = done.app_role_ids;
                 self.watch_personal_channel();
                 self.auth_needs_password_change = false;
                 self.auth_status = format!("signed in as {}", done.user);
@@ -7490,6 +7510,7 @@ impl ShipApp {
             SetupDone::Games(games) => self.apply_games(games),
             SetupDone::GamesDenied => {
                 self.games_gap = true;
+                self.games_loaded = true;
                 self.users_status =
                     "session list needs a staff read — join with the room key below".to_string();
             }
@@ -10019,17 +10040,13 @@ impl ShipApp {
                 .color(ONBOARD_ACCENT),
         );
         ui.heading("Choose a mode");
-        ui.label(
-            "Presentation watches the live feed. Simulation plans and runs an exercise.",
-        );
         ui.add_space(12.0);
         let w = ui.available_width();
         if ui
             .add_sized(
                 [w, 64.0],
                 egui::Button::new(mode_card_text(
-                    "📡 Presentation",
-                    "Live backend feed on the map",
+                    "📡 Command Center",
                 )),
             )
             .clicked()
@@ -10040,8 +10057,7 @@ impl ShipApp {
             .add_sized(
                 [w, 64.0],
                 egui::Button::new(mode_card_text(
-                    "🎮 Simulation",
-                    "Perencanaan → Persiapan → Eksekusi → Evaluasi",
+                    "🎮 Tactical Floor Game",
                 )),
             )
             .clicked()
@@ -10049,11 +10065,6 @@ impl ShipApp {
             self.enter_shell(AppMode::Simulation);
         }
         ui.add_space(10.0);
-        ui.label(
-            egui::RichText::new("Either way, the map loads under this screen. Switch any time from the toolbar.")
-                .weak()
-                .size(11.0),
-        );
     }
 
     /// Phase bar (State D, ticket #77): the four simulation phases
@@ -10063,34 +10074,46 @@ impl ShipApp {
     /// machine — nothing here writes the phase directly.
     fn sim_phase_bar(&mut self, ui: &mut egui::Ui) {
         let stage = self.sim_stage();
-        egui::Window::new("simulation phases")
+        let phase_bar_id = egui::Id::new("simulation phases");
+        let first_shot = ui
+            .ctx()
+            .memory(|memory| memory.area_rect(phase_bar_id).is_none());
+        let mut window = egui::Window::new("simulation phases")
+            .id(phase_bar_id)
             .title_bar(false)
             .collapsible(false)
-            .movable(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, PHASE_BAR_TOP))
-            .show(ui.ctx(), |ui| {
-                ui.horizontal(|ui| {
-                    let steps = [
-                        (SimStage::Planning, "1 Perencanaan"),
-                        (SimStage::Ready, "2 Persiapan"),
-                        (SimStage::Live, "3 Eksekusi"),
-                        (SimStage::Eval, "4 Evaluasi"),
-                    ];
-                    for (i, (s, label)) in steps.iter().enumerate() {
-                        if i > 0 {
-                            ui.label(egui::RichText::new("→").weak());
-                        }
-                        ui.label(if *s == stage {
-                            egui::RichText::new(*label)
-                                .strong()
-                                .color(ONBOARD_ACCENT)
-                        } else {
-                            egui::RichText::new(*label).weak()
-                        });
+            .resizable(false);
+        // Anchor only the first frame. Reapplying an anchor every frame
+        // overwrites egui's stored drag position as soon as the pointer
+        // is released, making the bar jump back to center.
+        if first_shot {
+            window = window.anchor(
+                egui::Align2::CENTER_TOP,
+                egui::vec2(0.0, PHASE_BAR_TOP),
+            );
+        }
+        window.movable(true).show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| {
+                let steps = [
+                    (SimStage::Planning, "1 Perencanaan"),
+                    (SimStage::Ready, "2 Persiapan"),
+                    (SimStage::Live, "3 Eksekusi"),
+                    (SimStage::Eval, "4 Evaluasi"),
+                ];
+                for (i, (s, label)) in steps.iter().enumerate() {
+                    if i > 0 {
+                        ui.label(egui::RichText::new("→").weak());
                     }
-                });
-                ui.separator();
+                    ui.label(if *s == stage {
+                        egui::RichText::new(*label)
+                            .strong()
+                            .color(ONBOARD_ACCENT)
+                    } else {
+                        egui::RichText::new(*label).weak()
+                    });
+                }
+            });
+            ui.separator();
                 match stage {
                     SimStage::Planning => {
                         // Slim status only: the Exercise setup panel on the
@@ -12309,6 +12332,7 @@ fn main() -> Result<(), String> {
                 factor_draft: 1.0,
                 users_games: Vec::new(),
                 games_gap: false,
+                games_loaded: false,
                 users_list: Vec::new(),
                 users_search: String::new(),
                 users_role: None,
@@ -12355,6 +12379,7 @@ fn main() -> Result<(), String> {
                 login_password: String::new(),
                 auth_user: None,
                 auth_user_id: None,
+                auth_app_role_ids: Vec::new(),
                 auth_token: None,
                 auth_issued_at: None,
                 auth_ttl_secs: 0,

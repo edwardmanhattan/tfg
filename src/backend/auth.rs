@@ -28,6 +28,15 @@ pub struct TokenPair {
     pub must_change_password: bool,
 }
 
+/// The authenticated account's stable identity and application-role ids.
+/// The role ids let the desktop client keep session-management controls
+/// hidden for participants without guessing from display names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedUser {
+    pub id: i64,
+    pub app_role_ids: Vec<i64>,
+}
+
 /// Strict pair decode (M2): the access token must be non-empty, the
 /// type present and Bearer, the lifetime present. Missing fields are a
 /// decode error — never an empty token that authenticates nothing or
@@ -166,13 +175,14 @@ impl MinosAuth {
     }
 
     /// Gate probe: who am I with this token. Ok carries the caller's
-    /// user id (C2: readiness matching needs it — roster rows key on
-    /// `id_user`, and the login identifier is not it). Ok means the
-    /// token works and no gate stands in the way; `Forbidden` with valid
-    /// credentials means the account is not Active (or
-    /// must_change_password still shuts doors) — matched as a variant
-    /// by the login island. A missing id is a decode error, never zero.
-    pub fn me(&self, access_token: &str) -> Result<i64, BackendError> {
+    /// user id and application-role ids (C2: readiness matching needs
+    /// the former; the setup screen needs the latter to separate an
+    /// organizer from a room-key participant). Ok means the token works
+    /// and no gate stands in the way; `Forbidden` with valid credentials
+    /// means the account is not Active (or must_change_password still
+    /// shuts doors) — matched as a variant by the login island. A
+    /// missing id is a decode error, never zero.
+    pub fn me(&self, access_token: &str) -> Result<AuthenticatedUser, BackendError> {
         // Status-first like the old probe (never unwrap-then-check):
         // the gate match on `Forbidden` must survive even a body that
         // is not the envelope shape.
@@ -187,9 +197,15 @@ impl MinosAuth {
         if !status.is_success() {
             return Err(BackendError::http_error(status.as_u16(), &body));
         }
-        body["data"]["id"]
+        let data = &body["data"];
+        let id = data["id"]
             .as_i64()
-            .ok_or_else(|| BackendError::Other("me answer without an id".to_string()))
+            .ok_or_else(|| BackendError::Other("me answer without an id".to_string()))?;
+        let app_role_ids = data["roles"]
+            .as_array()
+            .map(|roles| roles.iter().filter_map(|role| role["id"].as_i64()).collect())
+            .unwrap_or_default();
+        Ok(AuthenticatedUser { id, app_role_ids })
     }
 }
 

@@ -19,7 +19,7 @@ mod replay;
 
 pub use error::BackendError;
 
-pub use auth::{MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
+pub use auth::{AuthenticatedUser, MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
 pub use feed::{GameMsg, MinosRest, Snapshot};
 pub use live::{LIVE_BACKOFF_BASE_SECS, LIVE_BACKOFF_CAP_SECS, LiveCmd, LiveEvent, LiveWire};
 pub use master::{BackendUser, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePlacement, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, Review, ScenarioRole, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
@@ -385,7 +385,7 @@ mod tests {
                     )
                 } else if url == "/api/v1/users/me" {
                     tiny_http::Response::from_string(
-                        r#"{"status_code":200,"message":"Successfull","data":{"id":7,"username":"operator1"}}"#,
+                        r#"{"status_code":200,"message":"Successfull","data":{"id":7,"username":"operator1","roles":[{"id":2,"name":"Operator"}]}}"#,
                     )
                 } else {
                     tiny_http::Response::from_string("").with_status_code(404)
@@ -401,8 +401,9 @@ mod tests {
         let pair2 = auth.refresh("RT1").expect("refresh rotates");
         assert_eq!(pair2.access_token, "AT2");
         assert_eq!(pair2.refresh_token.as_deref(), Some("RT2"));
-        let uid = auth.me("AT2").expect("gate open");
-        assert_eq!(uid, 7, "probe carries the caller id for readiness matching");
+        let identity = auth.me("AT2").expect("gate open");
+        assert_eq!(identity.id, 7, "probe carries the caller id for readiness matching");
+        assert_eq!(identity.app_role_ids, vec![2], "probe carries application roles");
     }
 
     #[test]
