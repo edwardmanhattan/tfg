@@ -334,10 +334,11 @@ jobs:
             local frameworks="$2"
             local source_binary="${3:-$binary}"
             local raw_dependency dependency name destination newly_copied
-            local install_id
-            install_id="$(otool -D "$source_binary" 2>/dev/null | awk 'NR == 2 { print $1 }')"
+            local source_id binary_id
+            source_id="$(otool -D "$source_binary" 2>/dev/null | awk 'NR == 2 { print $1 }')"
+            binary_id="$(otool -D "$binary" 2>/dev/null | awk 'NR == 2 { print $1 }')"
             while read -r raw_dependency; do
-              if [[ -n "$install_id" && "$raw_dependency" == "$install_id" ]]; then
+              if [[ ( -n "$source_id" && "$raw_dependency" == "$source_id" ) || ( -n "$binary_id" && "$raw_dependency" == "$binary_id" ) ]]; then
                 continue
               fi
               if ! dependency="$(resolve_dependency "$source_binary" "$raw_dependency")"; then
