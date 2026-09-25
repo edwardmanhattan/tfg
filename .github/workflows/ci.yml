@@ -500,12 +500,25 @@ jobs:
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      - name: Build Debian binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --features maplibre_native/vulkan --timings
+
+      - name: Upload Debian Cargo timings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cargo-timings-debian13-amd64
+          path: target/cargo-timings
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Build Debian package
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --locked --features maplibre_native/vulkan
-
           package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           shlib_root="$RUNNER_TEMP/tfg-dpkg"
           deb_dir="dist/debian-package/tfg"
