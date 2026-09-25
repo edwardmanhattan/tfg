@@ -37,4 +37,7 @@ base64 = "0.22"
 # (§2, literal), and drops handshake refusal codes (H5: surfaced through
 # on_disconnected by patch). Pinned version must match the dependency below.
 [patch.crates-io]
+# 0.9.3 does not add Visual Studio's Release/Debug library directories to
+# rustc's link search path; keep the Windows build fix local until upstream ships it.
+maplibre_native = { path = "vendor/maplibre_native" }
 tokio-centrifuge = { path = "vendor/tokio-centrifuge" }
