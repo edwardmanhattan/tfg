@@ -257,7 +257,19 @@ jobs:
           cp licenses/maplibre-native-LICENSE.md "$deb_dir/usr/share/doc/tfg/MAPLIBRE-NATIVE-LICENSE.md"
           cp docs/runtime-paths.md "$deb_dir/usr/share/doc/tfg/README.md"
           runtime_libs="$(ldd target/release/${{ matrix.binary }} | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i }')"
-          depends="$(for library in $runtime_libs; do dpkg-query -S "$library" 2>/dev/null | cut -d: -f1 | head -n 1 || true; done | sort -u | paste -sd, -)"
+          # Resolve symlinks because Ubuntu reports some loader paths as diversions.
+          package_for_library() {
+            local resolved_library
+            resolved_library="$(readlink -f "$1")"
+            LC_ALL=C dpkg-query -S "$resolved_library" 2>/dev/null |
+              awk '!/^(diversion|local diversion) / {
+                sub(/: .*/, "")
+                gsub(/, */, " | ")
+                print
+                exit
+              }' || true
+          }
+          depends="$(for library in $runtime_libs; do package_for_library "$library"; done | sort -u | paste -sd, -)"
           depends="${depends:+$depends,}ca-certificates,libgl1,libvulkan1,libwayland-client0,libx11-6,libxkbcommon0"
           cat > "$deb_dir/DEBIAN/control" <<EOF
           Package: tfg
