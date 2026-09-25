@@ -714,6 +714,9 @@ impl SimSource {
 
 impl PollSource for SimSource {
     fn poll(&mut self) -> Result<Vec<Fix>, BackendError> {
+        // Drain before measuring the interval. ResetTick and mode-switch
+        // commands must affect this very poll, not the next one.
+        self.drain_commands();
         let now = Instant::now();
         let real_dt = self.last_tick.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
         self.last_tick = Some(now);

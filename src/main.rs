@@ -1577,6 +1577,12 @@ struct ShipApp {
     /// this per ship prevents an unrelated source or unit from resetting
     /// everyone else's glide.
     fix_animation_started: HashMap<String, Instant>,
+    animation_paused_fraction: HashMap<String, f64>,
+    /// Game samples whose arrival gap was too large to animate. Game
+    /// timestamps are scenario time, so arrival cadence is tracked here
+    /// instead of comparing assumed-time deltas.
+    game_animation_snap: HashSet<String>,
+    reconnect_snap: HashSet<String>,
     hidden: HashSet<String>,
     following: Option<String>,
     show_trail: bool,
@@ -2055,24 +2061,42 @@ impl ShipApp {
         // rounds must not replay the animation.
         let mut advanced = false;
         let accept_movement =
-            self.app_mode == AppMode::Presentation || self.mode.phase != Phase::Closed;
+            self.app_mode == AppMode::Presentation || self.mode.phase == Phase::Live;
+        let setup_sim_only =
+            self.app_mode == AppMode::Simulation && self.mode.phase == Phase::Setup;
         for fixes in self.poll_rx.try_iter() {
             rounds += 1;
             if !accept_movement {
                 continue;
             }
+            let fixes: Vec<Fix> = if setup_sim_only {
+                fixes
+                    .into_iter()
+                    .filter(|f| f.source == FixSource::Sim)
+                    .collect()
+            } else {
+                fixes
+            };
+            if fixes.is_empty() {
+                continue;
+            }
             let acked = self.registry.poll(fixes.clone());
-            let accepted_ids: HashSet<String> =
-                acked.iter().map(|(id, _)| id.clone()).collect();
-            // Local-first (master-data ticket): only accepted wire fixes
-            // land in the standing-picture table (decimal ids only; sim
-            // and replay names have no unit row).
+            let current_ids: HashSet<String> = acked
+                .iter()
+                .filter(|(id, _)| {
+                    fixes.iter().any(|f| &f.ship_id == id && !f.backfilled)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            // Local-first (master-data ticket): only accepted current wire
+            // fixes land in the standing-picture table (decimal ids only;
+            // sim, replay, and historical fixes have no current row).
             if let Some(conn) = &self.store {
                 let wire: Vec<tfg::geo::track::Fix> = fixes
                     .into_iter()
                     .filter(|f| {
                         f.source == tfg::geo::track::FixSource::Wire
-                            && accepted_ids.contains(&f.ship_id)
+                            && current_ids.contains(&f.ship_id)
                             && f.ship_id.bytes().all(|b| b.is_ascii_digit())
                     })
                     .collect();
@@ -2080,15 +2104,18 @@ impl ShipApp {
                     let _ = tfg::store::upsert_positions(conn, &wire, &tfg::backend::now_ts());
                 }
             }
-            // Accepted fixes move the glide clock and freshness; rejected
-            // duplicates/out-of-order arrivals do neither.
+            // Accepted current fixes move the glide clock and freshness;
+            // historical fixes are counted and journaled but never make a
+            // stale ship look fresh.
             let now = Instant::now();
             for (ship_id, _) in &acked {
-                self.last_seen.insert(ship_id.clone(), now);
                 *self.fix_count.entry(ship_id.clone()).or_insert(0) += 1;
-                self.fix_animation_started.insert(ship_id.clone(), now);
+                if current_ids.contains(ship_id) {
+                    self.last_seen.insert(ship_id.clone(), now);
+                    self.fix_animation_started.insert(ship_id.clone(), now);
+                }
             }
-            if !acked.is_empty() {
+            if !current_ids.is_empty() {
                 advanced = true;
             }
             // Ingest acks (Log grill, #20): report stamped seqs back to
@@ -2292,6 +2319,12 @@ impl ShipApp {
                     }
                     self.show_messages = true;
                 }
+                LiveEvent::Resynced => {
+                    let ids: Vec<String> =
+                        self.registry.ships().into_iter().map(|ship| ship.ship_id).collect();
+                    self.reconnect_snap.extend(ids.iter().cloned());
+                    self.game_animation_snap.extend(ids);
+                }
                 LiveEvent::Vanished(ids) => {
                     for id in ids {
                         self.registry.remove_ship(&id);
@@ -2303,21 +2336,23 @@ impl ShipApp {
                 LiveEvent::GamePositions(update) => {
                     let held = self.users_game.as_ref().map(|(id, _)| *id);
                     if self.app_mode != AppMode::Simulation
-                        || self.mode.phase == Phase::Closed
+                        || self.users_game_state.as_deref() != Some("execution")
                         || held != Some(update.game_id)
                     {
                         continue;
                     }
-                    let now = Instant::now();
-                    self.last_game_position_at = Some(now);
-                    self.last_plot_ok = Some(now);
-                    self.plot_fails = 0;
-                    self.ingest_game_positions(update);
+                    let (_, accepted) = self.ingest_game_positions(update);
+                    if accepted {
+                        let now = Instant::now();
+                        self.last_game_position_at = Some(now);
+                        self.last_plot_ok = Some(now);
+                        self.plot_fails = 0;
+                    }
                 }
                 LiveEvent::OrderIssued(event) => {
                     let held = self.users_game.as_ref().map(|(id, _)| *id);
                     if self.app_mode != AppMode::Simulation
-                        || self.mode.phase == Phase::Closed
+                        || self.users_game_state.as_deref() != Some("execution")
                         || held != Some(event.game_id)
                     {
                         continue;
@@ -2328,11 +2363,12 @@ impl ShipApp {
                     // position too. Apply it before reconciling the
                     // command result so the marker does not wait for a
                     // second REST/position publication.
-                    self.last_game_position_at = Some(Instant::now());
-                    self.ingest_game_positions(GamePositionUpdate::from_fix(
-                        game_id,
-                        fix.clone(),
-                    ));
+                    let (_, accepted) = self.ingest_game_positions(
+                        GamePositionUpdate::from_fix(game_id, fix.clone()),
+                    );
+                    if accepted {
+                        self.last_game_position_at = Some(Instant::now());
+                    }
                     let ship_id = fix.unit_id.to_string();
                     if matches!(
                         self.order_result.get(&ship_id),
@@ -2409,15 +2445,34 @@ impl ShipApp {
                 };
                 let paused = matches!(s.source, FixSource::Sim | FixSource::Game)
                     && self.game_paused;
-                let large_gap = self.registry.has_large_gap(
-                    &s.ship_id,
-                    (animation_secs * 3.0).ceil() as i64,
-                );
-                let frac = if paused || large_gap {
-                    1.0
+                let large_gap = if s.source == FixSource::Game {
+                    self.game_animation_snap.contains(&s.ship_id)
+                        || self.reconnect_snap.contains(&s.ship_id)
+                } else if s.source == FixSource::Wire {
+                    self.reconnect_snap.contains(&s.ship_id)
                 } else {
+                    self.registry.has_large_gap(
+                        &s.ship_id,
+                        (animation_secs * 3.0).ceil() as i64,
+                    )
+                };
+                let raw_frac =
                     (animation_started.elapsed().as_secs_f64() / animation_secs)
-                        .clamp(0.0, 1.0)
+                        .clamp(0.0, 1.0);
+                let frac = if large_gap {
+                    if matches!(s.source, FixSource::Wire | FixSource::Game) {
+                        self.reconnect_snap.remove(&s.ship_id);
+                    }
+                    self.animation_paused_fraction.remove(&s.ship_id);
+                    1.0
+                } else if paused {
+                    *self
+                        .animation_paused_fraction
+                        .entry(s.ship_id.clone())
+                        .or_insert(raw_frac)
+                } else {
+                    self.animation_paused_fraction.remove(&s.ship_id);
+                    raw_frac
                 };
                 self.reconcile_helm_preview(&s.ship_id, frac);
                 let pos = self.registry.blend(&s.ship_id, frac).unwrap_or(s.latest.position);
@@ -2499,16 +2554,21 @@ impl ShipApp {
     /// discarded rather than allowed to repopulate the new view.
     fn reset_registry_view(&mut self) {
         while self.poll_rx.try_recv().is_ok() {}
-        if let Some(rx) = &self.live_evt_rx {
-            while rx.try_recv().is_ok() {}
-        }
         while self.sim_evt_rx.try_recv().is_ok() {}
         self.registry = Registry::new(TrailBound::default());
         self.fix_animation_started.clear();
+        self.animation_paused_fraction.clear();
+        self.game_animation_snap.clear();
+        self.reconnect_snap.clear();
         self.last_seen.clear();
         self.fix_count.clear();
         self.last_game_position_at = None;
         self.plot_op = None;
+        self.setup_op = None;
+        self.pending_setup.clear();
+        if let Some(tx) = &self.live_cmd_tx {
+            let _ = tx.send(LiveCmd::Reseed);
+        }
     }
 
     /// Switch top-level modes (task #39): the view clears either way
@@ -2685,6 +2745,7 @@ impl ShipApp {
         if old_id != new_id {
             self.clear_visual_cache();
             self.reset_registry_view();
+            self.users_game_state = None;
         }
         self.users_game = game;
     }
@@ -3513,8 +3574,13 @@ impl ShipApp {
             } else {
                 None
             };
+            let position_game_id = if self.users_game_state.as_deref() == Some("execution") {
+                game_id
+            } else {
+                None
+            };
             let _ = tx.send(LiveCmd::WatchGame(game_id));
-            let _ = tx.send(LiveCmd::WatchGamePositions(game_id));
+            let _ = tx.send(LiveCmd::WatchGamePositions(position_game_id));
         }
     }
 
@@ -3597,6 +3663,7 @@ impl ShipApp {
         // otherwise release_game_pieces cannot see newly authoritative
         // hulls and can leave a local sim authority alive.
         self.users_project_stage(&d.state);
+        self.watch_game_channel();
         let placements_seg = match b.placements {
             Ok(view) => {
                 self.apply_placements(view);
@@ -4660,7 +4727,9 @@ impl ShipApp {
     /// hulls. Re-pulls while busy are ignored: the in-flight picture
     /// is the freshest ask.
     fn pull_minos_positions(&mut self) {
-        if self.app_mode != AppMode::Simulation {
+        if self.app_mode != AppMode::Simulation
+            || self.users_game_state.as_deref() != Some("execution")
+        {
             return;
         }
         let Some((gid, _)) = self.users_game.clone() else {
@@ -4693,7 +4762,10 @@ impl ShipApp {
     /// WebSocket position stream; only cadence/status bookkeeping differs.
     fn apply_plot(&mut self, done: PlotDone) {
         let current_id = self.users_game.as_ref().map(|(id, _)| *id);
-        if self.app_mode != AppMode::Simulation || current_id != Some(done.game_id) {
+        if self.app_mode != AppMode::Simulation
+            || self.mode.phase == Phase::Closed
+            || current_id != Some(done.game_id)
+        {
             return;
         }
         match done.result {
@@ -4702,7 +4774,7 @@ impl ShipApp {
                 self.plot_fails = 0;
                 let assumed_time = plot.assumed_time.clone();
                 let update = GamePositionUpdate::from_plot(done.game_id, plot);
-                let n = self.ingest_game_positions(update);
+                let (n, _) = self.ingest_game_positions(update);
                 self.users_status = format!("Exercise plot: {n} hull(s) @ {assumed_time}");
             }
             Err(e) => {
@@ -4715,7 +4787,7 @@ impl ShipApp {
     /// Turn one authoritative MinOS position publication into accepted
     /// Game fixes. The game-scoped poll keeps this independent stream
     /// from affecting Wire/Sim miss counters.
-    fn ingest_game_positions(&mut self, update: GamePositionUpdate) -> usize {
+    fn ingest_game_positions(&mut self, update: GamePositionUpdate) -> (usize, bool) {
         let n = update.positions.len();
         let fixes: Vec<Fix> = update
             .positions
@@ -4748,16 +4820,26 @@ impl ShipApp {
             })
             .collect();
         let acked = self.registry.poll_game(fixes);
-        if !acked.is_empty() {
+        let accepted = !acked.is_empty();
+        if accepted {
             let now = Instant::now();
             for (ship_id, _) in &acked {
+                let arrival_gap = self
+                    .last_seen
+                    .get(ship_id)
+                    .is_some_and(|last| now.saturating_duration_since(*last) > Duration::from_secs(5));
+                if arrival_gap {
+                    self.game_animation_snap.insert(ship_id.clone());
+                } else {
+                    self.game_animation_snap.remove(ship_id);
+                }
                 self.last_seen.insert(ship_id.clone(), now);
                 *self.fix_count.entry(ship_id.clone()).or_insert(0) += 1;
                 self.fix_animation_started.insert(ship_id.clone(), now);
             }
             self.last_poll = now;
         }
-        n
+        (n, accepted)
     }
 
 
@@ -5432,12 +5514,13 @@ impl ShipApp {
                 .map(|(_, n)| n)
                 .unwrap_or_else(|| "pick a session".to_string());
             let prev = self.users_game.clone();
+            let mut selected_game = prev.clone();
             egui::ComboBox::from_label("session")
                 .selected_text(picked)
                 .show_ui(ui, |ui| {
                     for g in &self.users_games {
                         ui.selectable_value(
-                            &mut self.users_game,
+                            &mut selected_game,
                             Some((g.id, g.name.clone())),
                             format!("{} ({})", g.name, g.state),
                         );
@@ -5448,15 +5531,14 @@ impl ShipApp {
                 self.users_refresh_directory();
                 self.users_refresh_game();
             }
-            if self.users_game != prev {
+            if selected_game != prev {
                 // A newly held game takes its stage from Minos, never
                 // from a local default: the resync inside the refresh
                 // projects Planning/Ready/Live/Eval off the detail read.
                 // Route the picker through the same held-game boundary
                 // as joins and bundle applies so old Registry data cannot
                 // survive a direct assignment.
-                let selected = self.users_game.take();
-                self.set_held_game(selected);
+                self.set_held_game(selected_game);
                 // The clock read belongs to the old hold — writes will
                 // re-read it for the new one.
                 self.minos_clock = None;
@@ -7559,25 +7641,26 @@ impl ShipApp {
         let setup_label = self.setup_op.as_ref().map(|op| op.label);
         if let Some(res) = self.setup_op.as_ref().and_then(|op| op.poll()) {
             self.setup_op = None;
-            match res {
-                Ok(done) => self.apply_setup(done),
-                Err(e) => {
-                    self.pending_placement = None;
-                    let line = match setup_label {
-                        Some(l) => format!("{l} failed: {e}"),
-                        None => format!("setup failed: {e}"),
-                    };
-                    self.feed(line.clone());
-                    self.users_status = line;
+            if self.app_mode == AppMode::Simulation {
+                match res {
+                    Ok(done) => self.apply_setup(done),
+                    Err(e) => {
+                        self.pending_placement = None;
+                        let line = match setup_label {
+                            Some(l) => format!("{l} failed: {e}"),
+                            None => format!("setup failed: {e}"),
+                        };
+                        self.feed(line.clone());
+                        self.users_status = line;
+                    }
                 }
+                self.dispatch_queued_refresh();
+                self.resume_pending_placement();
             }
-            self.dispatch_queued_refresh();
-            self.resume_pending_placement();
         }
-        // The WebSocket position stream is the primary source. If it is
-        // quiet for five seconds, use REST once per second as a recovery
-        // path rather than allowing the marker to go stale between sparse
-        // samples. A busy op never piles — the pull guards itself.
+        // The WebSocket game-position stream is an accelerator. The
+        // documented interim source is the REST plot; if the socket is
+        // quiet, recover through REST once per second.
         let game_stream_fresh = self
             .last_game_position_at
             .is_some_and(|at| at.elapsed() < Duration::from_secs(5));
@@ -12353,6 +12436,9 @@ fn main() -> Result<(), String> {
                 last_poll: Instant::now(),
                 last_game_position_at: None,
                 fix_animation_started: HashMap::new(),
+                animation_paused_fraction: HashMap::new(),
+                game_animation_snap: HashSet::new(),
+                reconnect_snap: HashSet::new(),
                 hidden: HashSet::new(),
                 following: None,
                 show_trail: true,

@@ -302,7 +302,6 @@ impl Registry {
             fix.seq = self.next_seq;
             self.next_seq += 1;
             let pair = (fix.ship_id.clone(), fix.seq);
-            seen.insert(fix.ship_id.clone());
             match self.ships.get_mut(&fix.ship_id) {
                 Some(s) => {
                     // A connected exercise's authoritative Game source
@@ -316,37 +315,59 @@ impl Registry {
                     }
                     let game_takes_authority = fix.source == FixSource::Game
                         && s.latest.source != FixSource::Game;
+                    if fix.backfilled
+                        && !game_takes_authority
+                        && fix.epoch_nanos() <= s.latest.epoch_nanos()
+                    {
+                        let inserted =
+                            s.track.iter().all(|old| old.epoch_nanos() != fix.epoch_nanos());
+                        if inserted {
+                            let at = s
+                                .track
+                                .iter()
+                                .position(|old| old.epoch_nanos() > fix.epoch_nanos())
+                                .unwrap_or(s.track.len());
+                            s.track.insert(at, fix);
+                            while s.track.len() > self.bound.max_fixes {
+                                s.track.pop_front();
+                            }
+                            acked.push(pair);
+                        }
+                        continue;
+                    }
                     // Instant order, not string order (mixed `Z`/offsets).
                     if !game_takes_authority
                         && fix.epoch_nanos() <= s.latest.epoch_nanos()
                     {
                         continue; // out-of-order or duplicate: drop
                     }
+                    let backfilled = fix.backfilled;
+                    let current_id = fix.ship_id.clone();
                     let previous = std::mem::replace(&mut s.latest, fix.clone());
                     s.previous = Some(previous);
-                    // A newer fix at the same coordinate may update the
-                    // heading, but it must not add another visible Trail dot.
-                    let same_position = s
-                        .track
-                        .back()
-                        .is_some_and(|last| last.position == fix.position);
-                    if !same_position {
-                        s.track.push_back(fix);
-                        while s.track.len() > self.bound.max_fixes {
-                            s.track.pop_front();
-                        }
+                    s.track.push_back(fix);
+                    while s.track.len() > self.bound.max_fixes {
+                        s.track.pop_front();
+                    }
+                    if !backfilled {
+                        seen.insert(current_id);
                     }
                     s.missed = 0;
                     s.stale = false;
                     acked.push(pair);
                 }
                 None => {
+                    let current_id = fix.ship_id.clone();
+                    let backfilled = fix.backfilled;
                     let mut track = VecDeque::new();
                     track.push_back(fix.clone());
                     self.ships.insert(
-                        fix.ship_id.clone(),
+                        current_id.clone(),
                         ShipState { latest: fix, previous: None, track, missed: 0, stale: false },
                     );
+                    if !backfilled {
+                        seen.insert(current_id);
+                    }
                     acked.push(pair);
                 }
             }
@@ -380,7 +401,15 @@ impl Registry {
                 latest: s.latest.clone(),
                 stale: s.stale,
                 silent: false,
-                trail: s.track.iter().map(|f| f.position).collect(),
+                trail: {
+                    let mut trail = Vec::new();
+                    for fix in &s.track {
+                        if trail.last() != Some(&fix.position) {
+                            trail.push(fix.position);
+                        }
+                    }
+                    trail
+                },
                 source: s.latest.source,
             })
             .collect();
@@ -560,6 +589,18 @@ mod tests {
         r.poll(vec![]);
         assert!(r.ships()[0].stale); // 3rd miss: stale, marker kept
         assert_eq!(r.ships().len(), 1);
+    }
+
+    #[test]
+    fn backfilled_history_enters_track_without_moving_latest() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![fix("a", 53.5, 9.9, "2026-09-12T00:00:10Z")]);
+        let mut historical = fix("a", 53.4, 9.9, "2026-09-12T00:00:00Z");
+        historical.backfilled = true;
+        r.poll(vec![historical]);
+        let ships = r.ships();
+        assert_eq!(ships[0].latest.position.latitude, 53.5);
+        assert_eq!(ships[0].trail.len(), 2);
     }
 
     #[test]

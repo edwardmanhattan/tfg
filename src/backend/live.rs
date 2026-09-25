@@ -118,6 +118,9 @@ pub enum LiveEvent {
     /// One authoritative MinOS game-position publication. The game id
     /// travels with it so a late event cannot enter another exercise.
     GamePositions(GamePositionUpdate),
+    /// A reconnect standing picture was merged. The next accepted
+    /// Wire sample for a listed ship must snap, not animate a gap.
+    Resynced,
     /// The reconnect picture no longer names these operational vessels.
     /// The UI removes them instead of leaving a permanently stale marker.
     Vanished(Vec<String>),
@@ -137,6 +140,8 @@ pub enum LiveCmd {
     /// Watch the caller's personal channel (H11): `personal:<user>`,
     /// or unsubscribe with None.
     WatchPersonal(Option<i64>),
+    /// Re-emit the current known picture after the UI resets its view.
+    Reseed,
     Shutdown,
 }
 
@@ -196,6 +201,9 @@ struct LiveShared {
     /// fix — and only a resync removes ships the picture no longer
     /// names (see `resync_snapshot`).
     known: std::sync::Mutex<std::collections::HashMap<String, Fix>>,
+    /// Historical fixes rescued during a reconnect resync. They belong
+    /// in the Track but are not the current known position.
+    historical: std::sync::Mutex<Vec<Fix>>,
     live: std::sync::atomic::AtomicBool,
     /// One-shot picture emission (H6): armed by the connect-time merge
     /// and every resync, consumed by the next poll. Polls otherwise
@@ -206,10 +214,9 @@ struct LiveShared {
 
 impl LiveShared {
     /// Drain the queue in arrival order (M5): every publication flows,
-    /// not just the newest per ship. The timestamp guard in
-    /// `merge_fixes` still drops anything older than known, so
-    /// retransmits never emit — but intermediate points reach the
-    /// Registry and the Track keeps them.
+    /// not just the newest per ship. The timestamp guard drops ordinary
+    /// retransmits; explicitly backfilled history is allowed through
+    /// so the Track can retain it without moving the current marker.
     fn drain_in_order(&self) -> Vec<Fix> {
         if let Ok(mut q) = self.queue.lock() {
             q.drain(..).map(|ev| ev.to_fix()).collect()
@@ -218,12 +225,17 @@ impl LiveShared {
         }
     }
 
-    /// Timestamp-guarded overlay of fixes onto the known picture: a
-    /// fix at or before the known stamp for its ship is dropped
-    /// loudly, never applied. Snapshots and socket bursts both funnel
-    /// through here, so their arrival order stops mattering. Returns
-    /// the accepted fixes — the poll side emits exactly these, so the
-    /// Registry only ever sees fresh data (H6).
+    fn drain_historical(&self) -> Vec<Fix> {
+        self.historical
+            .lock()
+            .map(|mut fixes| fixes.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Timestamp-guarded overlay of fixes onto the known picture. A
+    /// backfilled historical fix is still emitted for Track insertion,
+    /// but it never replaces a newer live known position. Ordinary stale
+    /// retransmits are dropped as before.
     fn merge_fixes(&self, fixes: Vec<Fix>, tag: &str) -> Vec<Fix> {
         let mut accepted = Vec::with_capacity(fixes.len());
         if fixes.is_empty() {
@@ -232,11 +244,28 @@ impl LiveShared {
         if let Ok(mut known) = self.known.lock() {
             for fix in fixes {
                 let id = fix.ship_id.clone();
-                match known.get(&id) {
-                    Some(prev) if prev.epoch_nanos() >= fix.epoch_nanos() => {
+                let previous = known.get(&id).map(|prev| prev.epoch_nanos());
+                if fix.backfilled {
+                    if previous.is_some_and(|stamp| stamp >= fix.epoch_nanos()) {
+                        eprintln!(
+                            "[LIVE-dbg] historical: unit={id} {tag} ts={} <= known ts={}",
+                            fix.ts,
+                            known.get(&id).map(|p| p.ts.as_str()).unwrap_or("")
+                        );
+                    } else {
+                        known.insert(id, fix.clone());
+                    }
+                    // Historical fixes belong in the Track even when the
+                    // current marker keeps the newer known position.
+                    accepted.push(fix);
+                    continue;
+                }
+                match previous {
+                    Some(stamp) if stamp >= fix.epoch_nanos() => {
                         eprintln!(
                             "[LIVE-dbg] drop: unit={id} {tag} ts={} <= known ts={}",
-                            fix.ts, prev.ts
+                            fix.ts,
+                            known.get(&id).map(|p| p.ts.as_str()).unwrap_or("")
                         );
                     }
                     _ => {
@@ -263,6 +292,25 @@ impl LiveShared {
     fn resync_snapshot(&self, picture: Vec<Fix>) -> Vec<String> {
         let queued = self.drain_in_order();
         let queued_accepted = self.merge_fixes(queued, "socket");
+        let historical: Vec<Fix> = if let Ok(known) = self.known.lock() {
+            queued_accepted
+                .iter()
+                .filter(|fix| {
+                    fix.backfilled
+                        && known
+                            .get(&fix.ship_id)
+                            .is_some_and(|current| current.epoch_nanos() > fix.epoch_nanos())
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !historical.is_empty()
+            && let Ok(mut pending) = self.historical.lock()
+        {
+            pending.extend(historical);
+        }
         let mut ids: std::collections::HashSet<String> =
             picture.iter().map(|f| f.ship_id.clone()).collect();
         // A queued socket fix is proof of life. It must be included in
@@ -331,6 +379,7 @@ impl LiveWire {
         let shared = std::sync::Arc::new(LiveShared {
             queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             known: std::sync::Mutex::new(std::collections::HashMap::new()),
+            historical: std::sync::Mutex::new(Vec::new()),
             // H5: not live until the handshake says so — the actor is
             // born down, and the first on_connected raises it. Polls
             // read as feed-down until then, never as a live picture.
@@ -357,18 +406,18 @@ impl LiveWire {
 }
 
 impl PollSource for LiveWire {
-    /// Fresh fixes only (H6): the accepted socket burst, plus the
-    /// one-shot picture when a (re)connect armed it. Replaying the
-    /// whole known picture every round froze Registry misses (a
-    /// duplicate marks `seen` without resetting) and inflated
-    /// last-seen/fix counts — a ship that stops publishing now goes
-    /// stale after 3 missed 2 s polls instead of never.
+    /// Fresh fixes plus historical Track inserts, and the one-shot
+    /// picture when a (re)connect armed it. Replaying the whole known
+    /// picture every round froze Registry misses; historical backfill
+    /// is emitted only when it carries information the current picture
+    /// does not.
     fn poll(&mut self) -> Result<Vec<Fix>, BackendError> {
         if !self.shared.live.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(Vec::new()); // actor down: feed-down reads as stale
         }
         let fresh = self.shared.drain_in_order();
         let mut out = self.shared.merge_fixes(fresh, "socket");
+        out.extend(self.shared.drain_historical());
         if self.shared.take_seed() {
             match self.shared.known.lock() {
                 Ok(known) => out.extend(known.values().cloned()),
@@ -508,6 +557,7 @@ fn run_actor(
                         // ship live on the socket is never reaped by an
                         // older picture.
                         let gone = shared.resync_snapshot(snap.fixes);
+                        let _ = event_tx.send(LiveEvent::Resynced);
                         if !gone.is_empty() {
                             let _ = event_tx.send(LiveEvent::Vanished(gone));
                         }
@@ -696,6 +746,10 @@ fn run_actor(
                         id,
                     );
                 }
+                Ok(LiveCmd::Reseed) => {
+                    shared.seed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = wake_tx.send(());
+                }
                 Ok(LiveCmd::Shutdown) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     break;
                 }
@@ -756,6 +810,7 @@ mod tests {
         std::sync::Arc::new(LiveShared {
             queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             known: std::sync::Mutex::new(std::collections::HashMap::new()),
+            historical: std::sync::Mutex::new(Vec::new()),
             live: std::sync::atomic::AtomicBool::new(true),
             seed: std::sync::atomic::AtomicBool::new(false),
         })

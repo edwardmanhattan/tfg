@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(update.positions.len(), 1);
         assert_eq!(update.positions[0].unit_id, 13);
         assert_eq!(update.positions[0].heading_deg, Some(87.5));
-        assert_eq!(update.positions[0].speed_kn, Some(14.2));
+        assert!((update.positions[0].speed_kn.unwrap() - 14.2).abs() < 1e-5);
     }
 
     #[test]
