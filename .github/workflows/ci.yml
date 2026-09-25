@@ -202,7 +202,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & "${{ github.workspace }}\target\maplibre-native\platform\windows\Get-VendorPackages.ps1" -Triplet x64-windows -Renderer OpenGL -With-ICU
+          $ErrorActionPreference = "Stop"
+          & "${{ github.workspace }}\target\maplibre-native\platform\windows\Get-VendorPackages.ps1" -Triplet "x64-windows" -Renderer "OpenGL" -With-ICU
+          if ($LASTEXITCODE -ne 0) { throw "MapLibre vendor setup failed with exit code $LASTEXITCODE" }
           "MLN_LOCAL_REPOSITORY=${{ github.workspace }}\target\maplibre-native" >> $env:GITHUB_ENV
 
       - name: Install Rust
