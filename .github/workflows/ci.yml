@@ -62,6 +62,7 @@ jobs:
             glslang-dev \
             glslang-tools \
             libcurl4-openssl-dev \
+            libdbus-1-dev \
             libfontconfig-dev \
             libicu-dev \
             libjpeg-turbo8-dev \
