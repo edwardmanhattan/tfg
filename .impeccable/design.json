@@ -297,7 +297,7 @@
       },
       "body": {
         "displayName": "Body",
-        "purpose": "Labels, rows, values, help lines — the workhorse."
+        "purpose": "Labels, rows, values, help lines \u2014 the workhorse."
       },
       "button": {
         "displayName": "Button",
@@ -313,7 +313,7 @@
       },
       "mono": {
         "displayName": "Mono",
-        "purpose": "Event feed and session-log lines — machine output only."
+        "purpose": "Event feed and session-log lines \u2014 machine output only."
       }
     },
     "shadows": [
@@ -325,7 +325,7 @@
       {
         "name": "popup-cast",
         "value": "6px 10px 8px rgba(0,0,0,0.376)",
-        "purpose": "Combobox and menu popups only — one step tighter than an island."
+        "purpose": "Combobox and menu popups only \u2014 one step tighter than an island."
       },
       {
         "name": "none-on-rules",
@@ -345,9 +345,9 @@
         "purpose": "Unit markers interpolate between accepted fixes (Registry::blend); the glide clock restarts only on genuinely new data."
       },
       {
-        "name": "tile-throttle",
-        "value": "2s track / 4s zoom / 6s jump",
-        "purpose": "Map scene rebuild cadence (TRACK/ZOOM/JUMP pumps); the last texture is drawn translated underneath so gestures never step."
+        "name": "tile-pump",
+        "value": "2 pumps / 4 pumps / 6 pumps",
+        "purpose": "Map scene rebuild cadence (TRACK/ZOOM/JUMP). These are PUMP COUNTS, not seconds: pump() is N x (render_once + sleep 50ms), so a jump is ~300ms. The last texture is drawn translated underneath so gestures never step."
       }
     ],
     "breakpoints": []
@@ -365,7 +365,7 @@
       "name": "Selected Toggle",
       "kind": "button",
       "refersTo": "button-selected",
-      "description": "Toolbar island switch / desktop tab in the ON state — the highest-contrast pairing in the system.",
+      "description": "Toolbar island switch / desktop tab in the ON state \u2014 the highest-contrast pairing in the system.",
       "html": "<button class=\"ds-toggle\" aria-pressed=\"true\">Session</button>",
       "css": ".ds-toggle { background: #3C3C3C; color: #B4B4B4; font: 300 13px 'Ubuntu Light', system-ui, sans-serif; padding: 6px 10px; border: 0; border-radius: 6px; cursor: pointer; transition: background .2s ease, color .2s ease; }\n.ds-toggle:hover { background: rgba(34,211,238,.16); color: #F0F0F0; }\n.ds-toggle:focus-visible { outline: 2px solid #22D3EE; outline-offset: 1px; }\n.ds-toggle[aria-pressed=\"true\"] { background: #22D3EE; color: #020617; }\n.ds-toggle[aria-pressed=\"true\"]:hover { background: #22D3EE; color: #020617; }"
     },
@@ -373,7 +373,7 @@
       "name": "Text Field",
       "kind": "input",
       "refersTo": "text-field",
-      "description": "A well cut into the panel — darker than its island so the field reads as recessed.",
+      "description": "A well cut into the panel \u2014 darker than its island so the field reads as recessed.",
       "html": "<input class=\"ds-field\" type=\"password\" placeholder=\"password\">",
       "css": ".ds-field { background: #020617; color: #8C8C8C; font: 300 13px 'Ubuntu Light', system-ui, sans-serif; padding: 6px 10px; width: 280px; max-width: 100%; border: 1px solid #334155; border-radius: 6px; }\n.ds-field::placeholder { color: #8C8C8C; opacity: .6; }\n.ds-field:focus { outline: none; border-color: #22D3EE; }\n.ds-field::selection { background: #22D3EE; color: #020617; }\n.ds-field:disabled { opacity: .5; }"
     },
@@ -382,7 +382,7 @@
       "kind": "card",
       "refersTo": "island",
       "description": "Floating window over the map: navy pane, 1px hairline, 8px corners, one 18px heading.",
-      "html": "<section class=\"ds-island\"><h2 class=\"ds-island-title\">Roster</h2><p class=\"ds-island-body\">3 ships — click a name to follow</p></section>",
+      "html": "<section class=\"ds-island\"><h2 class=\"ds-island-title\">Roster</h2><p class=\"ds-island-body\">3 ships \u2014 click a name to follow</p></section>",
       "css": ".ds-island { background: #0F172A; color: #8C8C8C; font: 300 13px 'Ubuntu Light', system-ui, sans-serif; border: 1px solid #334155; border-radius: 8px; padding: 6px; box-shadow: 10px 20px 15px rgba(0,0,0,.376); max-width: 420px; }\n.ds-island-title { margin: 0 0 8px; font-size: 18px; font-weight: 300; color: #8C8C8C; }\n.ds-island-body { margin: 0 0 8px; line-height: 1.4; }\n.ds-island:focus-within { border-color: #334155; }"
     },
     {
@@ -390,13 +390,13 @@
       "kind": "nav",
       "refersTo": "toolbar",
       "description": "Full-width, unrounded chrome band: island toggles left, zoom and clock right.",
-      "html": "<nav class=\"ds-toolbar\"><button class=\"ds-toggle ds-toolbar-toggle\" aria-pressed=\"true\">Session</button><span class=\"ds-toolbar-clock\">GAME 14:20 · G+01:12 (24×)</span></nav>",
+      "html": "<nav class=\"ds-toolbar\"><button class=\"ds-toggle ds-toolbar-toggle\" aria-pressed=\"true\">Session</button><span class=\"ds-toolbar-clock\">GAME 14:20 \u00b7 G+01:12 (24\u00d7)</span></nav>",
       "css": ".ds-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; background: #0F172A; color: #8C8C8C; font: 300 13px 'Ubuntu Light', system-ui, sans-serif; padding: 6px 10px; border-radius: 0; border-bottom: 1px solid #334155; }\n.ds-toolbar-toggle { border-radius: 6px; }\n.ds-toolbar-clock { margin-left: auto; font-variant-numeric: tabular-nums; }"
     },
     {
       "name": "Status Line",
       "kind": "custom",
-      "description": "State ink by message content — green/sand/red/gray, never gray-on-gray, never animated.",
+      "description": "State ink by message content \u2014 green/sand/red/gray, never gray-on-gray, never animated.",
       "html": "<p class=\"ds-status ds-status-ok\">connected to live feed</p><p class=\"ds-status ds-status-fail\">socket error: refused</p>",
       "css": ".ds-status { margin: 0 0 8px; font: 300 13px 'Ubuntu Light', system-ui, sans-serif; color: #808080; }\n.ds-status-ok { color: #4ADE80; }\n.ds-status-warn { color: #FABF69; }\n.ds-status-fail { color: #F87171; }\n.ds-status-idle { color: #808080; }"
     },
@@ -410,12 +410,12 @@
   ],
   "narrative": {
     "northStar": "The Night Ops Console",
-    "overview": "Calm, exact, mission-grade. The app is a dark navy instrument console laid\nover a night tile map: the map owns the whole window, the chrome is a thin\nband at the top plus movable islands floating over it, and every pixel of\nornament that isn't carrying state has been taken out. The reference feeling\nis a darkened exercise room — legible under glare on a field laptop and\nequally legible on a desk monitor at 02:00 — not a consumer dashboard and\ndefinitely not a neon HUD.\n\nDensity is deliberate. This is an Operate surface: an organizer or commander\nscans rows, toggles islands, and reads a clock under time pressure, so the\nlayout favours compact rows, hairline separation and short labels over airy\ncards. Expression lives in a very small number of precise details — the\nsingle cyan state signal, the ringed map symbology, the two-font split —\nand nowhere else. Confirmed visual anti-reference: decorative cyberpunk /\ngamer-chrome glow, and friendly rounded SaaS card stacks.\n\nThe map is the room's only light source. Everything else is a navy panel\nthat stays quiet until it has something to say, and when it does it says it\nin colored ink (green/amber/red/yellow) rather than in motion, badges, or\nanimation. The product's own doctrine — *present, never predict* — is the\naesthetic doctrine too: the interface reports accepted state and does not\nperform.",
+    "overview": "Calm, exact, mission-grade. The app is a dark navy instrument console laid\nover a night tile map: the map owns the whole window, the chrome is a thin\nband at the top plus movable islands floating over it, and every pixel of\nornament that isn't carrying state has been taken out. The reference feeling\nis a darkened exercise room \u2014 legible under glare on a field laptop and\nequally legible on a desk monitor at 02:00 \u2014 not a consumer dashboard and\ndefinitely not a neon HUD.\n\nDensity is deliberate. This is an Operate surface: an organizer or commander\nscans rows, toggles islands, and reads a clock under time pressure, so the\nlayout favours compact rows, hairline separation and short labels over airy\ncards. Expression lives in a very small number of precise details \u2014 the\nsingle cyan state signal, the ringed map symbology, the two-font split \u2014\nand nowhere else. Confirmed visual anti-reference: decorative cyberpunk /\ngamer-chrome glow, and friendly rounded SaaS card stacks.\n\nThe map is the room's only light source. Everything else is a navy panel\nthat stays quiet until it has something to say, and when it does it says it\nin colored ink (green/amber/red/yellow) rather than in motion, badges, or\nanimation. The product's own doctrine \u2014 *present, never predict* \u2014 is the\naesthetic doctrine too: the interface reports accepted state and does not\nperform.",
     "keyCharacteristics": [
       "One radar-cyan signal on a navy console; no second chrome accent.",
-      "Depth is tonal (chrome → slate → well) plus a 1px hairline, not shadow.",
+      "Depth is tonal (chrome \u2192 slate \u2192 well) plus a 1px hairline, not shadow.",
       "Ubuntu Light for people, Hack for machines; two type roles, no more.",
-      "Circles are map objects, rectangles are controls — never the reverse.",
+      "Circles are map objects, rectangles are controls \u2014 never the reverse.",
       "Status is always colored ink; idle is the only gray state."
     ],
     "rules": [
@@ -427,7 +427,7 @@
       {
         "name": "The Rank Rule",
         "section": "colors",
-        "body": "Green → Blue → Purple → Orange encodes group rank and nothing else. A rank color on a button, a label, or a panel is a bug."
+        "body": "Green \u2192 Blue \u2192 Purple \u2192 Orange encodes group rank and nothing else. A rank color on a button, a label, or a panel is a bug."
       },
       {
         "name": "The Never Gray-On-Gray Rule",
@@ -442,25 +442,25 @@
       {
         "name": "The Hairline Rule",
         "section": "elevation",
-        "body": "Every panel edge is exactly 1px of Hairline Slate. If a surface needs to feel raised, it steps a tone lighter — it does not get a bigger shadow, a glow, or a second border."
+        "body": "Every panel edge is exactly 1px of Hairline Slate. If a surface needs to feel raised, it steps a tone lighter \u2014 it does not get a bigger shadow, a glow, or a second border."
       }
     ],
     "dos": [
       "**Do** route every state-bearing message through the status ink function (green / sand / red / gray) before it reaches a label.",
       "**Do** keep Radar Cyan to live state: selection, links, hover/press wash, and toggle ON. Solid cyan with Deep Well text is the ON treatment.",
-      "**Do** separate panels with a 1px Hairline Slate stroke and step a tone for depth (Console Night → Panel Slate → Deep Well).",
+      "**Do** separate panels with a 1px Hairline Slate stroke and step a tone for depth (Console Night \u2192 Panel Slate \u2192 Deep Well).",
       "**Do** use the 8px island / 6px control radius pair exactly; 8px means container, 6px means control.",
-      "**Do** put machine output — event feed, session logs, ids — in Hack, and cap island body scroll at 420px (300px for the Roster and Fleet lists).",
+      "**Do** put machine output \u2014 event feed, session logs, ids \u2014 in Hack, and cap island body scroll at 420px (300px for the Roster and Fleet lists).",
       "**Do** draw map objects as circles with 2px rings and label them in Map Ink at 12px; keep zone fills at 70/255 alpha under an opaque 2px rank stroke.",
-      "**Do** keep the map canvas frameless and full-window — UI floats over it, never insets it."
+      "**Do** keep the map canvas frameless and full-window \u2014 UI floats over it, never insets it."
     ],
     "donts": [
       "**Don't** introduce a second chrome accent, a gradient, or a glow; the palette is one cyan plus navy neutrals plus scoped semantic hues.",
-      "**Don't** put a rank color (green/blue/purple/orange) on chrome — it is reserved for group rank on the map.",
-      "**Don't** ship gray-on-gray status, and don't animate to announce state — color says it first.",
+      "**Don't** put a rank color (green/blue/purple/orange) on chrome \u2014 it is reserved for group rank on the map.",
+      "**Don't** ship gray-on-gray status, and don't animate to announce state \u2014 color says it first.",
       "**Don't** add a third typeface, bold body text for emphasis, or monospace for anything a human wrote.",
       "**Don't** reach for a bigger shadow when a surface needs presence; use the hairline and a tonal step.",
-      "**Don't** round the toolbar, and don't add a filled \"brand\" primary button — resting controls stay graphite.",
+      "**Don't** round the toolbar, and don't add a filled \"brand\" primary button \u2014 resting controls stay graphite.",
       "**Don't** invent breakpoints or responsive stacking: this is a desktop window with movable islands."
     ]
   }
