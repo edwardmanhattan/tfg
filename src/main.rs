@@ -12498,6 +12498,9 @@ fn main() -> Result<(), String> {
     if std::env::args().any(|arg| arg == "--check-runtime") {
         return runtime_self_check(&paths);
     }
+    if std::env::args().any(|arg| arg == "--probe-gpu") {
+        return tfg::gpuprobe::probe();
+    }
     let map_cache = tfg::map_render::prepare_runtime_cache(&paths.map_cache)?;
     let initial_log = paths.initial_log.clone();
     let session_seq = tfg::log::next_session_seq(&paths.log_dir);

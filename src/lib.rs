@@ -1,6 +1,7 @@
 //! Presentation-mode ship map client (library root).
 //!
 //! - [`geo`]: Fix / Ship / Track / Trail model + smoothing (see CONTEXT.md).
+//! - [`gpuprobe`]: `--probe-gpu`, the graphics capability check.
 //! - [`camera`]: the eased camera move on an operator recentre.
 //! - [`chrome`]: island chrome — the floating-panel shell (see ADR-0014).
 //! - [`backend`]: v0 poll contract: `PollSource`, file replay, HTTP stub.
@@ -13,6 +14,7 @@ pub mod chrome;
 pub mod clock;
 pub mod command;
 pub mod fleet;
+pub mod gpuprobe;
 pub mod groups;
 pub mod geo;
 pub mod land;

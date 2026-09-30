@@ -312,6 +312,24 @@ jobs:
           target/release/${{ matrix.binary }} --check-runtime
           target/release/${{ matrix.binary }} --version
 
+      # --check-runtime validates assets, the tile seed and the local store.
+      # It never creates a graphics context, so nothing else in this build
+      # proves the binary can actually render. This does: instance, adapter,
+      # device, one off-screen pass, timed. Reported rather than enforced,
+      # because a CI runner may legitimately have no GPU and fall back to a
+      # software rasteriser — that is a quality tier, not a build failure.
+      - name: Probe graphics capability
+        shell: bash
+        continue-on-error: true
+        run: |
+          target/release/${{ matrix.binary }} --probe-gpu 2>&1 | tee "$RUNNER_TEMP/gpu-probe.txt"
+          {
+            echo '### GPU probe'
+            echo '```'
+            cat "$RUNNER_TEMP/gpu-probe.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Package Linux distribution
         if: runner.os == 'Linux'
         shell: bash
