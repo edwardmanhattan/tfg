@@ -1647,6 +1647,15 @@ struct ShipApp {
     /// Execution windows (roster/orders/log): run-local visibility,
     /// opened by the start path, never by toolbar toggles.
     show_roster: bool,
+    /// Island top-lefts, owned by [`tfg::chrome`] rather than by egui's
+    /// Window memory (ADR-0014). An island positions itself, so its origin
+    /// lives here and is written back after the island closes.
+    roster_pos: egui::Pos2,
+    inspector_pos: egui::Pos2,
+    orders_pos: egui::Pos2,
+    login_pos: egui::Pos2,
+    log_pos: egui::Pos2,
+    messages_pos: egui::Pos2,
     show_orders: bool,
     show_log: bool,
     /// Onboarding (ticket #77): boots to State A (Login), through
@@ -10900,7 +10909,17 @@ impl eframe::App for ShipApp {
         let mut follow_req: Option<(String, (f64, f64))> = None;
         if self.show_roster && (self.session_live() || self.app_mode == AppMode::Presentation) {
             let mut open = self.show_roster;
-            egui::Window::new("Roster").movable(true).default_size([300.0, 360.0]).default_pos(egui::pos2(816.0, 64.0)).open(&mut open).show(ui.ctx(), |ui| {
+            // Island chrome, not egui::Window (ADR-0014): egui::Frame can
+            // only paint a rounded rect, so a chamfered body is impossible
+            // on a native Window. The island owns its own position, so it
+            // is copied out and written back.
+            let mut pos = self.roster_pos;
+            let spec = tfg::chrome::Island::new(
+                egui::Id::new("Roster"),
+                "Roster",
+                egui::vec2(300.0, 420.0),
+            );
+            tfg::chrome::island_scrolled(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
             ui.label(format!("{} ships — click a name to follow", markers.len()));
             if markers.is_empty() {
                 ui.weak("No ships in view — place hulls from Fleet, or check the feed.");
@@ -10912,10 +10931,11 @@ impl eframe::App for ShipApp {
                 ui.checkbox(&mut self.show_trail, "trails");
             }
             ui.separator();
-            // Scrollbar ticket: the marker list is unbounded, so it gets
-            // its own cap (300px, same as the Fleet hull list) while the
-            // header, trails toggle, and unfollow stay pinned outside it.
-            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+            // The island body scrolls as one column (chrome::island_scrolled),
+            // so the marker list no longer carries its own 300px cap. That
+            // cap existed to stop a Window growing; a fixed-footprint
+            // island does not grow.
+            {
             for m in &markers {
                 ui.horizontal(|ui| {
                     let mut shown = !self.hidden.contains(&m.id);
@@ -10959,7 +10979,7 @@ impl eframe::App for ShipApp {
                     }
                 });
             }
-            });
+            }
             // Silent vessels (REST mapping ticket): announced but never
             // reported — listed so silence and non-existence stay distinct.
             // No follow, no select: there is no position to show.
@@ -11012,6 +11032,7 @@ impl eframe::App for ShipApp {
             ui.separator();
             });
             self.show_roster = open;
+            self.roster_pos = pos;
         }
         // Inspector: selection-driven (Inspector-model ticket). The window
         // exists iff a selection exists; closing it deselects. Ships get
@@ -11019,7 +11040,13 @@ impl eframe::App for ShipApp {
         // command + focus actions.
         if self.selection.is_some() {
             let mut open = true;
-            egui::Window::new("Inspector").movable(true).default_size([300.0, 320.0]).default_pos(egui::pos2(816.0, 440.0)).open(&mut open).show(ui.ctx(), |ui| {
+            let mut pos = self.inspector_pos;
+            let spec = tfg::chrome::Island::new(
+                egui::Id::new("Inspector"),
+                "Inspector",
+                egui::vec2(300.0, 320.0),
+            );
+            tfg::chrome::island_scrolled(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
             ui.heading("Inspector");
             let mut follow_selected: Option<(String, (f64, f64))> = None;
             let mut focus_group: Option<(String, (f64, f64))> = None;
@@ -11292,6 +11319,7 @@ impl eframe::App for ShipApp {
             }
             ui.separator();
             });
+            self.inspector_pos = pos;
             if !open {
                 self.deselect();
             }
@@ -11299,7 +11327,13 @@ impl eframe::App for ShipApp {
         // Orders island: Live-only; observers get no orders pane at all.
         if self.show_orders && self.mode.live() && !self.is_observer() {
             let mut open = self.show_orders;
-            egui::Window::new("Orders").movable(true).default_size([380.0, 360.0]).default_pos(egui::pos2(500.0, 250.0)).open(&mut open).show(ui.ctx(), |ui| {
+            let mut pos = self.orders_pos;
+            let spec = tfg::chrome::Island::new(
+                egui::Id::new("Orders"),
+                "Orders",
+                egui::vec2(380.0, 360.0),
+            );
+            tfg::chrome::island_scrolled(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
             // Direct HelmOrder surface: one selected unit at a time,
             // with MinOS authority in Live mode and a labelled local
             // sandbox projection in Simulation mode.
@@ -11486,31 +11520,53 @@ impl eframe::App for ShipApp {
             }
             });
             self.show_orders = open;
+            self.orders_pos = pos;
         }
         if self.show_login {
             let mut open = self.show_login;
-            egui::Window::new("Login").movable(true).default_pos(egui::pos2(8.0, 120.0)).open(&mut open).show(ui.ctx(), |ui| {
+            let mut pos = self.login_pos;
+            let spec = tfg::chrome::Island::new(
+                egui::Id::new("Login"),
+                "Login",
+                egui::vec2(300.0, 300.0),
+            );
+            tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
                 egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
                 self.login_island(ui);
                 });
             });
             self.show_login = open;
+            self.login_pos = pos;
         }
         if self.show_log && (self.session_live() || self.app_mode == AppMode::Presentation) {
             let mut open = self.show_log;
-            egui::Window::new("Log").movable(true).default_size([420.0, 260.0]).default_pos(egui::pos2(8.0, 480.0)).open(&mut open).show(ui.ctx(), |ui| {
+            let mut pos = self.log_pos;
+            let spec = tfg::chrome::Island::new(
+                egui::Id::new("Log"),
+                "Log",
+                egui::vec2(420.0, 260.0),
+            );
+            tfg::chrome::island_scrolled(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
                 self.log_island(ui);
             });
             self.show_log = open;
+            self.log_pos = pos;
         }
         // Messages island (H11): socket-arrived game mail. Visible in
         // both modes once mail exists or the session opens it.
         if self.show_messages {
             let mut open = self.show_messages;
-            egui::Window::new("Messages").movable(true).default_size([420.0, 300.0]).default_pos(egui::pos2(8.0, 170.0)).open(&mut open).show(ui.ctx(), |ui| {
+            let mut pos = self.messages_pos;
+            let spec = tfg::chrome::Island::new(
+                egui::Id::new("Messages"),
+                "Messages",
+                egui::vec2(420.0, 300.0),
+            );
+            tfg::chrome::island_scrolled(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
                 self.messages_island(ui);
             });
             self.show_messages = open;
+            self.messages_pos = pos;
         }
         if let Some((ship, at)) = follow_req {
             self.request_frame(&ship, at);
@@ -12629,6 +12685,12 @@ fn main() -> Result<(), String> {
                 session_seq,
                 transcript: Vec::new(),
                 show_roster: false,
+                roster_pos: egui::pos2(816.0, 64.0),
+                inspector_pos: egui::pos2(816.0, 440.0),
+                orders_pos: egui::pos2(500.0, 250.0),
+                login_pos: egui::pos2(8.0, 120.0),
+                log_pos: egui::pos2(8.0, 480.0),
+                messages_pos: egui::pos2(8.0, 170.0),
                 show_orders: false,
                 show_log: false,
                 onboard: Onboard::Login,

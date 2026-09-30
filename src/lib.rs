@@ -1,11 +1,13 @@
 //! Presentation-mode ship map client (library root).
 //!
 //! - [`geo`]: Fix / Ship / Track / Trail model + smoothing (see CONTEXT.md).
+//! - [`chrome`]: island chrome — the floating-panel shell (see ADR-0014).
 //! - [`backend`]: v0 poll contract: `PollSource`, file replay, HTTP stub.
 
 pub mod assets;
 pub mod backend;
 pub mod catalog;
+pub mod chrome;
 pub mod clock;
 pub mod command;
 pub mod fleet;

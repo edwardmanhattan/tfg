@@ -276,33 +276,51 @@ does not author its own shadow vocabulary; it inherits egui's stock shadows,
 which stay small and dark and are never the thing that communicates depth.
 
 ### Shadow Vocabulary
-- **Island cast** (`box-shadow: 10px 20px 15px rgba(0,0,0,0.376)`): the
-  default window shadow behind every floating island. Present for separation
-  from the moving map, not for drama.
+- **Island cast** (hard offset, `5px 6px` flat black at 120/255 alpha): the
+  default shadow behind every floating island. Present for separation from
+  the moving map, not for drama.
 - **Popup cast** (`box-shadow: 6px 10px 8px rgba(0,0,0,0.376)`): combobox
   and menu popups only — one step tighter than an island.
 - **No shadow on rules.** Separators and indent lines are a 1px #3C3C3C
   stroke with zero elevation; markers on the map carry depth with a 2px white
   ring, never a glow.
 
+**Why the island cast is hard, not blurred.** A blurred shadow is a fill-rate
+cost proportional to kernel radius, and it is the first thing in this
+document that stops being affordable on a software rasteriser or a weak
+integrated GPU. A hard offset is one extra mesh, reads as a graphic-design
+shadow rather than a drop shadow, and matches the tonal intent better than a
+soft blur would. Islands use the hard cast. Popups inherit egui's stock cast
+because they are small, transient, and never over the map.
+
 ### Named Rules
 **The Hairline Rule.** Every panel edge is exactly 1px of Hairline Slate.
 If a surface needs to feel raised, it steps a tone lighter — it does not get
 a bigger shadow, a glow, or a second border.
+
+**The One Exception.** The island's cut edge is 2px, and it is the only edge
+in the application that is not 1px. It is a signal, not a border: it tells
+you the surface is chamfered and therefore draggable. See Shapes.
 
 ## Shapes
 
 Two shapes, two meanings. Rectangles are controls and containers; circles are
 objects on the map. Nothing mixes them.
 
-- **Islands and windows** — gently curved corners at an 8px radius; menus
-  match at 6px.
+- **Islands and windows** — the top-right corner is **chamfered 20px**, and
+  the cut is stroked 2px in a cool grey brighter than Hairline Slate. Every
+  other corner stays square. Menus keep a 6px radius and are never chamfered.
 - **Controls** — buttons, toggles, checkboxes, selects and text fields all
   sit at a 6px radius. The radius is uniform across the whole widget family,
   so a control is recognisable by silhouette alone at a glance.
 - **Non-interactive chrome** — dividers, toolbar and unrounded panels stay
   square (2px where egui rounds a frame internally). Corner radius signals
-  "you can touch this".
+  "you can touch this"; the chamfer signals "this whole surface moves".
+- **The cut edge is never cyan.** Radar Cyan is reserved for live state. The
+  cut is a cool grey (`#8C9BAE`), and it brightens on hover only. If the cut
+  is ever promoted to cyan it must mean "this surface owns input" and be lit
+  only on the focused island — a rule extension with a reason, never a
+  decoration.
 - **Map symbology is pure circle geometry**: an 8px filled unit marker with
   a 2px white ring; a 12px ring for focus states (yellow = followed,
   light blue = selected, amber = old data); a 10px flag disc with a 2px white
@@ -310,6 +328,20 @@ objects on the map. Nothing mixes them.
   at 55% of the unit color.
 - **Zones** are translucent fills (70/255 alpha) with an opaque 2px stroke of
   the same rank color — outline is the shape, fill is only a hint.
+
+### Why the chamfer exists
+
+An angled edge is localised faster than a fade, because an eye can track an
+edge and cannot track a dissolve. The operator's attention is on the map and
+the islands are peripheral, so the cut is doing perception work, not
+decoration work.
+
+It is a polygon painted *around* an axis-aligned content rect, which is why it
+costs paint and not layout. That property is load-bearing: it is the only
+reason a chamfered island is viable without rewriting the islands' contents.
+It does not extend to sheared or slanted panels — a shear insets the top-left
+corner, so any fixed content inset pokes through the diagonal, and the
+maintenance cost lands on every widget rather than once.
 
 ## Components
 
@@ -343,15 +375,25 @@ when touched.
 ### Cards / Containers (Islands)
 - **Character:** quiet navy panes that float over the map and never compete
   with it.
-- **Corner Style:** 8px radius.
-- **Background:** Console Night; inset/secondary areas step to Panel Slate;
-  input wells step to Deep Well.
-- **Border:** 1px Hairline Slate on every side — the only edge treatment.
-- **Shadow Strategy:** stock island cast (see Elevation & Depth); the hairline
+- **Corner Style:** 20px chamfer on the top-right corner, 2px cut edge, all
+  other corners square.
+- **Background:** Console Night; the title band steps to Panel Slate; inset
+  and secondary areas step to Panel Slate; input wells step to Deep Well.
+- **Border:** 1px Hairline Slate on every side. The cut edge is the one 2px
+  exception (see The One Exception).
+- **Shadow Strategy:** hard island cast (see Elevation & Depth); the hairline
   does the real work.
-- **Internal Padding:** 6px island margin; rows separated by 10 × 8px; body
-  content scrolls at a 420px cap.
-- **Title:** one 18px Heading, sentence case, no eyebrow or kicker line.
+- **Internal Padding:** 12px island margin; rows separated by 10 × 8px.
+- **Title:** a 30px title band carrying one 12.5px monospace label in
+  short caps with 1.8px letter-spacing. The band is the drag region and the
+  only part of the island that moves it; the close button sits at its right,
+  clear of the chamfer.
+- **Fixed footprint:** an island does not resize to fit its content. The body
+  scrolls. A panel that grows under the cursor while someone is reading a map
+  is worse than one that scrolls, and a stable silhouette is what makes the
+  chamfer read as a shape rather than as a frame that happens to be there.
+- **Title-band hover** brightens the cut edge. Nothing else about the island
+  changes on hover.
 
 ### Inputs / Fields
 - **Style:** Deep Well background (darker than the island, so a field reads
@@ -394,10 +436,13 @@ when touched.
   and toggle ON. Solid cyan with Deep Well text is the ON treatment.
 - **Do** separate panels with a 1px Hairline Slate stroke and step a tone for
   depth (Console Night → Panel Slate → Deep Well).
-- **Do** use the 8px island / 6px control radius pair exactly; 8px means
-  container, 6px means control.
+- **Do** chamfer the island's top-right corner 20px and stroke the cut 2px in
+  cool grey; keep every other corner square.
+- **Do** use the 6px control radius exactly, and reserve the island's
+  chamfer for islands. 6px means control, chamfer means container.
 - **Do** put machine output — event feed, session logs, ids — in Hack, and
-  cap island body scroll at 420px (300px for the Roster and Fleet lists).
+  give every island a fixed footprint with a scrolling body rather than a
+  body that grows the island.
 - **Do** draw map objects as circles with 2px rings and label them in Map Ink
   at 12px; keep zone fills at 70/255 alpha under an opaque 2px rank stroke.
 - **Do** keep the map canvas frameless and full-window — UI floats over it,
@@ -405,7 +450,8 @@ when touched.
 
 ### Don't:
 - **Don't** introduce a second chrome accent, a gradient, or a glow; the
-  palette is one cyan plus navy neutrals plus scoped semantic hues.
+  palette is one cyan plus navy neutrals plus scoped semantic hues. The one
+  exception is the island's cut edge, which is a cool grey and never cyan.
 - **Don't** put a rank color (green/blue/purple/orange) on chrome — it is
   reserved for group rank on the map.
 - **Don't** ship gray-on-gray status, and don't animate to announce state —
