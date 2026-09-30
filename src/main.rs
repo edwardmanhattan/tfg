@@ -1674,6 +1674,11 @@ struct ShipApp {
     /// channel pump consumed a value, or a hull is mid-glide. Drives the
     /// on-demand repaint in `ui`.
     dirty: bool,
+    /// The shader seam. Carries the capability tier and egui's own target
+    /// format, so the halo pipeline can only ever be built for the format
+    /// it is drawn into. At `Quality::Low` it draws nothing and the map
+    /// looks exactly as it did before this existed.
+    fx: tfg::fx::Fx,
     show_orders: bool,
     show_log: bool,
     /// Onboarding (ticket #77): boots to State A (Login), through
@@ -12288,6 +12293,13 @@ impl eframe::App for ShipApp {
                 }
                 // Layer 4: all state rings over every body, in the
                 // prescribed selected → follow → old-data order.
+                //
+                // The rings are the channel; the shader halo reinforces the
+                // same three states rather than adding a fourth meaning.
+                // Collected here and painted after the rings so the additive
+                // pass lands on top of them, and skipped entirely at
+                // Quality::Low — the epaint rings are the whole visual then.
+                let mut halos: Vec<(egui::Pos2, tfg::fx::Halo, f32)> = Vec::new();
                 for m in &markers {
                     if self.hidden.contains(&m.id) {
                         continue;
@@ -12299,9 +12311,13 @@ impl eframe::App for ShipApp {
                             12.0,
                             egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE),
                         );
+                        halos.push((c, tfg::fx::Halo::Signal, 0.55));
                     }
                     if Some(&m.id) == self.following.as_ref() {
                         painter.circle_stroke(c, 14.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
+                        // Following is a louder state than selected: it is
+                        // where the camera is going.
+                        halos.push((c, tfg::fx::Halo::Signal, 0.75));
                     }
                     if m.old_data {
                         painter.circle_stroke(
@@ -12312,8 +12328,12 @@ impl eframe::App for ShipApp {
                                 egui::Color32::from_rgb(0xF5, 0x9E, 0x0B),
                             ),
                         );
+                        // Amber, weaker: old data is a caveat on what is
+                        // already shown, not a call to action.
+                        halos.push((c, tfg::fx::Halo::Stale, 0.40));
                     }
                 }
+                self.fx.paint_halos(&painter, &halos);
                 // Selected on-map heading handle: the arrow sits on the
                 // thumbnail body and edits only the local helm draft.
                 for (index, marker) in markers.iter().enumerate() {
@@ -12732,6 +12752,29 @@ fn main() -> Result<(), String> {
             // Required once: without image loaders, from_bytes fails.
             egui_extras::install_image_loaders(&cc.egui_ctx);
             apply_ops_theme(&cc.egui_ctx);
+            // The shader seam takes egui's own render state: the adapter's
+            // device type decides the tier, and `target_format` is the exact
+            // format of the pass the halo will be drawn into. Guessing the
+            // format would be a validation error at draw time rather than a
+            // wrong pixel, so it is taken rather than assumed.
+            let fx = match cc.wgpu_render_state.as_ref() {
+                Some(state) => tfg::fx::Fx::new(
+                    tfg::fx::Quality::from_device_type(state.adapter.get_info().device_type),
+                    state.target_format,
+                ),
+                // No wgpu state (a glow backend, or a creation context that
+                // never reached the painter): no shaders, and a placeholder
+                // format that is never used because the tier draws nothing.
+                None => tfg::fx::Fx::new(
+                    tfg::fx::Quality::Low,
+                    eframe::egui_wgpu::wgpu::TextureFormat::Rgba8Unorm,
+                ),
+            };
+            eprintln!(
+                "fx: {:?} on {:?}",
+                fx.quality(),
+                cc.wgpu_render_state.as_ref().map(|s| s.target_format)
+            );
             // Boot restore (spec-sync ticket): stored spec figures become
             // runtime catalog classes before the first frame, so register
             // hulls placed last session drive again without refetching.
@@ -12819,6 +12862,7 @@ fn main() -> Result<(), String> {
                 messages_pos: egui::pos2(8.0, 170.0),
                 glide: tfg::camera::Glide::new(CENTER),
                 dirty: false,
+                fx: tfg::fx::Fx::new(tfg::fx::Quality::Low, eframe::egui_wgpu::wgpu::TextureFormat::Rgba8Unorm),
                 show_orders: false,
                 show_log: false,
                 onboard: Onboard::Login,
@@ -13049,6 +13093,7 @@ fn main() -> Result<(), String> {
                 real_ts: None,
                 game_ts: None,
             };
+            app.fx = fx;
             app.reload_unit_symbols();
             // M3: wake the last session when its refresh token survived
             // in the keyring — a cold launch otherwise asks for login.

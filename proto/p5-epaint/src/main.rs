@@ -55,6 +55,11 @@ mod camera;
 #[path = "../../../src/gpuprobe.rs"]
 mod gpuprobe;
 
+// The shader seam. Its WGSL is compiled by the real driver here rather than
+// assumed valid, and the draw is checked for non-zero output.
+#[path = "../../../src/fx/mod.rs"]
+mod fx;
+
 // ---------------------------------------------------------------------------
 // Tokens, mirrored from DESIGN.md and apply_ops_theme (main.rs:12294).
 //
@@ -1001,6 +1006,15 @@ fn main() -> eframe::Result {
     // `--gpu-probe` runs the real `src/gpuprobe.rs` and exits, so the
     // capability check can be exercised on a real machine rather than only
     // type-checked.
+    if args.iter().any(|a| a == "--fx-selftest") {
+        return match fx_selftest() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("fx selftest FAILED: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
     if args.iter().any(|a| a == "--gpu-probe") {
         return match gpuprobe::probe() {
             Ok(()) => Ok(()),
@@ -1049,4 +1063,172 @@ fn main() -> eframe::Result {
             }))
         }),
     )
+}
+
+
+/// Compile and draw the shipped halo on the real device, then read the
+/// target back and assert it is not empty.
+///
+/// This is the only way to know the WGSL is valid: `cargo build` checks
+/// Rust, not WGSL, and a bad shader only fails at pipeline creation at
+/// runtime. It also proves the shader writes anything at all, rather than
+/// compiling to a no-op.
+///
+/// The uniform is written here from the layout documented in `src/fx`,
+/// independently of the module, so a drift between the two shows up as a
+/// blank target rather than passing silently.
+fn fx_selftest() -> Result<(), String> {
+    use eframe::egui_wgpu::wgpu;
+
+    const SIZE: u32 = 256;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|e| format!("runtime: {e}"))?;
+    rt.block_on(async {
+        let instance = wgpu::Instance::default();
+        let mut adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+        if adapters.is_empty() {
+            return Err("no adapter".to_string());
+        }
+        adapters.sort_by_key(|a| match a.get_info().device_type {
+            wgpu::DeviceType::DiscreteGpu => 0,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            _ => 2,
+        });
+        let adapter = adapters.swap_remove(0);
+        let info = adapter.get_info();
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("fx selftest"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| format!("device: {e}"))?;
+
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        let pipeline = fx::build_pipeline(&device, fmt).ok_or("build_pipeline returned None")?;
+        println!("fx: pipeline built for {fmt:?} on {:?}", info.device_type);
+
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fx target"),
+            size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: fmt,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fx uniform"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Centre of the target, radius HALO_R of 256px: centre_half = (0,0,half,half).
+        let half = (fx::HALO_R / SIZE as f32) * 2.0;
+        let mut bytes = [0u8; 32];
+        for (i, f) in [0.0f32, 0.0, half, half, 0.133, 0.827, 0.933, 1.0].iter().enumerate() {
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+        }
+        queue.write_buffer(&uniform, 0, &bytes);
+
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fx bg"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }],
+        });
+
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fx"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..6, 0..1);
+            drop(pass);
+        }
+
+        let row = SIZE * 4;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fx readback"),
+            size: (row * SIZE) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(SIZE),
+                },
+            },
+            wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+        );
+        queue.submit([enc.finish()]);
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(5)) })
+            .map_err(|e| format!("poll: {e}"))?;
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| format!("mapped range: {e:?}"))?;
+
+        let centre = (SIZE as usize / 2 * row as usize) + SIZE as usize / 2 * 4;
+        let edge_x = (SIZE as usize / 2 * row as usize) + (SIZE as usize * 3 / 4) * 4;
+        let total = SIZE as usize * SIZE as usize * 4;
+        let mut peak = 0u32;
+        for i in (0..total).step_by(4) {
+            let v = data[i] as u32 + data[i + 1] as u32 + data[i + 2] as u32;
+            if v > peak {
+                peak = v;
+            }
+        }
+        let lit = data[centre] as u32 + data[centre + 1] as u32 + data[centre + 2] as u32;
+        let outside = data[edge_x] as u32 + data[edge_x + 1] as u32 + data[edge_x + 2] as u32;
+        drop(data);
+        readback.unmap();
+
+        println!("fx: peak channel sum {peak}, centre {lit}, off-radius {outside}");
+        if peak == 0 {
+            return Err("target is empty — the shader drew nothing".to_string());
+        }
+        if lit == 0 {
+            return Err("nothing at the halo centre — uniform layout drifted".to_string());
+        }
+        if outside != 0 {
+            return Err(format!("wrote {outside} outside the halo radius — falloff is wrong"));
+        }
+        println!("fx: OK — WGSL compiled by {:?}, drew, and falls off correctly", info.device_type);
+        Ok::<(), String>(())
+    })
 }
