@@ -1,11 +1,13 @@
 //! Presentation-mode ship map client (library root).
 //!
 //! - [`geo`]: Fix / Ship / Track / Trail model + smoothing (see CONTEXT.md).
+//! - [`camera`]: the eased camera move on an operator recentre.
 //! - [`chrome`]: island chrome — the floating-panel shell (see ADR-0014).
 //! - [`backend`]: v0 poll contract: `PollSource`, file replay, HTTP stub.
 
 pub mod assets;
 pub mod backend;
+pub mod camera;
 pub mod catalog;
 pub mod chrome;
 pub mod clock;

@@ -427,6 +427,102 @@ when touched.
   opaque rank stroke, and a flag disc carrying lat/lon, drawn only at or
   above zoom 11.
 
+## Motion
+
+The rest of this document says *don't* a great deal. This section says **how**,
+because a console with no motion vocabulary drifts into either deadness or
+gamer-chrome, and both are failures.
+
+### The governing idea
+
+Motion is for three things only: telling the operator the interface heard
+them, keeping a state change legible, and making a jump in space
+intelligible. Anything else is decoration, and decoration on
+information-dense chrome hinders.
+
+**The frequency rule.** The more often something happens, the less it may
+move. A 100x/day action gets no animation at all. A keyboard shortcut never
+gets animation — a shortcut repeated hundreds of times a day with a
+transition on it feels slow and disconnected, and it is always a pointer-free
+path anyway. A once-per-exercise transition can be generous.
+
+### Easing
+
+egui's animation is linear in elapsed time, with the curve chosen by the
+caller: `emath::easing::*` carries the vocabulary. There are no spring
+physics here, because egui retargets an in-flight animation from its current
+value (`animation_manager.rs`) — an eased tween is correct, and a hand-rolled
+spring is a reinvention.
+
+| Curve | Use for |
+| --- | --- |
+| `cubic_out` | Everything that enters or moves. Decelerating: a surface should settle into place, never accelerate away from it. |
+| `quadratic_in_out` | Two-ended transitions where both start and end are visible (a tab indicator travelling between tabs). |
+| `linear` | Nothing. It is a default, not a choice. |
+
+### Durations
+
+| Moment | Duration | Note |
+| --- | --- | --- |
+| Press feedback | 0 | Colour state only. Never a transition. |
+| Island / control hover | 0 | Cut-edge brightening is instantaneous. |
+| Island open, panel step, tab change | 150-200ms | `cubic_out` |
+| Camera recentre on a hull | 300ms | `cubic_out`, on centre only — never on zoom |
+| Zoom step (the `-`/`+` buttons) | 200ms | `cubic_out`. The wheel is a continuous gesture and is never tweened. |
+| Simulation phase change | 250ms | `cubic_out`. Once per phase, so it may be generous. |
+
+### What may animate
+
+- **Camera centre and zoom**, on a deliberate operator action. The map's
+  texture already lags the camera and is drawn translated underneath it
+  (the "buttery canvas" pass), so an eased camera makes that lag read as
+  intent rather than as a stutter.
+- **Island and wizard step entrances**, 150-200ms `cubic_out`, entering from
+  the direction the operator came from. Back and Next leave by the same edge
+  they arrived on.
+- **A tab or phase indicator** travelling between a fixed set of positions.
+  Eased, because both ends are visible and the eye can follow the edge.
+- **A surface's own state** — hover wash, cut-edge brightness, press fill.
+
+### What may not animate
+
+- **Unit markers.** Data the operator is reading does not move for style.
+  Markers glide between accepted fixes because that is display interpolation
+  (ADR-0011), not animation, and it must never be extended, slowed, eased,
+  or given a stagger.
+- **Anything that pulses.** Specifically: stale markers do not pulse. The
+  wire drops in bulk, staleness is unattended, and an operator judging
+  whether data is real does not need it flapping.
+- **Island open/close.** Islands appear and vanish on an operator's explicit
+  action, and the close button is already the feedback. An entrance
+  transition here delays the thing the operator asked for.
+- **Lists.** No stagger, no draw-in. The roster, the log, and the feed
+  re-populate continuously; a stagger would re-fire constantly and read as
+  noise.
+- **Anything keyboard-initiated.**
+
+### Reduced motion
+
+`style.animation_time = 0.0` collapses every egui animation to its target
+immediately (`animation_manager.rs`), including the island fade. The client
+exposes a single switch; it is not per-component.
+
+### The frame clock
+
+egui drives transitions itself: an in-flight animation calls
+`request_repaint()`, so motion runs at display rate regardless of the
+client's repaint floor. The `request_repaint_after(100ms)` call is a
+**deadline, not a rate cap** — it guarantees a frame when nothing else has
+asked for one, so animations are not starved by it.
+
+What the floor actually costs is a full layout pass ten times a second while
+the console is idle and nothing is moving. For an air-gapped laptop station
+that is a battery cost, and it is why "Offline is a first-class state" is not
+quite true yet: the client never actually reaches zero. The fix is to replace
+the unconditional floor with a request on demand — from animation code, and
+from the wire when a fix arrives. That is an efficiency change, not a
+smoothness prerequisite.
+
 ## Do's and Don'ts
 
 ### Do:

@@ -1656,6 +1656,12 @@ struct ShipApp {
     login_pos: egui::Pos2,
     log_pos: egui::Pos2,
     messages_pos: egui::Pos2,
+    /// Eased camera (`src/camera.rs`). `center` is the live, displayed
+    /// value and is rewritten from this once per frame; `center` stays the
+    /// single thing every projection and hit-test reads, so the two never
+    /// disagree — not even mid-glide, when the tile underneath is still
+    /// catching up.
+    glide: tfg::camera::Glide,
     show_orders: bool,
     show_log: bool,
     /// Onboarding (ticket #77): boots to State A (Login), through
@@ -8716,16 +8722,33 @@ impl ShipApp {
     }
 
     /// Ask the map thread for a frame centered on `at` for `ship`. The
-    /// camera jumps now; the texture catches up translated underneath.
+    /// camera eases now; the texture catches up translated underneath.
     fn request_frame(&mut self, ship: &str, at: (f64, f64)) {
         let Some(tx) = self.map_req_tx.clone() else {
             return; // shutting down
         };
         self.map_seq += 1;
         self.recentering = Some(ship.to_string());
-        self.center = at;
+        self.glide_to(at);
         eprintln!("recentering on {ship}…");
         let _ = tx.send((self.map_seq, at, self.zoom, self.map_px, JUMP_PUMP));
+    }
+
+    /// Eased camera move. Retargeting mid-flight restarts the ramp from
+    /// where the camera currently is, so clicking a second hull during a
+    /// glide continues from there instead of jumping.
+    fn glide_to(&mut self, at: (f64, f64)) {
+        self.glide.retarget(at);
+        self.center = self.glide.at;
+    }
+
+    /// Direct manipulation — a pan or an anchor-preserving zoom — must be
+    /// 1:1 with the pointer, so it bypasses the easing entirely. `step`
+    /// rewrites `center` from `glide` every frame, so the ramp has to be
+    /// cleared here or the next frame would drag the camera back.
+    fn snap_camera(&mut self, at: (f64, f64)) {
+        self.glide.snap(at);
+        self.center = at;
     }
 
     /// Follow-tracking frame (task #45): light pump, no recenter label.
@@ -8736,7 +8759,7 @@ impl ShipApp {
         };
         self.map_seq += 1;
         self.recentering = Some(ship.to_string());
-        self.center = at;
+        self.glide_to(at);
         let _ = tx.send((self.map_seq, at, self.zoom, self.map_px, TRACK_PUMP));
     }
 
@@ -8757,7 +8780,10 @@ impl ShipApp {
             return; // shutting down
         };
         self.map_seq += 1;
-        let _ = tx.send((self.map_seq, self.center, self.zoom, self.map_px, pump));
+        // Chase the goal, not the current position: during a glide the
+        // camera is still travelling, and rendering where it is going lets
+        // the texture resolve in one request instead of one per frame.
+        let _ = tx.send((self.map_seq, self.glide.goal, self.zoom, self.map_px, pump));
     }
 
     /// Zoom step (slice iii): clamps, re-renders, and reports. Zones give
@@ -10656,6 +10682,14 @@ impl eframe::App for ShipApp {
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_map(ui.ctx());
+        // Camera glide (src/camera.rs): advance the eased camera and mirror
+        // it into `center` before anything reads it, so the overlay
+        // projection, the hit-tests and the painted picture all agree on
+        // where the camera is this frame. egui requests the repaints itself
+        // while a ramp is in flight, so this costs one call while the
+        // camera is travelling and nothing at all once it has settled.
+        self.glide.step(ui.ctx(), tfg::camera::GLIDE_SECS);
+        self.center = self.glide.at;
         // M7: harvest off-thread REST before rendering, so statuses
         // and lists are a frame fresh at most.
         self.pump_rest_ops();
@@ -11313,7 +11347,8 @@ impl eframe::App for ShipApp {
                 self.request_frame(&ship, at);
             }
             if let Some((gid, at)) = focus_group {
-                self.center = at;
+                // `request_frame` owns the camera move; pre-assigning here
+                // would fight the ramp.
                 self.zoom = self.zoom.max(ZONE_ZOOM);
                 self.request_frame(&gid, at);
             }
@@ -11813,14 +11848,18 @@ impl eframe::App for ShipApp {
                         let delta = response.drag_delta();
                         if delta.x != 0.0 || delta.y != 0.0 {
                             let (mw, mh) = self.map_dims();
-                            self.center = unproject_mercator(
+                            // Pan is direct manipulation: 1:1 with the
+                            // pointer, never eased. `snap_camera` clears
+                            // the ramp so the next frame's `step` does not
+                            // drag the camera back toward a stale goal.
+                            self.snap_camera(unproject_mercator(
                                 mw / 2.0 - delta.x as f64,
                                 mh / 2.0 - delta.y as f64,
                                 self.center,
                                 self.zoom,
                                 mw,
                                 mh,
-                            );
+                            ));
                             self.zoom_dirty = true;
                             // H1: keep repainting while the gesture runs; the
                             // idle 100ms cadence resumes when it ends.
@@ -11875,7 +11914,6 @@ impl eframe::App for ShipApp {
                             // Click-to-expand (grill #24): center the group
                             // and zoom in to its zone; the group selection
                             // opens its Inspector and arms group command.
-                            self.center = (flag.1, flag.2);
                             self.zoom = self.zoom.max(ZONE_ZOOM);
                             self.select_group(flag.0.clone());
                             self.request_frame(&flag.0, (flag.1, flag.2));
@@ -12037,7 +12075,10 @@ impl eframe::App for ShipApp {
                         if new != old {
                             if let Some(pos) = response.hover_pos() {
                                 let (mw, mh) = self.map_dims();
-                                self.center = anchor_center(
+                                // The wheel is a continuous gesture, so
+                                // the anchor correction is exact and
+                                // uneased — snapping, not gliding.
+                                self.snap_camera(anchor_center(
                                     (pos.x - rect.min.x) as f64,
                                     (pos.y - rect.min.y) as f64,
                                     self.center,
@@ -12045,7 +12086,7 @@ impl eframe::App for ShipApp {
                                     new,
                                     mw,
                                     mh,
-                                );
+                                ));
                             }
                             self.zoom = new;
                             eprintln!("zoom {new:.1}");
@@ -12691,6 +12732,7 @@ fn main() -> Result<(), String> {
                 login_pos: egui::pos2(8.0, 120.0),
                 log_pos: egui::pos2(8.0, 480.0),
                 messages_pos: egui::pos2(8.0, 170.0),
+                glide: tfg::camera::Glide::new(CENTER),
                 show_orders: false,
                 show_log: false,
                 onboard: Onboard::Login,
