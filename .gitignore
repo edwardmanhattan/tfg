@@ -1,2 +1,7 @@
 /target
 .env
+# Nested build trees: the prototype harness and the vendored MapLibre core
+# both compile in place and are several GB. Untracked is not ignored, so
+# without these a `git add proto/` would stage the whole debug directory.
+/proto/*/target
+/vendor/*/target

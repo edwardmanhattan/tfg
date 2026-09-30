@@ -1,0 +1,18 @@
+[package]
+name = "p5-epaint"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately NOT a member of tfg, and deliberately tiny. tfg pulls
+# maplibre_native (C++/cmake/cxx) and rusqlite bundled; none of that is
+# needed to answer "can epaint draw a hard-cut panel", and every one of
+# those minutes is a minute the prototype doesn't get to be iterated on.
+#
+# eframe's defaults include `wgpu` and exclude `glow`, so this renders
+# through the same egui-wgpu path tfg uses.
+[dependencies]
+eframe = "0.36"
+egui = "0.36"
+epaint = "0.36"
+tokio = { version = "1", features = ["rt"] }
