@@ -517,11 +517,25 @@ asked for one, so animations are not starved by it.
 
 What the floor actually costs is a full layout pass ten times a second while
 the console is idle and nothing is moving. For an air-gapped laptop station
-that is a battery cost, and it is why "Offline is a first-class state" is not
-quite true yet: the client never actually reaches zero. The fix is to replace
-the unconditional floor with a request on demand — from animation code, and
-from the wire when a fix arrives. That is an efficiency change, not a
-smoothness prerequisite.
+that is a battery cost, and it is why "Offline is a first-class state" was not
+quite true: the client never actually reached zero.
+
+The floor is now on demand. A frame is requested when a channel pump consumed
+something, when a hull is mid-glide, when the camera is easing, or when a
+REST request is outstanding (that last one at a 50ms cadence, because a login
+is an operator staring at a button and must not wait on anything). Otherwise
+a 2s watchdog fires.
+
+The watchdog is deliberate and temporary. Freshness deadlines, image URL
+expiry and the game clock can all change display state without crossing a
+channel, and they are not all enumerated. A 2s backstop turns a missed case
+into a two-second-old readout rather than a frozen console, for one frame per
+two seconds instead of ten. Removing it is the change that makes an idle
+console cost genuinely nothing, and it should not be removed until every
+timer in that list is event-driven.
+
+A paused simulation is stationary, so it does not hold the loop awake: a hull
+frozen part-way between two fixes needs no frames until it unpauses.
 
 ## Do's and Don'ts
 

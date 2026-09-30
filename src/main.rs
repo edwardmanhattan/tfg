@@ -321,6 +321,14 @@ const TRACK_PUMP: u32 = 2;
 /// Slowest follow re-request rate: tiles can't arrive faster than the
 /// network, so chasing harder only renders stale centers (task #45).
 const TRACK_MIN_INTERVAL_MS: u64 = 800;
+/// Idle backstop for the repaint loop. Long enough to be nearly free on an
+/// idle station, short enough that a repaint we failed to anticipate shows
+/// up as a two-second-old readout instead of a hung console. See the
+/// on-demand repaint in `ShipApp::ui`.
+const WATCHDOG_REPAINT: Duration = Duration::from_secs(2);
+/// Cadence while a REST request is outstanding — fast enough that a login
+/// result lands in one frame, and only paid for while something is pending.
+const REST_POLL_REPAINT: Duration = Duration::from_millis(50);
 /// Lead a followed ship by this many seconds of dead reckoning, so tile
 /// fetches run ahead of motion instead of behind it (task #45).
 const TRACK_LEAD_SECS: f64 = 8.0;
@@ -1662,6 +1670,10 @@ struct ShipApp {
     /// disagree — not even mid-glide, when the tile underneath is still
     /// catching up.
     glide: tfg::camera::Glide,
+    /// Set when something changed that nothing else will wake us for: a
+    /// channel pump consumed a value, or a hull is mid-glide. Drives the
+    /// on-demand repaint in `ui`.
+    dirty: bool,
     show_orders: bool,
     show_log: bool,
     /// Onboarding (ticket #77): boots to State A (Login), through
@@ -2543,6 +2555,13 @@ impl ShipApp {
                     raw_frac
                 };
                 self.reconcile_helm_preview(&s.ship_id, frac);
+                // A hull between fixes is a 1-2s interpolation (ADR-0011),
+                // not an animation, but it still needs frames. A paused sim
+                // holds its fraction and is already stationary, so it must
+                // not keep the loop awake.
+                if !paused && frac < 1.0 {
+                    self.dirty = true;
+                }
                 let pos = self.registry.blend(&s.ship_id, frac).unwrap_or(s.latest.position);
                 let (x, y) = project_mercator(pos.latitude, pos.longitude, center, self.zoom, mw, mh);
                 let trail = s
@@ -7665,9 +7684,27 @@ impl ShipApp {
     /// Frame pump for off-thread REST (M7): harvest finished ops and
     /// apply them on the UI thread. Slots clear as they resolve, so a
     /// failed op never wedges its button — the status line says why.
+    /// Any REST request still in flight. A completed request is polled
+    /// without a waker, so while one is outstanding the loop has to keep
+    /// asking for frames — otherwise a login would sit on a dead console
+    /// until the watchdog fired.
+    fn rest_in_flight(&self) -> bool {
+        self.login_op.is_some()
+            || self.refresh_op.is_some()
+            || self.sync_op.is_some()
+            || self.spec_op.is_some()
+            || self.pw_op.is_some()
+            || self.plot_op.is_some()
+            || self.setup_op.is_some()
+            || self.log_op.is_some()
+            || self.image_op.is_some()
+    }
+
     fn pump_rest_ops(&mut self) {
         if let Some(res) = self.login_op.as_ref().and_then(|op| op.poll()) {
             self.login_op = None;
+            // A completed request is invisible until a frame asks for it.
+            self.dirty = true;
             match res {
                 Ok(done) => self.apply_login(done),
                 Err(e) => self.auth_status = e,
@@ -7675,19 +7712,27 @@ impl ShipApp {
         }
         if let Some(res) = self.refresh_op.as_ref().and_then(|op| op.poll()) {
             self.refresh_op = None;
+            // A completed request is invisible until a frame asks for it.
+            self.dirty = true;
             let user = self.auth_user.clone().unwrap_or_default();
             self.apply_refresh(user, res);
         }
         if let Some(res) = self.sync_op.as_ref().and_then(|op| op.poll()) {
             self.sync_op = None;
+            // A completed request is invisible until a frame asks for it.
+            self.dirty = true;
             self.apply_sync(res);
         }
         if let Some(res) = self.spec_op.as_ref().and_then(|op| op.poll()) {
             self.spec_op = None;
+            // A completed request is invisible until a frame asks for it.
+            self.dirty = true;
             self.apply_specs(res);
         }
         if let Some(res) = self.pw_op.as_ref().and_then(|op| op.poll()) {
             self.pw_op = None;
+            // A completed request is invisible until a frame asks for it.
+            self.dirty = true;
             // The worker always resolves into a staged outcome; unwrap
             // either side into it.
             self.apply_password(res.unwrap_or_else(|e| e));
@@ -7698,6 +7743,8 @@ impl ShipApp {
             .and_then(|slot| slot.op.poll().map(|result| (slot.game_id, result)))
         {
             self.plot_op = None;
+            // A completed request is invisible until a frame asks for it.
+            self.dirty = true;
             match result {
                 Ok(done) => self.apply_plot(done),
                 Err(e) => self.apply_plot(PlotDone { game_id, result: Err(e) }),
@@ -7707,6 +7754,8 @@ impl ShipApp {
         // manifest once, then one temporary URL per pictured hull.
         if let Some(res) = self.image_op.as_ref().and_then(|op| op.poll()) {
             self.image_op = None;
+            // A completed request is invisible until a frame asks for it.
+            self.dirty = true;
             let request = self.image_request.take();
             match res {
                 Ok(out) => self.apply_image(out),
@@ -7734,6 +7783,8 @@ impl ShipApp {
         // harvests here; failures report and keep the old view.
         if let Some(res) = self.log_op.as_ref().and_then(|op| op.poll()) {
             self.log_op = None;
+            // A completed request is invisible until a frame asks for it.
+            self.dirty = true;
             match res {
                 Ok(LogOut::Files(files)) => {
                     self.log_files = files;
@@ -7760,6 +7811,8 @@ impl ShipApp {
         let setup_label = self.setup_op.as_ref().map(|op| op.label);
         if let Some(res) = self.setup_op.as_ref().and_then(|op| op.poll()) {
             self.setup_op = None;
+            // A completed request is invisible until a frame asks for it.
+            self.dirty = true;
             if self.app_mode == AppMode::Simulation {
                 match res {
                     Ok(done) => self.apply_setup(done),
@@ -8702,6 +8755,7 @@ impl ShipApp {
     /// while a fresher tile is in flight. One texture, updated in place.
     fn drain_map(&mut self, ctx: &egui::Context) {
         for (seq, center, zoom, size, img) in self.map_resp_rx.try_iter() {
+            self.dirty = true;
             if seq == self.map_seq {
                 match &mut self.map_tex {
                     Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
@@ -10688,7 +10742,7 @@ impl eframe::App for ShipApp {
         // where the camera is this frame. egui requests the repaints itself
         // while a ramp is in flight, so this costs one call while the
         // camera is travelling and nothing at all once it has settled.
-        self.glide.step(ui.ctx(), tfg::camera::GLIDE_SECS);
+        let gliding = self.glide.step(ui.ctx(), tfg::camera::GLIDE_SECS);
         self.center = self.glide.at;
         // M7: harvest off-thread REST before rendering, so statuses
         // and lists are a frame fresh at most.
@@ -10724,7 +10778,35 @@ impl eframe::App for ShipApp {
         // Group overlays (slice iii, grill #24): recomputed per frame from
         // live marker positions; zones above the zoom threshold, flags below.
         let (zones, flags) = self.group_geometry(&markers);
-        ui.ctx().request_repaint_after(Duration::from_millis(100));
+        // On-demand repaint. The old unconditional 100ms floor guaranteed a
+        // layout pass ten times a second whether or not anything moved; on
+        // an air-gapped laptop station that is the whole cost of an idle
+        // console, and it is why "Offline is a first-class state" was not
+        // quite true.
+        //
+        // A frame is asked for when: a channel pump consumed something, a
+        // hull is mid-glide, the camera is easing, or the operator touched
+        // anything (egui requests a frame per input event on its own).
+        //
+        // The watchdog is the honest part. Freshness deadlines, image URL
+        // expiry and the game clock can all change display state without
+        // anything crossing a channel, and they are not all enumerated
+        // here. A 2s backstop turns a missed case into a stale readout
+        // rather than a frozen console, at a cost of one frame per two
+        // seconds instead of ten. Drop it only once every timer in this
+        // list is event-driven — that is the change that makes an idle
+        // console cost genuinely nothing.
+        if self.dirty || gliding {
+            ui.ctx().request_repaint();
+        } else if self.rest_in_flight() {
+            // Hold the old cadence while a request is outstanding: a login
+            // is the operator staring at a button, and the result must not
+            // wait on the watchdog.
+            ui.ctx().request_repaint_after(REST_POLL_REPAINT);
+        } else {
+            ui.ctx().request_repaint_after(WATCHDOG_REPAINT);
+        }
+        self.dirty = false;
 
         // Onboarding (ticket #77): States A/B — login and mode
         // selection on a clean gradient — draw no toolbar, islands,
@@ -12736,6 +12818,7 @@ fn main() -> Result<(), String> {
                 log_pos: egui::pos2(8.0, 480.0),
                 messages_pos: egui::pos2(8.0, 170.0),
                 glide: tfg::camera::Glide::new(CENTER),
+                dirty: false,
                 show_orders: false,
                 show_log: false,
                 onboard: Onboard::Login,
