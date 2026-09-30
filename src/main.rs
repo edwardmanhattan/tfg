@@ -2375,8 +2375,7 @@ impl ShipApp {
                     self.show_messages = true;
                 }
                 LiveEvent::Resynced => {
-                    let ids: Vec<String> =
-                        self.registry.ships().into_iter().map(|ship| ship.ship_id).collect();
+                    let ids: Vec<String> = self.registry.ship_ids();
                     self.reconnect_snap.extend(ids.iter().cloned());
                     self.game_animation_snap.extend(ids);
                 }
@@ -2462,14 +2461,13 @@ impl ShipApp {
             }
         }
         if rounds > 0 {
-            let ships = self.registry.ships();
+            let ids = self.registry.ship_ids();
             eprintln!(
                 "poll: {} ship(s){}",
-                ships.len(),
-                ships
-                    .iter()
-                    .filter(|s| s.stale)
-                    .map(|s| format!(" [stale: {}]", s.ship_id))
+                ids.len(),
+                ids.iter()
+                    .filter(|id| self.registry.ship(id).is_some_and(|s| s.stale))
+                    .map(|id| format!(" [stale: {id}]"))
                     .collect::<String>()
             );
         }
@@ -4946,9 +4944,7 @@ impl ShipApp {
         ui.label(format!("Unit {id} · direct helm control"));
         let reported = self
             .registry
-            .ships()
-            .iter()
-            .find(|ship| ship.ship_id == id)
+            .ship(id)
             .map(|ship| (ship.latest.heading_deg, ship.latest.speed_kn));
         let (reported_heading, reported_speed) = reported
             .map(|(heading, speed)| (heading.unwrap_or(0.0), speed))
@@ -5223,9 +5219,7 @@ impl ShipApp {
         }
         let reported = self
             .registry
-            .ships()
-            .iter()
-            .find(|ship| ship.ship_id == id)
+            .ship(id)
             .map(|ship| (ship.latest.heading_deg, ship.latest.speed_kn));
         let (reported_heading, reported_speed) = reported
             .map(|(heading, speed)| (heading.unwrap_or(0.0), speed))
@@ -8523,9 +8517,7 @@ impl ShipApp {
         };
         let Some(latest) = self
             .registry
-            .ships()
-            .iter()
-            .find(|ship| ship.ship_id == id)
+            .ship(id)
             .and_then(|ship| ship.latest.heading_deg)
         else {
             self.helm_preview_pending.remove(id);
@@ -8591,9 +8583,7 @@ impl ShipApp {
             .map(|draft| draft.speed_kn)
             .or_else(|| {
                 self.registry
-                    .ships()
-                    .iter()
-                    .find(|ship| ship.ship_id == id)
+                    .ship(id)
                     .and_then(|ship| ship.latest.speed_kn)
             })
             .unwrap_or(0.0);
@@ -9629,9 +9619,9 @@ impl ShipApp {
                 let mut lon_sum = 0.0;
                 let mut count = 0usize;
                 for m in markers.iter().filter(|m| members.iter().any(|u| u == &m.id)) {
-                    if let Some(s) = self.registry.ships().iter().find(|s| s.ship_id == m.id) {
-                        lat_sum += s.latest.position.latitude;
-                        lon_sum += s.latest.position.longitude;
+                    if let Some(pos) = self.registry.position_of(&m.id) {
+                        lat_sum += pos.latitude;
+                        lon_sum += pos.longitude;
                         count += 1;
                     }
                 }
@@ -10959,9 +10949,7 @@ impl eframe::App for ShipApp {
                         // Roster click is a select like a marker click.
                         self.select_ship(m.id.clone());
                         if self.following.as_deref() == Some(&m.id) {
-                            if let Some(s) =
-                                self.registry.ships().iter().find(|s| s.ship_id == m.id)
-                            {
+                            if let Some(s) = self.registry.ship(&m.id) {
                                 follow_req = Some((
                                     m.id.clone(),
                                     (s.latest.position.latitude, s.latest.position.longitude),
@@ -11040,7 +11028,14 @@ impl eframe::App for ShipApp {
             let mut deselect = false;
             match self.selection.clone() {
                 Some(Selection::Ship(id)) => {
-            match self.registry.ships().iter().find(|s| s.ship_id == id).map(|s| (s.latest.clone(), s.stale, s.trail.len())) {
+            // Hoisted out of the `match` scrutinee: the arms below mutate
+            // `self` freely, and this keeps the registry borrow from
+            // overlapping them.
+            let selected = self
+                .registry
+                .ship(&id)
+                .map(|s| (s.latest.clone(), s.stale, s.trail_len));
+            match selected {
                 Some((fix, stale, trail_len)) => {
                     let sim_badge = if fix.source == FixSource::Sim {
                         " (sim)"
@@ -11249,7 +11244,7 @@ impl eframe::App for ShipApp {
                                     let mut lon_sum = 0.0;
                                     let mut count = 0usize;
                                     for m in &members {
-                                        if let Some(s) = self.registry.ships().iter().find(|s| &s.ship_id == m) {
+                                        if let Some(s) = self.registry.ship(m) {
                                             lat_sum += s.latest.position.latitude;
                                             lon_sum += s.latest.position.longitude;
                                             count += 1;
@@ -11469,7 +11464,7 @@ impl eframe::App for ShipApp {
                                     .to_string();
                             self.feed(msg.clone());
                             self.users_status = msg;
-                        } else if let Some(s) = self.registry.ships().iter().find(|s| s.ship_id == id) {
+                        } else if let Some(s) = self.registry.ship(&id) {
                             if let Some(tx) = &self.sim_cmd_tx {
                                 let class_id = ships
                                     .get(self.selected_class)
@@ -11525,8 +11520,11 @@ impl eframe::App for ShipApp {
         // re-render in flight, so frames can't pile.
         if self.recentering.is_none() {
             if let Some(id) = self.following.clone() {
-                if let Some(s) = self.registry.ships().iter().find(|s| s.ship_id == id) {
+                if let Some(s) = self.registry.ship(&id) {
                     let ship_pos = s.latest.position;
+                    // Copied out here so the registry borrow ends before
+                    // the &mut self calls below (track_frame).
+                    let motion = (s.latest.heading_deg, s.latest.speed_kn);
                     let center = GeoPosition {
                         latitude: self.center.0,
                         longitude: self.center.1,
@@ -11537,7 +11535,7 @@ impl eframe::App for ShipApp {
                     {
                         // Lead the ship: request tiles for where it is
                         // going, not where it was.
-                        let at = match (s.latest.heading_deg, s.latest.speed_kn) {
+                        let at = match motion {
                             (Some(h), Some(v)) if v > 0.5 => {
                                 let p = ship_pos.dead_reckon(h, v, TRACK_LEAD_SECS);
                                 (p.latitude, p.longitude)

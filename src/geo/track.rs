@@ -203,8 +203,51 @@ struct ShipState {
     latest: Fix,
     previous: Option<Fix>,
     track: VecDeque<Fix>,
+    /// Deduped positions for the trail, cached. [`Registry::ships`] is
+    /// called every frame, and re-deriving this per read meant re-scanning
+    /// each ship's whole track per ship per frame. Rebuilt for a ship only
+    /// when its track actually moved (see `poll_inner`), never on read.
+    trail: Vec<GeoPosition>,
+    /// Set by every mutation of `track`, cleared by the rebuild pass at the
+    /// end of `poll_inner`. The flag lives here rather than in a side table
+    /// so a new ship cannot be created already-marked-clean.
+    trail_dirty: bool,
     missed: u32,
     stale: bool,
+}
+
+/// Consecutive fixes at the same position collapse to one trail sample: a
+/// moored beacon reports every few minutes from one berth and would
+/// otherwise draw a dot per report.
+fn dedup_trail(track: &VecDeque<Fix>) -> Vec<GeoPosition> {
+    let mut trail = Vec::with_capacity(track.len());
+    for fix in track {
+        if trail.last() != Some(&fix.position) {
+            trail.push(fix.position);
+        }
+    }
+    trail
+}
+
+/// Borrowed read view of one ship, for the per-frame draw path.
+///
+/// [`Registry::ships`] materialises a `Vec<ShipView>` — every `Fix` deep
+/// cloned, every trail rebuilt, the whole thing sorted by id. That is the
+/// right shape for the roster and the wrong shape for a single-key lookup:
+/// the marker-centroid, inspector, helm and follow paths each want one
+/// ship, and several of them run every frame. They read it in place
+/// through this and allocate nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct ShipRef<'a> {
+    pub ship_id: &'a str,
+    pub latest: &'a Fix,
+    pub stale: bool,
+    /// Announced but never tracked (silent vessel): no position exists.
+    /// Always false here — a `ShipRef` only exists for a tracked ship, and
+    /// silent vessels live in [`Registry::announced`] until their first fix.
+    pub silent: bool,
+    pub trail_len: usize,
+    pub source: FixSource,
 }
 
 /// Read view of one ship for renderers / roster UI.
@@ -328,6 +371,7 @@ impl Registry {
                                 .position(|old| old.epoch_nanos() > fix.epoch_nanos())
                                 .unwrap_or(s.track.len());
                             s.track.insert(at, fix);
+                            s.trail_dirty = true;
                             while s.track.len() > self.bound.max_fixes {
                                 s.track.pop_front();
                             }
@@ -346,6 +390,7 @@ impl Registry {
                     let previous = std::mem::replace(&mut s.latest, fix.clone());
                     s.previous = Some(previous);
                     s.track.push_back(fix);
+                    s.trail_dirty = true;
                     while s.track.len() > self.bound.max_fixes {
                         s.track.pop_front();
                     }
@@ -363,7 +408,17 @@ impl Registry {
                     track.push_back(fix.clone());
                     self.ships.insert(
                         current_id.clone(),
-                        ShipState { latest: fix, previous: None, track, missed: 0, stale: false },
+                        ShipState {
+                            latest: fix,
+                            previous: None,
+                            track,
+                            // Built by the rebuild pass below, like any
+                            // other ship's first trail.
+                            trail: Vec::new(),
+                            trail_dirty: true,
+                            missed: 0,
+                            stale: false,
+                        },
                     );
                     if !backfilled {
                         seen.insert(current_id);
@@ -389,9 +444,27 @@ impl Registry {
                 }
             }
         }
+        // Trails are maintained here rather than on read: `ships()` runs
+        // every frame, so re-deriving each trail per read meant re-scanning
+        // each ship's whole track per ship per frame. Only ships whose track
+        // actually moved pay for a rebuild, and a round that accepts nothing
+        // new pays for none. A backfilled insert can land mid-track, so the
+        // rebuild re-derives the whole dedup rather than appending.
+        for s in self.ships.values_mut() {
+            if std::mem::take(&mut s.trail_dirty) {
+                s.trail = dedup_trail(&s.track);
+            }
+        }
         acked
     }
 
+    /// Every tracked ship, sorted by id, for renderers and the roster.
+    ///
+    /// This is the expensive read: it clones each ship's `Fix` and its
+    /// trail. Callers that want one ship, or only ids, want
+    /// [`Registry::ship`], [`Registry::position_of`] or
+    /// [`Registry::ship_ids`] instead — the per-frame paths use those, so
+    /// this stays a once-per-frame roster read.
     pub fn ships(&self) -> Vec<ShipView> {
         let mut out: Vec<ShipView> = self
             .ships
@@ -401,19 +474,42 @@ impl Registry {
                 latest: s.latest.clone(),
                 stale: s.stale,
                 silent: false,
-                trail: {
-                    let mut trail = Vec::new();
-                    for fix in &s.track {
-                        if trail.last() != Some(&fix.position) {
-                            trail.push(fix.position);
-                        }
-                    }
-                    trail
-                },
+                trail: s.trail.clone(),
                 source: s.latest.source,
             })
             .collect();
         out.sort_by(|a, b| a.ship_id.cmp(&b.ship_id));
+        out
+    }
+
+    /// One tracked ship, read in place. `None` for an id that is unknown
+    /// or announced-but-never-fixed (see [`Registry::announced`]).
+    ///
+    /// The single-key counterpart to [`Registry::ships`], for the draw
+    /// paths that look one ship up per marker, per group or per frame.
+    pub fn ship(&self, ship_id: &str) -> Option<ShipRef<'_>> {
+        self.ships.get(ship_id).map(|s| ShipRef {
+            ship_id: &s.latest.ship_id,
+            latest: &s.latest,
+            stale: s.stale,
+            silent: false,
+            trail_len: s.trail.len(),
+            source: s.latest.source,
+        })
+    }
+
+    /// Latest accepted position of one ship, or `None` if untracked.
+    /// The narrow read the group-centroid loop wants: it sums positions
+    /// and nothing else, per marker, per group, every frame.
+    pub fn position_of(&self, ship_id: &str) -> Option<GeoPosition> {
+        self.ships.get(ship_id).map(|s| s.latest.position)
+    }
+
+    /// Tracked ids, sorted, without building a `ShipView` per ship. For
+    /// callers that only need to know which identities exist.
+    pub fn ship_ids(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.ships.keys().cloned().collect();
+        out.sort();
         out
     }
 
@@ -844,5 +940,96 @@ mod tests {
         .unwrap();
         assert_eq!(f.position.latitude, 53.5);
         assert_eq!(f.epoch_secs(), 1789171200);
+    }
+
+    /// The single-key reads must agree with the roster read, field for
+    /// field, or the marker would draw from one picture while the roster
+    /// lists another.
+    #[test]
+    fn ship_ref_agrees_with_ships_read() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![fix("a", 53.5, 9.9, "2026-09-12T00:00:00Z")]);
+        r.poll(vec![fix("a", 53.6, 10.0, "2026-09-12T00:00:10Z")]);
+        r.poll(vec![fix("b", 1.0, 2.0, "2026-09-12T00:00:00Z")]);
+        // Three rounds that only b reports in, so a ages into staleness
+        // (the flag is part of what both reads must agree on) while b,
+        // which keeps reporting, stays fresh.
+        for i in 0..3 {
+            r.poll(vec![fix("b", 1.0 + i as f64 * 0.01, 2.0, &format!("2026-09-12T00:00:1{i}Z"))]);
+        }
+        let view = r.ships().into_iter().find(|s| s.ship_id == "a").unwrap();
+        let one = r.ship("a").expect("a is tracked");
+        assert_eq!(one.ship_id, view.ship_id);
+        assert_eq!(one.latest, &view.latest);
+        assert_eq!(one.stale, view.stale);
+        assert_eq!(one.trail_len, view.trail.len());
+        assert_eq!(one.source, view.source);
+        assert!(!one.silent, "a tracked ship is never silent");
+        assert_eq!(
+            r.position_of("a"),
+            Some(view.latest.position),
+            "position_of is the narrow read of the same fact"
+        );
+        // Staleness is per ship: b kept reporting, a did not.
+        assert!(one.stale, "a missed three polls");
+        assert!(!r.ship("b").expect("b is tracked").stale, "b kept reporting");
+        // Unknown and announced-only ids both read as untracked.
+        assert!(r.ship("nobody").is_none());
+        assert!(r.position_of("nobody").is_none());
+        r.announce("c".into(), None, None);
+        assert!(r.ship("c").is_none(), "announced is not tracked");
+    }
+
+    /// `ship_ids` exists so id-only callers skip building a `ShipView`
+    /// per ship; it must still be the sorted, tracked-only id set.
+    #[test]
+    fn ship_ids_are_sorted_and_exclude_announced() {
+        let mut r = Registry::new(TrailBound::default());
+        r.announce("zulu".into(), None, None);
+        r.poll(vec![
+            fix("delta", 1.0, 1.0, "2026-09-12T00:00:00Z"),
+            fix("alpha", 2.0, 2.0, "2026-09-12T00:00:00Z"),
+            fix("mike", 3.0, 3.0, "2026-09-12T00:00:00Z"),
+        ]);
+        assert_eq!(r.ship_ids(), ["alpha", "delta", "mike"]);
+    }
+
+    /// The trail is cached, not re-derived on read, so it has to be
+    /// rebuilt at exactly the points the track moves. These are the
+    /// transitions a stale cache would get wrong: the first fix, an
+    /// append, a deduped repeat, an eviction, and a mid-track backfill
+    /// insert (which can change the dedup of everything after it).
+    #[test]
+    fn cached_trail_tracks_every_track_mutation() {
+        let mut r = Registry::new(TrailBound { max_fixes: 3 });
+        // First fix: a trail exists immediately, before any second read.
+        r.poll(vec![fix("a", 53.5, 9.9, "2026-09-12T00:00:00Z")]);
+        assert_eq!(r.ship("a").unwrap().trail_len, 1);
+
+        // Append: one more sample.
+        r.poll(vec![fix("a", 53.6, 10.0, "2026-09-12T00:00:10Z")]);
+        assert_eq!(r.ship("a").unwrap().trail_len, 2);
+
+        // Deduped repeat at the same position adds no sample.
+        r.poll(vec![fix("a", 53.6, 10.0, "2026-09-12T00:00:20Z")]);
+        assert_eq!(r.ship("a").unwrap().trail_len, 2, "same position, no sample");
+
+        // Eviction: the bound drops the oldest, and the trail follows.
+        r.poll(vec![fix("a", 53.7, 10.1, "2026-09-12T00:00:30Z")]);
+        r.poll(vec![fix("a", 53.8, 10.2, "2026-09-12T00:00:40Z")]);
+        let ships = r.ships();
+        assert_eq!(ships[0].trail.len(), 3, "bounded at max_fixes");
+        assert_eq!(ships[0].trail[0].latitude, 53.6, "oldest evicted from trail too");
+
+        // Backfill inserted mid-track rebuilds the dedup, not just appends.
+        let mut r = Registry::new(TrailBound::default());
+        r.poll(vec![fix("b", 53.0, 9.0, "2026-09-12T00:00:00Z")]);
+        r.poll(vec![fix("b", 53.5, 9.5, "2026-09-12T00:00:20Z")]);
+        let mut mid = fix("b", 53.5, 9.5, "2026-09-12T00:00:10Z");
+        mid.backfilled = true;
+        r.poll(vec![mid]);
+        // The flush repeats 53.5/9.5, so it adds no sample of its own.
+        assert_eq!(r.ship("b").unwrap().trail_len, 2, "backfill deduped in place");
+        assert_eq!(r.ships()[0].trail[1].latitude, 53.5);
     }
 }
