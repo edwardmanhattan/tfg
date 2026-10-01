@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
+mod mln_checkout;
+
 const MLN_REPOSITORY_URL: &str = "https://github.com/maplibre/maplibre-native.git";
 const MLN_COMMIT: &str = "core-a33d3f00fb9dbf9117ce18edd799aa0ca5bcce5b";
 
@@ -570,8 +572,10 @@ fn build_local(
 
     // Some CI cache restores may leave an incomplete directory tree.
     // Require files that prove this is a usable maplibre-native checkout.
-    let has_required_checkout_files = maplibre_native_dir.join("CMakeLists.txt").is_file()
-        && maplibre_native_dir.join("include").is_dir();
+    let has_required_checkout_files = || -> bool {
+        maplibre_native_dir.join("CMakeLists.txt").is_file()
+            && maplibre_native_dir.join("include").is_dir()
+    };
 
     // A cached checkout from a previous `MLN_COMMIT` would be reused with the
     // current bridge sources, so treat a revision mismatch as unusable too.
@@ -584,40 +588,104 @@ fn build_local(
             .filter(|out| out.status.success())
             .is_some_and(|out| {
                 let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                // `MLN_COMMIT` may be a tag, so resolve it through the checkout too.
-                head == MLN_COMMIT
-                    || Command::new("git")
-                        .current_dir(&maplibre_native_dir)
-                        .args(["rev-parse", &format!("{MLN_COMMIT}^{{commit}}")])
-                        .output()
-                        .ok()
-                        .filter(|out| out.status.success())
-                        .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == head)
+                if head == MLN_COMMIT {
+                    return true;
+                }
+                // `MLN_COMMIT` names a tag (`core-<sha>`) and `clone_repository`
+                // fetches it with `--depth 1`, which stores the tag object but
+                // creates no local ref -- so resolving the name through git
+                // fails in every managed checkout, and this check rejected all
+                // of them, making each build delete and re-clone the tree. The
+                // SHA is in the tag's own name, so read it from there. The git
+                // fallback below still serves a caller-managed clone, which does
+                // have real refs.
+                if let Some(sha) = mln_checkout::expected_sha(MLN_COMMIT) {
+                    if head == sha {
+                        return true;
+                    }
+                }
+                // Any other shape: resolve it through the checkout, which
+                // works for a caller-managed clone that has real refs.
+                Command::new("git")
+                    .current_dir(&maplibre_native_dir)
+                    .args(["rev-parse", &format!("{MLN_COMMIT}^{{commit}}")])
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == head)
             })
     };
 
     let is_managed_checkout =
         env::var_os("MLN_LOCAL_REPOSITORY").is_none_or(|path| path.is_empty());
-    if is_managed_checkout
-        && maplibre_native_dir.exists()
-        && (!has_required_checkout_files || !is_expected_revision())
-    {
-        println!(
-            "cargo:warning=Removing stale or incomplete cached maplibre-native checkout at {}",
-            maplibre_native_dir.display()
-        );
-        fs::remove_dir_all(&maplibre_native_dir)?;
-    }
 
-    // Clone Repository
-    if !maplibre_native_dir.exists() {
-        println!("cargo:warning=Cloning maplibre-native.");
-        clone_repository(respository_dir, name, MLN_REPOSITORY_URL, MLN_COMMIT)?;
+    // Every submodule declared in `.gitmodules` must be populated. A build
+    // that died part-way through `git submodule update --init --recursive`
+    // leaves a tree that passes the revision and file checks above and still
+    // cannot compile, so this is the check that catches it. The list is read
+    // from the checkout rather than hardcoded, so a submodule added upstream
+    // is covered without editing this file, and 39 `is_dir` calls are free
+    // next to the clone they are guarding.
+    let submodules_ready = || -> bool {
+        let Ok(gitmodules) = fs::read_to_string(maplibre_native_dir.join(".gitmodules")) else {
+            return false;
+        };
+        let paths: Vec<&str> = gitmodules
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("path"))
+            .filter_map(|l| l.split_once('=').map(|(_, v)| v.trim()))
+            .collect();
+        !paths.is_empty() && paths.iter().all(|p| maplibre_native_dir.join(p).is_dir())
+    };
+
+    // Re-evaluated on every call rather than hoisted: `submodule_update` only
+    // runs inside the lock, so a value captured before it would report a
+    // freshly cloned checkout as unusable and send the next build straight
+    // back into a clone.
+    let is_usable = || -> bool {
+        maplibre_native_dir.exists()
+            && has_required_checkout_files()
+            && is_expected_revision()
+            && submodules_ready()
+    };
+
+    if is_managed_checkout {
+        // This used to delete any tree that looked incomplete and clone
+        // again, guarded by nothing but those checks. That is wrong whenever
+        // two builds overlap, which is the normal case here: an editor's
+        // `cargo check` and a terminal's `cargo run` both build this crate,
+        // and whichever lost the race deleted the directory the other was
+        // mid-clone into, restarting a 39-submodule fetch from zero.
+        //
+        // `mln_checkout::ensure` removes only while holding the checkout lock, so
+        // it cannot delete a tree somebody else is populating, and it waits
+        // for a concurrent build instead of racing it. `respository_dir` is
+        // the lock's parent -- `maplibre_native_dir` is this joined to `name`
+        // -- so the lock sits beside the checkout and survives the removal
+        // rather than being inside it.
+        mln_checkout::ensure(respository_dir, &maplibre_native_dir, is_usable, || {
+            if maplibre_native_dir.exists() {
+                println!(
+                    "cargo:warning=Removing stale or incomplete cached maplibre-native checkout at {}",
+                    maplibre_native_dir.display()
+                );
+                fs::remove_dir_all(&maplibre_native_dir)?;
+            }
+            println!("cargo:warning=Cloning maplibre-native.");
+            clone_repository(respository_dir, name, MLN_REPOSITORY_URL, MLN_COMMIT)?;
+            println!("cargo:warning=Updating maplibre-native submodules.");
+            submodule_update(&maplibre_native_dir)?;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })?;
+    } else {
+        // Caller-managed checkout via MLN_LOCAL_REPOSITORY: never delete it,
+        // just make sure it is there and its submodules are fetched.
+        if !maplibre_native_dir.exists() {
+            clone_repository(respository_dir, name, MLN_REPOSITORY_URL, MLN_COMMIT)?;
+        }
+        submodule_update(&maplibre_native_dir)?;
     }
     println!("cargo:rerun-if-changed={}", maplibre_native_dir.as_os_str().to_str().unwrap());
-
-    // Update submodules
-    submodule_update(&maplibre_native_dir)?;
 
     let mut config = cmake::Config::new(maplibre_native_dir.clone());
     config.build_target(TARGET_NAME);

@@ -63,6 +63,20 @@ jobs:
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      - name: Test the maplibre-native checkout guards
+        run: |
+          set -euo pipefail
+          # `mln_checkout` is vendored source, so cargo never treats it as a
+          # test target and its tests would otherwise never run. It has no
+          # dependencies, so `rustc --test` builds it straight from source in
+          # about a second -- no MapLibre, no workspace build. Run before the
+          # check below so a regression in the checkout logic is reported
+          # before, rather than as, a multi-minute rebuild.
+          rustc --edition 2024 --test \
+            vendor/maplibre_native/mln_checkout.rs \
+            -o "$RUNNER_TEMP/mln_checkout_test"
+          "$RUNNER_TEMP/mln_checkout_test"
+
       - name: Check Linux build
         run: cargo check --locked --features maplibre_native/vulkan
 

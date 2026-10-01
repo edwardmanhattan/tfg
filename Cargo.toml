@@ -39,5 +39,21 @@ base64 = "0.22"
 [patch.crates-io]
 # 0.9.3 does not export Visual Studio's Release/Debug or vcpkg library
 # directories to rustc; keep the Windows build fix local until upstream ships it.
+#
+# Also local: `mln_checkout.rs`, which fixes two upstream bugs in how this
+# crate manages its own cached source checkout.
+#
+# 1. Upstream judges a cached checkout stale by looking for `CMakeLists.txt`,
+#    deletes it, and clones again. Two builds overlapping — an editor's
+#    `cargo check` and a terminal's `cargo run`, normal here — means one
+#    deletes the tree the other is mid-clone into, restarting a 39-submodule
+#    fetch. `ensure` only removes while holding a lock file, and waits for a
+#    concurrent build instead of racing it.
+# 2. Upstream's revision check could never pass. It resolves MLN_COMMIT as a
+#    ref, but `clone_repository` fetches it with `--depth 1`, which leaves no
+#    local ref — so every build saw a "wrong revision" and re-cloned 2 GB.
+#    `expected_sha` reads the commit out of the tag's own name instead.
+#
+# Re-apply on the next version bump; no upstream issue filed.
 maplibre_native = { path = "vendor/maplibre_native" }
 tokio-centrifuge = { path = "vendor/tokio-centrifuge" }
