@@ -1,12 +1,13 @@
 ---
 name: Tactical Floor Game
-description: Night ops console for a live wargaming floor game — navy chrome over dark tiles, one radar-cyan signal.
+description: Night ops console for a live wargaming floor game — navy chrome floating over dark tiles, one radar-cyan signal, and a lit rim that says which surface owns input.
 colors:
   radar-cyan: "#22D3EE"
   console-night: "#0F172A"
   deep-well: "#020617"
   panel-slate: "#1E293B"
   hairline-slate: "#334155"
+  cut-grey: "#8C9BAE"
   map-ink: "#E2E8F0"
   body-silver: "#8C8C8C"
   button-graphite: "#3C3C3C"
@@ -46,9 +47,9 @@ typography:
     fontFamily: "Hack, Ubuntu Mono, monospace"
     fontSize: "13px"
     fontWeight: 400
-rounded:
-  island: "8px"
-  control: "6px"
+shapes:
+  island-chamfer: "20px top-right"
+  control-radius: "6px"
 spacing:
   sm: "6px"
   md: "8px"
@@ -59,78 +60,233 @@ components:
     backgroundColor: "{colors.console-night}"
     textColor: "{colors.body-silver}"
     typography: "{typography.body}"
-    rounded: "{rounded.island}"
-    padding: "6px"
+    padding: "12px"
+  seam:
+    restColor: "{colors.cut-grey}"
+    restAlpha: 0.34
+    activeColor: "{colors.radar-cyan}"
+    activeAlpha: 0.5
+    width: "2px"
+    inset: "1px"
+  band-scanline:
+    pitch: "4px"
+    alpha: 0.067
+    scope: "title band only"
   button:
     backgroundColor: "{colors.button-graphite}"
     textColor: "{colors.button-label}"
     typography: "{typography.button}"
-    rounded: "{rounded.control}"
+    rounded: "{shapes.control-radius}"
     padding: "6px 10px"
   button-hover:
     backgroundColor: "rgba(34, 211, 238, 0.16)"
     textColor: "#F0F0F0"
-    rounded: "{rounded.control}"
-    padding: "6px 10px"
-  button-active:
-    backgroundColor: "rgba(34, 211, 238, 0.27)"
-    textColor: "#FFFFFF"
-    rounded: "{rounded.control}"
+    rounded: "{shapes.control-radius}"
     padding: "6px 10px"
   button-selected:
     backgroundColor: "{colors.radar-cyan}"
     textColor: "{colors.deep-well}"
     typography: "{typography.button}"
-    rounded: "{rounded.control}"
+    rounded: "{shapes.control-radius}"
     padding: "6px 10px"
   text-field:
     backgroundColor: "{colors.deep-well}"
     textColor: "{colors.body-silver}"
     typography: "{typography.body}"
-    rounded: "{rounded.control}"
+    rounded: "{shapes.control-radius}"
     padding: "6px 10px"
     width: "280px"
-  toolbar:
+  top-zone:
     backgroundColor: "{colors.console-night}"
     textColor: "{colors.body-silver}"
-    typography: "{typography.body}"
+  side-zone:
+    backgroundColor: "{colors.console-night}"
+    textColor: "{colors.body-silver}"
 ---
 
 # Design System: Tactical Floor Game
 
 ## Overview
 
-**Creative North Star: "The Night Ops Console"**
+**Creative North Star: "The Lit Console"**
 
-Calm, exact, mission-grade. The app is a dark navy instrument console laid
-over a night tile map: the map owns the whole window, the chrome is a thin
-band at the top plus movable islands floating over it, and every pixel of
-ornament that isn't carrying state has been taken out. The reference feeling
-is a darkened exercise room — legible under glare on a field laptop and
-equally legible on a desk monitor at 02:00 — not a consumer dashboard and
-definitely not a neon HUD.
+Calm, exact, mission-grade. A dark navy instrument console floating over a
+night tile map: the map owns the whole window, the chrome is a thin band at
+the top plus a column of islands down one side, and the one piece of
+ornament in the system is a lit rim on the island you are touching.
 
-Density is deliberate. This is an Operate surface: an organizer or commander
-scans rows, toggles islands, and reads a clock under time pressure, so the
-layout favours compact rows, hairline separation and short labels over airy
-cards. Expression lives in a very small number of precise details — the
-single cyan state signal, the ringed map symbology, the two-font split —
-and nowhere else. Confirmed visual anti-reference: decorative cyberpunk /
-gamer-chrome glow, and friendly rounded SaaS card stacks.
+The register is *tactical with heat*. Sharp chamfers and machined edges
+read as built equipment rather than as web cards, and a surface carries a
+faint emissive rim so an operator can see at a glance which panel owns the
+pointer and which one does not. What the heat is spent on is the one channel
+it can pay for: **attention**. Everything else stays off.
 
-The map is the room's only light source. Everything else is a navy panel
-that stays quiet until it has something to say, and when it does it says it
-in colored ink (green/amber/red/yellow) rather than in motion, badges, or
-animation. The product's own doctrine — *present, never predict* — is the
-aesthetic doctrine too: the interface reports accepted state and does not
-perform.
+The map is the room's only light source. Every panel is navy and quiet until
+it has something to say, and when it does it says it in colored ink rather
+than in motion. The product's doctrine is *present, never predict*, and the
+aesthetic doctrine is the same: the interface reports accepted state and does
+not perform.
 
 **Key Characteristics:**
-- One radar-cyan signal on a navy console; no second chrome accent.
-- Depth is tonal (chrome → slate → well) plus a 1px hairline, not shadow.
+- One radar-cyan signal, and it means "live or yours". Nothing else is cyan.
+- The heat lives on the island rim and the title band, never across a body.
+- Depth is tonal (chrome → slate → well) plus a 1px hairline, and one 2px rim.
 - Ubuntu Light for people, Hack for machines; two type roles, no more.
-- Circles are map objects, rectangles are controls — never the reverse.
-- Status is always colored ink; idle is the only gray state.
+- Circles are map objects, rectangles are controls. The chamfer means a
+  surface that moves.
+
+## The three zones
+
+The window is divided into three zones and nothing else. There is no fourth
+place for a panel to live, which is what keeps the console readable.
+
+### Map stage — the background
+
+The tile canvas owns every pixel the panel layout offers. UI never insets
+it, and a zone never takes space from it: a docked zone floats over the map
+and the map's texture stays full-window beneath.
+
+The map is painted in egui's `Background` layer. Zones and islands paint in
+`Order::Middle`, above it, and they are `interactable`, so a zone steals the
+pointer from the map and a drag that starts over chrome is not a camera pan.
+
+**The one consequence, stated because it is easy to miss.** Because the side
+zone overlays rather than insets, the window's centre is not the map's
+*visible* centre. Any camera action that centres a hull must offset its goal
+by half the zone's width toward the open side, or the unit parks under the
+chrome. This is a rule about camera goals, not a layout fix.
+
+### Top zone — a fixed band
+
+A full-width unrounded band in Console Night, one row, holding the things an
+operator needs without hunting: connection state, how many are online, the
+clock block, and logout at the right.
+
+It is the frame, not a card, so it takes no corner radius. It floats over the
+map like everything else; it never pushes the map down.
+
+**The mode toggle is not here.** Presentation and Simulation is a startup
+decision, not an operating control, so it moved out of the toolbar and into
+the settings modal. Simulation mode does not announce itself: the console
+simply *is* the simulation, and the only hint is a word in the zone.
+
+### Side zone — a column of islands
+
+The side zone is where the operator works. It is a vertical column of
+islands down the left or right edge, toggled as a unit, and each island
+inside it carries one job.
+
+The zone **floats over the map**. This is deliberate and it is the opposite
+of what a dock normally does, so the reason is stated: an operator reads the
+map, and a map that resizes as a panel opens reflows the thing they are
+reading. The camera's visible centre moves instead, by the offset rule above.
+
+The zone docks **left or right** and remembers which. A commander who steers
+with the right hand and an organiser scanning rows with the left should not
+have to argue about it.
+
+### Modal zone — above everything
+
+Modal surfaces sit in `Order::Top`, centred, and they dim what is behind them
+so a drag cannot escape onto the map. Three exist: Scenario Composer, Fleet
+Picker, and Player Picker. Modals are for authoring; islands are for
+operating. A form with fields in it belongs in a modal, not in a column.
+
+## The five game states
+
+The side zone's contents are a function of one value: where the exercise is.
+There are five, and the zone is never empty.
+
+| State | Source | The side zone holds |
+| --- | --- | --- |
+| **No session** | no held game | The user island, then one island whose only verb is *start a new session*. |
+| **Planning** | `planning` | Essentials, Control, Fleet, Players. |
+| **Preparation** | `preparation` | Readiness: who is in, what is placed, what is outstanding. |
+| **Execution** | `execution` | Orders, Roster, Log. No setup, no pickers. |
+| **Closure** | `closure` | The assessment surface: summary, timeline, judgements. |
+
+Two rules make this a spine rather than a pile of conditionals.
+
+**The user island is always first.** Identity does not change with the state,
+so the one thing that does not move is pinned at the top of the column. It
+carries the avatar and the app role from the sign-in, and it is where logout
+lives when the top zone is collapsed.
+
+**A state never shows a verb that the backend would refuse.** `static` mode
+refuses ordering, so an Execution zone in a static exercise has no Orders
+island. Planning mode offers the Scenario Composer only when the mode is
+`scenario`. Hiding a verb is better than showing one that 409s.
+
+### Planning, in order
+
+Planning is the only state with a defined island order, and the order is the
+order of dependencies, not the order of importance.
+
+1. **Essentials.** Name, description, the planned real and assumed windows,
+   and the mode. Mode is fixed at creation and cannot be revised, so once a
+   session exists the control is read-only rather than hidden.
+2. **Control.** The time factor. The only field in Planning that stays live
+   after the exercise begins.
+3. **Fleet.** What is deployed, with a button that opens the Fleet Picker.
+4. **Players.** Who is in, with a button that opens the Player Picker.
+
+## Islands
+
+An island is a floating panel with a fixed footprint, a chamfered
+top-right corner, and a lit rim.
+
+- **Silhouette.** The top-right corner is chamfered 20px and the cut is
+  stroked 2px in Cut Grey. Every other corner is square. It is a polygon
+  painted around an axis-aligned content rect, so the cut costs paint and not
+  layout, which is why an island's contents never have to know about it.
+- **Fixed footprint.** An island does not resize to fit its content. The body
+  scrolls. A panel that grows under the cursor while someone is reading a map
+  is worse than one that scrolls, and a stable silhouette is what makes the
+  chamfer read as a shape.
+- **Title band.** 30px, Panel Slate, carrying one tracked monospace label in
+  short caps and, right-aligned, a count or a status. This is the band's
+  whole job. It is also where the only permitted texture lives.
+- **Body.** Console Night, scrolling, at a 420px cap.
+
+### The rim, and why it is neutral at rest
+
+This is the system's load-bearing decision and it was made by rendering, so
+the reasoning is recorded rather than asserted.
+
+An earlier pass lit **every** island's rim in Radar Cyan at rest. Rendered on
+its own it looked good. Rendered as a console it failed, for a reason that is
+only visible once more than one island is on screen: the accent had been
+spent on every surface at once, so it stopped being a signal. An operator
+reading "cyan" learned nothing, because cyan was everywhere.
+
+So the rim has two states, and this is the rule extension ADR-0014
+anticipated and left as a one-line change:
+
+- **At rest**, the rim is Cut Grey at 34%, one step above the hairline. It
+  separates the panel from the moving map and says nothing else.
+- **Owning input**, the rim is Radar Cyan at 50%. Exactly one island is in
+  this state at a time, and it is the one under the pointer.
+
+That is what buys the register. A lit rim on every panel is decoration; a lit
+rim on one panel is a focus indicator that happens to look like an instrument.
+
+### Texture, confined
+
+A horizontal rule texture was rendered across the whole body and rejected.
+The rules cut straight through the rows, and the first thing to lose was the
+smallest text on the panel — the class line under each hull name. Texture
+that crosses text does not read as texture; it reads as interference.
+
+The same failure killed a machined-slot pass: at 3px wide on an 8px pitch
+across a 340px band, forty slots are not ventilation, they are a dashed rule,
+and a dashed rule running through the title reads as a rendering fault.
+
+Confined to the **title band**, at a 4px pitch and 17/255 white, the texture
+is free. The band holds one short label and a count, nothing is lost, and the
+panel picks up a screen-like texture that supports rather than competes.
+
+This is the general rule and it covers every future surface: **texture and
+hardware detail live on the title band, never across a body.**
 
 ## Colors
 
@@ -138,439 +294,233 @@ The palette is a dark, low-chroma console field with one high-chroma signal
 and a small set of strictly-scoped semantic hues.
 
 ### Primary
-- **Radar Cyan** (#22D3EE): the only accent. It marks live state on chrome —
-  text selection, hyperlink text, the hovered and pressed wash on any
-  button, and the solid fill of a toolbar toggle that is switched ON. Its
-  rarity is what makes an ON state readable across a room.
+- **Radar Cyan** (#22D3EE). The only accent. It marks live state on chrome
+  and the surface that owns input: hover and press washes, the ON fill of a
+  toggle, selection, and a focused island's rim. Its rarity is what makes an
+  ON state readable across a room.
 
 ### Secondary
-The group-rank palette is a categorical scale, not decoration. It is used
-for the hull zones, centroid flags and per-rank identity drawn on the map
-(and, at the green end, for per-unit identity), and it is barred from chrome.
-- **Unsur Green** (#16A34A): rank 1 zone fill (at 70/255 alpha) and stroke;
-  also the default identity color for units without a named hull.
-- **Satuan Tugas Blue** (#2563EB): rank 2 zone fill and stroke; also the
-  named identity of the `nordwind` unit.
-- **Gugus Purple** (#9333EA): rank 3 zone fill and stroke.
-- **Operasi Gabungan Orange** (#EA580C): rank 4 (highest) zone fill and
-  stroke. Zones paint highest rank first so lower ranks layer over them.
+The group-rank palette is categorical and belongs to the map. It is barred
+from chrome.
+- **Unsur Green** (#16A34A): rank 1 zone.
+- **Satuan Tugas Blue** (#2563EB): rank 2 zone.
+- **Gugus Purple** (#9333EA): rank 3 zone.
+- **Operasi Gabungan Orange** (#EA580C): rank 4 zone. Zones paint highest
+  rank first so lower ranks layer over them.
 
 ### Status & Signal
-Semantic ink for state readouts; every status line routes through one
-function so state is never gray-on-gray.
-- **Signal Green** (#4ADE80): success and connected — "connected", "synced",
-  "signed in as", "issued", "redeemed".
-- **Warning Sand** (#FABF69): transitional or degraded-but-not-failed —
-  "connecting".
-- **Fault Red** (#F87171): failure — "fail", "refused", "error",
-  "unreachable", "socket error", "sync stopped".
-- **Idle Gray** (#808080): neutral/idle status and stale units.
-- **Data Amber** (#F59E0B): age-of-data marker — the ring around a unit
-  whose fix is old, and the hollow ghost of a replayed unit. Data age, never
-  feed state.
-- **Alert Yellow** (#FFFF00): attention without fault — `⚠` warning lines,
-  the strong `PAUSED` clock label, and the ring around the unit currently
-  being followed.
+Every state line routes through one function, so state is never gray on gray.
+- **Signal Green** (#4ADE80): connected, synced, signed in, issued.
+- **Warning Sand** (#FABF69): connecting, transitional.
+- **Fault Red** (#F87171): failed, refused, unreachable.
+- **Idle Gray** (#808080): neutral and stale.
+- **Data Amber** (#F59E0B): age of data, never feed state.
+- **Alert Yellow** (#FFFF00): attention without fault, and the strong
+  `PAUSED` label.
 
 ### Neutral
 The Console Night family carries all chrome; every step is a depth, not a hue.
-- **Console Night** (#0F172A): window fill and panel fill — the chrome every
-  island and the top toolbar are made of.
-- **Panel Slate** (#1E293B): faint background — the resting tone for
-  secondary/inset surfaces inside chrome.
-- **Deep Well** (#020617): extreme background — text-field wells, the
-  selection text color, and the near-black the map sits against.
-- **Hairline Slate** (#334155): every window/panel stroke (1px) — the single
-  edge treatment in the system.
-- **Body Silver** (#8C8C8C): default label and body text on chrome.
-- **Button Label** (#B4B4B4): text on a resting button; lifts to #F0F0F0 on
-  hover and white when pressed.
-- **Button Graphite** (#3C3C3C): resting button fill — deliberately dull so
-  the cyan wash on interaction reads as the event.
-- **Map Ink** (#E2E8F0): the only text drawn on tiles — unit ids, flag
-  labels, replay ghosts.
+- **Console Night** (#0F172A): island and zone fill.
+- **Panel Slate** (#1E293B): the title band and inset surfaces.
+- **Deep Well** (#020617): input wells, and the near-black the map sits against.
+- **Hairline Slate** (#334155): every 1px stroke.
+- **Cut Grey** (#8C9BAE): the chamfer's 2px cut edge, and an island's resting rim.
+- **Body Silver** (#8C8C8C): body text.
+- **Button Label** (#B4B4B4): resting button text, lifting to #F0F0F0 on hover.
+- **Button Graphite** (#3C3C3C): resting button fill, dull so the cyan wake-up
+  reads as the event.
+- **Map Ink** (#E2E8F0): the only text drawn on tiles.
 
 ### Named Rules
-**The One Signal Rule.** Radar Cyan is reserved for live chrome state
-(selection, link, hover/press wash, toggle ON). It is never a border, never a
-heading, never a background field, and it never appears twice as decoration.
-**The Rank Rule.** Green → Blue → Purple → Orange encodes group rank and
-nothing else. A rank color on a button, a label, or a panel is a bug.
-**The Never Gray-On-Gray Rule.** Any line reporting state goes through the
-status ink function. If a message could read as success, failure or idle, its
-color must say which.
+**The One Signal Rule.** Radar Cyan is live or yours, and never anything else.
+It is not a border, not a heading, not a background field, and not an
+everywhere-lit rim. **The Rank Rule.** Green → Blue → Purple → Orange is
+group rank and nothing else; a rank colour on a panel is a bug. **The Never
+Gray-On-Gray Rule.** Any line reporting state goes through the status ink
+function.
 
 ## Typography
 
-**Display Font:** none — the system has no display role by design.
-**Body Font:** Ubuntu Light, with system-ui and sans-serif fallback (egui's
-stock proportional family).
-**Label/Mono Font:** Hack, with Ubuntu Mono and monospace fallback (egui's
-stock monospace family).
+**Display Font:** none, by design.
+**Body Font:** Ubuntu Light, with system-ui fallback.
+**Label/Mono Font:** Hack, with Ubuntu Mono and monospace fallback.
 
-**Character:** A single light humanist sans doing all the human work, paired
-with a rigid monospace that is only ever allowed to show machine output. The
-lightness is what keeps a dense console readable; emphasis comes from color
-and position, not from weight.
+A single light humanist sans does the human work, paired with a rigid
+monospace only ever allowed to show machine output. Lightness is what keeps
+a dense console readable; emphasis comes from colour and position.
 
-### Hierarchy
-- **Heading** (300, 18px, default leading): island titles — "Session",
-  "Roster", "Orders", "Command center setup". One per island, never scaled up.
-- **Body** (300, 13px, default leading): labels, rows, values, help lines.
-  The workhorse; it sits in the spacing rhythm rather than in a measure —
-  islands are capped at 420px of scroll, so long lines wrap inside the island.
-- **Button** (300, 13px, default leading): button, toggle and selectable
-  labels. Sentence case, lowercase verbs ("connect live", "release").
-- **Label / Small** (300, 9px): the `small_button` zoom steppers and other
-  tightly-packed chrome affordances.
-- **Map Label** (300, 12px): unit ids and flag labels painted directly on
-  tiles, always in Map Ink.
-- **Mono** (400, 13px): the event feed and session-log lines only — machine
-  text, in a machine face.
+- **Heading** (300, 18px): one per zone-level surface. Never scaled up.
+- **Body** (300, 13px): the workhorse, in the spacing rhythm.
+- **Button** (300, 13px): sentence case, lowercase verbs.
+- **Small** (300, 9px): the zoom steppers and tight chrome.
+- **Map Label** (300, 12px): painted on tiles, always Map Ink.
+- **Mono** (400, 13px): event feed, session logs, ids.
 
-Emphasis is `.strong()` and it is spent almost nowhere (the `PAUSED` clock
-label is the canonical use); `.weak()` renders the same body color at 60%
-alpha for empty-state hints.
+**The Two-Face Rule.** If a human wrote it, it is Ubuntu Light. If a machine
+produced it, it is Hack. No third family, and no monospace for effect.
 
-### Named Rules
-**The Two-Face Rule.** If a human wrote it, it's Ubuntu Light. If a machine
-produced it, it's Hack. No third family, and no monospace used for effect.
+## Layout and density
 
-## Layout
-
-There is no grid and no breakpoint set: this is a native desktop window, so
+There is no grid and no breakpoint set. This is a native desktop window, so
 the spatial model is a **stage**, not a page.
 
-- **Top toolbar** — a full-width top panel in Console Night holding two
-  horizontal rows: row 1 is mode select, island toggles, and the `− z +`
-  zoom stepper; row 2 (Simulation only) is the `act` identity combobox, the
-  numbered desktop tabs (`[1] … [9]`), and the clock block (UTC line, then
-  the `GAME … · G+mm:ss (n×)` line with `PAUSED` beside it when frozen). The
-  toolbar has no corner radius — it is the frame, not a card.
-- **Map stage** — a central panel with no frame and no margin, so the tile
-  canvas owns every point the panel offers. UI never insets the map.
-- **Islands** — floating, movable windows (Session, Users, Roster, Fleet,
-  Groups, Orders, Inspector, Log, Connection, Login, Wizard) positioned on a
-  loose absolute grid of defaults (8/560/816px across, 64/140/300/478px
-  down). Islands are resizable where their content warrants it; the wizard
-  refuses to collapse below its 460px minimum and Fleet below 760px.
+- **Spacing rhythm** — item spacing 10 × 8px, button padding 10 × 6px, island
+  inner margin 12px. Rows are horizontal groups separated by 1px dividers
+  rather than by large gaps.
+- **Zone rhythm** — 16px between islands in the side zone, 24px between a
+  zone and the window edge.
 - **Scroll discipline** — island bodies scroll at a 420px cap so a tall
-  island never swallows the map; the Roster and Fleet hull lists get their
-  own 300px cap with their headers pinned outside it.
-- **Miller columns** — the Fleet picker's taxonomy column is fixed at
-  176 × 170px so the column set stays aligned while browsing.
-- **Spacing rhythm** — item spacing 10 × 8px (horizontal × vertical), button
-  padding 10 × 6px, indent 20px, island inner margin 6px. Rows are built from
-  horizontal groups separated by 1px dividers rather than by large gaps.
-- **Adaptation** — instead of reflowing, the operator rearranges: islands
-  drag, desktops swap on number keys 1–9, and the camera stays put. This is
-  the answer to varied screen sizes and glare — fewer, movable, dense surfaces
-  rather than stacked responsive cards.
+  island never swallows the map. Dense inner lists get their own tighter cap
+  with their header pinned outside it.
+- **Miller columns** — the Fleet Picker's taxonomy columns are fixed so the
+  column set stays aligned while browsing.
+- **Adaptation** — instead of reflowing, the operator rearranges: the side
+  zone docks left or right, and islands are dragged within it.
 
-## Elevation & Depth
+## Elevation and depth
 
-Layered, not lifted. Depth is a tonal ladder — Console Night chrome sits on
-Panel Slate insets, which sit over the Deep Well the map is drawn against —
-plus a 1px Hairline Slate stroke on every window and panel edge. The theme
-does not author its own shadow vocabulary; it inherits egui's stock shadows,
-which stay small and dark and are never the thing that communicates depth.
+Layered, not lifted. Console Night chrome sits on Panel Slate insets, which
+sit over the Deep Well the map is drawn against, plus a 1px hairline on every
+edge.
 
-### Shadow Vocabulary
-- **Island cast** (hard offset, `5px 6px` flat black at 120/255 alpha): the
-  default shadow behind every floating island. Present for separation from
-  the moving map, not for drama.
-- **Popup cast** (`box-shadow: 6px 10px 8px rgba(0,0,0,0.376)`): combobox
-  and menu popups only — one step tighter than an island.
-- **No shadow on rules.** Separators and indent lines are a 1px #3C3C3C
-  stroke with zero elevation; markers on the map carry depth with a 2px white
-  ring, never a glow.
+- **Island cast** — a hard offset, flat black at 120/255, offset 5 × 6px.
+  Present for separation from a moving map, not for drama. A blurred shadow
+  is a fill-rate cost proportional to kernel radius and is the first thing
+  that stops being affordable on a software rasteriser.
+- **Popup cast** — combobox and menu popups only, one step tighter.
+- **No shadow on rules.** A divider is a 1px stroke with zero elevation.
 
-**Why the island cast is hard, not blurred.** A blurred shadow is a fill-rate
-cost proportional to kernel radius, and it is the first thing in this
-document that stops being affordable on a software rasteriser or a weak
-integrated GPU. A hard offset is one extra mesh, reads as a graphic-design
-shadow rather than a drop shadow, and matches the tonal intent better than a
-soft blur would. Islands use the hard cast. Popups inherit egui's stock cast
-because they are small, transient, and never over the map.
+**The Hairline Rule.** Every panel edge is 1px of Hairline Slate. A surface
+that needs presence steps a tone lighter; it does not get a bigger shadow or
+a second border.
 
-### Named Rules
-**The Hairline Rule.** Every panel edge is exactly 1px of Hairline Slate.
-If a surface needs to feel raised, it steps a tone lighter — it does not get
-a bigger shadow, a glow, or a second border.
-
-**The One Exception.** The island's cut edge is 2px, and it is the only edge
-in the application that is not 1px. It is a signal, not a border: it tells
-you the surface is chamfered and therefore draggable. See Shapes.
+**The One Exception.** An island's rim is 2px, and it is the only edge in the
+application that is not 1px. It says the surface is chamfered and therefore
+draggable, and it is the only place the heat register is allowed to glow.
 
 ## Shapes
 
 Two shapes, two meanings. Rectangles are controls and containers; circles are
 objects on the map. Nothing mixes them.
 
-- **Islands and windows** — the top-right corner is **chamfered 20px**, and
-  the cut is stroked 2px in a cool grey brighter than Hairline Slate. Every
-  other corner stays square. Menus keep a 6px radius and are never chamfered.
-- **Controls** — buttons, toggles, checkboxes, selects and text fields all
-  sit at a 6px radius. The radius is uniform across the whole widget family,
-  so a control is recognisable by silhouette alone at a glance.
-- **Non-interactive chrome** — dividers, toolbar and unrounded panels stay
-  square (2px where egui rounds a frame internally). Corner radius signals
-  "you can touch this"; the chamfer signals "this whole surface moves".
-- **The cut edge is never cyan.** Radar Cyan is reserved for live state. The
-  cut is a cool grey (`#8C9BAE`), and it brightens on hover only. If the cut
-  is ever promoted to cyan it must mean "this surface owns input" and be lit
-  only on the focused island — a rule extension with a reason, never a
-  decoration.
-- **Map symbology is pure circle geometry**: an 8px filled unit marker with
-  a 2px white ring; a 12px ring for focus states (yellow = followed,
-  light blue = selected, amber = old data); a 10px flag disc with a 2px white
-  ring; a 14px ring on zone vertices over a 10px zone spine; 2px trail dots
-  at 55% of the unit color.
-- **Zones** are translucent fills (70/255 alpha) with an opaque 2px stroke of
-  the same rank color — outline is the shape, fill is only a hint.
+- **Islands and zones** — top-right corner chamfered 20px, cut stroked 2px in
+  Cut Grey. Every other corner square.
+- **Controls** — buttons, toggles, selects and fields all sit at 6px radius,
+  uniform across the family, so a control is recognisable by silhouette.
+- **Non-interactive chrome** — dividers, the top zone, and unrounded panels
+  stay square. Radius signals "you can touch this"; the chamfer signals "this
+  whole surface moves".
 
-### Why the chamfer exists
+**The cut edge is never cyan at rest.** It brightens, and it turns cyan, only
+on the island that owns input.
 
-An angled edge is localised faster than a fade, because an eye can track an
-edge and cannot track a dissolve. The operator's attention is on the map and
-the islands are peripheral, so the cut is doing perception work, not
-decoration work.
-
-It is a polygon painted *around* an axis-aligned content rect, which is why it
-costs paint and not layout. That property is load-bearing: it is the only
-reason a chamfered island is viable without rewriting the islands' contents.
-It does not extend to sheared or slanted panels — a shear insets the top-left
-corner, so any fixed content inset pokes through the diagonal, and the
-maintenance cost lands on every widget rather than once.
+- **Map symbology is pure circle geometry** — an 8px filled marker with a 2px
+  white ring; a 12px ring for focus; a 2px trail dot trail at 55% of the unit
+  colour; 2px zone strokes over 70/255 fills.
 
 ## Components
 
 ### Buttons
-Plain, compact and instrument-like: a dull graphite pill that only wakes up
-when touched.
-- **Shape:** gently curved (6px radius), padding 10px horizontal × 6px
-  vertical, sentence-case labels.
-- **Primary:** there is no filled brand button — importance is expressed by
-  position and by the ON state, never by a loud resting color. Resting fill
-  is Button Graphite with Button Label text.
-- **Hover / Focus:** fill becomes a Radar Cyan wash at 16% alpha, text lifts
-  to #F0F0F0, stroke 1.5px.
-- **Active / Pressed:** Radar Cyan wash at 27% alpha, text white, stroke 2px.
-- **Disabled:** rendered at 50% alpha (egui's disabled alpha) — greyed in
-  place, never hidden.
-- **Small:** the `−` / `+` zoom steppers use the 9px label style inside the
-  same 6px control shape.
+Plain, compact, instrument-like. A dull graphite pill that only wakes up when
+touched. 6px radius, 10 × 6px padding, sentence-case labels. There is no
+filled brand button; importance is expressed by position and by the ON state.
+Hover is a cyan wash at 16%, pressed at 27% with white text, disabled at 50%
+alpha in place.
 
-### Toggles & Selectables
-- **Style:** the same 6px control shape as buttons; used for the toolbar
-  island switches, desktop tabs, mode select (`📡 Presentation` /
-  `🎮 Simulation`), the Presentation/Simulation pair in the wizard, and every
-  roster row.
-- **State:** OFF is Button Graphite; ON is **solid Radar Cyan with Deep Well
-  text** — the highest-contrast pairing in the system, which is why an active
-  island is findable from across the room. Hover/press use the same cyan wash
-  as buttons.
-- Selected rows in ComboBoxes use the same cyan-fill rule.
+### Toggles and selects
+The same 6px shape. OFF is Button Graphite; ON is solid Radar Cyan with Deep
+Well text, the highest-contrast pairing in the system, which is why an active
+control is findable from across a room.
 
-### Cards / Containers (Islands)
-- **Character:** quiet navy panes that float over the map and never compete
-  with it.
-- **Corner Style:** 20px chamfer on the top-right corner, 2px cut edge, all
-  other corners square.
-- **Background:** Console Night; the title band steps to Panel Slate; inset
-  and secondary areas step to Panel Slate; input wells step to Deep Well.
-- **Border:** 1px Hairline Slate on every side. The cut edge is the one 2px
-  exception (see The One Exception).
-- **Shadow Strategy:** hard island cast (see Elevation & Depth); the hairline
-  does the real work.
-- **Internal Padding:** 12px island margin; rows separated by 10 × 8px.
-- **Title:** a 30px title band carrying one 12.5px monospace label in
-  short caps with 1.8px letter-spacing. The band is the drag region and the
-  only part of the island that moves it; the close button sits at its right,
-  clear of the chamfer.
-- **Fixed footprint:** an island does not resize to fit its content. The body
-  scrolls. A panel that grows under the cursor while someone is reading a map
-  is worse than one that scrolls, and a stable silhouette is what makes the
-  chamfer read as a shape rather than as a frame that happens to be there.
-- **Title-band hover** brightens the cut edge. Nothing else about the island
-  changes on hover.
+### Zones
+A zone is a column or a band of islands and nothing else. A zone has no
+background of its own; the islands inside it are the visible surface, and the
+map shows through the gaps. A zone that grew a panel of its own would be a
+fourth kind of thing.
 
-### Inputs / Fields
-- **Style:** Deep Well background (darker than the island, so a field reads
-  as cut into the panel), Body Silver text, 6px radius, 6px × 10px padding,
-  280px default width; password fields mask in place.
-- **Focus:** the cyan signal — cursor and selection fill are Radar Cyan, and
-  the selection text is Deep Well.
-- **Error / Disabled:** errors never live inside the field; they print as a
-  Fault Red status line beneath the control, with the recovery named on the
-  adjacent control. Disabled controls drop to 50% alpha.
+### Inputs
+Deep Well background so a field reads as cut into the panel, Body Silver text,
+6px radius, 280px default. Focus is the cyan signal: cursor and selection fill
+are Radar Cyan and the selection text is Deep Well. Errors never live inside
+the field; they print as a Fault Red status line beneath it with the recovery
+named on the adjacent control.
 
-### Navigation
-- **Toolbar:** full-width, unrounded Console Night band, two rows of
-  horizontal groups split by 1px dividers. Island toggles first, zoom and
-  clock last — controls the operator touches constantly sit leftmost.
-- **Desktop tabs:** selectable labels numbered `[1] … [9]`, mirroring the
-  number-key shortcuts; ON = cyan fill. The camera never moves when a tab
-  switches.
-- **Wizard:** a non-collapsible 460px-min island with a heading, one line of
-  guidance, and a `← Back` / `Next →` footer row separated by a divider.
-- **Mobile treatment:** none — this is a desktop window; adaptation is
-  dragging islands and swapping desktops, not reflowing.
-
-### Signature Components
-- **Status line** — one row of state ink (green / sand / red / gray) driven by
-  message content, so every backend message lands in a predictable color.
-  This is the app's most-used component and it is deliberately text-only.
-- **Unit marker** — filled circle + 2px white ring + 12px focus ring + a 12px
-  offset Map Ink label. Trails are 2px dots of the same color at 55% alpha.
-- **Zone hull / centroid flag** — a translucent rank-colored polygon with an
-  opaque rank stroke, and a flag disc carrying lat/lon, drawn only at or
-  above zoom 11.
+### Signature components
+- **Status line** — one row of state ink, text only. The most-used component
+  in the app.
+- **Unit marker** — filled circle, 2px white ring, 12px focus ring, Map Ink
+  label.
+- **User island** — a default person glyph at 32px, the display name, and the
+  app role as a small mono tag. It is the only surface in the app that is
+  about a person rather than about state.
 
 ## Motion
 
-The rest of this document says *don't* a great deal. This section says **how**,
-because a console with no motion vocabulary drifts into either deadness or
-gamer-chrome, and both are failures.
-
-### The governing idea
-
-Motion is for three things only: telling the operator the interface heard
-them, keeping a state change legible, and making a jump in space
-intelligible. Anything else is decoration, and decoration on
-information-dense chrome hinders.
+The governing idea: **motion tells the operator the interface heard them,
+keeps a state change legible, and makes a jump in space intelligible.**
+Anything else is decoration, and decoration on information-dense chrome
+hinders.
 
 **The frequency rule.** The more often something happens, the less it may
-move. A 100x/day action gets no animation at all. A keyboard shortcut never
-gets animation — a shortcut repeated hundreds of times a day with a
-transition on it feels slow and disconnected, and it is always a pointer-free
-path anyway. A once-per-exercise transition can be generous.
+move. A 100×/day action gets no animation. A keyboard shortcut never gets
+animation. A once-per-exercise transition may be generous.
 
-### Easing
-
-egui's animation is linear in elapsed time, with the curve chosen by the
-caller: `emath::easing::*` carries the vocabulary. There are no spring
-physics here, because egui retargets an in-flight animation from its current
-value (`animation_manager.rs`) — an eased tween is correct, and a hand-rolled
-spring is a reinvention.
+egui's animation is linear in elapsed time with the curve chosen by the
+caller, and it retargets an in-flight animation from its current value, so an
+eased tween is correct and a hand-rolled spring is a reinvention.
 
 | Curve | Use for |
 | --- | --- |
-| `cubic_out` | Everything that enters or moves. Decelerating: a surface should settle into place, never accelerate away from it. |
-| `quadratic_in_out` | Two-ended transitions where both start and end are visible (a tab indicator travelling between tabs). |
+| `cubic_out` | Everything that enters or moves. A surface settles, never accelerates away. |
+| `quadratic_in_out` | Two-ended transitions where both ends are visible. |
 | `linear` | Nothing. It is a default, not a choice. |
-
-### Durations
 
 | Moment | Duration | Note |
 | --- | --- | --- |
-| Press feedback | 0 | Colour state only. Never a transition. |
-| Island / control hover | 0 | Cut-edge brightening is instantaneous. |
-| Island open, panel step, tab change | 150-200ms | `cubic_out` |
-| Camera recentre on a hull | 300ms | `cubic_out`, on centre only — never on zoom |
-| Zoom step (the `-`/`+` buttons) | 200ms | `cubic_out`. The wheel is a continuous gesture and is never tweened. |
-| Simulation phase change | 250ms | `cubic_out`. Once per phase, so it may be generous. |
+| Press feedback | 0 | Colour state only. |
+| Island / control hover, rim lighting | 0 | Instantaneous. A focus indicator that fades in is late. |
+| Island open, modal step, tab change | 150–200ms | `cubic_out` |
+| Side zone show / hide, dock flip | 180ms | `cubic_out`, width and opacity together |
+| Camera recentre on a hull | 300ms | `cubic_out`, on centre only, never on zoom |
+| Zoom step (`−` / `+`) | 200ms | `cubic_out`. The wheel is a gesture and is never tweened. |
+| Game state change | 250ms | `cubic_out`. Once per state, so it may be generous. |
 
-### What may animate
+**What may animate.** Camera centre on a deliberate operator action, island
+and modal entrances from the direction the operator came from, an indicator
+travelling between fixed positions, and a surface's own state.
 
-- **Camera centre and zoom**, on a deliberate operator action. The map's
-  texture already lags the camera and is drawn translated underneath it
-  (the "buttery canvas" pass), so an eased camera makes that lag read as
-  intent rather than as a stutter.
-- **Island and wizard step entrances**, 150-200ms `cubic_out`, entering from
-  the direction the operator came from. Back and Next leave by the same edge
-  they arrived on.
-- **A tab or phase indicator** travelling between a fixed set of positions.
-  Eased, because both ends are visible and the eye can follow the edge.
-- **A surface's own state** — hover wash, cut-edge brightness, press fill.
+**What may not animate.** Unit markers, which glide because that is display
+interpolation and never for style. Anything that pulses: the wire drops in
+bulk and a stale marker does not need to flap. Lists, which repopulate
+continuously and would re-fire a stagger forever. Anything keyboard-initiated.
 
-### What may not animate
+**Island open and close is explicitly allowed to animate here**, which the
+previous system forbade. The earlier rule existed because a close button was
+already the feedback, and with islands now arriving in a column a 150ms
+settle is what makes a column read as a stack rather than as a pop. The
+duration stays at the low end for that reason.
 
-- **Unit markers.** Data the operator is reading does not move for style.
-  Markers glide between accepted fixes because that is display interpolation
-  (ADR-0011), not animation, and it must never be extended, slowed, eased,
-  or given a stagger.
-- **Anything that pulses.** Specifically: stale markers do not pulse. The
-  wire drops in bulk, staleness is unattended, and an operator judging
-  whether data is real does not need it flapping.
-- **Island open/close.** Islands appear and vanish on an operator's explicit
-  action, and the close button is already the feedback. An entrance
-  transition here delays the thing the operator asked for.
-- **Lists.** No stagger, no draw-in. The roster, the log, and the feed
-  re-populate continuously; a stagger would re-fire constantly and read as
-  noise.
-- **Anything keyboard-initiated.**
-
-### Reduced motion
-
-`style.animation_time = 0.0` collapses every egui animation to its target
-immediately (`animation_manager.rs`), including the island fade. The client
-exposes a single switch; it is not per-component.
-
-### The frame clock
-
-egui drives transitions itself: an in-flight animation calls
-`request_repaint()`, so motion runs at display rate regardless of the
-client's repaint floor. The `request_repaint_after(100ms)` call is a
-**deadline, not a rate cap** — it guarantees a frame when nothing else has
-asked for one, so animations are not starved by it.
-
-What the floor actually costs is a full layout pass ten times a second while
-the console is idle and nothing is moving. For an air-gapped laptop station
-that is a battery cost, and it is why "Offline is a first-class state" was not
-quite true: the client never actually reached zero.
-
-The floor is now on demand. A frame is requested when a channel pump consumed
-something, when a hull is mid-glide, when the camera is easing, or when a
-REST request is outstanding (that last one at a 50ms cadence, because a login
-is an operator staring at a button and must not wait on anything). Otherwise
-a 2s watchdog fires.
-
-The watchdog is deliberate and temporary. Freshness deadlines, image URL
-expiry and the game clock can all change display state without crossing a
-channel, and they are not all enumerated. A 2s backstop turns a missed case
-into a two-second-old readout rather than a frozen console, for one frame per
-two seconds instead of ten. Removing it is the change that makes an idle
-console cost genuinely nothing, and it should not be removed until every
-timer in that list is event-driven.
-
-A paused simulation is stationary, so it does not hold the loop awake: a hull
-frozen part-way between two fixes needs no frames until it unpauses.
+**Reduced motion** is one switch, not per-component: setting
+`style.animation_time = 0` collapses every animation to its target.
 
 ## Do's and Don'ts
 
 ### Do:
-- **Do** route every state-bearing message through the status ink function
-  (green / sand / red / gray) before it reaches a label.
-- **Do** keep Radar Cyan to live state: selection, links, hover/press wash,
-  and toggle ON. Solid cyan with Deep Well text is the ON treatment.
-- **Do** separate panels with a 1px Hairline Slate stroke and step a tone for
-  depth (Console Night → Panel Slate → Deep Well).
-- **Do** chamfer the island's top-right corner 20px and stroke the cut 2px in
-  cool grey; keep every other corner square.
-- **Do** use the 6px control radius exactly, and reserve the island's
-  chamfer for islands. 6px means control, chamfer means container.
-- **Do** put machine output — event feed, session logs, ids — in Hack, and
-  give every island a fixed footprint with a scrolling body rather than a
-  body that grows the island.
-- **Do** draw map objects as circles with 2px rings and label them in Map Ink
-  at 12px; keep zone fills at 70/255 alpha under an opaque 2px rank stroke.
-- **Do** keep the map canvas frameless and full-window — UI floats over it,
-  never insets it.
+- Route every state-bearing message through the status ink function.
+- Keep Radar Cyan to live state and the focused surface.
+- Separate panels with a 1px hairline and step a tone for depth.
+- Light a rim only on the island that owns input.
+- Keep texture and hardware detail on a title band, never across a body.
+- Put machine output in Hack and give every island a fixed footprint.
+- Draw map objects as circles with 2px rings and label them in Map Ink.
+- Hide a verb the backend would refuse rather than showing one that 409s.
 
 ### Don't:
-- **Don't** introduce a second chrome accent, a gradient, or a glow; the
-  palette is one cyan plus navy neutrals plus scoped semantic hues. The one
-  exception is the island's cut edge, which is a cool grey and never cyan.
-- **Don't** put a rank color (green/blue/purple/orange) on chrome — it is
-  reserved for group rank on the map.
-- **Don't** ship gray-on-gray status, and don't animate to announce state —
-  color says it first.
-- **Don't** add a third typeface, bold body text for emphasis, or monospace
-  for anything a human wrote.
-- **Don't** reach for a bigger shadow when a surface needs presence; use the
-  hairline and a tonal step.
-- **Don't** round the toolbar, and don't add a filled "brand" primary button —
-  resting controls stay graphite.
-- **Don't** invent breakpoints or responsive stacking: this is a desktop
-  window with movable islands.
+- Introduce a second chrome accent, a gradient, or a glow on a surface that
+  is not reporting state.
+- Put a rank colour on chrome.
+- Ship gray-on-gray status, or animate to announce state.
+- Add a third typeface, bold body text, or monospace for anything a human wrote.
+- Reach for a bigger shadow when a surface needs presence.
+- Round the top zone, or invent breakpoints and responsive stacking.
+- Put a panel anywhere but one of the three zones.
