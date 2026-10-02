@@ -207,7 +207,7 @@ mod tests {
                 }
             ]
         });
-        let m = master::parse_image_manifest(&data);
+        let m = MinosMaster::parse_image_manifest(&data);
         assert_eq!(m.version, "\"asset-v1\"", "ETag is the content identity");
         assert_eq!(m.entry_count, 2);
         assert_eq!(m.units_without_image, 7);
@@ -248,7 +248,7 @@ mod tests {
                 "turn_rate_max_deg_s": 2.5
             }
         });
-        let s = master::parse_hull_spec(&full, 13).expect("full spec");
+        let s = MinosMaster::parse_hull_spec(&full, 13).expect("full spec");
         assert_eq!(s.loa_m, Some(120.5));
         assert_eq!(s.beam_m, Some(16.2));
         assert_eq!(s.draft_m, Some(4.1));
@@ -263,7 +263,7 @@ mod tests {
             "unit_class": { "id": 5, "name": "Sigma" },
             "current_specification": { "version": 1, "speed_max_surface_kn": 12.0 }
         });
-        let s = master::parse_hull_spec(&bare, 13).expect("bare spec");
+        let s = MinosMaster::parse_hull_spec(&bare, 13).expect("bare spec");
         assert_eq!(s.loa_m, None, "an absent loa_m is unknown, not zero");
         assert_eq!(s.beam_m, None);
         assert_eq!(s.draft_m, None);
@@ -273,7 +273,7 @@ mod tests {
 
         // No published spec at all is the NoSpec refusal, as before.
         let none = serde_json::json!({ "unit_class": { "id": 5, "name": "Sigma" } });
-        assert!(master::parse_hull_spec(&none, 13).is_err());
+        assert!(MinosMaster::parse_hull_spec(&none, 13).is_err());
     }
 
     #[test]

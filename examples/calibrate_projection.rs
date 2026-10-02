@@ -96,8 +96,8 @@ fn main() {
     // Longitude pan: middle row hunts a north-south edge (port, river).
     let west = (-6.1080, 106.8300);
     let east = (-6.1080, 106.8700);
-    let fw = render(west);
-    let fe = render(east);
+    let fw = render(west, &cache);
+    let fe = render(east, &cache);
     let (xa, sxa) = edge_x(&fw);
     let (xb, sxb) = edge_x(&fe);
     let measured_lon = (xb - xa) as f64;
