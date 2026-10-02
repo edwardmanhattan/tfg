@@ -67,6 +67,40 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
         CREATE TABLE IF NOT EXISTS unit_type_symbols (
             type_id INTEGER PRIMARY KEY, symbol INTEGER NOT NULL
         );
+        -- Affiliation declarations. The map layer's OWN tables, like
+        -- unit_type_symbols: Minos publishes no affiliation at all (the
+        -- research on the map settled that), so every frame this client
+        -- draws is a statement the operator made.
+        --
+        -- The three declaration tables are SESSION-scoped: declaring a
+        -- branch hostile is a statement about one exercise, and must not
+        -- silently apply to the next one where the operator may be on
+        -- the other side. `scope` is the session key the caller passes.
+        -- our_branches is the exception and is deliberately NOT scoped:
+        -- this branch being mine is a fact about the operator, and holds
+        -- across every exercise they run.
+        --
+        -- Keyed on mirrored ids, never on names: branch names are
+        -- operator vocabulary (Navy, and whatever else), and a rename
+        -- must not repaint the map.
+        CREATE TABLE IF NOT EXISTS unit_affiliations (
+            scope TEXT NOT NULL, unit_id INTEGER NOT NULL,
+            affiliation INTEGER NOT NULL,
+            PRIMARY KEY (scope, unit_id)
+        );
+        CREATE TABLE IF NOT EXISTS group_affiliations (
+            scope TEXT NOT NULL, group_id TEXT NOT NULL,
+            affiliation INTEGER NOT NULL,
+            PRIMARY KEY (scope, group_id)
+        );
+        CREATE TABLE IF NOT EXISTS session_branch_affiliations (
+            scope TEXT NOT NULL, branch_id INTEGER NOT NULL,
+            affiliation INTEGER NOT NULL,
+            PRIMARY KEY (scope, branch_id)
+        );
+        CREATE TABLE IF NOT EXISTS our_branches (
+            branch_id INTEGER PRIMARY KEY
+        );
         CREATE TABLE IF NOT EXISTS unit_specs (
             unit_id INTEGER NOT NULL, version INTEGER NOT NULL,
             is_current INTEGER NOT NULL DEFAULT 0, body TEXT NOT NULL,
@@ -693,6 +727,255 @@ pub struct UnitTaxonomy {
     pub type_id: Option<i64>,
     pub category_id: Option<i64>,
     pub domain_id: Option<i64>,
+}
+
+/// What a thing is in relation to the operator watching the map.
+///
+/// Re-exported from `symbology`, which owns the type. This module is
+/// persistence: it keeps the four declaration tables and the resolver,
+/// but the domain enum it resolves to belongs to the symbology core.
+/// That direction matters beyond tidiness — `symbology` is compiled by
+/// `proto/p5-epaint`, and `store` pulls `rusqlite`, so an identity type
+/// living here would put a bundled SQLite amalgamation behind every
+/// vocabulary review.
+pub use crate::symbology::Affiliation;
+
+/// The facts one affiliation decision reads, as data.
+///
+/// Deliberately not a struct of lookups: the resolver takes ids, so the
+/// same pure function serves a unit on the map, a unit in the Roster
+/// and a group in the Inspector, and a caller cannot accidentally pass
+/// a display name into any of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AffiliationSubject {
+    /// Mirrored `units.id`, when the thing is a single hull.
+    pub unit_id: Option<i64>,
+    /// Session group id, when the thing belongs to one. Group ids are
+    /// strings, unlike the mirrored taxonomy ids.
+    pub group_id: Option<String>,
+    /// Mirrored `units.branch_id`, the session-branch declaration key.
+    pub branch_id: Option<i64>,
+    /// Whether this operator drives the thing. Being commanded is a
+    /// fact about the session, not about the world.
+    pub owned: bool,
+}
+
+/// Every affiliation declaration for one session, as data.
+///
+/// Deliberately parallel to [`SymbolResolver`]: the map layer keeps
+/// its own id-keyed assignment tables because Minos publishes neither,
+/// and reads them most-specific-first. Nothing here compares a NAME.
+#[derive(Debug, Clone, Default)]
+pub struct AffiliationResolver {
+    /// Session-scoped, most specific.
+    pub by_unit: std::collections::HashMap<i64, Affiliation>,
+    /// Session-scoped, the deliberate statement about a task force.
+    pub by_group: std::collections::HashMap<String, Affiliation>,
+    /// Session-scoped: "in THIS exercise, that branch is hostile".
+    pub by_branch: std::collections::HashMap<i64, Affiliation>,
+    /// NOT session-scoped: "this branch is mine", which holds across
+    /// every exercise the operator runs.
+    pub our_branches: std::collections::HashSet<i64>,
+}
+
+impl AffiliationResolver {
+    pub fn new(
+        by_unit: Vec<(i64, Affiliation)>,
+        by_group: Vec<(String, Affiliation)>,
+        by_branch: Vec<(i64, Affiliation)>,
+        our_branches: Vec<i64>,
+    ) -> Self {
+        AffiliationResolver {
+            by_unit: by_unit.into_iter().collect(),
+            by_group: by_group.into_iter().collect(),
+            by_branch: by_branch.into_iter().collect(),
+            our_branches: our_branches.into_iter().collect(),
+        }
+    }
+
+    /// Resolve one thing's affiliation, declarations above inference.
+    ///
+    /// The chain, in order: a unit declaration, then its group's, then
+    /// this session's declaration for its branch, then "ours" (driven
+    /// by this operator, or a branch the operator has claimed), then
+    /// Unknown.
+    ///
+    /// EXPLICIT BEATS INFERENCE AT EVERY LEVEL. A unit this operator
+    /// drives is friendly *unless* something is declared about it — and
+    /// when that looks wrong on screen the fix is to correct the
+    /// declaration, which is visible and deliberate. Conversely a
+    /// unit this operator does NOT drive is never painted hostile:
+    /// "our side" is a fact about the session, "hostile" is a judgement
+    /// about the world, and only the operator gets to make that call.
+    pub fn resolve(&self, subject: &AffiliationSubject) -> Affiliation {
+        if let Some(id) = subject.unit_id {
+            if let Some(declared) = self.by_unit.get(&id) {
+                return *declared;
+            }
+        }
+        if let Some(group) = &subject.group_id {
+            if let Some(declared) = self.by_group.get(group) {
+                return *declared;
+            }
+        }
+        if let Some(branch) = subject.branch_id {
+            if let Some(declared) = self.by_branch.get(&branch) {
+                return *declared;
+            }
+            if self.our_branches.contains(&branch) {
+                return Affiliation::Friendly;
+            }
+        }
+        if subject.owned {
+            return Affiliation::Friendly;
+        }
+        Affiliation::Unknown
+    }
+}
+
+/// Declare a hull's affiliation for one session. `None` removes the
+/// declaration, which is different from declaring Unknown: Unknown
+/// blocks the "ours" inference, no declaration invites it.
+pub fn set_unit_affiliation(
+    conn: &mut Connection,
+    scope: &str,
+    unit_id: i64,
+    affiliation: Option<Affiliation>,
+) -> Result<(), String> {
+    set_affiliation(conn, "unit_affiliations", "unit_id", scope, unit_id, affiliation)
+}
+
+/// Declare a group's affiliation for one session.
+pub fn set_group_affiliation(
+    conn: &mut Connection,
+    scope: &str,
+    group_id: &str,
+    affiliation: Option<Affiliation>,
+) -> Result<(), String> {
+    set_affiliation(conn, "group_affiliations", "group_id", scope, group_id, affiliation)
+}
+
+/// Declare a branch's affiliation for one session.
+pub fn set_branch_affiliation(
+    conn: &mut Connection,
+    scope: &str,
+    branch_id: i64,
+    affiliation: Option<Affiliation>,
+) -> Result<(), String> {
+    set_affiliation(
+        conn,
+        "session_branch_affiliations",
+        "branch_id",
+        scope,
+        &branch_id,
+        affiliation,
+    )
+}
+
+/// Record or withdraw the "this branch is mine" claim. Deliberately
+/// unscoped: it is a fact about the operator, not about one exercise.
+pub fn set_our_branch(conn: &Connection, branch_id: i64, ours: bool) -> Result<(), String> {
+    let result = if ours {
+        conn.execute(
+            "INSERT OR IGNORE INTO our_branches (branch_id) VALUES (?1)",
+            [branch_id],
+        )
+    } else {
+        conn.execute("DELETE FROM our_branches WHERE branch_id = ?1", [branch_id])
+    };
+    result.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// One upsert-or-delete for the three declaration tables, which differ
+/// only in their key column's type. `table` and `key` are literals at
+/// every call site, never values from the operator or the wire.
+fn set_affiliation<T: rusqlite::ToSql>(
+    conn: &mut Connection,
+    table: &str,
+    key: &str,
+    scope: &str,
+    id: T,
+    affiliation: Option<Affiliation>,
+) -> Result<(), String> {
+    match affiliation {
+        Some(value) => conn.execute(
+            &format!(
+                "INSERT INTO {table} (scope, {key}, affiliation) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(scope, {key}) DO UPDATE SET affiliation = excluded.affiliation"
+            ),
+            params![scope, &id, value as i32],
+        ),
+        None => conn.execute(
+            &format!("DELETE FROM {table} WHERE scope = ?1 AND {key} = ?2"),
+            params![scope, &id],
+        ),
+    }
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// Load every declaration that applies to one session.
+///
+/// An EMPTY resolver is the state before the operator has declared
+/// anything, and it must still answer: everything resolves Unknown
+/// rather than failing, because most units will be in exactly that
+/// state on a first run.
+pub fn affiliation_resolver(conn: &Connection, scope: &str) -> Result<AffiliationResolver, String> {
+    let by_unit = declared_pairs(conn, "unit_affiliations", "unit_id", scope)?;
+    let by_branch = declared_pairs(conn, "session_branch_affiliations", "branch_id", scope)?;
+    let by_group = declared_texts(conn, "group_affiliations", scope)?;
+    let mut our_branches = Vec::new();
+    let mut stmt = conn
+        .prepare("SELECT branch_id FROM our_branches")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        our_branches.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(AffiliationResolver::new(by_unit, by_group, by_branch, our_branches))
+}
+
+/// Read a key/affiliation pair table for one session.
+///
+/// `table` and `key` are literals at every call site, never values
+/// from the operator or the wire — the only interpolated text in these
+/// queries.
+fn declared_pairs(
+    conn: &Connection,
+    table: &str,
+    key: &str,
+    scope: &str,
+) -> Result<Vec<(i64, Affiliation)>, String> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT {key}, affiliation FROM {table} WHERE scope = ?1"))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([scope], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                Affiliation::from_ordinal(r.get::<_, i32>(1)?),
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+fn declared_texts(
+    conn: &Connection,
+    table: &str,
+    scope: &str,
+) -> Result<Vec<(String, Affiliation)>, String> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT group_id, affiliation FROM {table} WHERE scope = ?1"))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([scope], |r| {
+            Ok((r.get::<_, String>(0)?, Affiliation::from_ordinal(r.get::<_, i32>(1)?)))
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 /// `unit_type.id -> MapSymbol` assignments, as read from the local
@@ -1511,5 +1794,152 @@ mod tests {
                 (4, "Referee".to_string(), "Wasit".to_string(), true),
             ]
         );
+    }
+
+    fn subject(
+        unit: Option<i64>,
+        group: Option<&str>,
+        branch: Option<i64>,
+        owned: bool,
+    ) -> AffiliationSubject {
+        AffiliationSubject {
+            unit_id: unit,
+            group_id: group.map(str::to_string),
+            branch_id: branch,
+            owned,
+        }
+    }
+
+    #[test]
+    fn declarations_beat_inference_at_every_level() {
+        let mut conn = open(&std::path::PathBuf::from(":memory:")).expect("open");
+        // Unit beats group, group beats the session's branch
+        // declaration, and any of them beats "ours".
+        set_unit_affiliation(&mut conn, "s1", 7, Some(Affiliation::Neutral)).expect("unit");
+        set_group_affiliation(&mut conn, "s1", "gugus-1", Some(Affiliation::Hostile)).expect("group");
+        set_branch_affiliation(&mut conn, "s1", 1, Some(Affiliation::Friendly)).expect("branch");
+        set_our_branch(&conn, 1, true).expect("ours");
+        let r = affiliation_resolver(&conn, "s1").expect("load");
+
+        assert_eq!(r.resolve(&subject(Some(7), Some("gugus-1"), Some(1), true)), Affiliation::Neutral);
+        // Same unit without its own declaration falls to the group.
+        assert_eq!(r.resolve(&subject(Some(8), Some("gugus-1"), Some(1), true)), Affiliation::Hostile);
+        // Same branch, no unit or group: the session declaration wins.
+        assert_eq!(r.resolve(&subject(Some(9), None, Some(1), true)), Affiliation::Friendly);
+        // A different branch is ours only through inference, and our
+        // unit is friendly because the operator drives it.
+        assert_eq!(r.resolve(&subject(Some(9), None, Some(2), true)), Affiliation::Friendly);
+        // Neither declared nor ours: honest unknown.
+        assert_eq!(r.resolve(&subject(Some(9), None, Some(2), false)), Affiliation::Unknown);
+        // No ids at all still answers rather than failing.
+        assert_eq!(r.resolve(&subject(None, None, None, false)), Affiliation::Unknown);
+    }
+
+    #[test]
+    fn a_declaration_of_unknown_still_blocks_the_ours_inference() {
+        // Explicit beats inference: declaring Unknown on a driven unit
+        // keeps it unknown, which is how an operator says "I command it
+        // but I am not claiming its allegiance".
+        let mut conn = open(&std::path::PathBuf::from(":memory:")).expect("open");
+        set_unit_affiliation(&mut conn, "s1", 7, Some(Affiliation::Unknown)).expect("unit");
+        let r = affiliation_resolver(&conn, "s1").expect("load");
+        assert_eq!(r.resolve(&subject(Some(7), None, Some(1), true)), Affiliation::Unknown);
+        // Withdrawing the declaration invites the inference back, which
+        // is why "None" and "Unknown" are different states in the UI.
+        set_unit_affiliation(&mut conn, "s1", 7, None).expect("withdraw");
+        let r = affiliation_resolver(&conn, "s1").expect("reload");
+        assert_eq!(r.resolve(&subject(Some(7), None, Some(1), true)), Affiliation::Friendly);
+    }
+
+    #[test]
+    fn our_branches_outlive_the_session_that_claimed_them() {
+        let mut conn = open(&std::path::PathBuf::from(":memory:")).expect("open");
+        set_our_branch(&conn, 3, true).expect("ours");
+        set_branch_affiliation(&mut conn, "s1", 9, Some(Affiliation::Hostile)).expect("branch");
+        // A declaration is scoped to one exercise...
+        assert_eq!(
+            affiliation_resolver(&conn, "s2").expect("other session")
+                .resolve(&subject(Some(7), None, Some(9), false)),
+            Affiliation::Unknown
+        );
+        // ...while "this branch is mine" is a fact about the operator
+        // and survives every session.
+        assert_eq!(
+            affiliation_resolver(&conn, "s2").expect("other session")
+                .resolve(&subject(Some(7), None, Some(3), false)),
+            Affiliation::Friendly
+        );
+        set_our_branch(&conn, 3, false).expect("retract");
+        assert_eq!(
+            affiliation_resolver(&conn, "s1").expect("reload")
+                .resolve(&subject(Some(7), None, Some(3), false)),
+            Affiliation::Unknown
+        );
+    }
+
+    #[test]
+    fn declarations_survive_a_restart_and_a_rename() {
+        let path = std::env::temp_dir().join(format!(
+            "tfg-affiliation-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut conn = open(&path).expect("open");
+            set_unit_affiliation(&mut conn, "s1", 7, Some(Affiliation::Hostile)).expect("unit");
+        }
+        let conn = open(&path).expect("reopen");
+        assert_eq!(
+            affiliation_resolver(&conn, "s1").expect("load").resolve(&subject(Some(7), None, None, true)),
+            Affiliation::Hostile
+        );
+        // Renaming the branch the key used to point at changes nothing,
+        // because the key is an id and no name is read anywhere.
+        conn.execute(
+            "UPDATE helpers SET name = 'Merchant Marine' \
+             WHERE table_name = 'service_branches' AND id = 1",
+            [],
+        )
+        .expect("rename");
+        assert_eq!(
+            affiliation_resolver(&conn, "s1").expect("load").resolve(&subject(Some(7), None, None, true)),
+            Affiliation::Hostile
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_stale_ordinal_resolves_to_unknown_rather_than_panicking() {
+        let conn = open(&std::path::PathBuf::from(":memory:")).expect("open");
+        conn.execute(
+            "INSERT INTO unit_affiliations (scope, unit_id, affiliation) VALUES ('s1', 7, 99)",
+            [],
+        )
+        .expect("corrupt row");
+        let r = affiliation_resolver(&conn, "s1").expect("load");
+        assert_eq!(r.resolve(&subject(Some(7), None, None, false)), Affiliation::Unknown);
+        assert_eq!(Affiliation::from_ordinal(-3), Affiliation::Unknown);
+    }
+
+    #[test]
+    fn an_empty_store_still_answers_every_subject() {
+        // The state before the operator has declared anything: most
+        // units are in exactly this state on a first run, and the map
+        // must draw them all as unknown rather than fail.
+        let conn = open(&std::path::PathBuf::from(":memory:")).expect("open");
+        let r = affiliation_resolver(&conn, "s1").expect("load");
+        for subject in [
+            subject(None, None, None, false),
+            subject(Some(1), Some("g"), Some(1), false),
+        ] {
+            assert_eq!(r.resolve(&subject), Affiliation::Unknown);
+        }
+        // A unit this operator drives is friendly with nothing declared
+        // at all: being commanded is a fact about the session.
+        assert_eq!(r.resolve(&subject(Some(2), None, None, true)), Affiliation::Friendly);
+        assert!(r.by_unit.is_empty() && r.our_branches.is_empty());
     }
 }
