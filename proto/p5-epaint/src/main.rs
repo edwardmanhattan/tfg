@@ -1098,35 +1098,33 @@ fn main() -> eframe::Result {
 }
 
 
-/// Rewrite `src/symbology/icons_generated.rs` from the manifest.
+/// Rewrite `src/symbology/icons_generated.rs` from the two tables.
 ///
 /// Separate from `--symbology-check` rather than a `--force` on it
 /// because writing and asserting are different permissions, and a check
 /// that can silently repair what it is checking is not a check.
 fn symbology_generate() -> Result<(), String> {
-    let manifest = symbology::generate::manifest_path().map_err(|e| e.to_string())?;
-    let out = symbology::generate::regenerate(&manifest).map_err(|e| e.to_string())?;
+    let out = symbology::generate::regenerate().map_err(|e| e.to_string())?;
     println!("wrote {}", out.display());
     Ok(())
 }
 
-/// Fail loudly if the checked-in geometry has drifted from the manifest.
+/// Fail loudly if the checked-in geometry has drifted from the tables.
 ///
 /// The generated file is committed, so this is the only thing standing
 /// between a hand edit and a vocabulary whose readability invariants no
 /// longer hold.
 fn symbology_check() -> Result<(), String> {
-    let manifest = symbology::generate::manifest_path().map_err(|e| e.to_string())?;
     let generated = symbology::generate::generated_path().map_err(|e| e.to_string())?;
-    match symbology::generate::check_drift(&manifest, &generated).map_err(|e| e.to_string())? {
+    match symbology::generate::check_drift(&generated).map_err(|e| e.to_string())? {
         None => {
-            println!("icons.tsv and {} agree", generated.display());
+            println!(
+                "icons.tsv + milsymbol.tsv and {} agree",
+                generated.display()
+            );
             Ok(())
         }
-        Some(diff) => Err(format!(
-            "icons_generated.rs is stale against {}:\n\n{diff}",
-            manifest.display()
-        )),
+        Some(diff) => Err(format!("icons_generated.rs is stale:\n\n{diff}")),
     }
 }
 

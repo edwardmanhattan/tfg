@@ -17,6 +17,7 @@
 pub mod generate;
 pub mod icons;
 mod icons_generated;
+pub mod svgpath;
 
 #[allow(unused_imports)]
 pub use icons::{BOX_PX, EM_BOX};

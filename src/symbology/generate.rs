@@ -15,43 +15,52 @@
 //! already has, and the generated file sits beside the model that
 //! consumes it.
 //!
-//! ## The grammar
+//! ## Two files, not one
 //!
-//! Tab-separated, one icon per row: variant name, display name,
-//! dimension letter, semicolon-separated subpaths. Each subpath is
-//! prefixed `F` (closed, filled) or `S` (open, stroked). Over a 1000 em
-//! box with y DOWN and the origin at the icon's centre:
+//! `assets/symbology/milsymbol.tsv` holds the GEOMETRY, extracted from the
+//! MIT-licensed `spatialillusions/milsymbol` tables at a pinned commit.
+//! `assets/symbology/icons.tsv` holds the SELECTION: which upstream keys
+//! this client draws, what it calls them, and which battle dimension each
+//! draws in.
 //!
-//! ```text
-//! M x y            move
-//! L x y            line
-//! A cx cy r a0 a1  arc, degrees, y down
-//! Z                close the current subpath
-//! ```
+//! They are separate because they are different kinds of claim. The geometry
+//! is inherited evidence with a licence, a commit and a licence file; the
+//! selection is a judgement about which icons are worth drawing at 22 px.
+//! Merged into one file, a reviewer could not tell which coordinates were
+//! chosen and which were copied, and the judgement — the only part worth
+//! arguing with — would be buried in a wall of `d` attributes.
 //!
-//! No cubics and no quadratics, and that is the point rather than a
-//! limitation: every APP-6C icon in this vocabulary is straight strokes
-//! and circular arcs, so a grammar without curves lets this module PROVE
-//! the table sits inside its declared primitive set instead of asserting
-//! it.
+//! ## The grammar is upstream's, not ours
+//!
+//! The subpath cell is real SVG path data: `M L H V C S Q T A Z`, absolute
+//! and relative, with implicit repeats and numbers written without
+//! separators. [`super::svgpath`] parses it. An earlier revision of this
+//! generator used a ten-command DSL of `M`/`L`/`A` only, on the reasoning
+//! that a narrower grammar lets it prove the table sits inside its declared
+//! primitive set. That was sound while the table was hand-authored and the
+//! primitive set was a choice. It is wrong now that the geometry has a
+//! source: upstream writes cubics, and a parser that refused them would
+//! refuse most of the vocabulary.
 //!
 //! ## Why the coordinates come out flattened
 //!
-//! epaint 0.36 has no `PathEl`, so a painter could not consume an arc
-//! even if this module handed it one, and the headless contact sheet in
-//! the harness has no epaint at all. An arc therefore resolves to line
-//! segments HERE, once, and both consumers read the same segments. That
-//! is the property that makes a sheet a truthful picture of the map
-//! rather than a second renderer that agrees with the first one by luck.
+//! epaint 0.36 has no `PathEl` and no `FillRule`, so a painter could not
+//! consume a curve even if this module handed it one, and the headless
+//! contact sheet in the harness has no epaint at all. Every curve
+//! therefore resolves to line segments HERE, once, and both consumers read
+//! the same segments. That is the property that makes a sheet a truthful
+//! picture of the map rather than a second renderer that agrees with the
+//! first one by luck.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::icons::{
-    ARC_SEGMENT_CAP, EM_BOX, EM_HALF, EM_PER_PX, Fit, GAP_SAMPLES_PER_PX, Point,
-    MIN_ARC_SAGITTA_EM, MIN_ICON_STROKE_EM, MIN_INK_COVERAGE, MIN_STROKE_PX,
+    EM_BOX, EM_HALF, EM_PER_PX, Fit, GAP_SAMPLES_PER_PX, Point, MIN_ICON_STROKE_EM,
+    MIN_INK_EXTENT, MIN_STROKE_PX,
 };
+use super::svgpath::{self, Run};
 use super::BattleDimension;
 
 /// Which invariant a rejection came from.
@@ -90,6 +99,7 @@ impl Invariant {
         }
     }
 }
+
 
 /// Every way generation can refuse, carrying the icon and the subpath
 /// index whenever there is one.
@@ -178,6 +188,13 @@ pub fn generated_path() -> Result<PathBuf, GenerateError> {
         .ok_or_else(|| io(format!("no src/symbology/ above {}", env!("CARGO_MANIFEST_DIR"))))
 }
 
+/// The vendored geometry, beside the selection that names rows in it.
+pub fn geometry_path() -> Result<PathBuf, GenerateError> {
+    repo_root()
+        .map(|r| r.join("assets").join("symbology").join("milsymbol.tsv"))
+        .ok_or_else(|| io(format!("no assets/symbology/milsymbol.tsv above {}", env!("CARGO_MANIFEST_DIR"))))
+}
+
 fn repo_root() -> Option<PathBuf> {
     let mut dir: &Path = Path::new(env!("CARGO_MANIFEST_DIR"));
     loop {
@@ -190,38 +207,74 @@ fn repo_root() -> Option<PathBuf> {
 
 // --- the manifest -----------------------------------------------------------
 
-/// One manifest row, still in em coordinates.
+/// Upstream's authoring box: 200x200, centred on (100,100), y down.
 ///
-/// `Debug` only so `expect_err` compiles in the tests below; it is never
-/// printed in the shipping path, where the error carries the icon's name
-/// instead.
+/// Read straight off the tables — every coordinate in `milsymbol.tsv` sits
+/// inside it — and converted to em by [`to_em`]. It is a property of the
+/// source, not a choice, which is why it lives here rather than in `icons.rs`.
+const UPSTREAM_BOX: f64 = 200.0;
+
+/// Upstream's origin, in its own space.
+const UPSTREAM_ORIGIN: f64 = UPSTREAM_BOX / 2.0;
+
+/// The selection manifest's way of saying "this icon has no glyph".
+///
+/// A named sentinel rather than an empty cell, because an empty cell is
+/// indistinguishable from a file whose trailing tab was stripped, and the
+/// failure that produces — a parse error on save — looks like a bug in the
+/// parser rather than in the file.
+pub const NO_GEOMETRY: &str = "-";
+
+/// Milsymbol's space to tfg's: centre on the origin, scale to the em box.
+///
+/// Uniform, and the ratio is exactly 5, so this is a change of origin and a
+/// change of unit rather than a fit. Anything else would be scaling the art,
+/// which is the fit's job and is done once, later, by [`fit_for`].
+fn to_em(p: (f64, f64)) -> (f64, f64) {
+    let k = EM_BOX / UPSTREAM_BOX;
+    ((p.0 - UPSTREAM_ORIGIN) * k, (p.1 - UPSTREAM_ORIGIN) * k)
+}
+
+/// One row of `icons.tsv`: which icon, what it is called, and where its
+/// geometry lives upstream.
+///
+/// `pub(crate)` because [`check_and_flatten`] takes a slice of these and is
+/// itself `pub(crate)` for the tests. A `struct Row` behind a `pub(crate) fn`
+/// is a `private_interfaces` warning, and the honest fix is to widen the type
+/// rather than to narrow the function: the tests need to build rows by
+/// parsing a manifest, and hiding that behind a second constructor would be a
+/// wrapper with exactly one caller.
 #[derive(Debug)]
-struct Row {
+pub(crate) struct Row {
     variant: String,
     display: String,
     dimension: char,
-    subpaths: Vec<Subpath>,
+    /// The key in `milsymbol.tsv`.
+    upstream: String,
 }
 
-#[derive(Debug)]
-struct Subpath {
-    filled: bool,
-    segs: Vec<Seg>,
-    closed: bool,
-}
-
-#[derive(Debug)]
-enum Seg {
-    Move((f64, f64)),
-    Line((f64, f64)),
-    Arc { c: (f64, f64), r: f64, a0: f64, a1: f64 },
-}
-
-/// Parse the manifest text.
+/// One subpath as upstream wrote it: a fill flag and a `d`.
 ///
-/// Everything is validated HERE and nothing afterwards, because this is
-/// the only reader of a file a human types into, so this is where a bad
-/// number belongs.
+/// `pub(crate)` for the same reason as [`Row`]: it appears in the
+/// `pub(crate)` signature of [`check_and_flatten`].
+#[derive(Debug)]
+pub(crate) struct UpstreamMark {
+    filled: bool,
+    d: String,
+}
+
+/// `milsymbol.tsv`, keyed by upstream icon name.
+///
+/// A `BTreeMap` rather than a `HashMap` because generation must be
+/// deterministic, and an error message that names the same key twice in the
+/// same order is a message two people can compare.
+type Geometry = std::collections::BTreeMap<String, Vec<UpstreamMark>>;
+
+/// Parse the selection manifest.
+///
+/// Everything is validated HERE and nothing afterwards, because this is the
+/// only reader of a file a human types into, so this is where a bad value
+/// belongs.
 ///
 /// Crate-private rather than public: [`generate`] is the boundary, and a
 /// caller that reaches for the parsed rows bypasses the checks that
@@ -236,7 +289,7 @@ pub(crate) fn parse_manifest(text: &str) -> Result<Vec<Row>, GenerateError> {
         let cells: Vec<&str> = line.split('\t').collect();
         if cells.len() != 4 {
             return Err(io(format!(
-                "line {}: expected 4 tab-separated cells, found {}",
+                "icons.tsv line {}: expected 4 tab-separated cells, found {}",
                 lineno + 1,
                 cells.len()
             )));
@@ -244,6 +297,7 @@ pub(crate) fn parse_manifest(text: &str) -> Result<Vec<Row>, GenerateError> {
         let variant = cells[0].trim().to_string();
         let display = cells[1].trim().to_string();
         let letter = cells[2].trim();
+        let key = cells[3].trim().to_string();
         let fail = |d: String| bad(&variant, None, Invariant::Grammar, d);
 
         if !is_snake_case(&variant) {
@@ -262,18 +316,71 @@ pub(crate) fn parse_manifest(text: &str) -> Result<Vec<Row>, GenerateError> {
         if display.is_empty() {
             return Err(fail("empty display name".into()));
         }
-        let subpaths = parse_subpaths(&variant, cells[3])?;
         rows.push(Row {
             variant,
             display,
             dimension,
-            subpaths,
+            upstream: key,
         });
     }
     if rows.is_empty() {
-        return Err(io("manifest has no icon rows"));
+        return Err(io("icons.tsv has no icon rows"));
     }
     Ok(rows)
+}
+
+/// Parse the vendored geometry table.
+///
+/// No path grammar is interpreted here — only the subpath separator and the
+/// F/S prefix. Parsing a `d` is [`super::svgpath`]'s job and happens later,
+/// against an icon, so that a malformed path is reported against the icon that
+/// uses it rather than against a table of 687 rows nobody chose.
+fn parse_geometry(text: &str) -> Result<Geometry, GenerateError> {
+    let mut out = Geometry::new();
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.trim_end_matches('\r');
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let cells: Vec<&str> = line.split('\t').collect();
+        if cells.len() != 3 {
+            return Err(io(format!(
+                "milsymbol.tsv line {}: expected 3 tab-separated cells, found {}",
+                lineno + 1,
+                cells.len()
+            )));
+        }
+        let key = cells[0].trim().to_string();
+        let err = |d: String| bad(&key, None, Invariant::Grammar, d);
+        let mut marks = Vec::new();
+        for raw_sub in cells[2].split(';') {
+            let raw_sub = raw_sub.trim();
+            if raw_sub.is_empty() {
+                return Err(err("empty subpath between separators".into()));
+            }
+            let (prefix, body) = raw_sub.split_at(1);
+            let filled = match prefix {
+                "F" => true,
+                "S" => false,
+                other => {
+                    return Err(err(format!(
+                        "subpath must start with F or S, found `{other}`"
+                    )));
+                }
+            };
+            marks.push(UpstreamMark {
+                filled,
+                d: body.trim().to_string(),
+            });
+        }
+        if out.insert(key.clone(), marks).is_some() {
+            return Err(err("appears twice in milsymbol.tsv".into()));
+        }
+    }
+    if out.is_empty() {
+        return Err(io("milsymbol.tsv has no geometry rows"));
+    }
+    Ok(out)
 }
 
 fn is_snake_case(s: &str) -> bool {
@@ -283,94 +390,6 @@ fn is_snake_case(s: &str) -> bool {
         && !s.contains("__")
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-}
-
-fn parse_subpaths(icon: &str, cell: &str) -> Result<Vec<Subpath>, GenerateError> {
-    let mut out = Vec::new();
-    // An icon with no geometry is a real state, not a missing one:
-    // `Unspecified` draws an empty frame interior, which is what the
-    // standard says to draw when nobody has said what a thing is. It is
-    // the ONE exemption from the coverage floor, and every other
-    // invariant is vacuous rather than skipped.
-    if cell.trim().is_empty() {
-        return Ok(out);
-    }
-    for (i, raw) in cell.split(';').enumerate() {
-        let raw = raw.trim();
-        let err = |d: String| bad(icon, Some(i), Invariant::Grammar, d);
-        if raw.is_empty() {
-            return Err(err("empty subpath between separators".into()));
-        }
-        let (prefix, body) = raw.split_at(1);
-        let filled = match prefix {
-            "F" => true,
-            "S" => false,
-            other => {
-                return Err(err(format!(
-                    "subpath must start with F or S, found `{other}`"
-                )));
-            }
-        };
-        let toks: Vec<&str> = body.split_whitespace().collect();
-        let mut segs: Vec<Seg> = Vec::new();
-        let mut closed = false;
-        let mut k = 0usize;
-        while k < toks.len() {
-            match toks[k] {
-                "Z" => {
-                    closed = true;
-                    k += 1;
-                }
-                cmd @ ("M" | "L" | "A") => {
-                    let arity = if cmd == "A" { 5 } else { 2 };
-                    let operands = toks
-                        .get(k + 1..=k + arity)
-                        .ok_or_else(|| err(format!("`{cmd}` needs {arity} numbers")))?;
-                    let mut n = [0.0f64; 5];
-                    for (slot, tok) in n.iter_mut().zip(operands) {
-                        // `parse::<f64>` accepts `inf`, `NaN` and `1e999`,
-                        // all of which pass the grammar and then poison
-                        // every box comparison downstream.
-                        *slot = tok
-                            .parse::<f64>()
-                            .map_err(|_| err(format!("`{tok}` is not a number")))?;
-                        if !slot.is_finite() {
-                            return Err(err(format!("`{tok}` is not finite")));
-                        }
-                    }
-                    segs.push(match cmd {
-                        "M" => Seg::Move((n[0], n[1])),
-                        "L" => Seg::Line((n[0], n[1])),
-                        _ => Seg::Arc {
-                            c: (n[0], n[1]),
-                            r: n[2],
-                            a0: n[3],
-                            a1: n[4],
-                        },
-                    });
-                    k += 1 + arity;
-                }
-                other => {
-                    return Err(err(format!(
-                        "unknown command `{other}`; the grammar is M, L, A, Z and nothing else"
-                    )));
-                }
-            }
-        }
-        if segs.is_empty() {
-            return Err(err("subpath has no commands".into()));
-        }
-        if !matches!(segs.first(), Some(Seg::Move(_))) {
-            return Err(err("subpath must open with M".into()));
-        }
-        if filled && !closed {
-            return Err(err(
-                "an F subpath must end with Z: the renderer fills a closed loop only".into(),
-            ));
-        }
-        out.push(Subpath { filled, segs, closed });
-    }
-    Ok(out)
 }
 
 /// The SIDC's dimension letter, collapsed the way this code collapses it.
@@ -402,7 +421,7 @@ pub fn dimension_for(letter: char) -> Result<BattleDimension, char> {
 /// The other direction is caught by drift. A row added without
 /// regenerating leaves the checked-in enum a variant short, which is
 /// exactly what `--symbology-check` reports.
-fn check_rows(rows: &[Row]) -> Result<(), GenerateError> {
+fn check_rows(rows: &[Row], geometry: &Geometry) -> Result<(), GenerateError> {
     for (i, a) in rows.iter().enumerate() {
         if let Some(b) = rows[i + 1..].iter().find(|r| r.variant == a.variant) {
             return Err(GenerateError::File {
@@ -416,48 +435,41 @@ fn check_rows(rows: &[Row]) -> Result<(), GenerateError> {
             });
         }
     }
+    // Two icons may not name the same upstream key: they would flatten to
+    // identical geometry under two names, and the enum would grow a variant
+    // that no reader can tell apart from its twin. The no-glyph sentinel is
+    // exempt, because every no-glyph icon legitimately shares it.
+    for (i, a) in rows.iter().enumerate() {
+        if a.upstream == NO_GEOMETRY {
+            continue;
+        }
+        if let Some(b) = rows[i + 1..]
+            .iter()
+            .find(|r| r.upstream == a.upstream)
+        {
+            return Err(GenerateError::File {
+                invariant: Invariant::Exhaustiveness,
+                detail: format!(
+                    "icons `{}` and `{}` both name upstream `{}`; one glyph cannot be two \
+                     icons, and at 22 px nobody could tell them apart anyway",
+                    a.variant, b.variant, a.upstream
+                ),
+            });
+        }
+        if !geometry.contains_key(&a.upstream) {
+            return Err(bad(
+                &a.variant,
+                None,
+                Invariant::Grammar,
+                format!(
+                    "no geometry row `{}` in milsymbol.tsv; re-run \
+                     assets/symbology/extract-mjs.mjs, or check the key against the table",
+                    a.upstream
+                ),
+            ));
+        }
+    }
     Ok(())
-}
-
-/// How finely an arc is sampled, and its sagitta.
-struct ArcFacts {
-    segs: usize,
-    sagitta_em: f64,
-}
-
-fn arc_facts(r: f64, a0: f64, a1: f64) -> Result<ArcFacts, String> {
-    if r <= 0.0 {
-        return Err(format!("arc radius {r} must be positive"));
-    }
-    let sweep = (a1 - a0).abs();
-    if sweep == 0.0 {
-        return Err("arc spans zero degrees".into());
-    }
-    if sweep > 360.0 {
-        return Err(format!(
-            "arc spans {sweep}°, more than the circle it is drawn on"
-        ));
-    }
-    if sweep == 360.0 {
-        return Err(
-            "a 360° arc is a disc, not an arc; write it as two semicircles in one closed \
-             subpath so the endpoints are explicit"
-                .into(),
-        );
-    }
-    let sagitta = r * (1.0 - (sweep.to_radians() / 2.0).cos());
-    // The finest segment whose own sagitta is exactly the floor. Two is
-    // the floor on the count: one segment would draw the arc as a chord.
-    let segs = if sagitta <= MIN_ARC_SAGITTA_EM {
-        2
-    } else {
-        let step = 2.0 * (1.0 - MIN_ARC_SAGITTA_EM / r).acos();
-        ((sweep.to_radians() / step).ceil() as usize).max(2)
-    };
-    Ok(ArcFacts {
-        segs,
-        sagitta_em: sagitta,
-    })
 }
 
 /// One icon's flattened marks, still in em, plus the fit that puts them
@@ -495,93 +507,116 @@ struct Tagged {
 ///
 /// Returns in manifest order. There is no partial output: a half-checked
 /// vocabulary is the exact failure this generator exists to prevent.
-pub(crate) fn check_and_flatten(rows: &[Row]) -> Result<Vec<Flat>, GenerateError> {
-    check_rows(rows)?;
-    rows.iter().map(flatten_one).collect()
+pub(crate) fn check_and_flatten(
+    rows: &[Row],
+    geometry: &Geometry,
+) -> Result<Vec<Flat>, GenerateError> {
+    check_rows(rows, geometry)?;
+    // Every icon's errors, not just the first one's. A vocabulary review is
+    // the one place where a partial answer is worse than no answer: with
+    // fail-fast, re-pinning upstream means twenty iterations of "fix this one,
+    // run again, find the next", and the temptation is to widen the thresholds
+    // until the noise stops rather than to read the twenty messages.
+    //
+    // The FIRST failure stays the error — same variant, same invariant, same
+    // icon — with the rest appended to its detail. Returning a whole-file
+    // error instead would be tidier to build and would cost the caller the
+    // ability to ask WHICH rule fired, which is the one thing the error
+    // carries that the text does not.
+    let results: Vec<Result<Flat, GenerateError>> =
+        rows.iter().map(|r| flatten_one(r, geometry)).collect();
+    let mut failures = results.iter().filter_map(|r| r.as_ref().err());
+    let Some(first) = failures.next() else {
+        return Ok(results
+            .into_iter()
+            .map(|r| r.expect("no failures"))
+            .collect());
+    };
+    let rest: Vec<String> = failures.map(|e| e.to_string()).collect();
+    let GenerateError::Icon {
+        icon,
+        subpath,
+        invariant,
+        detail,
+    } = first
+    else {
+        return Err(clone_err(first));
+    };
+    Err(GenerateError::Icon {
+        icon: icon.clone(),
+        subpath: *subpath,
+        invariant: *invariant,
+        detail: format!(
+            "{detail}\n\n{icon}: {} more icon(s) also fail:\n  {}",
+            rest.len(),
+            rest.join("\n  ")
+        ),
+    })
 }
 
-fn flatten_one(row: &Row) -> Result<Flat, GenerateError> {
+/// Rebuild a file-level error, which `check_and_flatten` has no way to mutate
+/// in place.
+fn clone_err(e: &GenerateError) -> GenerateError {
+    match e {
+        GenerateError::File { invariant, detail } => GenerateError::File {
+            invariant: *invariant,
+            detail: detail.clone(),
+        },
+        GenerateError::Icon {
+            icon,
+            subpath,
+            invariant,
+            detail,
+        } => GenerateError::Icon {
+            icon: icon.clone(),
+            subpath: *subpath,
+            invariant: *invariant,
+            detail: detail.clone(),
+        },
+    }
+}
+
+/// Resolve one row against the geometry table and flatten it.
+///
+/// The join is here, in one place, rather than in [`parse_manifest`], because
+/// an unknown upstream key is only wrong in the context of the row that names
+/// it: the same string is a valid key for one icon and a typo for another, and
+/// reporting it against the row is the difference between a message somebody
+/// can act on and one they have to grep for.
+fn flatten_one(row: &Row, geometry: &Geometry) -> Result<Flat, GenerateError> {
     let mut tagged: Vec<Tagged> = Vec::new();
-    // The bounding box is over CENTRELINES, not over the stroked ink, and
-    // the fit is derived from it. Expanding the box by half a stroke and
-    // then scaling the un-expanded geometry by it would push the geometry
-    // out past the unit square by exactly the stroke half-width, which is
-    // the sort of off-by-a-stroke that only shows up as a sheet that
-    // looks slightly too big.
     let mut bbox: Option<(f64, f64, f64, f64)> = None;
 
-    for (si, sub) in row.subpaths.iter().enumerate() {
-        let mut run: Vec<(f64, f64)> = Vec::new();
-        for seg in &sub.segs {
-            match *seg {
-                Seg::Move(p) => {
-                    flush(&mut run, &mut tagged, &mut bbox, si, sub.filled);
-                    in_box(row, si, p.0, p.1)?;
-                    run.push(p);
-                }
-                Seg::Line(p) => {
-                    in_box(row, si, p.0, p.1)?;
-                    run.push(p);
-                }
-                Seg::Arc { c, r, a0, a1 } => {
-                    let facts = arc_facts(r, a0, a1)
-                        .map_err(|d| bad(&row.variant, Some(si), Invariant::Sagitta, d))?;
-                    if facts.sagitta_em < MIN_ARC_SAGITTA_EM {
-                        return Err(bad(
-                            &row.variant,
-                            Some(si),
-                            Invariant::Sagitta,
-                            format!(
-                                "arc r={r:.1} em over {:.1}° has a sagitta of {:.2} em = \
-                                 {:.3} px, under the {:.2} px floor; draw it as a disc or a ring \
-                                 of larger radius",
-                                (a1 - a0).abs(),
-                                facts.sagitta_em,
-                                facts.sagitta_em / EM_PER_PX,
-                                MIN_ARC_SAGITTA_EM / EM_PER_PX,
-                            ),
-                        ));
-                    }
-                    if facts.segs > ARC_SEGMENT_CAP {
-                        return Err(bad(
-                            &row.variant,
-                            Some(si),
-                            Invariant::Sagitta,
-                            format!(
-                                "arc needs {} segments to hold the sagitta floor, over the cap \
-                                 of {ARC_SEGMENT_CAP}; author it as closed subpaths instead",
-                                facts.segs
-                            ),
-                        ));
-                    }
-                    // An arc's endpoints are checked as vertices, but
-                    // the arc BULGES to centre +/- r on each axis and it
-                    // is the bulge that leaves the box.
-                    for (dx, dy) in [(-r, -r), (r, -r), (-r, r), (r, r)] {
-                        in_box(row, si, c.0 + dx, c.1 + dy)?;
-                    }
-                    let start = arc_point(c, r, a0);
-                    if let Some(&prev) = run.last() {
-                        if dist(prev, start) > 1e-6 {
-                            return Err(bad(
-                                &row.variant,
-                                Some(si),
-                                Invariant::Grammar,
-                                "arc does not begin where the previous command ended",
-                            ));
-                        }
-                    }
-                    if run.is_empty() {
-                        run.push(start);
-                    }
-                    for k in 1..=facts.segs {
-                        let t = a0 + (a1 - a0) * (k as f64 / facts.segs as f64);
-                        run.push(arc_point(c, r, t));
-                    }
-                }
-            }
+    // An icon with no geometry is a real state, not a missing one:
+    // `unspecified` draws an empty frame interior, which is what the standard
+    // says to draw when nobody has said what a thing is. It is spelled as the
+    // sentinel key [`NO_GEOMETRY`], and it is the ONE exemption from the
+    // coverage floor; every other invariant is vacuous rather than skipped.
+    if row.upstream == NO_GEOMETRY {
+        return Ok(Flat {
+            marks: Vec::new(),
+            fit: Fit::NONE,
+        });
+    }
+    let Some(upstream) = geometry.get(&row.upstream) else {
+        return Err(bad(
+            &row.variant,
+            None,
+            Invariant::Grammar,
+            format!(
+                "no geometry row `{}` in milsymbol.tsv; re-run \
+                 assets/symbology/extract-mjs.mjs, or check the key against the table",
+                row.upstream
+            ),
+        ));
+    };
+
+    for (si, mark) in upstream.iter().enumerate() {
+        let runs = svgpath::parse_path(&mark.d)
+            .map_err(|e| bad(&row.variant, Some(si), Invariant::Grammar, e.0))?;
+        for run in runs {
+            emit_run(row, si, mark.filled, run, &mut tagged, &mut bbox)?;
         }
-        flush(&mut run, &mut tagged, &mut bbox, si, sub.filled);
     }
 
     let fit = fit_for(row, bbox)?;
@@ -597,45 +632,80 @@ fn flatten_one(row: &Row) -> Result<Flat, GenerateError> {
     Ok(Flat { marks, fit })
 }
 
-/// Emit the pending run as one mark and start a new one.
+/// One device pixel, squared, in em².
 ///
-/// The F/S prefix decided here, at parse time, is what separates a fill
-/// from a stroke. Everything downstream — the raster scan, the
-/// coverage floor — reads that distinction off the mark rather than
-/// re-deriving it from geometry.
-fn flush(
-    run: &mut Vec<(f64, f64)>,
+/// The floor below which a fill is not a fill. Upstream marks a path filled by
+/// default — a filled shape with a 3-unit stroke riding on it — and epaint
+/// draws a fill and a stroke as separate Shapes, so this module has to pick
+/// one per mark. For many of upstream's paths the answer is forced by the
+/// geometry rather than chosen: the infantry saltire is
+/// `M25,50 L175,150 M25,150 L175,50`, two single segments, and filling
+/// either one encloses no area at all, so a faithful "filled" would make the
+/// whole icon vanish. What the reader sees is upstream's stroke. Same for
+/// reconnaissance's `M25,150 L175,50`.
+///
+/// So the rule is: a fill that covers less than one device pixel is not a
+/// fill, it is a stroke's job. That is a visibility floor rather than a tuning
+/// constant — below it the filled region is smaller than the smallest thing
+/// the device can put on screen.
+///
+/// In EM, and measured on points already converted to em. The space matters:
+/// upstream's box is 200 units to tfg's 1000, so the same threshold in
+/// upstream units would be 25 times too small and would let every hairline
+/// sliver through as a fill.
+const ONE_PIXEL_AREA_EM: f64 = EM_PER_PX * EM_PER_PX;
+
+/// Convert one upstream run to em, check it is inside the box, and keep it.
+fn emit_run(
+    row: &Row,
+    si: usize,
+    upstream_filled: bool,
+    run: Run,
     tagged: &mut Vec<Tagged>,
     bbox: &mut Option<(f64, f64, f64, f64)>,
-    subpath: usize,
-    filled: bool,
-) {
-    let pts = std::mem::take(run);
-    if pts.len() < 2 {
-        return;
+) -> Result<(), GenerateError> {
+    if run.points.len() < 2 {
+        return Ok(());
     }
+    let pts: Vec<(f64, f64)> = run.points.iter().map(|p| to_em(*p)).collect();
+    let filled = upstream_filled && svgpath::shoelace(&pts) >= ONE_PIXEL_AREA_EM;
+    // The box is checked on the FLATTENED polyline, not on the control
+    // points. A cubic's control points routinely sit outside the curve, and
+    // checking them would reject half the vocabulary for a bulge the reader
+    // never sees. The flattened vertices bound the curve to within the
+    // flattening tolerance, which is a quarter of a pixel.
     for (x, y) in &pts {
-        match bbox {
-            None => *bbox = Some((x - 0.0, y - 0.0, x + 0.0, y + 0.0)),
-            Some(b) => {
-                b.0 = b.0.min(*x);
-                b.1 = b.1.min(*y);
-                b.2 = b.2.max(*x);
-                b.3 = b.3.max(*y);
-            }
+        in_box(row, si, *x, *y)?;
+    }
+    // Seed from the first point and then extend over ALL of them, in that
+    // order. Seeding inside the loop and extending outside it — which is what
+    // this looked like for a moment — silently truncates the box of any icon
+    // whose FIRST subpath is its only subpath, to a zero-size box at that
+    // first vertex. The coverage floor then rejects the icon for having no
+    // ink, which reads like a geometry bug and is a bookkeeping one.
+    let (fx, fy) = pts[0];
+    match bbox {
+        None => *bbox = Some((fx, fy, fx, fy)),
+        Some(b) => {
+            b.0 = b.0.min(fx);
+            b.1 = b.1.min(fy);
+            b.2 = b.2.max(fx);
+            b.3 = b.3.max(fy);
         }
     }
-    let mark = Tagged {
+    for (x, y) in &pts {
+        let b = bbox.as_mut().expect("seeded above");
+        b.0 = b.0.min(*x);
+        b.1 = b.1.min(*y);
+        b.2 = b.2.max(*x);
+        b.3 = b.3.max(*y);
+    }
+    tagged.push(Tagged {
         filled,
         pts,
-        subpath,
-    };
-    tagged.push(mark);
-}
-
-fn arc_point(c: (f64, f64), r: f64, deg: f64) -> (f64, f64) {
-    let t = deg.to_radians();
-    (c.0 + r * t.cos(), c.1 + r * t.sin())
+        subpath: si,
+    });
+    Ok(())
 }
 
 fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -659,34 +729,35 @@ fn in_box(row: &Row, si: usize, x: f64, y: f64) -> Result<(), GenerateError> {
     Ok(())
 }
 
-/// The uniform em-to-unit-square fit, plus the coverage floor it answers.
+/// The uniform em-to-unit-square fit, plus the extent floor it answers.
 ///
-/// Coverage is checked on the AUTHORED ink because the fit rescales
-/// whatever was drawn to fill the square: the question is "was this drawn
-/// at a sane size in the em box", which is the author's decision, not
-/// "will it be big when drawn", which the fit decides.
+/// The floor is checked on the AUTHORED ink because the fit rescales whatever
+/// was drawn to fill the square: the question is "was this drawn at a sane size
+/// in the em box", which is the source's decision, not "will it be big when
+/// drawn", which the fit decides.
+///
+/// And it is the longer AXIS that is measured, not the area — see
+/// [`MIN_INK_EXTENT`](super::icons::MIN_INK_EXTENT) for why area rejects
+/// APP-6C's own horizontal-bar icons.
 fn fit_for(row: &Row, bbox: Option<(f64, f64, f64, f64)>) -> Result<Fit, GenerateError> {
-    // No ink is a real state, not a failure: `Unspecified` draws an empty
+    // No ink is a real state, not a failure: `unspecified` draws an empty
     // frame interior and that is what the standard says to draw.
     let Some((x0, y0, x1, y1)) = bbox else {
         return Ok(Fit::NONE);
     };
     let (w, h) = (x1 - x0, y1 - y0);
-    // Coverage is asked BEFORE the degenerate-shape test, not after. A
-    // single horizontal stroke has zero height, and treating that as "no
-    // ink to check" would let a one-pixel rule through as an icon.
-    let coverage = (w.max(0.0) * h.max(0.0)) / (EM_BOX * EM_BOX);
-    if coverage < MIN_INK_COVERAGE {
+    let extent = w.abs().max(h.abs()) / EM_BOX;
+    if extent < MIN_INK_EXTENT {
         return Err(bad(
             &row.variant,
             None,
             Invariant::InkCoverage,
             format!(
-                "ink bounding box is {w:.0} x {h:.0} em = {:.1}% of the em box, under the \
-                 {:.0}% floor; either the icon is meant to be much larger, or it is a dot that \
-                 the fit would blow up into a smear",
-                coverage * 100.0,
-                MIN_INK_COVERAGE * 100.0,
+                "ink spans {w:.0} x {h:.0} em, so its longer axis is {:.1}% of the em box, \
+                 under the {:.0}% floor; either the icon is meant to be much larger, or it is \
+                 a dot that the fit would blow up into a smear",
+                extent * 100.0,
+                MIN_INK_EXTENT * 100.0,
             ),
         ));
     }
@@ -984,17 +1055,32 @@ fn q(v: f32) -> String {
 }
 
 /// Parse, check and emit the generated file, all in memory.
-pub fn generate(manifest: &str) -> Result<String, GenerateError> {
+pub fn generate(manifest: &str, geometry: &str) -> Result<String, GenerateError> {
     let rows = parse_manifest(manifest)?;
-    let flats = check_and_flatten(&rows)?;
+    let geom = parse_geometry(geometry)?;
+    let flats = check_and_flatten(&rows, &geom)?;
     Ok(emit(&rows, &flats))
 }
 
-/// Parse, check and write the generated file.
-pub fn regenerate(manifest: &Path) -> Result<PathBuf, GenerateError> {
-    let text = std::fs::read_to_string(manifest)
+/// Read both tables from their canonical locations and generate.
+///
+/// The two paths are found rather than passed because every caller wants both,
+/// and a caller that could supply one and not the other is a caller that will
+/// eventually check the manifest against stale geometry.
+fn read_tables() -> Result<(String, String), GenerateError> {
+    let manifest = manifest_path()?;
+    let geometry = geometry_path()?;
+    let a = std::fs::read_to_string(&manifest)
         .map_err(|e| io(format!("{}: {e}", manifest.display())))?;
-    let generated = generate(&text)?;
+    let b = std::fs::read_to_string(&geometry)
+        .map_err(|e| io(format!("{}: {e}", geometry.display())))?;
+    Ok((a, b))
+}
+
+/// Parse, check and write the generated file.
+pub fn regenerate() -> Result<PathBuf, GenerateError> {
+    let (manifest, geometry) = read_tables()?;
+    let generated = generate(&manifest, &geometry)?;
     let out = generated_path()?;
     // Written to a sibling and renamed, so an interrupted run leaves the
     // previous table intact rather than a half-written file that would
@@ -1005,16 +1091,15 @@ pub fn regenerate(manifest: &Path) -> Result<PathBuf, GenerateError> {
     Ok(out)
 }
 
-/// Report drift between the manifest and the checked-in file, as a
+/// Report drift between the tables and the checked-in file, as a
 /// unified diff.
 ///
 /// A diff that fires on an unchanged tree is worse than no check at all,
 /// so the quantisation above is not cosmetic: it is what makes this
 /// function's answer stable.
-pub fn check_drift(manifest: &Path, generated: &Path) -> Result<Option<String>, GenerateError> {
-    let text =
-        std::fs::read_to_string(manifest).map_err(|e| io(format!("{}: {e}", manifest.display())))?;
-    let want = generate(&text)?;
+pub fn check_drift(generated: &Path) -> Result<Option<String>, GenerateError> {
+    let (manifest, geometry) = read_tables()?;
+    let want = generate(&manifest, &geometry)?;
     let have = std::fs::read_to_string(generated)
         .map_err(|e| io(format!("{}: {e}", generated.display())))?;
     if want == have {
@@ -1026,8 +1111,13 @@ pub fn check_drift(manifest: &Path, generated: &Path) -> Result<Option<String>, 
 fn emit(rows: &[Row], flats: &[Flat]) -> String {
     let mut s = String::new();
     s.push_str(
-        "// GENERATED. Source of truth is assets/symbology/icons.tsv; regenerate with\n\
+        "// GENERATED. Do not hand-edit; regenerate with\n\
          // `cargo run --manifest-path proto/p5-epaint/Cargo.toml -- --symbology-generate`.\n\
+         //\n\
+         // Which icons exist and what they are called is assets/symbology/icons.tsv.\n\
+         // The coordinates come from assets/symbology/milsymbol.tsv, extracted from\n\
+         // spatialillusions/milsymbol (MIT, Copyright (c) 2017 Mans Beckman) at a pinned\n\
+         // commit; see licenses/milsymbol-LICENSE.md and the header of that file.\n\
          //\n\
          // The invariants encoded here are the reason this file is generated rather\n\
          // than written: a hand edit is exactly how they stop holding.\n\n",
@@ -1190,12 +1280,33 @@ pub fn unified_diff(have: &str, want: &str, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::symbology::icons::MIN_ICON_STROKE_EM;
 
-    /// A row wide enough to clear every invariant, used as the baseline
-    /// the negative tests perturb.
-    const WIDE: &str =
-        "demo\tDemo\tG\tF M -450 -450 L 450 -450 L 450 450 L -450 450 Z;S M -450 -450 L 450 -450";
+    /// A geometry table wide enough to clear every invariant, used as the
+    /// baseline the negative tests perturb.
+    ///
+    /// In UPSTREAM's 200-unit space, not tfg's em box: the geometry table is
+    /// upstream's, and writing the fixtures in em would test a conversion the
+    /// real path never takes. `BOX` is 100x100 units, which is half the box
+    /// and so 500x500 em after conversion.
+    const GEOM: &str = concat!(
+        "DEMO\tground\tF M 10 10 L 10 190 L 190 190 Z ; ",
+        "F M 10 10 L 190 10\n",
+        "SPACED\tground\tF M 50 50 L 150 50 L 150 150 Z\n",
+        "BOX\tground\tF M 50 75 L 150 75 L 150 125 L 50 125 Z\n",
+        "DOTTY\tground\tS M 100 100 L 108 100\n",
+    );
+
+    fn geom(text: &str) -> Geometry {
+        parse_geometry(text).expect("geometry parses")
+    }
+
+    fn rows(text: &str) -> Vec<Row> {
+        parse_manifest(text).expect("manifest parses")
+    }
+
+    fn flat(manifest: &str, geometry: &str) -> Result<Vec<Flat>, GenerateError> {
+        check_and_flatten(&rows(manifest), &geom(geometry))
+    }
 
     #[test]
     fn the_two_stroke_thresholds_cannot_drift_apart() {
@@ -1206,63 +1317,77 @@ mod tests {
     }
 
     #[test]
-    fn the_manifest_grammar_round_trips() {
-        let rows = parse_manifest(WIDE).expect("parses");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].variant, "demo");
-        assert_eq!(rows[0].display, "Demo");
-        assert_eq!(rows[0].dimension, 'G');
-        assert_eq!(rows[0].subpaths.len(), 2);
+    fn the_manifest_joins_against_the_geometry() {
+        let t = rows("demo\tDemo\tG\tDEMO");
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].variant, "demo");
+        assert_eq!(t[0].display, "Demo");
+        assert_eq!(t[0].dimension, 'G');
+        assert_eq!(t[0].upstream, "DEMO");
     }
 
     #[test]
     fn comments_and_blank_lines_are_skipped() {
-        let text = format!("# a comment\n\n{WIDE}\n");
-        assert_eq!(parse_manifest(&text).expect("parses").len(), 1);
+        assert_eq!(rows("# a comment\n\ndemo\tDemo\tG\tDEMO\n").len(), 1);
     }
 
     #[test]
-    fn an_unknown_command_names_the_icon_and_the_subpath() {
-        let text = "demo\tDemo\tG\tF M -450 -450 Q 0 0 450 450 Z";
-        let msg = parse_manifest(text).expect_err("rejects").to_string();
-        assert!(msg.contains("demo"), "{msg}");
-        assert!(msg.contains("subpath 0"), "{msg}");
-        assert!(msg.contains("Q"), "{msg}");
-        assert!(msg.contains("grammar"), "{msg}");
+    fn a_wrong_cell_count_names_the_file_and_line() {
+        let msg = parse_manifest("demo\tDemo\tG").expect_err("rejects").to_string();
+        assert!(msg.contains("icons.tsv line 1"), "{msg}");
+        assert!(msg.contains("found 3"), "{msg}");
     }
 
     #[test]
-    fn a_bad_prefix_is_rejected() {
-        let text = "demo\tDemo\tG\tX M -450 -450 L 450 450";
-        assert!(parse_manifest(text).expect_err("rejects").to_string().contains("F or S"));
+    fn an_unknown_upstream_key_is_reported_against_its_row() {
+        // The distinction that matters: a typo in `icons.tsv` is a one-line
+        // fix, and the message has to say which line.
+        let err = flat("demo\tDemo\tG\tNOSUCHKEY", GEOM).expect_err("rejects");
+        assert!(err.to_string().contains("demo"), "{err}");
+        assert!(err.to_string().contains("NOSUCHKEY"), "{err}");
     }
 
     #[test]
-    fn a_malformed_number_is_rejected() {
-        assert!(parse_manifest("demo\tDemo\tG\tF M -450 -450 L three 450 Z").is_err());
-    }
-
-    #[test]
-    fn a_non_finite_number_is_rejected() {
-        // `str::parse::<f64>` accepts "inf", so this is a real hole and
-        // the finiteness check is what closes it.
-        assert!(parse_manifest("demo\tDemo\tG\tF M -450 -450 L inf 450 Z").is_err());
-    }
-
-    #[test]
-    fn an_unclosed_fill_is_rejected() {
-        assert!(parse_manifest("demo\tDemo\tG\tF M -450 -450 L 450 450").is_err());
+    fn the_no_geometry_sentinel_is_an_icon_with_no_glyph() {
+        // `unspecified` draws an empty frame interior, which is a real state.
+        let flats = flat("demo\tDemo\tG\t-", GEOM).expect("accepts");
+        assert!(flats[0].marks.is_empty());
     }
 
     #[test]
     fn an_unknown_dimension_letter_is_rejected() {
-        assert!(parse_manifest("demo\tDemo\tQ\tF M -450 -450 L 450 450 Z").is_err());
+        assert!(parse_manifest("demo\tDemo\tQ\tDEMO").is_err());
+    }
+
+    #[test]
+    fn a_bad_prefix_in_the_geometry_is_rejected() {
+        let msg = parse_geometry("K\tground\tX M0,0 L1,1").expect_err("rejects");
+        assert!(msg.to_string().contains("F or S"), "{msg}");
+    }
+
+    #[test]
+    fn a_malformed_path_is_reported_against_the_icon() {
+        let g = "BAD\tground\tF M 0 0 K 10 10";
+        let err = flat("demo\tDemo\tG\tBAD", g).expect_err("rejects");
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "{msg}");
+        assert!(msg.contains("subpath 0"), "{msg}");
+        assert!(msg.contains("grammar"), "{msg}");
+    }
+
+    #[test]
+    fn a_non_finite_coordinate_is_refused() {
+        // `1e999` reaches the lexer as text and `parse::<f64>` would make it
+        // infinity, which then poisons every box comparison downstream.
+        let g = "BAD\tground\tF M 0 0 L 1e999 0";
+        assert!(flat("demo\tDemo\tG\tBAD", g).is_err());
     }
 
     #[test]
     fn an_out_of_box_coordinate_reports_em_and_pixels() {
-        let text = "demo\tDemo\tG\tF M -900 -450 L 450 450 L 450 -450 Z";
-        let err = check_and_flatten(&parse_manifest(text).expect("parses")).expect_err("rejects");
+        // Upstream's box is 200 units; 5 units outside it is 25 em.
+        let g = "WIDE\tground\tF M -5 -100 L 100 -100 L 100 100 Z";
+        let err = flat("demo\tDemo\tG\tWIDE", g).expect_err("rejects");
         let msg = err.to_string();
         assert!(msg.contains("em"), "{msg}");
         assert!(msg.contains("px"), "{msg}");
@@ -1276,12 +1401,12 @@ mod tests {
     }
 
     #[test]
-    fn an_arc_whose_bulge_leaves_the_box_is_rejected() {
-        // Every vertex is well inside and the centre is at the origin, so
-        // only the arc's own BULGE can put it out of the box: a radius of
-        // 600 sweeps past the 500 em half-width.
-        let text = "demo\tDemo\tG\tS M -100 -100 A 0 0 600 0 90";
-        let err = check_and_flatten(&parse_manifest(text).expect("parses")).expect_err("rejects");
+    fn a_cubic_that_leaves_the_box_is_caught_by_its_flattened_vertices() {
+        // Control points sit inside the 200 box; the curve does not. This is
+        // the case that checking control points instead of the flattened
+        // polyline would miss.
+        let g = "ARC\tground\tF M 10 100 C 10 -400 190 -400 190 100 Z";
+        let err = flat("demo\tDemo\tG\tARC", g).expect_err("rejects");
         assert!(matches!(
             err,
             GenerateError::Icon {
@@ -1292,25 +1417,9 @@ mod tests {
     }
 
     #[test]
-    fn a_shallow_arc_is_rejected() {
-        // A large radius over a couple of degrees: a sagitta far under a
-        // quarter of a pixel. This is the rule that stops the anchor's
-        // ring being drawn as a thin annulus.
-        let text = "demo\tDemo\tG\tS M -400 0 A 0 0 400 0 2";
-        let err = check_and_flatten(&parse_manifest(text).expect("parses")).expect_err("rejects");
-        assert!(matches!(
-            err,
-            GenerateError::Icon {
-                invariant: Invariant::Sagitta,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn a_duplicated_icon_is_refused() {
-        let text = format!("{WIDE}\n{WIDE}");
-        let err = generate(&text).expect_err("refuses");
+        let m = "demo\tDemo\tG\tDEMO\ndemo\tDemo again\tG\tSPACED";
+        let err = check_and_flatten(&rows(m), &geom(GEOM)).expect_err("refuses");
         assert!(matches!(
             err,
             GenerateError::File {
@@ -1322,11 +1431,24 @@ mod tests {
     }
 
     #[test]
+    fn two_icons_may_not_name_the_same_upstream_key() {
+        // One glyph under two names is an enum variant no reader could
+        // distinguish from its twin, which is worse than not having it.
+        let m = "one\tOne\tG\tDEMO\ntwo\tTwo\tG\tDEMO";
+        let err = check_and_flatten(&rows(m), &geom(GEOM)).expect_err("refuses");
+        assert!(matches!(
+            err,
+            GenerateError::File {
+                invariant: Invariant::Exhaustiveness,
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("DEMO"), "{err}");
+    }
+
+    #[test]
     fn a_dot_does_not_meet_the_coverage_floor() {
-        let text = "demo\tDemo\tG\tS M -5 0 L 5 0";
-        let Err(err) = check_and_flatten(&parse_manifest(text).expect("parses")) else {
-            panic!("a dot must be rejected");
-        };
+        let err = flat("demo\tDemo\tG\tDOTTY", GEOM).expect_err("rejects");
         assert!(matches!(
             err,
             GenerateError::Icon {
@@ -1338,17 +1460,17 @@ mod tests {
 
     #[test]
     fn two_features_closer_than_a_stroke_are_rejected() {
-        // Three bars spanning the width. The top two are 110 em apart
-        // centre to centre, and each stroke inks 36 em either side, so
-        // 38 em of white survives between them — well under the 72 em
-        // floor. The third bar exists to lift the row's ink coverage over
-        // the dot floor, so that the GAP is what rejects this row and not
-        // the coverage rule firing first. That ordering is the point: an
+        // Three bars spanning the width. One stroke is 72 em, which is 14.4
+        // upstream units, so the top two — 18 units apart, 90 em — leave 18 em
+        // of white between their edges: over half a stroke and under the
+        // one-stroke floor, so the GAP rejects the row. The third bar lifts
+        // the row's ink coverage over the dot floor, so that the gap is what
+        // fires and not the coverage rule. That ordering is the point: an
         // invariant that shadows another one makes the shadowed one
         // untestable.
-        let text = "demo\tDemo\tG\tS M -450 -250 L 450 -250;S M -450 190 L 450 190;\
-                    S M -450 300 L 450 300";
-        let err = check_and_flatten(&parse_manifest(text).expect("parses")).expect_err("rejects");
+        let g = "GAPS\tground\tS M 10 40 L 190 40 ; S M 10 58 L 190 58 ; \
+                  S M 10 160 L 190 160";
+        let err = flat("demo\tDemo\tG\tGAPS", g).expect_err("rejects");
         assert!(matches!(
             err,
             GenerateError::Icon {
@@ -1360,31 +1482,30 @@ mod tests {
 
     #[test]
     fn features_that_cross_are_not_a_gap() {
-        // The infantry saltire: two strokes crossing at the centre, so
-        // every quadrant of the X is white pinching to nothing beside the
-        // crossing. Under any distance-between-features rule this shape
-        // fails, and it is the shape that most needs to pass. What makes
-        // it legal is that the two marks TOUCH, so the white is one
-        // shape's own notch rather than a gap between two.
-        let text = "demo\tDemo\tG\tS M -450 -450 L 450 450;S M -450 450 L 450 -450";
-        let flats = check_and_flatten(&parse_manifest(text).expect("parses")).expect("accepts");
-        assert_eq!(flats.len(), 1);
+        // The infantry saltire: two strokes crossing at the centre, so every
+        // quadrant of the X is white pinching to nothing beside the crossing.
+        // Under any distance-between-features rule this shape fails, and it is
+        // the shape that most needs to pass. What makes it legal is that the
+        // two marks TOUCH, so the white is one shape's own notch rather than
+        // a gap between two.
+        let g = "CROSS\tground\tS M 20 20 L 180 180 ; S M 20 180 L 180 20";
+        flat("demo\tDemo\tG\tCROSS", g).expect("accepts");
     }
 
     #[test]
     fn two_features_that_stop_short_are_still_a_gap() {
-        // The same saltire, with the crossing pulled apart into a near
-        // miss: the marks no longer touch, so the white between their
-        // nearest points is a gap the device has to resolve, and it is
-        // under the floor. This is the pair that the crossing test above
-        // must not accidentally excuse.
-        // The second stroke stops at (200, 320): 120/sqrt(2) = 85 em
-        // perpendicular from the first stroke's centreline, which leaves
-        // 85 - 36 = 49 em of white — about a pixel, over the one cell
-        // that counts as merged ink and under the 72 em floor. So the
-        // marks never touch, and the white between them is a gap.
-        let text = "demo\tDemo\tG\tS M -450 -450 L 450 450;S M -450 450 L 200 320";
-        let err = check_and_flatten(&parse_manifest(text).expect("parses")).expect_err("rejects");
+        // The same saltire pulled apart into a near miss: the marks no longer
+        // touch, so the white between their nearest points is a gap the
+        // device has to resolve, and it is under the floor. This is the pair
+        // the crossing test above must not accidentally excuse.
+        //
+        // The near end is (140,164): 24/sqrt(2) = 17 units, which is 85 em
+        // from the first stroke's centreline, so the white between their edges
+        // is 85 - 36 = 49 em — about a pixel, over the one cell that counts
+        // as merged ink and under the 72 em floor. So the marks never touch,
+        // and the white between them is a gap.
+        let g = "CROSS\tground\tS M 10 10 L 190 190 ; S M 10 190 L 140 164";
+        let err = flat("demo\tDemo\tG\tCROSS", g).expect_err("rejects");
         assert!(matches!(
             err,
             GenerateError::Icon {
@@ -1396,16 +1517,38 @@ mod tests {
 
     #[test]
     fn a_well_separated_pair_is_accepted() {
-        let text = "demo\tDemo\tG\tS M -450 -450 L -450 450;S M 450 -450 L 450 450";
-        check_and_flatten(&parse_manifest(text).expect("parses")).expect("accepts");
+        let g = "APART\tground\tS M 20 20 L 20 180 ; S M 180 20 L 180 180";
+        flat("demo\tDemo\tG\tAPART", g).expect("accepts");
+    }
+
+    #[test]
+    fn an_open_run_upstream_calls_filled_is_stroked() {
+        // The infantry saltire as upstream writes it: one `d`, marked filled,
+        // two single-segment runs. Filling either encloses no area, so the
+        // whole icon would vanish. The decision has to come from the
+        // geometry, and this is the test that says so.
+        let g = "SALTIRE\tground\tF M 25 50 L 175 150 M25,150 175,50";
+        let flats = flat("demo\tDemo\tG\tSALTIRE", g).expect("accepts");
+        let marks = &flats[0].marks;
+        assert_eq!(marks.len(), 2, "two runs, one per M");
+        assert!(
+            marks.iter().all(|m| !m.filled),
+            "an open line has nothing to fill"
+        );
+    }
+
+    #[test]
+    fn a_closed_run_upstream_calls_filled_is_filled() {
+        let flats = flat("demo\tDemo\tG\tSPACED", GEOM).expect("accepts");
+        assert!(flats[0].marks.iter().all(|m| m.filled));
     }
 
     #[test]
     fn generation_is_deterministic() {
         // A diff that fires on an unchanged tree is worse than no check.
         assert_eq!(
-            generate(WIDE).expect("generates"),
-            generate(WIDE).expect("generates")
+            generate("demo\tDemo\tG\tDEMO", GEOM).expect("generates"),
+            generate("demo\tDemo\tG\tDEMO", GEOM).expect("generates")
         );
     }
 
@@ -1418,11 +1561,14 @@ mod tests {
 
     #[test]
     fn a_flattened_icon_fills_the_unit_square() {
-        // Invariant 6's promise, on a shape whose longer axis is known.
-        let text = "demo\tDemo\tG\tF M -450 -200 L 450 -200 L 450 200 L -450 200 Z";
-        let flats = check_and_flatten(&parse_manifest(text).expect("parses")).expect("accepts");
+        // Invariant 6's promise, on a shape whose longer axis is known: a
+        // 100x70 upstream box is 500x350 em, so the uniform fit scales it to
+        // 1.0 x 0.7 and centres it. 350 em also clears the coverage floor,
+        // which a 100x50 box would not — that is what the floor is for.
+        let g = "WIDE\tground\tF M 50 65 L 150 65 L 150 135 L 50 135 Z";
+        let flats = flat("demo\tDemo\tG\tWIDE", g).expect("accepts");
         let mark = &flats[0].marks[0];
-        assert!(mark.filled, "the manifest prefixed this subpath F");
+        assert!(mark.filled, "upstream marked this subpath filled");
         let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
         for p in &mark.pts {
             x0 = x0.min(p.0);
@@ -1435,6 +1581,9 @@ mod tests {
         assert!(((y0 + y1) / 2.0 - 0.5).abs() < 1e-4);
         // Uniform scale, so the short axis keeps its aspect rather than
         // being stretched into the hostile frame's rhombus.
-        assert!(((y1 - y0) / (x1 - x0) - 400.0 / 900.0).abs() < 1e-3);
+        assert!(((y1 - y0) / (x1 - x0) - 0.7).abs() < 1e-3);
     }
+
+
 }
+

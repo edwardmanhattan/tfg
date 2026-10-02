@@ -1,17 +1,23 @@
 //! Icon geometry: the primitive a painter consumes, the em box the
-//! manifest is authored in, and the affine between them.
+//! readability thresholds are stated in, and the affine between them.
 //!
 //! No egui, on purpose. [`Point`] and [`IconMark`] are plain data, so
-//! the epaint painter in `main.rs` and the headless contact sheet in
+//! the epaint painter in `main.rs` and the contact sheet in
 //! `proto/p5-epaint` consume exactly the same geometry — which is what
 //! makes a sheet a truthful picture of the map rather than a second
 //! renderer that agrees with the first one by luck.
 //!
-//! Arcs do NOT survive into this module. epaint 0.36 has no `PathEl`
-//! and no `FillRule`: `PathShape` is a single `Vec<Pos2>` whose fill is
-//! documented as convex-polygons-only. An arc is therefore flattened to
-//! line segments at GENERATION time, by [`crate::symbology::generate`],
-//! and every mark here is already a polyline.
+//! The geometry itself is NOT authored here. It is extracted from the MIT
+//! tables of `spatialillusions/milsymbol` at a pinned commit into
+//! `assets/symbology/milsymbol.tsv`, and this module only says what a
+//! threshold means.
+//!
+//! Curves do NOT survive into this module, and neither do arcs. epaint 0.36
+//! has no `PathEl` and no `FillRule`: `PathShape` is a single `Vec<Pos2>`
+//! whose fill is documented as convex-polygons-only. Every curve is
+//! therefore flattened to line segments at GENERATION time, by
+//! [`crate::symbology::svgpath`], and every mark here is already a
+//! polyline.
 
 /// One vertex, in the unit square `[0, 1]^2`, y DOWN.
 ///
@@ -28,7 +34,7 @@ pub type Point = (f32, f32);
 pub const EM_BOX: f64 = 1000.0;
 
 /// Half the em box. The origin is the ICON's centre, not the frame's,
-/// because the manifest describes one icon and the frame is drawn around
+/// because the geometry describes one icon and the frame is drawn around
 /// it afterwards.
 pub const EM_HALF: f64 = EM_BOX / 2.0;
 
@@ -82,16 +88,26 @@ pub const MIN_ARC_SAGITTA_PX: f64 = 0.25;
 /// [`MIN_ARC_SAGITTA_PX`] in em.
 pub const MIN_ARC_SAGITTA_EM: f64 = MIN_ARC_SAGITTA_PX * EM_PER_PX;
 
-/// The fraction of the em box an icon's ink bounding box must cover.
+/// The fraction of the em box an icon's LONGER AXIS must span.
 ///
-/// A floor on the AUTHORED size, not on the drawn size: invariant 6
-/// rescales whatever is drawn to fill the unit square, so coverage is
-/// what catches an icon authored two orders of magnitude too small and
-/// about to be blown up into an unrecognisable smear. Set well below
-/// what a real icon achieves — a slim missile body is the tight case at
-/// roughly a quarter — because the point is to reject a dot, not to
-/// insist every icon be a square.
-pub const MIN_INK_COVERAGE: f64 = 0.15;
+/// A floor on the AUTHORED size, not on the drawn size: the fit rescales
+/// whatever is drawn to fill the unit square, so this is what catches an icon
+/// authored orders of magnitude too small and about to be blown up into an
+/// unrecognisable smear.
+///
+/// The AXIS and not the bounding box's AREA, because area is the wrong
+/// question to ask of a uniform fit. The fit scales by the longer axis, so a
+/// long thin icon is drawn at exactly the same size as a square one and is not
+/// a smear at all — and APP-6C has real icons of that shape. `supply` is
+/// upstream's `M25,120 l150,0`: a bare horizontal line, 750 em wide and ZERO em
+/// tall. Its area is zero and it is not a dot. An area floor rejects it; an
+/// axis floor accepts it and still rejects a dot, which is the entire point of
+/// the rule.
+///
+/// Measured over the selected icons the tightest is 0.24 (upstream's
+/// `engineer`, an 80-unit bracket) and the loosest 0.84. 0.15 sits below all
+/// of them with room to spare, and nowhere near the degenerate cases.
+pub const MIN_INK_EXTENT: f64 = 0.15;
 
 /// Grid cells per logical pixel in the gap scan.
 ///
@@ -99,14 +115,6 @@ pub const MIN_INK_COVERAGE: f64 = 0.15;
 /// the scan asks whether any gap is under about 1.6 px, and a 1 px grid
 /// would put the answer in the same cell as the ink.
 pub const GAP_SAMPLES_PER_PX: f64 = 4.0;
-
-/// Upper bound on the line segments one arc may flatten into.
-///
-/// Not a quality setting: an arc that needs more than this to hold the
-/// sagitta floor is either a near-circle the author should draw as
-/// subpaths, or a mistake, and both deserve to hear about it rather than
-/// to emit a ten-thousand-point table.
-pub const ARC_SEGMENT_CAP: usize = 64;
 
 /// One primitive of a drawn icon, already flattened and already in the
 /// unit square.

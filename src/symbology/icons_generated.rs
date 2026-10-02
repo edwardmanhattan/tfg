@@ -1,5 +1,10 @@
-// GENERATED. Source of truth is assets/symbology/icons.tsv; regenerate with
+// GENERATED. Do not hand-edit; regenerate with
 // `cargo run --manifest-path proto/p5-epaint/Cargo.toml -- --symbology-generate`.
+//
+// Which icons exist and what they are called is assets/symbology/icons.tsv.
+// The coordinates come from assets/symbology/milsymbol.tsv, extracted from
+// spatialillusions/milsymbol (MIT, Copyright (c) 2017 Mans Beckman) at a pinned
+// commit; see licenses/milsymbol-LICENSE.md and the header of that file.
 //
 // The invariants encoded here are the reason this file is generated rather
 // than written: a hand edit is exactly how they stop holding.
@@ -17,32 +22,83 @@ use super::BattleDimension;
 #[repr(u8)]
 pub enum UnitIcon {
     #[allow(non_camel_case_types)]
-    Naval = 0,
+    SurfaceCombatant = 0,
     #[allow(non_camel_case_types)]
-    Infantry = 1,
+    PatrolCraft = 1,
     #[allow(non_camel_case_types)]
-    Armour = 2,
+    MineWarfare = 2,
     #[allow(non_camel_case_types)]
-    Artillery = 3,
+    AmphibiousWarfareShip = 3,
     #[allow(non_camel_case_types)]
-    RotaryWing = 4,
+    Carrier = 4,
     #[allow(non_camel_case_types)]
-    FixedWing = 5,
+    OilerTanker = 5,
     #[allow(non_camel_case_types)]
-    Missile = 6,
+    HospitalShip = 6,
     #[allow(non_camel_case_types)]
-    Unspecified = 7,
+    Auxiliary = 7,
+    #[allow(non_camel_case_types)]
+    Convoy = 8,
+    #[allow(non_camel_case_types)]
+    UnmannedSurface = 9,
+    #[allow(non_camel_case_types)]
+    Submarine = 10,
+    #[allow(non_camel_case_types)]
+    Infantry = 11,
+    #[allow(non_camel_case_types)]
+    Armour = 12,
+    #[allow(non_camel_case_types)]
+    Artillery = 13,
+    #[allow(non_camel_case_types)]
+    Reconnaissance = 14,
+    #[allow(non_camel_case_types)]
+    AirDefence = 15,
+    #[allow(non_camel_case_types)]
+    Engineer = 16,
+    #[allow(non_camel_case_types)]
+    Medical = 17,
+    #[allow(non_camel_case_types)]
+    Signal = 18,
+    #[allow(non_camel_case_types)]
+    Supply = 19,
+    #[allow(non_camel_case_types)]
+    AmphibiousGround = 20,
+    #[allow(non_camel_case_types)]
+    NavalInfantry = 21,
+    #[allow(non_camel_case_types)]
+    RotaryWing = 22,
+    #[allow(non_camel_case_types)]
+    FixedWing = 23,
+    #[allow(non_camel_case_types)]
+    Unspecified = 24,
 }
 
 impl UnitIcon {
-    pub const ALL: [UnitIcon; 8] = [
-        UnitIcon::Naval,
+    pub const ALL: [UnitIcon; 25] = [
+        UnitIcon::SurfaceCombatant,
+        UnitIcon::PatrolCraft,
+        UnitIcon::MineWarfare,
+        UnitIcon::AmphibiousWarfareShip,
+        UnitIcon::Carrier,
+        UnitIcon::OilerTanker,
+        UnitIcon::HospitalShip,
+        UnitIcon::Auxiliary,
+        UnitIcon::Convoy,
+        UnitIcon::UnmannedSurface,
+        UnitIcon::Submarine,
         UnitIcon::Infantry,
         UnitIcon::Armour,
         UnitIcon::Artillery,
+        UnitIcon::Reconnaissance,
+        UnitIcon::AirDefence,
+        UnitIcon::Engineer,
+        UnitIcon::Medical,
+        UnitIcon::Signal,
+        UnitIcon::Supply,
+        UnitIcon::AmphibiousGround,
+        UnitIcon::NavalInfantry,
         UnitIcon::RotaryWing,
         UnitIcon::FixedWing,
-        UnitIcon::Missile,
         UnitIcon::Unspecified,
     ];
 
@@ -50,13 +106,30 @@ impl UnitIcon {
 /// to. Distinct from [`UnitIcon::name`], which is the operator-facing string.
     pub fn variant_name(self) -> &'static str {
         match self {
-            UnitIcon::Naval => "naval",
+            UnitIcon::SurfaceCombatant => "surface_combatant",
+            UnitIcon::PatrolCraft => "patrol_craft",
+            UnitIcon::MineWarfare => "mine_warfare",
+            UnitIcon::AmphibiousWarfareShip => "amphibious_warfare_ship",
+            UnitIcon::Carrier => "carrier",
+            UnitIcon::OilerTanker => "oiler_tanker",
+            UnitIcon::HospitalShip => "hospital_ship",
+            UnitIcon::Auxiliary => "auxiliary",
+            UnitIcon::Convoy => "convoy",
+            UnitIcon::UnmannedSurface => "unmanned_surface",
+            UnitIcon::Submarine => "submarine",
             UnitIcon::Infantry => "infantry",
             UnitIcon::Armour => "armour",
             UnitIcon::Artillery => "artillery",
+            UnitIcon::Reconnaissance => "reconnaissance",
+            UnitIcon::AirDefence => "air_defence",
+            UnitIcon::Engineer => "engineer",
+            UnitIcon::Medical => "medical",
+            UnitIcon::Signal => "signal",
+            UnitIcon::Supply => "supply",
+            UnitIcon::AmphibiousGround => "amphibious_ground",
+            UnitIcon::NavalInfantry => "naval_infantry",
             UnitIcon::RotaryWing => "rotary_wing",
             UnitIcon::FixedWing => "fixed_wing",
-            UnitIcon::Missile => "missile",
             UnitIcon::Unspecified => "unspecified",
         }
     }
@@ -64,13 +137,30 @@ impl UnitIcon {
     /// Operator-facing display name.
     pub fn name(self) -> &'static str {
         match self {
-            UnitIcon::Naval => "Naval",
+            UnitIcon::SurfaceCombatant => "Surface combatant",
+            UnitIcon::PatrolCraft => "Patrol craft",
+            UnitIcon::MineWarfare => "Mine warfare vessel",
+            UnitIcon::AmphibiousWarfareShip => "Amphibious warfare ship",
+            UnitIcon::Carrier => "Carrier",
+            UnitIcon::OilerTanker => "Tanker / oiler",
+            UnitIcon::HospitalShip => "Hospital ship",
+            UnitIcon::Auxiliary => "Auxiliary / cargo hull",
+            UnitIcon::Convoy => "Convoy",
+            UnitIcon::UnmannedSurface => "Unmanned surface vehicle",
+            UnitIcon::Submarine => "Submarine",
             UnitIcon::Infantry => "Infantry",
             UnitIcon::Armour => "Armour",
             UnitIcon::Artillery => "Artillery",
+            UnitIcon::Reconnaissance => "Reconnaissance",
+            UnitIcon::AirDefence => "Air defence",
+            UnitIcon::Engineer => "Engineer",
+            UnitIcon::Medical => "Medical",
+            UnitIcon::Signal => "Signal",
+            UnitIcon::Supply => "Supply",
+            UnitIcon::AmphibiousGround => "Amphibious (ground)",
+            UnitIcon::NavalInfantry => "Naval (anchor)",
             UnitIcon::RotaryWing => "Rotary wing aviation",
             UnitIcon::FixedWing => "Fixed wing aviation",
-            UnitIcon::Missile => "Missile",
             UnitIcon::Unspecified => "Unspecified",
         }
     }
@@ -79,13 +169,30 @@ impl UnitIcon {
 /// letter collapsed the way this symbology collapses it.
     pub fn default_dimension(self) -> BattleDimension {
         match self {
-            UnitIcon::Naval => BattleDimension::LandAndSeaSurface,
+            UnitIcon::SurfaceCombatant => BattleDimension::LandAndSeaSurface,
+            UnitIcon::PatrolCraft => BattleDimension::LandAndSeaSurface,
+            UnitIcon::MineWarfare => BattleDimension::LandAndSeaSurface,
+            UnitIcon::AmphibiousWarfareShip => BattleDimension::LandAndSeaSurface,
+            UnitIcon::Carrier => BattleDimension::LandAndSeaSurface,
+            UnitIcon::OilerTanker => BattleDimension::LandAndSeaSurface,
+            UnitIcon::HospitalShip => BattleDimension::LandAndSeaSurface,
+            UnitIcon::Auxiliary => BattleDimension::LandAndSeaSurface,
+            UnitIcon::Convoy => BattleDimension::LandAndSeaSurface,
+            UnitIcon::UnmannedSurface => BattleDimension::LandAndSeaSurface,
+            UnitIcon::Submarine => BattleDimension::Subsurface,
             UnitIcon::Infantry => BattleDimension::LandAndSeaSurface,
             UnitIcon::Armour => BattleDimension::LandAndSeaSurface,
             UnitIcon::Artillery => BattleDimension::LandAndSeaSurface,
+            UnitIcon::Reconnaissance => BattleDimension::LandAndSeaSurface,
+            UnitIcon::AirDefence => BattleDimension::LandAndSeaSurface,
+            UnitIcon::Engineer => BattleDimension::LandAndSeaSurface,
+            UnitIcon::Medical => BattleDimension::LandAndSeaSurface,
+            UnitIcon::Signal => BattleDimension::LandAndSeaSurface,
+            UnitIcon::Supply => BattleDimension::LandAndSeaSurface,
+            UnitIcon::AmphibiousGround => BattleDimension::LandAndSeaSurface,
+            UnitIcon::NavalInfantry => BattleDimension::LandAndSeaSurface,
             UnitIcon::RotaryWing => BattleDimension::AirAndSpace,
             UnitIcon::FixedWing => BattleDimension::AirAndSpace,
-            UnitIcon::Missile => BattleDimension::LandAndSeaSurface,
             UnitIcon::Unspecified => BattleDimension::LandAndSeaSurface,
         }
     }
@@ -93,42 +200,88 @@ impl UnitIcon {
 
 /// Each icon's marks, flattened and already in the unit square. Indexed by
 /// [`UnitIcon`] as a `u8`.
-pub const GEOMETRY: [&[IconMark]; 8] = [
+pub const GEOMETRY: [&[IconMark]; 25] = [
     &[
-        IconMark::Stroke(&[(0.500000, 0.000000), (0.574951, 0.031006), (0.605957, 0.105957), (0.574951, 0.180664), (0.500000, 0.211670), (0.425049, 0.180664), (0.394043, 0.105957), (0.425049, 0.031006), (0.500000, 0.000000)]),
-        IconMark::Stroke(&[(0.500000, 0.211670), (0.500000, 0.882324)]),
-        IconMark::Stroke(&[(0.264648, 0.353027), (0.735352, 0.353027)]),
-        IconMark::Stroke(&[(0.370605, 0.882324), (0.629395, 0.882324)]),
-        IconMark::Stroke(&[(0.370605, 0.882324), (0.205811, 1.000000), (0.205811, 0.835205)]),
-        IconMark::Stroke(&[(0.629395, 0.882324), (0.794189, 1.000000), (0.794189, 0.835205)]),
+        IconMark::Fill(&[(0.500000, 0.899902), (-0.000000, 0.560059), (0.300049, 0.600098), (0.300049, 0.399902), (0.399902, 0.399902), (0.399902, 0.300049), (0.100098, 0.300049), (0.100098, 0.199951), (0.399902, 0.199951), (0.399902, 0.100098), (0.600098, 0.100098), (0.600098, 0.199951), (0.899902, 0.199951), (0.899902, 0.300049), (0.600098, 0.300049), (0.600098, 0.399902), (0.699951, 0.399902), (0.699951, 0.600098), (1.000000, 0.560059), (0.500000, 0.899902)]),
     ],
     &[
-        IconMark::Stroke(&[(-0.000000, -0.000000), (1.000000, 1.000000)]),
-        IconMark::Stroke(&[(-0.000000, 1.000000), (1.000000, -0.000000)]),
+        IconMark::Fill(&[(0.000000, 0.500000), (0.500000, 1.000000), (1.000000, 0.500000), (0.750000, 0.500000), (0.750000, 0.000000), (0.250000, 0.000000), (0.250000, 0.500000), (0.000000, 0.500000)]),
     ],
     &[
-        IconMark::Fill(&[(-0.000000, 0.166748), (1.000000, 0.166748), (1.000000, 0.300049), (-0.000000, 0.300049)]),
-        IconMark::Fill(&[(-0.000000, 0.699951), (1.000000, 0.699951), (1.000000, 0.833252), (-0.000000, 0.833252)]),
+        IconMark::Fill(&[(0.463135, 0.076172), (0.463135, 0.165283), (0.323975, 0.228271), (0.247803, 0.152100), (0.195557, 0.204346), (0.273926, 0.282715), (0.234863, 0.423828), (0.000000, 0.423828), (0.000000, 0.489014), (0.065186, 0.489014), (0.500000, 0.923828), (0.934814, 0.489014), (1.000000, 0.489014), (1.000000, 0.423828), (0.782715, 0.423828), (0.717285, 0.278320), (0.804443, 0.197754), (0.760986, 0.145752), (0.673828, 0.223877), (0.543457, 0.165283), (0.543457, 0.076172), (0.463135, 0.076172)]),
     ],
     &[
-        IconMark::Fill(&[(0.500000, -0.000000), (0.750000, 0.066895), (0.933105, 0.250000), (1.000000, 0.500000), (0.933105, 0.750000), (0.750000, 0.933105), (0.500000, 1.000000), (0.250000, 0.933105), (0.066895, 0.750000), (-0.000000, 0.500000), (0.066895, 0.250000), (0.250000, 0.066895), (0.500000, -0.000000)]),
+        IconMark::Stroke(&[(0.500000, 1.000000), (1.000000, 1.000000)]),
+        IconMark::Fill(&[(0.500000, 1.000000), (0.000000, 0.500000), (0.250000, 0.500000), (0.250000, 0.000000), (0.750000, 0.000000), (0.750000, 0.500000), (1.000000, 0.500000), (0.500000, 1.000000)]),
     ],
     &[
-        IconMark::Fill(&[(0.500000, 0.252686), (0.674805, 0.325195), (0.747314, 0.500000), (0.674805, 0.674805), (0.500000, 0.747314), (0.325195, 0.674805), (0.252686, 0.500000), (0.325195, 0.325195), (0.500000, 0.252686)]),
-        IconMark::Stroke(&[(0.650146, 0.650146), (1.000000, 1.000000)]),
-        IconMark::Stroke(&[(0.349854, 0.650146), (-0.000000, 1.000000)]),
-        IconMark::Stroke(&[(0.349854, 0.349854), (-0.000000, -0.000000)]),
-        IconMark::Stroke(&[(0.650146, 0.349854), (1.000000, -0.000000)]),
+        IconMark::Fill(&[(0.000000, 0.500000), (0.500000, 1.000000), (1.000000, 0.500000), (0.500000, 0.500000), (0.500000, 0.000000), (0.000000, 0.000000), (0.000000, 0.500000)]),
     ],
     &[
-        IconMark::Fill(&[(0.500000, 0.362549), (0.597168, 0.402832), (0.637451, 0.500000), (0.597168, 0.597168), (0.500000, 0.637451), (0.402832, 0.597168), (0.362549, 0.500000), (0.402832, 0.402832), (0.500000, 0.362549)]),
-        IconMark::Stroke(&[(0.500000, 0.375000), (0.500000, 0.000000)]),
-        IconMark::Stroke(&[(0.500000, 0.625000), (0.500000, 1.000000)]),
+        IconMark::Stroke(&[(0.222168, 0.500000), (0.222168, 0.111084), (0.777832, 0.111084), (0.777832, 0.500000), (1.000000, 0.500000), (0.833252, 0.888916), (0.166748, 0.888916), (-0.000000, 0.500000), (0.222168, 0.500000)]),
     ],
     &[
-        IconMark::Fill(&[(0.500000, -0.000000), (0.617676, 0.220703), (0.617676, 1.000000), (0.382324, 1.000000), (0.382324, 0.220703)]),
-        IconMark::Fill(&[(0.382324, 0.720703), (0.058838, 1.000000), (0.382324, 1.000000)]),
-        IconMark::Fill(&[(0.617676, 0.720703), (0.941162, 1.000000), (0.617676, 1.000000)]),
+        IconMark::Stroke(&[(0.222168, 0.500000), (0.222168, 0.111084), (0.777832, 0.111084), (0.777832, 0.500000), (1.000000, 0.500000), (0.833252, 0.888916), (0.166748, 0.888916), (-0.000000, 0.500000), (0.222168, 0.500000)]),
+        IconMark::Fill(&[(0.444336, 0.444336), (0.444336, 0.277832), (0.555664, 0.277832), (0.555664, 0.444336), (0.722168, 0.444336), (0.722168, 0.555664), (0.555664, 0.555664), (0.555664, 0.722168), (0.444336, 0.722168), (0.444336, 0.555664), (0.277832, 0.555664), (0.277832, 0.444336), (0.444336, 0.444336)]),
+    ],
+    &[
+        IconMark::Stroke(&[(0.222168, 0.500000), (0.222168, 0.111084), (0.777832, 0.111084), (0.777832, 0.500000), (1.000000, 0.500000), (0.833252, 0.888916), (0.166748, 0.888916), (-0.000000, 0.500000), (0.222168, 0.500000)]),
+    ],
+    &[
+        IconMark::Fill(&[(0.250000, 0.718750), (0.000000, 0.718750), (0.000000, 0.281250), (1.000000, 0.281250), (1.000000, 0.718750), (0.750000, 0.718750), (0.750000, 0.468750), (0.250000, 0.468750), (0.250000, 0.718750)]),
+    ],
+    &[
+        IconMark::Fill(&[(0.000000, 0.293701), (0.500000, 0.543701), (1.000000, 0.293701), (1.000000, 0.393799), (0.500000, 0.706299), (0.000000, 0.393799), (0.000000, 0.293701)]),
+    ],
+    &[
+        IconMark::Fill(&[(0.187500, 0.312500), (0.812500, 0.312500), (1.000000, 0.500000), (0.812500, 0.687500), (0.187500, 0.687500), (0.000000, 0.500000), (0.187500, 0.312500)]),
+    ],
+    &[
+        IconMark::Stroke(&[(0.000000, 0.166748), (1.000000, 0.833252)]),
+        IconMark::Stroke(&[(0.000000, 0.833252), (1.000000, 0.166748)]),
+    ],
+    &[
+        IconMark::Stroke(&[(0.785645, 0.271484), (1.000000, 0.500000), (0.785645, 0.728516), (0.214355, 0.728516), (0.000000, 0.500000), (0.214355, 0.271484), (0.785645, 0.271484)]),
+    ],
+    &[
+        IconMark::Stroke(&[(0.500000, 1.000000), (0.500000, -0.000000)]),
+        IconMark::Stroke(&[(0.345459, 0.793701), (0.345459, 0.278320)]),
+        IconMark::Stroke(&[(0.654541, 0.793701), (0.654541, 0.278320)]),
+        IconMark::Stroke(&[(0.345459, 0.206299), (0.500000, -0.000000), (0.654541, 0.206299)]),
+    ],
+    &[
+        IconMark::Stroke(&[(0.000000, 0.833252), (1.000000, 0.166748)]),
+    ],
+    &[
+        IconMark::Stroke(&[(0.000000, 0.600098), (0.500000, 0.399902), (1.000000, 0.600098)]),
+    ],
+    &[
+        IconMark::Stroke(&[(0.000000, 0.718750), (0.000000, 0.281250), (1.000000, 0.281250), (1.000000, 0.718750)]),
+        IconMark::Stroke(&[(0.500000, 0.281250), (0.500000, 0.618652)]),
+    ],
+    &[
+        IconMark::Stroke(&[(0.500000, 0.166748), (0.500000, 0.833252)]),
+        IconMark::Stroke(&[(0.000000, 0.500000), (1.000000, 0.500000)]),
+    ],
+    &[
+        IconMark::Stroke(&[(0.000000, 0.166748), (0.500000, 0.566650), (0.500000, 0.433350), (1.000000, 0.833252)]),
+    ],
+    &[
+        IconMark::Stroke(&[(-8.000000, 8.000000), (8.000000, 8.000000)]),
+    ],
+    &[
+        IconMark::Stroke(&[(-0.000000, 0.434082), (0.124023, 0.565918), (0.248047, 0.434082), (0.372070, 0.565918), (0.496094, 0.434082), (0.620117, 0.565918), (0.744141, 0.434082), (0.868164, 0.565918), (1.000000, 0.434082)]),
+    ],
+    &[
+        IconMark::Stroke(&[(0.499512, 0.973389), (0.499512, 0.026611)]),
+        IconMark::Stroke(&[(0.144287, 0.085693), (0.854492, 0.085693)]),
+        IconMark::Fill(&[(-0.000000, 0.505859), (0.033203, 0.767334), (0.087646, 0.736572), (0.498291, 0.968750), (0.501709, 0.968750), (0.912354, 0.736572), (0.966797, 0.767334), (1.000000, 0.505859), (0.920654, 0.581543), (0.829590, 0.635010), (0.875732, 0.692871), (0.505371, 0.894043), (0.501709, 0.945068), (0.498291, 0.894043), (0.127930, 0.692871), (0.174072, 0.635010), (0.082764, 0.581543), (0.003662, 0.505859), (-0.000000, 0.505859)]),
+    ],
+    &[
+        IconMark::Fill(&[(0.000000, 0.312500), (0.500000, 0.500000), (1.000000, 0.312500), (1.000000, 0.687500), (0.500000, 0.500000), (0.000000, 0.687500), (0.000000, 0.312500)]),
+    ],
+    &[
+        IconMark::Fill(&[(0.500000, 0.500000), (1.000000, 0.300049), (1.000000, 0.699951), (0.500000, 0.500000), (-0.000000, 0.699951), (-0.000000, 0.300049), (0.500000, 0.500000)]),
     ],
     &[],
 ];
@@ -137,13 +290,30 @@ pub const GEOMETRY: [&[IconMark]; 8] = [
 /// icon's margins rather than draw it. `scale` is UNIFORM: a per-axis scale
 /// would turn the infantry saltire into the hostile frame's rhombus. The
 /// geometry above is already normalised, so drawing never needs this.
-pub const FIT: [Fit; 8] = [
-    Fit { scale: 0.001221, dx: 0.500000, dy: 0.529297 },
+pub const FIT: [Fit; 25] = [
+    Fit { scale: 0.003906, dx: 0.500000, dy: 0.500000 },
+    Fit { scale: 0.004883, dx: 0.500000, dy: 0.500000 },
+    Fit { scale: 0.004395, dx: 0.500000, dy: 0.489014 },
+    Fit { scale: 0.004883, dx: 0.500000, dy: 0.500000 },
+    Fit { scale: 0.004883, dx: 0.500000, dy: 0.500000 },
+    Fit { scale: 0.002197, dx: 0.500000, dy: 0.500000 },
+    Fit { scale: 0.002197, dx: 0.500000, dy: 0.500000 },
+    Fit { scale: 0.002197, dx: 0.500000, dy: 0.500000 },
+    Fit { scale: 0.002441, dx: 0.500000, dy: 0.531250 },
+    Fit { scale: 0.002441, dx: 0.500000, dy: 0.493652 },
+    Fit { scale: 0.002441, dx: 0.500000, dy: 0.500000 },
+    Fit { scale: 0.001221, dx: 0.500000, dy: 0.500000 },
+    Fit { scale: 0.002197, dx: 0.500000, dy: 0.500000 },
+    Fit { scale: 0.001953, dx: 0.500000, dy: 0.484619 },
+    Fit { scale: 0.001221, dx: 0.500000, dy: 0.500000 },
+    Fit { scale: 0.001221, dx: 0.500000, dy: 0.266602 },
+    Fit { scale: 0.002441, dx: 0.500000, dy: 0.493652 },
     Fit { scale: 0.001221, dx: 0.500000, dy: 0.500000 },
     Fit { scale: 0.001221, dx: 0.500000, dy: 0.500000 },
-    Fit { scale: 0.001953, dx: 0.500000, dy: 0.500000 },
-    Fit { scale: 0.001709, dx: 0.500000, dy: 0.500000 },
-    Fit { scale: 0.001221, dx: 0.500000, dy: 0.500000 },
-    Fit { scale: 0.001465, dx: 0.500000, dy: 0.632324 },
+    Fit { scale: 1.000000, dx: 0.000000, dy: 0.000000 },
+    Fit { scale: 0.001221, dx: 0.494629, dy: 0.500000 },
+    Fit { scale: 0.002441, dx: 0.499512, dy: 0.440918 },
+    Fit { scale: 0.002441, dx: 0.500000, dy: 0.500000 },
+    Fit { scale: 0.003418, dx: 0.500000, dy: 0.500000 },
     Fit { scale: 1.000000, dx: 0.000000, dy: 0.000000 },
 ];

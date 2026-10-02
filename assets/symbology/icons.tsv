@@ -1,15 +1,88 @@
-# NATO APP-6C unit icons, authored from the standard's own icon descriptions.
-# Tab-separated: variant, display name, SIDC dimension letter, subpaths.
-# Each subpath is prefixed F (closed, filled) or S (open, stroked).
-# Coordinates are em over a 1000x1000 box, y DOWN, origin at the icon centre.
-# Grammar: M x y | L x y | A cx cy r a0 a1 (degrees) | Z.
-# Regenerate with: cargo run --manifest-path proto/p5-epaint/Cargo.toml -- --symbology-generate
+# Which APP-6C icons this client draws, and why.
+#
+# The geometry is NOT here. It is in milsymbol.tsv, extracted from the MIT
+# tables, and this file only says which upstream keys the client uses and what
+# it calls them. Splitting them is deliberate: the geometry is evidence with a
+# licence and a pinned commit, and the selection is a judgement. Mixing them
+# would make the judgement unreviewable, because a reviewer cannot see which
+# coordinates were chosen and which were inherited.
+#
+# Regenerate the geometry with:
+#   MILSYMBOL_SRC=<milsymbol checkout> node assets/symbology/extract-mjs.mjs \
+#     --out assets/symbology/milsymbol.tsv
+# Then regenerate the Rust table with:
+#   cargo run --manifest-path proto/p5-epaint/Cargo.toml -- --symbology-generate
+#
+# Columns: variant, display name, dimension letter, upstream key.
+#   variant   snake_case; becomes the enum variant verbatim
+#   display   operator-facing string
+#   dimension F U S G A P X Z -- the SIDC battle-dimension letter, collapsed
+#             the way this symbology collapses it (F and S both draw a closed
+#             frame, so they share BattleDimension::LandAndSeaSurface)
+#   key       the row in milsymbol.tsv
+#
+# The selection rule is DISTINGUISHABILITY AT 22 PX, not completeness. See
+# FINDINGS.md: eight sea roles in the standard are the same trapezoid hull, and
+# five more are the same downward arrow. Those are in here anyway because they
+# ARE the standard's icons and inventing a substitute would be worse than the
+# limitation, but the contact sheet is where that limitation is visible, and
+# the label is what actually separates a corvette from a destroyer.
+#
+# Two upstream icons were REMOVED by the generator rather than by taste. It
+# rejects `SE.IC.SEA SURFACE DECOY` (its three chevrons sit 1.50 px apart at
+# 22 px) and `SE.IC.DISTRESSED VESSEL` (1.25 px), both under the 1.58 px
+# one-stroke floor. Upstream strokes at 3 units in a 200 box — 0.33 px at our
+# size — and we stroke at 1.58 px because anything thinner vanishes at 22 px.
+# That five-fold difference is what closes their gaps, and it is the price of
+# being legible. Neither role is in the client's domain, so nothing is lost.
 
-naval	Naval	S	S M 0 -450 A 0 -360 90 -90 90 A 0 -360 90 90 270 Z;S M 0 -270 L 0 300;S M -200 -150 L 200 -150;S M -110 300 L 110 300;S M -110 300 L -250 400 L -250 260;S M 110 300 L 250 400 L 250 260
-infantry	Infantry	G	S M -420 -420 L 420 420;S M -420 420 L 420 -420
-armour	Armour	G	F M -450 -300 L 450 -300 L 450 -180 L -450 -180 Z;F M -450 180 L 450 180 L 450 300 L -450 300 Z
-artillery	Artillery	G	F M 0 -250 A 0 0 250 -90 90 A 0 0 250 90 270 Z
-rotary_wing	Rotary wing aviation	A	F M 0 -140 A 0 0 140 -90 90 A 0 0 140 90 270 Z;S M 85 85 L 283 283;S M -85 85 L -283 283;S M -85 -85 L -283 -283;S M 85 -85 L 283 -283
-fixed_wing	Fixed wing aviation	A	F M 0 -110 A 0 0 110 -90 90 A 0 0 110 90 270 Z;S M 0 -100 L 0 -400;S M 0 100 L 0 400
-missile	Missile	S	F M 0 -430 L 80 -280 L 80 250 L -80 250 L -80 -280 Z;F M -80 60 L -300 250 L -80 250 Z;F M 80 60 L 300 250 L 80 250 Z
-unspecified	Unspecified	G	
+# --- sea surface ----------------------------------------------------------
+# The hull class of a TNI-AL ship goes here. A `Korvet misil` and a `Frigat
+# serbaguna` are both Surface Combatant at Far zoom; the hull number and the
+# role string carry the difference, at Near zoom and in the Inspector.
+surface_combatant	Surface combatant	S	SE.IC.SURFACE COMBATANT, LINE
+patrol_craft	Patrol craft	S	SE.IC.PATROL
+mine_warfare	Mine warfare vessel	S	SE.IC.MINE WARFARE VESSEL
+amphibious_warfare_ship	Amphibious warfare ship	S	SE.IC.AMPHIBIOUS WARFARE SHIP
+carrier	Carrier	S	SE.IC.CARRIER
+oiler_tanker	Tanker / oiler	S	SE.IC.OILER/TANKER
+hospital_ship	Hospital ship	S	SE.IC.HOSPITAL SHIP CIV
+auxiliary	Auxiliary / cargo hull	S	SE.IC.CARGO, GENERAL
+convoy	Convoy	S	SE.IC.CONVOY
+unmanned_surface	Unmanned surface vehicle	S	SE.IC.UNMANNED SURFACE WATER VEHICLE
+
+# --- subsurface -----------------------------------------------------------
+# The one place hull class keeps its own icon, because a submarine's class is
+# not a thing the chart is trying to distinguish at theatre zoom: every one of
+# them is a submarine.
+submarine	Submarine	U	SU.IC.SUBMARINE
+
+# --- land -----------------------------------------------------------------
+# Ground units exist in the model because a task group can hold them, not
+# because this client has any. Kept to the set a group editor would plausibly
+# offer, and each one is a distinct silhouette.
+infantry	Infantry	G	GR.IC.FF.INFANTRY
+armour	Armour	G	GR.IC.ARMOUR
+artillery	Artillery	G	GR.IC.FF.FIELD ARTILLERY ROCKET
+reconnaissance	Reconnaissance	G	GR.IC.FF.RECONNAISSANCE
+air_defence	Air defence	G	GR.IC.FF.AIR DEFENCE
+engineer	Engineer	G	GR.IC.ENGINEER
+medical	Medical	G	GR.IC.FF.MEDICAL
+signal	Signal	G	GR.IC.FF.SIGNAL
+supply	Supply	G	GR.IC.FF.SUPPLY
+amphibious_ground	Amphibious (ground)	G	GR.IC.FF.AMPHIBIOUS
+naval_infantry	Naval (anchor)	G	GR.IC.FF.NAVAL
+
+# --- air and space --------------------------------------------------------
+rotary_wing	Rotary wing aviation	A	GR.IC.AVIATION ROTARY WING
+fixed_wing	Fixed wing aviation	A	GR.IC.AVIATION FIXED WING
+
+# --- the empty frame interior ---------------------------------------------
+# `Unspecified` draws no icon at all, which is a real state: a unit whose type
+# nobody has assigned. It has no upstream key because there is no glyph for it,
+# and inventing one would be a claim the standard does not make.
+#
+# `-` rather than an empty cell: an editor strips a trailing tab, so the
+# "no glyph" sentinel would silently become a parse error the first time
+# somebody saved the file.
+unspecified	Unspecified	G	-
