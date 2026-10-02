@@ -36,6 +36,12 @@ pub enum LogKind {
     ShipBlocked,
     /// Game-minute boundary crossed, derived from the ADR-0004 clock.
     Marker,
+    /// A declared affiliation (map representation): the operator stated
+    /// which side a unit, group or branch is on. Journalled so an
+    /// observer can see that a contact was declared hostile at G+12:30
+    /// by that seat, instead of wondering why it draws as a red
+    /// diamond.
+    AffiliationSet,
     Join,
     Telegram,
 }

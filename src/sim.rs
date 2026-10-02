@@ -152,6 +152,16 @@ pub enum SimCommand {
     /// Rotate the journal to a fresh per-session file (state-machine
     /// grill, #26): Start opens a new file, the old one stays on disk.
     RotateJournal { path: PathBuf },
+    /// A declared affiliation, recorded for the session. The UI owns
+    /// the declaration (it writes the operator's own tables) and the
+    /// sim owns the journal, so the entry travels the command channel
+    /// rather than opening a SECOND writer on the same file — which
+    /// would collide on sequence numbers.
+    NoteAffiliation {
+        actor: String,
+        subject: String,
+        affiliation: String,
+    },
 }
 
 /// Read view of one owned ship for the orders UI.
@@ -655,6 +665,16 @@ impl SimSource {
                     });
                     self.last_seq.clear();
                     self.last_marker_min = 0;
+                }
+                SimCommand::NoteAffiliation { actor, subject, affiliation } => {
+                    // No state changes here: the declaration is already
+                    // in the UI's own tables. This is the record of it.
+                    self.journal.append(
+                        self.clock.game_now_ts(),
+                        actor,
+                        LogKind::AffiliationSet,
+                        serde_json::json!({"subject": subject, "affiliation": affiliation}),
+                    );
                 }
             }
         }
