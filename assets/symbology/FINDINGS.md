@@ -92,3 +92,45 @@ than one device pixel is not a fill, it is a stroke's job. The threshold lives
 in `generate.rs`, in em, and is measured after the conversion to em — upstream's
 box is 200 units to tfg's 1000, so the same number in upstream units would be
 25 times too small and would let every hairline sliver through as a fill.
+
+## 6. The canonical frame geometry, and one shape that must NOT be copied
+
+`src/ms/symbolgeometries.js` in the same pinned checkout carries the frame
+outlines with explicit bounding boxes, in the same 200-unit space centred on
+(100,100). Extents measured off the paths:
+
+| frame | bbox | note |
+| --- | --- | --- |
+| friendly | 150 x 100 | `M25,50 l150,0 0,100 -150,0 z` |
+| hostile | 144 x 144 | `M 100,28 L172,100 100,172 28,100 100,28 Z` |
+| neutral | 110 x 110 | `M45,45 l110,0 0,110 -110,0 z` |
+| unknown | 138.5 x 138.5 | four CUBIC lobes, inner square side 74 |
+
+Three of these replace numbers in the tree that no one could check.
+`frame_extent` claims the extents were "MEASURED from the standard's own
+artwork, not inferred from a filename" and cites 590x390, 586x586, 430x430,
+590x590. The ratios survive (friendly is the only non-square, and 1.5:1 either
+way) but the provenance claim is not one this project can make, and the
+neutral frame is 110 against a friendly height of 100 — **larger**, where the
+tree deliberately inscribes it smaller so the box holds everything. That
+reversal is a house decision and needs recording as one, not as a measurement.
+
+The icon box is corroborated rather than assumed: `icon.js:5` defaults `gbbox`
+to `x1:50, x2:150, y1:50, y2:150`, a 100x100 box in the 200 space. So the
+icon's fit target is that box, and `frame_icon_radius`'s four tuned
+multipliers — including the `0.55` for the quatrefoil, a hidden coupling to
+`PER_LOBE` in `quatrefoil_polygon` — can go.
+
+**Do not copy `SeaFriend`, which upstream draws as a CIRCLE, `cx 100 cy 100
+r 60`.** That is the later-edition sea frame; APP-6C draws the sea surface
+friendly frame as the same rectangle as land, and this project implements
+APP-6C. Upstream keys its frame table by `dimension + affiliation` with no
+edition in the key, so it cannot be read off the table which shape belongs to
+which edition — copying it would import a 2525D outline into an APP-6C
+implementation. This is the one place in the port where the source is right
+about the standard and still wrong for this project.
+
+The four cubic lobes also contradict `quatrefoil_polygon`, which builds four
+SEMICIRCULAR ones from `extent/4` arcs on an `extent/2` inner square. Same
+shape, different curve: the canonical one has inner side 74 and total extent
+138.5, so each lobe rises 32.25 rather than the current 34.6.
