@@ -56,12 +56,12 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use super::BattleDimension;
 use super::icons::{
-    EM_BOX, EM_HALF, EM_PER_PX, Fit, GAP_SAMPLES_PER_PX, Point, MIN_ICON_STROKE_EM,
-    MIN_INK_EXTENT, MIN_STROKE_PX,
+    EM_BOX, EM_HALF, EM_PER_PX, Fit, GAP_SAMPLES_PER_PX, MIN_ICON_STROKE_EM, MIN_INK_EXTENT,
+    MIN_STROKE_PX, Point,
 };
 use super::svgpath::{self, Run};
-use super::BattleDimension;
 
 /// Which invariant a rejection came from.
 ///
@@ -99,7 +99,6 @@ impl Invariant {
         }
     }
 }
-
 
 /// Every way generation can refuse, carrying the icon and the subpath
 /// index whenever there is one.
@@ -178,21 +177,36 @@ fn bad(
 pub fn manifest_path() -> Result<PathBuf, GenerateError> {
     repo_root()
         .map(|r| r.join("assets").join("symbology").join("icons.tsv"))
-        .ok_or_else(|| io(format!("no assets/symbology/icons.tsv above {}", env!("CARGO_MANIFEST_DIR"))))
+        .ok_or_else(|| {
+            io(format!(
+                "no assets/symbology/icons.tsv above {}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+        })
 }
 
 /// The generated file, beside the model that consumes it.
 pub fn generated_path() -> Result<PathBuf, GenerateError> {
     repo_root()
         .map(|r| r.join("src").join("symbology").join("icons_generated.rs"))
-        .ok_or_else(|| io(format!("no src/symbology/ above {}", env!("CARGO_MANIFEST_DIR"))))
+        .ok_or_else(|| {
+            io(format!(
+                "no src/symbology/ above {}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+        })
 }
 
 /// The vendored geometry, beside the selection that names rows in it.
 pub fn geometry_path() -> Result<PathBuf, GenerateError> {
     repo_root()
         .map(|r| r.join("assets").join("symbology").join("milsymbol.tsv"))
-        .ok_or_else(|| io(format!("no assets/symbology/milsymbol.tsv above {}", env!("CARGO_MANIFEST_DIR"))))
+        .ok_or_else(|| {
+            io(format!(
+                "no assets/symbology/milsymbol.tsv above {}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+        })
 }
 
 fn repo_root() -> Option<PathBuf> {
@@ -443,10 +457,7 @@ fn check_rows(rows: &[Row], geometry: &Geometry) -> Result<(), GenerateError> {
         if a.upstream == NO_GEOMETRY {
             continue;
         }
-        if let Some(b) = rows[i + 1..]
-            .iter()
-            .find(|r| r.upstream == a.upstream)
-        {
+        if let Some(b) = rows[i + 1..].iter().find(|r| r.upstream == a.upstream) {
             return Err(GenerateError::File {
                 invariant: Invariant::Exhaustiveness,
                 detail: format!(
@@ -761,9 +772,15 @@ fn fit_for(row: &Row, bbox: Option<(f64, f64, f64, f64)>) -> Result<Fit, Generat
             ),
         ));
     }
-    if w <= 0.0 || h <= 0.0 {
-        return Ok(Fit::NONE);
-    }
+    // A zero extent on ONE axis is not a degenerate icon and is deliberately not
+    // special-cased. APP-6C's `supply` is a bare horizontal line — 750 em wide
+    // and zero em tall, meant to be drawn at full width — and an earlier
+    // version of this function bailed out to `Fit::NONE` on `w <= 0 || h <= 0`,
+    // which left it in em coordinates inside a table documented as being in
+    // the unit square, where the painter multiplies by the box and draws it
+    // hundreds of pixels off screen. `w.max(h)` is non-zero because the
+    // coverage floor above refuses anything whose longer axis is under 15% of
+    // the box, and that includes the both-zero case.
     let scale = (1.0 / w.max(h)) as f32;
     let cx = (x0 + x1) / 2.0;
     let cy = (y0 + y1) / 2.0;
@@ -805,7 +822,11 @@ fn fit_for(row: &Row, bbox: Option<(f64, f64, f64, f64)>) -> Result<Fit, Generat
 /// Cells outside the icon's own bounding box are skipped: the margin
 /// between the icon and the em box is invariants 2 and 6's business and
 /// would otherwise be scanned as if it were a gap.
-fn check_gaps(row: &Row, tagged: &[Tagged], bbox: Option<(f64, f64, f64, f64)>) -> Result<(), GenerateError> {
+fn check_gaps(
+    row: &Row,
+    tagged: &[Tagged],
+    bbox: Option<(f64, f64, f64, f64)>,
+) -> Result<(), GenerateError> {
     let Some((bx0, by0, bx1, by1)) = bbox else {
         return Ok(());
     };
@@ -955,7 +976,10 @@ fn nearest_walls(
 ) -> [(u16, i64); 4] {
     let mut found = [(u16::MAX, 0i64); 4];
     for k in 1..=reach {
-        for (slot, (dx, dy)) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)].into_iter().enumerate() {
+        for (slot, (dx, dy)) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)]
+            .into_iter()
+            .enumerate()
+        {
             if found[slot].0 != u16::MAX {
                 continue;
             }
@@ -972,7 +996,6 @@ fn nearest_walls(
     }
     found
 }
-
 
 fn cell_origin(g: usize, _n: usize, cell: f64) -> f64 {
     -EM_HALF + (g as f64 + 0.5) * cell
@@ -1047,11 +1070,17 @@ fn camel(snake: &str) -> String {
 /// emits unchanged bytes. `k / 4096` is exact in `f32` and at
 /// [`MIN_STROKE_PX`](super::icons::MIN_STROKE_PX) the grid is roughly 185
 /// times finer than one device pixel, so nothing visible is lost.
+///
+/// No clamp, deliberately. This used to saturate at plus or minus 8, which is
+/// a number no normalised coordinate can reach and an em coordinate reaches
+/// easily — so it silently rewrote a geometry bug into a different geometry
+/// bug, and the one icon it hit drew as a 16 em line where the standard's is
+/// 750. A wrong coordinate should print wrong and be caught by
+/// `every_icon_sits_in_the_unit_square`.
 const QUANT: f32 = 4096.0;
 
 fn q(v: f32) -> String {
-    let k = (v * QUANT).round().clamp(-QUANT * 8.0, QUANT * 8.0);
-    format!("{:.6}", k / QUANT)
+    format!("{:.6}", (v * QUANT).round() / QUANT)
 }
 
 /// Parse, check and emit the generated file, all in memory.
@@ -1141,11 +1170,17 @@ fn emit(rows: &[Row], flats: &[Flat]) -> String {
         // manifest keeps one spelling in the file a human edits. The
         // allow is on the enum, not per variant, because a manifest with
         // thirty icons should not carry thirty allows.
-        s.push_str(&format!("    #[allow(non_camel_case_types)]\n    {} = {i},\n", camel(&r.variant)));
+        s.push_str(&format!(
+            "    #[allow(non_camel_case_types)]\n    {} = {i},\n",
+            camel(&r.variant)
+        ));
     }
     s.push_str("}\n\nimpl UnitIcon {\n");
 
-    s.push_str(&format!("    pub const ALL: [UnitIcon; {}] = [\n", rows.len()));
+    s.push_str(&format!(
+        "    pub const ALL: [UnitIcon; {}] = [\n",
+        rows.len()
+    ));
     for r in rows {
         s.push_str(&format!("        UnitIcon::{},\n", camel(&r.variant)));
     }
@@ -1333,7 +1368,9 @@ mod tests {
 
     #[test]
     fn a_wrong_cell_count_names_the_file_and_line() {
-        let msg = parse_manifest("demo\tDemo\tG").expect_err("rejects").to_string();
+        let msg = parse_manifest("demo\tDemo\tG")
+            .expect_err("rejects")
+            .to_string();
         assert!(msg.contains("icons.tsv line 1"), "{msg}");
         assert!(msg.contains("found 3"), "{msg}");
     }
@@ -1543,6 +1580,52 @@ mod tests {
         assert!(flats[0].marks.iter().all(|m| m.filled));
     }
 
+    /// The table is documented as being in the unit square, and the painter
+    /// multiplies by the box believing it. Checked against the CHECKED-IN
+    /// table rather than against a fresh `generate`, because the artifact is
+    /// what ships and a generator that is right while its output is stale has
+    /// still shipped the stale one.
+    ///
+    /// This is the invariant that catches a fit which bails out and leaves raw
+    /// em coordinates behind — which is exactly how APP-6C's `supply`, a bare
+    /// horizontal line with zero height, drew as a 16 em line at (-8, 8).
+    #[test]
+    fn every_icon_sits_in_the_unit_square() {
+        use super::super::icons_generated::{FIT, GEOMETRY, UnitIcon};
+        for (icon, marks) in UnitIcon::ALL.iter().zip(GEOMETRY.iter()) {
+            for mark in *marks {
+                let pts = match mark {
+                    super::super::icons::IconMark::Fill(p)
+                    | super::super::icons::IconMark::Stroke(p) => *p,
+                };
+                assert!(!pts.is_empty(), "{icon:?} has an empty mark");
+                for &(x, y) in pts {
+                    assert!(
+                        (-1e-6..=1.0 + 1e-6).contains(&x) && (-1e-6..=1.0 + 1e-6).contains(&y),
+                        "{icon:?} has ({x}, {y}) outside the unit square"
+                    );
+                }
+            }
+        }
+    }
+
+    /// And the identity fit means exactly one thing: no ink at all. An icon
+    /// with geometry and an identity fit is the other half of the same bug,
+    /// because a caller reasoning about margins from `FIT` would be told the
+    /// icon has none.
+    #[test]
+    fn only_an_icon_with_no_ink_has_the_identity_fit() {
+        use super::super::icons_generated::{FIT, GEOMETRY, UnitIcon};
+        for (icon, (marks, fit)) in UnitIcon::ALL.iter().zip(GEOMETRY.iter().zip(FIT.iter())) {
+            assert_eq!(
+                marks.is_empty(),
+                *fit == super::super::icons::Fit::NONE,
+                "{icon:?} has {} marks and fit {fit:?}",
+                marks.len()
+            );
+        }
+    }
+
     #[test]
     fn generation_is_deterministic() {
         // A diff that fires on an unchanged tree is worse than no check.
@@ -1583,7 +1666,4 @@ mod tests {
         // being stretched into the hostile frame's rhombus.
         assert!(((y1 - y0) / (x1 - x0) - 0.7).abs() < 1e-3);
     }
-
-
 }
-

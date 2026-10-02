@@ -134,3 +134,81 @@ The four cubic lobes also contradict `quatrefoil_polygon`, which builds four
 SEMICIRCULAR ones from `extent/4` arcs on an `extent/2` inner square. Same
 shape, different curve: the canonical one has inner side 74 and total extent
 138.5, so each lobe rises 32.25 rather than the current 34.6.
+
+Both of these have now landed, in `src/symbology/frame.rs`: the outlines are
+the canonical ones, the quatrefoil is flattened from the upstream path rather
+than assembled from arcs, and the icon box is one number instead of four tuned
+multipliers. The `frame_extent` comment that §6 calls unverifiable is gone.
+
+## 7. The cubic flattening bound was FALSE, not merely loose
+
+Found while porting the quatrefoil, because reusing `svgpath.rs` on a path
+authored in the reference space is the first thing that has to survive being
+flown in a different unit.
+
+`segs_for` chose a segment count from the second difference of a curve's
+control points: `bound = 0.25 * max(|P0-2P1+P2|, |P1-2P3+P2|)`, then
+`n = ceil(sqrt(bound / tolerance))`. A quarter is the right constant for a
+QUADRATIC and the wrong one for a cubic — a quadratic's worst case is its
+apex, half a second difference out; a cubic's comes a third of the way along,
+where it has already picked up the whole of it, so it needs three quarters.
+
+The estimate was not merely conservative. The canonical quatrefoil lobe
+`M63,63 C63,20 137,20 137,63` stands **32.25 units off its own chord** while a
+quarter of its second difference is 21.4. And the cubic that looks straight,
+`M0 0 C33 66 66 99 99 99` — the first three control points collinear, which is
+what `a_straight_cubic_needs_one_segment` was built on — deviates **17.5 em**
+against a tolerance of 11.36. One segment was accepted for a curve that broke
+the tolerance by half, and the test that should have caught it was asserting
+the wrong thing about the wrong path.
+
+So a "tolerance the curve provably exceeds is not a tolerance", and every
+flattened table in this project was up to three times coarser than it claimed.
+Three quarters is the correction; the test is now split in two, one genuinely
+collinear cubic and one that only looks it.
+
+Two things followed, and both are now in the code rather than in a comment:
+`parse_path_at(d, tolerance)` takes the tolerance as a parameter, because the
+icon tables are in em and the frame outlines are in reference units and passing
+the em figure to the latter would flatten five times too coarsely — the same
+class of mistake as §5, in the opposite direction. And the frame's tolerance is
+written as the conversion `MIN_ARC_SAGITTA_PX * REFERENCE_SIDE / BOX_PX` with a
+test pinning it to the em route, so neither number can drift alone.
+
+Regenerating after the correction changed four of the twenty-five icons —
+`AirDefence`, `AmphibiousGround`, `NavalInfantry`, `FixedWing`, the ones with
+curves coarse enough for the bound to matter — and every readability invariant
+still holds. A stricter flattening can only remove curvature, never open a
+gap, so nothing that passed before can fail now.
+
+## 8. A zero-height icon was emitted in the wrong coordinate space, and a clamp hid it
+
+Found by LOOKING at the sheet, which is the whole argument for having one.
+
+`fit_for` had a `if w <= 0.0 || h <= 0.0 { return Ok(Fit::NONE) }` guard, and
+`Fit::NONE` is the IDENTITY. So any icon with zero extent on one axis was left
+in raw em coordinates inside a table whose own doc comment says "already in the
+unit square" — and the painter multiplies that by the box, so `supply` drew as a
+16 em line where the standard's is 750 em wide.
+
+The guard was hidden by `q`, which saturated at plus or minus 8 while
+formatting. Eight is a value no normalised coordinate can reach and an em
+coordinate reaches trivially, so the clamp rewrote one wrong number into a
+different wrong number, quietly, in the only place the number was printed. Both
+were removed: the guard is gone (`w.max(h)` cannot be zero, because the
+coverage floor already refuses anything under 15% of the box, and that includes
+the both-zero case) and the clamp is gone.
+
+Two invariants replace them, and both run against the **checked-in table**
+rather than a fresh `generate`, because the artifact is what ships and a
+generator that is right while its output is stale has still shipped the stale
+one:
+
+- `every_icon_sits_in_the_unit_square` — every point of every mark is inside
+  `[0, 1]`, to 1e-6.
+- `only_an_icon_with_no_ink_has_the_identity_fit` — `FIT[i] == Fit::NONE` if
+  and only if `GEOMETRY[i]` is empty, so a caller reasoning about an icon's
+  margins from `FIT` is never told an icon with geometry has none.
+
+Both failed on the old table, which is the only evidence they are worth
+anything. `supply` now draws as the full-width bar §4 said it was.

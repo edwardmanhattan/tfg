@@ -11,9 +11,12 @@
 //! drag a multi-gigabyte C++ build behind every vocabulary review.
 //!
 //! [`icons`]: the geometry primitive, the em box, the em-to-pixel affine.
+//! [`frame`]: the four outlines that carry affiliation, the icon box inside
+//! them, and the openness that carries battle dimension.
 //! [`generate`]: the manifest parser, the readability invariants, the
 //! code emitter. Reads `assets/symbology/icons.tsv`.
 
+pub mod frame;
 pub mod generate;
 pub mod icons;
 mod icons_generated;

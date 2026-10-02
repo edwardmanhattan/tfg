@@ -112,13 +112,29 @@ pub fn shoelace(points: &[(f64, f64)]) -> f64 {
     acc.abs() / 2.0
 }
 
-/// Parse one `d` attribute into flattened runs.
+/// Parse one `d` attribute into flattened runs, at the icon tolerance.
+///
+/// The shorthand every caller but [`super::frame`] wants: see
+/// [`parse_path_at`] for why the tolerance is a parameter at all.
+pub fn parse_path(d: &str) -> Result<Vec<Run>, PathError> {
+    parse_path_at(d, MIN_ARC_SAGITTA_EM)
+}
+
+/// Parse one `d` attribute into flattened runs, at a stated tolerance.
+///
+/// `tolerance` is the largest chord error allowed, in the SAME UNITS AS THE
+/// PATH'S OWN COORDINATES — which is the whole reason it is a parameter
+/// rather than a constant. The tables in `assets/symbology/milsymbol.tsv` are
+/// authored in a 200-unit reference space while [`MIN_ARC_SAGITTA_EM`] is
+/// stated in em, so passing the em figure unconverted to a reference-space
+/// path would flatten five times too coarsely and the caller would have no way
+/// to notice: see `FINDINGS.md` §5 for the same trap in the fill decision.
 ///
 /// A path with no drawing command at all is an error rather than an empty
 /// result: every run this function returns has at least two points, so a path
 /// that cannot produce one is malformed, and a silent empty result would turn
 /// a typo into an icon that draws nothing and passes every invariant.
-pub fn parse_path(d: &str) -> Result<Vec<Run>, PathError> {
+pub fn parse_path_at(d: &str, tolerance: f64) -> Result<Vec<Run>, PathError> {
     let mut lex = Lexer::new(d);
     let mut runs: Vec<Run> = Vec::new();
     let mut cur: Vec<P> = Vec::new();
@@ -208,7 +224,7 @@ pub fn parse_path(d: &str) -> Result<Vec<Run>, PathError> {
                 let c1 = lex.point(rel, origin)?;
                 let c2 = lex.point(rel, origin)?;
                 let p = lex.point(rel, origin)?;
-                cubic(&mut cur, origin, c1, c2, p)?;
+                cubic(&mut cur, origin, c1, c2, p, tolerance)?;
                 at = Some(p);
                 last_cubic_ctrl = Some(c2);
                 last_quad_ctrl = None;
@@ -216,7 +232,7 @@ pub fn parse_path(d: &str) -> Result<Vec<Run>, PathError> {
                     let d1 = lex.point(rel, at.unwrap())?;
                     let d2 = lex.point(rel, at.unwrap())?;
                     let e = lex.point(rel, at.unwrap())?;
-                    cubic(&mut cur, at.unwrap(), d1, d2, e)?;
+                    cubic(&mut cur, at.unwrap(), d1, d2, e, tolerance)?;
                     at = Some(e);
                     last_cubic_ctrl = Some(d2);
                 }
@@ -233,7 +249,7 @@ pub fn parse_path(d: &str) -> Result<Vec<Run>, PathError> {
                 };
                 let c2 = lex.point(rel, origin)?;
                 let p = lex.point(rel, origin)?;
-                cubic(&mut cur, origin, reflected, c2, p)?;
+                cubic(&mut cur, origin, reflected, c2, p, tolerance)?;
                 at = Some(p);
                 last_cubic_ctrl = Some(c2);
                 last_quad_ctrl = None;
@@ -241,7 +257,7 @@ pub fn parse_path(d: &str) -> Result<Vec<Run>, PathError> {
                     let d2 = lex.point(rel, at.unwrap())?;
                     let e = lex.point(rel, at.unwrap())?;
                     let d1 = (2.0 * at.unwrap().0 - c2.0, 2.0 * at.unwrap().1 - c2.1);
-                    cubic(&mut cur, at.unwrap(), d1, d2, e)?;
+                    cubic(&mut cur, at.unwrap(), d1, d2, e, tolerance)?;
                     at = Some(e);
                     last_cubic_ctrl = Some(d2);
                 }
@@ -249,14 +265,14 @@ pub fn parse_path(d: &str) -> Result<Vec<Run>, PathError> {
             'Q' => {
                 let c = lex.point(rel, origin)?;
                 let p = lex.point(rel, origin)?;
-                quad(&mut cur, origin, c, p)?;
+                quad(&mut cur, origin, c, p, tolerance)?;
                 at = Some(p);
                 last_quad_ctrl = Some(c);
                 last_cubic_ctrl = None;
                 while lex.peek_is_number() {
                     let d = lex.point(rel, at.unwrap())?;
                     let e = lex.point(rel, at.unwrap())?;
-                    quad(&mut cur, at.unwrap(), d, e)?;
+                    quad(&mut cur, at.unwrap(), d, e, tolerance)?;
                     at = Some(e);
                     last_quad_ctrl = Some(d);
                 }
@@ -267,14 +283,14 @@ pub fn parse_path(d: &str) -> Result<Vec<Run>, PathError> {
                     _ => origin,
                 };
                 let p = lex.point(rel, origin)?;
-                quad(&mut cur, origin, reflected, p)?;
+                quad(&mut cur, origin, reflected, p, tolerance)?;
                 at = Some(p);
                 last_quad_ctrl = Some(reflected);
                 last_cubic_ctrl = None;
                 while lex.peek_is_number() {
                     let e = lex.point(rel, at.unwrap())?;
                     let d = (2.0 * at.unwrap().0 - reflected.0, 2.0 * at.unwrap().1 - reflected.1);
-                    quad(&mut cur, at.unwrap(), d, e)?;
+                    quad(&mut cur, at.unwrap(), d, e, tolerance)?;
                     at = Some(e);
                     last_quad_ctrl = Some(d);
                 }
@@ -286,13 +302,13 @@ pub fn parse_path(d: &str) -> Result<Vec<Run>, PathError> {
                 let large = lex.flag()?;
                 let sweep = lex.flag()?;
                 let p = lex.point(rel, origin)?;
-                arc(&mut cur, origin, rx, ry, rot, large, sweep, p)?;
+                arc(&mut cur, origin, rx, ry, rot, large, sweep, p, tolerance)?;
                 at = Some(p);
                 last_cubic_ctrl = None;
                 last_quad_ctrl = None;
                 while lex.peek_is_number() {
                     let (rx2, ry2, rot2, l2, s2, e2) = lex.arc_tail(rel, at.unwrap())?;
-                    arc(&mut cur, at.unwrap(), rx2, ry2, rot2, l2, s2, e2)?;
+                    arc(&mut cur, at.unwrap(), rx2, ry2, rot2, l2, s2, e2, tolerance)?;
                     at = Some(e2);
                 }
             }
@@ -340,33 +356,45 @@ fn flush(runs: &mut Vec<Run>, cur: &mut Vec<P>, closed: &mut bool) {
 /// Segments needed to hold the tolerance, from an upper bound on the
 /// deviation of a curve from its chord.
 ///
-/// Both bounds below are the standard second-difference estimates: a cubic's
-/// control polygon deviates from the chord by at most a quarter of its
-/// second difference, and halving the segment shrinks that by the square, so
-/// the count is the square root. Using a bound rather than a measurement is
-/// the point — the answer must not depend on how the curve happens to be
-/// oriented.
-fn cubic_segments(p0: P, p1: P, p2: P, p3: P) -> usize {
-    let d = |a: P, b: P, c: P| ((a.0 - 2.0 * b.0 + c.0).powi(2) + (a.1 - 2.0 * b.1 + c.1).powi(2)).sqrt();
-    let bound = 0.25 * d(p0, p1, p2).max(d(p1, p2, p3));
-    segs_for(bound)
+/// Both bounds below are the standard second-difference estimates: halving a
+/// segment shrinks a curve's deviation from its own chord by the square, so
+/// the count is the square root of the ratio. Using a bound rather than a
+/// measurement is the point: the answer must not depend on how the curve
+/// happens to be oriented.
+///
+/// The constants are three quarters for a cubic and a half for a quadratic,
+/// and they are not interchangeable. A quadratic's worst case is its own apex,
+/// which is half its second difference; a cubic's comes a third of the way
+/// along, where it has already picked up the whole of it, so it needs three
+/// quarters. An earlier version of this file used a quarter for the cubic,
+/// which is not a loose bound but a FALSE one: the canonical APP-6C quatrefoil
+/// lobe, `M63,63 C63,20 137,20 137,63`, stands 32.25 units off its chord while
+/// a quarter of its second difference is 21.4. A tolerance the curve provably
+/// exceeds is not a tolerance.
+fn cubic_segments(p0: P, p1: P, p2: P, p3: P, tolerance: f64) -> usize {
+    let bound = 0.75 * second_difference(p0, p1, p2).max(second_difference(p1, p2, p3));
+    segs_for(bound, tolerance)
 }
 
-fn quad_segments(p0: P, p1: P, p2: P) -> usize {
-    let d = ((p0.0 - 2.0 * p1.0 + p2.0).powi(2) + (p0.1 - 2.0 * p1.1 + p2.1).powi(2)).sqrt();
-    segs_for(0.5 * d)
+fn quad_segments(p0: P, p1: P, p2: P, tolerance: f64) -> usize {
+    segs_for(0.5 * second_difference(p0, p1, p2), tolerance)
 }
 
-fn segs_for(bound: f64) -> usize {
-    if bound <= MIN_ARC_SAGITTA_EM {
+/// `|a - 2b + c|`, the second difference both bounds above are stated in.
+fn second_difference(a: P, b: P, c: P) -> f64 {
+    ((a.0 - 2.0 * b.0 + c.0).powi(2) + (a.1 - 2.0 * b.1 + c.1).powi(2)).sqrt()
+}
+
+fn segs_for(bound: f64, tolerance: f64) -> usize {
+    if bound <= tolerance {
         return 1;
     }
-    ((bound / MIN_ARC_SAGITTA_EM).sqrt().ceil() as usize).clamp(1, SEGMENT_CAP)
+    ((bound / tolerance).sqrt().ceil() as usize).clamp(1, SEGMENT_CAP)
 }
 
-fn cubic(out: &mut Vec<P>, p0: P, p1: P, p2: P, p3: P) -> Result<(), PathError> {
-    let n = cubic_segments(p0, p1, p2, p3);
-    if n == SEGMENT_CAP && bound_exceeds(p0, p1, p2, p3) {
+fn cubic(out: &mut Vec<P>, p0: P, p1: P, p2: P, p3: P, tolerance: f64) -> Result<(), PathError> {
+    let n = cubic_segments(p0, p1, p2, p3, tolerance);
+    if n == SEGMENT_CAP && bound_exceeds(p0, p1, p2, p3, tolerance) {
         return err(format!(
             "cubic needs more than {SEGMENT_CAP} segments to hold the flattening \
              tolerance; its control points are degenerate"
@@ -379,14 +407,13 @@ fn cubic(out: &mut Vec<P>, p0: P, p1: P, p2: P, p3: P) -> Result<(), PathError> 
     Ok(())
 }
 
-fn bound_exceeds(p0: P, p1: P, p2: P, p3: P) -> bool {
-    let d = |a: P, b: P, c: P| ((a.0 - 2.0 * b.0 + c.0).powi(2) + (a.1 - 2.0 * b.1 + c.1).powi(2)).sqrt();
-    let bound = 0.25 * d(p0, p1, p2).max(d(p1, p2, p3));
-    (bound / MIN_ARC_SAGITTA_EM).sqrt() > SEGMENT_CAP as f64
+fn bound_exceeds(p0: P, p1: P, p2: P, p3: P, tolerance: f64) -> bool {
+    let bound = 0.75 * second_difference(p0, p1, p2).max(second_difference(p1, p2, p3));
+    (bound / tolerance).sqrt() > SEGMENT_CAP as f64
 }
 
-fn quad(out: &mut Vec<P>, p0: P, p1: P, p2: P) -> Result<(), PathError> {
-    let n = quad_segments(p0, p1, p2);
+fn quad(out: &mut Vec<P>, p0: P, p1: P, p2: P, tolerance: f64) -> Result<(), PathError> {
+    let n = quad_segments(p0, p1, p2, tolerance);
     for i in 1..=n {
         let t = i as f64 / n as f64;
         let u = 1.0 - t;
@@ -424,6 +451,7 @@ fn arc(
     large: bool,
     sweep: bool,
     to: P,
+    tolerance: f64,
 ) -> Result<(), PathError> {
     if rx == 0.0 || ry == 0.0 {
         // The spec says treat this as a straight line.
@@ -486,7 +514,7 @@ fn arc(
     let sweep_rad = delta.abs();
     let r_eff = rx.max(ry);
     let n = {
-        let per = 2.0 * (1.0 - MIN_ARC_SAGITTA_EM / r_eff).clamp(-1.0, 1.0).acos();
+        let per = 2.0 * (1.0 - tolerance / r_eff).clamp(-1.0, 1.0).acos();
         if per <= 0.0 {
             SEGMENT_CAP
         } else {
@@ -719,8 +747,22 @@ mod tests {
 
     #[test]
     fn a_straight_cubic_needs_one_segment() {
-        let r = &parse_path("M0 0 C33 66 66 99 99 99").expect("parses")[0];
+        // Collinear control points: the curve IS its chord, so one segment is
+        // the whole answer and the tables should not pay for a straight line.
+        let r = &parse_path("M0 0 C33 66 66 132 99 198").expect("parses")[0];
         assert_eq!(r.points.len(), 2);
+    }
+
+    #[test]
+    fn a_cubic_that_only_looks_straight_is_not_flattened_to_one_segment() {
+        // The three leading control points of this one are collinear, so it is
+        // the obvious candidate for a single chord, and it is what the cubic
+        // bound used to accept: its chord deviation is 17.5 em against a
+        // tolerance of 11.36. A quarter of its second difference is 8.25, so
+        // the old estimate claimed a curve held a tolerance it broke by half.
+        // Three quarters is 24.75, which two segments then beat at 5.53.
+        let r = &parse_path("M0 0 C33 66 66 99 99 99").expect("parses")[0];
+        assert_eq!(r.points.len(), 3);
     }
 
     #[test]
