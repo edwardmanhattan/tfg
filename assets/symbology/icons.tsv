@@ -1,0 +1,15 @@
+# NATO APP-6C unit icons, authored from the standard's own icon descriptions.
+# Tab-separated: variant, display name, SIDC dimension letter, subpaths.
+# Each subpath is prefixed F (closed, filled) or S (open, stroked).
+# Coordinates are em over a 1000x1000 box, y DOWN, origin at the icon centre.
+# Grammar: M x y | L x y | A cx cy r a0 a1 (degrees) | Z.
+# Regenerate with: cargo run --manifest-path proto/p5-epaint/Cargo.toml -- --symbology-generate
+
+naval	Naval	S	S M 0 -450 A 0 -360 90 -90 90 A 0 -360 90 90 270 Z;S M 0 -270 L 0 300;S M -200 -150 L 200 -150;S M -110 300 L 110 300;S M -110 300 L -250 400 L -250 260;S M 110 300 L 250 400 L 250 260
+infantry	Infantry	G	S M -420 -420 L 420 420;S M -420 420 L 420 -420
+armour	Armour	G	F M -450 -300 L 450 -300 L 450 -180 L -450 -180 Z;F M -450 180 L 450 180 L 450 300 L -450 300 Z
+artillery	Artillery	G	F M 0 -250 A 0 0 250 -90 90 A 0 0 250 90 270 Z
+rotary_wing	Rotary wing aviation	A	F M 0 -140 A 0 0 140 -90 90 A 0 0 140 90 270 Z;S M 85 85 L 283 283;S M -85 85 L -283 283;S M -85 -85 L -283 -283;S M 85 -85 L 283 -283
+fixed_wing	Fixed wing aviation	A	F M 0 -110 A 0 0 110 -90 90 A 0 0 110 90 270 Z;S M 0 -100 L 0 -400;S M 0 100 L 0 400
+missile	Missile	S	F M 0 -430 L 80 -280 L 80 250 L -80 250 L -80 -280 Z;F M -80 60 L -300 250 L -80 250 Z;F M 80 60 L 300 250 L 80 250 Z
+unspecified	Unspecified	G	

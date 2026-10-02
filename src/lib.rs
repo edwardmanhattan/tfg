@@ -6,6 +6,7 @@
 //! - [`camera`]: the eased camera move on an operator recentre.
 //! - [`chrome`]: island chrome — the floating-panel shell (see ADR-0014).
 //! - [`backend`]: v0 poll contract: `PollSource`, file replay, HTTP stub.
+//! - [`symbology`]: APP-6C symbol model + generated icon geometry. Leaf: depends on nothing.
 
 pub mod assets;
 pub mod backend;
@@ -26,3 +27,4 @@ pub mod overlay;
 pub mod paths;
 pub mod sim;
 pub mod store;
+pub mod symbology;

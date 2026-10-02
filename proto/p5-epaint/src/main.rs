@@ -60,6 +60,16 @@ mod gpuprobe;
 #[path = "../../../src/fx/mod.rs"]
 mod fx;
 
+// The APP-6C symbology core. This is the module the harness exists for as
+// much as the panel is: it has no egui and no sqlite in it, so it compiles
+// here in about two seconds and its icon generator runs headless. That is
+// why `Affiliation` and `BattleDimension` moved out of `store` and
+// `map_render` into it — as long as a symbology type reached through
+// `store`, this line would drag rusqlite's bundled amalgamation behind
+// every vocabulary review.
+#[path = "../../../src/symbology/mod.rs"]
+mod symbology;
+
 // ---------------------------------------------------------------------------
 // Tokens, mirrored from DESIGN.md and apply_ops_theme (main.rs:12294).
 //
@@ -1003,6 +1013,28 @@ impl eframe::App for Proto {
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
+    // The symbology modes run before anything touches a window. They are
+    // headless by construction: the module they drive has no egui in it,
+    // which is the entire reason the vocabulary can be checked without a
+    // graphics context and without the MapLibre build.
+    if args.iter().any(|a| a == "--symbology-generate") {
+        return match symbology_generate() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+    }
+    if args.iter().any(|a| a == "--symbology-check") {
+        return match symbology_check() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+    }
     // `--gpu-probe` runs the real `src/gpuprobe.rs` and exits, so the
     // capability check can be exercised on a real machine rather than only
     // type-checked.
@@ -1065,6 +1097,38 @@ fn main() -> eframe::Result {
     )
 }
 
+
+/// Rewrite `src/symbology/icons_generated.rs` from the manifest.
+///
+/// Separate from `--symbology-check` rather than a `--force` on it
+/// because writing and asserting are different permissions, and a check
+/// that can silently repair what it is checking is not a check.
+fn symbology_generate() -> Result<(), String> {
+    let manifest = symbology::generate::manifest_path().map_err(|e| e.to_string())?;
+    let out = symbology::generate::regenerate(&manifest).map_err(|e| e.to_string())?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+/// Fail loudly if the checked-in geometry has drifted from the manifest.
+///
+/// The generated file is committed, so this is the only thing standing
+/// between a hand edit and a vocabulary whose readability invariants no
+/// longer hold.
+fn symbology_check() -> Result<(), String> {
+    let manifest = symbology::generate::manifest_path().map_err(|e| e.to_string())?;
+    let generated = symbology::generate::generated_path().map_err(|e| e.to_string())?;
+    match symbology::generate::check_drift(&manifest, &generated).map_err(|e| e.to_string())? {
+        None => {
+            println!("icons.tsv and {} agree", generated.display());
+            Ok(())
+        }
+        Some(diff) => Err(format!(
+            "icons_generated.rs is stale against {}:\n\n{diff}",
+            manifest.display()
+        )),
+    }
+}
 
 /// Compile and draw the shipped halo on the real device, then read the
 /// target back and assert it is not empty.
