@@ -1014,6 +1014,7 @@ struct Proto {
     heat_dark: bool,
     zone_mode: bool,
     zone_right: bool,
+    modal_mode: bool,
     selected: usize,
     replay: u64,
     tone: Option<egui::TextureId>,
@@ -1114,6 +1115,80 @@ impl eframe::App for Proto {
             // side-zone unit actually builds and a single island cannot
             // show whether the stack rhythm or the rim's one-at-a-time rule
             // holds.
+            //
+            // `--modal` puts the real modal over the real zone, which is the
+            // only way to judge the two things that matter about a modal:
+            // whether the dimmed map behind it still reads as a map, and
+            // whether a form is legible on top of it.
+            if self.modal_mode {
+                let specs = vec![
+                    (
+                        chrome::Island::new(
+                            Id::new("z.user"),
+                            "Operator",
+                            vec2(chrome::zone_width(), 112.0),
+                        )
+                        .with_trailing("Administrator"),
+                        true,
+                    ),
+                    (
+                        chrome::Island::new(
+                            Id::new("z.players"),
+                            "Players",
+                            vec2(chrome::zone_width(), 320.0),
+                        )
+                        .with_trailing("6 SEATED"),
+                        true,
+                    ),
+                ];
+                let origins = chrome::zone_island_origins(chrome::Dock::Left, screen, &specs);
+                let rects: Vec<egui::Rect> = specs
+                    .iter()
+                    .zip(&origins)
+                    .map(|((s, _), p)| s.rect_at(*p))
+                    .collect();
+                let owner =
+                    chrome::owning_island(&rects, ui.ctx().input(|i| i.pointer.hover_pos()));
+                for (i, ((spec, _), mut pos)) in specs.iter().cloned().zip(origins).enumerate() {
+                    let mut open = true;
+                    chrome::island_owned(
+                        ui.ctx(),
+                        &spec,
+                        &mut pos,
+                        &mut open,
+                        owner == Some(i),
+                        |ui| {
+                            ui.weak("a zone island, behind the dim");
+                        },
+                    );
+                }
+
+                let spec =
+                    chrome::Modal::new(Id::new("players"), "Add players", vec2(640.0, 420.0));
+                chrome::modal(&ctx, &spec, |ui| {
+                    let mut search = String::new();
+                    ui.label("Search the account directory");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut search)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.separator();
+                    for (name, role) in [
+                        ("Super User", "Administrator"),
+                        ("Rina Hartono", "Operator"),
+                        ("Bagas Saputra", "Operator"),
+                        ("Dewi Lestari", "Operator"),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(name);
+                            ui.monospace(role);
+                            if ui.small_button("seat").clicked() {}
+                        });
+                    }
+                });
+                return;
+            }
+
             if self.zone_mode {
                 let specs = vec![
                     (chrome::Island::new(Id::new("User"), "Operator", vec2(chrome::zone_width(), 96.0))
@@ -1360,6 +1435,7 @@ fn main() -> eframe::Result {
     // exist because the rim rule (ADR-0016) claims exactly one island lights
     // at a time, and that claim is only checkable with three on screen.
     let zone_mode = args.iter().any(|a| a == "--zone");
+    let modal_mode = args.iter().any(|a| a == "--modal");
     let zone_right = args.iter().any(|a| a == "--zone-right");
 
     let options = eframe::NativeOptions {
@@ -1379,6 +1455,7 @@ fn main() -> eframe::Result {
                 heat_dark,
                 zone_mode,
                 zone_right,
+                modal_mode,
                 selected: 0,
                 replay: 0,
                 tone: None,

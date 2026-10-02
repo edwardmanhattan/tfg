@@ -43,6 +43,7 @@ the MapLibre core.
 | Link state as a type, not a parsed sentence | `LinkState` | five variants, each with its own status ink |
 | "In room" is a fact | `Participant::joined_at` | the server already returned it; the parser threw it away |
 | Reduced motion is wired | `ui()` | one `motion_secs` constant, 0 when reduced |
+| The modal primitive, with a real input-swallowing backdrop | `src/chrome.rs` `modal`, `Modal` | 4 geometry tests; the negative-body test failed twice before it passed |
 
 `cargo test --lib`: 266 pass. Two failures are pre-existing and unrelated
 (`quad_bow_follows_the_compass`, `order_move_applies_then_higher_overrides_loudly`);
@@ -103,10 +104,18 @@ wrong in several places.
 Ordered so each unit is verifiable on its own and each one shrinks the risk of
 the next.
 
-1. **The three modals.** Scenario Composer is the new one; Fleet Picker and
-   Player Picker are the existing miller/drag code re-homed into
-   `Order::Top` with a backdrop. The composer's contract is settled (see the
-   backend table above); its client does not exist.
+1. **The three modals, on the primitive that now exists.** `chrome::modal`
+   is landed and tested; the three modals ON it are not started.
+   - **Scenario Composer** is new end to end. Its contract is settled (see
+     the backend table): a game's book of ordered scenarios, each with
+     ordered steps, a step being content plus an optional `HHMM` window and
+     NO title, staff-only, no player-facing current-step read.
+   - **Fleet Picker** is the existing miller/drag code re-homed. It is
+     roughly 80% built; the work is the container and making the drag-to-map
+     survive the modal, which the backdrop now blocks and the drag handler
+     will have to opt into deliberately.
+   - **Player Picker** is `users_directory_ui`/`users_roster_ui` re-homed,
+     plus the game-role pick and the "this role may need a command" note.
 2. **Execution and Closure island sets.** The zone shows one compact island
    for each today. The Orders, Roster, Log and assessment surfaces exist as
    free-floating islands and a docked panel, and they belong in the column.
@@ -135,6 +144,10 @@ the next.
   toggle now lives in Settings as well, so the card and the modal are the
   same decision asked twice. Collapsing the card is the last piece of the
   owner's item 1 and it is the reason `Onboard` will lose a state.
+- **`chrome::modal` is verified by tests, not by a render.** The harness has a
+  `--modal` path that draws the real modal over the real zone, but the
+  capture did not complete, so the dim strength and the form-over-map
+  contrast are unlooked-at. Run `--island --modal` before trusting either.
 - **Screenshot arithmetic lies.** hyprctl reports window `at`/`size` in
   LOGICAL pixels and the crop has to be scaled by the monitor scale. A
   capture that skipped that cropped ~200px off the right of every image,

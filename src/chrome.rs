@@ -32,7 +32,7 @@
 use egui::epaint::TextShape;
 use egui::{
     Color32, CornerRadius, FontId, Id, Layout, Order, Painter, Pos2, Rect, Response, Sense, Shape,
-    Stroke, Ui, UiBuilder, Vec2, pos2, vec2,
+    Stroke, StrokeKind, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 
 // The palette and the measurements live in their own module so that both
@@ -597,6 +597,193 @@ pub fn owning_island(rects: &[Rect], pointer: Option<Pos2>) -> Option<usize> {
 /// zone that grew a panel of its own would be a fourth kind of thing on
 /// screen. There is deliberately no function to call for it.
 
+// ---------------------------------------------------------------------------
+// The modal zone
+// ---------------------------------------------------------------------------
+
+/// A modal surface: the third zone, for authoring rather than operating.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Modal {
+    pub id: Id,
+    pub title: String,
+    pub size: Vec2,
+    /// Set to `false` by the close button. The caller owns persisting it,
+    /// same contract as an island.
+    pub open: bool,
+}
+
+impl Modal {
+    pub fn new(id: Id, title: &str, size: Vec2) -> Self {
+        Self {
+            id,
+            title: title.to_string(),
+            size,
+            open: true,
+        }
+    }
+
+    /// Where the panel sits, centred in `viewport` and never larger than
+    /// it.
+    ///
+    /// Clamping rather than shrinking: a modal that silently changes its own
+    /// footprint to fit a small screen reflows a form the operator is halfway
+    /// through, and a form whose fields have moved under the cursor is worse
+    /// than a form with a scrollbar.
+    pub fn rect_in(&self, viewport: Rect) -> Rect {
+        let size = Vec2::new(
+            self.size.x.min(viewport.width()),
+            self.size.y.min(viewport.height()),
+        );
+        Rect::from_center_size(viewport.center(), size)
+    }
+
+    /// The body rect: below the title row, inside the pad.
+    ///
+    /// Clamped to be non-negative. On a window shorter than the title row
+    /// plus both pads the naive subtraction yields a NEGATIVE height, and
+    /// `scope_builder` handed a negative rect lays its content out somewhere
+    /// other than inside the panel — which on a short window is a form that
+    /// vanishes instead of scrolling. The first version did exactly that,
+    /// and the test that checks for it is the reason it does not any more.
+    pub fn body_rect(&self, rect: Rect) -> Rect {
+        let top_left = pos2(rect.left() + tokens::PAD, rect.top() + MODAL_TITLE_H + tokens::PAD);
+        let bottom_right = pos2(rect.right() - tokens::PAD, rect.bottom() - tokens::PAD);
+        Rect::from_min_max(
+            pos2(top_left.x.min(bottom_right.x), top_left.y.min(bottom_right.y)),
+            pos2(top_left.x.max(bottom_right.x), top_left.y.max(bottom_right.y)),
+        )
+    }
+}
+
+/// How much the modal dims what is behind it.
+///
+/// Enough that a lit map stops competing with a form, not so much that the
+/// island the modal was opened from becomes unreadable — the operator still
+/// needs to see the zone they are working in.
+pub const MODAL_BACKDROP_ALPHA: u8 = 150;
+
+/// Title row height. Smaller than an island's band because a modal has no
+/// chamfer and no drag region, so the band is carrying only a label and a
+/// close button.
+pub const MODAL_TITLE_H: f32 = 30.0;
+
+/// Show a modal, or report that it was closed.
+///
+/// Two things make a modal a modal and both are here rather than left to the
+/// caller, because getting either wrong produces the same bug: a drag that
+/// starts inside the form and ends outside it continues onto the map, so
+/// dropping a hull "into" the Fleet Picker pans the camera instead.
+///
+/// - The backdrop is a real widget with `Sense::click_and_drag()`, painted
+///   across the whole viewport before the panel. It swallows the pointer, so
+///   a drag that leaves the panel dies on the backdrop rather than reaching
+///   the map.
+/// - It paints in `Order::Foreground`, above the zones and above the map.
+///   `Order` has no `Top` in egui 0.36 — `Foreground` is the layer above
+///   normal windows, which is what a modal is.
+///
+/// Returns `false` when the modal was closed this frame, so the caller can
+/// drop its state without tracking a second flag.
+pub fn modal(
+    ctx: &egui::Context,
+    spec: &Modal,
+    body: impl FnOnce(&mut Ui),
+) -> bool {
+    let viewport = ctx.viewport_rect();
+    let rect = spec.rect_in(viewport);
+
+    let mut clicked_close = false;
+    egui::Area::new(spec.id.with("__backdrop"))
+        .fixed_pos(viewport.min)
+        .movable(false)
+        .constrain(false)
+        .interactable(true)
+        .order(Order::Foreground)
+        .show(ctx, |ui| {
+            // Claim the whole viewport before the panel exists, so the panel
+            // is drawn over a region that already belongs to the backdrop.
+            let (full, _) = ui.allocate_exact_size(viewport.size(), Sense::click_and_drag());
+            ui.painter().rect_filled(
+                full,
+                CornerRadius::ZERO,
+                Color32::from_black_alpha(MODAL_BACKDROP_ALPHA),
+            );
+        });
+
+    egui::Area::new(spec.id)
+        .fixed_pos(rect.min)
+        .movable(false)
+        .constrain(false)
+        .interactable(true)
+        .order(Order::Foreground)
+        .show(ctx, |ui| {
+            ui.set_min_size(spec.size);
+            ui.set_max_size(spec.size);
+            let panel = ui.min_rect();
+            let painter = ui.painter_at(panel);
+
+            // Square, not chamfered. The chamfer means "this whole surface
+            // moves" (ADR-0014), and a modal does not move.
+            painter.rect_filled(
+                panel,
+                CornerRadius::ZERO,
+                tokens::CONSOLE_NIGHT,
+            );
+            painter.rect_stroke(
+                panel,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, tokens::HAIRLINE_SLATE),
+                StrokeKind::Inside,
+            );
+
+            let title_row = Rect::from_min_max(
+                panel.left_top(),
+                pos2(panel.right(), panel.top() + MODAL_TITLE_H),
+            );
+            painter.rect_filled(title_row, CornerRadius::ZERO, tokens::PANEL_SLATE);
+            painter.line_segment(
+                [
+                    pos2(title_row.left(), title_row.bottom()),
+                    pos2(title_row.right(), title_row.bottom()),
+                ],
+                Stroke::new(1.0, tokens::HAIRLINE_SLATE),
+            );
+            tracked_caps(
+                ctx,
+                &painter,
+                pos2(title_row.left() + tokens::PAD, title_row.center().y - 7.0),
+                &spec.title,
+                tokens::TITLE_SIZE,
+                tokens::MAP_INK,
+                tokens::TITLE_TRACKING,
+            );
+
+            let close_rect = Rect::from_center_size(
+                pos2(
+                    panel.right() - tokens::PAD - tokens::CLOSE * 0.5,
+                    panel.top() + MODAL_TITLE_H * 0.5,
+                ),
+                vec2(tokens::CLOSE, tokens::CLOSE),
+            );
+            let close = ui.interact(close_rect, spec.id.with("__close"), Sense::click());
+            paint_close(&painter, close_rect, close.hovered());
+            clicked_close = close.clicked();
+
+            ui.scope_builder(
+                UiBuilder::new()
+                    .max_rect(spec.body_rect(panel))
+                    .layout(Layout::top_down(egui::Align::LEFT))
+                    .sense(Sense::hover()),
+                body,
+            );
+        });
+
+    if clicked_close {
+        return false;
+    }
+    spec.open
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,5 +937,60 @@ mod tests {
     fn no_pointer_means_no_owner() {
         let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 100.0));
         assert_eq!(owning_island(&[r], None), None);
+    }
+
+    // -- the modal zone ----------------------------------------------------
+
+    fn modal(size: Vec2) -> Modal {
+        Modal::new(Id::new("m"), "Test", size)
+    }
+
+    /// A modal is centred, which is the whole of "modal" geometrically.
+    #[test]
+    fn a_modal_is_centred() {
+        let vp = Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0));
+        let rect = modal(vec2(700.0, 500.0)).rect_in(vp);
+        assert_eq!(rect.center(), vp.center());
+        assert_eq!(rect.width(), 700.0);
+        assert_eq!(rect.height(), 500.0);
+    }
+
+    /// A modal taller than the window is clamped, never centred off-screen
+    /// and never allowed to reflow its own form.
+    #[test]
+    fn a_modal_never_leaves_the_window() {
+        let vp = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0));
+        let rect = modal(vec2(900.0, 700.0)).rect_in(vp);
+        assert_eq!(rect.width(), 600.0, "clamped to the window width");
+        assert_eq!(rect.height(), 400.0, "clamped to the window height");
+        assert!(rect.left() >= vp.left() && rect.right() <= vp.right());
+        assert!(rect.top() >= vp.top() && rect.bottom() <= vp.bottom());
+    }
+
+    /// A window narrower than the pad still gets a body. The body rect has
+    /// to stay non-degenerate or `scope_builder` is handed a negative rect
+    /// and the form vanishes rather than scrolling.
+    #[test]
+    fn the_body_survives_a_tiny_window() {
+        let vp = Rect::from_min_size(pos2(0.0, 0.0), vec2(60.0, 50.0));
+        let rect = modal(vec2(400.0, 300.0)).rect_in(vp);
+        let body = modal(vec2(400.0, 300.0)).body_rect(rect);
+        assert!(body.width() >= 0.0, "body collapsed to nothing");
+        assert!(body.height() >= 0.0, "body collapsed to nothing");
+    }
+
+    /// The body sits inside the panel with its top below the title row.
+    /// A form whose first field is drawn under the title is unreadable, and
+    /// this is the assertion that catches it.
+    #[test]
+    fn the_body_is_inside_the_panel_and_below_the_title() {
+        let vp = Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0));
+        let spec = modal(vec2(700.0, 500.0));
+        let rect = spec.rect_in(vp);
+        let body = spec.body_rect(rect);
+        assert!(body.left() >= rect.left());
+        assert!(body.right() <= rect.right());
+        assert!(body.top() >= rect.top() + MODAL_TITLE_H);
+        assert!(body.bottom() <= rect.bottom());
     }
 }
