@@ -30,9 +30,14 @@ use tfg::geo::GeoPosition;
 use tfg::map_render::LiveMap;
 use tfg::paths::AppPaths;
 use tfg::map_render::{
-    ProjectedUnitGeometry, UnitLod, anchor_center, grid_spacing_deg, project_mercator,
-    projected_unit_geometry, rotated_unit_quad_with_forward_heading, select_unit_lod,
-    unproject_mercator,
+    FRAME_VIEWPORT_FRACTION, GROUP_ZONE_MIN_PX, GroupRepresentation, MIN_HIT_PX,
+    ProjectedUnitGeometry, SYMBOL_BOX_PX, SYMBOL_FOOTPRINT_RADIUS_PX, SymbolFrame, UnitLod,
+    ZONE_HIT_BAND_PX, anchor_center, battle_dimension, frame_for, frame_icon_radius, frame_polygon,
+    frame_strokes, grid_spacing_deg, hit_polygon, meters_per_pixel, project_mercator,
+    projected_group_extent, projected_unit_geometry, rotated_unit_quad_with_forward_heading,
+    select_group_representation, select_unit_lod, should_paint_group_text, should_paint_unit_label,
+    unit_is_planned, unproject_mercator, zone_pad_px, zone_polygon, zone_width_px,
+    zoom_for_group_frame, zoom_for_ground_resolution,
 };
 use tfg::land::Land;
 use tfg::sim::{
@@ -53,11 +58,6 @@ type MapReq = (u64, (f64, f64), f64, (u32, u32), u32);
 type MapResp = (u64, (f64, f64), f64, (u32, u32), egui::ColorImage);
 const CENTER: (f64, f64) = (-6.108, 106.910);
 const ZOOM: f64 = 11.0;
-/// Zone/flag threshold (grill #24, slice iii): zones at or above this
-/// zoom, centroid flags below. Zoom controls feed the map thread.
-const ZONE_ZOOM: f64 = 11.0;
-/// Fixed ground padding around live hulls, in screen px (grill #24).
-const ZONE_PAD_PX: f64 = 26.0;
 /// Island scroll rule (scrollbar ticket): island bodies whose content can
 /// exceed the window scroll vertically instead of clipping. 420px fits a
 /// 640px viewport under the toolbar with room for window chrome; unbounded
@@ -352,9 +352,41 @@ struct ShipMarker {
     /// unit disappear.
     map_symbol: tfg::store::MapSymbol,
     latitude: f64,
+    /// The blended position's longitude, carried beside the latitude
+    /// so a group's ground extent is measured from the same fix the
+    /// marker is drawn with rather than a second lookup of the
+    /// registry's latest.
+    longitude: f64,
+    /// The marker's own drawn extent in logical pixels — the larger of
+    /// its length and beam — carried so a group's Zone can be padded to
+    /// enclose what it actually holds rather than to enclose a point.
+    /// Zero when nothing measurable is known; the Zone pad floors that.
+    footprint_px: f64,
+    /// Resolved affiliation, so the painter never reaches back into the
+    /// resolver mid-frame. Unknown is a real answer, never a missing
+    /// one: the resolver always terminates.
+    affiliation: tfg::store::Affiliation,
+    /// In the exercise but unassigned in the task organisation, which the
+    /// symbology draws as a dashed frame. Independent of `stale`: a
+    /// planned unit and a silent one are different facts.
+    planned: bool,
     label: String,
     lod: UnitLod,
     visual: Option<UnitVisual>,
+}
+
+/// Which key an affiliation declaration is filed under. The three
+/// declaration keys exist because an UNPLACED hull belongs to no group:
+/// a group-only model leaves every unplaced contact unknown forever,
+/// which is honest and useless for an opposing force nobody bothered to
+/// place. `OurBranch` is the odd one out — it is a fact about the
+/// operator rather than about an exercise, so it is not session-scoped.
+#[derive(Debug, Clone)]
+enum Declaration {
+    Unit(i64),
+    Group(String),
+    Branch(i64),
+    OurBranch(i64),
 }
 
 /// One drill row label (setup-overhaul picker): id_name first (grill
@@ -597,51 +629,251 @@ fn map_symbol_fill(
     )
 }
 
+/// Paint a group's far symbol: frame shape for allegiance, icon for
+/// what its members are, LEVEL colour for its place in the task
+/// organisation.
+///
+/// Three orthogonal channels, so the group reads without being told which
+/// is which: a shape an operator already knows from every map, a glyph
+/// from the same vocabulary as a unit's, and a hue the Zones already use
+/// — which is what makes a group look the same in both its
+/// representations.
+fn paint_group_symbol(
+    painter: &egui::Painter,
+    ui: &egui::Ui,
+    symbol: &GroupSymbolGeom,
+    origin: egui::Pos2,
+    focused: bool,
+    zoom: f64,
+) {
+    let c = origin + egui::vec2(symbol.x, symbol.y);
+    let frame = frame_for(symbol.affiliation);
+    // A group's dimension follows its members' kind: a formation of
+    // aircraft is not a surface task force, whatever its allegiance.
+    let dimension = symbol
+        .icon
+        .map(battle_dimension)
+        .unwrap_or(tfg::map_render::BattleDimension::LandAndSeaSurface);
+    for run in frame_strokes(dimension, frame, (c.x as f64, c.y as f64), SYMBOL_BOX_PX) {
+        painter.add(egui::Shape::line(
+            run.into_iter()
+                .map(|(x, y)| egui::pos2(x as f32, y as f32))
+                .collect(),
+            egui::Stroke::new(1.5, symbol.level_ink),
+        ));
+    }
+    match symbol.icon {
+        // An empty frame interior is a real state: these members do not
+        // agree on one kind.
+        None => {}
+        Some(icon) => paint_map_symbol(
+            painter,
+            c,
+            icon,
+            symbol.level_ink,
+            false,
+            frame_icon_radius(frame, SYMBOL_BOX_PX) as f32
+                / (SYMBOL_FOOTPRINT_RADIUS_PX as f32),
+        ),
+    }
+    // `name (count)`, unchanged from the Flag: the theatre-zoom read the
+    // operator has today. Whether it FITS is the one rule every group
+    // text obeys, measured against the group's own ground extent.
+    let extent_px = 2.0 * symbol.cover_radius_m / meters_per_pixel(symbol.lat, zoom);
+    if !should_paint_group_text(extent_px, advance_width_px(ui, &symbol.label), focused) {
+        return;
+    }
+    painter.text(
+        c + egui::vec2(0.0, SYMBOL_BOX_PX as f32 * 0.5 + 3.0),
+        egui::Align2::CENTER_TOP,
+        &symbol.label,
+        egui::FontId::proportional(MAP_LABEL_PX),
+        symbol.level_ink,
+    );
+}
+
+/// Map label ink size. One constant, because a fits test compares a
+/// measured text against an extent and two font sizes would make the
+/// comparison meaningless.
+const MAP_LABEL_PX: f32 = 12.0;
+
+/// The advance width of a string in the map label font.
+///
+/// The sum of glyph advances rather than a laid-out rect: it is what the
+/// fits predicate consumes, it is monotonic in length, and it needs no
+/// colour or wrap width to be meaningful. Measurement stays here, in the
+/// paint layer, because egui's fonts need a context — the POLICY in
+/// map_render.rs takes a plain number and is testable without one.
+fn advance_width_px(ui: &egui::Ui, text: &str) -> f32 {
+    let font = egui::FontId::proportional(MAP_LABEL_PX);
+    ui.fonts_mut(|fonts| text.chars().map(|c| fonts.glyph_width(&font, c)).sum())
+}
+
+/// Whether the operator is holding this entity: selected, or followed.
+fn entity_focused(selected: &Option<Selection>, following: Option<&String>, id: &str) -> bool {
+    selected.as_ref() == Some(&Selection::Ship(id.to_string()))
+        || selected.as_ref() == Some(&Selection::Group(id.to_string()))
+        || following == Some(&id.to_string())
+}
+
+/// The ink an affiliation frame is drawn in.
+///
+/// The four canonical hues — blue friendly, red hostile, green neutral,
+/// yellow unknown — used ONLY for units. Level colour belongs to groups,
+/// so the two never share a hue channel; the disambiguator between a
+/// green Unsur symbol and a green neutral hull is that a group far
+/// symbol always carries its `name (count)` and a unit carries none.
+///
+/// Colour is the REDUNDANT cue here: the frame's shape is primary, so a
+/// greyscale screenshot and a colour-blind operator still read
+/// allegiance from the shape alone.
+fn affiliation_ink(affiliation: tfg::store::Affiliation) -> egui::Color32 {
+    match affiliation {
+        tfg::store::Affiliation::Friendly => egui::Color32::from_rgb(0x4C, 0x9A, 0xFF),
+        tfg::store::Affiliation::Hostile => egui::Color32::from_rgb(0xFF, 0x5A, 0x5A),
+        tfg::store::Affiliation::Neutral => egui::Color32::from_rgb(0x5A, 0xD1, 0x7A),
+        tfg::store::Affiliation::Unknown => egui::Color32::from_rgb(0xF5, 0xC2, 0x4B),
+    }
+}
+
+/// Paint a unit's affiliation frame: the shape carries allegiance, the
+/// stroke its hue.
+///
+/// The frame is NEVER greyed for staleness — the glyph greys, the frame
+/// keeps its hue, because "who stopped reporting" and "whose side" are
+/// two different questions, and a stale hostile hull must still read as
+/// hostile. Status keeps the rings and the halo.
+fn paint_affiliation_frame(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    affiliation: tfg::store::Affiliation,
+    dimension: tfg::map_render::BattleDimension,
+    planned: bool,
+) -> SymbolFrame {
+    let frame = frame_for(affiliation);
+    let stroke = egui::Stroke::new(1.5, affiliation_ink(affiliation));
+    for run in frame_strokes(
+        dimension,
+        frame,
+        (center.x as f64, center.y as f64),
+        SYMBOL_BOX_PX,
+    ) {
+        let points: Vec<egui::Pos2> = run
+            .into_iter()
+            .map(|(x, y)| egui::pos2(x as f32, y as f32))
+            .collect();
+        // Planned status, the symbology's own channel: a dashed frame
+        // for a piece in the exercise but not yet in the task
+        // organisation. NOT the stale channel — a hull that has stopped
+        // reporting keeps a solid frame, because "planned" and "we have
+        // not heard from it" are different facts.
+        if planned {
+            painter.add(egui::Shape::dashed_line(&points, stroke, 3.0, 2.5));
+        } else {
+            painter.add(egui::Shape::line(points, stroke));
+        }
+    }
+    frame
+}
+
+/// The redundant affiliation channel where the icon is a photograph.
+///
+/// A Middle/Near unit is a textured quad, and a hostile diamond cannot
+/// wrap a rotated photograph — so at those two levels the hue carries
+/// the identity instead, which is APP-6's own arrangement (fill colour
+/// is a redundant indication of affiliation). Without it, affiliation
+/// would vanish as the operator zooms in on a unit.
+fn paint_affiliation_tint(
+    painter: &egui::Painter,
+    points: &[egui::Pos2],
+    affiliation: tfg::store::Affiliation,
+) {
+    let ink = affiliation_ink(affiliation);
+    painter.add(egui::Shape::convex_polygon(
+        points.to_vec(),
+        egui::Color32::from_rgba_unmultiplied(ink.r(), ink.g(), ink.b(), 46),
+        egui::Stroke::new(1.5, ink),
+    ));
+}
+
 /// Paint the universal far-map fallback. The existing radius-8 circle
 /// remains underneath; this smaller glyph sits inside its white
 /// outline, and every branch terminates in a shape.
+/// The member symbol a group draws, if its members agree on one.
+///
+/// A strict MAJORITY, not a plurality and not the fattest member: one
+/// destroyer in a force of twelve aircraft must not speak for it, which
+/// is the same rule the affiliation resolver follows about declarations.
+/// No majority paints an empty frame — a group that genuinely mixes
+/// kinds is a container, and the empty interior says so instead of
+/// naming a wrong kind.
+fn plurality_icon(symbols: &[tfg::store::MapSymbol]) -> Option<tfg::store::MapSymbol> {
+    if symbols.is_empty() {
+        return None;
+    }
+    // Tallied by ordinal: `MapSymbol` is a plain enum with no Hash/Ord,
+    // and the ordinal is its stable identity, so the tie-break below is
+    // deterministic rather than dependent on iteration order.
+    let mut tally: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    for symbol in symbols {
+        *tally.entry(*symbol as i32).or_insert(0) += 1;
+    }
+    tally
+        .into_iter()
+        .max_by_key(|(ordinal, count)| (*count, *ordinal))
+        .and_then(|(ordinal, count)| {
+            (count * 2 > symbols.len())
+                .then(|| tfg::store::MapSymbol::from_ordinal(ordinal))
+        })
+}
+
 fn paint_map_symbol(
     painter: &egui::Painter,
     center: egui::Pos2,
     symbol: tfg::store::MapSymbol,
     base: egui::Color32,
     stale: bool,
+    scale: f32,
 ) {
+    // The shape decides the accent and the fill; `scale` decides how far
+    // the glyph reaches. The two are separate on purpose: an icon FILLS
+    // its frame rather than floating inside a border, so the four frames
+    // need four icon reaches from ONE glyph vocabulary.
     let shape = map_symbol_shape(symbol);
     let fill = map_symbol_fill(base, shape, stale);
+    // Every literal below was drawn against the radius-8 circle the
+    // marker already carries, so `scale` is a multiplier on that
+    // reference rather than a new radius to remember per glyph.
+    let reach = |value: f32| value * scale;
     let polygon = |points: Vec<egui::Pos2>| {
-        painter.add(egui::Shape::convex_polygon(
-            points,
-            fill,
-            egui::Stroke::NONE,
-        ));
+        painter.add(egui::Shape::convex_polygon(points, fill, egui::Stroke::NONE));
     };
     match shape {
         MapSymbolShape::Dot => {
-            painter.circle_filled(center, 3.0, fill);
+            painter.circle_filled(center, reach(3.0), fill);
         }
         MapSymbolShape::Destroyer => {
-            polygon(regular_polygon(center, 5.5, 3, -std::f32::consts::FRAC_PI_2));
+            polygon(regular_polygon(center, reach(5.5), 3, -std::f32::consts::FRAC_PI_2));
         }
         MapSymbolShape::Frigate => {
-            polygon(regular_polygon(center, 5.2, 4, 0.0));
+            polygon(regular_polygon(center, reach(5.2), 4, 0.0));
         }
         MapSymbolShape::Corvette => {
             polygon(regular_polygon(
                 center,
-                4.5,
+                reach(4.5),
                 4,
                 std::f32::consts::FRAC_PI_4,
             ));
         }
         MapSymbolShape::Auxiliary => {
             painter.rect_filled(
-                egui::Rect::from_center_size(center, egui::vec2(9.0, 3.0)),
+                egui::Rect::from_center_size(center, egui::vec2(reach(9.0), reach(3.0))),
                 1.0,
                 fill,
             );
             painter.rect_filled(
-                egui::Rect::from_center_size(center, egui::vec2(3.0, 9.0)),
+                egui::Rect::from_center_size(center, egui::vec2(reach(3.0), reach(9.0))),
                 1.0,
                 fill,
             );
@@ -649,13 +881,13 @@ fn paint_map_symbol(
         MapSymbolShape::Landing => {
             polygon(regular_polygon(
                 center,
-                5.5,
+                reach(5.5),
                 5,
                 -std::f32::consts::FRAC_PI_2,
             ));
         }
         MapSymbolShape::Submarine => {
-            let points = regular_polygon(center, 1.0, 16, 0.0)
+            let points = regular_polygon(center, reach(1.0), 16, 0.0)
                 .into_iter()
                 .map(|point| {
                     center + egui::vec2((point.x - center.x) * 1.5, (point.y - center.y) * 0.65)
@@ -665,31 +897,37 @@ fn paint_map_symbol(
         }
         MapSymbolShape::Plane => {
             polygon(vec![
-                center + egui::vec2(6.0, 0.0),
-                center + egui::vec2(-4.0, -4.5),
-                center + egui::vec2(-4.0, 4.5),
+                center + egui::vec2(reach(6.0), 0.0),
+                center + egui::vec2(-reach(4.0), -reach(4.5)),
+                center + egui::vec2(-reach(4.0), reach(4.5)),
             ]);
         }
         MapSymbolShape::Tank => {
             painter.rect_filled(
-                egui::Rect::from_center_size(center + egui::vec2(-4.0, 0.0), egui::vec2(1.5, 8.0)),
+                egui::Rect::from_center_size(
+                    center + egui::vec2(-reach(4.0), 0.0),
+                    egui::vec2(reach(1.5), reach(8.0)),
+                ),
                 1.0,
                 fill,
             );
             painter.rect_filled(
-                egui::Rect::from_center_size(center + egui::vec2(4.0, 0.0), egui::vec2(1.5, 8.0)),
+                egui::Rect::from_center_size(
+                    center + egui::vec2(reach(4.0), 0.0),
+                    egui::vec2(reach(1.5), reach(8.0)),
+                ),
                 1.0,
                 fill,
             );
             painter.rect_filled(
-                egui::Rect::from_center_size(center, egui::vec2(6.0, 4.0)),
+                egui::Rect::from_center_size(center, egui::vec2(reach(6.0), reach(4.0))),
                 1.0,
                 fill,
             );
         }
         MapSymbolShape::Port => {
-            painter.circle_stroke(center, 5.0, egui::Stroke::new(2.0, fill));
-            painter.circle_filled(center, 1.5, fill);
+            painter.circle_stroke(center, reach(5.0), egui::Stroke::new(2.0 * scale, fill));
+            painter.circle_filled(center, reach(1.5), fill);
         }
     }
 }
@@ -738,6 +976,37 @@ fn unit_image_points(
     )
 }
 
+/// The polygon a marker is picked by: exactly what it paints, grown to
+/// the minimum target if it is smaller than that.
+///
+/// The Representation decides the shape — the rotated quad where a
+/// photograph or silhouette is drawn, the affiliation frame's box where
+/// a glyph is — and the same `hit_polygon` dilation serves both, so
+/// there is one hit rule rather than one per representation. A polyline
+/// of 6 px is unfriendly to a mouse; a photograph's target is the
+/// photograph.
+fn marker_hit_points(
+    marker: &ShipMarker,
+    zoom: f64,
+    pixels_per_point: f32,
+) -> Vec<(f64, f64)> {
+    let origin = egui::pos2(0.0, 0.0);
+    if let Some(quad) = unit_image_points(marker, zoom, pixels_per_point, origin) {
+        let quad: Vec<(f64, f64)> = quad
+            .iter()
+            .map(|p| (p.x as f64, p.y as f64))
+            .collect();
+        return hit_polygon(&quad, MIN_HIT_PX);
+    }
+    // The painted frames have DIFFERENT bounding boxes by design (an
+    // inscribed square is smaller than the rectangle that fills it), so
+    // the hit region is the symbol BOX for every affiliation — which is
+    // what keeps a hull equally clickable whichever way its allegiance
+    // changes.
+    let box_poly = frame_polygon(SymbolFrame::Rectangle, (marker.x, marker.y), SYMBOL_BOX_PX);
+    hit_polygon(&box_poly, MIN_HIT_PX)
+}
+
 fn marker_body_hit(
     marker: &ShipMarker,
     px: f64,
@@ -745,11 +1014,71 @@ fn marker_body_hit(
     zoom: f64,
     pixels_per_point: f32,
 ) -> bool {
-    if let Some(points) = unit_image_points(marker, zoom, pixels_per_point, egui::pos2(0.0, 0.0)) {
-        let points: Vec<(f32, f32)> = points.iter().map(|point| (point.x, point.y)).collect();
-        return in_poly(px, py, &points);
+    in_poly(px, py, &marker_hit_points(marker, zoom, pixels_per_point))
+}
+
+/// Pick order: the Representation that is PAINTED LAST is the one on
+/// top, so it is picked first. The body layer paints Far, then Middle,
+/// then Near; this walks the same list backwards. Last-painted is what
+/// the operator believes is covering what is under it — and the old code
+/// took the FIRST painted marker, which is the one they cannot see when
+/// near-zoom thumbnails overlap.
+fn paint_order(markers: &[ShipMarker]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..markers.len()).collect();
+    // Stable, so markers of equal Representation keep their list order.
+    order.sort_by_key(|&i| match markers[i].lod {
+        UnitLod::Far => 0,
+        UnitLod::Middle => 1,
+        UnitLod::Near => 2,
+    });
+    order
+}
+
+/// Click a Zone's OUTLINE, or the name written on it — never its
+/// interior. The interior of a Zone is ground: in a client where
+/// clicking the map places a unit and clicking empty water clears the
+/// selection, letting a translucent overlay capture both is a bug
+/// wearing a feature's clothes. Units still beat a Zone's outline.
+fn zone_outline_hit(
+    px: f64,
+    py: f64,
+    pts: &[(f32, f32)],
+    label_c: (f64, f64),
+    label_half_w: f64,
+) -> bool {
+    // A zero half-width means the group painted no name (the label
+    // policy suppressed it), not that there is a zero-width target
+    // sitting on the centroid catching everything through it.
+    if label_half_w > 0.0
+        && label_c.0 - label_half_w <= px
+        && px <= label_c.0 + label_half_w
+        && label_c.1 - 9.0 <= py
+        && py <= label_c.1 + 9.0
+    {
+        return true;
     }
-    ((marker.x - px).powi(2) + (marker.y - py).powi(2)).sqrt() <= 18.0
+    if pts.len() < 2 {
+        return false;
+    }
+    // Indexed rather than `windows(2)`: a polygon's edges wrap, and a
+    // window pair walk silently leaves the LAST edge unpickable — the
+    // closing edge of a Zone is exactly where an operator clicks when
+    // tracing a formation's boundary.
+    (0..pts.len()).any(|i| {
+        distance_to_segment(px, py, pts[i], pts[(i + 1) % pts.len()]) <= ZONE_HIT_BAND_PX
+    })
+}
+
+fn distance_to_segment(px: f64, py: f64, a: (f32, f32), b: (f32, f32)) -> f64 {
+    let (ax, ay) = (a.0 as f64, a.1 as f64);
+    let (bx, by) = (b.0 as f64, b.1 as f64);
+    let (dx, dy) = (bx - ax, by - ay);
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-9 {
+        return (px - ax).hypot(py - ay);
+    }
+    let t = (((px - ax) * dx + (py - ay) * dy) / len_sq).clamp(0.0, 1.0);
+    (px - (ax + t * dx)).hypot(py - (ay + t * dy))
 }
 
 fn paint_unit_image(
@@ -821,25 +1150,32 @@ impl Default for Draft {
 }
 
 /// Zone polygon for one group, in screen px (slice iii, grill #24).
-/// Carries the group id so zones are clickable like flags.
+/// Carries the group id so a Zone can be selected from the map.
 struct ZoneGeom {
     group: String,
     pts: Vec<(f32, f32)>,
     fill: egui::Color32,
     stroke: egui::Color32,
+    /// `name (count)` — the same string a far symbol carries, so a
+    /// group reads the same in both representations.
+    label: String,
+    /// The hull's on-screen width: the extent a label is measured
+    /// against, and the same measure a far symbol uses as twice its
+    /// cover radius.
+    width_px: f64,
 }
 
 /// Point-in-polygon over a zone's screen pts (ray cast). Degenerate
 /// hulls (fewer than 3 pts) never hit: click the ship or flag instead.
-fn in_poly(px: f64, py: f64, pts: &[(f32, f32)]) -> bool {
+fn in_poly(px: f64, py: f64, pts: &[(f64, f64)]) -> bool {
     if pts.len() < 3 {
         return false;
     }
     let mut inside = false;
     let mut j = pts.len() - 1;
     for i in 0..pts.len() {
-        let (xi, yi) = (pts[i].0 as f64, pts[i].1 as f64);
-        let (xj, yj) = (pts[j].0 as f64, pts[j].1 as f64);
+        let (xi, yi) = (pts[i].0, pts[i].1);
+        let (xj, yj) = (pts[j].0, pts[j].1);
         if (yi > py) != (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi {
             inside = !inside;
         }
@@ -848,72 +1184,37 @@ fn in_poly(px: f64, py: f64, pts: &[(f32, f32)]) -> bool {
     inside
 }
 
-/// Collapsed group flag: centroid screen point + lat/lon for click-to-expand.
-struct FlagGeom {
+/// A group drawn as a symbol rather than a Zone: the collapsed form of
+/// the task organisation at theatre zoom.
+///
+/// This is what the Flag used to be, and the difference is the point: a
+/// Flag was a name and a count, which is not a symbol. This one carries
+/// allegiance in its frame SHAPE, its members' kind in the icon, and its
+/// level in the stroke colour — three orthogonal channels, so a group
+/// reads correctly without anyone being told which is which.
+#[derive(Clone)]
+struct GroupSymbolGeom {
+    group: String,
+    /// Screen centre: the ONE centroid the ladder measured from.
     x: f32,
     y: f32,
+    /// The same centroid in lat/lon, for framing the camera on a click.
     lat: f64,
     lon: f64,
+    /// `name (count)` — the Flag's content, unchanged. WHEN it paints is
+    /// the label policy's business (issue #175), not this type's.
     label: String,
-    group: String,
-    color: egui::Color32,
-}
-
-/// Monotone-chain convex hull over screen points (grill #24: live hulls).
-fn convex_hull(mut pts: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
-    if pts.len() <= 1 {
-        return pts;
-    }
-    pts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let cross = |o: (f64, f64), a: (f64, f64), b: (f64, f64)| {
-        (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
-    };
-    let mut lower: Vec<(f64, f64)> = Vec::new();
-    for &p in &pts {
-        while lower.len() >= 2
-            && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 0.0
-        {
-            lower.pop();
-        }
-        lower.push(p);
-    }
-    let mut upper: Vec<(f64, f64)> = Vec::new();
-    for &p in pts.iter().rev() {
-        while upper.len() >= 2
-            && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 0.0
-        {
-            upper.pop();
-        }
-        upper.push(p);
-    }
-    lower.pop();
-    upper.pop();
-    lower.extend(upper);
-    lower
-}
-
-/// Fixed ground padding (grill #24): push hull points outward from the
-/// centroid by PAD px.
-fn pad_hull(pts: &[(f64, f64)], pad: f64) -> Vec<(f64, f64)> {
-    if pts.is_empty() {
-        return Vec::new();
-    }
-    let n = pts.len() as f64;
-    let (cx, cy) = (
-        pts.iter().map(|p| p.0).sum::<f64>() / n,
-        pts.iter().map(|p| p.1).sum::<f64>() / n,
-    );
-    pts.iter()
-        .map(|&(x, y)| {
-            let (dx, dy) = (x - cx, y - cy);
-            let d = (dx * dx + dy * dy).sqrt();
-            if d < 1e-6 {
-                (x, y)
-            } else {
-                (x + dx / d * pad, y + dy / d * pad)
-            }
-        })
-        .collect()
+    affiliation: tfg::store::Affiliation,
+    /// The plurality member symbol, or None for a group whose members do
+    /// not agree on one. None paints an EMPTY FRAME, which reads as the
+    /// container it is rather than as a confident wrong answer.
+    icon: Option<tfg::store::MapSymbol>,
+    /// Level colour on the stroke and fill tint — the channel a unit
+    /// spends on affiliation instead, so the two never share a hue.
+    level_ink: egui::Color32,
+    /// Cover radius in metres, so framing a group on a click aims at the
+    /// zoom where it earns a Zone rather than at a constant.
+    cover_radius_m: f64,
 }
 
 /// One blocking REST action off the egui thread (M7): the worker runs
@@ -1824,6 +2125,11 @@ struct ShipApp {
     users_roles: Vec<(i64, String, String, bool)>,
     users_roster: Vec<tfg::backend::Participant>,
     users_gunits: Vec<tfg::backend::GameUnit>,
+    /// Ids of pieces in the exercise but UNASSIGNED in the task
+    /// organisation (`id_hierarchy_node` absent). The symbology draws
+    /// planned status as a dashed frame, and this is the fact behind
+    /// it: a declaration a human made, not the absence of a fix.
+    unassigned_units: std::collections::HashSet<i64>,
     /// The caller's own pieces from the last join/readiness answer:
     /// the order authority when the staff unit list is gapped. Never
     /// merged into users_gunits — a partial list must never pose as
@@ -2050,9 +2356,22 @@ struct ShipApp {
     unit_type_ids: HashMap<i64, i64>,
     unit_type_names: HashMap<i64, String>,
     unit_type_symbols: HashMap<i64, tfg::store::MapSymbol>,
+    /// `units.id -> branch_id` from the mirror, for the affiliation
+    /// resolver's session-branch declaration. The Fleet cache is built
+    /// from the fleet manifest and carries no taxonomy ids at all, so
+    /// this is read from the same query that feeds `unit_symbols`.
+    unit_branches: HashMap<i64, i64>,
+    /// Every affiliation declaration for the current session, as one
+    /// value. Nothing here decides anything yet: the painters read it
+    /// when the frames land.
+    affiliations: tfg::store::AffiliationResolver,
     /// Last selected LOD per unit, kept across frames so the Near
     /// threshold has hysteresis instead of oscillating on zoom jitter.
     unit_lods: HashMap<String, UnitLod>,
+    /// Last selected Representation per group, kept the same way so a
+    /// formation sitting on the Zone threshold holds its level instead
+    /// of oscillating. Keyed by group id, like `unit_lods` by ship id.
+    group_representations: HashMap<String, GroupRepresentation>,
     /// Operator-only visual heading override. It rotates the thumbnail
     /// without rewriting the authoritative Minos fix.
     heading_overrides: HashMap<String, f32>,
@@ -2613,6 +2932,12 @@ impl ShipApp {
                     .map(|visual| visual.map_symbol)
                     .or_else(|| unit_id.and_then(|unit_id| self.unit_symbols.get(&unit_id).copied()))
                     .unwrap_or(tfg::store::MapSymbol::UnknownShip);
+                // Allegiance, resolved beside the symbol: a unit the
+                // mirror never classified still draws, as Unknown.
+                let affiliation = self
+                    .affiliations
+                    .resolve(&self.affiliation_subject(&s.ship_id));
+                let planned = unit_is_planned(unit_id, &self.unassigned_units);
                 let stale = s.stale
                     || (s.source == FixSource::Game
                         && self
@@ -2630,6 +2955,10 @@ impl ShipApp {
                     heading_deg,
                     map_symbol,
                     latitude: pos.latitude,
+                    longitude: pos.longitude,
+                    footprint_px: geometry.length_px.max(geometry.beam_px),
+                    affiliation,
+                    planned,
                     label: self.map_label(
                         &s.ship_id,
                         s.latest.name.as_deref(),
@@ -3255,6 +3584,7 @@ impl ShipApp {
                 // version also gets its taxonomy-derived symbol again.
                 self.reload_fleet_cache();
                 self.reload_unit_symbols();
+                self.reload_affiliations();
                 self.hydrate_visual_facts();
                 // A register sync is an explicit operator action; use it
                 // as a prompt to check the manifest too, so a newly
@@ -3752,6 +4082,7 @@ impl ShipApp {
         let units_seg = match b.units {
             Ok(u) => {
                 self.users_gunits = u;
+                self.refresh_unassigned_units();
                 self.units_gap = false;
                 format!("units: {}", self.users_gunits.len())
             }
@@ -5890,6 +6221,7 @@ impl ShipApp {
                 tfg::store::MapSymbol::UnknownShip,
                 egui::Color32::LIGHT_BLUE,
                 false,
+                1.0,
             );
             return;
         };
@@ -5913,6 +6245,7 @@ impl ShipApp {
                 symbol,
                 egui::Color32::LIGHT_BLUE,
                 false,
+                1.0,
             );
         }
     }
@@ -7877,10 +8210,12 @@ impl ShipApp {
             }
             SetupDone::Units(units, note) => {
                 self.users_gunits = units;
+                self.refresh_unassigned_units();
                 self.users_status = note;
             }
             SetupDone::Assign(units, note, pick) => {
                 self.users_gunits = units;
+                self.refresh_unassigned_units();
                 self.arm_fleet_pick(pick.to_string());
                 self.users_status = note;
                 if let Some((_, la, lo)) = self.pending_placement.take() {
@@ -7889,6 +8224,7 @@ impl ShipApp {
             }
             SetupDone::Unassign(units, note, removed) => {
                 self.users_gunits = units;
+                self.refresh_unassigned_units();
                 // Out of the game entirely: the local half goes too.
                 self.release_hull(&removed.to_string());
                 self.users_status = note;
@@ -8274,6 +8610,7 @@ impl ShipApp {
         self.unit_type_ids.clear();
         self.unit_type_names.clear();
         self.unit_type_symbols.clear();
+        self.unit_branches.clear();
         let Some(conn) = self.store.as_ref() else {
             return;
         };
@@ -8298,9 +8635,300 @@ impl ShipApp {
                 if let Some(type_id) = unit.type_id {
                     self.unit_type_ids.insert(unit_id, type_id);
                 }
+                if let Some(branch) = unit.branch_id {
+                    self.unit_branches.insert(unit_id, branch);
+                }
                 Some((unit_id, resolver.resolve(unit.taxonomy())))
             })
             .collect();
+    }
+
+    /// Which session's declarations apply.
+    ///
+    /// A declaration is scoped to one exercise: "that branch is hostile"
+    /// is a statement about THIS exercise, and must not silently apply to
+    /// the next one where the operator may be on the other side. A
+    /// connected session is keyed on its game id; a local one on the
+    /// session log number, which is already the client's per-session
+    /// identity.
+    fn affiliation_scope(&self) -> String {
+        match self.users_game.as_ref() {
+            Some((game_id, _)) => format!("game:{game_id}"),
+            None => format!("local:{}", self.session_seq),
+        }
+    }
+
+    /// The facts one affiliation decision reads for a hull: its
+    /// mirrored ids, the group it belongs to, and whether this operator
+    /// drives it. Built as data so the resolver never sees a name.
+    fn affiliation_subject(&self, ship_id: &str) -> tfg::store::AffiliationSubject {
+        let group_id = self
+            .groups
+            .group_list()
+            .iter()
+            .find(|g| self.groups.group_units(&g.id).iter().any(|u| u == ship_id))
+            .map(|g| g.id.clone());
+        let unit_id = ship_id.parse::<i64>().ok();
+        tfg::store::AffiliationSubject {
+            unit_id,
+            group_id,
+            branch_id: unit_id.and_then(|id| self.unit_branches.get(&id).copied()),
+            // The UI's commanded set is the closest thing to the sim's
+            // `owned_ids()`, which the sim thread owns. Driving a hull
+            // is a fact about the session, not about the world.
+            owned: self.controlled.contains(ship_id),
+        }
+    }
+
+    /// A group's centroid latitude, cover radius in metres and anchor
+    /// point, measured from its members' positions — for the gestures
+    /// that happen outside a paint frame (a roster focus, a double-click
+    /// on a Zone, which carries no radius of its own).
+    fn group_extent(&self, gid: &str) -> Option<(f64, f64, (f64, f64))> {
+        let positions: Vec<(f64, f64)> = self
+            .groups
+            .group_units(gid)
+            .iter()
+            .filter_map(|id| self.registry.position_of(id))
+            .map(|p| (p.latitude, p.longitude))
+            .collect();
+        if positions.len() < 2 {
+            return None;
+        }
+        let extent = projected_group_extent(&positions, self.zoom);
+        Some((
+            extent.centroid_lat,
+            extent.cover_radius_m,
+            (extent.centroid_lat, extent.centroid_lon),
+        ))
+    }
+
+    /// The same aim for a group the operator focused from the roster,
+    /// where no symbol has been drawn yet.
+    fn zoom_to_show_group(&self, gid: &str) -> Option<f64> {
+        let (lat, radius_m, _) = self.group_extent(gid)?;
+        Some(
+            zoom_for_ground_resolution(lat, radius_m * 0.8 / GROUP_ZONE_MIN_PX).clamp(3.0, 18.0),
+        )
+    }
+
+    /// What side a GROUP is, for its frame's shape.
+    ///
+    /// The group's own declaration wins. Failing one, a group is what its
+    /// members are **when they agree**: every visible member resolving to
+    /// the same affiliation makes the group that affiliation, so a task
+    /// force of one declared side does not draw as unknown. Members that
+    /// disagree leave the group Unknown — a group that spans both sides
+    /// genuinely has no side, and picking the majority here would be the
+    /// same invention as picking the fattest hull for its icon.
+    ///
+    /// Not settled by a decision ticket: the affiliation model fixed the
+    /// declaration chain for a UNIT and left a group's own case open.
+    fn group_affiliation(&self, gid: &str, members: &[&ShipMarker]) -> tfg::store::Affiliation {
+        if let Some(declared) = self.affiliations.by_group.get(gid) {
+            return *declared;
+        }
+        let mut agreed: Option<tfg::store::Affiliation> = None;
+        for marker in members {
+            let resolved = marker.affiliation;
+            match agreed {
+                None => agreed = Some(resolved),
+                Some(first) if first == resolved => {}
+                Some(_) => return tfg::store::Affiliation::Unknown,
+            }
+        }
+        agreed.unwrap_or(tfg::store::Affiliation::Unknown)
+    }
+
+    /// Recompute which exercise pieces are unassigned in the tree.
+    fn refresh_unassigned_units(&mut self) {
+        self.unassigned_units = self
+            .users_gunits
+            .iter()
+            .filter(|g| g.hierarchy_node.is_none())
+            .map(|g| g.unit_id)
+            .collect();
+    }
+
+    /// Reload every affiliation declaration for this session. An empty
+    /// resolver is a valid state — most units are undeclared on a first
+    /// run and must still resolve, to Unknown.
+    fn reload_affiliations(&mut self) {
+        let Some(conn) = self.store.as_ref() else {
+            return;
+        };
+        let scope = self.affiliation_scope();
+        self.affiliations = tfg::store::affiliation_resolver(conn, &scope).unwrap_or_default();
+    }
+
+    /// One declaration, written through to the session's tables, the
+    /// resolver reloaded, and — in Live — the change journaled naming
+    /// the seat that made it.
+    fn declare_affiliation(
+        &mut self,
+        what: Declaration,
+        affiliation: Option<tfg::store::Affiliation>,
+    ) {
+        let Some(mut conn) = self.store.take() else {
+            self.users_status = "affiliation needs the local store".to_string();
+            return;
+        };
+        let scope = self.affiliation_scope();
+        let result = match &what {
+            Declaration::Unit(id) => {
+                tfg::store::set_unit_affiliation(&mut conn, &scope, *id, affiliation)
+            }
+            Declaration::Group(id) => {
+                tfg::store::set_group_affiliation(&mut conn, &scope, id, affiliation)
+            }
+            Declaration::Branch(id) => {
+                tfg::store::set_branch_affiliation(&mut conn, &scope, *id, affiliation)
+            }
+            Declaration::OurBranch(id) => {
+                tfg::store::set_our_branch(&conn, *id, affiliation.is_some())
+            }
+        };
+        self.store = Some(conn);
+        match result {
+            Ok(()) => {
+                self.reload_affiliations();
+                let name = match &what {
+                    Declaration::Unit(id) => format!("unit {id}"),
+                    Declaration::Group(id) => format!("group {id}"),
+                    Declaration::Branch(id) => format!("branch {id}"),
+                    Declaration::OurBranch(id) => format!("our branch {id}"),
+                };
+                self.users_status = match affiliation {
+                    Some(value) => format!("side: {name} is {}", value.label()),
+                    None => format!("side: {name} is not declared"),
+                };
+                if self.mode.in_live() {
+                    if let Some(tx) = self.sim_cmd_tx.as_ref() {
+                        let _ = tx.send(SimCommand::NoteAffiliation {
+                            actor: self
+                                .acting_as
+                                .clone()
+                                .unwrap_or_else(|| "organizer".to_string()),
+                            subject: name,
+                            affiliation: affiliation
+                                .map(|a| a.as_str().to_string())
+                                .unwrap_or_else(|| "undeclared".to_string()),
+                        });
+                    }
+                }
+            }
+            Err(e) => self.users_status = format!("side declaration failed: {e}"),
+        }
+    }
+
+    /// One control, three declarations, beside the per-type symbol
+    /// editor — which is the precedent: a client-owned, id-keyed mapping
+    /// table edited per unit.
+    ///
+    /// "Not declared" is a real choice beside Unknown, because they are
+    /// different states: no declaration invites the "ours" inference (a
+    /// unit this operator drives reads Friendly), while a declared
+    /// Unknown blocks it. The operator who wants a driven hull to draw
+    /// as unknown says so explicitly.
+    fn affiliation_editor(&mut self, ui: &mut egui::Ui, ship_id: &str) {
+        let subject = self.affiliation_subject(ship_id);
+        let resolved = self.affiliations.resolve(&subject);
+        let unit_id = subject.unit_id;
+        let group_id = subject.group_id.clone();
+        let branch_id = subject.branch_id;
+        let owned = subject.owned;
+
+        ui.separator();
+        ui.label(format!("side · {}", resolved.label()));
+
+        let declared_unit = unit_id.and_then(|id| self.affiliations.by_unit.get(&id).copied());
+        if let Some(id) = unit_id {
+            Self::affiliation_picker(
+                ui,
+                "this unit",
+                declared_unit,
+                |value| self.declare_affiliation(Declaration::Unit(id), value),
+            );
+        }
+
+        if let Some(group) = group_id.as_ref() {
+            let name = self
+                .groups
+                .group(group)
+                .map(|g| g.name.clone())
+                .unwrap_or_else(|| group.clone());
+            let declared = self.affiliations.by_group.get(group).copied();
+            Self::affiliation_picker(
+                ui,
+                &format!("group {name}"),
+                declared,
+                |value| self.declare_affiliation(Declaration::Group(group.clone()), value),
+            );
+        }
+
+        if let Some(branch) = branch_id {
+            let label = self
+                .store
+                .as_ref()
+                .and_then(|conn| tfg::store::branch_label(conn, branch))
+                .map(|(name, id_name)| {
+                    if id_name.is_empty() || id_name == name {
+                        name
+                    } else {
+                        format!("{name} · {id_name}")
+                    }
+                })
+                .unwrap_or_else(|| format!("branch #{branch}"));
+            let declared = self.affiliations.by_branch.get(&branch).copied();
+            Self::affiliation_picker(
+                ui,
+                &format!("branch {label} (this exercise)"),
+                declared,
+                |value| self.declare_affiliation(Declaration::Branch(branch), value),
+            );
+            let mut ours = self.affiliations.our_branches.contains(&branch);
+            if ui.checkbox(&mut ours, format!("{label} is my side")).changed() {
+                self.declare_affiliation(
+                    Declaration::OurBranch(branch),
+                    ours.then_some(tfg::store::Affiliation::Friendly),
+                );
+            }
+        }
+
+        // The chain that produced the answer, so a surprising frame is
+        // explainable from where the operator is standing.
+        ui.weak(if owned && resolved == tfg::store::Affiliation::Friendly {
+            "friendly by inference: this operator drives it, or its branch is mine".to_string()
+        } else if resolved == tfg::store::Affiliation::Unknown {
+            match branch_id {
+                Some(b) => format!("unknown: branch #{b} is neither declared nor mine"),
+                None => "unknown: nothing declared".to_string(),
+            }
+        } else {
+            "declared".to_string()
+        });
+    }
+
+    /// "Not declared" plus the four states.
+    fn affiliation_picker(
+        ui: &mut egui::Ui,
+        what: &str,
+        declared: Option<tfg::store::Affiliation>,
+        mut apply: impl FnMut(Option<tfg::store::Affiliation>),
+    ) {
+        egui::ComboBox::from_id_salt(("affiliation", what))
+            .selected_text(declared.map(|a| a.label()).unwrap_or("not declared"))
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(declared.is_none(), "not declared").clicked() {
+                    apply(None);
+                }
+                for value in tfg::store::Affiliation::ALL {
+                    if ui.selectable_label(declared == Some(value), value.label()).clicked() {
+                        apply(Some(value));
+                    }
+                }
+            });
+        ui.weak(what);
     }
 
     /// Rotate the selected thumbnail without changing Minos' reported
@@ -8845,8 +9473,9 @@ impl ShipApp {
         let _ = tx.send((self.map_seq, self.glide.goal, self.zoom, self.map_px, pump));
     }
 
-    /// Zoom step (slice iii): clamps, re-renders, and reports. Zones give
-    /// way to flags below ZONE_ZOOM.
+    /// Zoom step: clamps, re-renders, and reports. Each group's own
+    /// extent decides where it becomes a Zone, so there is no shared
+    /// threshold for the map to cross.
     fn zoom_by(&mut self, delta: f64) {
         self.zoom = (self.zoom + delta).clamp(3.0, 18.0);
         eprintln!("zoom {:.0}", self.zoom);
@@ -9663,14 +10292,22 @@ impl ShipApp {
     }
 
 
-    /// Zone + flag geometry for this frame (slice iii, grill #24): live
-    /// hulls over member markers in the per-rank palette, single-unit
-    /// circles, centroid flags carrying lat/lon. Empty groups draw nothing.
-    fn group_geometry(&self, markers: &[ShipMarker]) -> (Vec<ZoneGeom>, Vec<FlagGeom>) {
+    /// Group overlay geometry for this frame: a Zone per group whose
+    /// ground is big enough to read as a shape, and a framed symbol per
+    /// group whose extent is too small for one.
+    ///
+    /// The Representation IS this split — there is no third return value
+    /// carrying it, because a painter that can see which list a group is
+    /// in has the answer.
+    fn group_geometry(
+        &mut self,
+        markers: &[ShipMarker],
+    ) -> (Vec<ZoneGeom>, Vec<GroupSymbolGeom>) {
         // Higher ranks first so lower-rank zones paint over them.
         let mut ordered: Vec<_> = self.groups.group_list().iter().collect();
         ordered.sort_by_key(|g| std::cmp::Reverse(g.kind.rank()));
-        let mut work: Vec<(Vec<String>, String, String, egui::Color32, egui::Color32)> = Vec::new();
+        let mut work: Vec<(Vec<String>, String, String, egui::Color32, egui::Color32)> =
+            Vec::new();
         for g in ordered {
             let (fill, stroke) = match g.kind {
                 GroupKind::Unsur => (
@@ -9690,63 +10327,102 @@ impl ShipApp {
                     egui::Color32::from_rgb(0xea, 0x58, 0x0c),
                 ),
             };
-            work.push((self.groups.group_units(&g.id), g.id.clone(), g.name.clone(), fill, stroke));
+            work.push((
+                self.groups.group_units(&g.id),
+                g.id.clone(),
+                g.name.clone(),
+                fill,
+                stroke,
+            ));
         }
+        // A nested group goes quiet when far: a Gugus frame and three
+        // Unsur frames within a few pixels is unreadable, and the parent
+        // plus its count already says the task organisation exists.
+        let nested = self.groups.nested_ids();
+        let selected_group = match self.selection.as_ref() {
+            Some(Selection::Group(gid)) => Some(gid.clone()),
+            _ => None,
+        };
+        let (mw, mh) = self.map_dims();
+        let center = self.center;
         let mut zones = Vec::new();
-        let mut flags = Vec::new();
-        for (members, gid, name, fill, stroke) in work {
-            let pts: Vec<(f64, f64)> = markers
+        let mut symbols = Vec::new();
+        for (members, gid, name, fill, level_ink) in work {
+            // Hidden members leave everything: the hull, the centroid,
+            // the count and the extent. A Group with no non-hidden
+            // member draws nothing at all — and, because `hidden` is
+            // the operator's deliberate per-unit "show on map" choice,
+            // nothing that could give away where those units are.
+            let visible: Vec<&ShipMarker> = markers
                 .iter()
                 .filter(|m| !self.hidden.contains(&m.id) && members.iter().any(|u| u == &m.id))
-                .map(|m| (m.x, m.y))
                 .collect();
-            if pts.is_empty() {
+            if visible.is_empty() {
                 continue;
             }
-            if self.zoom < ZONE_ZOOM {
-                let n = pts.len();
-                let (cx, cy) = (
-                    pts.iter().map(|p| p.0).sum::<f64>() / n as f64,
-                    pts.iter().map(|p| p.1).sum::<f64>() / n as f64,
-                );
-                let mut lat_sum = 0.0;
-                let mut lon_sum = 0.0;
-                let mut count = 0usize;
-                for m in markers.iter().filter(|m| members.iter().any(|u| u == &m.id)) {
-                    if let Some(pos) = self.registry.position_of(&m.id) {
-                        lat_sum += pos.latitude;
-                        lon_sum += pos.longitude;
-                        count += 1;
-                    }
-                }
-                if count == 0 {
-                    continue;
-                }
-                flags.push(FlagGeom {
-                    x: cx as f32,
-                    y: cy as f32,
-                    lat: lat_sum / count as f64,
-                    lon: lon_sum / count as f64,
-                    label: format!("{name} ({n})"),
+            let positions: Vec<(f64, f64)> =
+                visible.iter().map(|m| (m.latitude, m.longitude)).collect();
+            // The ONE centroid: measured here, drawn on there, so the
+            // extent is always taken about the point the operator sees.
+            let extent = projected_group_extent(&positions, self.zoom);
+            let current = self.group_representations.get(&gid).copied();
+            let representation = select_group_representation(&extent, current);
+            self.group_representations.insert(gid.clone(), representation);
+            let (sx, sy) = project_mercator(
+                extent.centroid_lat,
+                extent.centroid_lon,
+                center,
+                self.zoom,
+                mw,
+                mh,
+            );
+            let pts: Vec<(f64, f64)> = visible.iter().map(|m| (m.x, m.y)).collect();
+
+            if representation == GroupRepresentation::Zone {
+                // A TRUE convex dilation of the member hull, padded to
+                // enclose the members' own markers: the fattest member's
+                // half-extent (or the Far symbol's footprint circle,
+                // whichever is larger) plus a margin.
+                let fattest = visible.iter().map(|m| m.footprint_px).fold(0.0f64, f64::max);
+                let hull = zone_polygon(&pts, zone_pad_px(fattest));
+                let width_px = zone_width_px(&hull);
+                zones.push(ZoneGeom {
                     group: gid,
-                    color: stroke,
+                    label: format!("{name} ({})", pts.len()),
+                    width_px,
+                    pts: hull.into_iter().map(|(x, y)| (x as f32, y as f32)).collect(),
+                    fill,
+                    stroke: level_ink,
                 });
                 continue;
             }
-            let hull = pad_hull(&convex_hull(pts), ZONE_PAD_PX);
-            zones.push(ZoneGeom {
+
+            // Far. A nested group stays silent unless it is selected —
+            // selection is never invisible on the map, and the halo says
+            // which frame is the selected one. The ladder itself is NOT
+            // overridden: selecting a small group never forces a Zone.
+            let selected = selected_group.as_deref() == Some(gid.as_str());
+            if nested.contains(&gid) && !selected {
+                continue;
+            }
+            let affiliation = self.group_affiliation(&gid, &visible);
+            symbols.push(GroupSymbolGeom {
                 group: gid,
-                pts: hull.into_iter().map(|(x, y)| (x as f32, y as f32)).collect(),
-                fill,
-                stroke,
+                x: sx as f32,
+                y: sy as f32,
+                lat: extent.centroid_lat,
+                lon: extent.centroid_lon,
+                label: format!("{name} ({})", pts.len()),
+                affiliation,
+                icon: plurality_icon(
+                    &visible.iter().map(|m| m.map_symbol).collect::<Vec<_>>(),
+                ),
+                level_ink,
+                cover_radius_m: extent.cover_radius_m,
             });
         }
-        (zones, flags)
+        (zones, symbols)
     }
-
-
-
-
 
     /// Log island: current warning plus the capped sim event feed.
     /// Empty feed names the next action instead of showing a blank box.
@@ -10781,8 +11457,11 @@ impl eframe::App for ShipApp {
             }
         }
         // Group overlays (slice iii, grill #24): recomputed per frame from
-        // live marker positions; zones above the zoom threshold, flags below.
-        let (zones, flags) = self.group_geometry(&markers);
+        // live marker positions; a Zone per group whose extent reads as a
+        // shape, a framed symbol per group whose extent does not.
+        // The Representation of each group rides along for the painters that
+        // will consume it; the flag itself stays until #172 retires it.
+        let (zones, group_symbols) = self.group_geometry(&markers);
         // On-demand repaint. The old unconditional 100ms floor guaranteed a
         // layout pass ten times a second whether or not anything moved; on
         // an air-gapped laptop station that is the whole cost of an idle
@@ -11194,6 +11873,7 @@ impl eframe::App for ShipApp {
                     };
                     ui.label(format!("ship: {}{sim_badge}{}", self.unit_label(&id), if stale { " (stale)" } else { "" }));
                     self.map_symbol_editor(ui, &id);
+                    self.affiliation_editor(ui, &id);
                     let reported_heading = self.registry.blend_heading(&id, 1.0);
                     self.heading_editor(ui, &id, reported_heading);
                     // Hull picture (images ticket): the decoded
@@ -11435,8 +12115,11 @@ impl eframe::App for ShipApp {
             }
             if let Some((gid, at)) = focus_group {
                 // `request_frame` owns the camera move; pre-assigning here
-                // would fight the ramp.
-                self.zoom = self.zoom.max(ZONE_ZOOM);
+                // would fight the ramp. The zoom floor is where THIS
+                // group's own extent earns a Zone.
+                if let Some(zoom) = self.zoom_to_show_group(&gid) {
+                    self.zoom = self.zoom.max(zoom);
+                }
                 self.request_frame(&gid, at);
             }
             ui.separator();
@@ -11872,6 +12555,7 @@ impl eframe::App for ShipApp {
                                     self.symbol_for_unit(uid),
                                     egui::Color32::LIGHT_BLUE,
                                     false,
+                                    1.0,
                                 );
                             }
                         }
@@ -11962,16 +12646,29 @@ impl eframe::App for ShipApp {
                 if ui.input(|input| input.pointer.any_released()) {
                     self.map_heading_drag = None;
                 }
+                // Paint order and pick order are the same list: the body
+                // layer draws Far, Middle, Near, and picking walks it
+                // backwards, so declared here for both uses.
+                let body_order = paint_order(&markers);
                 // Map click: stand up a catalog unit when placing, place
                 // a pending waypoint when arming, else select nearest.
                 // Armed clicks never deselect; empty water clears the
                 // selection (Inspector-model ticket).
-                if self.mode.phase != Phase::Closed && response.clicked() {
+                // One click, one meaning. A single click SELECTS whatever
+                // is under it — unit, group, or nothing (empty water
+                // clears the selection); a DOUBLE click frames a group so
+                // its Zone comes back. The first click of a double click
+                // still selects, which is what an operator expects.
+                let clicked = response.clicked();
+                let double_clicked = response.double_clicked();
+                let single = clicked && !double_clicked;
+                if self.mode.phase != Phase::Closed && (single || double_clicked) {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let px = (pos.x - rect.min.x) as f64;
                         let py = (pos.y - rect.min.y) as f64;
                         let (mw, mh) = self.map_dims();
-                        if placement_click_allowed(
+                        if single
+                            && placement_click_allowed(
                             self.mode.phase,
                             self.fleet_pick.as_deref(),
                             self.mode.armed.load(Ordering::SeqCst),
@@ -11985,50 +12682,89 @@ impl eframe::App for ShipApp {
                             // or automatic placement.
                             self.try_place_picked(la, lo);
                             self.mode.tool = SetupTool::Select;
-                        } else if self.placing {
+                        } else if single && self.placing {
                             let (la, lo) = unproject_mercator(
                                 px, py, self.center, self.zoom, mw, mh,
                             );
                             eprintln!("waypoint preview ({la:.4}, {lo:.4})");
                             self.pending_waypoint = Some((la, lo));
-                        } else if let Some(flag) = flags
-                            .iter()
-                            .find(|f| {
-                                ((f.x as f64 - px).powi(2) + (f.y as f64 - py).powi(2)).sqrt() < 16.0
-                            })
-                            .map(|f| (f.group.clone(), f.lat, f.lon))
-                        {
-                            // Click-to-expand (grill #24): center the group
-                            // and zoom in to its zone; the group selection
-                            // opens its Inspector and arms group command.
-                            self.zoom = self.zoom.max(ZONE_ZOOM);
-                            self.select_group(flag.0.clone());
-                            self.request_frame(&flag.0, (flag.1, flag.2));
                         } else {
-                            let hit = markers
+                            // Pick order mirrors paint order: the marker
+                            // painted last is on top and is picked first.
+                            let hit_unit = body_order
                                 .iter()
+                                .rev()
+                                .map(|&i| &markers[i])
                                 .filter(|m| !self.hidden.contains(&m.id))
                                 .find(|m| {
-                                    marker_body_hit(
-                                        m,
-                                        px,
-                                        py,
-                                        self.zoom,
-                                        pixels_per_point,
-                                    )
+                                    marker_body_hit(m, px, py, self.zoom, pixels_per_point)
                                 })
                                 .map(|m| m.id.clone());
-                            if let Some(id) = hit {
+                            // A group's symbol box, then a Zone's
+                            // outline and its name — never a Zone's
+                            // interior.
+                            let hit_group_symbol = group_symbols
+                                .iter()
+                                .find(|g| {
+                                    ((g.x as f64 - px).powi(2) + (g.y as f64 - py).powi(2)).sqrt()
+                                        <= SYMBOL_BOX_PX / 2.0
+                                })
+                                .cloned();
+                            let hit_zone = zones.iter().find(|z| {
+                                let cx = z.pts.iter().map(|p| p.0).sum::<f32>() / z.pts.len() as f32
+                                    + rect.min.x;
+                                let cy = z.pts.iter().map(|p| p.1).sum::<f32>() / z.pts.len() as f32
+                                    + rect.min.y;
+                                zone_outline_hit(
+                                    px,
+                                    py,
+                                    &z.pts,
+                                    (cx as f64, cy as f64),
+                                    advance_width_px(ui, &z.label) as f64 / 2.0,
+                                )
+                            });
+
+                            if double_clicked {
+                                // Framing is a group gesture: a group's
+                                // own extent, filling FRAME_VIEWPORT_FRACTION
+                                // of the window.
+                                let framed = hit_group_symbol.clone().map(|g| {
+                                    (g.group, g.lat, g.lon, g.cover_radius_m)
+                                });
+                                if let Some((gid, lat, lon, radius)) = framed {
+                                    let (mw, _) = self.map_dims();
+                                    self.zoom = zoom_for_group_frame(
+                                        lat,
+                                        radius,
+                                        mw,
+                                        FRAME_VIEWPORT_FRACTION,
+                                    );
+                                    self.request_frame(&gid, (lat, lon));
+                                } else if let Some(z) = hit_zone {
+                                    // A Zone carries no radius, so it is
+                                    // measured here from its members.
+                                    if let Some((lat, radius_m, at)) =
+                                        self.group_extent(&z.group)
+                                    {
+                                        let (mw, _) = self.map_dims();
+                                        self.zoom = zoom_for_group_frame(
+                                            lat,
+                                            radius_m,
+                                            mw,
+                                            FRAME_VIEWPORT_FRACTION,
+                                        );
+                                        self.request_frame(&z.group, at);
+                                    }
+                                }
+                            } else if let Some(id) = hit_unit {
                                 eprintln!("select {id}");
                                 self.select_ship(id);
-                            } else if let Some(gid) = zones
-                                .iter()
-                                .find(|z| in_poly(px, py, &z.pts))
-                                .map(|z| z.group.clone())
-                            {
-                                // Zone click (no ship hit): select the group.
-                                eprintln!("select group {gid}");
-                                self.select_group(gid);
+                            } else if let Some(g) = hit_group_symbol {
+                                eprintln!("select group {}", g.group);
+                                self.select_group(g.group);
+                            } else if let Some(z) = hit_zone {
+                                eprintln!("select group {}", z.group);
+                                self.select_group(z.group.clone());
                             } else if self.fleet_pick.is_none() && !self.placing {
                                 // Empty water, nothing armed: deselect (the
                                 // Inspector shuts with the selection).
@@ -12082,13 +12818,13 @@ impl eframe::App for ShipApp {
                                     )
                                 })
                                 .map(|m| m.id.clone());
-                            let near_flag = flags
+                            let near_group = group_symbols
                                 .iter()
-                                .find(|f| {
-                                    ((f.x as f64 - px).powi(2) + (f.y as f64 - py).powi(2)).sqrt()
+                                .find(|g| {
+                                    ((g.x as f64 - px).powi(2) + (g.y as f64 - py).powi(2)).sqrt()
                                         < 16.0
                                 })
-                                .map(|f| f.group.clone());
+                                .map(|g| g.group.clone());
                             if let Some(mid) = near_marker {
                                 match mid.parse::<i64>() {
                                     Ok(hull) => self.users_command(hull, uid),
@@ -12096,7 +12832,7 @@ impl eframe::App for ShipApp {
                                         "drop refused: {mid} is not a register hull"
                                     )),
                                 }
-                            } else if let Some(group) = near_flag {
+                            } else if let Some(group) = near_group {
                                 let members = self.groups.group_units(&group);
                                 match self.users_client() {
                                     Ok((m, t)) => {
@@ -12192,7 +12928,7 @@ impl eframe::App for ShipApp {
                 if self.show_grid {
                     self.paint_map_grid(&painter, rect);
                 }
-                // Group zones under ships, flags above them (slice iii).
+                // Group Zones and symbols under ships, drawn above them.
                 for z in &zones {
                     let pts: Vec<egui::Pos2> = z
                         .pts
@@ -12206,31 +12942,49 @@ impl eframe::App for ShipApp {
                         } else {
                             (z.stroke, 2.0)
                         };
-                    if pts.len() >= 3 {
-                        painter.add(egui::Shape::convex_polygon(
-                            pts,
-                            z.fill,
-                            egui::Stroke::new(stroke_w, stroke_color),
-                        ));
-                    } else if pts.len() == 2 {
-                        painter.line_segment([pts[0], pts[1]], egui::Stroke::new(10.0, z.fill));
-                        painter.circle_filled(pts[0], 6.0, z.stroke);
-                        painter.circle_filled(pts[1], 6.0, z.stroke);
-                    } else if pts.len() == 1 {
-                        painter.circle_filled(pts[0], 14.0, z.fill);
-                        painter.circle_stroke(pts[0], 14.0, egui::Stroke::new(2.0, z.stroke));
+                    // `zone_polygon` always returns a real polygon now
+                    // (a two-member capsule, a grown hull, a disc for one
+                    // member), so there is no degenerate branch left to
+                    // paint — and a one-member Group never gets here
+                    // anyway, because its Representation is always Far.
+                    painter.add(egui::Shape::convex_polygon(
+                        pts.clone(),
+                        z.fill,
+                        egui::Stroke::new(stroke_w, stroke_color),
+                    ));
+                    // Zones were ANONYMOUS until now — only flags carried
+                    // a name — so the near view asked "what am I looking
+                    // at". Same fits rule as a far symbol, measured
+                    // against the hull's own width, at the hull centroid.
+                    let focused =
+                        entity_focused(&self.selection, self.following.as_ref(), &z.group);
+                    if should_paint_group_text(
+                        z.width_px,
+                        advance_width_px(ui, &z.label),
+                        focused,
+                    ) {
+                        let centre = egui::pos2(
+                            rect.min.x + pts.iter().map(|p| p.x).sum::<f32>() / pts.len() as f32,
+                            rect.min.y + pts.iter().map(|p| p.y).sum::<f32>() / pts.len() as f32,
+                        );
+                        painter.text(
+                            centre + egui::vec2(0.0, -6.0),
+                            egui::Align2::CENTER_BOTTOM,
+                            &z.label,
+                            egui::FontId::proportional(MAP_LABEL_PX),
+                            z.stroke,
+                        );
                     }
                 }
-                for f in &flags {
-                    let c = rect.min + egui::vec2(f.x, f.y);
-                    painter.circle_filled(c, 10.0, f.color);
-                    painter.circle_stroke(c, 10.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
-                    painter.text(
-                        c + egui::vec2(13.0, -10.0),
-                        egui::Align2::LEFT_TOP,
-                        &f.label,
-                        egui::FontId::proportional(12.0),
-                        MAP_INK,
+                for symbol in &group_symbols {
+                    let focused = entity_focused(&self.selection, self.following.as_ref(), &symbol.group);
+                    paint_group_symbol(
+                        &painter,
+                        ui,
+                        symbol,
+                        rect.min,
+                        focused,
+                        self.zoom,
                     );
                 }
                 let mut image_quads: Vec<Option<Vec<egui::Pos2>>> =
@@ -12241,6 +12995,15 @@ impl eframe::App for ShipApp {
                     || self.mode.in_live();
                 for m in &markers {
                     if self.hidden.contains(&m.id) || !self.show_trail || !trails_visible {
+                        continue;
+                    }
+                    // Trails are a Near/Middle channel: at Far the trail
+                    // dots are 2 px and the ships they belong to are 4.
+                    // Dropped, never faded — a fade needs per-frame alpha
+                    // state, and under repaint-on-demand that means
+                    // repainting toward a target computed from where a
+                    // trail is GOING.
+                    if m.lod == UnitLod::Far {
                         continue;
                     }
                     let color = if m.stale { egui::Color32::GRAY } else { Self::ship_color(&m.id) };
@@ -12255,7 +13018,8 @@ impl eframe::App for ShipApp {
                 // Layer 2: all symbol-or-image bodies. An eligible
                 // Middle/Near texture replaces the circle; otherwise
                 // the universal circle + taxonomy glyph remains.
-                for (index, m) in markers.iter().enumerate() {
+                for &index in &body_order {
+                    let m = &markers[index];
                     if self.hidden.contains(&m.id) {
                         continue;
                     }
@@ -12268,29 +13032,39 @@ impl eframe::App for ShipApp {
                         pixels_per_point,
                         rect.min,
                     );
-                    if image_quads[index].is_none() {
-                        painter.circle_filled(c, 8.0, color);
-                        paint_map_symbol(&painter, c, m.map_symbol, color, m.stale);
-                    }
-                }
-                // Layer 3: symbol outlines only. Textured unit images keep
-                // their own photographic edge; a geometric white outline
-                // makes the image look like a pasted-on rectangle.
-                for (index, m) in markers.iter().enumerate() {
-                    if self.hidden.contains(&m.id) {
-                        continue;
-                    }
-                    if image_quads[index].is_some() {
-                        continue;
-                    }
-                    let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
-                    let outline = if m.stale {
-                        egui::Color32::GRAY
+                    if let Some(quad) = image_quads[index].as_ref() {
+                        // Middle/Near: the icon is a photograph, so the
+                        // affiliation rides the redundant colour
+                        // channel rather than a frame that cannot wrap
+                        // a rotated quad.
+                        paint_affiliation_tint(&painter, quad, m.affiliation);
                     } else {
-                        egui::Color32::WHITE
-                    };
-                    painter.circle_stroke(c, 8.0, egui::Stroke::new(2.0, outline));
+                        painter.circle_filled(c, 8.0, color);
+                        let frame = paint_affiliation_frame(
+                            &painter,
+                            c,
+                            m.affiliation,
+                            battle_dimension(m.map_symbol),
+                            m.planned,
+                        );
+                        paint_map_symbol(
+                            &painter,
+                            c,
+                            m.map_symbol,
+                            color,
+                            m.stale,
+                            frame_icon_radius(frame, SYMBOL_BOX_PX) as f32
+                                / (SYMBOL_FOOTPRINT_RADIUS_PX as f32),
+                        );
+                    }
                 }
+                // Layer 3 is gone: the white circle outline it drew is
+                // superseded by the affiliation frame painted in layer 2.
+                // A second outline around every symbol muddied the one
+                // thing the frame is for — reading allegiance — and the
+                // old circle also greyed with staleness, which is a
+                // second channel for a state the glyph and the rings
+                // already carry.
                 // Layer 4: all state rings over every body, in the
                 // prescribed selected → follow → old-data order.
                 //
@@ -12462,9 +13236,15 @@ impl eframe::App for ShipApp {
                     );
                 }
                 // Layer 5: labels last, after replay and waypoint
-                // overlays, so every unit label remains readable.
+                // overlays, so every unit label that IS painted remains
+                // readable. Names are a Near channel plus focus: before
+                // this, every unit on the map was labelled at every zoom.
                 for m in &markers {
                     if self.hidden.contains(&m.id) {
+                        continue;
+                    }
+                    let focused = entity_focused(&self.selection, self.following.as_ref(), &m.id);
+                    if !should_paint_unit_label(m.lod, focused) {
                         continue;
                     }
                     let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
@@ -12472,7 +13252,7 @@ impl eframe::App for ShipApp {
                         c + egui::vec2(10.0, -10.0),
                         egui::Align2::LEFT_TOP,
                         &m.label,
-                        egui::FontId::proportional(12.0),
+                        egui::FontId::proportional(MAP_LABEL_PX),
                         MAP_INK,
                     );
                 }
@@ -12936,6 +13716,7 @@ fn main() -> Result<(), String> {
                 users_roles: Vec::new(),
                 users_roster: Vec::new(),
                 users_gunits: Vec::new(),
+                unassigned_units: std::collections::HashSet::new(),
                 commanded_hulls: Vec::new(),
                 roster_gap: false,
                 units_gap: false,
@@ -13056,7 +13837,10 @@ fn main() -> Result<(), String> {
                 unit_type_ids: HashMap::new(),
                 unit_type_names: HashMap::new(),
                 unit_type_symbols: HashMap::new(),
+                unit_branches: HashMap::new(),
+                affiliations: tfg::store::AffiliationResolver::default(),
                 unit_lods: HashMap::new(),
+                group_representations: HashMap::new(),
                 heading_overrides: HashMap::new(),
                 pending_image_urls: Vec::new(),
                 image_op: None,
@@ -13095,6 +13879,7 @@ fn main() -> Result<(), String> {
             };
             app.fx = fx;
             app.reload_unit_symbols();
+            app.reload_affiliations();
             // M3: wake the last session when its refresh token survived
             // in the keyring — a cold launch otherwise asks for login.
             app.restore_session();
@@ -13190,6 +13975,191 @@ mod tests {
             .collect();
         assert_eq!(identities.len(), tfg::store::MapSymbol::ALL.len());
         assert_eq!(map_symbol_shape(tfg::store::MapSymbol::UnknownShip), MapSymbolShape::Dot);
+    }
+
+    /// Every affiliation gets its own frame AND its own hue: the shape
+    /// is primary (it survives a greyscale screenshot), the colour is
+    /// the redundant second cue. Two states sharing either would make
+    /// one of the channels lie.
+    #[test]
+    fn every_affiliation_has_its_own_frame_and_ink() {
+        let frames: std::collections::HashSet<_> = tfg::store::Affiliation::ALL
+            .into_iter()
+            .map(|a| frame_for(a))
+            .collect();
+        assert_eq!(frames.len(), tfg::store::Affiliation::ALL.len());
+        let inks: std::collections::HashSet<_> = tfg::store::Affiliation::ALL
+            .into_iter()
+            .map(|a| affiliation_ink(a).to_array())
+            .collect();
+        assert_eq!(inks.len(), tfg::store::Affiliation::ALL.len());
+        // Hostile is red, friendly is blue, unknown is yellow: the three
+        // readings an operator already has in their head.
+        let ink = |a| affiliation_ink(a);
+        assert!(ink(tfg::store::Affiliation::Hostile).r() > ink(tfg::store::Affiliation::Hostile).b());
+        assert!(ink(tfg::store::Affiliation::Friendly).b() > ink(tfg::store::Affiliation::Friendly).r());
+    }
+
+    /// An icon fits inside its frame, and the frame does not change size
+    /// when allegiance changes — the two properties [hit-test parity]
+    /// relies on. The geometry itself is tested in map_render.rs; this
+    /// pins that the painter passes the geometry those tests produced.
+    #[test]
+    fn the_painter_scales_glyphs_to_fill_their_frame() {
+        for affiliation in tfg::store::Affiliation::ALL {
+            let frame = frame_for(affiliation);
+            let radius = frame_icon_radius(frame, SYMBOL_BOX_PX);
+            let scale = radius / SYMBOL_FOOTPRINT_RADIUS_PX;
+            assert!(scale > 0.0 && scale < 2.0, "{affiliation:?} scale {scale}");
+            // The reference glyph reaches 5.5 of the 8 px circle, so a
+            // scale of 1 keeps today's look and never grows a glyph past
+            // the circle the marker already paints.
+            assert!(5.5 * scale <= SYMBOL_FOOTPRINT_RADIUS_PX + 1e-9);
+        }
+    }
+
+    /// A marker with nothing but an identity and a Representation. The
+    /// picking tests care about geometry and order, not about fixes.
+    fn marker_stub() -> ShipMarker {
+        ShipMarker {
+            id: String::new(),
+            x: 0.0,
+            y: 0.0,
+            stale: false,
+            old_data: false,
+            source: FixSource::Wire,
+            trail: Vec::new(),
+            heading_deg: None,
+            map_symbol: tfg::store::MapSymbol::UnknownShip,
+            latitude: 0.0,
+            longitude: 0.0,
+            footprint_px: 0.0,
+            affiliation: tfg::store::Affiliation::Unknown,
+            planned: false,
+            label: String::new(),
+            lod: UnitLod::Far,
+            visual: None,
+        }
+    }
+
+    /// Pick order is paint order reversed: what is painted last is on
+    /// top, so it is picked first. A stable sort keeps markers of equal
+    /// Representation in their list order, and Far must genuinely come
+    /// first — otherwise the ladder's whole hierarchy is upside down.
+    #[test]
+    fn pick_order_is_the_reverse_of_paint_order() {
+        let mut markers: Vec<ShipMarker> = Vec::new();
+        // Deliberately jumbled: Middle, Near, Far, Near, Far.
+        for (i, lod) in [
+            UnitLod::Middle,
+            UnitLod::Near,
+            UnitLod::Far,
+            UnitLod::Near,
+            UnitLod::Far,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            markers.push(ShipMarker {
+                id: format!("m{i}"),
+                lod,
+                x: i as f64 * 100.0,
+                y: 0.0,
+                ..marker_stub()
+            });
+        }
+        let order = paint_order(&markers);
+        let ranks: Vec<u8> = order.iter().map(|&i| match markers[i].lod {
+            UnitLod::Far => 0,
+            UnitLod::Middle => 1,
+            UnitLod::Near => 2,
+        }).collect();
+        assert_eq!(ranks, vec![0, 0, 1, 2, 2], "paint order is Far, Middle, Near");
+        // Same Representation keeps its original relative order.
+        assert!(order[0] < order[1], "Far markers keep list order");
+        assert!(order[3] < order[4], "Near markers keep list order");
+        // And picking walks that list backwards, so the marker painted
+        // LAST is picked first — here the last Near in list order.
+        assert_eq!(*order.last().unwrap(), 3);
+        assert_eq!(*order.first().unwrap(), 2);
+    }
+
+    /// THE property hit-test parity rests on: the painted frames have
+    /// different bounding boxes by design (an inscribed square is smaller
+    /// than the rectangle that fills it), so the pick region is the symbol
+    /// BOX for every affiliation — a hull stays equally clickable
+    /// whichever way its allegiance changes.
+    #[test]
+    fn every_affiliation_has_the_same_hit_region() {
+        let mut reference: Option<Vec<(f64, f64)>> = None;
+        for affiliation in tfg::store::Affiliation::ALL {
+            let marker = ShipMarker {
+                affiliation,
+                lod: UnitLod::Far,
+                x: 400.0,
+                y: 300.0,
+                ..marker_stub()
+            };
+            let hit = marker_hit_points(&marker, 12.0, 1.0);
+            // The first affiliation sets the reference; every other one
+            // must produce exactly the same points.
+            let Some(first) = reference.as_ref() else {
+                reference = Some(hit);
+                continue;
+            };
+            assert_eq!(hit.len(), first.len(), "{affiliation:?} vertex count");
+            assert!(
+                hit.iter().zip(first).all(|(a, b)| {
+                    (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9
+                }),
+                "{affiliation:?} must be picked by the same box"
+            );
+            // And it is aimable: at least the symbol box across.
+            let width = hit.iter().map(|p| p.0).fold(f64::MIN, f64::max)
+                - hit.iter().map(|p| p.0).fold(f64::MAX, f64::min);
+            assert!(width >= MIN_HIT_PX - 1e-6, "{affiliation:?} width {width}");
+        }
+    }
+
+    /// A Zone is picked by its outline and its name, never by its
+    /// interior: the middle of a translucent ground overlay is still map.
+    #[test]
+    fn a_zone_is_picked_by_its_outline_not_its_inside() {
+        // A 200 x 100 rectangle of screen px.
+        let pts = vec![(0.0, 0.0), (200.0, 0.0), (200.0, 100.0), (0.0, 100.0)];
+        let label_c = (100.0, 50.0);
+        // Deep inside, far from every edge: NOT a hit.
+        assert!(!zone_outline_hit(100.0, 50.0, &pts, label_c, 0.0));
+        // On the outline: a hit, within the band.
+        assert!(zone_outline_hit(0.0, 50.0, &pts, label_c, 0.0));
+        assert!(zone_outline_hit(100.0, 0.0, &pts, label_c, 0.0));
+        // Just outside the band: not a hit.
+        assert!(!zone_outline_hit(-ZONE_HIT_BAND_PX - 1.0, 50.0, &pts, label_c, 0.0));
+        // The name on the Zone is a hit wherever it sits.
+        assert!(zone_outline_hit(100.0, 50.0, &pts, label_c, 40.0));
+        assert!(!zone_outline_hit(100.0, 80.0, &pts, label_c, 20.0));
+    }
+
+    /// A group draws its members' kind only when they AGREE, by strict
+    /// majority. One destroyer in twelve aircraft must not speak for the
+    /// group, and an exact tie must never be broken by iteration order.
+    #[test]
+    fn a_group_draws_a_kind_only_on_a_strict_majority() {
+        use tfg::store::MapSymbol::{Corvette, Destroyer, Plane, Submarine};
+        assert_eq!(
+            plurality_icon(&[Corvette, Corvette, Corvette, Corvette, Corvette, Corvette, Destroyer]),
+            Some(Corvette),
+            "six corvettes beat one destroyer"
+        );
+        // Mixed, and an exact tie: no icon, so the frame stays empty
+        // rather than naming a wrong kind.
+        assert_eq!(plurality_icon(&[Corvette, Corvette, Plane, Plane]), None);
+        // Exactly half is still not a majority.
+        assert_eq!(plurality_icon(&[Corvette, Plane]), None);
+        // One member alone IS a majority of one — the rule is about
+        // agreement, not about being a crowd.
+        assert_eq!(plurality_icon(&[Submarine]), Some(Submarine));
+        assert_eq!(plurality_icon(&[]), None);
     }
 
     /// The manifest's discriminator is the asset kind. Pixel size is

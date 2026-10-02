@@ -143,13 +143,22 @@ _When connected, session membership is read live from the backend (user director
 An organizer-issued code binding a named roster entry to a session seat. Generated locally (mock backend in dev); redemption over the network is a later slice.
 _Avoid_: invitation (that's the message, not the code), token
 
+**Group symbol**:
+A Group drawn as a symbol rather than a Zone: its affiliation frame, a plurality icon of what its members are, its level colour, and `name (count)` at the member centroid. Fixed size, never rotated — a Group has no heading and no published dimension. A nested Group goes quiet when it is a symbol unless it is selected; a selected one draws beside its parent, and the ladder is never overridden to show it.
+_Avoid_: flag (that was a name and a count, not a symbol)
+
 **Zone**:
-The rendered area of a group: a live hull around member positions plus a fixed ground padding, in the level color. Collapses to a flag when zoomed out.
+The rendered ground a Group holds: a live hull around its member positions, dilated outward far enough to enclose those members' markers. In the level colour. Collapses to a group symbol when the group's own extent is too small for a shape to read.
 _Avoid_: area (that's organizer-drawn, a different feature), region
 
-**Flag**:
-A collapsed group marker at the member centroid: group name plus member count. Clicking it zooms in to reveal the zone.
-_Avoid_: pin, icon
+**Affiliation**:
+What a thing is in relation to the operator watching the map: Friendly, Neutral, Hostile, or Unknown. Stated, never inferred: a unit the operator drives is Friendly unless something is declared about it, and a unit they do not drive is never painted Hostile. Declared per unit, per group, or per branch for one exercise; "this branch is mine" is a standing fact about the operator rather than about a session. Operators read it as **Side**.
+_Avoid_: side (that is the operator-facing word, not the canonical one), faction, relation
+_2525D calls this standard identity, and adds assumed friend and exercise/pending; those two are deliberately not adopted._
+
+**Representation**:
+How one entity is drawn at the current zoom, chosen from its size on screen rather than from the zoom itself: a Unit's photograph, silhouette or symbol; a Group's Zone or its far symbol. A Representation is never stated by the operator and never forced by a tool — it is what the thing actually needs at that zoom.
+_Avoid_: LOD, detail level, zoom level (that's the input, not the answer)
 
 **Desktop**:
 One scope's command view: the four panes (map, roster, inspector, orders) with action panes filtered to the scope's jurisdiction. Multi-scope players switch between desktops; organizer and observers get a single merged one.
