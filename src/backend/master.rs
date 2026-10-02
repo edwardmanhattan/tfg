@@ -1600,6 +1600,265 @@ impl MinosMaster {
         })
     }
 
+    // -----------------------------------------------------------------------
+    // The scenario book.
+    //
+    // A game has exactly ONE book, and the book IS its ordered scenarios —
+    // there is no books table and no cross-game template, so the composer
+    // authors a game's own book rather than picking from a catalog.
+    //
+    // NOT the same thing as `scenario_roles` above. Those are the identities a
+    // message is sent AS; these are the beats the Game Master authors. The
+    // two names are one word apart and mean unrelated things, which the
+    // backend says at its own router and which is why they are separate types
+    // here rather than one `Scenario` with a flag.
+    //
+    // Steps arrive NESTED inside a scenario and nowhere else: there is no
+    // step-list route and no single-step read. Every step write answers with
+    // the whole scenario, because the ids are server-assigned and the
+    // composer redraws from the answer rather than guessing one.
+    // -----------------------------------------------------------------------
+
+    /// The whole book. Answers either as a bare array or wrapped, so both are
+    /// accepted rather than betting on the envelope.
+    pub fn game_scenarios(
+        &self,
+        token: &str,
+        game_id: i64,
+    ) -> Result<Vec<GameScenario>, BackendError> {
+        let data = self.get(token, &format!("/games/{game_id}/scenarios"))?;
+        Ok(Self::parse_scenarios(&data, game_id))
+    }
+
+    /// One scenario with its steps.
+    pub fn game_scenario(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+    ) -> Result<GameScenario, BackendError> {
+        let data = self.get(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}"),
+        )?;
+        Self::parse_scenario(&data, game_id)
+    }
+
+    /// Add a scenario to the book's end.
+    ///
+    /// Append only: the caller does not choose a position, so two organizers
+    /// adding at once cannot collide on the ordering index.
+    pub fn create_game_scenario(
+        &self,
+        token: &str,
+        game_id: i64,
+        title: &str,
+        description: &str,
+    ) -> Result<GameScenario, BackendError> {
+        let data = self.post(
+            token,
+            &format!("/games/{game_id}/scenarios"),
+            serde_json::json!({ "title": title, "description": description }),
+        )?;
+        Self::parse_scenario(&data, game_id)
+    }
+
+    /// Rename a scenario or edit its description. Absent fields leave alone.
+    pub fn update_game_scenario(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        title: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<GameScenario, BackendError> {
+        let mut body = serde_json::Map::new();
+        if let Some(t) = title {
+            body.insert("title".into(), serde_json::Value::String(t.into()));
+        }
+        if let Some(d) = description {
+            body.insert(
+                "description".into(),
+                serde_json::Value::String(d.into()),
+            );
+        }
+        let data = self.patch(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}"),
+            serde_json::Value::Object(body),
+        )?;
+        Self::parse_scenario(&data, game_id)
+    }
+
+    /// Put the book's scenarios in a new order: a whole-list PUT of every
+    /// live id, checked server-side as a permutation.
+    pub fn reorder_scenarios(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_ids: &[i64],
+    ) -> Result<Vec<GameScenario>, BackendError> {
+        let data = self.put(
+            token,
+            &format!("/games/{game_id}/scenarios/order"),
+            serde_json::json!({ "scenario_ids": scenario_ids }),
+        )?;
+        Ok(Self::parse_scenarios(&data, game_id))
+    }
+
+    /// Add a step to the end of a scenario.
+    ///
+    /// `window` is both ends or neither; the backend refuses a half-window
+    /// and [`hhmm_ok`] refuses one before the request goes out.
+    pub fn add_scenario_step(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        content: &str,
+        window: Option<(&str, &str)>,
+    ) -> Result<GameScenario, BackendError> {
+        let mut body = serde_json::Map::new();
+        body.insert("content".into(), serde_json::Value::String(content.into()));
+        if let Some((start, end)) = window {
+            body.insert("start_hour".into(), serde_json::Value::String(start.into()));
+            body.insert("end_hour".into(), serde_json::Value::String(end.into()));
+        }
+        let data = self.post_created(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}/steps"),
+            serde_json::Value::Object(body),
+        )?;
+        Self::parse_scenario(&data, game_id)
+    }
+
+    /// Edit one step. Absent fields leave alone, so CLEARING a window means
+    /// sending two empty strings rather than omitting them.
+    pub fn update_scenario_step(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+        content: Option<&str>,
+        window: Option<Option<(&str, &str)>>,
+    ) -> Result<GameScenario, BackendError> {
+        let mut body = serde_json::Map::new();
+        if let Some(c) = content {
+            body.insert("content".into(), serde_json::Value::String(c.into()));
+        }
+        if let Some(w) = window {
+            match w {
+                Some((start, end)) => {
+                    body.insert("start_hour".into(), serde_json::Value::String(start.into()));
+                    body.insert("end_hour".into(), serde_json::Value::String(end.into()));
+                }
+                None => {
+                    body.insert("start_hour".into(), serde_json::Value::String(String::new()));
+                    body.insert("end_hour".into(), serde_json::Value::String(String::new()));
+                }
+            }
+        }
+        let data = self.patch(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}"),
+            serde_json::Value::Object(body),
+        )?;
+        Self::parse_scenario(&data, game_id)
+    }
+
+    /// Take a step out. Answers with the scenario that remains; positions are
+    /// NOT renumbered, so a gap in the order is legal and expected.
+    pub fn delete_scenario_step(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+    ) -> Result<GameScenario, BackendError> {
+        let data = self.delete(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}"),
+        )?;
+        Self::parse_scenario(&data, game_id)
+    }
+
+    /// The book, from either envelope shape.
+    fn parse_scenarios(
+        v: &serde_json::Value,
+        game_id: i64,
+    ) -> Vec<GameScenario> {
+        v.as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| Self::parse_scenario(s, game_id).ok())
+            .collect()
+    }
+
+    /// One scenario, steps nested.
+    ///
+    /// A scenario without an id is a decode error rather than a dropped row:
+    /// the composer's whole job is editing THIS scenario, and silently
+    /// omitting it would leave the author looking at an empty list with no
+    /// idea why.
+    fn parse_scenario(
+        v: &serde_json::Value,
+        fallback_game: i64,
+    ) -> Result<GameScenario, BackendError> {
+        let id = v["id"]
+            .as_i64()
+            .ok_or_else(|| BackendError::Other("scenario answer without an id".to_string()))?;
+        Ok(GameScenario {
+            id,
+            game_id: v["id_game"].as_i64().unwrap_or(fallback_game),
+            position: v["position"].as_i64().unwrap_or(0),
+            title: v["title"].as_str().unwrap_or("").to_string(),
+            description: v["description"].as_str().unwrap_or("").to_string(),
+            steps: v["steps"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|step| Self::parse_scenario_step(step, id))
+                .collect(),
+        })
+    }
+
+    /// One nested step.
+    ///
+    /// `scenario_id` comes from the PARENT, not from the step's own payload.
+    /// The step is nested inside its scenario, so the parent already knows,
+    /// and reading it from the child meant a step was silently dropped for
+    /// omitting a field it did not need — which is how a response that is
+    /// perfectly valid apart from that omission loses a row from the
+    /// composer's list with nothing on screen to explain it.
+    fn parse_scenario_step(
+        v: &serde_json::Value,
+        parent_scenario_id: i64,
+    ) -> Option<GameScenarioStep> {
+        Some(GameScenarioStep {
+            id: v["id"].as_i64()?,
+            scenario_id: parent_scenario_id,
+            position: v["position"].as_i64().unwrap_or(0),
+            // Content may legitimately be empty: a plan is authored while it
+            // is being written, and the backend says so explicitly rather
+            // than requiring a placeholder.
+            content: v["content"].as_str().unwrap_or("").to_string(),
+            // The window rides as authored `HHMM` strings. The derived
+            // assumed-clock instants are recomputed by the server on every
+            // clock write, so carrying them would show a stale reading.
+            start_hour: v["start_hour"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string()),
+            end_hour: v["end_hour"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string()),
+        })
+    }
+
     /// One message as the inbox draws it (#99): the drawable subset of
     /// the response. `sender` is the assumed identity where one was
     /// claimed, else the real author where entitled, else unknown —
@@ -2117,6 +2376,90 @@ pub struct ScenarioRole {
     pub name: String,
 }
 
+/// One scenario: a titled beat in a game's book, with ordered steps.
+///
+/// A game has exactly one book and the book is its ordered scenarios. There
+/// is no cross-game catalog and no template, which is why the composer
+/// authors rather than selects.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameScenario {
+    pub id: i64,
+    pub game_id: i64,
+    /// Zero-based index in the book. Gaps are legal after a delete.
+    pub position: i64,
+    /// Required by the backend; may not be blank.
+    pub title: String,
+    /// May be empty — a plan is authored while it is being written.
+    pub description: String,
+    /// Nested, and the ONLY place steps arrive: there is no step-list route.
+    pub steps: Vec<GameScenarioStep>,
+}
+
+/// One step: the free text that says what must happen, plus an optional
+/// window on the exercise's assumed clock.
+///
+/// THERE IS NO TITLE. The backend decided the content *is* the label, so a
+/// client that shows a separate title field is inventing a field the
+/// contract does not have.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameScenarioStep {
+    pub id: i64,
+    pub scenario_id: i64,
+    /// Zero-based within the scenario. Gaps are legal after a delete.
+    pub position: i64,
+    /// May be empty, deliberately: a step whose text is still to come is a
+    /// legitimate authoring state, not an error.
+    pub content: String,
+    /// The window as authored, `HHMM`, four digits. Both ends or neither.
+    pub start_hour: Option<String>,
+    pub end_hour: Option<String>,
+}
+
+impl GameScenarioStep {
+    /// The window, if both ends are present.
+    ///
+    /// One accessor rather than reading the pair at each call site, because a
+    /// half-window is unrepresentable on the wire and a caller that checks
+    /// one end and uses the other is a caller that will eventually send a
+    /// 400.
+    pub fn window(&self) -> Option<(&str, &str)> {
+        Some((self.start_hour.as_deref()?, self.end_hour.as_deref()?))
+    }
+
+    /// The window as one list row, or a dash when there is none.
+    pub fn window_label(&self) -> String {
+        match self.window() {
+            Some((s, e)) => format!("{s}-{e}"),
+            None => "-".to_string(),
+        }
+    }
+}
+
+/// Whether `s` is a `HHMM` the backend will accept.
+///
+/// Strict on purpose, because the backend's own parser is: exactly four
+/// characters, digits only, hour at most 23, minute at most 59. So `900`,
+/// `2400`, `10:00` and `1060` are all refused, and a client that accepts any
+/// of them turns an immediate local correction into a 400 from the field.
+///
+/// Checked on the way out so the author sees the problem while typing.
+pub fn hhmm_ok(s: &str) -> bool {
+    if s.len() != 4 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let h = s[0..2].parse::<u32>().unwrap_or(99);
+    let m = s[2..4].parse::<u32>().unwrap_or(99);
+    h <= 23 && m <= 59
+}
+
+/// Whether a pair of `HHMM` strings is a window the backend will accept.
+///
+/// Both ends or neither, and the end must be after the start. A window that
+/// crosses midnight is two steps, by the backend's own rule.
+pub fn hhmm_window_ok(start: &str, end: &str) -> bool {
+    hhmm_ok(start) && hhmm_ok(end) && start < end
+}
+
 /// One game roster row: who holds which seat, and on which side.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Participant {
@@ -2262,5 +2605,123 @@ impl MinosMaster {
         crate::store::store_spec(conn, unit_id, spec.version, true, &body)
             .map_err(BackendError::Other)?;
         Ok(spec)
+    }
+}
+
+#[cfg(test)]
+mod scenario_tests {
+    use super::{hhmm_ok, hhmm_window_ok, MinosMaster, GameScenarioStep};
+
+    /// The client's `HHMM` check has to be exactly as strict as the server's
+    /// or it defers a local correction to a 400 from the field. The refused
+    /// set here is the server's parser's set, not a guess at it.
+    #[test]
+    fn hhmm_matches_the_servers_parser() {
+        for good in ["0000", "0900", "1000", "1030", "2359"] {
+            assert!(hhmm_ok(good), "{good} should be accepted");
+        }
+        for bad in ["", "9", "900", "2400", "10:00", "1060", "9999", "+900", "09 0", "abcd"] {
+            assert!(!hhmm_ok(bad), "{bad:?} should be refused");
+        }
+    }
+
+    /// A window is both ends or neither, and it runs forwards. A window that
+    /// crosses midnight is two steps, which is the server's rule and not one
+    /// this client gets to relax.
+    #[test]
+    fn a_window_needs_both_ends_and_must_run_forwards() {
+        assert!(hhmm_window_ok("1000", "1030"));
+        assert!(!hhmm_window_ok("1030", "1000"), "an end before its start");
+        assert!(!hhmm_window_ok("1000", "1000"), "a zero-length window");
+        assert!(!hhmm_window_ok("2300", "0100"), "crossing midnight");
+        assert!(
+            !hhmm_window_ok("0900", "1000 "),
+            "a trailing space is not trimmed away silently"
+        );
+    }
+
+    /// A half-window is unrepresentable on the wire, so reading one is not
+    /// possible. Reading the pair through one accessor is what stops a
+    /// caller checking one end and using the other.
+    #[test]
+    fn a_step_window_is_all_or_nothing() {
+        let both = GameScenarioStep {
+            id: 1,
+            scenario_id: 1,
+            position: 0,
+            content: "sweep".into(),
+            start_hour: Some("1000".into()),
+            end_hour: Some("1030".into()),
+        };
+        assert_eq!(both.window(), Some(("1000", "1030")));
+        assert_eq!(both.window_label(), "1000-1030");
+
+        for (s, e) in [(Some("1000"), None), (None, Some("1030")), (None, None)] {
+            let step = GameScenarioStep {
+                start_hour: s.map(String::from),
+                end_hour: e.map(String::from),
+                ..both.clone()
+            };
+            assert_eq!(step.window(), None, "half a window must read as none");
+            assert_eq!(step.window_label(), "-");
+        }
+    }
+
+    /// Steps arrive nested inside the scenario and nowhere else, so the
+    /// parse is the only place that has to get it right.
+    #[test]
+    fn a_scenario_parses_with_its_nested_steps() {
+        let v: serde_json::Value = serde_json::json!({
+            "id": 12,
+            "id_game": 3,
+            "position": 0,
+            "title": "First light",
+            "description": "",
+            "steps": [
+                { "id": 1, "id_scenario": 12, "position": 0, "content": "sweep north", "start_hour": "1000", "end_hour": "1030" },
+                { "id": 2, "id_scenario": 12, "position": 1, "content": "", "start_hour": null, "end_hour": null }
+            ]
+        });
+        let s = MinosMaster::parse_scenario(&v, 3).expect("a scenario with an id decodes");
+        assert_eq!(s.id, 12);
+        assert_eq!(s.title, "First light");
+        assert_eq!(s.steps.len(), 2);
+        assert_eq!(s.steps[0].window_label(), "1000-1030");
+        assert_eq!(
+            s.steps[1].content, "",
+            "an empty step is a legitimate authoring state, not dropped"
+        );
+        assert_eq!(s.steps[1].window_label(), "-");
+    }
+
+    /// A scenario with no id is a decode error rather than a dropped row.
+    /// The composer's whole job is editing this scenario; dropping it would
+    /// leave the author staring at an empty list with no idea why.
+    #[test]
+    fn a_scenario_without_an_id_is_refused() {
+        let v = serde_json::json!({ "id_game": 3, "title": "nameless" });
+        assert!(MinosMaster::parse_scenario(&v, 3).is_err());
+    }
+
+    /// A step with no id is dropped rather than rendered: the composer's
+    /// delete and edit verbs address steps by id, and a row that cannot be
+    /// addressed is a row whose buttons all fail.
+    ///
+    /// The step that IS addressable carries NO `id_scenario` of its own, and
+    /// is kept anyway, because the parent supplies it. Reading it from the
+    /// child instead dropped this row too, which is what the first version
+    /// of this test found.
+    #[test]
+    fn a_step_takes_its_scenario_from_the_parent() {
+        let v: serde_json::Value = serde_json::json!({
+            "id": 5, "id_game": 3, "position": 0, "title": "t",
+            "steps": [
+                { "position": 0, "content": "no id" },
+                { "id": 2, "position": 1, "content": "has an id" }
+            ]
+        });
+        let s = MinosMaster::parse_scenario(&v, 3).expect("the scenario itself decodes");
+        assert_eq!(s.steps.len(), 1);
+        assert_eq!(s.steps[0].content, "has an id");
     }
 }

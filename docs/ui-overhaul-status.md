@@ -44,8 +44,11 @@ the MapLibre core.
 | "In room" is a fact | `Participant::joined_at` | the server already returned it; the parser threw it away |
 | Reduced motion is wired | `ui()` | one `motion_secs` constant, 0 when reduced |
 | The modal primitive, with a real input-swallowing backdrop | `src/chrome.rs` `modal`, `Modal` | 4 geometry tests; the negative-body test failed twice before it passed |
+| The scenario book's client API | `backend::master` `GameScenario`, `GameScenarioStep`, 8 methods | 6 tests: the `HHMM` rules, nested-step parse, no-id refusal |
+| The Scenario Composer modal | `ShipApp::composer_modal`, `composer_body` | `cargo check` clean; **not looked at** (no compositor on this machine) |
+| The composer draft's rules | `ComposerDraft::problem` | 5 tests: half-window, malformed, backwards, no-window, empty content |
 
-`cargo test --lib`: 266 pass. Two failures are pre-existing and unrelated
+`cargo test --lib`: 278 pass. `cargo test --bin tfg`: 30 pass. Two failures are pre-existing and unrelated
 (`quad_bow_follows_the_compass`, `order_move_applies_then_higher_overrides_loudly`);
 both were confirmed failing on a stashed tree before this work.
 
@@ -104,12 +107,9 @@ wrong in several places.
 Ordered so each unit is verifiable on its own and each one shrinks the risk of
 the next.
 
-1. **The three modals, on the primitive that now exists.** `chrome::modal`
-   is landed and tested; the three modals ON it are not started.
-   - **Scenario Composer** is new end to end. Its contract is settled (see
-     the backend table): a game's book of ordered scenarios, each with
-     ordered steps, a step being content plus an optional `HHMM` window and
-     NO title, staff-only, no player-facing current-step read.
+1. **The remaining two modals.** `chrome::modal` is landed, the Scenario
+   Composer is built on it, and the other two are still the old inline
+   widgets.
    - **Fleet Picker** is the existing miller/drag code re-homed. It is
      roughly 80% built; the work is the container and making the drag-to-map
      survive the modal, which the backdrop now blocks and the drag handler

@@ -1313,6 +1313,62 @@ struct LoginDone {
     probe_note: Option<String>,
 }
 
+/// What a book read or write answered with.
+///
+/// A step write answers with the whole scenario and a book read with the
+/// whole book, so one slot has to carry both. `One` is spliced into the
+/// local list rather than replacing it: replacing would drop every OTHER
+/// scenario the author was not looking at.
+enum Book {
+    List(Vec<tfg::backend::GameScenario>),
+    One(tfg::backend::GameScenario),
+}
+
+/// A step being written, before the server has given it an id.
+///
+/// Held as a draft rather than written straight through because the backend
+/// assigns ids and answers with the whole scenario: a form that only exists
+/// after a round trip is a form the author cannot see their cursor in.
+#[derive(Default, Clone)]
+struct ComposerDraft {
+    content: String,
+    /// `HHMM`, validated by `tfg::backend::hhmm_ok` on the way out.
+    start_hour: String,
+    end_hour: String,
+}
+
+impl ComposerDraft {
+    fn window(&self) -> Option<(&str, &str)> {
+        (!self.start_hour.is_empty() && !self.end_hour.is_empty())
+            .then_some((self.start_hour.as_str(), self.end_hour.as_str()))
+    }
+
+    /// What is wrong with the draft, if anything.
+    ///
+    /// Half a window is the case that matters: the backend refuses it, and
+    /// the refusal arrives after the author has finished typing rather than
+    /// while they are still in the field.
+    fn problem(&self) -> Option<String> {
+        match (self.start_hour.is_empty(), self.end_hour.is_empty()) {
+            (false, true) => Some("a window needs an end as well as a start".into()),
+            (true, false) => Some("a window needs a start as well as an end".into()),
+            (false, false) => {
+                if !tfg::backend::hhmm_ok(&self.start_hour) {
+                    return Some(format!("{} is not a military time like 1000", self.start_hour));
+                }
+                if !tfg::backend::hhmm_ok(&self.end_hour) {
+                    return Some(format!("{} is not a military time like 1030", self.end_hour));
+                }
+                if !tfg::backend::hhmm_window_ok(&self.start_hour, &self.end_hour) {
+                    return Some("a window's end must be after its start".into());
+                }
+                None
+            }
+            (true, true) => None,
+        }
+    }
+}
+
 /// Finished sync (M7): the store connection rides back (it moved
 /// into the worker); counts render the status line.
 struct SyncDone {
@@ -2180,6 +2236,29 @@ struct ShipApp {
     users_roles: Vec<(i64, String, String, bool)>,
     users_roster: Vec<tfg::backend::Participant>,
     users_gunits: Vec<tfg::backend::GameUnit>,
+    /// The held game's scenario book, and which scenario the composer has
+    /// open. The book is loaded with the rest of the Planning bundle; the
+    /// open id is `None` when the composer is closed.
+    scenarios: Vec<tfg::backend::GameScenario>,
+    composer_scenario: Option<i64>,
+    /// Whether the composer is on screen. Separate from
+    /// `composer_scenario` because a game with an EMPTY book must still be
+    /// openable: the add-field lives in the modal, so with no scenario to
+    /// select there would be no way to reach it.
+    composer_visible: bool,
+    /// A step being authored, before it is a server row. It exists as a
+    /// draft because the backend assigns the id, and a field that only
+    /// appears after a round trip is a field an author cannot see their
+    /// cursor in.
+    composer_draft: ComposerDraft,
+    /// What is wrong with the draft, shown under the form. Separate from
+    /// `users_status` because a half-typed window is not a backend refusal
+    /// and must not overwrite the last real status line.
+    composer_draft_error: Option<String>,
+    /// The in-flight book read or write. One slot rather than one per verb:
+    /// the composer is a single author at a time, and a second write would
+    /// answer against a book the first write had already changed.
+    scenarios_op: Option<RestOp<Book, String>>,
     /// Ids of pieces in the exercise but UNASSIGNED in the task
     /// organisation (`id_hierarchy_node` absent). The symbology draws
     /// planned status as a dashed frame, and this is the fact behind
@@ -3248,8 +3327,20 @@ impl ShipApp {
             self.clear_visual_cache();
             self.reset_registry_view();
             self.users_game_state = None;
+            // The book belongs to a game, so holding another one has to
+            // clear it: otherwise the composer opens showing the previous
+            // session's scenarios, and a write against them would be
+            // refused by a boundary the author cannot see on screen.
+            self.scenarios.clear();
+            self.composer_scenario = None;
+            self.composer_visible = false;
+            self.composer_draft = ComposerDraft::default();
+            self.composer_draft_error = None;
         }
         self.users_game = game;
+        if old_id != new_id && self.users_game.is_some() {
+            self.load_scenarios();
+        }
     }
 
     /// Stash a fresh pair: access token in memory with a fresh issue
@@ -6190,6 +6281,30 @@ impl ShipApp {
                 ui.text_edit_singleline(&mut self.setup_map_tag);
             });
             ui.weak("mode is always maneuver — the only mode this release.");
+        // The scenario book's entry point, on the island that already owns
+        // the held session's own facts.
+        //
+        // ABSENT outside planning rather than greyed out: authoring is a
+        // planning-time act and the server refuses it after, so a control
+        // that would 403 is a lie about what this session can do.
+        if self.users_game.is_some() && self.users_game_state.as_deref() == Some("planning") {
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Scenario composer")
+                    .on_hover_text("author this session's scenarios and the steps players see")
+                    .clicked()
+                {
+                    self.open_composer(None);
+                }
+                if !self.scenarios.is_empty() {
+                    let steps: usize = self.scenarios.iter().map(|s| s.steps.len()).sum();
+                    ui.weak(format!(
+                        "{} scenario(s), {steps} step(s).",
+                        self.scenarios.len()
+                    ));
+                }
+            });
+        }
         }
     }
 
@@ -7351,6 +7466,272 @@ impl ShipApp {
                 }
             });
         self.settings_open = open && !closed;
+    }
+
+    // -- the Scenario Composer ------------------------------------------------
+    //
+    // Authors ONE game's book. It is not a picker over a catalog: a game has
+    // exactly one book, the book IS its ordered scenarios, and there is no
+    // cross-game template. So the modal's left column is this game's
+    // scenarios and the right column is the open scenario's steps.
+    //
+    // Every write is off-thread and answers with the whole scenario, so the
+    // list is redrawn from the server's answer rather than from a local guess
+    // at what the order now is.
+
+    fn open_composer(&mut self, scenario_id: Option<i64>) {
+        // A remembered open scenario is worth keeping across a close, so an
+        // explicit argument wins and otherwise the previous one is reused.
+        // With none, the first in the book is the sensible landing: the book
+        // is ordered and an author reopening means to keep working.
+        if let Some(id) = scenario_id {
+            self.composer_scenario = Some(id);
+        } else if self.composer_scenario.is_none() {
+            self.composer_scenario = self.scenarios.first().map(|s| s.id);
+        }
+        self.composer_visible = true;
+        self.composer_draft = ComposerDraft::default();
+        self.composer_draft_error = None;
+        self.load_scenarios();
+    }
+
+    /// Re-read the book. The answer replaces the whole list.
+    fn load_scenarios(&mut self) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.users_status = "hold a session first".to_string();
+            return;
+        };
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("book refused: {e}");
+                return;
+            }
+        };
+        self.scenarios_op = Some(spawn_rest("scenarios", move || {
+            master
+                .game_scenarios(&tok, gid)
+                .map_err(|e| e.to_string())
+                .map(Book::List)
+        }));
+    }
+
+    fn add_scenario_step(&mut self) {
+        let Some(sid) = self.composer_scenario else {
+            return;
+        };
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        if let Some(problem) = self.composer_draft.problem() {
+            self.composer_draft_error = Some(problem);
+            return;
+        }
+        let content = std::mem::take(&mut self.composer_draft.content);
+        let window = self.composer_draft.window().map(|(a, b)| (a.to_string(), b.to_string()));
+        self.composer_draft = ComposerDraft::default();
+        self.composer_draft_error = None;
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("step refused: {e}");
+                return;
+            }
+        };
+        let window = window.map(|(a, b)| (a, b));
+        self.scenarios_op = Some(spawn_rest("scenario-step", move || {
+            master
+                .add_scenario_step(
+                    &tok,
+                    gid,
+                    sid,
+                    &content,
+                    window.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+                )
+                .map_err(|e| e.to_string())
+                .map(Book::One)
+        }));
+    }
+
+    fn delete_scenario_step(&mut self, step_id: i64) {
+        let Some(sid) = self.composer_scenario else {
+            return;
+        };
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("delete refused: {e}");
+                return;
+            }
+        };
+        self.scenarios_op = Some(spawn_rest("scenario-step-del", move || {
+            master
+                .delete_scenario_step(&tok, gid, sid, step_id)
+                .map_err(|e| e.to_string())
+                .map(Book::One)
+        }));
+    }
+
+    fn create_scenario(&mut self, title: &str) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        let title = title.trim();
+        if title.is_empty() {
+            // The backend requires a title, and it is the one field on this
+            // form that cannot be empty.
+            self.composer_draft_error = Some("a scenario needs a title".into());
+            return;
+        }
+        let title = title.to_string();
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("scenario refused: {e}");
+                return;
+            }
+        };
+        self.scenarios_op = Some(spawn_rest("scenario-create", move || {
+            master
+                .create_game_scenario(&tok, gid, &title, "")
+                .map_err(|e| e.to_string())
+                .map(Book::One)
+        }));
+    }
+
+    /// The composer modal.
+    fn composer_modal(&mut self, ui: &egui::Ui) {
+        let open_sid = self.composer_scenario;
+        let spec = tfg::chrome::Modal::new(
+            egui::Id::new("composer"),
+            "Scenario composer",
+            egui::vec2(880.0, 560.0),
+        );
+        let kept = tfg::chrome::modal(ui.ctx(), &spec, |ui| self.composer_body(ui, open_sid));
+        if !kept {
+            self.composer_scenario = None;
+            self.composer_draft = ComposerDraft::default();
+            self.composer_draft_error = None;
+        }
+    }
+
+    /// The composer body, in two columns.
+    ///
+    /// Written as ONE `columns` closure with `cols[0]`/`cols[1]` indexed at
+    /// each use rather than bound once. Binding both up front is two live
+    /// mutable borrows of the same `Vec<Ui>`, which the borrow checker
+    /// refuses, and splitting it into two closures means calling `columns`
+    /// twice, which draws two 50/50 splits instead of one pair of columns.
+    fn composer_body(&mut self, ui: &mut egui::Ui, open_sid: Option<i64>) {
+        let scenarios = self.scenarios.clone();
+        ui.columns(2, |cols| {
+            cols[0].label("This game's book");
+            cols[0].separator();
+            if scenarios.is_empty() {
+                cols[0].weak("No scenarios yet. One game has one book.");
+            }
+            for sc in scenarios.iter() {
+                let selected = Some(sc.id) == open_sid;
+                if cols[0]
+                    .selectable_label(
+                        selected,
+                        format!("{}  -  {} step(s)", sc.title, sc.steps.len()),
+                    )
+                    .clicked()
+                    && !selected
+                {
+                    self.composer_scenario = Some(sc.id);
+                }
+            }
+            cols[0].add_space(8.0);
+            let mut new_title = String::new();
+            ui_input(&mut cols[0], &mut new_title, "New scenario title");
+            if cols[0].button("Add scenario").clicked() {
+                self.create_scenario(&new_title);
+            }
+
+            cols[1].separator();
+            match open_sid.and_then(|id| scenarios.iter().find(|sc| sc.id == id).cloned()) {
+                None => {
+                    cols[1].weak("Pick a scenario, or add one.");
+                }
+                Some(open) => {
+                    let steps = open.steps.clone();
+                    cols[1].label(format!("Steps - {}", open.title));
+                    cols[1].weak("Each step is one thing that must happen, in order.");
+                    if steps.is_empty() {
+                        cols[1].weak("No steps yet. A plan may be authored while it is written.");
+                    }
+                    for step in steps.iter() {
+                        cols[1].horizontal(|row| {
+                            row.monospace(format!("{:>2}", step.position + 1));
+                            // A step with no text reads as weak ink, because
+                            // "(not written yet)" is a placeholder the author
+                            // supplied rather than something anyone decided.
+                            let text = if step.content.is_empty() {
+                                "(not written yet)".to_string()
+                            } else {
+                                step.content.clone()
+                            };
+                            let label = egui::RichText::new(text);
+                            row.label(if step.content.is_empty() {
+                                label.weak()
+                            } else {
+                                label
+                            });
+                            row.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |tail| {
+                                    if tail.small_button("remove").clicked() {
+                                        self.delete_scenario_step(step.id);
+                                    }
+                                    tail.monospace(step.window_label());
+                                },
+                            );
+                        });
+                    }
+                    cols[1].separator();
+                    cols[1].label("New step");
+                    ui_text(
+                        &mut cols[1],
+                        &mut self.composer_draft.content,
+                        "What must happen",
+                    );
+                    cols[1].horizontal(|row| {
+                        let mut draft = self.composer_draft.clone();
+                        row.label("window");
+                        let a = row.add(
+                            egui::TextEdit::singleline(&mut draft.start_hour)
+                                .desired_width(52.0)
+                                .hint_text("1000"),
+                        );
+                        let b = row.add(
+                            egui::TextEdit::singleline(&mut draft.end_hour)
+                                .desired_width(52.0)
+                                .hint_text("1030"),
+                        );
+                        if a.changed() || b.changed() {
+                            self.composer_draft = draft;
+                        }
+                        row.weak("HHMM, or leave both empty");
+                    });
+                    if let Some(problem) = self.composer_draft.problem() {
+                        warn_line(&mut cols[1], problem);
+                    }
+                    if let Some(err) = self.composer_draft_error.clone() {
+                        warn_line(&mut cols[1], err);
+                    }
+                    if cols[1].button("Add step").clicked() {
+                        self.add_scenario_step();
+                    }
+                    cols[1].separator();
+                    status_line(&mut cols[1], &self.users_status.clone());
+                }
+            }
+        });
     }
 
     /// The side zone: a column of islands whose contents are a function of
@@ -8697,6 +9078,33 @@ impl ShipApp {
             // A completed request is invisible until a frame asks for it.
             self.dirty = true;
             self.apply_specs(res);
+        }
+        // The scenario book. A step write answers with ONE scenario, so it
+        // is spliced into the local list rather than replacing it:
+        // replacing would drop every other scenario the author was not
+        // looking at, and the composer is a whole-book tool.
+        if let Some(res) = self.scenarios_op.as_ref().and_then(|op| op.poll()) {
+            self.scenarios_op = None;
+            // A completed request is invisible until a frame asks for it.
+            self.dirty = true;
+            match res {
+                Ok(Book::List(list)) => {
+                    self.scenarios = list;
+                    self.users_status = format!("{} scenario(s).", self.scenarios.len());
+                }
+                Ok(Book::One(one)) => {
+                    if let Some(slot) = self.scenarios.iter_mut().find(|s| s.id == one.id) {
+                        *slot = one.clone();
+                    } else {
+                        self.scenarios.push(one.clone());
+                    }
+                    if self.composer_scenario.is_none() {
+                        self.composer_scenario = Some(one.id);
+                    }
+                    self.users_status = format!("saved \u{201c}{}\u{201d}.", one.title);
+                }
+                Err(e) => self.users_status = format!("book refused: {e}"),
+            }
         }
         if let Some(res) = self.pw_op.as_ref().and_then(|op| op.poll()) {
             self.pw_op = None;
@@ -12033,6 +12441,9 @@ impl eframe::App for ShipApp {
         if self.settings_open {
             self.settings_modal(ui);
         }
+        if self.composer_visible {
+            self.composer_modal(ui);
+        }
 
         let mut follow_req: Option<(String, (f64, f64))> = None;
         if self.show_roster
@@ -14067,6 +14478,12 @@ fn main() -> Result<(), String> {
                 users_role: None,
                 users_roles: Vec::new(),
                 users_roster: Vec::new(),
+                scenarios: Vec::new(),
+                composer_scenario: None,
+                composer_visible: false,
+                composer_draft: ComposerDraft::default(),
+                composer_draft_error: None,
+                scenarios_op: None,
                 users_gunits: Vec::new(),
                 unassigned_units: std::collections::HashSet::new(),
                 commanded_hulls: Vec::new(),
@@ -14244,6 +14661,106 @@ fn main() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- the composer's draft ---------------------------------------------
+    //
+    // The draft is the only place the author can be told what is wrong with
+    // a step BEFORE the round trip, so its rules are worth pinning: a
+    // refusal that only arrives as a 400 from the field is a refusal the
+    // author has to guess the cause of.
+
+    /// No window is the default and is always fine. Both ends empty is what
+    /// an unauthored window looks like, and it is what the backend takes.
+    #[test]
+    fn a_draft_with_no_window_is_valid() {
+        let d = ComposerDraft {
+            content: "sweep north".into(),
+            ..Default::default()
+        };
+        assert_eq!(d.window(), None);
+        assert_eq!(d.problem(), None);
+    }
+
+    /// Half a window is the case that bites: the backend refuses it, so the
+    /// author is told now rather than after finishing the form.
+    #[test]
+    fn half_a_window_is_refused_before_the_request() {
+        let half_start = ComposerDraft {
+            start_hour: "1000".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            half_start.problem().as_deref(),
+            Some("a window needs an end as well as a start")
+        );
+
+        let half_end = ComposerDraft {
+            end_hour: "1030".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            half_end.problem().as_deref(),
+            Some("a window needs a start as well as an end")
+        );
+    }
+
+    /// Malformed and backwards windows are named as such, and the message
+    /// quotes what was typed, because "not a military time" without the
+    /// offending value leaves the author hunting.
+    #[test]
+    fn a_bad_window_says_which_value_is_bad() {
+        let bad_start = ComposerDraft {
+            start_hour: "900".into(),
+            end_hour: "1030".into(),
+            ..Default::default()
+        };
+        assert!(bad_start
+            .problem()
+            .unwrap()
+            .starts_with("900 is not a military time"));
+
+        let bad_end = ComposerDraft {
+            start_hour: "1000".into(),
+            end_hour: "25:00".into(),
+            ..Default::default()
+        };
+        assert!(bad_end
+            .problem()
+            .unwrap()
+            .starts_with("25:00 is not a military time"));
+
+        let backwards = ComposerDraft {
+            start_hour: "1030".into(),
+            end_hour: "1000".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            backwards.problem().as_deref(),
+            Some("a window's end must be after its start")
+        );
+    }
+
+    /// A good window comes through as the pair the request expects, not as
+    /// the two fields re-derived at the call site.
+    #[test]
+    fn a_good_window_becomes_the_pair_the_request_takes() {
+        let d = ComposerDraft {
+            content: "".into(),
+            start_hour: "1000".into(),
+            end_hour: "1030".into(),
+        };
+        assert_eq!(d.problem(), None);
+        assert_eq!(d.window(), Some(("1000", "1030")));
+    }
+
+    /// An empty step is a legitimate authoring state, not something the
+    /// draft refuses. The backend says so explicitly, and a client that
+    /// insisted on text would block an author from saving a skeleton.
+    #[test]
+    fn an_empty_step_is_not_the_drafts_business() {
+        let d = ComposerDraft::default();
+        assert_eq!(d.problem(), None, "content is the server's rule, not the draft's");
+    }
 
     fn entry(unit_id: i64, w: Option<u32>, h: Option<u32>) -> tfg::backend::UnitImageEntry {
         tfg::backend::UnitImageEntry {
@@ -14802,4 +15319,26 @@ mod tests {
         let unsupported = UnitVisual::from_entry(&future, "v1", symbol(2));
         assert!(!unsupported.is_map_renderable(), "a future kind is not a hull image");
     }
+}
+
+/// A single-line field with a fixed label above it.
+///
+/// Two helpers rather than one `field` because the composer's two shapes
+/// differ: the title is one short line, the step content is a box. Forcing
+/// both through one helper would have meant a parameter that is ignored half
+/// the time.
+fn ui_input(ui: &mut egui::Ui, value: &mut String, label: &str) {
+    ui.label(egui::RichText::new(label).weak().small());
+    ui.add(
+        egui::TextEdit::singleline(value).desired_width(f32::INFINITY),
+    );
+}
+
+fn ui_text(ui: &mut egui::Ui, value: &mut String, label: &str) {
+    ui.label(egui::RichText::new(label).weak().small());
+    ui.add(
+        egui::TextEdit::multiline(value)
+            .desired_width(f32::INFINITY)
+            .desired_rows(3),
+    );
 }
