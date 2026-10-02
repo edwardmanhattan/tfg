@@ -87,6 +87,22 @@ impl Groups {
     }
 
     /// Member units of one group, descended through its children.
+    /// Every id that is somebody's CHILD.
+    ///
+    /// The map needs this to keep nested groups quiet when they are drawn
+    /// as symbols: a Gugus frame and three Unsur frames within a few
+    /// pixels is unreadable, and the parent's count already says the task
+    /// organisation exists. One pass, so it costs nothing per frame.
+    pub fn nested_ids(&self) -> HashSet<String> {
+        let mut nested = HashSet::new();
+        for group in self.groups.iter() {
+            for child in &group.children {
+                nested.insert(child.clone());
+            }
+        }
+        nested
+    }
+
     pub fn group_units(&self, id: &str) -> Vec<String> {
         let mut out = Vec::new();
         self.collect_units(id, &mut out);

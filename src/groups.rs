@@ -76,6 +76,40 @@ mod tests {
     use crate::command::Authority;
     use std::collections::HashMap;
 
+    /// A nested group must be identifiable in one pass, because the map
+    /// asks that question every frame to keep child symbols quiet.
+    #[test]
+    fn nested_ids_reports_every_child_and_no_root() {
+        // Built bottom-up, as the hierarchy demands: a child exists
+        // before its parent can muster it.
+        let mut g = Groups::default();
+        g.add_group("unsur".into(), "Unsur".into(), GroupKind::Unsur, vec![], vec![], None)
+            .expect("unsur");
+        g.add_group(
+            "gugus".into(),
+            "Gugus".into(),
+            GroupKind::Gugus,
+            vec![],
+            vec!["unsur".into()],
+            None,
+        )
+        .expect("gugus");
+        g.add_group(
+            "op".into(),
+            "Op".into(),
+            GroupKind::OperasiGabungan,
+            vec![],
+            vec!["gugus".into()],
+            None,
+        )
+        .expect("op");
+        let nested = g.nested_ids();
+        assert!(nested.contains("unsur"), "a child is nested");
+        assert!(nested.contains("gugus"), "a grandchild is nested too");
+        assert!(!nested.contains("op"), "a root is nobody's child");
+        assert_eq!(nested.len(), 2);
+    }
+
     fn rig() -> (Groups, HashMap<String, String>) {
         let mut g = Groups::default();
         g.add_group(
