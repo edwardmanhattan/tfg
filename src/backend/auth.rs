@@ -28,13 +28,83 @@ pub struct TokenPair {
     pub must_change_password: bool,
 }
 
-/// The authenticated account's stable identity and application-role ids.
-/// The role ids let the desktop client keep session-management controls
-/// hidden for participants without guessing from display names.
+/// One application role, as `/users/me` returns it.
+///
+/// An id AND a name, because the two answer different questions and neither
+/// substitutes for the other: capability derives from the id (the backend
+/// keys its policies on ids, and a role may be renamed without revoking
+/// anything), while the Operator island has to render a word an operator can
+/// read. The client previously kept ids only and printed `APP ROLE 1`, which
+/// tells a person nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppRole {
+    pub id: i64,
+    pub name: String,
+}
+
+/// The authenticated account's identity, as `GET /users/me` describes it.
+///
+/// Every field here comes from that response and nothing is invented. The
+/// contract returns `username`, `name`, `email` and a nullable `photo_url`
+/// alongside the role array (Minos `dto.UserDetail`); the client used to
+/// parse two of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedUser {
     pub id: i64,
-    pub app_role_ids: Vec<i64>,
+    /// The login identifier. Never blank: a blank one failed at `/auth/login`.
+    pub username: String,
+    /// The person's name. May be blank — the column is nullable in spirit and
+    /// an account created only with a username is legitimate.
+    pub display_name: String,
+    pub email: Option<String>,
+    /// A presigned, time-limited URL, or `None`.
+    ///
+    /// `None` means two different things and the client cannot tell them
+    /// apart: the account has no photo, or a presign failed. The backend logs
+    /// the second and returns the account without one. So this is a
+    /// "maybe no picture", never an error, and the UI draws its default
+    /// glyph for it rather than reporting a failure. There is also no
+    /// endpoint to set a photo yet, so most accounts will be glyphs.
+    pub photo_url: Option<String>,
+    pub app_roles: Vec<AppRole>,
+}
+
+impl AuthenticatedUser {
+    /// Whether the account holds a given application role.
+    ///
+    /// The only question the client asks about roles, and it asks it by id
+    /// on purpose: names are authorable in the CMS, so a name comparison
+    /// would change what the UI allows when someone renames a row.
+    pub fn has_app_role(&self, id: i64) -> bool {
+        self.app_roles.iter().any(|r| r.id == id)
+    }
+
+    /// The roles' names, comma-joined, for a display surface.
+    ///
+    /// Empty when there are none, which is a real state: an account with no
+    /// application role is a participant account, and the caller decides
+    /// whether that reads as "no role" or as nothing at all.
+    pub fn app_role_label(&self) -> String {
+        self.app_roles
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// What to show in the Operator island's name slot.
+    ///
+    /// The display name when there is one, the login identifier otherwise.
+    /// The identifier is the fallback because it is the one string the
+    /// backend guarantees, and an island that says nothing is worse than one
+    /// that says a username.
+    pub fn label(&self) -> &str {
+        if self.display_name.trim().is_empty() {
+            &self.username
+        } else {
+            &self.display_name
+        }
+    }
 }
 
 /// Strict pair decode (M2): the access token must be non-empty, the
@@ -198,15 +268,59 @@ impl MinosAuth {
             return Err(BackendError::http_error(status.as_u16(), &body));
         }
         let data = &body["data"];
-        let id = data["id"]
-            .as_i64()
-            .ok_or_else(|| BackendError::Other("me answer without an id".to_string()))?;
-        let app_role_ids = data["roles"]
-            .as_array()
-            .map(|roles| roles.iter().filter_map(|role| role["id"].as_i64()).collect())
-            .unwrap_or_default();
-        Ok(AuthenticatedUser { id, app_role_ids })
+        parse_user(data)
     }
+}
+
+/// Decode one `/users/me` payload.
+///
+/// Split out of [`MinosAuth::me`] so the fields the Operator island depends
+/// on can be tested without a socket. The first version of that test
+/// re-implemented this function inline and drifted from it, which is the
+/// failure this split exists to prevent: a test that mirrors the code proves
+/// nothing about the code.
+///
+/// Only `id` is required, because it is the one field every later readiness
+/// check joins on. Everything else has a defined "absent" and is folded into
+/// one rather than defaulted into a lie.
+pub(crate) fn parse_user(data: &serde_json::Value) -> Result<AuthenticatedUser, BackendError> {
+    let id = data["id"]
+        .as_i64()
+        .ok_or_else(|| BackendError::Other("me answer without an id".to_string()))?;
+    // A role row without an id is skipped rather than defaulted: it cannot
+    // answer a capability question, and inventing an id would grant whatever
+    // it happened to collide with.
+    let app_roles = data["roles"]
+        .as_array()
+        .map(|roles| {
+            roles
+                .iter()
+                .filter_map(|role| {
+                    let id = role["id"].as_i64()?;
+                    Some(AppRole {
+                        id,
+                        name: role["name"].as_str().unwrap_or_default().to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // `""` and a missing key are both "no value", and the backend stores
+    // these nullable, so an empty string is folded rather than shown.
+    let text = |key: &str| {
+        data[key]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+    };
+    Ok(AuthenticatedUser {
+        id,
+        username: data["username"].as_str().unwrap_or_default().to_string(),
+        display_name: data["name"].as_str().unwrap_or_default().to_string(),
+        email: text("email"),
+        photo_url: text("photo_url"),
+        app_roles,
+    })
 }
 
 /// Refresh-token store (keyring resolution): OS keyring entry per

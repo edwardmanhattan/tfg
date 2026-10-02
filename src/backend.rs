@@ -19,7 +19,7 @@ mod replay;
 
 pub use error::BackendError;
 
-pub use auth::{AuthenticatedUser, MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
+pub use auth::{AppRole, AuthenticatedUser, MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
 pub use feed::{GameMsg, MinosRest, Snapshot};
 pub use live::{LIVE_BACKOFF_BASE_SECS, LIVE_BACKOFF_CAP_SECS, LiveCmd, LiveEvent, LiveWire};
 pub use master::{BackendUser, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, Review, ScenarioRole, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
@@ -385,7 +385,7 @@ mod tests {
                     )
                 } else if url == "/api/v1/users/me" {
                     tiny_http::Response::from_string(
-                        r#"{"status_code":200,"message":"Successfull","data":{"id":7,"username":"operator1","roles":[{"id":2,"name":"Operator"}]}}"#,
+                        r#"{"status_code":200,"message":"Successfull","data":{"id":7,"username":"operator1","name":"Rina Hartono","email":"rina@example.id","photo_url":"https://minos.example/sig.png","roles":[{"id":2,"name":"Operator"}]}}"#,
                     )
                 } else {
                     tiny_http::Response::from_string("").with_status_code(404)
@@ -403,7 +403,88 @@ mod tests {
         assert_eq!(pair2.refresh_token.as_deref(), Some("RT2"));
         let identity = auth.me("AT2").expect("gate open");
         assert_eq!(identity.id, 7, "probe carries the caller id for readiness matching");
-        assert_eq!(identity.app_role_ids, vec![2], "probe carries application roles");
+        assert_eq!(identity.app_roles.len(), 1, "probe carries application roles");
+        assert!(
+            identity.has_app_role(2),
+            "capability asks by id, because a role may be renamed"
+        );
+        assert!(
+            !identity.has_app_role(1),
+            "a role the account does not hold must not answer true"
+        );
+        assert_eq!(
+            identity.app_role_label(),
+            "Operator",
+            "the Operator island has to render a word, not a number"
+        );
+        assert_eq!(identity.label(), "Rina Hartono", "the display name wins");
+        assert_eq!(
+            identity.photo_url.as_deref(),
+            Some("https://minos.example/sig.png"),
+            "the presigned photo is carried through untouched"
+        );
+    }
+
+    /// The `/users/me` fields the Operator island depends on, and the
+    /// fallbacks that keep it from rendering an empty island.
+    ///
+    /// These are the cases the contract actually allows: `photo_url` is
+    /// nullable, `name` can be blank on an account created with only a
+    /// username, and nullable text arrives as an empty string in some
+    /// deployments rather than as a null.
+    #[test]
+    fn an_account_with_no_photo_or_display_name_still_labels_itself() {
+        use crate::backend::auth::parse_user;
+
+        let bare = parse_user(&serde_json::json!({ "id": 1, "username": "operator1" }))
+            .expect("an id is the only required field");
+        assert_eq!(bare.photo_url, None, "no photo is not an error");
+        assert_eq!(bare.email, None);
+        assert_eq!(bare.label(), "operator1", "falls back to the username");
+        assert_eq!(
+            bare.app_role_label(),
+            "",
+            "an account with no role says nothing rather than guessing"
+        );
+
+        let blanked = parse_user(&serde_json::json!({
+            "id": 1,
+            "username": "operator1",
+            "name": "",
+            "email": "   ",
+            "photo_url": serde_json::Value::Null,
+            "roles": [{ "id": 1 }],
+        }))
+        .expect("an id is the only required field");
+        assert_eq!(blanked.label(), "operator1", "a blank name is not a name");
+        assert_eq!(blanked.email, None, "whitespace is not an address");
+        assert_eq!(
+            blanked.photo_url, None,
+            "an explicit null is absence, not a broken URL"
+        );
+        assert_eq!(
+            blanked.app_role_label(),
+            "",
+            "a role row with no name must not print a blank tag"
+        );
+
+        // A role with no id cannot answer a capability question, so it is
+        // dropped rather than defaulted to something.
+        let partial = parse_user(&serde_json::json!({
+            "id": 1,
+            "roles": [{ "name": "Operator" }, { "id": 2, "name": "Administrator" }],
+        }))
+        .expect("an id is the only required field");
+        assert_eq!(partial.app_roles.len(), 1);
+        assert!(partial.has_app_role(2));
+    }
+
+    /// An answer with no id is a decode error, never a user with id zero.
+    /// Zero would join against real rows.
+    #[test]
+    fn a_me_answer_without_an_id_is_refused() {
+        use crate::backend::auth::parse_user;
+        assert!(parse_user(&serde_json::json!({ "username": "operator1" })).is_err());
     }
 
     #[test]

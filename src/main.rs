@@ -23,6 +23,7 @@ use chrono::{TimeZone, Utc};
 use tfg::backend::{BackendError, FileReplay, GameFix, GameMsg, GamePositionUpdate, LiveCmd, LiveEvent, LiveWire, MinosAuth, MinosMaster, MinosRest, MockPoll, PollSource, TokenPair};
 use tfg::catalog::Catalog;
 use tfg::fleet::Fleet;
+use tfg::gamestate::GameState;
 use tfg::groups::{GroupKind, Groups};
 use tfg::command::{Authority, Grant, GrantDenial, Leg, MoveCommand, Verb};
 use tfg::geo::track::{Fix, FixSource, Registry, TrailBound, should_track};
@@ -88,6 +89,54 @@ enum Phase {
     Setup,
     Live,
     Closed,
+}
+
+/// Whether the top zone is rendering floating chrome or the onboarding card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkState {
+    /// No socket. The default before anyone asks to connect.
+    Idle,
+    /// A connect is in flight. Nothing has been proved yet.
+    Connecting,
+    /// The actor reported Connected.
+    Live,
+    /// The server refused: bad token, or a gate in the way.
+    Refused,
+    /// Transport failed after a connect, or the socket dropped.
+    Faulted,
+}
+
+impl LinkState {
+    /// The one word the top zone shows. Short caps, no verb, because this is
+    /// a state and not an event.
+    fn label(self) -> &'static str {
+        match self {
+            LinkState::Idle => "OFFLINE",
+            LinkState::Connecting => "CONNECTING",
+            LinkState::Live => "LIVE",
+            LinkState::Refused => "REFUSED",
+            LinkState::Faulted => "FAULT",
+        }
+    }
+
+    /// The status ink. Every state routes through here, so a line reporting
+    /// the link can never be gray-on-gray (DESIGN.md's Never Gray-On-Gray
+    /// rule).
+    fn ink(self) -> egui::Color32 {
+        match self {
+            LinkState::Live => tfg::tokens::SIGNAL_GREEN,
+            LinkState::Connecting => tfg::tokens::WARNING_SAND,
+            LinkState::Refused | LinkState::Faulted => tfg::tokens::FAULT_RED,
+            LinkState::Idle => tfg::tokens::IDLE_GREY,
+        }
+    }
+
+    /// Whether the socket is supposed to exist, which is not the same as
+    /// whether it is up. A refusal leaves it wired, so `is_some` on the
+    /// sender is the honest "asked for" and this is the honest "up".
+    fn is_up(self) -> bool {
+        matches!(self, LinkState::Live)
+    }
 }
 
 /// Placement pointer tool. Active in Setup (initial fleet) and Live
@@ -200,14 +249,6 @@ enum Onboard {
 /// Eksekusi is `Phase::Live`, Evaluasi is `Phase::Closed`. Derived
 /// from `UiMode` every frame, never stored, so the existing state
 /// machine (#26) stays the single writer of the phase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SimStage {
-    Planning,
-    Ready,
-    Live,
-    Eval,
-}
-
 /// Runtime wire backends for the poll thread (task #39). Replay stays
 /// boot-only (env).
 enum WireKind {
@@ -440,19 +481,7 @@ fn warn_line(ui: &mut egui::Ui, msg: String) {
 
 /// Human-readable freshness for the context strip. A bare `162s` reads like
 /// a sensor dump; minutes and an explicit “never” are useful at a glance.
-fn human_age(at: Option<Instant>) -> String {
-    let Some(at) = at else { return "never".to_string() };
-    let seconds = at.elapsed().as_secs();
-    if seconds < 60 {
-        format!("{seconds}s ago")
-    } else if seconds < 3_600 {
-        format!("{}m ago", seconds / 60)
-    } else if seconds < 86_400 {
-        format!("{}h ago", seconds / 3_600)
-    } else {
-        format!("{}d ago", seconds / 86_400)
-    }
-}
+
 
 /// Strip fractional seconds and the date from an RFC3339 timestamp. The full
 /// wire value remains available in the log; the operator only needs “now”.
@@ -1273,8 +1302,13 @@ struct PlotSlot {
 struct LoginDone {
     user: String,
     pair: tfg::backend::TokenPair,
-    uid: Option<i64>,
-    app_role_ids: Vec<i64>,
+    /// The whole `/users/me` projection, when the gate probe ran.
+    ///
+    /// It used to ride back as a bare uid plus a `Vec<i64>` of role ids,
+    /// which is what made the Operator island print `APP ROLE 1`. The
+    /// response is one object; carrying two slices of it and re-deriving the
+    /// rest is how the display half got lost.
+    identity: Option<tfg::backend::AuthenticatedUser>,
     needs_change: bool,
     probe_note: Option<String>,
 }
@@ -1960,6 +1994,27 @@ struct ShipApp {
     /// Window memory (ADR-0014). An island positions itself, so its origin
     /// lives here and is written back after the island closes.
     roster_pos: egui::Pos2,
+    /// The side zone (ADR-0016 / DESIGN.md "The three zones"): a column of
+    /// islands down one edge, toggled as a unit.
+    ///
+    /// `show_side_zone` and `side_dock` are the whole of the zone's
+    /// persistent state. Both are plain fields on purpose: the app has no
+    /// storage backend (`eframe::NativeOptions` exposes none), so anything
+    /// remembered here dies with the process. Writing that down is cheaper
+    /// than a settings key that silently does nothing.
+    show_side_zone: bool,
+    side_dock: tfg::chrome::Dock,
+    /// The settings modal's visibility. A bool rather than egui memory
+    /// because the modal holds a mode switch that has to be able to cancel.
+    settings_open: bool,
+    /// Reduced motion. Collapses every egui animation to its target by
+    /// zeroing the animation clock, which is the one switch DESIGN.md
+    /// promises rather than per-component.
+    reduced_motion: bool,
+    /// The animation budget in seconds when motion is allowed. One number
+    /// for the whole console, so the taste is tunable in one place and the
+    /// reduced-motion path is literally this set to zero.
+    motion_secs: f32,
     inspector_pos: egui::Pos2,
     orders_pos: egui::Pos2,
     login_pos: egui::Pos2,
@@ -2193,7 +2248,8 @@ struct ShipApp {
     /// Application-role ids from the same probe. An empty list is a
     /// participant account: room-key join is available, session setup
     /// administration is not.
-    auth_app_role_ids: Vec<i64>,
+    /// The whole `/users/me` projection. `None` is not signed in.
+    auth_identity: Option<tfg::backend::AuthenticatedUser>,
     auth_token: Option<String>,
     auth_issued_at: Option<Instant>,
     auth_ttl_secs: u64,
@@ -2238,6 +2294,14 @@ struct ShipApp {
     live_cmd_tx: Option<Sender<LiveCmd>>,
     live_evt_rx: Option<Receiver<LiveEvent>>,
     live_status: String,
+    /// The link's state as a type, kept beside `live_status` rather than
+    /// re-derived from it.
+    ///
+    /// The message is a human sentence and the state is not, and the top
+    /// zone wants the state. Classifying the sentence at every read would
+    /// put a substring match on every frame of a console whose whole design
+    /// rule is that state says its own colour.
+    live_state: LinkState,
     /// First-connect marker: the actor's Connected fires per
     /// (re)connect, and only a repeat while a game is held triggers
     /// the held-game reconciliation (games list → split bundle + plot
@@ -2666,6 +2730,7 @@ impl ShipApp {
         for evt in live_evts {
             match evt {
                 LiveEvent::Connected { client_id } => {
+                    self.live_state = LinkState::Live;
                     self.live_status = format!("connected ({client_id})");
                     self.feed(format!("live connected ({client_id})"));
                     // Reconnect reconciliation: the actor already
@@ -2694,6 +2759,7 @@ impl ShipApp {
                         format!("reconnecting (attempt {attempt}, ~{wait_secs}s)");
                 }
                 LiveEvent::Refused { code, reason } => {
+                    self.live_state = LinkState::Refused;
                     self.live_status = format!("refused {code}: {reason}");
                     self.feed(format!("live refused {code}: {reason}"));
                     if code == 101 {
@@ -2806,6 +2872,7 @@ impl ShipApp {
                     }
                 }
                 LiveEvent::SocketError(e) => {
+                    self.live_state = LinkState::Faulted;
                     self.live_status = format!("socket error: {e}");
                     eprintln!("live socket error: {e}");
                 }
@@ -3078,19 +3145,31 @@ impl ShipApp {
     /// `Phase::Setup` (the ready flag gates Persiapan), Eksekusi is
     /// Live, Evaluasi is Closed. Derived, so `UiMode` stays the
     /// single writer of the underlying phase.
-    fn sim_stage(&self) -> SimStage {
-        match self.mode.phase {
-            Phase::Setup => {
-                if self.sim_ready {
-                    SimStage::Ready
-                } else {
-                    SimStage::Planning
-                }
-            }
-            Phase::Live => SimStage::Live,
-            Phase::Closed => SimStage::Eval,
+
+
+    /// The single game-state read, derived once per frame.
+    ///
+    /// The backend is authoritative (ADR-0008): `users_game_state` is what a
+    /// `GET /games/{id}` resync last wrote, and a held game with no state yet
+    /// reads as `NoSession` rather than as a guess. `UiMode` stays the only
+    /// writer of the LOCAL phase, and this is the one place the two are
+    /// reconciled.
+    ///
+    /// Presentation has no session of its own, so it is always `NoSession`
+    /// and the side zone shows the watcher rather than a planning surface.
+    fn game_state(&self) -> GameState {
+        if self.app_mode == AppMode::Presentation {
+            return GameState::NoSession;
+        }
+        match (&self.users_game, &self.users_game_state) {
+            (Some(_), Some(state)) => GameState::from_wire(state),
+            _ => GameState::NoSession,
         }
     }
+
+    /// `GameState::is_planning` as a method, so call sites read as a
+    /// question about the game rather than as a free function.
+
 
 
     /// Connect/stop the live socket: token-gated swap onto the
@@ -3104,6 +3183,7 @@ impl ShipApp {
                 let _ = tx.send(WireKind::Empty);
                 self.live_cmd_tx = None;
                 self.live_evt_rx = None;
+                self.live_state = LinkState::Idle;
                 self.live_status = "idle".to_string();
                 eprintln!("wire: live stopped");
             }
@@ -3124,6 +3204,7 @@ impl ShipApp {
                 });
                 self.live_cmd_tx = Some(cmd_tx);
                 self.live_evt_rx = Some(event_rx);
+                self.live_state = LinkState::Connecting;
                 self.live_status = "connecting…".to_string();
                 eprintln!("wire: live {ws_url}");
                 // H11: a fresh actor watches nothing — re-declare the
@@ -3235,13 +3316,14 @@ impl ShipApp {
             let _ = tx.send(LiveCmd::Shutdown);
         }
         self.live_evt_rx = None;
-        self.live_status = "idle".to_string();
+        self.live_state = LinkState::Idle;
+                self.live_status = "idle".to_string();
         // A new sign-in's first Connected is a first connect, never a
         // reconnect — the next hold starts cold.
         self.live_connected_once = false;
         self.auth_user = None;
         self.auth_user_id = None;
-        self.auth_app_role_ids.clear();
+        self.auth_identity = None;
         self.auth_token = None;
         self.auth_issued_at = None;
         self.auth_ttl_secs = 0;
@@ -3365,8 +3447,7 @@ impl ShipApp {
                 return Ok(LoginDone {
                     user: id,
                     pair,
-                    uid: None,
-                    app_role_ids: Vec::new(),
+                    identity: None,
                     needs_change: true,
                     probe_note: None,
                 });
@@ -3376,24 +3457,21 @@ impl ShipApp {
                 Ok(identity) => Ok(LoginDone {
                     user: id,
                     pair,
-                    uid: Some(identity.id),
-                    app_role_ids: identity.app_role_ids,
+                    identity: Some(identity),
                     needs_change: false,
                     probe_note: None,
                 }),
                 Err(tfg::backend::BackendError::Forbidden { .. }) => Ok(LoginDone {
                     user: id,
                     pair,
-                    uid: None,
-                    app_role_ids: Vec::new(),
+                    identity: None,
                     needs_change: true,
                     probe_note: None,
                 }),
                 Err(e) => Ok(LoginDone {
                     user: id.clone(),
                     pair,
-                    uid: None,
-                    app_role_ids: Vec::new(),
+                    identity: None,
                     needs_change: false,
                     probe_note: Some(format!("signed in as {id} · probe: {e}")),
                 }),
@@ -3406,13 +3484,13 @@ impl ShipApp {
     fn apply_login(&mut self, done: LoginDone) {
         self.login_password.clear();
         self.store_pair(done.user.clone(), done.pair);
-        self.auth_app_role_ids = done.app_role_ids;
+        self.auth_identity = done.identity.clone();
         if done.needs_change {
             self.auth_needs_password_change = true;
             self.auth_status = format!("signed in as {} · must change password", done.user);
             return;
         }
-        match done.uid {
+        match done.identity.as_ref().map(|i| i.id) {
             Some(uid) => {
                 self.auth_user_id = Some(uid);
                 self.watch_personal_channel();
@@ -3512,11 +3590,11 @@ impl ShipApp {
                         format!("resumed as {user} · must change password");
                     return;
                 }
-                self.auth_app_role_ids.clear();
+                self.auth_identity = None;
                 match client.me(self.auth_token.as_deref().unwrap_or("")) {
                     Ok(identity) => {
                         self.auth_user_id = Some(identity.id);
-                        self.auth_app_role_ids = identity.app_role_ids;
+                        self.auth_identity = Some(identity);
                         self.auth_needs_password_change = false;
                         self.auth_status = format!("resumed session as {user}");
                         eprintln!("session restored for {user}");
@@ -4880,6 +4958,10 @@ impl ShipApp {
             role_name: j.role_name.clone(),
             judge: j.judge,
             ready: j.ready,
+            // A successful join IS a room entry, so this seat is in the
+            // room by construction. The server stamps the instant; the
+            // headcount only needs to know it is not absent.
+            joined_at: Some("now".to_string()),
         };
         match self.users_roster.iter_mut().find(|p| p.user_id == j.user_id) {
             Some(slot) => *slot = row,
@@ -5934,7 +6016,7 @@ impl ShipApp {
     /// Room-key join remains available to every authenticated account,
     /// so a participant never has to see an unusable empty picker.
     fn can_manage_sessions(&self) -> bool {
-        self.games_loaded && !self.games_gap && !self.auth_app_role_ids.is_empty()
+        self.games_loaded && !self.games_gap && self.has_app_role()
     }
 
     /// Setup flow step 1 (#79): hold a game — pick a listed one or
@@ -6927,26 +7009,33 @@ impl ShipApp {
     /// Setup gate: steps unlock in order — game, then seats, then
     /// pieces, then review. A locked step names its missing
     /// prerequisite; the server still refuses bad advances loudly.
+    /// Why an island's picker is not usable yet, if it is not.
+    ///
+    /// Was the wizard's step gate. The zone shows every island at once, so
+    /// there is no step to lock and nothing to navigate — but the *reason* is
+    /// still the useful part, and dropping it would leave a disabled button
+    /// with no explanation. Indexed by the same order the wizard used, so
+    /// `2` is Fleet and `1` is Players.
     fn setup_step_lock(&self, step: usize) -> Option<String> {
         if self.users_game.is_none() {
             return if step == 0 {
                 None
             } else {
-                Some("hold a session in step 1 first".to_string())
+                Some("hold a session in Essentials first".to_string())
             };
         }
         match step {
             0 | 1 => None,
             2 => {
                 if self.users_roster.is_empty() {
-                    Some("seat someone in step 2 first".to_string())
+                    Some("seat someone in Players first".to_string())
                 } else {
                     None
                 }
             }
             _ => {
                 if self.users_gunits.is_empty() && self.commanded_hulls.is_empty() {
-                    Some("assign pieces in step 3 first".to_string())
+                    Some("assign pieces in Fleet first".to_string())
                 } else {
                     None
                 }
@@ -7002,77 +7091,629 @@ impl ShipApp {
     /// Exercise setup panel (#79): Planning's whole UI in one place —
     /// game, players, fleet, ready. Visible while Planning lasts; the
     /// phase bar owns Persiapan onward.
-    fn setup_panel(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("exercise-setup")
-            .resizable(true)
-            .default_size(760.0)
-            .show(ui, |ui| {
-                ui.heading("Setup");
+    /// The top zone: a fixed full-width band, floating over the map.
+    ///
+    /// It is an `Area` rather than a `Panel` for the same reason the side
+    /// zone is: a panel takes space from the `CentralPanel`, and the map
+    /// owns every pixel the layout offers.
+    ///
+    /// Contents, left to right, in the order an operator reads them under
+    /// time pressure: whether the link is up, how many of the exercise are
+    /// in the room, the map controls, then the clock, settings, and sign-out
+    /// at the right.
+    ///
+    /// The mode toggle is NOT here. Presentation versus Simulation is a
+    /// startup decision, not an operating control, and Simulation does not
+    /// announce itself: the console simply is the exercise. The toggle moved
+    /// to `settings_modal`.
+    fn top_zone(&mut self, ui: &mut egui::Ui) {
+        let vp = ui.ctx().viewport_rect();
+        egui::Area::new(egui::Id::new("topzone"))
+            .fixed_pos(vp.left_top())
+            .movable(false)
+            .constrain(false)
+            .interactable(true)
+            .order(egui::Order::Middle)
+            .show(ui.ctx(), |ui| {
+                ui.set_max_width(vp.width());
+                // Measured from the viewport, NOT from `ui.available_width()`.
+                // An `Area` has no width until its content has been laid out,
+                // so on the first frame — and on every frame, since nothing
+                // ever fixes it — its inner `Ui` reports an unconstrained
+                // width and every budget check passes. The viewport is the
+                // only honest answer to "how much room does this band have".
+                let avail = vp.width();
                 ui.horizontal(|ui| {
-                    for (i, label) in
-                        ["1 Session", "2 Players", "3 Fleet", "4 Review"]
-                            .iter()
-                            .enumerate()
+                    self.link_ui(ui);
+                    ui.add_space(tfg::tokens::INDENT);
+                    self.headcount_ui(ui);
+                    // "What now", in weak ink. The zone shows what IS; this
+                    // is the one thing it cannot, and an operator who has
+                    // lost their place is the operator this is for.
+                    //
+                    // It is the first thing to go on a narrow window, and
+                    // it is gated rather than left to clip, because a left
+                    // group that consumes the whole width pushes the
+                    // right-hand group past the window edge and takes the
+                    // sign-out button with it.
+                    //
+                    // The budget is a constant rather than a measurement,
+                    // and the honest version would measure the right group's
+                    // width instead. It is set with slack on purpose so that
+                    // being wrong about it costs a hint rather than a
+                    // button. Measured against this console's chrome the
+                    // whole band needs about 900 points.
+                    const HINT_BUDGET: f32 = 900.0;
+                    if avail > HINT_BUDGET {
+                        ui.add_space(tfg::tokens::INDENT);
+                        ui.label(
+                            egui::RichText::new(self.next_action_hint())
+                                .weak()
+                                .small(),
+                        );
+                    }
+                    ui.add_space(tfg::tokens::INDENT);
+                    self.map_controls(ui);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Sign out").clicked() {
+                            self.sign_out("signed out from the top zone");
+                        }
+                        if ui.button("Settings").clicked() {
+                            self.settings_open = true;
+                        }
+                        self.clock_ui(ui);
+                    });
+                });
+            });
+    }
+
+    /// The link's state: a dot and one word.
+    ///
+    /// A dot rather than an icon because the colour is the message and an
+    /// icon would need a third glyph for a state the word already names.
+    fn link_ui(&mut self, ui: &mut egui::Ui) {
+        let state = self.live_state;
+        let label = state.label();
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(label.len() as f32 * 8.0 + 24.0, 22.0),
+            egui::Sense::click(),
+        );
+        ui.painter_at(rect).circle_filled(rect.left_center(), 4.0, state.ink());
+        let clicked = resp.clicked();
+        resp.on_hover_text(match self.live_state {
+            LinkState::Idle => "no connection requested".to_string(),
+            _ => self.live_status.clone(),
+        });
+        // A click on the link is the one verb that belongs on the face of
+        // it: connect or stop, which is what an operator reaches for when
+        // the word says the wrong thing.
+        if clicked {
+            self.toggle_live();
+        }
+        ui.painter_at(rect).text(
+            rect.left_center() + egui::vec2(12.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            state.label(),
+            egui::FontId::monospace(12.0),
+            state.ink(),
+        );
+    }
+
+    /// How many of the roster are actually in the room.
+    ///
+    /// Two numbers, because "online" is ambiguous and only one of them is
+    /// knowable: seated is the roster's length, in-room is the count whose
+    /// `joined_at` is set. Presentation has no roster at all, so it says
+    /// nothing rather than showing a zero that reads as a failure.
+    fn headcount_ui(&self, ui: &mut egui::Ui) {
+        if self.users_game.is_none() {
+            return;
+        }
+        let seated = self.users_roster.len();
+        let in_room = self
+            .users_roster
+            .iter()
+            .filter(|p| p.joined_at.is_some())
+            .count();
+        ui.monospace(format!("{in_room}/{seated} in room"));
+    }
+
+    /// Zoom, and nothing else.
+    ///
+    /// The band carries only what an operator reaches for during an
+    /// exercise. The grid, the zone's visibility and which edge it holds
+    /// are layout preferences that do not change mid-run, and a first pass
+    /// put all of them here: at a 768px window the right-hand group then
+    /// collided with this one. Preferences went to the settings modal
+    /// instead, and the band got a width budget it can actually meet.
+    fn map_controls(&mut self, ui: &mut egui::Ui) {
+        if ui.small_button("\u{2212}").on_hover_text("zoom out").clicked() {
+            self.zoom_by(-1.0);
+        }
+        ui.monospace(format!("z{:.0}", self.zoom))
+            .on_hover_text("zoom level");
+        if ui.small_button("+").on_hover_text("zoom in").clicked() {
+            self.zoom_by(1.0);
+        }
+    }
+
+    /// The clock, on one line and inside a width budget.
+    ///
+    /// The old toolbar spent three rows on this and spelled out "UTC",
+    /// "Game", "pace" and "local". A band that is a third of a short
+    /// window tall for a clock is not a frame, and the words carried no
+    /// meaning a fixed-width timestamp does not. The two-letter source
+    /// stays because it answers a real question: whether the reading came
+    /// from the exercise or from this machine.
+    fn clock_ui(&self, ui: &mut egui::Ui) {
+        let elapsed = self.game_elapsed_secs.unwrap_or(0);
+        let source = if self.live_state.is_up() && self.game_state().is_running() {
+            "ex"
+        } else {
+            "lo"
+        };
+        let mut line = format!(
+            "{}  G+{:02}:{:02}  {source} {:.0}\u{d7}",
+            short_timestamp(self.real_ts.as_deref()),
+            elapsed / 60,
+            elapsed % 60,
+            self.game_ratio
+        );
+        if self.game_paused {
+            line.push_str("  PAUSED");
+        }
+        let mut text = egui::RichText::new(line).monospace();
+        if self.game_paused {
+            text = text.color(tfg::tokens::ALERT_YELLOW);
+        }
+        ui.label(text);
+    }
+
+    /// The settings modal. It exists for the things an operator sets once
+    /// rather than during an exercise, which after the overhaul is a short
+    /// list: the mode, the text scale, and the reduced-motion switch.
+    fn settings_modal(&mut self, ui: &egui::Ui) {
+        let mut open = self.settings_open;
+        let mut closed = false;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(340.0);
+                ui.label("Mode");
+                ui.weak("Presentation watches a backend. Simulation plays an exercise. Switching clears the view.");
+                ui.horizontal(|ui| {
+                    let mut mode = self.app_mode;
+                    if ui
+                        .selectable_value(&mut mode, AppMode::Presentation, "Presentation")
+                        .clicked()
+                        && mode != self.app_mode
                     {
-                        let lock = self.setup_step_lock(i);
-                        if ui
-                            .add_enabled(
-                                lock.is_none(),
-                                egui::Button::new(*label).selected(self.setup_step == i),
-                            )
-                            .clicked()
-                        {
-                            self.setup_step = i;
-                        }
-                        if i < 3 {
-                            ui.label(egui::RichText::new("→").weak());
-                        }
+                        self.set_app_mode(mode);
+                    }
+                    if ui
+                        .selectable_value(&mut mode, AppMode::Simulation, "Simulation")
+                        .clicked()
+                        && mode != self.app_mode
+                    {
+                        self.set_app_mode(mode);
                     }
                 });
-                // The first locked step explains itself — navigation is
-                // never a dead click.
-                if let Some(reason) =
-                    (0..4).filter_map(|i| self.setup_step_lock(i)).next()
-                {
-                    ui.weak(format!("Steps unlock in order — {reason}."));
-                }
                 ui.separator();
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        // A hold dropped under a deep step shows the lock,
-                        // never stale content for a game no longer held.
-                        if let Some(reason) = self.setup_step_lock(self.setup_step) {
-                            ui.weak(format!("Locked — {reason}."));
-                        } else {
-                            match self.setup_step {
-                                0 => self.setup_game_ui(ui),
-                                1 => self.setup_players_ui(ui),
-                                2 => self.setup_fleet_ui(ui),
-                                _ => self.setup_ready_ui(ui),
+                ui.label("Layout");
+                ui.checkbox(&mut self.show_grid, "Geographic grid")
+                    .on_hover_text("a reference grid over the map");
+                ui.toggle_value(&mut self.show_side_zone, "Side zone")
+                    .on_hover_text("the column of islands down one edge");
+                if self.show_side_zone {
+                    ui.horizontal(|ui| {
+                        ui.label("Docked");
+                        for (label, dock) in [
+                            ("left", tfg::chrome::Dock::Left),
+                            ("right", tfg::chrome::Dock::Right),
+                        ] {
+                            if ui
+                                .selectable_label(self.side_dock == dock, label)
+                                .clicked()
+                            {
+                                self.side_dock = dock;
                             }
                         }
                     });
+                }
                 ui.separator();
+                ui.label("Text size");
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(self.setup_step > 0, egui::Button::new("← Back"))
-                        .clicked()
+                    for (label, scale) in
+                        [("Smaller", 0.875), ("Default", 1.0), ("Larger", 1.15)]
                     {
-                        self.setup_step -= 1;
-                    }
-                    if ui
-                        .add_enabled(
-                            self.setup_step < 3
-                                && self.setup_step_lock(self.setup_step + 1).is_none(),
-                            egui::Button::new("Next →"),
-                        )
-                        .clicked()
-                    {
-                        self.setup_step += 1;
+                        if ui
+                            .selectable_label(
+                                (self.text_scale - scale).abs() < 0.001,
+                                label,
+                            )
+                            .clicked()
+                        {
+                            self.text_scale = scale;
+                        }
                     }
                 });
+                ui.separator();
+                ui.label("Motion");
+                ui.checkbox(&mut self.reduced_motion, "Reduce motion")
+                    .on_hover_text("collapse every transition to its target");
+                ui.separator();
+                ui.weak("Nothing here is remembered across launches: the client has no settings store.");
+                if ui.button("Close").clicked() {
+                    closed = true;
+                }
             });
+        self.settings_open = open && !closed;
+    }
+
+    /// The side zone: a column of islands whose contents are a function of
+    /// [`GameState`], floating over the map.
+    ///
+    /// It replaces both `Panel::left` docks and the four-step setup wizard.
+    /// Three things changed and each is deliberate:
+    ///
+    /// - **It is an `Area`, not a `Panel`.** A panel takes space from the
+    ///   `CentralPanel`, which resizes the map the operator is reading. The
+    ///   zone floats instead, and `visible_center` pays for that by shifting
+    ///   every camera goal away from the zone.
+    /// - **All the Planning islands are live at once**, where the wizard made
+    ///   them one-at-a-time behind a step lock. A column of four short
+    ///   islands is more scannable than a wizard, and it removes the Back /
+    ///   Next pair whose only job was to change which panel was on screen.
+    /// - **Ownership is resolved once**, before any island paints, so exactly
+    ///   one rim lights (ADR-0016). Letting each island ask would light every
+    ///   island the pointer was inside, which for a column is at most one —
+    ///   but "at most one by accident" is not the same guarantee as "one by
+    ///   construction".
+    fn side_zone(&mut self, ui: &mut egui::Ui) {
+        use tfg::chrome::{Island, island_owned, owning_island, zone_island_origins};
+        let state = self.game_state();
+        let w = tfg::chrome::zone_width();
+
+        // The user island is first in every state, because identity is the
+        // one thing that does not change with the exercise.
+        let mut entries: Vec<(Island, bool)> = vec![(
+            Island::new(egui::Id::new("z.user"), "Operator", egui::vec2(w, 112.0))
+                .with_trailing(&self.app_role_tag()),
+            true,
+        )];
+
+        match state {
+            GameState::NoSession => entries.push((
+                Island::new(egui::Id::new("z.start"), "New session", egui::vec2(w, 168.0)),
+                true,
+            )),
+            GameState::Planning => {
+                entries.push((
+                    Island::new(egui::Id::new("z.essentials"), "Essentials", egui::vec2(w, 380.0))
+                        .with_trailing("STEP 1"),
+                    true,
+                ));
+                entries.push((
+                    Island::new(egui::Id::new("z.control"), "Control", egui::vec2(w, 150.0)),
+                    true,
+                ));
+                entries.push((
+                    Island::new(egui::Id::new("z.fleet"), "Fleet", egui::vec2(w, 320.0))
+                        .with_trailing(&format!("{} PIECES", self.users_gunits.len())),
+                    true,
+                ));
+                entries.push((
+                    Island::new(egui::Id::new("z.players"), "Players", egui::vec2(w, 320.0))
+                        .with_trailing(&format!("{} SEATED", self.users_roster.len())),
+                    true,
+                ));
+            }
+            GameState::Preparation => entries.push((
+                Island::new(egui::Id::new("z.ready"), "Readiness", egui::vec2(w, 360.0))
+                    .with_trailing("STEP 2"),
+                true,
+            )),
+            GameState::Execution => {
+                entries.push((
+                    Island::new(egui::Id::new("z.clock"), "Exercise", egui::vec2(w, 200.0)),
+                    true,
+                ));
+            }
+            GameState::Closure => entries.push((
+                Island::new(egui::Id::new("z.assessment"), "Assessment", egui::vec2(w, 420.0)),
+                true,
+            )),
+        }
+
+        let dock = self.side_dock;
+        let origins = zone_island_origins(dock, ui.ctx().viewport_rect(), &entries);
+
+        // One pointer query for the whole column. `map` is indexed by the
+        // entries that survived the closed filter, which is why the rects are
+        // built from the same `zip` the render loop uses.
+        let rects: Vec<egui::Rect> = entries
+            .iter()
+            .zip(&origins)
+            .map(|((spec, _), pos)| spec.rect_at(*pos))
+            .collect();
+        let pointer = ui.ctx().input(|i| i.pointer.hover_pos());
+        let owner = owning_island(&rects, pointer);
+
+        for (i, ((spec, _), mut pos)) in entries.into_iter().zip(origins).enumerate() {
+            let mut open = true;
+            let owns = owner == Some(i);
+            let id = spec.id;
+            let title = spec.title.clone();
+            island_owned(ui.ctx(), &spec, &mut pos, &mut open, owns, |ui| match id {
+                x if x == egui::Id::new("z.user") => self.zone_user_body(ui),
+                x if x == egui::Id::new("z.start") => self.zone_start_body(ui),
+                x if x == egui::Id::new("z.essentials") => self.zone_essentials_body(ui),
+                x if x == egui::Id::new("z.control") => self.zone_control_body(ui),
+                x if x == egui::Id::new("z.fleet") => self.zone_fleet_body(ui),
+                x if x == egui::Id::new("z.players") => self.zone_players_body(ui),
+                x if x == egui::Id::new("z.ready") => self.zone_ready_body(ui),
+                x if x == egui::Id::new("z.clock") => self.zone_exercise_body(ui),
+                x if x == egui::Id::new("z.assessment") => self.zone_assessment_body(ui),
+                _ => {
+                    ui.weak(format!("{title} — no body"));
+                }
+            });
+        }
+    }
+
+    /// Whether the side zone is occupying the left edge, where the legacy
+    /// free-floating islands are parked.
+    ///
+    /// Those islands still exist for Presentation, which has no zone, so they
+    /// cannot simply be deleted. Rendering them under the zone is worse than
+    /// either: two panels on top of each other, and the operator sees the
+    /// wrong one.
+    fn zone_owns_left_edge(&self) -> bool {
+        self.show_side_zone && self.side_dock == tfg::chrome::Dock::Left
+    }
+
+    /// Whether the account holds any application role at all.
+    ///
+    /// `can_manage_sessions` gates the session browser and every lifecycle
+    /// write on this. The original test was `!app_role_ids.is_empty()` on a
+    /// `Vec<i64>` the parser filled from the role array, so it meant "the
+    /// probe ran and the account has a role" — which is what asking the
+    /// identity for its roles means now, without carrying a second copy of
+    /// the answer.
+    fn has_app_role(&self) -> bool {
+        self.auth_identity
+            .as_ref()
+            .is_some_and(|i| !i.app_roles.is_empty())
+    }
+
+    /// The app role, as the small mono tag the user island carries.
+    ///
+    /// The client holds role *ids* only (`AuthenticatedUser.app_role_ids`),
+    /// and `/users/me` returns the names alongside them but the parser drops
+    /// them. Until that is fixed the id is the honest answer: an operator
+    /// seeing a number learns nothing, which is why this is a tag and not a
+    /// claim. See `docs/ui-overhaul-status.md`.
+    fn app_role_tag(&self) -> String {
+        match &self.auth_identity {
+            Some(identity) => match identity.app_role_label() {
+                label if label.is_empty() => "PARTICIPANT".to_string(),
+                label => label,
+            },
+            None => "NOT SIGNED IN".to_string(),
+        }
+    }
+
+    fn zone_user_body(&mut self, ui: &mut egui::Ui) {
+        let identity = self.auth_identity.clone();
+        ui.horizontal(|ui| {
+            self.avatar(ui, 40.0, identity.as_ref());
+            ui.vertical(|ui| {
+                match &identity {
+                    Some(i) => ui.label(i.label()),
+                    None => ui.weak("not signed in"),
+                };
+                ui.weak(self.app_role_tag());
+            });
+        });
+        if let Some(i) = &identity
+            && let Some(email) = &i.email
+        {
+            ui.weak(email);
+        }
+        ui.separator();
+        status_line(ui, &self.auth_status.clone());
+        if ui.button("Sign out").clicked() {
+            self.sign_out("signed out from the operator island");
+        }
+    }
+
+    /// The operator's picture, or the default person glyph.
+    ///
+    /// `photo_url` is a presigned URL that expires, so it is fetched by egui's
+    /// loader and cached by URL rather than held by us; there is nothing to
+    /// refresh. `None` is the common case and not an error: the backend has
+    /// no endpoint to set a photo, so most accounts have none, and a failed
+    /// presign is indistinguishable from absence by design.
+    ///
+    /// A circular crop is painted over the image rather than requested,
+    /// because the source is whatever the account uploaded and the island's
+    /// silhouette is a circle.
+    fn avatar(&self, ui: &mut egui::Ui, size: f32, identity: Option<&tfg::backend::AuthenticatedUser>) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+        let p = ui.painter_at(rect);
+        // `try_load_texture` returns `None` until the asynchronous loader has
+        // finished, so the glyph shows for the first frames and is replaced
+        // by the photo when it arrives. That is the honest fallback: a
+        // missing picture and an unfinished one look the same, and neither is
+        // worth reporting.
+        let photo = identity.and_then(|i| i.photo_url.as_deref()).and_then(|url| {
+            match ui
+                .ctx()
+                .try_load_texture(url, egui::TextureOptions::LINEAR, egui::load::SizeHint::Scale(size.into()))
+            {
+                Ok(egui::load::TexturePoll::Ready { texture }) => Some(texture),
+                _ => None,
+            }
+        });
+        match photo {
+            Some(tex) => {
+                ui.add(
+                    egui::Image::from_texture(tex)
+                        .fit_to_exact_size(egui::vec2(size, size))
+                        .sense(egui::Sense::hover()),
+                );
+            }
+            None => self.person_glyph(&p, rect, size),
+        }
+        p.circle_stroke(
+            rect.center(),
+            size * 0.5,
+            egui::Stroke::new(1.0, tfg::tokens::HAIRLINE_SLATE),
+        );
+    }
+
+    /// The default person mark: a head and shoulders in Body Silver on a
+    /// Slate disc, ringed by the hairline.
+    fn person_glyph(&self, p: &egui::Painter, rect: egui::Rect, size: f32) {
+        p.circle_filled(rect.center(), size * 0.5, tfg::tokens::PANEL_SLATE);
+        let c = rect.center();
+        p.circle_filled(
+            c + egui::vec2(0.0, -size * 0.13),
+            size * 0.16,
+            tfg::tokens::BODY_SILVER,
+        );
+        p.add(egui::Shape::convex_polygon(
+            vec![
+                c + egui::vec2(-size * 0.26, size * 0.30),
+                c + egui::vec2(-size * 0.26, size * 0.10),
+                c + egui::vec2(0.0, -size * 0.02),
+                c + egui::vec2(size * 0.26, size * 0.10),
+                c + egui::vec2(size * 0.26, size * 0.30),
+            ],
+            tfg::tokens::BODY_SILVER,
+            egui::Stroke::NONE,
+        ));
+    }
+
+    fn zone_start_body(&mut self, ui: &mut egui::Ui) {
+        ui.label("No session held.");
+        ui.weak("A session is a plan the Game Master authors: a force, a roster and a window.");
+        ui.separator();
+        if ui.button("Start a new session →").clicked() {
+            // The Game Master's own flow is to create one and then hold it;
+            // the create verb is where the name and the mode live.
+            self.setup_create_game();
+        }
+        status_line(ui, &self.users_status.clone());
+    }
+
+    fn zone_essentials_body(&mut self, ui: &mut egui::Ui) {
+        self.setup_game_ui(ui);
+    }
+
+    fn zone_control_body(&mut self, ui: &mut egui::Ui) {
+        ui.label("Game time multiplier");
+        let mut factor = self.factor_draft;
+        let resp = ui.add(
+            egui::DragValue::new(&mut factor)
+                .speed(0.5)
+                .range(1.0..=144.0)
+                .suffix("×"),
+        );
+        if resp.changed() {
+            self.factor_draft = factor;
+        }
+        ui.weak(format!("Pace {:.0}× — read from Minos.", self.game_ratio));
+        if ui.button("Apply").clicked() {
+            self.set_minos_factor(self.factor_draft);
+        }
+    }
+
+    fn zone_fleet_body(&mut self, ui: &mut egui::Ui) {
+        // The wizard's step lock becomes a note on the island it applies to.
+        // The information is worth keeping: it is the reason a picker button
+        // is disabled — the zone just no longer hides the panel behind it.
+        if let Some(reason) = self.setup_step_lock(2) {
+            ui.weak(format!("Not yet — {reason}."));
+            ui.separator();
+        }
+        self.setup_fleet_ui(ui);
+    }
+
+    fn zone_players_body(&mut self, ui: &mut egui::Ui) {
+        if let Some(reason) = self.setup_step_lock(1) {
+            ui.weak(format!("Not yet — {reason}."));
+            ui.separator();
+        }
+        self.setup_players_ui(ui);
+        // The checklist and the advance live at the END of the column,
+        // under the last island in dependency order. They were the wizard's
+        // fourth step; ending the sequence is still what they mean, and
+        // putting them under Players keeps that reading.
+        ui.separator();
+        self.setup_ready_ui(ui);
+    }
+
+    fn zone_ready_body(&mut self, ui: &mut egui::Ui) {
+        let blockers = self.setup_checklist();
+        ui.label(format!("{} outstanding", blockers.len()));
+        ui.separator();
+        self.readiness_ui(ui);
+        if let Some(note) = self.phase_note.clone() {
+            warn_line(ui, note);
+        }
+        ui.separator();
+        // Entering execution is the Preparation island's one verb. It was
+        // the phase bar's, and the bar went away with the wizard, so without
+        // this an exercise could never leave preparation.
+        let clear = blockers.is_empty();
+        if ui
+            .add_enabled(
+                clear,
+                egui::Button::new("Enter execution →"),
+            )
+            .on_hover_text(if clear {
+                "the server gates this itself"
+            } else {
+                "readiness is not clear"
+            })
+            .clicked()
+        {
+            self.setup_advance_execution();
+        }
+        if !clear {
+            for b in blockers.iter().take(3) {
+                ui.weak(format!("• {b}"));
+            }
+        }
+        status_line(ui, &self.users_status.clone());
+    }
+
+    fn zone_exercise_body(&mut self, ui: &mut egui::Ui) {
+        let elapsed = self.game_elapsed_secs.unwrap_or(0);
+        ui.label(format!("G+{:02}:{:02}", elapsed / 60, elapsed % 60));
+        if self.game_paused {
+            ui.label(
+                egui::RichText::new("PAUSED")
+                    .strong()
+                    .color(tfg::tokens::ALERT_YELLOW),
+            );
+        }
+        ui.separator();
+        if ui.button("End session →").clicked() {
+            self.close_game();
+        }
+        if let Some(note) = self.phase_note.clone() {
+            warn_line(ui, note);
+        }
+        status_line(ui, &self.users_status.clone());
+    }
+
+    fn zone_assessment_body(&mut self, ui: &mut egui::Ui) {
+        self.assessment_body(ui);
     }
 
     /// New session from Closure: starts a NEW exercise from the
@@ -7115,41 +7756,32 @@ impl ShipApp {
         self.assessment_tab = 0;
     }
 
-    /// Closure assessment workspace: summary, timeline, judgements,
-    /// reviews, transcript beside the frozen map. Timeline, judgements,
-    /// and reviews plug into their slots in their own tickets; this
-    /// shell owns summary, snapshot (the map behind it), transcript,
-    /// export, and the new-session action.
-    fn assessment_panel(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("assessment")
-            .resizable(true)
-            .default_size(340.0)
-            .show(ui, |ui| {
-                ui.heading("Assessment");
-                ui.horizontal(|ui| {
-                    for (i, label) in ["Summary", "Timeline", "Judgements", "Reviews", "Transcript"]
-                        .iter()
-                        .enumerate()
-                    {
-                        if ui
-                            .selectable_label(self.assessment_tab == i, *label)
-                            .clicked()
-                        {
-                            self.assessment_tab = i;
-                        }
-                    }
-                });
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| match self.assessment_tab {
-                        1 => self.timeline_ui(ui),
-                        2 => self.judgements_ui(ui),
-                        3 => self.reviews_ui(ui),
-                        4 => self.transcript_ui(ui),
-                        _ => self.assessment_summary_ui(ui),
-                    });
-            });
+    /// Closure assessment workspace, as an island body: summary, timeline,
+    /// judgements, reviews, transcript. It was a `Panel::left`; the side zone
+    /// owns its placement now, so the tabs and the scroll are the only thing
+    /// left here.
+    fn assessment_body(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            for (i, label) in ["Summary", "Timeline", "Judgements", "Reviews", "Transcript"]
+                .iter()
+                .enumerate()
+            {
+                if ui
+                    .selectable_label(self.assessment_tab == i, *label)
+                    .clicked()
+                {
+                    self.assessment_tab = i;
+                }
+            }
+        });
+        ui.separator();
+        match self.assessment_tab {
+            1 => self.timeline_ui(ui),
+            2 => self.judgements_ui(ui),
+            3 => self.reviews_ui(ui),
+            4 => self.transcript_ui(ui),
+            _ => self.assessment_summary_ui(ui),
+        }
     }
 
     /// Assessment slot: session summary + export + new session.
@@ -7980,8 +8612,7 @@ impl ShipApp {
                     Ok(identity) => Ok(PwResult::Changed(LoginDone {
                         user,
                         pair,
-                        uid: Some(identity.id),
-                        app_role_ids: identity.app_role_ids,
+                        identity: Some(identity),
                         needs_change: false,
                         probe_note: None,
                     })),
@@ -8000,8 +8631,8 @@ impl ShipApp {
                 self.pw_current.clear();
                 self.pw_new.clear();
                 self.store_pair(done.user.clone(), done.pair);
-                self.auth_user_id = done.uid;
-                self.auth_app_role_ids = done.app_role_ids;
+                self.auth_user_id = done.identity.as_ref().map(|i| i.id);
+                self.auth_identity = done.identity;
                 self.watch_personal_channel();
                 self.auth_needs_password_change = false;
                 self.auth_status = format!("signed in as {}", done.user);
@@ -8374,48 +9005,7 @@ impl ShipApp {
     /// Rendered on the toolbar of every island. Role names display
     /// as-is (authorable backend-side); capability derives from the
     /// seat row and commanded hulls, never from name comparison.
-    fn context_strip(&self) -> String {
-        let source = if self.auth_token.is_some() {
-            "Connected exercise"
-        } else {
-            "Local sandbox"
-        };
-        let session = self
-            .users_game
-            .as_ref()
-            .map(|(_, n)| n.clone())
-            .unwrap_or_else(|| "No session selected".to_string());
-        let phase = match self.users_game_state.as_deref() {
-            Some("planning") => "Planning",
-            Some("preparation") => "Preparation",
-            Some("execution") => "Live",
-            Some("closure") => "Closed",
-            _ => "Not connected",
-        };
-        let who = self.auth_user.as_deref().unwrap_or("Not signed in");
-        let seat = match self.own_roster_row() {
-            None => "no seat".to_string(),
-            Some(p) if p.judge => format!("{} · judge-side", p.role_name),
-            Some(p) => {
-                let n = self.commanded_hulls.len();
-                if n == 0 {
-                    p.role_name.clone()
-                } else {
-                    format!("{} · {n} hull{}", p.role_name, if n == 1 { "" } else { "s" })
-                }
-            }
-        };
-        let plot = if self.last_plot_ok.is_some() {
-            human_age(self.last_plot_ok)
-        } else {
-            "waiting".to_string()
-        };
-        format!(
-            "{source} · Session: {session} · Phase: {phase} · Signed in as {who} ({seat}) · Last sync: {} · Plot: {plot} · Next: {}",
-            human_age(self.last_game_sync),
-            self.next_action_hint(),
-        )
-    }
+
 
     /// The one action the strip points at: auth → hold → phase gate →
     /// orders → assessment. Hints only; gates still refuse loudly.
@@ -9416,9 +10006,44 @@ impl ShipApp {
         };
         self.map_seq += 1;
         self.recentering = Some(ship.to_string());
-        self.glide_to(at);
+        let goal = self.visible_center(at);
+        self.glide_to(goal);
         eprintln!("recentering on {ship}…");
-        let _ = tx.send((self.map_seq, at, self.zoom, self.map_px, JUMP_PUMP));
+        let _ = tx.send((self.map_seq, goal, self.zoom, self.map_px, JUMP_PUMP));
+    }
+
+    /// The geographic point that should sit at the middle of the map's
+    /// *visible* area, given that `at` should sit at the middle of the map.
+    ///
+    /// The side zone floats over the map rather than insetting it, so the
+    /// window's centre and the visible centre are different points. Without
+    /// this, every "recentre on this hull" would park the hull underneath the
+    /// chrome whenever the zone is showing on that side.
+    ///
+    /// The shift is computed in pixels and unprojected rather than guessed
+    /// in degrees, because a degree offset is only correct at one zoom. The
+    /// zone's half-width is the shift, and it is positive when the zone is on
+    /// the left so that the visible centre moves right.
+    fn visible_center(&self, at: (f64, f64)) -> (f64, f64) {
+        let shift_px =
+            tfg::chrome::camera_centre_offset(self.side_dock, !self.show_side_zone);
+        if shift_px == 0.0 {
+            return at;
+        }
+        let (w, h) = self.map_dims();
+        // The pixel sampled is the one that should END UP at the map's
+        // centre, not the shift itself. `unproject_mercator` takes a
+        // viewport-relative pixel, so the visible centre of a map whose left
+        // `s` pixels are covered is at `w/2 + s` — and passing `s` directly
+        // would move the centre the wrong way by the map's own width.
+        tfg::map_render::unproject_mercator(
+            (w as f64 / 2.0) + shift_px as f64,
+            (h / 2.0) as f64,
+            at,
+            self.zoom,
+            w as f64,
+            h as f64,
+        )
     }
 
     /// Eased camera move. Retargeting mid-flight restarts the ramp from
@@ -11173,229 +11798,6 @@ impl ShipApp {
         ui.add_space(10.0);
     }
 
-    /// Phase bar (State D, ticket #77): the four simulation phases
-    /// with their advance verb, floating over the loaded map. Planning
-    /// carries the picks (Simulation Mode, Scenario) and points at the
-    /// setup islands underneath; each verb drives the existing state
-    /// machine — nothing here writes the phase directly.
-    fn sim_phase_bar(&mut self, ui: &mut egui::Ui) {
-        let stage = self.sim_stage();
-        let phase_bar_id = egui::Id::new("simulation phases");
-        let first_shot = ui
-            .ctx()
-            .memory(|memory| memory.area_rect(phase_bar_id).is_none());
-        let mut window = egui::Window::new("simulation phases")
-            .id(phase_bar_id)
-            .title_bar(false)
-            .collapsible(false)
-            .resizable(false);
-        // Anchor only the first frame. Reapplying an anchor every frame
-        // overwrites egui's stored drag position as soon as the pointer
-        // is released, making the bar jump back to center.
-        if first_shot {
-            window = window.anchor(
-                egui::Align2::CENTER_TOP,
-                egui::vec2(0.0, PHASE_BAR_TOP),
-            );
-        }
-        window.movable(true).show(ui.ctx(), |ui| {
-            ui.horizontal(|ui| {
-                let steps = [
-                    (SimStage::Planning, "1 Perencanaan"),
-                    (SimStage::Ready, "2 Persiapan"),
-                    (SimStage::Live, "3 Eksekusi"),
-                    (SimStage::Eval, "4 Evaluasi"),
-                ];
-                for (i, (s, label)) in steps.iter().enumerate() {
-                    if i > 0 {
-                        ui.label(egui::RichText::new("→").weak());
-                    }
-                    ui.label(if *s == stage {
-                        egui::RichText::new(*label)
-                            .strong()
-                            .color(ONBOARD_ACCENT)
-                    } else {
-                        egui::RichText::new(*label).weak()
-                    });
-                }
-            });
-            ui.separator();
-                match stage {
-                    SimStage::Planning => {
-                        // Slim status only: the Exercise setup panel on the
-                        // left owns every verb (game → players → fleet).
-                        let game = self
-                            .users_game
-                            .clone()
-                            .map(|(_, n)| n)
-                            .unwrap_or_else(|| "no game selected".to_string());
-                        ui.horizontal(|ui| {
-                            ui.label(format!(
-                                "Perencanaan — session: {game} · Exercise: {}",
-                                self.users_game_state.as_deref().unwrap_or("?"),
-                            ));
-                            ui.label(
-                                egui::RichText::new("steps 1–4 in the setup panel")
-                                    .weak(),
-                            );
-                        });
-                        if let Some(note) = self.phase_note.clone() {
-                            warn_line(ui, note);
-                        }
-                    }
-                    SimStage::Ready => {
-                        // Backend readiness, not local windows: the gate
-                        // counts exercise-side seats, their Ready flags,
-                        // and assigned pieces. Advance is the transition
-                        // plus the local engine start, refused loudly.
-                        // H1: no local way back — Minos is forward-only,
-                        // so preparation never re-renders as Planning.
-                        // The resync re-reads the detail (another client
-                        // may have moved the game meanwhile).
-                        let (side, ready) = self.setup_gate_counts();
-                        ui.label(format!(
-                            "Persiapan — {side} exercise-side · {ready} ready · {} pieces · {} placed · {} to go · Exercise: {}",
-                            self.users_gunits.len(),
-                            self.users_placements.len(),
-                            self.placement_unplaced,
-                            self.users_game_state.as_deref().unwrap_or("?"),
-                        ));
-                        // The room key is minted on entry to
-                        // preparation — which is exactly why it reads
-                        // here: the Setup panel is planning-only, so
-                        // the phase bar is the sole surface on screen
-                        // at the moment the key exists, and the Game
-                        // Master is standing right here to share it
-                        // with the personnel declaring readiness
-                        // below.
-                        match self.minos_room_key.clone() {
-                            Some(key) => {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("room key:").strong());
-                                    ui.label(egui::RichText::new(&key).monospace().strong());
-                                    if ui.small_button("copy").on_hover_text("copy the room key").clicked() {
-                                        ui.ctx().copy_text(key.clone());
-                                        self.users_status = "room key copied".to_string();
-                                    }
-                                });
-                                ui.weak("share this with your personnel — they enter it in setup step 1 to join the room.");
-                            }
-                            None => {
-                                ui.weak("no room key on the held session — ask its Game Master.");
-                            }
-                        }
-                        // C2: the caller declares here too, so one client
-                        // alone can walk the gate: place, declare, advance.
-                        self.readiness_ui(ui);
-                        if let Some(note) = self.phase_note.clone() {
-                            warn_line(ui, note);
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.button("↻ resync").clicked() {
-                                self.users_refresh_games();
-                                self.users_refresh_game();
-                            }
-                            if ui.button("Mulai eksekusi →").clicked() {
-                                self.setup_advance_execution();
-                            }
-                        });
-                    }
-                    SimStage::Live => {
-                        // #98: plot health rides the bar — last success
-                        // age, or the failure streak backing the cadence.
-                        let plot_health = match (self.last_plot_ok, self.plot_fails) {
-                            (_, f) if f > 0 => format!("plot failed ×{f}"),
-                            (Some(t), _) => {
-                                format!("plot {}s ago", t.elapsed().as_secs())
-                            }
-                            _ => "plot never".to_string(),
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label(format!(
-                                "Eksekusi — session {} · {} · Exercise: {} · {plot_health}",
-                                self.game_ts.as_deref().unwrap_or("—"),
-                                if self.game_paused { "PAUSED" } else { "running" },
-                                self.users_game_state.as_deref().unwrap_or("?"),
-                            ));
-                            // C3: pull the authoritative plot on demand.
-                            // Continuous polling is a later slice: no
-                            // position channel is published yet.
-                            if ui.button("plot").clicked() {
-                                self.pull_minos_positions();
-                            }
-                            if ui.button("End session →").clicked() {
-                                self.close_game();
-                            }
-                        });
-                        // H2-H3: the scenario clock, Minos-owned. Writes
-                        // are reads — pause/resume/factor answer the
-                        // clock, because no clock GET exists.
-                        ui.horizontal(|ui| {
-                            // Learned denial gates the controls with
-                            // its reason — never role names, since
-                            // judges may hold the grant and Game
-                            // Masters may lack it.
-                            if self.clock_denied {
-                                ui.weak("clock control needs the control grant in this session — ask the Game Master");
-                            } else {
-                                match self.minos_clock.clone() {
-                                    Some(c) => {
-                                        ui.label(format!(
-                                            "scenario {} · {} · {} · {}x",
-                                            c.assumed_now.as_deref().unwrap_or("—"),
-                                            if c.running { "running" } else { "held" },
-                                            if c.accepting_actions {
-                                                "accepting"
-                                            } else {
-                                                "orders closed"
-                                            },
-                                            c.time_factor,
-                                        ));
-                                        let verb = if c.running { "pause" } else { "resume" };
-                                        if ui.button(verb).clicked() {
-                                            self.pause_or_resume_minos();
-                                        }
-                                    }
-                                    None => {
-                                        ui.label("scenario clock: unread");
-                                        if ui.button("pause").clicked() {
-                                            self.pause_or_resume_minos();
-                                        }
-                                    }
-                                }
-                                ui.label("factor:");
-                                // No backend upper bound by contract; the box
-                                // caps at a day-in-ten-minutes for sanity.
-                                ui.add(
-                                    egui::DragValue::new(&mut self.factor_draft)
-                                        .speed(0.5)
-                                        .range(0.1..=144.0)
-                                        .suffix("x"),
-                                ).on_hover_text("scenario rate through Minos");
-                                if ui.small_button("set").clicked() {
-                                    let f = self.factor_draft;
-                                    self.set_minos_factor(f);
-                                }
-                            }
-                        });
-                    }
-                    SimStage::Eval => {
-                        ui.horizontal(|ui| {
-                            ui.label(format!(
-                                "Evaluasi — assessment ready · Exercise: {} · transcript {} line(s).",
-                                self.users_game_state.as_deref().unwrap_or("?"),
-                                self.transcript.len()
-                            ));
-                            // The workspace panel beside the map owns
-                            // the actions; the bar only jumps to them.
-                            if ui.button("Open debrief →").clicked() {
-                                self.assessment_tab = 4;
-                            }
-                        });
-                    }
-                }
-            });
-    }
 }
 
 impl eframe::App for ShipApp {
@@ -11437,6 +11839,22 @@ impl eframe::App for ShipApp {
         if let Some(base) = self.base_ppp {
             ui.ctx().set_pixels_per_point(base * self.text_scale);
         }
+        // Reduced motion: zeroing egui's animation clock collapses every
+        // in-flight tween to its target this frame. It is one number rather
+        // than a per-component switch because DESIGN.md promises one switch,
+        // and because a partial implementation is worse than none: an island
+        // that fades while its neighbour does not reads as a bug.
+        //
+        // Read first, so switching the preference back on restores the
+        // user's own setting rather than the last value this code wrote.
+        let wants_motion = !self.reduced_motion;
+        ui.ctx().all_styles_mut(|style| {
+            style.animation_time = if wants_motion {
+                self.motion_secs
+            } else {
+                0.0
+            };
+        });
         // Flush a trailing seamless-zoom step (task #43): the last tick
         // inside the throttle window still gets its frame.
         if self.zoom_dirty && self.last_zoom_req.elapsed() >= Duration::from_millis(250) {
@@ -11549,95 +11967,7 @@ impl eframe::App for ShipApp {
         // The dock is dead; every flow below is a floating island.
         // Keys: Space pause · 1-9 desktops · [ ] ships · G groups ·
         // F follow · W waypoint-at-center · O orders · R roster · Esc drop.
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                // Top-level mode (task #39): session lives in
-                // Simulation; Presentation watches a backend.
-                let mut mode = self.app_mode;
-                ui.selectable_value(&mut mode, AppMode::Presentation, "📡 Presentation");
-                ui.selectable_value(&mut mode, AppMode::Simulation, "🎮 Simulation");
-                if mode != self.app_mode {
-                    self.set_app_mode(mode);
-                }
-                ui.separator();
-                // Auth is cross-mode: the token feeds both Presentation
-                // watching and Simulation play.
-                ui.toggle_value(&mut self.show_login, "Login");
-                if self.app_mode == AppMode::Presentation {
-                    // No Inspector toggle: selection drives it (a marker or
-                    // roster click opens it, deselect closes it).
-                    ui.toggle_value(&mut self.show_log, "Log");
-                    ui.toggle_value(&mut self.show_messages, "Messages");
-                    ui.toggle_value(&mut self.show_roster, "Roster");
-                }
-                // Simulation has no island toggles: the Exercise setup
-                // panel owns Planning, execution auto-shows its windows.
-                ui.separator();
-                if ui.small_button("−").on_hover_text("zoom out").clicked() {
-                    self.zoom_by(-1.0);
-                }
-                ui.label(format!("z{:.0}", self.zoom)).on_hover_text("zoom level");
-                if ui.small_button("+").on_hover_text("zoom in").clicked() {
-                    self.zoom_by(1.0);
-                }
-                ui.checkbox(&mut self.show_grid, "Grid")
-                     .on_hover_text("show a geographic reference grid");
-                 ui.menu_button("Aa", |ui| {
-                    for (label, scale) in
-                        [("Smaller", 0.875), ("Default", 1.0), ("Larger", 1.15)]
-                    {
-                        if ui
-                            .selectable_label(
-                                (self.text_scale - scale).abs() < 0.001,
-                                label,
-                            )
-                            .on_hover_text("text size for this session")
-                            .clicked()
-                        {
-                            self.text_scale = scale;
-                        }
-                    }
-                });
-            });
-            // Clock block: real + derived game time, humane format
-            // (grill #17, ADR-0004). Both readings come from the sim.
-            ui.horizontal(|ui| {
-                ui.label(format!("UTC {}", short_timestamp(self.real_ts.as_deref())));
-                if self.game_paused {
-                    ui.label(
-                        egui::RichText::new("PAUSED")
-                            .strong()
-                            .color(egui::Color32::YELLOW),
-                    );
-                }
-            });
-            ui.horizontal(|ui| {
-                let elapsed = self.game_elapsed_secs.unwrap_or(0);
-                let g = short_timestamp(self.game_ts.as_deref());
-                // Source on the face: a connected execution shows the
-                // Minos projection (epoch + pace from answers), anything
-                // else is an explicitly local sandbox clock.
-                let source = if self.users_game_state.as_deref() == Some("execution")
-                    && self.users_game.is_some()
-                {
-                    "exercise"
-                } else {
-                    "local"
-                };
-                ui.label(format!(
-                    "Game {g} · G+{:02}:{:02} · {source} pace {:.0}×",
-                    elapsed / 60,
-                    elapsed % 60,
-                    self.game_ratio
-                ));
-            });
-            // Context strip: the operating model on one line, every
-            // island, every frame. Weak ink — status lines above it
-            // still carry the loud news.
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(self.context_strip()).weak().small());
-            });
-        });
+        self.top_zone(ui);
         // State C (onboarding ticket, #77): Presentation's first
         // action is one prominent connect card over the loaded map —
         // it hides once live is up or the operator dismisses it.
@@ -11697,17 +12027,18 @@ impl eframe::App for ShipApp {
         // State D (onboarding ticket, #77): the four-phase bar over
         // the loaded map — Planning shows the setup panel beside it,
         // Evaluasi the assessment workspace.
-        if self.app_mode == AppMode::Simulation {
-            self.sim_phase_bar(ui);
-            if self.sim_stage() == SimStage::Planning {
-                self.setup_panel(ui);
-            } else if self.sim_stage() == SimStage::Eval {
-                self.assessment_panel(ui);
-            }
+        if self.app_mode == AppMode::Simulation && self.show_side_zone {
+            self.side_zone(ui);
+        }
+        if self.settings_open {
+            self.settings_modal(ui);
         }
 
         let mut follow_req: Option<(String, (f64, f64))> = None;
-        if self.show_roster && (self.session_live() || self.app_mode == AppMode::Presentation) {
+        if self.show_roster
+            && !self.zone_owns_left_edge()
+            && (self.session_live() || self.app_mode == AppMode::Presentation)
+        {
             let mut open = self.show_roster;
             // Island chrome, not egui::Window (ADR-0014): egui::Frame can
             // only paint a rounded rect, so a chamfered body is impossible
@@ -12327,7 +12658,12 @@ impl eframe::App for ShipApp {
             self.show_orders = open;
             self.orders_pos = pos;
         }
-        if self.show_login {
+        // The side zone's Operator island carries identity and the sign-out,
+        // so the free-floating Login island is redundant — and at x=8 it sits
+        // directly underneath the zone. Suppressed while the zone is showing
+        // rather than deleted, because Presentation still has no zone and
+        // still needs it.
+        if self.show_login && !self.zone_owns_left_edge() {
             let mut open = self.show_login;
             let mut pos = self.login_pos;
             let spec = tfg::chrome::Island::new(
@@ -12343,7 +12679,10 @@ impl eframe::App for ShipApp {
             self.show_login = open;
             self.login_pos = pos;
         }
-        if self.show_log && (self.session_live() || self.app_mode == AppMode::Presentation) {
+        if self.show_log
+            && !self.zone_owns_left_edge()
+            && (self.session_live() || self.app_mode == AppMode::Presentation)
+        {
             let mut open = self.show_log;
             let mut pos = self.log_pos;
             let spec = tfg::chrome::Island::new(
@@ -12359,7 +12698,7 @@ impl eframe::App for ShipApp {
         }
         // Messages island (H11): socket-arrived game mail. Visible in
         // both modes once mail exists or the session opens it.
-        if self.show_messages {
+        if self.show_messages && !self.zone_owns_left_edge() {
             let mut open = self.show_messages;
             let mut pos = self.messages_pos;
             let spec = tfg::chrome::Island::new(
@@ -13266,35 +13605,44 @@ impl eframe::App for ShipApp {
 }
 
 /// Dark ops-console theme (task #37): navy chrome over dark tiles, one
-/// cyan accent, rounded islands, roomier spacing. Stock font, applied to
-/// every theme slot so the look holds regardless of system preference.
+/// cyan accent, roomier spacing. Stock font, applied to every theme slot so
+/// the look holds regardless of system preference.
+///
+/// The values come from `tokens` rather than being written out again. This
+/// function used to carry its own copy of six of them, and `chrome.rs` a
+/// third copy of four, which meant a palette change was a search.
 fn apply_ops_theme(ctx: &egui::Context) {
+    use tfg::tokens;
     ctx.all_styles_mut(|style| {
         style.visuals = egui::Visuals::dark();
         let v = &mut style.visuals;
-        let chrome = egui::Color32::from_rgb(0x0F, 0x17, 0x2A);
-        let sunken = egui::Color32::from_rgb(0x02, 0x06, 0x17);
-        let line = egui::Color32::from_rgb(0x33, 0x41, 0x55);
-        let accent = egui::Color32::from_rgb(0x22, 0xD3, 0xEE);
-        v.window_fill = chrome;
-        v.window_stroke = egui::Stroke::new(1.0, line);
+        v.window_fill = tokens::CONSOLE_NIGHT;
+        v.window_stroke = egui::Stroke::new(1.0, tokens::HAIRLINE_SLATE);
+        // A popup keeps a radius. An island carries a chamfer and paints its
+        // own body, so this radius never reaches one.
         v.window_corner_radius = egui::CornerRadius::same(8);
-        v.panel_fill = chrome;
-        v.faint_bg_color = egui::Color32::from_rgb(0x1E, 0x29, 0x3B);
-        v.extreme_bg_color = sunken;
-        v.hyperlink_color = accent;
-        v.selection.bg_fill = accent;
-        v.selection.stroke = egui::Stroke::new(1.0, sunken);
+        v.panel_fill = tokens::CONSOLE_NIGHT;
+        v.faint_bg_color = tokens::PANEL_SLATE;
+        v.extreme_bg_color = tokens::DEEP_WELL;
+        v.hyperlink_color = tokens::RADAR_CYAN;
+        v.selection.bg_fill = tokens::RADAR_CYAN;
+        v.selection.stroke = egui::Stroke::new(1.0, tokens::DEEP_WELL);
         for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
-            w.corner_radius = egui::CornerRadius::same(6);
+            w.corner_radius =
+                egui::CornerRadius::same(tokens::CONTROL_RADIUS);
+            w.weak_bg_fill = tokens::BUTTON_GRAPHITE;
         }
+        // Hover and press wake up in the accent. Alpha, not `gamma_multiply`,
+        // because gamma-multiplying a bright cyan at low intensity lands it
+        // in the reds and the wash stops reading as the accent at all.
+        let cyan = tokens::RADAR_CYAN;
         v.widgets.hovered.weak_bg_fill =
-            egui::Color32::from_rgba_unmultiplied(0x22, 0xD3, 0xEE, 40);
+            egui::Color32::from_rgba_unmultiplied(cyan.r(), cyan.g(), cyan.b(), 40);
         v.widgets.active.weak_bg_fill =
-            egui::Color32::from_rgba_unmultiplied(0x22, 0xD3, 0xEE, 70);
-        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        style.spacing.button_padding = egui::vec2(10.0, 6.0);
-        style.spacing.indent = 20.0;
+            egui::Color32::from_rgba_unmultiplied(cyan.r(), cyan.g(), cyan.b(), 70);
+        style.spacing.item_spacing = tokens::ITEM_SPACING;
+        style.spacing.button_padding = tokens::BUTTON_PADDING;
+        style.spacing.indent = tokens::INDENT;
     });
 }
 
@@ -13313,7 +13661,6 @@ const ONBOARD_INK: egui::Color32 = egui::Color32::from_rgb(0x02, 0x06, 0x17);
 /// sign-in card's inputs and its primary button, text centered.
 const AUTH_FIELD_H: f32 = 34.0;
 /// Phase bar sits under the toolbar (three rows in Simulation ≈ 112px).
-const PHASE_BAR_TOP: f32 = 116.0;
 
 fn validate_map_seed(path: &std::path::Path) -> Result<(), String> {
     tfg::map_render::validate_cache(path)
@@ -13635,6 +13982,11 @@ fn main() -> Result<(), String> {
                 transcript: Vec::new(),
                 show_roster: false,
                 roster_pos: egui::pos2(816.0, 64.0),
+                show_side_zone: true,
+                side_dock: tfg::chrome::Dock::Left,
+                settings_open: false,
+                reduced_motion: false,
+                motion_secs: 0.2,
                 inspector_pos: egui::pos2(816.0, 440.0),
                 orders_pos: egui::pos2(500.0, 250.0),
                 login_pos: egui::pos2(8.0, 120.0),
@@ -13757,7 +14109,7 @@ fn main() -> Result<(), String> {
                 login_password: String::new(),
                 auth_user: None,
                 auth_user_id: None,
-                auth_app_role_ids: Vec::new(),
+                auth_identity: None,
                 auth_token: None,
                 auth_issued_at: None,
                 auth_ttl_secs: 0,
@@ -13784,6 +14136,7 @@ fn main() -> Result<(), String> {
                 live_evt_rx: None,
                 live_connected_once: false,
                 live_status: "idle".to_string(),
+                live_state: LinkState::Idle,
                 login_op: None,
                 refresh_op: None,
                 sync_op: None,

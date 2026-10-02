@@ -2058,4 +2058,55 @@ mod tests {
             assert!((lo - lon).abs() < 1e-9, "lon {lo} vs {lon}");
         }
     }
+
+    /// The floating side zone's camera correction, as arithmetic.
+    ///
+    /// `ShipApp::visible_center` re-centres on the viewport pixel that should
+    /// end up in the middle of the *visible* map, which is `w/2 + s` when the
+    /// zone covers `s` pixels on the left. The first version passed `s`
+    /// itself, which moved the centre left by half the map's width and parked
+    /// the framed hull under the chrome — the exact failure the correction
+    /// exists to prevent, and one no screenshot would show.
+    ///
+    /// The property asserted is the SHIFT, not a specific hull's landing
+    /// spot: under the corrected centre, the old centre renders `s` pixels
+    /// to the left of the new centre's middle, which is the same statement as
+    /// "content moved right by `s`, so a centred hull lands on the visible
+    /// centre". Asserting a hull's exact pixel would only be true for a hull
+    /// that happened to be centred to begin with.
+    #[test]
+    fn a_left_covered_zone_shifts_the_map_right_by_half_the_zone() {
+        let center = (-6.108, 106.910);
+        let (w, h, zoom) = (1200.0_f64, 800.0_f64, 11.0_f64);
+        let shift = 320.0_f64 / 2.0;
+
+        let goal = unproject_mercator(w / 2.0 + shift, h / 2.0, center, zoom, w, h);
+        let (px, py) = project_mercator(center.0, center.1, goal, zoom, w, h);
+        assert!(
+            (px - (w / 2.0 - shift)).abs() < 0.01,
+            "old centre rendered at {px}, wanted {}",
+            w / 2.0 - shift
+        );
+        assert!((py - h / 2.0).abs() < 0.01, "the shift must be horizontal");
+    }
+
+    /// A right-docked zone shifts the map the other way. The sign is the
+    /// whole reason this is tested rather than eyeballed: a zone on the
+    /// right has to move content LEFT, and a sign error here parks the hull
+    /// under the chrome on the opposite side, which looks like the zone is
+    /// not working at all.
+    #[test]
+    fn a_right_covered_zone_shifts_the_map_left() {
+        let center = (-6.108, 106.910);
+        let (w, h, zoom) = (1200.0_f64, 800.0_f64, 11.0_f64);
+        let shift = -320.0_f64 / 2.0;
+
+        let goal = unproject_mercator(w / 2.0 + shift, h / 2.0, center, zoom, w, h);
+        let (px, _) = project_mercator(center.0, center.1, goal, zoom, w, h);
+        assert!(
+            (px - (w / 2.0 - shift)).abs() < 0.01,
+            "old centre rendered at {px}, wanted {}",
+            w / 2.0 - shift
+        );
+    }
 }

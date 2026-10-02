@@ -39,8 +39,22 @@ use egui::{
 // not to compile it on the user's behalf — but `src/chrome.rs` has no tfg
 // types, so pointing at it here type-checks the file that actually ships,
 // against the same egui 0.36 / epaint 0.36 the app resolves.
+//
+// `tokens` is declared at this crate's root rather than inside `chrome` so
+// that `chrome.rs`'s `use crate::tokens;` resolves identically here and in
+// tfg. That is the whole reason the import is spelled `crate::` and not
+// `super::`: `super::tokens` would work in tfg and fail here, which is a
+// failure that only shows up in this harness.
+#[path = "../../../src/tokens.rs"]
+mod tokens;
 #[path = "../../../src/chrome.rs"]
 mod chrome;
+
+// The exercise lifecycle. A leaf with no tfg types, so its six tests run
+// here in two seconds instead of behind a link against the MapLibre core.
+// This is the only reason it is a module rather than a type in `main.rs`.
+#[path = "../../../src/gamestate.rs"]
+mod gamestate;
 
 // The real camera tween, same trick: `src/camera.rs` depends only on egui,
 // so `cargo test` here runs its `#[cfg(test)]` tests — which is the only way
@@ -137,6 +151,57 @@ const VARIANTS: [(Variant, &str, &str); 3] = [
         "silhouette untouched · halftone + edge glow only",
     ),
 ];
+
+// ---------------------------------------------------------------------------
+// Heat pass — the "tactical with heat" register, rendered rather than argued.
+//
+// Three sub-passes, each answering a different question the register cannot
+// be judged without:
+//
+// - `Heat::Seam` — a lit inner rim on the island. The question is whether a
+//   glow can stay on a panel edge without becoming the thing you look at.
+// - `Heat::Vent` — a machined slot and notch detail on the title band. The
+//   question is whether "built object" detail survives at reading density.
+// - `Heat::Scanline` — a fine horizontal rule texture, the CRT texture of
+//   the register. The question is the one DESIGN.md answered "no" before:
+//   does it hold up over an information-dense body?
+//
+// `Heat::None` is the control. It renders the notch with today's paint, so
+// every judgement below is against the shipped baseline rather than against
+// a memory of it.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Heat {
+    None,
+    Seam,
+    Vent,
+    Scanline,
+}
+
+const HEATS: [(Heat, &str, &str); 4] = [
+    (Heat::None, "None", "today's paint · the control"),
+    (Heat::Seam, "Seam", "lit inner rim · glow on an edge"),
+    (Heat::Vent, "Vent", "machined slots · built-object detail"),
+    (Heat::Scanline, "Scan", "rule texture · the CRT question"),
+];
+
+/// Inner rim brightness. Deliberately low: a rim that competes with the
+/// panel's own title text has already failed, and the only way to know the
+/// threshold is to render it.
+const RIM: Color32 = Color32::from_rgb(0x22, 0xD3, 0xEE);
+
+/// Depth of the inner rim band, px.
+const RIM_INSET: f32 = 1.0;
+const RIM_BAND: f32 = 2.0;
+
+/// Machined slot geometry on the title band, px.
+const VENT_W: f32 = 3.0;
+const VENT_H: f32 = 9.0;
+const VENT_GAP: f32 = 5.0;
+
+/// Horizontal rule spacing for the scanline pass, px.
+const SCAN_PITCH: f32 = 4.0;
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -424,6 +489,16 @@ fn roster_ui(ui: &mut Ui, selected: &mut usize) {
 // uses: trails under bodies under outlines.
 // ---------------------------------------------------------------------------
 
+/// The empty stage: near-black, no map, no markers.
+///
+/// An emissive edge reads completely differently over a lit map and over a
+/// void, and the app has both — a panel over open water and a panel over
+/// the well during a boot. Judging the heat on the lit map alone would hide
+/// the case where the glow is the only thing carrying the silhouette.
+fn dark_stage(painter: &egui::Painter, r: Rect) {
+    painter.rect_filled(r, CornerRadius::ZERO, WELL);
+}
+
 fn map_backdrop(painter: &egui::Painter, r: Rect) {
     paint_wash(
         painter,
@@ -532,7 +607,7 @@ fn map_backdrop(painter: &egui::Painter, r: Rect) {
 /// axis-aligned in *every* variant. That is the reason a cut panel costs
 /// paint and not layout — the reason `Notch` and `Blade` are viable at all
 /// rather than being a rewrite.
-fn panel_chrome(
+fn panel_chrome_heat(
     _ctx: &egui::Context,
     painter: &egui::Painter,
     variant: Variant,
@@ -540,6 +615,7 @@ fn panel_chrome(
     enter: f32,
     tone: Option<egui::TextureId>,
     show_hitbox: bool,
+    heat: Heat,
 ) -> Rect {
     let e = enter.clamp(0.0, 1.0);
     // Applied to the chrome as a whole, so the entrance reads as one
@@ -642,6 +718,33 @@ fn panel_chrome(
         }
     }
 
+    // The heat passes, painted on the settled silhouette. Order matters:
+    // the scanlines are texture and go on the body, the seam is an inner
+    // edge and goes over the fill, the vents are hardware and go last so
+    // nothing paints over them.
+    if heat != Heat::None && e > 0.6 {
+        let settled = if variant == Variant::Blade {
+            sheared(rect, LEAN * e)
+        } else {
+            chamfer_tr(rect, CUT * e)
+        };
+
+        if heat == Heat::Scanline {
+            paint_scanlines(painter, rect, e);
+        }
+
+        if heat == Heat::Vent {
+            paint_vents(painter, rect, e);
+        }
+
+        // Every heat pass also shows the seam's resting state, so the
+        // neutral-vs-lit question is judged on one panel rather than
+        // remembered across two.
+        if heat != Heat::None {
+            paint_seam(painter, &settled, e, heat == Heat::Seam);
+        }
+    }
+
     // A sheared silhouette's top-left corner is inset by the full lean, so
     // its content inset has to clear that plus a margin — otherwise the
     // header pokes through the diagonal.
@@ -650,6 +753,97 @@ fn panel_chrome(
         pos2(rect.left() + pad_x, rect.top() + 14.0 + 22.0 * e),
         pos2(rect.right() - 16.0, rect.bottom() - 14.0),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Heat passes.
+//
+// Each one is a question the register cannot be argued about, so each is
+// painted and looked at. `e` is the entrance scalar so a pass arrives with
+// the panel rather than popping onto a settled one.
+// ---------------------------------------------------------------------------
+
+/// A lit inner rim, drawn as the silhouette's own outline offset inward.
+///
+/// The offset is why this reads as a rim and not as a stroke: the band sits
+/// between the outline and the body fill, so it is brightest exactly where
+/// the panel meets the map.
+///
+/// `hot` decides the colour, and the choice is the whole finding. Rendering
+/// every island's rim in Radar Cyan looked good in isolation and spent the
+/// one accent that carries meaning on every panel at once, so an operator
+/// could no longer read "this surface owns input" from the glow. At rest the
+/// rim is a neutral cool grey, a shade above the hairline; cyan is reserved
+/// for the island the pointer is on. That is the rule extension ADR-0014
+/// anticipated, and rendering it is what showed the alternative is wrong.
+fn paint_seam(painter: &egui::Painter, pts: &[Pos2], e: f32, hot: bool) {
+    let a = (e - 0.6) / 0.4;
+    let mut inner: Vec<Pos2> = Vec::with_capacity(pts.len());
+    let c = centroid(pts);
+    for p in pts {
+        let toward = c - *p;
+        inner.push(*p + toward.normalized() * RIM_INSET);
+    }
+    let tint = if hot { RIM.linear_multiply(0.5) } else { Color32::from_rgb(0x8C, 0x9B, 0xAE).linear_multiply(0.34) };
+    painter.add(Shape::closed_line(
+        inner
+            .iter()
+            .copied()
+            .chain(std::iter::once(inner[0]))
+            .collect::<Vec<_>>(),
+        Stroke::new(RIM_BAND, tint.linear_multiply(a)),
+    ));
+}
+
+fn centroid(pts: &[Pos2]) -> Pos2 {
+    let sum: Vec2 = pts.iter().fold(Vec2::ZERO, |acc, p| acc + p.to_vec2());
+    (sum / pts.len() as f32).to_pos2()
+}
+
+/// Machined slots along the bottom edge of the title band.
+///
+/// The test is whether "built object" detail survives at reading density,
+/// which is a question about count before it is a question about shape. Ten
+/// slots reads as ventilation; forty reads as a dotted line, and a dotted
+/// line is not hardware.
+fn paint_vents(painter: &egui::Painter, rect: Rect, e: f32) {
+    let a = (e - 0.6) / 0.4;
+    let y = rect.top() + 30.0 - 5.0;
+    let mut x = rect.right() - 16.0 - 5.0 * (VENT_W + VENT_GAP);
+    while x > rect.left() + 30.0 {
+        let slot = Rect::from_center_size(pos2(x, y), vec2(VENT_W, VENT_H));
+        painter.rect_filled(slot, CornerRadius::same(1), WELL.linear_multiply(0.9 * a));
+        painter.rect_stroke(
+            slot,
+            CornerRadius::same(1),
+            Stroke::new(1.0, LINE.linear_multiply(1.6 * a)),
+            StrokeKind::Inside,
+        );
+        x -= VENT_W + VENT_GAP;
+    }
+}
+
+/// A fine horizontal rule texture over the TITLE BAND only.
+///
+/// Rendered across the whole body it failed, and the reason is worth
+/// recording because it is the same reason the vent pass failed: the rules
+/// cut straight through the rows, and the smallest text on the panel (the
+/// class line under each hull name) is the first thing to lose. Texture that
+/// crosses text does not read as texture, it reads as interference.
+///
+/// Confined to the band it costs nothing, because the band holds one short
+/// tracked label and a count.
+fn paint_scanlines(painter: &egui::Painter, rect: Rect, e: f32) {
+    let a = (e - 0.6) / 0.4;
+    let band_bottom = rect.top() + 48.0;
+    let mut y = rect.top() + SCAN_PITCH;
+    while y < band_bottom {
+        painter.line_segment(
+            [pos2(rect.left(), y), pos2(rect.right() - CUT, y)],
+            Stroke::new(1.0, Color32::from_white_alpha((17.0 * a) as u8)),
+        );
+        y += SCAN_PITCH;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -671,6 +865,10 @@ enum Pick {
 }
 
 fn picker(ctx: &egui::Context, current: usize) -> Pick {
+    picker_two(ctx, VARIANTS.iter().map(|v| v.1).collect(), current)
+}
+
+fn picker_two(ctx: &egui::Context, heats: Vec<&str>, current: usize) -> Pick {
     let mut pick = Pick::None;
     egui::Area::new(Id::new("picker"))
         .order(egui::Order::Foreground)
@@ -683,7 +881,7 @@ fn picker(ctx: &egui::Context, current: usize) -> Pick {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
 
-                for (i, (_, label, _)) in VARIANTS.iter().enumerate() {
+                for (i, label) in heats.iter().enumerate() {
                     let galley = ctx.fonts_mut(|f| f.layout_job(single_line(label, 13.0, Color32::WHITE)));
                     let size = galley.size();
                     let (rect, resp) = ui.allocate_exact_size(
@@ -812,6 +1010,10 @@ fn one_line_wrap() -> egui::text::TextWrapping {
 
 struct Proto {
     variant: usize,
+    heat: usize,
+    heat_dark: bool,
+    zone_mode: bool,
+    zone_right: bool,
     selected: usize,
     replay: u64,
     tone: Option<egui::TextureId>,
@@ -847,6 +1049,18 @@ impl eframe::App for Proto {
             } else {
                 0
             };
+            let hn = HEATS.len() as i32;
+            let hstep = if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                1
+            } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                hn - 1
+            } else {
+                0
+            };
+            if hstep > 0 {
+                self.heat = ((self.heat as i32 + hstep) % hn) as usize;
+                self.replay += 1;
+            }
             if step > 0 {
                 self.variant = ((self.variant as i32 + step) % n) as usize;
                 self.replay += 1;
@@ -860,11 +1074,23 @@ impl eframe::App for Proto {
                     self.replay += 1;
                 }
             }
+            for (i, key) in [egui::Key::Num7, egui::Key::Num8, egui::Key::Num9]
+                .iter()
+                .enumerate()
+            {
+                if ctx.input(|inp| inp.key_pressed(*key)) && self.heat != i {
+                    self.heat = i;
+                    self.replay += 1;
+                }
+            }
             if ctx.input(|i| i.key_pressed(egui::Key::R)) {
                 self.replay += 1;
             }
             if ctx.input(|i| i.key_pressed(egui::Key::H)) {
                 self.show_hitbox = !self.show_hitbox;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::D)) {
+                self.heat_dark = !self.heat_dark;
             }
         }
 
@@ -882,8 +1108,53 @@ impl eframe::App for Proto {
         map_backdrop(&ui.painter_at(screen), screen);
 
         if self.island_mode {
-            // The real module, exactly as tfg will call it.
-            let spec = chrome::Island::new(Id::new("Roster"), "Roster", vec2(300.0, 420.0));
+            // The real module, exactly as tfg will call it. `--zone` stacks
+            // three islands down one docked column instead of showing a
+            // single free-floating one, because the zone is the thing the
+            // side-zone unit actually builds and a single island cannot
+            // show whether the stack rhythm or the rim's one-at-a-time rule
+            // holds.
+            if self.zone_mode {
+                let specs = vec![
+                    (chrome::Island::new(Id::new("User"), "Operator", vec2(chrome::zone_width(), 96.0))
+                        .with_trailing("OPERATOR"),
+                     true),
+                    (chrome::Island::new(Id::new("Connection"), "Connection", vec2(chrome::zone_width(), 132.0))
+                        .with_trailing("LIVE"),
+                     true),
+                    (chrome::Island::new(Id::new("Roster"), "Roster", vec2(chrome::zone_width(), 300.0))
+                        .with_trailing("8 / 125"),
+                     true),
+                ];
+                let viewport = screen;
+                let dock = if self.zone_right { chrome::Dock::Right } else { chrome::Dock::Left };
+                let origins = chrome::zone_island_origins(dock, viewport, &specs);
+                let selected = self.selected;
+                let mut selected = selected;
+                for ((spec, _), mut pos) in specs.iter().zip(origins) {
+                    let mut open = true;
+                    let title = spec.title.clone();
+                    let trailing = spec.trailing.clone();
+                    let z = chrome::zone_width();
+                    if title == "Roster" {
+                        chrome::island_scrolled(&ctx, spec, &mut pos, &mut open, |ui| {
+                            roster_ui(ui, &mut selected);
+                        });
+                    } else {
+                        chrome::island(&ctx, spec, &mut pos, &mut open, |ui| {
+                            ui.spacing_mut().item_spacing.y = 6.0;
+                            ui.label(format!("{} — z{:.0}", title, z));
+                        });
+                    }
+                    let _ = trailing;
+                }
+                self.selected = selected;
+                picker_two(&ctx, HEATS.iter().map(|h| h.1).collect(), self.heat);
+                return;
+            }
+
+            let spec = chrome::Island::new(Id::new("Roster"), "Roster", vec2(300.0, 420.0))
+                .with_trailing("8 / 125");
             let mut pos = self.island_pos;
             let mut open = self.island_open;
             let selected = self.selected;
@@ -906,15 +1177,19 @@ impl eframe::App for Proto {
             if !open {
                 self.island_open = true;
             }
-            picker(&ctx, self.variant);
+            picker_two(&ctx, HEATS.iter().map(|h| h.1).collect(), self.heat);
             return;
         }
 
         let variant = VARIANTS[self.variant].0;
+        let heat = HEATS[self.heat].0;
+        if self.heat_dark {
+            dark_stage(&ui.painter_at(screen), screen);
+        }
         // One eased scalar drives the whole entrance. Re-keying on
         // (variant, replay) is what makes R and a switch re-run it.
         let enter = ctx.animate_bool_with_time_and_easing(
-            Id::new(("enter", self.variant, self.replay)),
+            Id::new(("enter", self.variant, self.heat, self.replay)),
             true,
             self.motion * ENTER_SECS,
             easing::cubic_out,
@@ -934,8 +1209,8 @@ impl eframe::App for Proto {
                 .sense(Sense::hover()),
             |ui| {
                 let painter = ui.painter_at(panel);
-                let inner = panel_chrome(
-                    &ctx, &painter, variant, panel, enter, self.tone, self.show_hitbox,
+                let inner = panel_chrome_heat(
+                    &ctx, &painter, variant, panel, enter, self.tone, self.show_hitbox, heat,
                 );
 
                 // Header. The rotated, tracked, short-caps label is the
@@ -1069,6 +1344,23 @@ fn main() -> eframe::Result {
         .unwrap_or(0);
     let hitbox = args.iter().any(|a| a == "--hitbox");
     let island_mode = args.iter().any(|a| a == "--island");
+    // `--heat N` selects a heat pass, `--heat-dark` renders it over the
+    // near-black well instead of the map wash. Both exist because the only
+    // honest way to judge an emissive edge is to see it on both grounds it
+    // will ever sit on: over a lit map, and over an empty stage.
+    let heat = args
+        .iter()
+        .position(|a| a == "--heat")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|i| *i < HEATS.len())
+        .unwrap_or(0);
+    let heat_dark = args.iter().any(|a| a == "--heat-dark");
+    // `--zone` stacks the side zone, `--zone-right` docks it right. Both
+    // exist because the rim rule (ADR-0016) claims exactly one island lights
+    // at a time, and that claim is only checkable with three on screen.
+    let zone_mode = args.iter().any(|a| a == "--zone");
+    let zone_right = args.iter().any(|a| a == "--zone-right");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1083,6 +1375,10 @@ fn main() -> eframe::Result {
         Box::new(move |_cc| {
             Ok(Box::new(Proto {
                 variant,
+                heat,
+                heat_dark,
+                zone_mode,
+                zone_right,
                 selected: 0,
                 replay: 0,
                 tone: None,

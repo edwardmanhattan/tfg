@@ -489,6 +489,10 @@ impl MinosMaster {
                     role_name: p["role_name"].as_str().unwrap_or("").to_string(),
                     judge: p["is_judge_side"].as_bool().unwrap_or(false),
                     ready: p["is_ready"].as_bool().unwrap_or(false),
+                    joined_at: p["joined_at"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.to_string()),
                 })
             })
             .collect()
@@ -2123,6 +2127,13 @@ pub struct Participant {
     pub judge: bool,
     /// Readiness badge: cleared whenever a seat's role changes.
     pub ready: bool,
+    /// When this person presented the room key, if they have.
+    ///
+    /// `None` is a real state and not a gap: assigned but not yet in the
+    /// room. That distinction is the whole of the top zone's headcount, and
+    /// the client used to throw this field away and then had nothing honest
+    /// to show for "how many are online".
+    pub joined_at: Option<String>,
 }
 
 /// One game piece with its current commander, if any.
