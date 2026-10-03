@@ -477,10 +477,21 @@ impl MinosMaster {
     /// answers with the whole roster (latest contract: seat / role
     /// change / remove all return it — no read-after-write).
     fn parse_roster(v: &serde_json::Value) -> Vec<Participant> {
-        v.as_array()
+        // The roster is WRAPPED. `GET /games/{id}/participants` answers
+        // `{"data": {"participants": [...]}}`, so after the envelope is
+        // unwrapped the value is an object, not an array — and `as_array()`
+        // on it returned None, which turned a seated roster into an empty one
+        // with no error anywhere.
+        //
+        // Found by driving: the seat was in the database (`seat.py` printed
+        // it, and the API still returns it) while the island said "0 SEATED".
+        // An empty roster is the one answer an operator cannot act on, so the
+        // shape is read both ways rather than assumed.
+        let rows = v
+            .as_array()
             .cloned()
-            .unwrap_or_default()
-            .iter()
+            .unwrap_or_else(|| v["participants"].as_array().cloned().unwrap_or_default());
+        rows.iter()
             .filter_map(|p| {
                 Some(Participant {
                     user_id: p["id_user"].as_i64()?,
@@ -3286,6 +3297,44 @@ mod window_authoring_tests {
         for p in [GamePace::Standard, GamePace::Fast] {
             assert_eq!(GamePace::parse(p.wire()), Some(p));
         }
+    }
+
+    /// The roster is wrapped on the wire, and the wrapper is the whole bug.
+    ///
+    /// `as_array()` on `{"participants": [...]}` is None, so a seated game
+    /// rendered as an empty one and nothing said so. Asserted against the
+    /// server's real envelope AND the bare array, because the write paths
+    /// (`add_participant` and friends) answer with the same wrapper and both
+    /// shapes have been seen on this client.
+    #[test]
+    fn a_wrapped_roster_reads_as_its_rows() {
+        let row = serde_json::json!({
+            "id_user": 4,
+            "user_name": "Super User",
+            "id_game_role": 18,
+            "role_name": "Game Master",
+            "is_judge_side": false,
+            "is_ready": false,
+            "joined_at": "2026-10-03T23:20:00+07:00"
+        });
+        let wrapped = serde_json::json!({ "participants": [row.clone()] });
+        let bare = serde_json::json!([row]);
+
+        for shape in [wrapped, bare] {
+            let roster = MinosMaster::parse_roster(&shape);
+            assert_eq!(roster.len(), 1, "shape {shape}");
+            assert_eq!(roster[0].user_id, 4);
+            assert_eq!(roster[0].role_name, "Game Master");
+            assert!(roster[0].joined_at.is_some(), "a joined_at is a fact");
+        }
+    }
+
+    /// An envelope that is neither shape must not invent rows, and must not
+    /// panic on a missing key either.
+    #[test]
+    fn an_unrecognised_roster_envelope_is_empty_rather_than_wrong() {
+        assert!(MinosMaster::parse_roster(&serde_json::json!({})).is_empty());
+        assert!(MinosMaster::parse_roster(&serde_json::json!(null)).is_empty());
     }
 
 }
