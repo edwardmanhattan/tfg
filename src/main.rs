@@ -1324,6 +1324,23 @@ enum Book {
     One(tfg::backend::GameScenario),
 }
 
+/// Whether a release at `pos` should place a hull, given where the picker
+/// panel is.
+///
+/// The map's rect is full-bleed and therefore CONTAINS the panel, so
+/// "released over the map" is not on its own enough: a release over the form
+/// would drop a hull at whatever sea lies behind it.
+///
+/// A free function rather than a method because the rule is pure and the app
+/// is not. A rule only checkable by standing up a store connection, a core
+/// map and a token is a rule that does not get checked.
+fn drop_lands_on_map(panel: Option<egui::Rect>, pos: egui::Pos2) -> bool {
+    match panel {
+        Some(panel) => !panel.contains(pos),
+        None => true,
+    }
+}
+
 /// A step being written, before the server has given it an id.
 ///
 /// Held as a draft rather than written straight through because the backend
@@ -2255,6 +2272,17 @@ struct ShipApp {
     /// `users_status` because a half-typed window is not a backend refusal
     /// and must not overwrite the last real status line.
     composer_draft_error: Option<String>,
+    /// Whether the Fleet Picker modal is showing.
+    fleet_picker_open: bool,
+    /// The picker panel's rect for this frame, or `None` when it is closed.
+    ///
+    /// The drop handler needs it because the map's own rect contains the
+    /// modal: the map is full-bleed under the floating zones, so a release
+    /// over the panel would otherwise place a hull at whatever map point
+    /// happens to be behind the form. Recomputed per frame from the same
+    /// `Modal::rect_in` the primitive used, so there is one answer to where
+    /// the panel is rather than two that can disagree.
+    fleet_panel_rect: Option<egui::Rect>,
     /// The in-flight book read or write. One slot rather than one per verb:
     /// the composer is a single author at a time, and a second write would
     /// answer against a book the first write had already changed.
@@ -6913,11 +6941,32 @@ impl ShipApp {
             return;
         }
         let crew = self.setup_crew();
-        let assigning = self.unit_picker_ui(ui, &crew);
-        for (hull, name) in assigning {
-            self.setup_assign_unit(hull, &name);
-        }
-        ui.separator();
+        // The picker is a modal, so the island offers the door and keeps the
+        // RESULT. The list of assigned pieces is the thing the operator comes
+        // back to read — the register with its four Miller columns is a
+        // means, not a summary, and in a 320-point column it would be the only
+        // thing on the island.
+        ui.horizontal(|ui| {
+            let assigned = self.users_gunits.len();
+            if ui
+                .button(if assigned > 0 {
+                    format!("Fleet picker ({assigned} assigned)")
+                } else {
+                    "Fleet picker".to_string()
+                })
+                .on_hover_text("browse the register and drag a hull onto the map")
+                .clicked()
+            {
+                self.fleet_picker_open = true;
+                self.fleet_panel_rect = None;
+            }
+            if self.fleet_pick.is_some() {
+                ui.weak(
+                    "a hull is armed \u{2014} drag it from the picker onto the map, \
+                     or place it at the centre from inside.",
+                );
+            }
+        });
         ui.strong("Pieces");
         if self.users_gunits.is_empty() {
             ui.weak("No pieces yet — assign register hulls above.");
@@ -7600,6 +7649,56 @@ impl ShipApp {
                 .map_err(|e| e.to_string())
                 .map(Book::One)
         }));
+    }
+
+    // -- the Fleet Picker ----------------------------------------------------
+    //
+    // The Miller columns re-homed onto `chrome::modal`. Two things about it
+    // are not the composer's problem and are the reason it is its own unit:
+    //
+    // 1. A drag starts on a row INSIDE the panel and ends on the map BEHIND
+    //    it. The map is full-bleed under the floating zones, so its rect
+    //    contains the panel, and a naive release would drop a hull at
+    //    whatever point lies behind the form.
+    // 2. The drag ghost is painted by the map, which is UNDER the backdrop.
+    //    So while a drag is in flight the backdrop clears instead of dimming
+    //    — see `chrome::Backdrop`.
+
+    /// The Fleet Picker modal.
+    ///
+    /// Not a picker over the register alone: it is also where placement is
+    /// armed and where the caller's own hulls are lifted, because all three
+    /// act on the same `fleet_pick` and splitting them puts the state in one
+    /// modal and its effect on the map in another.
+    fn fleet_picker_modal(&mut self, ui: &egui::Ui) {
+        let crew = self.setup_crew();
+        let mut spec = tfg::chrome::Modal::new(
+            egui::Id::new("fleet-picker"),
+            "Fleet picker",
+            egui::vec2(980.0, 620.0),
+        );
+        // A drag in flight means the pointer is about to be over the map, and
+        // the ghost it is aiming with is painted there. Dimming now would
+        // dim the one thing the operator is looking at.
+        if self.unit_drag.is_some() {
+            spec = spec.clear_backdrop();
+        }
+        let panel = spec.rect_in(ui.ctx().viewport_rect());
+        let kept = tfg::chrome::modal(ui.ctx(), &spec, |ui| {
+            let picked = self.unit_picker_ui(ui, &crew);
+            for (hull, name) in picked {
+                self.setup_assign_unit(hull, &name);
+            }
+        });
+        // Published even when the modal is closing: the drop handler runs
+        // later in the same frame, on the release that closed it, and on that
+        // frame the panel is still where the pointer left it.
+        self.fleet_panel_rect = Some(panel);
+        if !kept {
+            self.fleet_picker_open = false;
+            self.clear_fleet_pick();
+            self.unit_drag = None;
+        }
     }
 
     /// The composer modal.
@@ -12444,6 +12543,13 @@ impl eframe::App for ShipApp {
         if self.composer_visible {
             self.composer_modal(ui);
         }
+        if self.fleet_picker_open {
+            self.fleet_picker_modal(ui);
+        } else {
+            // A closed picker must not keep refusing drops: the rect is
+            // only meaningful on a frame where the panel was drawn.
+            self.fleet_panel_rect = None;
+        }
 
         let mut follow_req: Option<(String, (f64, f64))> = None;
         if self.show_roster
@@ -13241,7 +13347,10 @@ impl eframe::App for ShipApp {
                     if let Some(drag) = self.unit_drag.take() {
                         if drag.moved {
                             let drop = ui.input(|input| input.pointer.interact_pos());
-                            if let Some(pos) = drop.filter(|pos| rect.contains(*pos)) {
+                            let on_map = drop
+                                .filter(|pos| rect.contains(*pos))
+                                .filter(|pos| drop_lands_on_map(self.fleet_panel_rect, *pos));
+                            if let Some(pos) = on_map {
                                 let px = (pos.x - rect.min.x) as f64;
                                 let py = (pos.y - rect.min.y) as f64;
                                 let (mw, mh) = self.map_dims();
@@ -13252,11 +13361,25 @@ impl eframe::App for ShipApp {
                                 self.try_place_picked(la, lo);
                                 self.mode.tool = SetupTool::Select;
                             } else {
+
                                 self.clear_fleet_pick();
-                                self.users_status = format!(
-                                    "{} placement cancelled · release over the map",
-                                    drag.name
-                                );
+                                // The two refusals are different and the
+                                // operator needs to know which: off the map
+                                // is a miss, over the form is a correction.
+                                self.users_status = if self
+                                    .fleet_panel_rect
+                                    .is_some_and(|p| drop.is_some_and(|d| p.contains(d)))
+                                {
+                                    format!(
+                                        "{} not placed \u{2014} release over the map, not the picker",
+                                        drag.name
+                                    )
+                                } else {
+                                    format!(
+                                        "{} placement cancelled \u{2014} release over the map",
+                                        drag.name
+                                    )
+                                };
                             }
                         } else {
                             self.arm_fleet_pick(drag.id);
@@ -14478,6 +14601,8 @@ fn main() -> Result<(), String> {
                 users_role: None,
                 users_roles: Vec::new(),
                 users_roster: Vec::new(),
+                fleet_picker_open: false,
+                fleet_panel_rect: None,
                 scenarios: Vec::new(),
                 composer_scenario: None,
                 composer_visible: false,
@@ -14760,6 +14885,66 @@ mod tests {
     fn an_empty_step_is_not_the_drafts_business() {
         let d = ComposerDraft::default();
         assert_eq!(d.problem(), None, "content is the server's rule, not the draft's");
+    }
+
+    // -- the picker's drop target -------------------------------------------
+    //
+    // The map is full-bleed under the floating zones, so its rect contains
+    // the picker panel. That containment is the whole hazard: without the
+    // exception below, a drag released over the form places a hull at
+    // whatever sea lies behind it.
+
+    /// The panel these tests place: 400x300 at (100, 100).
+    fn picker_panel() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(400.0, 300.0))
+    }
+
+    /// A release over the panel is NOT a release over the map.
+    ///
+    /// `Rect::contains` is half-open, so the top-left corner is inside and a
+    /// point exactly on the bottom-right edge is not. Both boundaries are
+    /// pinned, because that edge is where a hull ends up one pixel from where
+    /// the operator let go of it.
+    #[test]
+    fn a_release_over_the_picker_is_not_a_drop() {
+        let panel = picker_panel();
+        for pos in [
+            egui::pos2(300.0, 250.0), // centre
+            egui::pos2(100.0, 100.0), // top-left corner: inside
+            egui::pos2(499.0, 399.0), // just inside bottom-right
+            egui::pos2(100.0, 399.0), // bottom-left edge
+        ] {
+            assert!(
+                !drop_lands_on_map(Some(panel), pos),
+                "{pos:?} is inside the picker and must not place"
+            );
+        }
+        for pos in [
+            egui::pos2(99.0, 250.0),  // just left of it
+            egui::pos2(500.5, 250.0), // just right of it
+            egui::pos2(300.0, 99.0),  // just above it
+            egui::pos2(300.0, 400.5), // just below it
+        ] {
+            assert!(
+                drop_lands_on_map(Some(panel), pos),
+                "{pos:?} is outside the picker and must place"
+            );
+        }
+    }
+
+    /// With no panel there is nothing to refuse, so placement behaves exactly
+    /// as it did before the picker existed. A stale rect would silently make
+    /// a region of the map unplaceable, so the closed case has to be the
+    /// permissive one.
+    #[test]
+    fn a_closed_picker_refuses_nothing() {
+        for pos in [
+            egui::pos2(0.0, 0.0),
+            egui::pos2(1919.0, 1079.0),
+            egui::pos2(960.0, 540.0),
+        ] {
+            assert!(drop_lands_on_map(None, pos));
+        }
     }
 
     fn entry(unit_id: i64, w: Option<u32>, h: Option<u32>) -> tfg::backend::UnitImageEntry {

@@ -47,8 +47,11 @@ the MapLibre core.
 | The scenario book's client API | `backend::master` `GameScenario`, `GameScenarioStep`, 8 methods | 6 tests: the `HHMM` rules, nested-step parse, no-id refusal |
 | The Scenario Composer modal | `ShipApp::composer_modal`, `composer_body` | `cargo check` clean; **not looked at** (no compositor on this machine) |
 | The composer draft's rules | `ComposerDraft::problem` | 5 tests: half-window, malformed, backwards, no-window, empty content |
+| The Fleet Picker modal | `ShipApp::fleet_picker_modal` | `cargo check` clean; **not looked at** (no compositor) |
+| A clear backdrop for drag-to-map | `chrome::Backdrop` | 2 tests: it drops the dim and nothing else, and a dim is actually dimmed |
+| A release over the picker is not a drop | `main::drop_lands_on_map` | 2 tests pinning the panel edge, half-open, and the closed case |
 
-`cargo test --lib`: 278 pass. `cargo test --bin tfg`: 30 pass. Two failures are pre-existing and unrelated
+`cargo test --lib`: 280 pass. `cargo test --bin tfg`: 32 pass. Two failures are pre-existing and unrelated
 (`quad_bow_follows_the_compass`, `order_move_applies_then_higher_overrides_loudly`);
 both were confirmed failing on a stashed tree before this work.
 
@@ -107,15 +110,10 @@ wrong in several places.
 Ordered so each unit is verifiable on its own and each one shrinks the risk of
 the next.
 
-1. **The remaining two modals.** `chrome::modal` is landed, the Scenario
-   Composer is built on it, and the other two are still the old inline
-   widgets.
-   - **Fleet Picker** is the existing miller/drag code re-homed. It is
-     roughly 80% built; the work is the container and making the drag-to-map
-     survive the modal, which the backdrop now blocks and the drag handler
-     will have to opt into deliberately.
-   - **Player Picker** is `users_directory_ui`/`users_roster_ui` re-homed,
-     plus the game-role pick and the "this role may need a command" note.
+1. **The Player Picker modal.** `chrome::modal` is landed, and the Scenario
+   Composer and Fleet Picker are built on it. What is left is
+   `users_directory_ui`/`users_roster_ui` re-homed, plus the game-role pick
+   and the "this role may need a command" note.
 2. **Execution and Closure island sets.** The zone shows one compact island
    for each today. The Orders, Roster, Log and assessment surfaces exist as
    free-floating islands and a docked panel, and they belong in the column.

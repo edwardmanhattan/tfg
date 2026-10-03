@@ -610,6 +610,25 @@ pub struct Modal {
     /// Set to `false` by the close button. The caller owns persisting it,
     /// same contract as an island.
     pub open: bool,
+    /// Whether the backdrop paints its dim.
+    pub backdrop: Backdrop,
+}
+
+/// What the backdrop behind a modal does about the map.
+///
+/// Both variants swallow input identically — that is the whole point of the
+/// backdrop and it never varies. What varies is whether it darkens, because a
+/// modal that dims also dims the thing the operator is aiming at.
+///
+/// `Clear` exists for exactly one caller: a drag from inside a modal out onto
+/// the map. The drag ghost is painted by the map, so under a dim it is the
+/// dimmest thing on screen at the moment its legibility matters most. Swallow
+/// without dimming and the ghost reads at full contrast while the map behind
+/// it still cannot be clicked by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backdrop {
+    Dim,
+    Clear,
 }
 
 impl Modal {
@@ -619,6 +638,28 @@ impl Modal {
             title: title.to_string(),
             size,
             open: true,
+            backdrop: Backdrop::Dim,
+        }
+    }
+
+    /// A modal whose backdrop swallows input without darkening.
+    ///
+    /// Only correct where something behind the modal is the target of the
+    /// pointer's next move. Everywhere else the dim is what tells the
+    /// operator that the map is inert.
+    pub fn clear_backdrop(mut self) -> Self {
+        self.backdrop = Backdrop::Clear;
+        self
+    }
+
+    /// The fill alpha for this backdrop.
+    ///
+    /// One function so the two variants cannot disagree about what "no dim"
+    /// means, and so a test can pin the choice without a renderer.
+    pub fn backdrop_alpha(&self) -> u8 {
+        match self.backdrop {
+            Backdrop::Dim => MODAL_BACKDROP_ALPHA,
+            Backdrop::Clear => 0,
         }
     }
 
@@ -703,11 +744,17 @@ pub fn modal(
             // Claim the whole viewport before the panel exists, so the panel
             // is drawn over a region that already belongs to the backdrop.
             let (full, _) = ui.allocate_exact_size(viewport.size(), Sense::click_and_drag());
-            ui.painter().rect_filled(
-                full,
-                CornerRadius::ZERO,
-                Color32::from_black_alpha(MODAL_BACKDROP_ALPHA),
-            );
+            // The sense is unconditional and the fill is not: a clear
+            // backdrop must still block the map underneath, and that is a
+            // separate decision from how dark it looks.
+            let alpha = spec.backdrop_alpha();
+            if alpha > 0 {
+                ui.painter().rect_filled(
+                    full,
+                    CornerRadius::ZERO,
+                    Color32::from_black_alpha(alpha),
+                );
+            }
         });
 
     egui::Area::new(spec.id)
@@ -787,6 +834,32 @@ pub fn modal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The backdrop's two jobs are independent and both are load-bearing.
+    /// "No dim" must not have been implemented as "no backdrop", or a drag
+    /// out of the modal clicks the map underneath it.
+    #[test]
+    fn a_clear_backdrop_drops_the_dim_and_nothing_else() {
+        let dimmed = Modal::new(Id::new("m"), "M", vec2(100.0, 100.0));
+        assert_eq!(dimmed.backdrop_alpha(), MODAL_BACKDROP_ALPHA);
+
+        let clear = dimmed.clone().clear_backdrop();
+        assert_eq!(clear.backdrop_alpha(), 0);
+
+        // Everything else about the modal is untouched, so clearing is a
+        // painting decision and not a different kind of window.
+        assert_eq!(clear.rect_in(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                   dimmed.rect_in(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))));
+        assert_eq!(clear.title, dimmed.title);
+    }
+
+    /// A dim of zero would read as "no backdrop was drawn" to anything that
+    /// inspects the alpha, so the two are kept distinguishable by construction.
+    #[test]
+    fn dimming_is_actually_dimmed() {
+        assert!(MODAL_BACKDROP_ALPHA > 0, "a dim backdrop that dims nothing");
+        assert!(MODAL_BACKDROP_ALPHA < 255, "a dim backdrop that blacks out the map");
+    }
 
     fn island(size_y: f32) -> (Island, bool) {
         (Island::new(Id::new("t"), "T", vec2(tokens::ZONE_W, size_y)), true)
