@@ -1324,21 +1324,37 @@ enum Book {
     One(tfg::backend::GameScenario),
 }
 
-/// Whether a release at `pos` should place a hull, given where the picker
-/// panel is.
+/// Whether a game role may need a fleet before the exercise can run.
 ///
-/// The map's rect is full-bleed and therefore CONTAINS the panel, so
-/// "released over the map" is not on its own enough: a release over the form
-/// would drop a hull at whatever sea lies behind it.
+/// TRUE for everything that is not judge-side, because that is all the
+/// helpers mirror can say. There is no positive "requires a command" flag on
+/// a game role — the schema carries `is_judge_side` and nothing else — so the
+/// honest form of this question is "is this the judge side", and the answer
+/// for the rest is a warning rather than a block.
+///
+/// A free function because the rule is pure and takes only the flag: the note
+/// appears in two places (the seat form and the roster row) and one answer
+/// served from two places is two answers waiting to disagree.
+fn role_may_need_command(is_judge_side: bool) -> bool {
+    !is_judge_side
+}
+
+/// Whether a release at `pos` should land on the map, given the modal panels
+/// currently on screen.
+///
+/// The map's rect is full-bleed and therefore CONTAINS any floating zone, so
+/// "released over the map" is not on its own enough: a release over a form
+/// would place at whatever map point happens to be behind it.
+///
+/// A LIST, not one rect, because two modals each own a drag-to-map — the
+/// Fleet picker for hulls and the Player picker for people — and a single slot
+/// would mean whichever drew last silently disarmed the other.
 ///
 /// A free function rather than a method because the rule is pure and the app
 /// is not. A rule only checkable by standing up a store connection, a core
 /// map and a token is a rule that does not get checked.
-fn drop_lands_on_map(panel: Option<egui::Rect>, pos: egui::Pos2) -> bool {
-    match panel {
-        Some(panel) => !panel.contains(pos),
-        None => true,
-    }
+fn drop_lands_on_map(panels: &[egui::Rect], pos: egui::Pos2) -> bool {
+    !panels.iter().any(|panel| panel.contains(pos))
 }
 
 /// A step being written, before the server has given it an id.
@@ -2274,15 +2290,22 @@ struct ShipApp {
     composer_draft_error: Option<String>,
     /// Whether the Fleet Picker modal is showing.
     fleet_picker_open: bool,
-    /// The picker panel's rect for this frame, or `None` when it is closed.
+    /// Whether the Player Picker modal is showing.
+    player_picker_open: bool,
+    /// Every modal panel's rect, for this frame.
     ///
-    /// The drop handler needs it because the map's own rect contains the
-    /// modal: the map is full-bleed under the floating zones, so a release
-    /// over the panel would otherwise place a hull at whatever map point
-    /// happens to be behind the form. Recomputed per frame from the same
-    /// `Modal::rect_in` the primitive used, so there is one answer to where
-    /// the panel is rather than two that can disagree.
-    fleet_panel_rect: Option<egui::Rect>,
+    /// The drop handlers need these because the map's own rect contains the
+    /// panels: the map is full-bleed under the floating zones, so a release
+    /// over a form would otherwise place at whatever map point happens to be
+    /// behind it. Recomputed per frame from the same `Modal::rect_in` the
+    /// primitive used, so there is one answer to where each panel is rather
+    /// than two that can disagree.
+    ///
+    /// A Vec because two modals each own a drag-to-map, and cleared once per
+    /// frame rather than per modal: a panel cannot remove its own rect on the
+    /// frame it closes, and that frame is exactly the one where a release is
+    /// still landing.
+    modal_panel_rects: Vec<egui::Rect>,
     /// The in-flight book read or write. One slot rather than one per verb:
     /// the composer is a single author at a time, and a second write would
     /// answer against a book the first write had already changed.
@@ -4522,6 +4545,33 @@ impl ShipApp {
                         ui.selectable_value(&mut self.users_role, Some(*id), name);
                     }
                 });
+            // Say what the chosen role will imply BEFORE the seat is taken.
+            // A commander with no fleet is discovered when the exercise
+            // starts, which is the worst possible moment; saying it here
+            // costs one line and the operator can ignore it.
+            if let Some((_, name, _, judge)) = self
+                .users_role
+                .and_then(|r| self.users_roles.iter().find(|(id, _, _, _)| *id == r))
+                .cloned()
+            {
+                if role_may_need_command(judge) {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{name} may need a command \u{2014} assign a hull after seating"
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{name} is judge side \u{2014} no command, exempt from readiness"
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+            }
         });
         let mut seating: Vec<i64> = Vec::new();
         egui::ScrollArea::vertical().id_salt("users-dir").max_height(170.0).show(
@@ -4577,9 +4627,74 @@ impl ShipApp {
         }
     }
 
-    /// Setup flow step 2, roster half (#79): who holds which seat,
-    /// role changes (each clears readiness), and removals.
+    /// The roster as the Players island shows it: who is seated, in what,
+    /// and whether anything is still missing.
+    ///
+    /// READ ONLY, and that is the point. The editable roster lives in the
+    /// Player Picker modal, and both are on screen at once while it is open.
+    /// Two editable copies would collide on their per-row ComboBox ids —
+    /// egui keys a widget by Id, so two `("roster-role", user_id)` boxes in
+    /// one frame are ONE widget, which opens one popup in the wrong place
+    /// and lets a click land in the other.
     fn users_roster_ui(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Seated");
+        if self.users_game.is_none() {
+            ui.weak("Pick a session to see its roster.");
+            return;
+        }
+        if self.users_roster.is_empty() {
+            ui.weak("Nobody seated yet.");
+            return;
+        }
+        for p in self.users_roster.clone() {
+            ui.horizontal(|ui| {
+                ui.label(p.user_name.clone());
+                ui.label(egui::RichText::new(p.role_name.clone()).weak());
+                if p.judge {
+                    ui.label(egui::RichText::new("judge").weak().small());
+                } else if p.ready {
+                    ui.label(
+                        egui::RichText::new("ready")
+                            .small()
+                            .color(egui::Color32::from_rgb(0x4A, 0xDE, 0x80)),
+                    );
+                } else {
+                    ui.label(egui::RichText::new("not ready").weak().small());
+                }
+            });
+        }
+        let uncommanded = self.seated_without_command();
+        if !uncommanded.is_empty() {
+            ui.weak(format!(
+                "{} awaiting a command: {}",
+                uncommanded.len(),
+                uncommanded.join(", ")
+            ));
+        }
+    }
+
+    /// Seated exercise-side people who hold no hull.
+    ///
+    /// One accessor because the roster row, the island summary and the
+    /// readiness gate all need this answer, and three copies of the
+    /// judge-then-filtered-count is three places to forget the judge side.
+    fn seated_without_command(&self) -> Vec<String> {
+        self.users_roster
+            .iter()
+            .filter(|p| !self.users_is_judge(p))
+            .filter(|p| {
+                !self
+                    .commanded_hulls
+                    .iter()
+                    .any(|h| h.commander_id == Some(p.user_id))
+            })
+            .map(|p| p.user_name.clone())
+            .collect()
+    }
+
+    /// The editable roster, inside the Player Picker: who holds which seat,
+    /// role changes (each clears readiness), and removals.
+    fn roster_editor_ui(&mut self, ui: &mut egui::Ui) {
         ui.strong("Roster");
         if self.users_game.is_none() {
             ui.weak("Pick a session to see its roster.");
@@ -4608,8 +4723,32 @@ impl ShipApp {
                                 }
                             }
                         });
-                    if p.judge {
+                    // Judge side is the only positive fact the helpers
+                    // mirror carries, so `role_may_need_command` on it is the
+                    // whole of what can be known here — hence the branch, and
+                    // hence the softer wording on the other side.
+                    let judge_side = self.users_is_judge(p);
+                    if judge_side {
                         ui.label(egui::RichText::new("(judge)").weak().small());
+                    } else if role_may_need_command(false)
+                        && !self
+                            .commanded_hulls
+                            .iter()
+                            .any(|h| h.commander_id == Some(p.user_id))
+                    {
+                        // A warning, not a block: nothing forbids an
+                        // exercise-side seat from holding no hull, and the
+                        // server does not refuse it. Amber says so without
+                        // claiming the exercise cannot start.
+                        ui.label(
+                            egui::RichText::new("no command yet")
+                                .color(egui::Color32::from_rgb(246, 197, 107))
+                                .small(),
+                        );
+                    }
+                    if p.judge {
+                        // Judge side is exempt from readiness: nothing to
+                        // say, which is why this branch is empty.
                     } else if p.ready {
                         ui.label(
                             egui::RichText::new("✓ ready")
@@ -6356,8 +6495,30 @@ impl ShipApp {
             status_line(ui, &self.users_status.clone());
             return;
         }
-        self.users_directory_ui(ui);
+        // The picker is a modal, so this island is the roster SUMMARY and the
+        // door. Seating is one decision about a person — who, as what, and for
+        // some roles which fleet — and in a 320-point column that decision
+        // needs room the island does not have.
+        ui.horizontal(|ui| {
+            let seated = self.users_roster.len();
+            if ui
+                .button(if seated > 0 {
+                    format!("Player picker ({seated} seated)")
+                } else {
+                    "Player picker".to_string()
+                })
+                .on_hover_text("seat accounts into game roles")
+                .clicked()
+            {
+                self.player_picker_open = true;
+            }
+            if let Some(p) = self.own_roster_row() {
+                ui.label(egui::RichText::new(format!("you: {}", p.role_name)).weak().small());
+            }
+        });
         ui.separator();
+        // The seated list stays here: it is the state the operator reads
+        // back, and a count alone would not say who is missing.
         self.users_roster_ui(ui);
         status_line(ui, &self.users_status.clone());
     }
@@ -6958,7 +7119,6 @@ impl ShipApp {
                 .clicked()
             {
                 self.fleet_picker_open = true;
-                self.fleet_panel_rect = None;
             }
             if self.fleet_pick.is_some() {
                 ui.weak(
@@ -7693,11 +7853,64 @@ impl ShipApp {
         // Published even when the modal is closing: the drop handler runs
         // later in the same frame, on the release that closed it, and on that
         // frame the panel is still where the pointer left it.
-        self.fleet_panel_rect = Some(panel);
+        self.modal_panel_rects.push(panel);
         if !kept {
             self.fleet_picker_open = false;
             self.clear_fleet_pick();
             self.unit_drag = None;
+        }
+    }
+
+    // -- the Player Picker ----------------------------------------------------
+    //
+    // Three things in one form because they are one decision: WHO from the
+    // app directory, AS WHAT game role, and — for some roles — WHICH FLEET
+    // they command. Splitting them across three surfaces is how a role ends
+    // up seated with no command and nobody notices until the exercise starts.
+    //
+    // It also owns the drag-to-map that assigns a seated person a piece: the
+    // press starts on a directory row and the release is on a unit marker or
+    // a group flag. Same map-under-a-modal hazard as the Fleet picker, and
+    // the same two answers — clear the backdrop while the drag is in flight,
+    // and refuse a release that lands on a panel.
+
+    /// Whether a person-drag is in flight, for the backdrop decision.
+    fn player_drag_in_flight(&self) -> bool {
+        self.udrag.is_some() || self.upress.is_some()
+    }
+
+    /// The Player Picker modal.
+    fn player_picker_modal(&mut self, ui: &egui::Ui) {
+        let mut spec = tfg::chrome::Modal::new(
+            egui::Id::new("player-picker"),
+            "Player picker",
+            egui::vec2(940.0, 600.0),
+        );
+        // The drag ghost is painted by the map, which is under the
+        // backdrop. Same reasoning as the Fleet picker: do not dim the thing
+        // the operator is aiming.
+        if self.player_drag_in_flight() {
+            spec = spec.clear_backdrop();
+        }
+        let panel = spec.rect_in(ui.ctx().viewport_rect());
+        // Indexed rather than bound: `&mut cols[0]` and `&mut cols[1]` are
+        // two live mutable borrows of one Vec, which the borrow checker
+        // refuses even though they are different elements.
+        let kept = tfg::chrome::modal(ui.ctx(), &spec, |ui| {
+            ui.columns(2, |cols| {
+                self.users_directory_ui(&mut cols[0]);
+                self.roster_editor_ui(&mut cols[1]);
+            });
+            status_line(ui, &self.users_status.clone());
+        });
+        self.modal_panel_rects.push(panel);
+        if !kept {
+            self.player_picker_open = false;
+            // A person-drag does not survive the modal that started it: the
+            // release would land on the map with no panel to have started it,
+            // which is a command nobody asked for.
+            self.udrag = None;
+            self.upress = None;
         }
     }
 
@@ -12540,15 +12753,17 @@ impl eframe::App for ShipApp {
         if self.settings_open {
             self.settings_modal(ui);
         }
+        // Cleared here, before any panel publishes, rather than by each modal
+        // on close. See `modal_panel_rects`.
+        self.modal_panel_rects.clear();
         if self.composer_visible {
             self.composer_modal(ui);
         }
         if self.fleet_picker_open {
             self.fleet_picker_modal(ui);
-        } else {
-            // A closed picker must not keep refusing drops: the rect is
-            // only meaningful on a frame where the panel was drawn.
-            self.fleet_panel_rect = None;
+        }
+        if self.player_picker_open {
+            self.player_picker_modal(ui);
         }
 
         let mut follow_req: Option<(String, (f64, f64))> = None;
@@ -13349,7 +13564,7 @@ impl eframe::App for ShipApp {
                             let drop = ui.input(|input| input.pointer.interact_pos());
                             let on_map = drop
                                 .filter(|pos| rect.contains(*pos))
-                                .filter(|pos| drop_lands_on_map(self.fleet_panel_rect, *pos));
+                                .filter(|pos| drop_lands_on_map(&self.modal_panel_rects, *pos));
                             if let Some(pos) = on_map {
                                 let px = (pos.x - rect.min.x) as f64;
                                 let py = (pos.y - rect.min.y) as f64;
@@ -13366,9 +13581,8 @@ impl eframe::App for ShipApp {
                                 // The two refusals are different and the
                                 // operator needs to know which: off the map
                                 // is a miss, over the form is a correction.
-                                self.users_status = if self
-                                    .fleet_panel_rect
-                                    .is_some_and(|p| drop.is_some_and(|d| p.contains(d)))
+                                self.users_status = if drop
+                                    .is_some_and(|d| !drop_lands_on_map(&self.modal_panel_rects, d))
                                 {
                                     format!(
                                         "{} not placed \u{2014} release over the map, not the picker",
@@ -13675,6 +13889,19 @@ impl eframe::App for ShipApp {
                         self.feed(reason);
                     } else {
                     match (drop, self.users_game.clone()) {
+                        // Released over the form, not the map. Asked before
+                        // the marker arm below because the map's rect
+                        // CONTAINS the panel, so that arm would otherwise
+                        // answer "release over a unit marker" — advice about a
+                        // place the operator was never aiming at.
+                        (Some(p), Some((_gid, _)))
+                            if rect.contains(p)
+                                && !drop_lands_on_map(&self.modal_panel_rects, p) =>
+                        {
+                            self.feed(format!(
+                                "{uname} not assigned \u{2014} release over a unit marker, not the form"
+                            ));
+                        }
                         (Some(p), Some((gid, _))) if rect.contains(p) => {
                             let px = (p.x - rect.min.x) as f64;
                             let py = (p.y - rect.min.y) as f64;
@@ -14602,7 +14829,8 @@ fn main() -> Result<(), String> {
                 users_roles: Vec::new(),
                 users_roster: Vec::new(),
                 fleet_picker_open: false,
-                fleet_panel_rect: None,
+                player_picker_open: false,
+                modal_panel_rects: Vec::new(),
                 scenarios: Vec::new(),
                 composer_scenario: None,
                 composer_visible: false,
@@ -14899,15 +15127,15 @@ mod tests {
         egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(400.0, 300.0))
     }
 
-    /// A release over the panel is NOT a release over the map.
+    /// A release over a panel is NOT a release over the map.
     ///
     /// `Rect::contains` is half-open, so the top-left corner is inside and a
     /// point exactly on the bottom-right edge is not. Both boundaries are
     /// pinned, because that edge is where a hull ends up one pixel from where
     /// the operator let go of it.
     #[test]
-    fn a_release_over_the_picker_is_not_a_drop() {
-        let panel = picker_panel();
+    fn a_release_over_a_panel_is_not_a_drop() {
+        let panels = [picker_panel()];
         for pos in [
             egui::pos2(300.0, 250.0), // centre
             egui::pos2(100.0, 100.0), // top-left corner: inside
@@ -14915,7 +15143,7 @@ mod tests {
             egui::pos2(100.0, 399.0), // bottom-left edge
         ] {
             assert!(
-                !drop_lands_on_map(Some(panel), pos),
+                !drop_lands_on_map(&panels, pos),
                 "{pos:?} is inside the picker and must not place"
             );
         }
@@ -14926,25 +15154,93 @@ mod tests {
             egui::pos2(300.0, 400.5), // just below it
         ] {
             assert!(
-                drop_lands_on_map(Some(panel), pos),
+                drop_lands_on_map(&panels, pos),
                 "{pos:?} is outside the picker and must place"
             );
         }
     }
 
-    /// With no panel there is nothing to refuse, so placement behaves exactly
-    /// as it did before the picker existed. A stale rect would silently make
-    /// a region of the map unplaceable, so the closed case has to be the
-    /// permissive one.
+    /// With no panels there is nothing to refuse, so placement behaves
+    /// exactly as it did before either picker existed. A stale rect would
+    /// silently make a region of the map unplaceable, so the empty case has
+    /// to be the permissive one.
     #[test]
-    fn a_closed_picker_refuses_nothing() {
+    fn no_panels_refuse_nothing() {
         for pos in [
             egui::pos2(0.0, 0.0),
             egui::pos2(1919.0, 1079.0),
             egui::pos2(960.0, 540.0),
         ] {
-            assert!(drop_lands_on_map(None, pos));
+            assert!(drop_lands_on_map(&[], pos));
         }
+    }
+
+    /// Two panels, not one: the Fleet picker owns hull drags and the Player
+    /// picker owns person drags, and a single slot would mean whichever drew
+    /// last silently disarmed the other. A point inside EITHER is refused.
+    #[test]
+    fn every_open_panel_refuses() {
+        let fleet = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(400.0, 300.0));
+        let players = egui::Rect::from_min_size(egui::pos2(600.0, 400.0), egui::vec2(400.0, 300.0));
+        let panels = [fleet, players];
+        // Each panel's own centre, checked against the OTHER panel present:
+        // a one-element list would pass both of these.
+        assert!(!drop_lands_on_map(&panels, egui::pos2(300.0, 250.0)));
+        assert!(!drop_lands_on_map(&panels, egui::pos2(800.0, 550.0)));
+        // A point in neither still lands, even though both panels are open.
+        assert!(drop_lands_on_map(&panels, egui::pos2(50.0, 900.0)));
+        assert!(drop_lands_on_map(&panels, egui::pos2(1500.0, 200.0)));
+    }
+
+    /// A read-only roster and an editable one must never appear in the same
+    /// frame. egui keys a widget by `Id`, so two per-row ComboBoxes salted
+    /// `("roster-role", user_id)` are ONE widget: one popup, opened from the
+    /// wrong copy, with a click that lands in the other. The island is
+    /// therefore read-only and the modal owns every verb.
+    ///
+    /// A source-level check rather than a render, because the failure is an
+    /// Id collision and an Id collision does not show up as anything a
+    /// screenshot would make obvious — the form looks right and the wrong one
+    /// responds.
+    #[test]
+    fn the_editable_roster_is_only_in_the_modal() {
+        // Assembled from parts so this test does not spell the call it is
+        // counting — not even in a comment, since a comment is in the file
+        // too and the count would never settle.
+        let needle = ["self.", "roster_editor_ui(", "&mut"].concat();
+        let src = include_str!("main.rs");
+        let calls = src.split(needle.as_str()).count() - 1;
+        assert_eq!(
+            calls, 1,
+            "the editable roster must be called from exactly one place"
+        );
+        // And the island's copy takes no ComboBox, which is what makes it
+        // safe to draw while the modal is open.
+        let island = src
+            .split("fn users_roster_ui(")
+            .nth(1)
+            .expect("the island roster exists")
+            .split("fn seated_without_command(")
+            .next()
+            .expect("it ends where the next fn begins");
+        assert!(
+            !island.contains("ComboBox"),
+            "the island roster must stay read-only"
+        );
+        assert!(
+            !island.contains("small_button"),
+            "the island roster must carry no verbs"
+        );
+    }
+
+    /// The only positive fact the helpers mirror carries about a game role
+    /// is `is_judge_side`, so "may need a command" is exactly its negation.
+    /// A test that says anything more would be asserting a flag the schema
+    /// does not have.
+    #[test]
+    fn only_the_judge_side_is_known_not_to_need_a_command() {
+        assert!(!role_may_need_command(true), "judge side never commands");
+        assert!(role_may_need_command(false), "everything else may");
     }
 
     fn entry(unit_id: i64, w: Option<u32>, h: Option<u32>) -> tfg::backend::UnitImageEntry {

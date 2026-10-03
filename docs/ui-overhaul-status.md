@@ -49,9 +49,12 @@ the MapLibre core.
 | The composer draft's rules | `ComposerDraft::problem` | 5 tests: half-window, malformed, backwards, no-window, empty content |
 | The Fleet Picker modal | `ShipApp::fleet_picker_modal` | `cargo check` clean; **not looked at** (no compositor) |
 | A clear backdrop for drag-to-map | `chrome::Backdrop` | 2 tests: it drops the dim and nothing else, and a dim is actually dimmed |
-| A release over the picker is not a drop | `main::drop_lands_on_map` | 2 tests pinning the panel edge, half-open, and the closed case |
+| A release over a panel is not a drop | `main::drop_lands_on_map` | 3 tests: the panel edge half-open, the empty case, and TWO panels where one would pass both |
+| The Player Picker modal | `ShipApp::player_picker_modal` | `cargo check` clean; **not looked at** (no compositor) |
+| The seat note's rule | `main::role_may_need_command` | a test that says exactly what the schema can support and no more |
+| Island roster is read-only, editor is in the modal | `users_roster_ui` / `roster_editor_ui` | a source-level check on the Id collision, which no screenshot would reveal |
 
-`cargo test --lib`: 280 pass. `cargo test --bin tfg`: 32 pass. Two failures are pre-existing and unrelated
+`cargo test --lib`: 280 pass. `cargo test --bin tfg`: 35 pass. Harness: 90 pass. Two failures are pre-existing and unrelated
 (`quad_bow_follows_the_compass`, `order_move_applies_then_higher_overrides_loudly`);
 both were confirmed failing on a stashed tree before this work.
 
@@ -110,13 +113,19 @@ wrong in several places.
 Ordered so each unit is verifiable on its own and each one shrinks the risk of
 the next.
 
-1. **The Player Picker modal.** `chrome::modal` is landed, and the Scenario
-   Composer and Fleet Picker are built on it. What is left is
-   `users_directory_ui`/`users_roster_ui` re-homed, plus the game-role pick
-   and the "this role may need a command" note.
-2. **Execution and Closure island sets.** The zone shows one compact island
+1. **Execution and Closure island sets.** The zone shows one compact island
    for each today. The Orders, Roster, Log and assessment surfaces exist as
    free-floating islands and a docked panel, and they belong in the column.
+2. **`description` is write-only in the client.** `parse_game_detail` never
+   reads it, so the Essentials island shows a blank field after a reload.
+   Fix the parser before that island ships.
+3. **Collapse `Onboard::Mode`.** Simulation currently announces itself, which
+   the brief forbids. Collapsing the enum removes an `Onboard` state and takes
+   the mode card out of the console entirely.
+4. **Re-run every "looked at" claim on a working compositor.** Every visual
+   decision in this file was checked on a rendered frame at some point EXCEPT
+   everything from the modal primitive onward: the backdrop dim, the three
+   modals, and both drag-to-map gestures. That is a real gap, not a formality.
 
 ## Traps worth writing down
 
