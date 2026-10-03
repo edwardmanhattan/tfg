@@ -1345,6 +1345,35 @@ fn drop_lands_on_map(panels: &[egui::Rect], pos: egui::Pos2) -> bool {
     !panels.iter().any(|panel| panel.contains(pos))
 }
 
+/// The height a zone island should stack at, given what its content asked
+/// for.
+///
+/// `want` is the island's OWN measurement from last frame, or `None` if it
+/// has not been drawn. `declared` is the constant it was written with, which
+/// is both the first frame's height and the floor. `ceiling` keeps one
+/// unbounded body from pushing every island below it off the screen.
+///
+/// Three refusals, each for a different reason to be wrong:
+///
+/// - `None` keeps the declared height, so a column that has never been
+///   measured lays out sensibly rather than at zero.
+/// - A non-finite or non-positive `want` is the same as `None`. A layout can
+///   report nonsense — an island measured at zero height on the frame its
+///   content is empty, say — and `NaN` through `clamp` silently poisons a
+///   rect, which then drops every island under it.
+/// - The floor and ceiling are applied AFTER, so a measurement can grow an
+///   island but never shrink it below what it declared, and never past the
+///   window.
+///
+/// A free function because it is pure and this is the rule that decides
+/// whether the column is laid out at all.
+fn fitted_island_height(declared: f32, want: Option<f32>, ceiling: f32) -> f32 {
+    match want {
+        Some(w) if w.is_finite() && w > 0.0 => w.clamp(declared.min(ceiling), ceiling),
+        _ => declared.min(ceiling),
+    }
+}
+
 /// A step being written, before the server has given it an id.
 ///
 /// Held as a draft rather than written straight through because the backend
@@ -8474,6 +8503,46 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             }
         }
 
+        // Stack by what the islands asked for LAST frame, not by the constant
+        // they were declared with.
+        //
+        // The column's heights used to be hand-picked constants and they
+        // were wrong often enough that the Operator island shipped at 112pt
+        // against content needing 140 — which a render revealed and no
+        // geometry test could, because every rect involved was correct.
+        //
+        // So the column measures itself. `chrome::island_fitted_height` reads
+        // what the previous frame's draw published into the context's TEMP
+        // storage, which is why there is no field on the app holding it: temp
+        // storage is already scoped to one frame, and a parallel HashMap
+        // would be a second source of truth that can disagree with it.
+        //
+        // One frame of lag is the price, and it is the right trade against
+        // the alternative: the zone stacks by heights fixed before anything
+        // is drawn, so measuring IN ADVANCE means running every body twice,
+        // and every write a body performs would fire twice. A frame of lag
+        // cannot fire a write twice.
+        //
+        // The declared constant stays as the FIRST frame's height and as the
+        // floor, so a column that has never been measured lays out sensibly
+        // rather than at zero.
+        //
+        // Clamped both ways: an island never shrinks below what it was
+        // declared to need, and never grows past `ZONE_ISLAND_MAX` — an
+        // unbounded body (a roster of five hundred) would otherwise push the
+        // islands below it off the screen, which is worse than clipping it.
+        let vp = ui.ctx().viewport_rect();
+        let ceiling = (vp.height() - tfg::tokens::ZONE_ISLAND_GAP).max(80.0);
+        let mut entries = entries;
+        for (spec, _) in entries.iter_mut() {
+            let declared = spec.size.y;
+            spec.size.y = fitted_island_height(
+                declared,
+                tfg::chrome::island_fitted_height(ui.ctx(), spec.id),
+                ceiling,
+            );
+        }
+
         let dock = self.side_dock;
         let origins = zone_island_origins(dock, ui.ctx().viewport_rect(), &entries);
 
@@ -15397,6 +15466,69 @@ mod tests {
     fn an_empty_step_is_not_the_drafts_business() {
         let d = ComposerDraft::default();
         assert_eq!(d.problem(), None, "content is the server's rule, not the draft's");
+    }
+
+    // -- the column measures itself -----------------------------------------
+    //
+    // The heights used to be hand-picked constants, and they were wrong often
+    // enough that the Operator island shipped at 112pt against content
+    // needing 140. The column now stacks at what each island measured last
+    // frame, so these are the rules that decide whether it lays out at all.
+
+    /// With no measurement the declared constant is used, unchanged.
+    ///
+    /// The first frame has no measurement, and a column laid out at zero is
+    /// not a transient state to be waited out — it is the first thing anyone
+    /// sees.
+    #[test]
+    fn an_unmeasured_island_keeps_its_declared_height() {
+        assert_eq!(fitted_island_height(140.0, None, 900.0), 140.0);
+    }
+
+    /// A measurement grows the island, which is the whole point.
+    #[test]
+    fn a_measurement_grows_the_island() {
+        assert_eq!(fitted_island_height(70.0, Some(140.0), 900.0), 140.0);
+        // And a small one does not shrink it past what it declared: the
+        // constant is a floor, so a frame with less content cannot make the
+        // island jump about.
+        assert_eq!(fitted_island_height(140.0, Some(98.0), 900.0), 140.0);
+    }
+
+    /// A nonsense measurement is refused rather than clamped.
+    ///
+    /// `NaN` through `clamp` silently poisons a rect, and a poisoned rect
+    /// drops every island under it — so this is the case where a bad
+    /// measurement is worse than no measurement.
+    #[test]
+    fn a_nonsense_measurement_is_refused() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -50.0] {
+            assert_eq!(
+                fitted_island_height(140.0, Some(bad), 900.0),
+                140.0,
+                "{bad} must fall back to the declared height"
+            );
+        }
+    }
+
+    /// One unbounded body must not push the islands below it off the screen.
+    #[test]
+    fn a_measurement_cannot_exceed_the_ceiling() {
+        assert_eq!(fitted_island_height(140.0, Some(5000.0), 900.0), 900.0);
+        // And a declared height above the ceiling is itself clamped, or the
+        // first frame would overflow the window before any measurement
+        // arrives.
+        assert_eq!(fitted_island_height(5000.0, None, 900.0), 900.0);
+    }
+
+    /// The picker is not a modal, so nothing about it goes in here — but the
+    /// three modals all size themselves against this same window.
+    #[test]
+    fn a_micro_window_still_yields_a_usable_ceiling() {
+        // The caller's `ceiling` is `max(80.0)`-guarded, but the function
+        // must not produce a negative or inverted range if handed one.
+        assert_eq!(fitted_island_height(140.0, Some(400.0), 0.0), 0.0);
+        assert!(fitted_island_height(140.0, Some(400.0), 0.0) >= 0.0);
     }
 
     // -- the picker's drop target -------------------------------------------

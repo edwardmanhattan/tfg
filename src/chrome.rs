@@ -372,6 +372,7 @@ pub fn island_owned(
     let mut title_resp: Option<Response> = None;
     let mut clicked_close = false;
     let mut overflowed = false;
+    let mut fitted: Option<f32> = None;
 
     egui::Area::new(spec.id)
         .fixed_pos(island_pos)
@@ -492,8 +493,11 @@ pub fn island_owned(
                     // rather than a cut control. 12pt separates the two cases
                     // cleanly: the real 112pt overflow measured ~52pt over,
                     // and this noise measures 4pt.
-                    overflowed =
-                        ui.min_rect().height() > content.height() + OVERFLOW_SLACK;
+                    let used = ui.min_rect().height();
+                    overflowed = used > content.height() + OVERFLOW_SLACK;
+                    // `min_rect()` reports the content's natural height even
+                    // when handed a smaller rect — measured, not assumed.
+                    fitted = Some(spec.size.y - content.height() + used);
                 },
             );
 
@@ -503,7 +507,12 @@ pub fn island_owned(
     if clicked_close {
         *open = false;
     }
-    ctx.data_mut(|d| d.insert_temp(island_overflow_key(spec.id), overflowed));
+    ctx.data_mut(|d| {
+        d.insert_temp(island_overflow_key(spec.id), overflowed);
+        if let Some(f) = fitted {
+            d.insert_temp(island_fitted_key(spec.id), f);
+        }
+    });
     title_resp
 }
 
@@ -534,6 +543,32 @@ fn island_overflow_key(id: Id) -> Id {
 pub fn island_overflowed(ctx: &Context, id: Id) -> bool {
     ctx.data(|d| d.get_temp::<bool>(island_overflow_key(id)))
         .unwrap_or(false)
+}
+
+/// The key an island's fitted height is filed under.
+fn island_fitted_key(id: Id) -> Id {
+    id.with("__fitted")
+}
+
+/// The island height its content actually wanted, or `None` if it has not
+/// been drawn since the last read.
+///
+/// This is what makes the zone self-sizing WITHOUT running any body twice.
+///
+/// `min_rect()` reports the content's natural height even when it was handed
+/// a smaller rect — measured, not assumed: the Operator island measured 98.4
+/// against 94 available, so the layout was not clamped. So an island can
+/// draw at whatever height it was given and then say what it would have
+/// preferred, and the column can use that on the NEXT frame.
+///
+/// One frame of lag is the whole price, and it is the right trade against the
+/// alternative: the zone stacks by heights fixed before anything is drawn, so
+/// measuring in advance means running every body twice, and running a body
+/// twice double-fires its writes. A frame of lag cannot fire a write twice.
+///
+/// TEMP storage, like the overflow flag — this is a fact about one frame.
+pub fn island_fitted_height(ctx: &Context, id: Id) -> Option<f32> {
+    ctx.data(|d| d.get_temp::<f32>(island_fitted_key(id)))
 }
 
 /// Convenience for the common shape: a fixed-size island whose body
