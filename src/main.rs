@@ -8148,6 +8148,199 @@ impl ShipApp {
             }
         });
     }
+    /// The Orders surface, as the Execution column shows it.
+    ///
+    /// Extracted verbatim from the free-floating Orders island rather than
+    /// rewritten: the helm surface is a hundred and eighty lines of
+    /// jurisdiction and authority checks, and re-deriving any of it while
+    /// moving it is how a refactor becomes a rewrite.
+    fn orders_body(&mut self, ui: &mut egui::Ui) {
+// Direct HelmOrder surface: one selected unit at a time,
+// with MinOS authority in Live mode and a labelled local
+// sandbox projection in Simulation mode.
+ui.heading("Helm");
+// Group selection is inspectable here, but the first slice
+// deliberately avoids a multi-unit helm fan-out.
+if let Some(Selection::Group(_gid)) = self.selection.clone() {
+    ui.collapsing("Legacy waypoint navigation (compatibility)", |ui| {
+if let Some(Selection::Group(gid)) = self.selection.clone() {
+    match self.group_info(&gid) {
+        Some((name, members)) => {
+            let allowed: Vec<String> = members
+                .iter()
+                .filter(|u| self.action_allows(u))
+                .cloned()
+                .collect();
+            let auth = self.command_authority(&allowed);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(format!("group: {name} · {} unit(s)", members.len()));
+                if ui.small_button("✕").clicked() {
+                    self.deselect();
+                }
+            });
+            match auth {
+                Some(a) if !allowed.is_empty() => {
+                    ui.label(format!(
+                        "authority: {} · {} in jurisdiction",
+                        Self::authority_label(a),
+                        allowed.len()
+                    ));
+                    if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
+                        self.placing = !self.placing;
+                    }
+                    let can_commit = self
+                        .pending_waypoint
+                        .is_some_and(|(la, lo)| {
+                            self.land
+                                .as_ref()
+                                .map(|l| {
+                                    l.is_water(&GeoPosition {
+                                        latitude: la,
+                                        longitude: lo,
+                                    })
+                                })
+                                .unwrap_or(true)
+                        });
+                    if self.pending_waypoint.is_some() && !can_commit {
+                        warn_line(ui, "waypoint on land — pick water".to_string());
+                    }
+                    if ui
+                        .add_enabled(
+                            can_commit,
+                            egui::Button::new(format!("order group ({})", allowed.len())),
+                        )
+                        .clicked()
+                    {
+                        if let Some((la, lo)) = self.pending_waypoint {
+                            if let Some(tx) = &self.sim_cmd_tx {
+                                let waypoint = GeoPosition {
+                                    latitude: la,
+                                    longitude: lo,
+                                };
+                                let legs: Vec<Leg> = allowed
+                                    .iter()
+                                    .map(|ship| {
+                                        let max = self
+                                            .order_views
+                                            .get(ship)
+                                            .map(|v| v.max_speed_kn)
+                                            .unwrap_or(self.order_speed);
+                                        Leg {
+                                            ship_id: ship.clone(),
+                                            waypoint,
+                                            speed_kn: self.order_speed.min(max),
+                                        }
+                                    })
+                                    .collect();
+                                let _ = tx.send(SimCommand::OrderMove {
+                                    command: MoveCommand {
+                                        legs,
+                                        default_speed_kn: Some(self.order_speed),
+                                        authority: a,
+                                        grant: Grant {
+                                            units: allowed.clone(),
+                                            expires_game_secs: u64::MAX,
+                                            verbs: vec![Verb::Move],
+                                        },
+                                    },
+                                });
+                                eprintln!(
+                                    "order group {name} -> ({la:.4}, {lo:.4})"
+                                );
+                            }
+                            self.pending_waypoint = None;
+                            self.placing = false;
+                        }
+                    }
+                }
+                _ => {
+                    ui.label("Outside your jurisdiction — view only.");
+                }
+            }
+            ui.separator();
+        }
+        None => {
+            ui.label("group removed.");
+            if ui.small_button("clear").clicked() {
+                self.deselect();
+            }
+        }
+    }
+}
+    });
+}
+if let Some(Selection::Ship(id)) = self.selection.clone() {
+    // Scoped desktop (slice iv): command inside jurisdiction,
+    // view everything.
+    let allowed = self.action_allows(&id);
+    if !allowed {
+        ui.label("Outside your jurisdiction — view only.");
+    } else if self.minos_order_target(&id).is_some() {
+        self.minos_order_ui(ui, &id);
+    } else if self.controlled.contains(&id) {
+        self.local_helm_order_ui(ui, &id);
+    } else {
+        // Take-control with a class selector (grill #18): the
+        // chosen class's stats drive the unit from then on.
+        // Options name their authority (H10): Minos rows
+        // carry the spec version, bundled rows the asset.
+        let ships = self.catalog.ship_classes();
+        let names: Vec<String> = ships
+            .iter()
+            .map(|c| {
+                if c.version > 0 {
+                    format!("{} · {} v{}", c.name, Catalog::class_source(c), c.version)
+                } else {
+                    format!("{} · {}", c.name, Catalog::class_source(c))
+                }
+            })
+            .collect();
+        egui::ComboBox::from_label("")
+            .selected_text(
+                names.get(self.selected_class).map(|s| s.as_str()).unwrap_or("—"),
+            )
+            .show_ui(ui, |ui| {
+                for (i, name) in names.iter().enumerate() {
+                    ui.selectable_value(&mut self.selected_class, i, name.as_str());
+                }
+            });
+        if allowed && ui.small_button("take control").clicked() {
+            // C3: Minos drives its pieces in execution — a
+            // local takeover would be the ghost this ticket
+            // removes. Order them through Minos instead.
+            if self.users_game_state.as_deref() == Some("execution")
+                && id.parse::<i64>().is_ok_and(|uid| {
+                    self.users_gunits.iter().any(|g| g.unit_id == uid)
+                })
+            {
+                let msg =
+                    "take control refused: the exercise is already driving this unit"
+                        .to_string();
+                self.feed(msg.clone());
+                self.users_status = msg;
+            } else if let Some(s) = self.registry.ship(&id) {
+                if let Some(tx) = &self.sim_cmd_tx {
+                    let class_id = ships
+                        .get(self.selected_class)
+                        .map(|c| c.id.clone())
+                        .unwrap_or_default();
+                    let _ = tx.send(SimCommand::TakeControl {
+                        ship_id: id.clone(),
+                        pos: s.latest.position,
+                        class_id,
+                    });
+                    eprintln!("take control {id}");
+                }
+                self.controlled.insert(id);
+            }
+        }
+    }
+} else if self.selection.is_none() {
+    ui.label("select a ship or group first");
+}
+    }
+
 
     /// The side zone: a column of islands whose contents are a function of
     /// [`GameState`], floating over the map.
@@ -8212,16 +8405,49 @@ impl ShipApp {
                     .with_trailing("STEP 2"),
                 true,
             )),
+            // Execution is the state the console spends its life in, so the
+            // column is a working surface rather than a summary: what time it
+            // is, what you can order, who is actually here, and what just
+            // happened. Four islands in that order — the clock because it is
+            // read most, the orders because they are the verb, and the two
+            // that answer "is this going right" underneath both.
             GameState::Execution => {
                 entries.push((
-                    Island::new(egui::Id::new("z.clock"), "Exercise", egui::vec2(w, 200.0)),
+                    Island::new(egui::Id::new("z.clock"), "Exercise", egui::vec2(w, 200.0))
+                        .with_trailing(&format!("G+{:02}:{:02}",
+                            self.game_elapsed_secs.unwrap_or(0) / 60,
+                            self.game_elapsed_secs.unwrap_or(0) % 60)),
+                    true,
+                ));
+                entries.push((
+                    Island::new(egui::Id::new("z.orders"), "Orders", egui::vec2(w, 420.0))
+                        .with_trailing(&self.selection_label()),
+                    true,
+                ));
+                entries.push((
+                    Island::new(egui::Id::new("z.crew"), "Crew", egui::vec2(w, 240.0))
+                        .with_trailing(&format!("{} IN ROOM", self.crew_in_room())),
+                    true,
+                ));
+                entries.push((
+                    Island::new(egui::Id::new("z.log"), "Log", egui::vec2(w, 260.0)),
                     true,
                 ));
             }
-            GameState::Closure => entries.push((
-                Island::new(egui::Id::new("z.assessment"), "Assessment", egui::vec2(w, 420.0)),
-                true,
-            )),
+            // Closure is read-only, so the column is what you debrief with:
+            // the assessment workspace, and the log it is read out of.
+            // Deliberately no Orders — nothing is ordered after the fact, and
+            // a control that would be refused is a lie about the state.
+            GameState::Closure => {
+                entries.push((
+                    Island::new(egui::Id::new("z.assessment"), "Assessment", egui::vec2(w, 420.0)),
+                    true,
+                ));
+                entries.push((
+                    Island::new(egui::Id::new("z.log"), "Log", egui::vec2(w, 260.0)),
+                    true,
+                ));
+            }
         }
 
         let dock = self.side_dock;
@@ -8252,12 +8478,39 @@ impl ShipApp {
                 x if x == egui::Id::new("z.players") => self.zone_players_body(ui),
                 x if x == egui::Id::new("z.ready") => self.zone_ready_body(ui),
                 x if x == egui::Id::new("z.clock") => self.zone_exercise_body(ui),
+                x if x == egui::Id::new("z.orders") => self.zone_orders_body(ui),
+                x if x == egui::Id::new("z.crew") => self.zone_crew_body(ui),
+                x if x == egui::Id::new("z.log") => self.zone_log_body(ui),
                 x if x == egui::Id::new("z.assessment") => self.zone_assessment_body(ui),
                 _ => {
                     ui.weak(format!("{title} — no body"));
                 }
             });
         }
+    }
+
+    /// Whether the side zone already carries the surface the free-floating
+    /// islands duplicate.
+    ///
+    /// The column and the floating islands are not two views of one thing —
+    /// they are two copies, and drawing both is the operator editing one and
+    /// looking at the other. So it is per SURFACE and not just "the zone is
+    /// showing": Execution carries Orders, Crew and Log, so those three stop
+    /// floating there, while Planning carries none of them and they stay.
+    ///
+    /// Presentation has no column at all, so `show_side_zone` alone does not
+    /// answer it — hence the state check. Without that, turning the zone on
+    /// in Presentation would suppress islands the column is not drawing.
+    fn zone_carries(&self, surface: &str) -> bool {
+        if !self.show_side_zone {
+            return false;
+        }
+        let in_column = match self.game_state() {
+            GameState::Execution => matches!(surface, "orders" | "crew" | "log"),
+            GameState::Closure => matches!(surface, "log"),
+            _ => false,
+        };
+        in_column
     }
 
     /// Whether the side zone is occupying the left edge, where the legacy
@@ -8506,6 +8759,94 @@ impl ShipApp {
             warn_line(ui, note);
         }
         status_line(ui, &self.users_status.clone());
+    }
+
+    fn zone_orders_body(&mut self, ui: &mut egui::Ui) {
+        // The same gate the free-floating island had: orders are for whoever
+        // is actually driving the exercise, not for an observer watching one.
+        // Moving the surface must not widen who can order.
+        if self.is_observer() {
+            ui.weak("Observing — orders are not yours to give.");
+            return;
+        }
+        if self.selection.is_none() {
+            ui.weak("Select a ship or a group on the map.");
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("zone-orders")
+            .max_height(360.0)
+            .show(ui, |ui| self.orders_body(ui));
+    }
+
+    fn zone_log_body(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("zone-log")
+            .max_height(200.0)
+            .show(ui, |ui| self.log_island(ui));
+    }
+
+    /// Who is actually in the exercise right now.
+    ///
+    /// `joined_at` is the fact that matters and it is not the roster: a
+    /// participant is SEATED when they are given a role and IN THE ROOM when
+    /// they arrive with the room key. During execution the difference is the
+    /// difference between a commander who can be reached and one who is
+    /// assigned to nobody, so the two are counted separately rather than
+    /// collapsed into one headcount.
+    fn zone_crew_body(&mut self, ui: &mut egui::Ui) {
+        if self.users_game.is_none() {
+            ui.weak("No session held.");
+            return;
+        }
+        if self.users_roster.is_empty() {
+            ui.weak("Nobody seated.");
+            return;
+        }
+        ui.weak("seated is a role; in room is arrival");
+        for p in self.users_roster.clone() {
+            let here = p.joined_at.is_some();
+            ui.horizontal(|ui| {
+                ui.label(p.user_name.clone());
+                ui.label(egui::RichText::new(p.role_name.clone()).weak().small());
+                let mark = if self.users_is_judge(&p) {
+                    egui::RichText::new("judge").weak().small()
+                } else if !here {
+                    egui::RichText::new("not arrived")
+                        .color(tfg::tokens::ALERT_YELLOW)
+                        .small()
+                } else if p.ready {
+                    egui::RichText::new("in room")
+                        .color(tfg::tokens::SIGNAL_GREEN)
+                        .small()
+                } else {
+                    egui::RichText::new("in room · not ready")
+                        .color(tfg::tokens::ALERT_YELLOW)
+                        .small()
+                };
+                ui.label(mark);
+            });
+        }
+    }
+
+    /// How many participants have actually arrived, not merely been seated.
+    fn crew_in_room(&self) -> usize {
+        self.users_roster.iter().filter(|p| p.joined_at.is_some()).count()
+    }
+
+    /// The Orders island's trailing note: what it is currently pointed at.
+    ///
+    /// A group selection holds a group ID, not a name, so the name is
+    /// resolved here rather than printed raw — a trailing note reading
+    /// "Orders · 4" tells the operator nothing about which four.
+    fn selection_label(&self) -> String {
+        match &self.selection {
+            Some(Selection::Ship(id)) => id.clone(),
+            Some(Selection::Group(gid)) => self
+                .group_info(gid)
+                .map(|(name, members)| format!("{name} ({})", members.len()))
+                .unwrap_or_else(|| format!("{gid} (gone)")),
+            None => "NO SELECTION".to_string(),
+        }
     }
 
     fn zone_assessment_body(&mut self, ui: &mut egui::Ui) {
@@ -12831,6 +13172,11 @@ impl eframe::App for ShipApp {
         }
 
         let mut follow_req: Option<(String, (f64, f64))> = None;
+        // NOT gated on `zone_carries`: this island lists SHIPS in view, and
+        // the column's Crew island lists PEOPLE in the room. They answer
+        // different questions and both are wanted during execution, so
+        // suppressing either would lose something. The names differ for the
+        // same reason — "Roster" beside "Crew" is not two names for one thing.
         if self.show_roster
             && !self.zone_owns_left_edge()
             && (self.session_live() || self.app_mode == AppMode::Presentation)
@@ -13257,7 +13603,11 @@ impl eframe::App for ShipApp {
             }
         }
         // Orders island: Live-only; observers get no orders pane at all.
-        if self.show_orders && self.mode.live() && !self.is_observer() {
+        if self.show_orders
+            && self.mode.live()
+            && !self.is_observer()
+            && !self.zone_carries("orders")
+        {
             let mut open = self.show_orders;
             let mut pos = self.orders_pos;
             let spec = tfg::chrome::Island::new(
@@ -13266,190 +13616,7 @@ impl eframe::App for ShipApp {
                 egui::vec2(380.0, 360.0),
             );
             tfg::chrome::island_scrolled(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
-            // Direct HelmOrder surface: one selected unit at a time,
-            // with MinOS authority in Live mode and a labelled local
-            // sandbox projection in Simulation mode.
-            ui.heading("Helm");
-            // Group selection is inspectable here, but the first slice
-            // deliberately avoids a multi-unit helm fan-out.
-            if let Some(Selection::Group(_gid)) = self.selection.clone() {
-                ui.collapsing("Legacy waypoint navigation (compatibility)", |ui| {
-            if let Some(Selection::Group(gid)) = self.selection.clone() {
-                match self.group_info(&gid) {
-                    Some((name, members)) => {
-                        let allowed: Vec<String> = members
-                            .iter()
-                            .filter(|u| self.action_allows(u))
-                            .cloned()
-                            .collect();
-                        let auth = self.command_authority(&allowed);
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label(format!("group: {name} · {} unit(s)", members.len()));
-                            if ui.small_button("✕").clicked() {
-                                self.deselect();
-                            }
-                        });
-                        match auth {
-                            Some(a) if !allowed.is_empty() => {
-                                ui.label(format!(
-                                    "authority: {} · {} in jurisdiction",
-                                    Self::authority_label(a),
-                                    allowed.len()
-                                ));
-                                if ui.small_button(if self.placing { "click map…" } else { "place waypoint" }).clicked() {
-                                    self.placing = !self.placing;
-                                }
-                                let can_commit = self
-                                    .pending_waypoint
-                                    .is_some_and(|(la, lo)| {
-                                        self.land
-                                            .as_ref()
-                                            .map(|l| {
-                                                l.is_water(&GeoPosition {
-                                                    latitude: la,
-                                                    longitude: lo,
-                                                })
-                                            })
-                                            .unwrap_or(true)
-                                    });
-                                if self.pending_waypoint.is_some() && !can_commit {
-                                    warn_line(ui, "waypoint on land — pick water".to_string());
-                                }
-                                if ui
-                                    .add_enabled(
-                                        can_commit,
-                                        egui::Button::new(format!("order group ({})", allowed.len())),
-                                    )
-                                    .clicked()
-                                {
-                                    if let Some((la, lo)) = self.pending_waypoint {
-                                        if let Some(tx) = &self.sim_cmd_tx {
-                                            let waypoint = GeoPosition {
-                                                latitude: la,
-                                                longitude: lo,
-                                            };
-                                            let legs: Vec<Leg> = allowed
-                                                .iter()
-                                                .map(|ship| {
-                                                    let max = self
-                                                        .order_views
-                                                        .get(ship)
-                                                        .map(|v| v.max_speed_kn)
-                                                        .unwrap_or(self.order_speed);
-                                                    Leg {
-                                                        ship_id: ship.clone(),
-                                                        waypoint,
-                                                        speed_kn: self.order_speed.min(max),
-                                                    }
-                                                })
-                                                .collect();
-                                            let _ = tx.send(SimCommand::OrderMove {
-                                                command: MoveCommand {
-                                                    legs,
-                                                    default_speed_kn: Some(self.order_speed),
-                                                    authority: a,
-                                                    grant: Grant {
-                                                        units: allowed.clone(),
-                                                        expires_game_secs: u64::MAX,
-                                                        verbs: vec![Verb::Move],
-                                                    },
-                                                },
-                                            });
-                                            eprintln!(
-                                                "order group {name} -> ({la:.4}, {lo:.4})"
-                                            );
-                                        }
-                                        self.pending_waypoint = None;
-                                        self.placing = false;
-                                    }
-                                }
-                            }
-                            _ => {
-                                ui.label("Outside your jurisdiction — view only.");
-                            }
-                        }
-                        ui.separator();
-                    }
-                    None => {
-                        ui.label("group removed.");
-                        if ui.small_button("clear").clicked() {
-                            self.deselect();
-                        }
-                    }
-                }
-            }
-                });
-            }
-            if let Some(Selection::Ship(id)) = self.selection.clone() {
-                // Scoped desktop (slice iv): command inside jurisdiction,
-                // view everything.
-                let allowed = self.action_allows(&id);
-                if !allowed {
-                    ui.label("Outside your jurisdiction — view only.");
-                } else if self.minos_order_target(&id).is_some() {
-                    self.minos_order_ui(ui, &id);
-                } else if self.controlled.contains(&id) {
-                    self.local_helm_order_ui(ui, &id);
-                } else {
-                    // Take-control with a class selector (grill #18): the
-                    // chosen class's stats drive the unit from then on.
-                    // Options name their authority (H10): Minos rows
-                    // carry the spec version, bundled rows the asset.
-                    let ships = self.catalog.ship_classes();
-                    let names: Vec<String> = ships
-                        .iter()
-                        .map(|c| {
-                            if c.version > 0 {
-                                format!("{} · {} v{}", c.name, Catalog::class_source(c), c.version)
-                            } else {
-                                format!("{} · {}", c.name, Catalog::class_source(c))
-                            }
-                        })
-                        .collect();
-                    egui::ComboBox::from_label("")
-                        .selected_text(
-                            names.get(self.selected_class).map(|s| s.as_str()).unwrap_or("—"),
-                        )
-                        .show_ui(ui, |ui| {
-                            for (i, name) in names.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_class, i, name.as_str());
-                            }
-                        });
-                    if allowed && ui.small_button("take control").clicked() {
-                        // C3: Minos drives its pieces in execution — a
-                        // local takeover would be the ghost this ticket
-                        // removes. Order them through Minos instead.
-                        if self.users_game_state.as_deref() == Some("execution")
-                            && id.parse::<i64>().is_ok_and(|uid| {
-                                self.users_gunits.iter().any(|g| g.unit_id == uid)
-                            })
-                        {
-                            let msg =
-                                "take control refused: the exercise is already driving this unit"
-                                    .to_string();
-                            self.feed(msg.clone());
-                            self.users_status = msg;
-                        } else if let Some(s) = self.registry.ship(&id) {
-                            if let Some(tx) = &self.sim_cmd_tx {
-                                let class_id = ships
-                                    .get(self.selected_class)
-                                    .map(|c| c.id.clone())
-                                    .unwrap_or_default();
-                                let _ = tx.send(SimCommand::TakeControl {
-                                    ship_id: id.clone(),
-                                    pos: s.latest.position,
-                                    class_id,
-                                });
-                                eprintln!("take control {id}");
-                            }
-                            self.controlled.insert(id);
-                        }
-                    }
-                }
-            } else if self.selection.is_none() {
-                ui.label("select a ship or group first");
-            }
+            self.orders_body(ui);
             });
             self.show_orders = open;
             self.orders_pos = pos;
@@ -13477,6 +13644,7 @@ impl eframe::App for ShipApp {
         }
         if self.show_log
             && !self.zone_owns_left_edge()
+            && !self.zone_carries("log")
             && (self.session_live() || self.app_mode == AppMode::Presentation)
         {
             let mut open = self.show_log;
@@ -15330,6 +15498,45 @@ mod tests {
             2,
             "Onboard must be Login and App and nothing else"
         );
+    }
+
+    /// The column and the free-floating islands must never both carry a
+    /// surface. Two copies of the Orders panel is not two views of one
+    /// thing — it is the operator editing one and looking at the other.
+    ///
+    /// Asserted per SURFACE rather than as "the zone is showing", because
+    /// Execution carries Orders, Crew and Log while Planning carries none of
+    /// them, and Presentation has no column at all. A single blanket gate
+    /// would either double-draw in Planning or blank Presentation's islands
+    /// the moment the zone was switched on.
+    #[test]
+    fn a_surface_is_in_the_column_or_floating_never_both() {
+        let src = include_str!("main.rs");
+
+        // The floating copies are all gated on the same predicate. Spelled
+        // with the receiver so this test is not itself one of the matches.
+        let gate = ["self.", "zone_carries("].concat();
+        let gated = src.matches(gate.as_str()).count();
+        // One per suppressed floating island: orders and log.
+        assert_eq!(gated, 2, "orders and log must each check the column");
+
+        // And the predicate is the ONLY thing that decides: no floating
+        // island may decide by asking the game state directly, which is how
+        // the two copies drifted apart before.
+        // The floating Roster is deliberately absent: it lists ships, and the
+        // column's Crew lists people. Naming it here would assert a
+        // duplication that does not exist.
+        for island in ["show_orders", "show_log"] {
+            let arms = src
+                .split(&format!("if self.{island}\n"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{island} is drawn somewhere"));
+            let head = arms.lines().take(8).collect::<Vec<_>>().join("\n");
+            assert!(
+                head.contains("zone_carries"),
+                "{island} does not ask whether the column already carries it"
+            );
+        }
     }
 
     /// Settings offers a VIEW, not a peer mode. Presentation is a way of

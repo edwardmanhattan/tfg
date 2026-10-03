@@ -54,7 +54,7 @@ the MapLibre core.
 | The seat note's rule | `main::role_may_need_command` | a test that says exactly what the schema can support and no more |
 | Island roster is read-only, editor is in the modal | `users_roster_ui` / `roster_editor_ui` | a source-level check on the Id collision, which no screenshot would reveal |
 
-`cargo test --lib`: 285 pass. `cargo test --bin tfg`: 37 pass. Harness: 90 pass. Two failures are pre-existing and unrelated
+`cargo test --lib`: 285 pass. `cargo test --bin tfg`: 38 pass. Harness: 90 pass. Two failures are pre-existing and unrelated
 (`quad_bow_follows_the_compass`, `order_move_applies_then_higher_overrides_loudly`);
 both were confirmed failing on a stashed tree before this work.
 
@@ -122,10 +122,7 @@ wrong in several places.
 Ordered so each unit is verifiable on its own and each one shrinks the risk of
 the next.
 
-1. **Execution and Closure island sets.** The zone shows one compact island
-   for each today. The Orders, Roster, Log and assessment surfaces exist as
-   free-floating islands and a docked panel, and they belong in the column.
-2. **Re-run every "looked at" claim on a working compositor.** Every visual
+1. **Re-run every "looked at" claim on a working compositor.** Every visual
    decision in this file was checked on a rendered frame at some point EXCEPT
    everything from the modal primitive onward: the backdrop dim, the three
    modals, and both drag-to-map gestures. That is a real gap, not a formality.
