@@ -54,7 +54,7 @@ the MapLibre core.
 | The seat note's rule | `main::role_may_need_command` | a test that says exactly what the schema can support and no more |
 | Island roster is read-only, editor is in the modal | `users_roster_ui` / `roster_editor_ui` | a source-level check on the Id collision, which no screenshot would reveal |
 
-`cargo test --lib`: 285 pass. `cargo test --bin tfg`: 38 pass. Harness: 90 pass. Two failures are pre-existing and unrelated
+`cargo test --lib`: 286 pass. `cargo test --bin tfg`: 38 pass. Harness: 91 pass. Two failures are pre-existing and unrelated
 (`quad_bow_follows_the_compass`, `order_move_applies_then_higher_overrides_loudly`);
 both were confirmed failing on a stashed tree before this work.
 
@@ -124,13 +124,13 @@ the next.
 
 1. **The three modals and both drag-to-map gestures are still unrendered.**
    The compositor came back and the console was photographed against the real
-   map, but opening a modal needs a held session AND a pointer, and this
-   machine has `wtype` but no `ydotool`/`dotool`/`xdotool`, while
-   `hyprctl dispatch` is Lua-only and throws on every focus call. So the three
-   modals, both drag-to-map gestures, and `MODAL_BACKDROP_ALPHA` against the
-   real map are verified by tests and nothing else. Someone with a mouse has
-   to open them.
-2. **Island heights are hand-guessed constants.** `side_zone` stacks by
+   map, and the backdrop dim is now settled (see below), but opening a modal
+   needs a held session AND a pointer. This machine has `wtype` but no
+   `ydotool`/`dotool`/`xdotool`, and `hyprctl dispatch` is Lua-only and throws
+   on every focus call. Someone with a mouse has to open them.
+2. **Island heights are hand-guessed constants.** `island_owned` now CLIPS and
+   now REPORTS an overflow to stderr, so a wrong height cannot pass silently
+   — but neither is measured. `side_zone` stacks by
    heights fixed before anything is drawn, so they cannot be measured from
    content without running each body twice — and running a body twice
    double-fires its writes. `island_owned` now clips, so a wrong height is
@@ -200,6 +200,37 @@ Two fixes, and the order matters:
 - The status line came off the identity island (it was a transient connection
   fact, which the top zone's link state already reports) and the island is
   now 140pt, measured by rendering. 104 and 128 both clipped the button.
+
+**The dim was judged against the wrong background, and that mattered.** The
+harness has no background of its own — the window is transparent, so every
+capture showed the near-black desktop wallpaper. Judging a *black* overlay
+against a *black* background tells you nothing, and the real tile map is
+bright. `p5-epaint --bright` now paints a map-like ground (pale sea,
+near-white land, coastlines, grid, place labels) for exactly this. On it the
+two candidates are nowhere near each other:
+
+| alpha | land under the dim | what survives |
+| --- | --- | --- |
+| 150 | srgb(100,101,96) | almost nothing; land and sea collapse to one value, coastlines vanish, place labels all but disappear |
+| 104 | srgb(143,143,136) | land/sea/grid/coastline all hold, labels stay legible, islands behind still recede |
+
+Getting there also cost a bug: the first version of `--bright` painted
+*inside* the `island_mode` branch, after the modal's early `return`, so it
+never ran. A render that shows exactly the previous background is the tell.
+
+**A silent clip is worse than a loud one.** Clipping the island bodies fixed
+the corruption but turned "corrupts the island below" into "a button quietly
+vanishes", which reads as a bug in the form. So `island_owned` publishes
+whether its body fit and the zone logs it. Verified in both directions: with
+the Operator island at 140pt there are zero reports; deliberately shrinking
+it to 90pt produces exactly one.
+
+The threshold is one text line, and it is a measurement rather than taste. At
+0.5pt every island reported, because a layout's `min_rect` runs ~4pt past
+the last control for trailing spacing — the Operator island measures 98.4
+against 94 available and renders with visible slack. That false positive
+briefly looked like a second bug in the "New session" island, which was worth
+chasing down rather than shipping. The real 112pt overflow ran ~52pt over.
 
 **Also confirmed by render:** the mode card is gone and the app goes straight
 from login into the console (the keyring token still logs in, so this was a

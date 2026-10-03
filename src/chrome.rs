@@ -31,8 +31,8 @@
 // miss, and the only import in this file that is not `egui::`-prefixed.
 use egui::epaint::TextShape;
 use egui::{
-    Color32, CornerRadius, FontId, Id, Layout, Order, Painter, Pos2, Rect, Response, Sense, Shape,
-    Stroke, StrokeKind, Ui, UiBuilder, Vec2, pos2, vec2,
+    Color32, Context, CornerRadius, FontId, Id, Layout, Order, Painter, Pos2, Rect, Response,
+    Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 
 // The palette and the measurements live in their own module so that both
@@ -371,6 +371,7 @@ pub fn island_owned(
     let island_pos = *pos;
     let mut title_resp: Option<Response> = None;
     let mut clicked_close = false;
+    let mut overflowed = false;
 
     egui::Area::new(spec.id)
         .fixed_pos(island_pos)
@@ -473,6 +474,26 @@ pub fn island_owned(
                 |ui| {
                     ui.set_clip_rect(content.intersect(ui.max_rect()));
                     body(ui);
+                    // Whether the body needed MORE room than it was given.
+                    //
+                    // The clip above makes an overflow quiet, and quiet is
+                    // worse than loud when the height is a hand-picked
+                    // constant: the Operator island shipped at 112pt against
+                    // content needing more, and nothing said so until a
+                    // screenshot. So the fact is published rather than
+                    // swallowed — see `island_overflowed`.
+                    // A LINE, not a hair. The first threshold was 0.5pt and
+                    // it reported EVERY island, because a layout's
+                    // `min_rect` runs a few points past the last control for
+                    // trailing spacing: the Operator island measured 98.4
+                    // against 94 available and rendered with visible slack
+                    // under the button. So the tolerance has to be at least
+                    // one line, and anything below that is padding noise
+                    // rather than a cut control. 12pt separates the two cases
+                    // cleanly: the real 112pt overflow measured ~52pt over,
+                    // and this noise measures 4pt.
+                    overflowed =
+                        ui.min_rect().height() > content.height() + OVERFLOW_SLACK;
                 },
             );
 
@@ -482,7 +503,37 @@ pub fn island_owned(
     if clicked_close {
         *open = false;
     }
+    ctx.data_mut(|d| d.insert_temp(island_overflow_key(spec.id), overflowed));
     title_resp
+}
+
+/// The key an island's overflow flag is filed under in the context's temp
+/// storage.
+///
+/// TEMP, deliberately: this is a fact about one frame's layout, and a
+/// persistent entry would outlive the island that set it — a closed island
+/// would keep reporting an overflow from whenever it was last drawn, and
+/// nothing would be able to tell the difference.
+fn island_overflow_key(id: Id) -> Id {
+    id.with("__overflow")
+}
+
+/// Whether an island's body did not fit the rect it was given.
+///
+/// Published by `island_owned` and read by the zone, which reports it rather
+/// than leaving the operator to notice that a control has gone missing.
+///
+/// This is the loud half of the clip. Clipping alone turned "corrupts the
+/// island below" into "silently loses a control", which is not obviously an
+/// improvement — a form whose button has vanished looks like a bug in the
+/// form. With this, a wrong height is a line in the log the moment it
+/// happens.
+///
+/// FALSE when the island has not been drawn this frame, because "not drawn"
+/// is not "did not fit".
+pub fn island_overflowed(ctx: &Context, id: Id) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(island_overflow_key(id)))
+        .unwrap_or(false)
 }
 
 /// Convenience for the common shape: a fixed-size island whose body
@@ -720,20 +771,36 @@ impl Modal {
 /// island the modal was opened from becomes unreadable — the operator still
 /// needs to see the zone they are working in.
 ///
-/// MEASURED, not chosen. The first value was 150 and a render showed the map
-/// essentially gone: the zone islands behind read as ghosts and the map was
-/// dark mush, which contradicts the whole premise that the map is the
-/// background and the interface floats above it. 104 keeps the grid, the
-/// symbols and the island outlines legible under the dim.
+/// MEASURED, not chosen, and measured on the right background.
 ///
-/// The one caveat, stated because it matters: 104 was judged against the
-/// harness's near-black synthetic background. The real tile map is BRIGHT —
-/// white land, pale sea — and a black overlay lands differently on it. It is
-/// much better than 150 on any background, but its exact value against the
-/// real map is still unverified, because opening a modal needs a held session
-/// and a pointer, and this machine has no pointer injection tool. See
-/// `docs/ui-overhaul-status.md`.
+/// The first value was 150. Judged against the harness — which has no
+/// background of its own, so every capture showed a near-black desktop
+/// wallpaper — 150 looked like plenty. That judgement was worthless: a black
+/// overlay over black tells you nothing, and the real tile map is BRIGHT.
+/// `p5-epaint --bright` now paints a map-like ground (pale sea, near-white
+/// land, coastlines, grid, place labels) for exactly this reason.
+///
+/// On that ground the two values are not close. At 150 land and sea collapse
+/// to a single value — land reads srgb(100,101,96) against sea srgb(35,38,54)
+/// — the coastline strokes vanish and the place labels all but disappear, so
+/// the map stops reading as a map. At 104 land holds at srgb(143,143,136),
+/// land/sea/grid/coastline all survive, the labels stay legible, and the zone
+/// islands behind still read as clearly recessed. 104 it is.
 pub const MODAL_BACKDROP_ALPHA: u8 = 104;
+
+/// How far an island's content may run past its rect before it counts as
+/// overflowing.
+///
+/// ONE TEXT LINE, and that is the whole argument. A layout's `min_rect`
+/// extends a few points past the last control for trailing spacing, so a
+/// zero tolerance reports every island in the column and the signal means
+/// nothing — which is worse than no signal, because the first person to see
+/// it ignores it.
+///
+/// Measured: the Operator island at 140pt reports 98.4 used against 94
+/// available and renders with slack under the button. The same island at the
+/// original 112pt ran about 52pt over, which is the case worth catching.
+pub const OVERFLOW_SLACK: f32 = 12.0;
 
 /// Title row height. Smaller than an island's band because a modal has no
 /// chamfer and no drag region, so the band is carrying only a label and a
@@ -866,6 +933,38 @@ pub fn modal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The overflow threshold is a LINE, not a hair, and the reason is a
+    /// measurement rather than taste.
+    ///
+    /// At 0.5pt every island in the column reported, because a layout's
+    /// `min_rect` runs a few points past the last control for trailing
+    /// spacing — the Operator island measures 98.4 against 94 available and
+    /// renders with visible slack under the button. A signal that fires on
+    /// everything is worse than no signal, because the first person to see it
+    /// learns to ignore it.
+    ///
+    /// Pinned rather than left as a judgement call, because the failure mode
+    /// is silent in both directions: too tight and every island screams, too
+    /// loose and the real overflow ships again.
+    #[test]
+    fn the_overflow_threshold_is_one_line_not_a_hair() {
+        // The padding noise this exists to absorb, measured.
+        assert!(
+            OVERFLOW_SLACK >= 4.0,
+            "trailing spacing measured ~4pt; a smaller threshold reports every island"
+        );
+        // The real overflow it must still catch, measured.
+        assert!(
+            OVERFLOW_SLACK <= 20.0,
+            "the Operator island at 112pt ran ~52pt over and must still be caught"
+        );
+        // Below a line of text, or a label would be cut before it counts.
+        assert!(
+            OVERFLOW_SLACK < 20.0,
+            "a threshold at or past the body text line hides a cut label"
+        );
+    }
 
     /// The backdrop's two jobs are independent and both are load-bearing.
     /// "No dim" must not have been implemented as "no backdrop", or a drag

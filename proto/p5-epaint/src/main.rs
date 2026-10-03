@@ -1026,8 +1026,81 @@ struct Proto {
     /// screenshot pass that judges the prototypes, not only by the
     /// type-check.
     island_mode: bool,
+    /// Paint a map-like bright ground behind everything.
+    bright: bool,
     island_pos: Pos2,
     island_open: bool,
+}
+
+/// A stand-in for the real tile map: pale sea, white land, a grid, and a few
+/// labels. Not a map — a background with the right LUMINANCE and contrast,
+/// which is all a black overlay's behaviour depends on.
+fn paint_bright_ground(ui: &mut egui::Ui, screen: egui::Rect) {
+    let p = ui.painter_at(screen);
+    let sea = egui::Color32::from_rgb(0xA8, 0xC8, 0xE8);
+    let land = egui::Color32::from_rgb(0xF2, 0xF0, 0xE8);
+    let ink = egui::Color32::from_rgb(0x40, 0x50, 0x60);
+
+    p.rect_filled(screen, egui::CornerRadius::ZERO, sea);
+
+    // Coastline-ish landmasses. Arbitrary blobs: the point is that large
+    // areas sit near white, which is what a dim has to survive.
+    for (fx, fy, fw, fh) in [
+        (0.02f32, 0.02f32, 0.34f32, 0.30f32),
+        (0.02, 0.02, 0.34, 0.30),
+        (0.58, 0.10, 0.40, 0.46),
+        (0.10, 0.62, 0.46, 0.34),
+        (0.70, 0.70, 0.28, 0.26),
+    ] {
+        let r = egui::Rect::from_min_size(
+            screen.min + egui::vec2(screen.width() * fx, screen.height() * fy),
+            egui::vec2(screen.width() * fw, screen.height() * fh),
+        );
+        p.rect_filled(r, egui::CornerRadius::same(28), land);
+        p.rect_stroke(
+            r,
+            egui::CornerRadius::same(28),
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(0xE8, 0xC8, 0x88)),
+            egui::StrokeKind::Outside,
+        );
+    }
+
+    // The geographic grid the real console draws over the map.
+    let step = screen.width() / 6.0;
+    let mut x = screen.left();
+    while x < screen.right() {
+        p.line_segment(
+            [
+                egui::pos2(x, screen.top()),
+                egui::pos2(x, screen.bottom()),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x88, 0xA0, 0xB8)),
+        );
+        x += step;
+    }
+    let mut y = screen.top();
+    while y < screen.bottom() {
+        p.line_segment(
+            [
+                egui::pos2(screen.left(), y),
+                egui::pos2(screen.right(), y),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x88, 0xA0, 0xB8)),
+        );
+        y += step;
+    }
+
+    // Labels, so there is fine bright text for the dim to compete with —
+    // the thing a form most has to stay legible against.
+    for (i, label) in ["Jakarta", "Surabaya", "Bandung", "Medan"].iter().enumerate() {
+        p.text(
+            egui::pos2(screen.left() + 24.0 + (i % 2) as f32 * 180.0, 40.0 + (i / 2) as f32 * 26.0),
+            egui::Align2::LEFT_TOP,
+            label,
+            egui::FontId::proportional(14.0),
+            ink,
+        );
+    }
 }
 
 impl eframe::App for Proto {
@@ -1107,6 +1180,21 @@ impl eframe::App for Proto {
         }
 
         map_backdrop(&ui.painter_at(screen), screen);
+
+        // `--bright` paints a map-like ground: pale sea, white land, a grid
+        // and some labels.
+        //
+        // This exists because the harness has NO background of its own — the
+        // window is transparent, so every previous capture showed the desktop
+        // wallpaper, which is nearly black. Judging the modal's backdrop dim
+        // against a black wallpaper is judging it against nothing: the real
+        // tile map is BRIGHT (white land, pale sea) and a black overlay lands
+        // completely differently on it. The dim is the one modal decision
+        // that cannot be judged without the right background, and the wrong
+        // background is exactly what was there.
+        if self.bright {
+            paint_bright_ground(ui, screen);
+        }
 
         if self.island_mode {
             // The real module, exactly as tfg will call it. `--zone` stacks
@@ -1419,6 +1507,7 @@ fn main() -> eframe::Result {
         .unwrap_or(0);
     let hitbox = args.iter().any(|a| a == "--hitbox");
     let island_mode = args.iter().any(|a| a == "--island");
+    let bright = args.iter().any(|a| a == "--bright");
     // `--heat N` selects a heat pass, `--heat-dark` renders it over the
     // near-black well instead of the map wash. Both exist because the only
     // honest way to judge an emissive edge is to see it on both grounds it
@@ -1463,6 +1552,7 @@ fn main() -> eframe::Result {
                 show_hitbox: hitbox,
                 motion,
                 island_mode,
+            bright,
                 island_pos: pos2(340.0, 90.0),
                 island_open: true,
             }))

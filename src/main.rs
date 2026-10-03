@@ -8507,9 +8507,28 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 x if x == egui::Id::new("z.log") => self.zone_log_body(ui),
                 x if x == egui::Id::new("z.assessment") => self.zone_assessment_body(ui),
                 _ => {
-                    ui.weak(format!("{title} — no body"));
+                    ui.weak(format!("{title} \u{2014} no body"));
                 }
             });
+
+            // The loud half of the clip. An island whose content did not fit
+            // is a hand-picked height that is wrong, and it is reported here
+            // rather than left for a screenshot to reveal: the Operator
+            // island shipped at 112pt against content needing more, and the
+            // overflow was invisible to every geometry test because every
+            // rect involved was correct.
+            //
+            // Logged, not shown. The operator cannot act on it — the height
+            // is a constant — but a developer reading stderr can, and a
+            // silently missing button on a form looks like a bug in the form.
+            if tfg::chrome::island_overflowed(ui.ctx(), spec.id) {
+                eprintln!(
+                    "island {:?} (\"{}\") does not fit: {}pt given, content needs more",
+                    spec.id,
+                    spec.title,
+                    spec.size.y
+                );
+            }
         }
     }
 
