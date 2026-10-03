@@ -466,3 +466,21 @@ U+2611 are in **no** bundled font, so no fallback can rescue them. Five of the
 seven sat on text that already said the fact (`ready`, `assigned`, `placed`), so
 the glyph was decoration and is gone. The two that actually carried state, the
 `to` and `cc` toggles, became `●`, which Hack does cover.
+
+### "Retry the sync" was advice that could not work
+
+The gate fails closed, which is right, but it failed with a sentence that was
+wrong in the one case that mattered. Against the deployed dev API the checklist
+read *"the readiness check could not be read — retry the sync"* — and the sync
+was never going to succeed, because the server does not publish the route. That
+is a client ahead of its server, not a connection having a bad moment, and the
+two want different sentences.
+
+`BackendError::Api` already carries the status, so this is classified rather
+than guessed: `NotRead` (nothing has run yet), `Unread` (failed, may work next
+time) and `Absent` (404, this server has no such route). Only `Unread` keeps the
+word "retry". `Absent` says the server does not publish the check.
+
+Same class as the two dead-end controls from earlier today: an affordance that
+promises something it cannot deliver. The gate refusing is correct; the advice
+attached to it was not.
