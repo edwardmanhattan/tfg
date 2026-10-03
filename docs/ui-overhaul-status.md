@@ -392,7 +392,7 @@ overflowed its box; Control and Fleet did not overflow, they were never given
 room. A clip report is evidence that a box is too small, not evidence that the
 column adds up.
 
-**3. Two codepoints render as `.notdef` boxes.** `→` (U+2192, 44 call sites)
+**3. FIXED. Two codepoints rendered as `.notdef` boxes.** `→` (U+2192, 44 call sites)
 and `✓` (U+2713, 7 call sites) both come out as hollow rectangles, so every
 "Enter preparation →" and every "· ready ✓" is a button with a broken glyph in
 it. No `FontDefinitions` is registered anywhere in `src/`, so this is egui's
@@ -442,3 +442,27 @@ deployed.
 
 **The original section 2 below is kept as written, because the arithmetic is
 what the fix is accountable to.**
+
+### Why every arrow was a box
+
+Not a font that was missing. epaint's default `Proportional` family is
+`[Ubuntu-Light, NotoEmoji, emoji-icon]` — with **Hack omitted** — and Hack is
+the face that carries the arrows. Reading both cmaps: Ubuntu-Light covers none
+of U+2192, U+2190, U+25B8, U+25CF or U+221A; Hack covers all five. epaint's own
+`Monospace` family already lists Hack second, annotated *"fallback for √ etc"*,
+which is this exact fix applied to the wrong family.
+
+So all 44 arrow labels were boxes. The fix appends one NAME to the Proportional
+list — the bytes are already in `font_data` under `"Hack"` — which means no
+vendored font, no new dependency, and Latin still comes from Ubuntu-Light because
+it stays first.
+
+No test can see this class of bug. The string in the source is correct and the
+glyph lookup *succeeds*, returning the missing-glyph box; nothing about the
+program is wrong except what it draws.
+
+The ticks are a separate problem with a separate answer: U+2713, U+2714 and
+U+2611 are in **no** bundled font, so no fallback can rescue them. Five of the
+seven sat on text that already said the fact (`ready`, `assigned`, `placed`), so
+the glyph was decoration and is gone. The two that actually carried state, the
+`to` and `cc` toggles, became `●`, which Hack does cover.

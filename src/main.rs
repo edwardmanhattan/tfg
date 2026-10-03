@@ -1348,6 +1348,32 @@ fn unknown_gate_blockers(gap: bool) -> Vec<String> {
     }]
 }
 
+/// Put a font that covers the UI's symbols behind the proportional face.
+///
+/// egui resolves a glyph by walking a family's font list in order, and its
+/// default `Proportional` family is `[Ubuntu-Light, NotoEmoji, emoji-icon]` —
+/// with Hack omitted. Hack is the face that actually carries the arrows: read
+/// out of the two cmaps, Ubuntu-Light covers none of U+2192, U+2190, U+25B8,
+/// U+25CF or U+221A, and Hack covers all of them. epaint's own `Monospace`
+/// family already lists Hack second with the comment "fallback for √ etc",
+/// which is this fix, applied to the wrong family.
+///
+/// So every arrow drawn in the default style was a `.notdef` box, on 44
+/// button labels, and no test can see it: the string in the source is correct
+/// and the glyph atlas lookup succeeds, returning the missing-glyph box.
+///
+/// The bytes are already in `font_data` under the name "Hack", so this appends
+/// a NAME. No vendored font, no new dependency, and Latin text still comes from
+/// Ubuntu-Light because it stays first in the list.
+fn add_symbol_fallbacks(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let family = fonts.families.entry(egui::FontFamily::Proportional).or_default();
+    if !family.iter().any(|f| f == "Hack") {
+        family.push("Hack".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 /// Whether a release at `pos` should land on the map, given the modal panels
 /// currently on screen.
 ///
@@ -4852,7 +4878,7 @@ impl ShipApp {
                         // say, which is why this branch is empty.
                     } else if p.ready {
                         ui.label(
-                            egui::RichText::new("✓ ready")
+                            egui::RichText::new("ready")
                                 .small()
                                 .color(egui::Color32::from_rgb(0x4A, 0xDE, 0x80)),
                         );
@@ -7298,7 +7324,7 @@ impl ShipApp {
                             ));
                         });
                         if assigned {
-                            ui.label(egui::RichText::new("assigned ✓").weak().small());
+                            ui.label(egui::RichText::new("assigned").weak().small());
                         } else if ui.small_button("assign").clicked() {
                             assignment = row
                                 .id
@@ -7426,7 +7452,7 @@ impl ShipApp {
                             .iter()
                             .any(|p| p.unit_id == gu.unit_id);
                         if placed {
-                            ui.label(egui::RichText::new("placed ✓").weak().small());
+                            ui.label(egui::RichText::new("placed").weak().small());
                             if ui.small_button("lift").clicked() {
                                 lifts.push((gu.unit_id, gu.unit_name.clone()));
                             }
@@ -7559,7 +7585,7 @@ impl ShipApp {
             }
             Some(p) if p.ready => {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} · {} — ready ✓", p.user_name, p.role_name));
+                    ui.label(format!("{} · {} — ready", p.user_name, p.role_name));
                     if ui.small_button("withdraw").clicked() {
                         self.set_own_readiness(false);
                     }
@@ -7642,7 +7668,7 @@ impl ShipApp {
             "Placements: {} placed · {} to go{}",
             self.users_placements.len(),
             self.placement_unplaced,
-            if self.placement_ready { " · ready ✓" } else { "" },
+            if self.placement_ready { " · ready" } else { "" },
         ));
         ui.separator();
         // The checklist names every blocker; the button names its
@@ -13053,10 +13079,10 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                         ui.label(format!("{} · {}", p.user_name, p.role_name));
                         let to_on = self.msg_to.contains(&p.user_id);
                         let cc_on = self.msg_cc.contains(&p.user_id);
-                        if ui.small_button(if to_on { "to ✓" } else { "to" }).clicked() {
+                        if ui.small_button(if to_on { "to ●" } else { "to" }).clicked() {
                             toggles.push((p.user_id, true));
                         }
-                        if ui.small_button(if cc_on { "cc ✓" } else { "cc" }).clicked() {
+                        if ui.small_button(if cc_on { "cc ●" } else { "cc" }).clicked() {
                             toggles.push((p.user_id, false));
                         }
                     });
@@ -15312,6 +15338,7 @@ fn main() -> Result<(), String> {
         Box::new(move |cc| {
             // Required once: without image loaders, from_bytes fails.
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            add_symbol_fallbacks(&cc.egui_ctx);
             apply_ops_theme(&cc.egui_ctx);
             // The shader seam takes egui's own render state: the adapter's
             // device type decides the tier, and `target_format` is the exact
