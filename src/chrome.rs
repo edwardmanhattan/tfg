@@ -469,9 +469,16 @@ pub fn island_owned(
                 );
             }
 
-            let close = ui.interact(close_rect, spec.id.with("__close"), Sense::click());
-            paint_close(&painter, close_rect, close.hovered());
-            clicked_close = close.clicked();
+            // The close button is registered LAST, after the body scope, and
+            // that order is the whole fix.
+            //
+            // egui gives a click to ONE widget: the topmost clickable widget
+            // whose interact rect contains the press, ties going to the last
+            // one registered. Hover is not exclusive, so a button buried under
+            // the body's widgets still lights up while every click lands on
+            // whatever was registered after it. That is what this was:
+            // hovering the ✕ lit it and clicking it did nothing, on every
+            // island and in every modal.
 
             // Body, in a fixed rect, and CLIPPED to it.
             //
@@ -534,6 +541,10 @@ pub fn island_owned(
             );
 
             title_resp = Some(drag);
+
+            let close = ui.interact(close_rect, spec.id.with("__close"), Sense::click());
+            paint_close(&painter, close_rect, close.hovered());
+            clicked_close = close.clicked();
         });
 
     if clicked_close {
@@ -1007,9 +1018,10 @@ pub fn modal(
                 ),
                 vec2(tokens::CLOSE, tokens::CLOSE),
             );
-            let close = ui.interact(close_rect, spec.id.with("__close"), Sense::click());
-            paint_close(&painter, close_rect, close.hovered());
-            clicked_close = close.clicked();
+            // Registered after the body scope, for the reason spelled out in
+            // `island`: a click goes to the topmost clickable widget, and
+            // hover does not, so registering this before the body left a
+            // button that lit up and swallowed nothing.
 
             ui.scope_builder(
                 UiBuilder::new()
@@ -1018,6 +1030,10 @@ pub fn modal(
                     .sense(Sense::hover()),
                 body,
             );
+
+            let close = ui.interact(close_rect, spec.id.with("__close"), Sense::click());
+            paint_close(&painter, close_rect, close.hovered());
+            clicked_close = close.clicked();
         });
 
     if clicked_close {
