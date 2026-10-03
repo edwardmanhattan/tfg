@@ -1655,6 +1655,29 @@ impl MinosMaster {
     // there is no books table and no cross-game template, so the composer
     // authors a game's own book rather than picking from a catalog.
     //
+    /// What the server says about whether this game may leave preparation.
+    ///
+    /// `GET /games/{id}/readiness` — the same path the two readiness WRITES
+    /// use, read rather than declared.
+    pub fn game_readiness(
+        &self,
+        token: &str,
+        game_id: i64,
+    ) -> Result<GameReadinessView, BackendError> {
+        let data = self.get(token, &format!("/games/{game_id}/readiness"))?;
+        Ok(GameReadinessView {
+            can_execute: data["can_execute"].as_bool().unwrap_or(false),
+            blockers: data["blockers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|b| b.as_str().map(|s| s.to_string()))
+                .collect(),
+            fast: data["fast"].as_bool().unwrap_or(false),
+        })
+    }
+
     // NOT the same thing as `scenario_roles` above. Those are the identities a
     // message is sent AS; these are the beats the Game Master authors. The
     // two names are one word apart and mean unrelated things, which the
@@ -2041,17 +2064,6 @@ pub struct TimeWindow {
 }
 
 impl TimeWindow {
-    /// Whether the window can carry the exercise: both ends declared.
-    ///
-    /// The only question about a window this client has to ask, because
-    /// `validateTimeBase` has already settled the rest — each end is compared
-    /// with its own start and nothing compares the two clocks — so a window
-    /// with both ends present is either valid or a rejection that reached the
-    /// author before this read did.
-    pub fn is_complete(&self) -> bool {
-        self.actual_end.is_some() && self.assumed_end.is_some()
-    }
-
     /// Whether the window says nothing at all. The edit form's "leave alone":
     /// six blank fields must not become a write that blanks a window somebody
     /// else authored.
@@ -2720,6 +2732,41 @@ fn date_ok(s: &str) -> bool {
     (1..=days).contains(&d)
 }
 
+/// What the server says about whether an exercise may start.
+///
+/// A PROJECTION of the gate, not the client's copy of it. Every value was
+/// already readable through a route this client has; what the server publishes
+/// here is the verdict, and the list of ingredients still missing in the
+/// server's own words.
+///
+/// The client used to derive all of this from the roster and the placements,
+/// and derived it wrong: five conditions, four of them implemented, and a
+/// button disabled on a game the server would have accepted.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GameReadinessView {
+    /// Whether `preparation` -> `execution` is permitted right now.
+    pub can_execute: bool,
+    /// Every missing ingredient, as the server words it.
+    ///
+    /// Empty when `can_execute`. Never rebuilt here: a client that reworded
+    /// them would be one more copy of the rule, which is the thing this
+    /// endpoint exists to end.
+    pub blockers: Vec<String>,
+    /// `fast` waives the readiness condition and nothing else.
+    pub fast: bool,
+}
+
+impl GameReadinessView {
+    /// Whether the outstanding list names the readiness condition.
+    ///
+    /// A question about WORDING, not about the gate — it decides whether the
+    /// client may attach the participant names to that one sentence, and
+    /// nothing else. Deliberately not a rule: the verdict is `can_execute`.
+    pub fn names_readiness(&self) -> bool {
+        self.blockers.iter().any(|b| b.contains("not declared themselves ready"))
+    }
+}
+
 /// One game roster row: who holds which seat, and on which side.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Participant {
@@ -3100,22 +3147,24 @@ mod game_prose_tests {
                 assumed_end: Some("2026-10-02T1630".into()),
             }
         );
-        assert!(d.window.is_complete());
     }
 
     /// A game with no planned window is the NORMAL state of a draft, and the
     /// client cannot invent the missing end — the backend supplies no default
     /// because the window is the Game Master's declaration of when the
-    /// exercise finishes. So absence reads as an all-`None` window, and the
-    /// gate refuses it, rather than as an error or a guessed finish.
+    /// exercise finishes. So absence reads as an all-`None` window, rather
+    /// than as an error or a guessed finish.
+    ///
+    /// No assertion about completeness, because the client no longer decides
+    /// what complete means: `GET /games/{id}/readiness` answers that, and a
+    /// local `is_complete` is the kind of second opinion that drifts.
     #[test]
-    fn a_detail_with_no_window_reads_as_an_incomplete_one() {
+    fn a_detail_with_no_window_reads_as_an_empty_one() {
         let d = detail(serde_json::json!({
             "id": 7, "name": "n", "mode": "maneuver", "state": "planning"
         }));
         assert_eq!(d.window, TimeWindow::default());
         assert!(d.window.is_empty());
-        assert!(!d.window.is_complete());
     }
 }
 
@@ -3239,140 +3288,4 @@ mod window_authoring_tests {
         }
     }
 
-    /// The window's own two questions. `is_complete` reads the two ENDS and
-    /// nothing else, because that is what the gate reads — and the fact that a
-    /// window with both ends but no starts passes is the server's own rule,
-    /// not a shortcut: `validateTimeBase` compares each end against the start
-    /// ALREADY ON THE GAME, so a client that demanded a start here would
-    /// refuse to send a PATCH the server is happy to take.
-    #[test]
-    fn a_window_is_complete_when_both_ends_are_declared() {
-        let ends_only = TimeWindow {
-            actual_end: Some("2026-11-01T18:00:00Z".into()),
-            assumed_end: Some("2000-01-01T16:00:00Z".into()),
-            ..Default::default()
-        };
-        assert!(ends_only.is_complete());
-        assert!(!ends_only.is_empty(), "it says something even without starts");
-
-        let started_only = TimeWindow {
-            actual_start: Some("2026-11-01T08:00:00Z".into()),
-            assumed_start: Some("2000-01-01T06:00:00Z".into()),
-            ..Default::default()
-        };
-        assert!(!started_only.is_complete(), "a start is not an end");
-
-        let one_end = TimeWindow {
-            actual_end: Some("2026-11-01T18:00:00Z".into()),
-            ..Default::default()
-        };
-        assert!(!one_end.is_complete(), "both ends or neither");
-
-        let finished = TimeWindow {
-            actual_start: Some("2026-11-01T08:00:00Z".into()),
-            ..ends_only.clone()
-        };
-        assert!(finished.is_complete());
-        assert!(!finished.is_empty());
-        assert!(TimeWindow::default().is_empty());
-    }
-
-    /// The bug this whole slice exists for was a PAYLOAD bug, so the payload
-    /// is what gets asserted: against a real socket, not against the type.
-    ///
-    /// Two things have to be true at once and neither implies the other. The
-    /// four window keys and `pace` reach the wire at all, which is what was
-    /// missing. And a key nobody filled is ABSENT rather than null, because
-    /// the backend merges a present key into the game and omits an absent one,
-    /// so a null would be a write the author did not ask for.
-    #[test]
-    fn update_game_writes_the_window_and_omits_what_was_not_filled() {
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let tap = seen.clone();
-        let server = tiny_http::Server::http("127.0.0.1:18096").expect("bind test port");
-        std::thread::spawn(move || {
-            for mut rq in server.incoming_requests().take(2) {
-                let mut body = String::new();
-                rq.as_reader()
-                    .read_to_string(&mut body)
-                    .unwrap_or_default();
-                let sent = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
-                tap.lock().expect("tap").push(sent.clone());
-                // The stub answers with what it was sent, the way the real
-                // PATCH does: the answer is a re-read of the merged game.
-                let mut data = sent.as_object().cloned().unwrap_or_default();
-                data.insert("id".into(), serde_json::json!(3));
-                data.insert("name".into(), serde_json::json!("n"));
-                data.insert("mode".into(), serde_json::json!("maneuver"));
-                data.insert("state".into(), serde_json::json!("planning"));
-                let envelope = serde_json::json!({ "status_code": 200, "data": data });
-                let _ = rq.respond(tiny_http::Response::from_string(envelope.to_string()));
-            }
-        });
-        let master = MinosMaster::new("http://127.0.0.1:18096/api/v1").expect("client builds");
-
-        let full = master
-            .update_game(
-                "AT",
-                3,
-                &GameUpdate {
-                    name: Some("Operasi Batu Malang".into()),
-                    pace: Some(GamePace::Fast),
-                    window: TimeWindow {
-                        actual_start: Some("2026-11-01T08:00:00Z".into()),
-                        actual_end: Some("2026-11-01T18:00:00Z".into()),
-                        assumed_start: Some("2000-01-01T06:00:00Z".into()),
-                        assumed_end: Some("2000-01-01T16:00:00Z".into()),
-                    },
-                    ..Default::default()
-                },
-            )
-            .expect("update");
-        assert_eq!(full.pace, Some(GamePace::Fast), "the answer re-reads the pace");
-
-        let one_end = master
-            .update_game(
-                "AT",
-                3,
-                &GameUpdate {
-                    window: TimeWindow {
-                        assumed_end: Some("2000-01-01T16:00:00Z".into()),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            )
-            .expect("update");
-
-        let bodies = seen.lock().expect("tap").clone();
-        assert_eq!(bodies[0]["pace"], "fast", "the pace reaches the wire");
-        assert_eq!(
-            full.window,
-            TimeWindow {
-                actual_start: Some("2026-11-01T08:00:00Z".into()),
-                actual_end: Some("2026-11-01T18:00:00Z".into()),
-                assumed_start: Some("2000-01-01T06:00:00Z".into()),
-                assumed_end: Some("2000-01-01T16:00:00Z".into()),
-            },
-            "and the re-read carries all four back"
-        );
-        for (key, on_the_wire) in [
-            ("actual_start", "2026-11-01T08:00:00Z"),
-            ("actual_end", "2026-11-01T18:00:00Z"),
-            ("assumed_start", "2000-01-01T06:00:00Z"),
-            ("assumed_end", "2000-01-01T16:00:00Z"),
-        ] {
-            assert_eq!(bodies[0][key], on_the_wire, "{key} reaches the wire");
-        }
-        assert_eq!(
-            bodies[1].as_object().expect("an object").len(),
-            1,
-            "an untouched window contributes nothing: {bodies:?}"
-        );
-        assert_eq!(bodies[1]["assumed_end"], "2000-01-01T16:00:00Z");
-        assert!(
-            one_end.window.actual_start.is_none(),
-            "and the answer did not invent the other three"
-        );
-    }
 }

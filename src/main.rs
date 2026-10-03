@@ -1326,81 +1326,26 @@ enum Book {
 fn role_may_need_command(is_judge_side: bool) -> bool {
     !is_judge_side
 }
-
-/// The tail the participant condition writes, so `setup_checklist` can hang
-/// the outstanding names off the one blocker the count produces.
+/// What to say when the gate is unknown, because it is a fact about two
+/// different events rather than one.
 ///
-/// A protocol between two functions in this file, which is exactly why it is
-/// named rather than inlined at both ends.
-const NOT_READY: &str = " participant(s) not ready";
-
-/// The gate's PLAN conditions: the planned window and the map.
+/// NEVER an empty list. Empty means "nothing is outstanding", and that is the
+/// one answer that must never be invented — this runs before the first bundle
+/// lands and after a failed read.
 ///
-/// Split out from the participant conditions because these two come from the
-/// detail and the placements read alone. A client whose roster came back
-/// staff-only cannot count anybody, and it still owes an answer about a window
-/// it can plainly read. So the window blocker has to be reachable with no
-/// roster behind it.
-fn plan_gate_blockers(
-    window: &tfg::backend::TimeWindow,
-    pieces: usize,
-    unplaced: i64,
-) -> Vec<String> {
-    let mut blockers = Vec::new();
-    if !window.is_complete() {
-        blockers.push(
-            "the planned window is incomplete (both the real end and the exercise end are required)"
-                .to_string(),
-        );
-    }
-    if pieces == 0 {
-        blockers.push("no pieces assigned yet (step 3)".to_string());
-    }
-    if unplaced > 0 {
-        blockers.push(format!("{unplaced} unit(s) are not placed"));
-    }
-    blockers
-}
-
-/// The client's re-derivation of the server's execution gate: every blocker
-/// named, empty means the advance will be accepted.
+/// `gap` distinguishes "has not run yet", which is normal on first paint, from
+/// "could not be read", which is a degraded sync the operator can retry. Folding
+/// them together would lose the only half that is actionable.
 ///
-/// FIVE conditions, in the order `GameReadiness.CanExecute` tests them: the
-/// window, the pieces, the placements, the fighters, and then readiness.
-/// `fast` waives the FIFTH and nothing else. The window is the FIRST, which
-/// is worth stating plainly because it is the condition this client spent
-/// months without — an exercise with no declared finish passed every check
-/// the client knew how to make, offered a live "Enter execution" button, and
-/// was then refused by the server with a 409 naming a field the console had
-/// no control for.
-///
-/// So: a waiver on the wrong condition is not a smaller bug. It is this bug.
-/// The order above is the server's and the test table mirrors it.
-///
-/// `pace` is an `Option` because an UNRECOGNISED pace is not a third pace. It
-/// requires the declaration. See `GamePace::parse`: reading a value this build
-/// has never heard of as `fast` waives a ceremony gate on a version skew.
-///
-/// A free function because the rule is pure and the app is not. Asking whether
-/// a window is complete requires a store, a map and a token, which is a rule
-/// that does not get asked.
-fn execution_gate_blockers(
-    window: &tfg::backend::TimeWindow,
-    pace: Option<tfg::backend::GamePace>,
-    pieces: usize,
-    unplaced: i64,
-    fighters: usize,
-    ready: usize,
-) -> Vec<String> {
-    let mut blockers = plan_gate_blockers(window, pieces, unplaced);
-    if fighters == 0 {
-        blockers.push("no exercise-side seats (step 2)".to_string());
-    } else if pace.map_or(true, tfg::backend::GamePace::requires_readiness_declaration)
-        && ready < fighters
-    {
-        blockers.push(format!("{} participant(s) not ready", fighters - ready));
-    }
-    blockers
+/// A free function because the rule is pure and the app is not, and because
+/// this is the branch where a deleted rule would quietly come back: it is the
+/// one place tempted to work the gate out from what this client happens to hold.
+fn unknown_gate_blockers(gap: bool) -> Vec<String> {
+    vec![if gap {
+        "the readiness check could not be read — retry the sync".to_string()
+    } else {
+        "the readiness check has not run yet".to_string()
+    }]
 }
 
 /// Whether a release at `pos` should land on the map, given the modal panels
@@ -1522,6 +1467,8 @@ struct GameBundle {
     roster: Result<Vec<tfg::backend::Participant>, tfg::backend::BackendError>,
     units: Result<Vec<tfg::backend::GameUnit>, tfg::backend::BackendError>,
     placements: Result<tfg::backend::PlacementList, tfg::backend::BackendError>,
+    /// The server's verdict on the execution gate.
+    readiness: Result<tfg::backend::GameReadinessView, tfg::backend::BackendError>,
 }
 
 /// Deferred map drop for an async placement (#100): the local
@@ -2401,6 +2348,19 @@ struct ShipApp {
     /// Cleared whenever the hold changes, because a detail is a fact about ONE
     /// game and a stale one would show the previous session's plan.
     held_detail: Option<tfg::backend::GameDetail>,
+    /// What the server last said about whether the held game may start.
+    ///
+    /// `None` before the first bundle lands, and after a failed read.
+    /// `readiness_gap` distinguishes the two, because they mean different
+    /// things to the operator: "not looked yet" and "could not be read".
+    readiness: Option<tfg::backend::GameReadinessView>,
+    /// Whether the last readiness read failed.
+    ///
+    /// The house pattern for a subordinate read: keep the last good answer
+    /// behind a gap flag rather than replacing it with an empty list that reads
+    /// as truth. An empty list here would say "nothing is outstanding", which
+    /// is the most dangerous possible answer.
+    readiness_gap: bool,
     /// Every modal panel's rect, for this frame.
     ///
     /// The drop handlers need these because the map's own rect contains the
@@ -4207,7 +4167,8 @@ impl ShipApp {
             let roster = master.game_participants(&tok, gid);
             let units = master.game_units_list(&tok, gid);
             let placements = master.placements_list(&tok, gid);
-            Ok(SetupDone::Bundle(GameBundle { detail, roster, units, placements }))
+            let readiness = master.game_readiness(&tok, gid);
+            Ok(SetupDone::Bundle(GameBundle { detail, roster, units, placements, readiness }))
         }));
     }
 
@@ -4417,6 +4378,22 @@ impl ShipApp {
             }
             Err(e) => format!("roster failed: {e}"),
         };
+        // The gate. Degrades like any other subordinate: a failed read keeps
+        // the last good verdict behind a gap flag, because the alternative is
+        // an empty blocker list, and an empty list says "nothing is
+        // outstanding" — the one answer that must never be invented.
+        let readiness_seg = match b.readiness {
+            Ok(view) => {
+                let blockers = view.blockers.len();
+                self.readiness = Some(view);
+                self.readiness_gap = false;
+                format!("readiness: {blockers} outstanding")
+            }
+            Err(e) => {
+                self.readiness_gap = true;
+                format!("readiness unreadable: {e}")
+            }
+        };
         let units_seg = match b.units {
             Ok(u) => {
                 self.users_gunits = u;
@@ -4452,7 +4429,7 @@ impl ShipApp {
             Err(e) => format!("placements failed: {e}"),
         };
         self.users_status = format!(
-            "session synced ({}) · {roster_seg} · {units_seg} · {placements_seg}",
+            "session synced ({}) · {roster_seg} · {units_seg} · {placements_seg} · {readiness_seg}",
             d.state
         );
     }
@@ -7727,76 +7704,51 @@ impl ShipApp {
 
     /// Readiness checklist: every blocker named, empty means clear.
     ///
-    /// A formatter over [`execution_gate_blockers`]. The rule lives there and
-    /// in no other place, so the checklist cannot drift from the gate it is
-    /// predicting. What is left here is the two things the function cannot be
-    /// told: the names behind the readiness count, and the roster-gap
-    /// fallback, where the participant arithmetic cannot run at all.
+    /// A FORMATTER over the server's answer. There is no longer a rule here,
+    /// and that is the point: this function used to re-derive the execution
+    /// gate from the roster, the placements and the pace, and it derived it
+    /// wrong. Five conditions in the rule, four of them implemented, and a
+    /// button disabled on a game the server would have accepted while the panel
+    /// beside it reported "0 outstanding".
+    ///
+    /// So the words are the server's, the verdict is the server's, and the only
+    /// thing added here is decoration: the NAMES behind the readiness count,
+    /// when this client can read the roster to find them.
     fn setup_checklist(&self) -> Vec<String> {
-        let window = self.held_window();
-        let pace = self.held_pace();
-        let pieces = self.users_gunits.len().max(self.commanded_hulls.len());
-        if self.roster_gap {
-            // A gapped roster means this client cannot count anybody, so the
-            // crew conditions are replaced by the one thing it CAN see: the
-            // caller's own seat. The window and the map still stand, because
-            // neither is a fact about the roster.
-            let mut blockers = plan_gate_blockers(&window, pieces, self.placement_unplaced);
-            if pace.map_or(true, tfg::backend::GamePace::requires_readiness_declaration) {
-                match self.own_roster_row() {
-                    Some(p) if p.judge => {}
-                    Some(p) if p.ready => {}
-                    Some(_) => blockers.push("you have not declared readiness".to_string()),
-                    None => blockers.push(
-                        "you hold no seat — join with the room key (step 1)".to_string(),
-                    ),
-                }
-            }
-            return blockers;
-        }
-        let (fighters, ready) = self.setup_gate_counts();
-        let mut blockers = execution_gate_blockers(
-            &window,
-            pace,
-            pieces,
-            self.placement_unplaced,
-            fighters,
-            ready,
-        );
-        // The names behind the count. Presentation on top of the rule rather
-        // than a second derivation of it — "3 participant(s) not ready" with
-        // nobody named sends the operator to the roster to find three people.
-        let waiting: Vec<String> = self
-            .users_roster
-            .iter()
-            .filter(|p| !self.users_is_judge(p) && !p.ready)
-            .map(|p| p.user_name.clone())
-            .collect();
-        if !waiting.is_empty() {
-            if let Some(b) = blockers.iter_mut().find(|b| b.ends_with(NOT_READY)) {
-                b.push_str(": ");
+        let Some(view) = self.readiness.as_ref() else {
+            return self.unknown_gate_blockers();
+        };
+        let mut blockers = view.blockers.clone();
+        if view.names_readiness() && !self.roster_gap {
+            let waiting: Vec<String> = self
+                .users_roster
+                .iter()
+                .filter(|p| !self.users_is_judge(p) && !p.ready)
+                .map(|p| p.user_name.clone())
+                .collect();
+            if !waiting.is_empty()
+                && let Some(b) = blockers.first_mut()
+            {
+                b.push_str(" Not yet: ");
                 b.push_str(&waiting.join(", "));
             }
         }
         blockers
     }
 
-    /// The held game's planned window, off the last detail read.
+    /// What to say when the gate has not been read.
     ///
-    /// `None` before the first bundle lands reads as an incomplete window and
-    /// an unknown pace, and both fail closed: a gate with no detail behind it
-    /// says the window is missing rather than waving the advance through.
-    fn held_window(&self) -> tfg::backend::TimeWindow {
-        self.held_detail
-            .as_ref()
-            .map(|d| d.window.clone())
-            .unwrap_or_default()
-    }
-
-    /// The held game's pace, or `None` when it is unknown. `None` requires the
-    /// readiness declaration — see [`tfg::backend::GamePace::parse`].
-    fn held_pace(&self) -> Option<tfg::backend::GamePace> {
-        self.held_detail.as_ref().and_then(|d| d.pace)
+    /// NEVER an empty list. Empty means "nothing is outstanding", which is the
+    /// one answer that must never be invented — and this is the branch that
+    /// runs before the first bundle lands and after a failed read. It refuses
+    /// the advance instead, which costs a click the operator was going to make
+    /// anyway and buys them a reason.
+    ///
+    /// It also does not try to work the gate out from what this client holds.
+    /// That is the derivation this whole change exists to delete, and a
+    /// degraded path is exactly where a deleted rule quietly comes back.
+    fn unknown_gate_blockers(&self) -> Vec<String> {
+        unknown_gate_blockers(self.readiness_gap)
     }
 
     /// Exercise setup panel (#79): Planning's whole UI in one place —
@@ -15449,6 +15401,8 @@ fn main() -> Result<(), String> {
                 fleet_picker_open: false,
                 player_picker_open: false,
                 held_detail: None,
+                readiness: None,
+                readiness_gap: false,
                 modal_panel_rects: Vec::new(),
                 scenarios: Vec::new(),
                 composer_scenario: None,
@@ -15681,146 +15635,46 @@ mod tests {
     /// `unplaced` is left at zero unless it is the point, because zero is
     /// what the field means when nothing is unplaced, and a case that had to
     /// set it to pass would be asserting the zero value instead of the rule.
+    // -- the checklist, which is no longer a rule ---------------------------
+
+    /// The checklist is the SERVER'S WORDS. A client that rebuilt them would be
+    /// a second copy of the gate, which is the thing this change exists to end
+    /// — and the copy was already wrong once.
     #[test]
-    fn the_execution_gate_is_five_conditions_and_fast_waives_one() {
-        let rows = [
-            Row {
-                name: "nothing assigned at all",
-                window: no_window(),
-                pace: Some(tfg::backend::GamePace::Standard),
-                pieces: 0,
-                unplaced: 0,
-                fighters: 0,
-                ready: 0,
-                want: &[
-                    "the planned window is incomplete (both the real end and the exercise end are required)",
-                    "no pieces assigned yet (step 3)",
-                    "no exercise-side seats (step 2)",
-                ],
-                why: "nothing to manoeuvre, no clock to run it on, nobody to command it",
-            },
-            Row {
-                name: "fast with the window missing and nobody ready",
-                window: no_window(),
-                pace: Some(tfg::backend::GamePace::Fast),
-                pieces: 1,
-                unplaced: 0,
-                fighters: 3,
-                ready: 0,
-                want: &[
-                    "the planned window is incomplete (both the real end and the exercise end are required)",
-                ],
-                why: "fast waives the readiness declaration and NOTHING else — the window is still a refusal",
-            },
-            Row {
-                name: "fast, window set, nobody ready",
-                window: window_set(),
-                pace: Some(tfg::backend::GamePace::Fast),
-                pieces: 1,
-                unplaced: 0,
-                fighters: 3,
-                ready: 0,
-                want: &[],
-                why: "the regression row: this is the exercise fast exists for, and the client used to block it",
-            },
-            Row {
-                name: "standard with the window missing",
-                window: no_window(),
-                pace: Some(tfg::backend::GamePace::Standard),
-                pieces: 1,
-                unplaced: 0,
-                fighters: 2,
-                ready: 2,
-                want: &[
-                    "the planned window is incomplete (both the real end and the exercise end are required)",
-                ],
-                why: "a ready crew does not buy an exercise with no declared finish",
-            },
-            Row {
-                name: "everything set and everyone ready",
-                window: window_set(),
-                pace: Some(tfg::backend::GamePace::Standard),
-                pieces: 1,
-                unplaced: 0,
-                fighters: 2,
-                ready: 2,
-                want: &[],
-                why: "the only state a game may leave preparation in",
-            },
-            Row {
-                name: "an unknown pace is not a fast pace",
-                window: window_set(),
-                pace: None,
-                pieces: 1,
-                unplaced: 0,
-                fighters: 1,
-                ready: 0,
-                want: &["1 participant(s) not ready"],
-                why: "reading an unrecognised pace as fast would start the exercise on a version skew",
-            },
-            Row {
-                name: "one hull of five unplaced",
-                window: window_set(),
-                pace: Some(tfg::backend::GamePace::Fast),
-                pieces: 5,
-                unplaced: 1,
-                fighters: 1,
-                ready: 1,
-                want: &["1 unit(s) are not placed"],
-                why: "a placed hull out of five satisfies the at-least-one-piece rule and still strands the other four",
-            },
-            Row {
-                name: "more pieces than commanders is fine",
-                window: window_set(),
-                pace: Some(tfg::backend::GamePace::Standard),
-                pieces: 5,
-                unplaced: 0,
-                fighters: 1,
-                ready: 1,
-                want: &[],
-                why: "one commando may hold several hulls; the schema does not forbid it",
-            },
-        ];
-        for r in &rows {
-            let got = execution_gate_blockers(
-                &r.window, r.pace, r.pieces, r.unplaced, r.fighters, r.ready,
-            );
-            assert_eq!(
-                got.iter().map(String::as_str).collect::<Vec<_>>(),
-                r.want,
-                "{}: {}",
-                r.name,
-                r.why
-            );
-        }
+    fn the_checklist_passes_the_servers_words_through() {
+        let view = tfg::backend::GameReadinessView {
+            can_execute: false,
+            blockers: vec![
+                "the planned window is incomplete (both actual_end and assumed_end are required)"
+                    .to_string(),
+                "2 of 3 unit(s) have not been placed on the map".to_string(),
+            ],
+            fast: false,
+        };
+        assert_eq!(view.blockers.len(), 2);
+        assert!(!view.names_readiness(), "neither blocker is about readiness");
     }
 
-    /// The plan conditions stand on their own, because a client whose roster
-    /// read came back staff-only can still see the window and the placement
-    /// count. Dropping them there would leave the gate blocked for a reason
-    /// the checklist never mentions.
+    /// An unread or unrun gate must NEVER read as clear.
+    ///
+    /// Empty means "nothing is outstanding", and that is the one answer that
+    /// must never be invented. This branch runs before the first bundle lands
+    /// and after a failed read, so an empty list here would offer the advance
+    /// on a game nobody has checked.
     #[test]
-    fn the_window_and_the_map_need_no_roster_to_be_reported() {
-        assert_eq!(plan_gate_blockers(&no_window(), 1, 0).len(), 1);
-        assert_eq!(plan_gate_blockers(&window_set(), 1, 0).len(), 0);
-        assert_eq!(plan_gate_blockers(&window_set(), 0, 2).len(), 2);
+    fn an_unknown_gate_refuses_rather_than_reads_as_clear() {
+        assert!(!unknown_gate_blockers(false).is_empty(), "never run yet");
+        assert!(!unknown_gate_blockers(true).is_empty(), "read failed");
     }
 
-    /// The names are presentation hung off the count, matched by the tail the
-    /// participant condition writes. Both halves are named, so if the wording
-    /// moves, this fails instead of quietly dropping the names.
+    /// The two unknown states say DIFFERENT things, because they are different
+    /// events. "Has not run yet" is normal on first paint; "could not be read"
+    /// is a degraded sync the operator may need to retry. Folding them into one
+    /// string loses the only actionable half.
     #[test]
-    fn the_readiness_blocker_is_the_one_the_checklist_extends() {
-        let blockers = execution_gate_blockers(
-            &window_set(),
-            Some(tfg::backend::GamePace::Standard),
-            1,
-            0,
-            3,
-            1,
-        );
-        assert_eq!(blockers, vec!["2 participant(s) not ready"]);
-        assert!(blockers[0].ends_with(NOT_READY));
+    fn an_unread_gate_says_so_and_names_the_remedy() {
+        assert!(unknown_gate_blockers(true)[0].contains("retry"));
+        assert!(!unknown_gate_blockers(false)[0].contains("retry"));
     }
 
     // -- the composer's draft ---------------------------------------------

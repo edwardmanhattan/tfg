@@ -145,11 +145,32 @@ Now: window and pace are authorable on the edit form, and the gate is ONE
 function (`execution_gate_blockers`) that `setup_checklist` formats rather
 than reimplements.
 
-Still open, and it is the real fix: **the server should publish the gate**
-rather than the client recomputing it. `ReadinessCounts` already returns all
-five values from one statement; exposing them behind a route is a projection,
-not a second implementation. Two repos, and it was deliberately not started
-before the console could start an exercise at all.
+**DONE, in both repos.** Minos now publishes the gate:
+`GET /games/{id}/readiness` (commit `aaee9bf` on `wip`) answers
+`{can_execute, blockers, fast}`, where `blockers` is the SAME list a refused
+transition names, split into sentences. It is a GET on the path the two
+readiness *writes* already use, and it widens nothing: every value was already
+readable through a route this client has.
+
+tfg consumes it and the local derivation is **gone** —
+`execution_gate_blockers`, `plan_gate_blockers`, `NOT_READY`, `held_window`,
+`held_pace` and `TimeWindow::is_complete` all deleted. `setup_checklist` is a
+formatter over the server's words now; the only thing it adds is the
+participant names behind the readiness count.
+
+Two consequences worth knowing:
+
+- **`roster_gap` no longer affects the gate at all.** The client used to fall
+  back to "did *you* declare" when it could not read the roster, which told a
+  caller the gate was clear when the server disagreed. The server counts
+  regardless of what the caller may read.
+- **An unknown gate refuses rather than reading as clear.** Before the first
+  bundle lands, and after a failed readiness read, the checklist says so —
+  never an empty list, because empty means "nothing is outstanding" and that is
+  the one answer that must never be invented.
+
+Test count went DOWN (293 from 295) and that is the point: tests for a rule
+that no longer exists were deleted with it.
 
 ## Not built yet, in the order it should be
 
