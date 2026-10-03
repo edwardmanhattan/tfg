@@ -123,11 +123,16 @@ Ordered so each unit is verifiable on its own and each one shrinks the risk of
 the next.
 
 1. **The three modals and both drag-to-map gestures are still unrendered.**
-   The compositor came back and the console was photographed against the real
-   map, and the backdrop dim is now settled (see below), but opening a modal
-   needs a held session AND a pointer. This machine has `wtype` but no
-   `ydotool`/`dotool`/`xdotool`, and `hyprctl dispatch` is Lua-only and throws
-   on every focus call. Someone with a mouse has to open them.
+   Both blockers have been removed and the work got as far as signing in:
+   `scripts/ui-shoot/` has a working uinput pointer (no root needed) and a
+   Minos stack with no root and no docker, and a real session was created with
+   a Game Master seat, two scenarios and three steps. It stopped because each
+   `uim.py` call creates its own pointer device, and focus did not survive the
+   sequence — the second round of keystrokes went to a different window. Keep
+   ONE device alive for a whole interaction, as the README says. What is still
+   unverified is the part a session exercises: whether `unit_picker_ui` fits a
+   980x620 body, and whether a drag really leaves the modal and lands on the
+   sea.
 2. ~~Island heights are hand-guessed constants.~~ DONE — the column now
    measures itself (see below). What remains is the CEILING: an island whose
    content is genuinely unbounded is clipped at the window rather than
