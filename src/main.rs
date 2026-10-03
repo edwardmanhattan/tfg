@@ -3775,6 +3775,17 @@ impl ShipApp {
                 // Login syncs (master-data ticket): the working copy
                 // refreshes on every entry, off-thread.
                 self.sync_now();
+                // The session list too.
+                //
+                // `sign_out` clears it as part of the session boundary, so
+                // signing back in re-entered the console with an EMPTY
+                // session list and nothing re-read it. Found by driving: sign
+                // out, sign in, and the no-session island offered only
+                // "create a session" — the picker row was gone, because the
+                // predicate that draws it also asks whether the list has
+                // loaded. The list is what the console is for; a sign-in that
+                // does not fetch it is a sign-in that starts blind.
+                self.users_refresh_games();
             }
             None => {
                 self.auth_status = done.probe_note.unwrap_or_else(|| format!("signed in as {}", done.user));
@@ -4737,7 +4748,25 @@ impl ShipApp {
             ui,
             |ui| {
                 if self.users_list.is_empty() {
-                    ui.weak("No accounts — sign in, then refresh.");
+                    // The server's own words, or nothing.
+                    //
+                    // This used to be a fixed "No accounts — sign in, then
+                    // refresh." A render showed it on a signed-in operator
+                    // whose account WAS in the directory: the picker opens
+                    // without reading it, so the list is empty before any
+                    // read, and the sentence blamed the one thing that was
+                    // not wrong. `users_status` already carries the reason
+                    // (a refused read, a filter that matched nothing, a
+                    // directory mid-flight), so say that instead of inventing
+                    // a cause. An empty state that guesses is the same class
+                    // of lie as a button that promises a route the server
+                    // does not publish.
+                    let why = self.users_status.clone();
+                    if why.is_empty() {
+                        ui.weak("Directory not read yet — press find.");
+                    } else {
+                        ui.weak(why);
+                    }
                 }
                 for u in &self.users_list {
                     ui.horizontal(|ui| {
@@ -6675,6 +6704,70 @@ impl ShipApp {
         self.games_loaded && !self.games_gap && self.has_app_role()
     }
 
+    /// The session combo and its refresh, shared by both places a session can
+    /// be chosen from.
+    ///
+    /// It was only ever drawn from the Essentials island, which renders while a
+    /// session is HELD — so on a cold start, with nothing held, there was no
+    /// way back to an existing session and the only verb was "create one". A
+    /// render showed it: the top band says "Choose or join a session" above an
+    /// island whose sole control creates a new one. The no-session island now
+    /// offers the list too, because re-opening yesterday's exercise is the
+    /// common case and creating a duplicate is the expensive mistake.
+    fn session_picker_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let picked = self
+                .users_game
+                .clone()
+                .map(|(_, n)| n)
+                .unwrap_or_else(|| "pick a session".to_string());
+            let prev = self.users_game.clone();
+            let mut selected_game = prev.clone();
+            egui::ComboBox::from_label("session")
+                .selected_text(picked)
+                .show_ui(ui, |ui| {
+                    for g in &self.users_games {
+                        ui.selectable_value(
+                            &mut selected_game,
+                            Some((g.id, g.name.clone())),
+                            format!("{} ({})", g.name, g.state),
+                        );
+                    }
+                });
+            if ui.small_button("refresh").clicked() {
+                self.users_refresh_games();
+                self.users_refresh_directory();
+                self.users_refresh_game();
+            }
+            if selected_game != prev {
+                // A newly held game takes its stage from Minos, never
+                // from a local default: the resync inside the refresh
+                // projects Planning/Ready/Live/Eval off the detail read.
+                // Route the picker through the same held-game boundary
+                // as joins and bundle applies so old Registry data cannot
+                // survive a direct assignment.
+                self.set_held_game(selected_game);
+                // The clock read belongs to the old hold — writes will
+                // re-read it for the new one.
+                self.minos_clock = None;
+                self.minos_room_key = None;
+                self.clock_denied = false; // new hold, unknown grant
+                self.delete_armed = false;
+                self.edit_open = false;
+                self.users_refresh_game();
+            }
+        });
+    }
+
+    /// Whether the no-session island offers the session list.
+    ///
+    /// One predicate for the row and for the island's declared height: the two
+    /// were separate conditions once, and a picker drawn into a 168pt island is
+    /// a clipped picker.
+    fn session_picker_visible(&self) -> bool {
+        self.can_manage_sessions() && !self.users_games.is_empty()
+    }
+
     /// Setup flow step 1 (#79): hold a game — pick a listed one or
     /// create a session. Only `name` is required; blank optionals are
     /// omitted, never sent empty.
@@ -6695,48 +6788,7 @@ impl ShipApp {
             ui.separator();
         }
         if can_manage_sessions {
-            ui.horizontal(|ui| {
-                let picked = self
-                    .users_game
-                    .clone()
-                    .map(|(_, n)| n)
-                    .unwrap_or_else(|| "pick a session".to_string());
-                let prev = self.users_game.clone();
-                let mut selected_game = prev.clone();
-                egui::ComboBox::from_label("session")
-                    .selected_text(picked)
-                    .show_ui(ui, |ui| {
-                        for g in &self.users_games {
-                            ui.selectable_value(
-                                &mut selected_game,
-                                Some((g.id, g.name.clone())),
-                                format!("{} ({})", g.name, g.state),
-                            );
-                        }
-                    });
-                if ui.small_button("refresh").clicked() {
-                    self.users_refresh_games();
-                    self.users_refresh_directory();
-                    self.users_refresh_game();
-                }
-                if selected_game != prev {
-                    // A newly held game takes its stage from Minos, never
-                    // from a local default: the resync inside the refresh
-                    // projects Planning/Ready/Live/Eval off the detail read.
-                    // Route the picker through the same held-game boundary
-                    // as joins and bundle applies so old Registry data cannot
-                    // survive a direct assignment.
-                    self.set_held_game(selected_game);
-                    // The clock read belongs to the old hold — writes will
-                    // re-read it for the new one.
-                    self.minos_clock = None;
-                    self.minos_room_key = None;
-                    self.clock_denied = false;  // new hold, unknown grant
-                    self.delete_armed = false;
-                    self.edit_open = false;
-                    self.users_refresh_game();
-                }
-            });
+            self.session_picker_row(ui);
             // Admin writes: staff-granted, planning-only. Hidden without
             // the staff read (a player would only 403); past planning the
             // server refuses loudly instead.
@@ -6910,6 +6962,15 @@ impl ShipApp {
                 .clicked()
             {
                 self.player_picker_open = true;
+                // Read what the modal exists to show, on the way in.
+                //
+                // The composer already does this (`open_composer` calls
+                // `load_scenarios`) and the picker did not, so opening it
+                // rendered an empty directory with no read attempted. The
+                // Minos log is what settles it: pressing the button produced
+                // no GET /users at all, and the read only happened when the
+                // operator found the `find` button by looking for one.
+                self.users_refresh_directory();
             }
             if let Some(p) = self.own_roster_row() {
                 ui.label(egui::RichText::new(format!("you: {}", p.role_name)).weak().small());
@@ -8705,7 +8766,17 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
 
         match state {
             GameState::NoSession => entries.push((
-                Island::new(egui::Id::new("z.start"), "New session", egui::vec2(w, 168.0)),
+                // 168 is the create-only form. The session picker adds a row and a
+                // separator on top of it, and a declared height is a FLOOR the
+                // measured height cannot exceed — so the taller case has to be
+                // declared taller or the picker is drawn into a clipped box.
+                // 272 is what the picker case measures, rounded up: at 212 the
+                // clip report said "212pt given, content needs more".
+                Island::new(
+                    egui::Id::new("z.start"),
+                    "New session",
+                    egui::vec2(w, if self.session_picker_visible() { 272.0 } else { 168.0 }),
+                ),
                 true,
             )),
             GameState::Planning => {
@@ -9003,6 +9074,19 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     }
 
     fn zone_user_body(&mut self, ui: &mut egui::Ui) {
+        // Signed out, the island IS the way back in.
+        //
+        // Found by driving: signing out cleared the session and left the
+        // console showing "not signed in" with a Sign out button and no way
+        // to sign in. `sign_out` never raises `show_login`, and the floating
+        // Login island is suppressed while the zone owns the left edge — so
+        // the only route back was relaunching the app. The identity block is
+        // what a signed-in operator reads; a signed-out one has nothing to
+        // read and something to do.
+        if self.auth_identity.is_none() {
+            self.sign_in_form(ui);
+            return;
+        }
         let identity = self.auth_identity.clone();
         ui.horizontal(|ui| {
             self.avatar(ui, 40.0, identity.as_ref());
@@ -9131,6 +9215,10 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     /// game exists. Creating here hands the game over, the zone becomes
     /// Planning, and the rest of the plan is authored from there.
     fn zone_start_body(&mut self, ui: &mut egui::Ui) {
+        if self.session_picker_visible() {
+            self.session_picker_row(ui);
+            ui.separator();
+        }
         ui.label("No session held.");
         ui.weak("A session is a plan the Game Master authors: a force, a roster and a window.");
         ui.separator();
@@ -10106,6 +10194,35 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     /// endpoint, the must_change_password gate as a blocking form,
     /// sign-out. Token state feeds the later socket work; refresh runs
     /// proactively per frame.
+    /// Identifier, password, sign in. One function because two surfaces need
+    /// it and they drifted: the free-floating Login island carried the form
+    /// while the side zone's Operator island showed identity alone, so signing
+    /// out of the zone left no way back in.
+    fn sign_in_form(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("identifier:");
+            ui.add_sized(
+                [ui.available_width(), AUTH_FIELD_H],
+                egui::TextEdit::singleline(&mut self.login_identifier)
+                    .min_size(egui::vec2(0.0, AUTH_FIELD_H))
+                    .vertical_align(egui::Align::Center),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("password:");
+            ui.add_sized(
+                [ui.available_width(), AUTH_FIELD_H],
+                egui::TextEdit::singleline(&mut self.login_password)
+                    .password(true)
+                    .min_size(egui::vec2(0.0, AUTH_FIELD_H))
+                    .vertical_align(egui::Align::Center),
+            );
+        });
+        if ui.button("sign in").clicked() {
+            self.attempt_sign_in();
+        }
+    }
+
     fn login_island(&mut self, ui: &mut egui::Ui) {
         ui.heading("Login");
         if let Some(user) = self.auth_user.clone() {
@@ -10130,28 +10247,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 self.change_password_ui(ui);
             }
         } else {
-            ui.horizontal(|ui| {
-                ui.label("identifier:");
-                ui.add_sized(
-                    [ui.available_width(), AUTH_FIELD_H],
-                    egui::TextEdit::singleline(&mut self.login_identifier)
-                        .min_size(egui::vec2(0.0, AUTH_FIELD_H))
-                        .vertical_align(egui::Align::Center),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("password:");
-                ui.add_sized(
-                    [ui.available_width(), AUTH_FIELD_H],
-                    egui::TextEdit::singleline(&mut self.login_password)
-                        .password(true)
-                        .min_size(egui::vec2(0.0, AUTH_FIELD_H))
-                        .vertical_align(egui::Align::Center),
-                );
-            });
-            if ui.button("sign in").clicked() {
-                self.attempt_sign_in();
-            }
+            self.sign_in_form(ui);
         }
         status_line(ui, &self.auth_status.clone());
         // Local-first sync (master-data ticket): whole-table replace
