@@ -484,3 +484,131 @@ word "retry". `Absent` says the server does not publish the check.
 Same class as the two dead-end controls from earlier today: an affordance that
 promises something it cannot deliver. The gate refusing is correct; the advice
 attached to it was not.
+## The private display, second pass: the three modals, and five dead ends
+
+Took over from `docs/ui-verify-handoff.md` at `b52cfcc`. The environment was
+gone (`/tmp/opencode` empty), so the first hour was the bring-up; that is now
+one command, `scripts/ui-shoot/env-up.sh`, and the two traps in it are written
+down at the top of the script.
+
+**The gate claim is verified.** Against local Minos the Players island's
+checklist quotes the server verbatim: *"the planned window is incomplete (both
+actual_end and assumed_end are required, and each must be after its own start)"*
+and *"no units assigned"*. `GET /games/2/readiness` answers the same two
+sentences. This is the published gate working end to end.
+
+**All three modals have now been rendered.** Player picker, Fleet picker and
+Scenario composer, each opened, read and closed from the running console. The
+composer's write path works: a step typed into it came back from
+`GET /games/2/scenarios` as a third step on *First light*.
+
+### Fixed, each confirmed by driving
+
+**The close glyph did nothing, on every island and in every modal.** It lit on
+hover and swallowed no clicks. The cause is egui's, not ours: a click goes to
+one widget, the topmost clickable one whose interact rect contains the press,
+with ties to the last registered. Hover is not exclusive. The close button was
+registered before the body scope, so the body's own widgets were on top of it.
+Registering it after the body fixes both primitives. Instrumented before the
+change (`hover=true click=false`) and after (`click=true`, probe pixel flips),
+because a fix for "the button does nothing" is worth exactly as much as its
+evidence.
+
+**A seated game rendered as an empty one.** `parse_roster` called `as_array()`
+on `data`, but `GET /games/{id}/participants` answers `data: {participants:
+[...]}`. `None` became an empty roster, with no error anywhere: the island said
+`0 SEATED` while the seat was in the database and still in the API's answer.
+Both shapes are read now, with a test for each and one for an envelope that is
+neither. This is the third parser in this project to drop a whole field, and
+the status doc already says the habit that catches them is to keep the whole
+response.
+
+**Signing out was a one-way door.** `sign_out` never raises `show_login`, and
+the floating Login island is suppressed whenever the zone owns the left edge,
+so the console sat at `NOT SIGNED IN` with a Sign out button and no way to sign
+in. Relaunching was the only exit. The form is now one function, rendered by
+the zone's Operator island when there is no identity. Sign out, sign in from
+the island, console back.
+
+**A cold start could not re-open a session.** The session picker is drawn by the
+Essentials island, which renders only while a session is held, so with nothing
+held the only verb was *create one* — under a top band that says "Choose or join
+a session". Three sessions existed on the server and none was reachable. The
+picker row is now shared by both surfaces and drawn by the no-session island
+too. Re-opening yesterday's exercise is the common case; making a duplicate is
+the expensive mistake.
+
+**A sign-in that fetched nothing started blind.** `sign_out` clears the session
+list, and signing back in never re-read it, so the picker row vanished on the
+second sign-in. `apply_login` re-reads it.
+
+**The Player picker opened on an empty directory.** `open_composer` loads the
+book on open; the picker set a flag and nothing else. The Minos request log is
+the proof — pressing the button issued no `GET /users` at all — so the read
+only happened when the operator found the `find` button. It reads on open now.
+
+**"No accounts — sign in, then refresh."** Shown to a signed-in operator whose
+own account was in the directory, because the empty state was hardcoded and the
+directory had not been read yet. `users_status` already carries the reason, so
+the empty state says that instead of inventing a cause.
+
+### Not fixed, and why
+
+**An island body cannot be scrolled, so clipped content is unreachable.** The
+legacy islands wrap themselves in a `ScrollArea`; the zone's do not. `island()`
+clips the body to the island's content rect, so anything past the fold is gone,
+and the loud clip report goes to stderr where no operator is. Worse, the wheel
+over an island scrolls the *column*: the zone's scroll is a manual handler that
+reads the raw delta, so it moves whether or not the island consumed anything.
+This is why the Scenario composer's button has never been reachable at the
+default window size — it sits below the Essentials island's fold. At 1200x900
+the island measures taller, the button appears, and the composer opens. The fix
+is not small: per-island scrolling means the column scroll and the body scroll
+have to stop fighting over one wheel, and the column's is a view transform
+applied at draw time precisely so island drags keep working.
+
+**A zone island's close glyph cannot close it.** `side_zone` builds its entries
+with a literal `true` for open, and the draw loop sets `let mut open = true` per
+frame and discards `island_owned`'s return. The click lands and is thrown away.
+This one is a decision, not a bug: `DESIGN.md` gives the side zone no close
+button and says its contents are a function of `GameState`, so either the glyph
+goes or the zone grows a way to reopen what it closed. The second is a product
+answer, and it is the owner's.
+
+**The prose truncation does not reproduce.** At 2x on a settled frame the label
+reads *"joining needs a seat first — a valid key without one"* / *"is refused
+(ask the Game Master)."* The `is` is at the start of line two and nothing is
+clipped. Not patched, because there is nothing to patch. The widening
+experiment the handoff proposed is not worth running against a defect that is
+not there; what is worth knowing is that this session independently produced a
+capture with a modal's background missing entirely, which is what a mid-frame
+grab looks like, and that is the likeliest explanation for the original
+sighting.
+
+**The map does not corrupt on resize.** The window is hardcoded to 1040x640 at
+launch, so a capture of a 1600x1100 root photographs the black desktop beside
+the app and reads as a corrupt map. Resized to 1200x900 while running, the map
+fills it cleanly. Item 4 of the previous pass is closed, and it was never an
+app defect — it cost a full bug hunt, which is why it is written down here.
+
+### Still unverified, and why
+
+**Both drag-to-map gestures.** The local mirror has no units (`units 0` in the
+sync note), so the Fleet picker's rows are empty and there is nothing to drag.
+The gestures need a seeded unit catalogue, which is a data task.
+
+**Legibility of the top band over a bright map.** The band has no fill of its
+own, so `0:00:00 to 1x PAUSED` in the heat accent sits on the sea while the
+map's own labels run through the hint text. Whether that is intended is a
+design question about the band, and it is recorded rather than decided.
+
+### What the tools cost, and what they are now
+
+Every coordinate read off a rendered screenshot was wrong by 10 to 30pt,
+because a cropped image is displayed at a scale that is not knowable from the
+image. Three rounds went into clicking the wrong control. `shot.sh` burns a
+labelled grid into the capture; `click-sweep.sh` and `hover-sweep.sh` use one
+probe pixel as an oracle instead of reading a picture. `xdrv click()` now holds
+the press for 70ms, because a zero-length press+release is dropped often enough
+to read as a dead control. And the app needs 30 seconds after launch before it
+will take input at all — 14 is not enough, and the symptom is silence.
