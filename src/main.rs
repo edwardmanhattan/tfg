@@ -8979,13 +8979,49 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         ));
     }
 
+    /// The only island that renders when no session is held, so it is also
+    /// the only place a session can be NAMED.
+    ///
+    /// It used to offer a bare "Start a new session" button, which called the
+    /// create verb with nothing filled and answered "name the game first" —
+    /// pointing at a form that was not on screen, because the create form lives
+    /// on the Essentials island and that island only renders once a session is
+    /// HELD. A verb that cannot succeed is worse than no verb: it looks like
+    /// the way in and it is not.
+    ///
+    /// Name only, because name is the one field `POST /games` requires, and
+    /// every other field is optional and reachable from the edit form once the
+    /// game exists. Creating here hands the game over, the zone becomes
+    /// Planning, and the rest of the plan is authored from there.
+    /// The only island that renders when no session is held, so it is also
+    /// the only place a session can be NAMED.
+    ///
+    /// It used to offer a bare "Start a new session" button, which called the
+    /// create verb with nothing filled and answered "name the game first" —
+    /// pointing at a form that was not on screen, because the create form lives
+    /// on the Essentials island and that island only renders once a session is
+    /// HELD. A verb that cannot succeed is worse than no verb: it looks like
+    /// the way in and it is not.
+    ///
+    /// Name only, because name is the one field `POST /games` requires, and
+    /// every other field is optional and reachable from the edit form once the
+    /// game exists. Creating here hands the game over, the zone becomes
+    /// Planning, and the rest of the plan is authored from there.
     fn zone_start_body(&mut self, ui: &mut egui::Ui) {
         ui.label("No session held.");
         ui.weak("A session is a plan the Game Master authors: a force, a roster and a window.");
         ui.separator();
-        if ui.button("Start a new session →").clicked() {
-            // The Game Master's own flow is to create one and then hold it;
-            // the create verb is where the name and the mode live.
+        ui.label(egui::RichText::new("name").weak().small());
+        ui.add(
+            egui::TextEdit::singleline(&mut self.setup_name)
+                .desired_width(f32::INFINITY)
+                .hint_text("the exercise's name"),
+        );
+        if ui
+            .button("Create session →")
+            .on_hover_text("create it and hold it; the rest of the plan is authored in Planning")
+            .clicked()
+        {
             self.setup_create_game();
         }
         status_line(ui, &self.users_status.clone());
@@ -15956,6 +15992,41 @@ mod tests {
             !island.contains("small_button"),
             "the island roster must carry no verbs"
         );
+    }
+
+    /// Every way to CREATE a session renders a name field.
+    ///
+    /// Found the hard way: with no session held, the only island on screen
+    /// offered "Start a new session", which called the create verb with
+    /// nothing filled and answered "name the game first" — pointing at a form
+    /// that only renders once a session is HELD. The way in was a verb that
+    /// could not succeed.
+    ///
+    /// Source-level rather than a render, because the bug is about which
+    /// function renders the field, and that is not a thing a screenshot shows:
+    /// the island looked complete and the refusal came from three clicks later.
+    ///
+    /// The needle is assembled so this test cannot satisfy itself: the check
+    /// walks functions, and a function that merely MENTIONS both strings would
+    /// pass for free.
+    #[test]
+    fn every_create_verb_has_a_name_field_on_screen() {
+        let create = ["self.", "setup_create_game()"].concat();
+        let field = ["setup_", "name"].concat();
+        let src = include_str!("main.rs");
+        let mut checked = 0;
+        for body in src.split("\n    fn ").skip(1) {
+            if !body.contains(create.as_str()) {
+                continue;
+            }
+            let name = body.split(['(', ' ']).next().unwrap_or("").to_string();
+            assert!(
+                body.contains(field.as_str()),
+                "`{name}` calls the create verb but renders no {field} field, so it can only ever refuse with name-the-game-first"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 1, "the check found no create call site to test");
     }
 
     // -- the console does not introduce itself ---------------------------
