@@ -352,3 +352,57 @@ sleep twice produced a plausible PNG of the wrong window.
 
 Look at the renders. Two of the four heat passes were rejected by looking,
 and both failures were invisible in the code.
+## What the render actually shows (private display, first pass)
+
+Driven on Xvfb with `scripts/ui-shoot/xdrv.c`, not on the real screen. Four
+findings, three of them defects I introduced or inherited, and one I am not yet
+able to attribute.
+
+**1. The readiness endpoint 404s against the deployed backend.** The route
+exists locally at `minos internal/routers/game.go:477`, and `aaee9bf` is the
+commit that added it, but the API the console actually points at answers
+`HTTP 404: Not Found` for `/games/{id}/readiness` while `/games/{id}` and
+`/games/{id}/participants` answer. So the client is ahead of the server it
+depends on. This is not a hypothetical: the console cannot show a gate verdict
+against this environment until that commit is deployed.
+
+What is worth keeping is how it failed. The checklist read
+
+    • the readiness check could not be read — retry the sync
+
+rather than reporting zero blockers, and `unknown_gate_blockers` is what put
+that sentence there. A client that had kept the old local derivation would have
+happily reported "0 outstanding" and lit the Enter button, because a roster of
+zero and a window nobody declared still add up to a clear gate. Deleting the
+derivation did not just remove a second opinion; it removed the only thing that
+could have answered wrongly.
+
+**2. The Planning column cannot fit its own islands at the default window
+size.** Planning declares four islands at 380 + 150 + 320 + 320 = 1170pt. The
+side zone at the app's hardcoded `1040x640` has `640 - ZONE_ISLAND_GAP` = 624pt.
+The declared height is a floor (`fitted_island_height` clamps to
+`declared.min(ceiling)`), so the shortfall cannot be absorbed: Essentials is
+clipped mid-sentence and **Control and Fleet never render at all**. The clock
+multiplier and the fleet are unreachable in the state where you set the clock and
+assemble the fleet.
+
+Every rect involved is correct, which is why no geometry test caught it. The
+loud clip reports only Essentials, because Essentials is the one whose *body*
+overflowed its box; Control and Fleet did not overflow, they were never given
+room. A clip report is evidence that a box is too small, not evidence that the
+column adds up.
+
+**3. Two codepoints render as `.notdef` boxes.** `→` (U+2192, 44 call sites)
+and `✓` (U+2713, 7 call sites) both come out as hollow rectangles, so every
+"Enter preparation →" and every "· ready ✓" is a button with a broken glyph in
+it. No `FontDefinitions` is registered anywhere in `src/`, so this is egui's
+bundled fallback failing to cover two characters the UI leans on heavily. Font
+coverage is resolved on the CPU into the atlas, so this is not an artefact of
+software rendering. It is invisible in code review and obvious in a screenshot.
+
+**4. Unattributed: the map corrupted after a window resize.** At 1600x1100,
+resized from 1040x640, the map rendered large beige blocks, vertical stripe
+artefacts and a black band across the bottom. At 1040x640 it was correct. That
+is either a viewport that does not re-fit on resize, which would be a real bug,
+or an llvmpipe artefact, which would not be. One more capture at a second size
+settles it and I have not done that yet, so it stays a suspicion.
