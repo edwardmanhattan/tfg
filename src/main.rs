@@ -2292,6 +2292,11 @@ struct ShipApp {
     fleet_picker_open: bool,
     /// Whether the Player Picker modal is showing.
     player_picker_open: bool,
+    /// The held session's last detail read, kept whole.
+    ///
+    /// Cleared whenever the hold changes, because a detail is a fact about ONE
+    /// game and a stale one would show the previous session's plan.
+    held_detail: Option<tfg::backend::GameDetail>,
     /// Every modal panel's rect, for this frame.
     ///
     /// The drop handlers need these because the map's own rect contains the
@@ -3385,6 +3390,7 @@ impl ShipApp {
             self.scenarios.clear();
             self.composer_scenario = None;
             self.composer_visible = false;
+            self.held_detail = None;
             self.composer_draft = ComposerDraft::default();
             self.composer_draft_error = None;
         }
@@ -4248,6 +4254,7 @@ impl ShipApp {
         // including to None, which unsubscribes.
         self.watch_game_channel();
         if self.users_game.is_none() {
+            self.held_detail = None;
             self.users_roster.clear();
             self.users_gunits.clear();
             self.commanded_hulls.clear();
@@ -4275,6 +4282,13 @@ impl ShipApp {
         let d = b.detail;
         self.set_held_game(Some((d.id, d.name.clone())));
         self.users_game_state = Some(d.state.clone());
+        // The WHOLE detail is kept, not destructured away. It used to be read
+        // for six fields and the rest thrown out, which is how `description`
+        // ended up write-only: the create form wrote it, the parser dropped
+        // it, and the Essentials island had nothing to show after a reload.
+        // Keeping the detail makes the next unparsed field a visible omission
+        // rather than a silent one.
+        self.held_detail = Some(d.clone());
         // H2: the chosen rate rides the detail — a mid-exercise select
         // learns the clock it is joining.
         self.minos_time_factor =
@@ -6159,6 +6173,101 @@ impl ShipApp {
         }));
     }
 
+    /// The held session's own plan, read back.
+    ///
+    /// This exists because `description` was WRITE-ONLY: the create form sent
+    /// it, `parse_game_detail` dropped it, and nothing in the app ever read
+    /// it — so the field showed blank after any reload. The fix is not a
+    /// special case here but the parser keeping what the server sent; this
+    /// is simply the first place that looks at it.
+    ///
+    /// READ ONLY on purpose. The edit form's contract is blank-means-
+    /// unchanged with an empty string meaning CLEAR, so seeding those drafts
+    /// from the detail would turn every save into "set all six fields to what
+    /// they already are" — and for the two nullable columns that means every
+    /// save CLEARS them.
+    fn held_plan_prose(&mut self, ui: &mut egui::Ui) {
+        let Some(d) = self.held_detail.clone() else {
+            return;
+        };
+        ui.separator();
+        ui.strong("The plan");
+        // A field with nothing in it says so rather than rendering an empty
+        // row, because six blank lines read as a broken panel rather than as
+        // an exercise nobody has written down yet.
+        let mut said_any = false;
+        for (label, text) in [
+            ("description", &d.description),
+            ("purpose", &d.purpose),
+            ("target", &d.target),
+        ] {
+            if !text.is_empty() {
+                ui.label(egui::RichText::new(label).weak().small());
+                ui.label(text.clone());
+                said_any = true;
+            }
+        }
+        // `area` is the one field the server withholds, and it omits BOTH
+        // "unset" and "withheld" the same way — so the honest reading needs
+        // who is asking. See `GameDetail::area_is_withheld`.
+        let withheld = d.area_is_withheld(self.can_manage_sessions());
+        match (&d.area, withheld) {
+            (Some(area), _) => {
+                ui.label(egui::RichText::new("area").weak().small());
+                ui.label(area.clone());
+                said_any = true;
+            }
+            (None, true) => {
+                ui.label(
+                    egui::RichText::new("area withheld until execution").weak().small(),
+                );
+                said_any = true;
+            }
+            (None, false) => {
+                ui.label(egui::RichText::new("no area set").weak().small());
+            }
+        }
+        if let Some(tag) = d.map_tag.clone() {
+            ui.label(egui::RichText::new("map tag").weak().small());
+            ui.label(egui::RichText::new(tag).monospace());
+            said_any = true;
+        }
+        // The overlay is a DISPLAY rule, not a secret: the server never
+        // withholds it, and it is the client's job to hide it once execution
+        // begins. Whether this island honours that is a separate question
+        // from whether it reads the field.
+        if let Some(text) = d.overlay_text.clone() {
+            let during_execution = d.state == "execution";
+            ui.label(egui::RichText::new("overlay").weak().small());
+            ui.label(if during_execution {
+                egui::RichText::new(text).weak()
+            } else {
+                egui::RichText::new(text).strong()
+            });
+            said_any = true;
+        }
+        // The ends are the plan, and comparing them with the realised finish
+        // is the point of closure — so all four, not just the starts.
+        let mut ends = Vec::new();
+        for (label, value) in [
+            ("actual start", &d.actual_start),
+            ("assumed start", &d.assumed_start),
+            ("actual end", &d.actual_end),
+            ("assumed end", &d.assumed_end),
+        ] {
+            if let Some(v) = value {
+                ends.push(format!("{label} {v}"));
+            }
+        }
+        if !ends.is_empty() {
+            ui.label(egui::RichText::new(ends.join("  ·  ")).monospace().small());
+            said_any = true;
+        }
+        if !said_any {
+            ui.weak("Nothing written yet — the plan is authored while it is being written.");
+        }
+    }
+
     /// Held-game edit form (admin ticket): six blank-means-unchanged
     /// rows; at least one filled to send. Empty area/map_tag clears
     /// (nullable columns); past planning the server refuses loudly.
@@ -6372,6 +6481,7 @@ impl ShipApp {
                 }
             }
         }
+        self.held_plan_prose(ui);
         status_line(ui, &self.users_status.clone());
         ui.separator();
         // C2: room-key join. The key is the only input — the answer
@@ -14830,6 +14940,7 @@ fn main() -> Result<(), String> {
                 users_roster: Vec::new(),
                 fleet_picker_open: false,
                 player_picker_open: false,
+                held_detail: None,
                 modal_panel_rects: Vec::new(),
                 scenarios: Vec::new(),
                 composer_scenario: None,

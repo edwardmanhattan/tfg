@@ -701,13 +701,32 @@ impl MinosMaster {
     /// update answer (the mutation re-reads and returns the same
     /// shape the detail endpoint serves).
     fn parse_game_detail(v: &serde_json::Value, fallback_id: i64) -> GameDetail {
+        // Three-state text is OMISSION, so it needs a different read from the
+        // plain prose. `description`/`purpose`/`target` are always sent, so
+        // absent means empty; `area`/`map_tag` are omitted both when unset
+        // AND when withheld from a participant, and the two are
+        // indistinguishable from here — see `GameDetail::area_is_withheld`.
+        let absent_when_unset = |key: &str| {
+            v[key]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        };
         GameDetail {
             id: v["id"].as_i64().unwrap_or(fallback_id),
             name: v["name"].as_str().unwrap_or("").to_string(),
             mode: v["mode"].as_str().unwrap_or("").to_string(),
             state: v["state"].as_str().unwrap_or("").to_string(),
+            description: v["description"].as_str().unwrap_or("").to_string(),
+            purpose: v["purpose"].as_str().unwrap_or("").to_string(),
+            target: v["target"].as_str().unwrap_or("").to_string(),
+            area: absent_when_unset("area"),
+            map_tag: absent_when_unset("map_tag"),
+            overlay_text: absent_when_unset("overlay_text"),
             actual_start: v["actual_start"].as_str().map(|s| s.to_string()),
             assumed_start: v["assumed_start"].as_str().map(|s| s.to_string()),
+            actual_end: v["actual_end"].as_str().map(|s| s.to_string()),
+            assumed_end: v["assumed_end"].as_str().map(|s| s.to_string()),
             time_factor: v["time_factor"].as_f64().unwrap_or(0.0),
             room_key: v["room_key"].as_str().map(|s| s.to_string()),
         }
@@ -1997,6 +2016,23 @@ pub struct GameDetail {
     pub name: String,
     pub mode: String,
     pub state: String,
+    /// The Game Master's prose. Sent to EVERYONE entitled to the game, so
+    /// unlike `area` there is no withholding rule and an empty string
+    /// unambiguously means "not written".
+    pub description: String,
+    pub purpose: String,
+    pub target: String,
+    /// Absent means unset OR withheld — the server omits both with the same
+    /// shape, so the client cannot tell them apart from the response alone.
+    /// `GameDetail::area_is_withheld` gives the honest reading.
+    pub area: Option<String>,
+    pub map_tag: Option<String>,
+    /// Written to be displayed above the map during planning and preparation.
+    /// Never withheld; hidden at execution by a rule the CLIENT applies, from
+    /// the state it already has. Absent means unset.
+    pub overlay_text: Option<String>,
+    pub actual_end: Option<String>,
+    pub assumed_end: Option<String>,
     pub actual_start: Option<String>,
     pub assumed_start: Option<String>,
     pub time_factor: f64,
@@ -2006,6 +2042,24 @@ pub struct GameDetail {
     /// because withholding it from the group that must use it would
     /// make the feature impossible.
     pub room_key: Option<String>,
+}
+
+impl GameDetail {
+    /// Whether an absent `area` means WITHHELD rather than unset.
+    ///
+    /// The two are the same shape on the wire, so this is a question about
+    /// WHO IS ASKING rather than about the payload: a Game Master is never
+    /// withheld, so for them absence means unset; a participant receives the
+    /// area only from execution onward, so before that its absence IS the
+    /// withholding.
+    ///
+    /// `(is_game_master, state)` rather than a bool because both halves are
+    /// needed and computing them at each call site is how the two get mixed
+    /// up — reading `state == "execution"` alone would show "withheld" to the
+    /// Game Master, who is simply looking at an exercise with no area yet.
+    pub fn area_is_withheld(&self, is_game_master: bool) -> bool {
+        self.area.is_none() && !is_game_master && self.state != "execution"
+    }
 }
 
 /// One hull's starting position on the map (C2): a Minos placement row.
@@ -2723,5 +2777,114 @@ mod scenario_tests {
         let s = MinosMaster::parse_scenario(&v, 3).expect("the scenario itself decodes");
         assert_eq!(s.steps.len(), 1);
         assert_eq!(s.steps[0].content, "has an id");
+    }
+}
+
+#[cfg(test)]
+mod game_prose_tests {
+    use super::{GameDetail, MinosMaster};
+
+    fn detail(v: serde_json::Value) -> GameDetail {
+        MinosMaster::parse_game_detail(&v, 7)
+    }
+
+    /// The bug this fixes: `description` was sent by the create form and
+    /// dropped by the parser, so it was write-only. Every prose field is
+    /// asserted together, because the parser dropped six and fixing one would
+    /// leave five more of the same shape.
+    #[test]
+    fn the_prose_fields_survive_the_read() {
+        let d = detail(serde_json::json!({
+            "id": 7,
+            "name": "RIMPAC",
+            "mode": "maneuver",
+            "state": "planning",
+            "description": "two-day exercise",
+            "purpose": "train the staff",
+            "target": "the exercise area"
+        }));
+        assert_eq!(d.description, "two-day exercise");
+        assert_eq!(d.purpose, "train the staff");
+        assert_eq!(d.target, "the exercise area");
+    }
+
+    /// Absent prose means "not written", which is an empty string rather than
+    /// an absence — these two fields are always sent, so there is no
+    /// withholding rule to confuse the two readings.
+    #[test]
+    fn unwritten_prose_is_empty_not_absent() {
+        let d = detail(serde_json::json!({
+            "id": 7, "name": "n", "mode": "maneuver", "state": "planning"
+        }));
+        assert_eq!(d.description, "");
+        assert_eq!(d.purpose, "");
+        assert_eq!(d.target, "");
+    }
+
+    /// The three-state fields omit BOTH "unset" and "withheld" the same way,
+    /// so the read has to be an absence — and an empty string must not become
+    /// a value, because "the area is the empty string" is not a thing.
+    #[test]
+    fn a_three_state_field_is_absent_until_it_has_a_value() {
+        let d = detail(serde_json::json!({
+            "id": 7, "name": "n", "mode": "maneuver", "state": "planning",
+            "area": "Strait of Malacca",
+            "map_tag": "",
+            "overlay_text": "D+1"
+        }));
+        assert_eq!(d.area.as_deref(), Some("Strait of Malacca"));
+        assert_eq!(d.map_tag, None, "an empty map tag is unset, not set-to-empty");
+        assert_eq!(d.overlay_text.as_deref(), Some("D+1"));
+    }
+
+    /// The area's two absences are the same shape on the wire, so the
+    /// difference is WHO IS ASKING. A Game Master is never withheld, so for
+    /// them absence means unset — reading the state alone would tell the
+    /// person who is editing the plan that their own area is hidden.
+    #[test]
+    fn an_absent_area_is_withheld_only_from_a_participant_before_execution() {
+        let planning = detail(serde_json::json!({
+            "id": 7, "name": "n", "mode": "maneuver", "state": "planning"
+        }));
+        assert!(
+            !planning.area_is_withheld(true),
+            "a Game Master looking at an unset area is not being withheld"
+        );
+        assert!(
+            planning.area_is_withheld(false),
+            "a participant before execution is being withheld"
+        );
+
+        let execution = detail(serde_json::json!({
+            "id": 7, "name": "n", "mode": "maneuver", "state": "execution"
+        }));
+        assert!(
+            !execution.area_is_withheld(false),
+            "execution is when the area stops being withheld"
+        );
+
+        // A SET area is never withheld, whoever is asking.
+        let set = detail(serde_json::json!({
+            "id": 7, "name": "n", "mode": "maneuver", "state": "planning",
+            "area": "somewhere"
+        }));
+        assert!(!set.area_is_withheld(false));
+    }
+
+    /// The ends ride the detail too, and comparing them with the realised
+    /// finish is the whole point of closure — so the read has to carry all
+    /// four, not just the two starts.
+    #[test]
+    fn the_ends_ride_alongside_the_starts() {
+        let d = detail(serde_json::json!({
+            "id": 7, "name": "n", "mode": "maneuver", "state": "execution",
+            "actual_start": "2026-10-01T08:00:00Z",
+            "assumed_start": "2026-10-01T0600",
+            "actual_end": "2026-10-02T16:30:00Z",
+            "assumed_end": "2026-10-02T1630"
+        }));
+        assert_eq!(d.actual_start.as_deref(), Some("2026-10-01T08:00:00Z"));
+        assert_eq!(d.actual_end.as_deref(), Some("2026-10-02T16:30:00Z"));
+        assert_eq!(d.assumed_end.as_deref(), Some("2026-10-02T1630"));
     }
 }

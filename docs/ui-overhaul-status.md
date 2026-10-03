@@ -54,7 +54,7 @@ the MapLibre core.
 | The seat note's rule | `main::role_may_need_command` | a test that says exactly what the schema can support and no more |
 | Island roster is read-only, editor is in the modal | `users_roster_ui` / `roster_editor_ui` | a source-level check on the Id collision, which no screenshot would reveal |
 
-`cargo test --lib`: 280 pass. `cargo test --bin tfg`: 35 pass. Harness: 90 pass. Two failures are pre-existing and unrelated
+`cargo test --lib`: 285 pass. `cargo test --bin tfg`: 35 pass. Harness: 90 pass. Two failures are pre-existing and unrelated
 (`quad_bow_follows_the_compass`, `order_move_applies_then_higher_overrides_loudly`);
 both were confirmed failing on a stashed tree before this work.
 
@@ -96,10 +96,19 @@ wrong in several places.
   (`game_service.go:2756-2790`), enforced at assignment time.
 - **`GamePace` (`standard`/`fast`) is unmodelled by the client.** `fast`
   waives exactly one readiness gate. Worth surfacing in Planning.
-- **`description` is write-only today.** The client sends it on create and
-  update; `parse_game_detail` never reads it back, so the Essentials island
-  would show a blank field after a reload. Fix the parser before that island
-  ships. This is the same defect `parse_user` had, found the same way.
+- **A field the parser drops is a field the island cannot show.** This bit
+  TWICE: `parse_user` threw away four of five `/users/me` fields, and
+  `parse_game_detail` threw away six of the game's. Both were write-only in
+  the client — the create/edit form sent them and nothing read them back. The
+  habit that catches it is keeping the whole response, not cherry-picking:
+  `ShipApp::held_detail` now stores `GameDetail` whole, so the next unparsed
+  field is a visible omission rather than a silent one.
+- **Two absences are the same shape on the wire.** Minos omits `area` both
+  when it is unset and when it is withheld from a participant, so the client
+  cannot tell them apart from the response. `GameDetail::area_is_withheld`
+  answers it from WHO IS ASKING instead — a Game Master is never withheld.
+  Reading the game state alone would tell the person editing the plan that
+  their own area is hidden.
 - **There is still no endpoint to set a user photo.** `photo_url` is only
   ever populated by a bootstrap seed or by a presign of an existing key, so
   most accounts keep the default glyph. That is a backend gap, not a client
@@ -116,13 +125,10 @@ the next.
 1. **Execution and Closure island sets.** The zone shows one compact island
    for each today. The Orders, Roster, Log and assessment surfaces exist as
    free-floating islands and a docked panel, and they belong in the column.
-2. **`description` is write-only in the client.** `parse_game_detail` never
-   reads it, so the Essentials island shows a blank field after a reload.
-   Fix the parser before that island ships.
-3. **Collapse `Onboard::Mode`.** Simulation currently announces itself, which
+2. **Collapse `Onboard::Mode`.** Simulation currently announces itself, which
    the brief forbids. Collapsing the enum removes an `Onboard` state and takes
    the mode card out of the console entirely.
-4. **Re-run every "looked at" claim on a working compositor.** Every visual
+3. **Re-run every "looked at" claim on a working compositor.** Every visual
    decision in this file was checked on a rendered frame at some point EXCEPT
    everything from the modal primitive onward: the backdrop dim, the three
    modals, and both drag-to-map gestures. That is a real gap, not a formality.
