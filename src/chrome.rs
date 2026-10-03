@@ -485,6 +485,14 @@ pub fn island_owned(
             // invisible rather than corrupting its neighbour, which is the
             // difference between a bug and a mistake.
             //
+            // `band` in that intersection is load-bearing, and it was easy to
+            // miss: this scope re-clips to the island's own content rect, which
+            // OVERWRITES the band clip set above. Without it a scrolled island
+            // paints its body up over the top band, which the drag clamp used to
+            // make impossible because it held every island at or below the
+            // window top. The scroll removed that guarantee, so the clip carries
+            // it now.
+            //
             // Clipping is not the same as fitting: content that does not fit
             // is now lost quietly instead of loudly. The honest fix is for
             // the caller to size its island to its content, and that is a
@@ -497,7 +505,7 @@ pub fn island_owned(
                     .layout(Layout::top_down(egui::Align::LEFT))
                     .sense(Sense::hover()),
                 |ui| {
-                    ui.set_clip_rect(content.intersect(ui.max_rect()));
+                    ui.set_clip_rect(content.intersect(ui.max_rect()).intersect(band));
                     body(ui);
                     // Whether the body needed MORE room than it was given.
                     //
