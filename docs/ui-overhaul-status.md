@@ -123,7 +123,13 @@ Ordered so each unit is verifiable on its own and each one shrinks the risk of
 the next.
 
 1. **The three modals and both drag-to-map gestures are still unrendered.**
-   Both blockers have been removed and the work got as far as signing in:
+   A pointer now exists and a real session exists, but **no button press and no
+   key press has reached the app** — see `scripts/ui-shoot/README.md` for the
+   three silent failures behind that. Do not drive input on this machine's
+   desktop until event delivery is confirmed: the failure is silent and the
+   blast radius is whatever window the user has open.
+   Both surface blockers were removed and the work got as far as the login
+   card:
    `scripts/ui-shoot/` has a working uinput pointer (no root needed) and a
    Minos stack with no root and no docker, and a real session was created with
    a Game Master seat, two scenarios and three steps. It stopped because each

@@ -97,3 +97,40 @@ Also:
 - The app dies when the shell call that launched it ends. Use
   `setsid nohup … &`.
 - Do not resize or close the user's windows to get a cleaner shot.
+## Where this stopped, and what is NOT solved
+
+The pointer moves the compositor's cursor — `hyprctl cursorpos` confirms it,
+and the login card's button was located by scanning for its cyan fill to
+within a pixel. But **no button press and no key press has ever reached tfg**,
+by coordinates or by Tab order. So the three modals are still unrendered.
+
+Three findings, each of which fails silently:
+
+1. **A relative pointer cannot be positioned.** libinput applies its
+   acceleration curve, so a delta of 100 arrives as 200. Measured: asking for
+   (100,100) produced a cursor at (200,200), and asking for (1200,700)
+   produced the bottom-right corner of the screen, because acceleration made
+   the delta enormous and it saturated. Nothing reports an error.
+2. **Absolute axes do not take on this kernel.** `UI_ABS_SETUP` must be called
+   BEFORE `UI_DEV_CREATE` (afterwards it is EINVAL, from C as well), and even
+   then the cursor pins to the screen corner — which is what a device whose
+   axes have a zero range does with any value. Not chased further.
+3. **Key events need every key bit advertised.** libinput decides a device is
+   a keyboard from the bits registered at creation. Registering only
+   `BTN_LEFT`/`BTN_RIGHT` and emitting `KEY_A` means the device is a mouse
+   that makes key noises. Registering all of them changed nothing here, so
+   something further along — seat assignment for a hotplugged device, most
+   likely — is not delivering the events to the client.
+
+## The focus guard is necessary and NOT sufficient
+
+`drive.py` re-reads the focused window before every keystroke and aborts if it
+is not tfg. That guard did its job: the run that typed a password into a chat
+window had no guard, and the run that followed it never typed outside tfg.
+
+But it only proves tfg was focused *at the moment of the check*. It does not
+prove the compositor will deliver an event to that window, which is exactly
+the gap that let a password reach a chat app in the first place. **Until
+event delivery itself is confirmed, do not drive input on this machine's
+desktop unattended** — the failure is silent and the blast radius is whatever
+window the user happened to have open.

@@ -108,102 +108,6 @@ EVENT_FMT = "llHHi"
 EVENT_SIZE = struct.calcsize(EVENT_FMT)
 
 
-class Mouse:
-    def __init__(self):
-        self.fd = os.open(UINPUT_PATH, os.O_WRONLY)
-        self._setup()
-
-    def _setup(self):
-        # Via the IOCTL, not a write.
-        #
-        # Writing the struct is the legacy path and this kernel answers
-        # EINVAL for it with nothing to say why — verified by compiling the
-        # same probe in C, so it is the kernel and not this code. The
-        # uinput.h comment on UI_DEV_SETUP says exactly this: it was ADDED as
-        # the way to set device parameters. C: `write` -> EINVAL, `ioctl` -> 0.
-        setup = struct.pack(
-            UI_DEV_SETUP_FMT,
-            BUS_VIRTUAL, 0x1234, 0x5678, 0x0001,
-            b"tfg-shoot-mouse".ljust(80, b"\0"),
-            0,                               # ff_effects_max
-        )
-        import fcntl
-        fcntl.ioctl(self.fd, UI_DEV_SETUP, setup)
-
-        for ev in (EV_KEY, EV_REL, EV_SYN):
-            self._ioc(UI_SET_EVBIT, ev)
-        for rel in (REL_X, REL_Y, REL_WHEEL, REL_HWHEEL):
-            self._ioc(UI_SET_RELBIT, rel)
-        for key in (BTN_LEFT, BTN_RIGHT):
-            self._ioc(UI_SET_KEYBIT, key)
-
-        fcntl.ioctl(self.fd, UI_DEV_CREATE)
-
-        # libinput needs the device to exist before it will report a seat, and
-        # a request sent before the hotplug lands is simply dropped.
-        time.sleep(0.4)
-
-    def _ioc(self, request, value):
-        fcntl.ioctl(self.fd, request, value)
-
-    def emit(self, etype, code, value):
-        now = time.time()
-        sec = int(now)
-        usec = int((now - sec) * 1_000_000)
-        os.write(self.fd, struct.pack(EVENT_FMT, sec, usec, etype, code, value))
-
-    def syn(self):
-        self.emit(EV_SYN, 0, 0)
-
-    def move_abs(self, x, y):
-        """Go to (x, y) in compositor pixels, from a pinned origin.
-
-        This is a RELATIVE device, so a raw delta only means "that far from
-        wherever you were" — and a freshly created device has no position, so
-        "click at 1375,562" lands somewhere arbitrary and the symptom is "the
-        app ignored my click".
-
-        The fix is to pin first: one huge negative delta drives the pointer to
-        the top-left (the compositor clamps), then the real move is measured
-        from there and is therefore exact. Both deltas go in one frame so the
-        compositor never shows the sweep across the screen.
-
-        Absolute axes would be the obvious answer and are not available here:
-        UI_ABS_SETUP answers EINVAL on this kernel, from C as well as from
-        here, and the legacy struct-uinput_setup write path is refused too.
-        """
-        self.emit(EV_REL, REL_X, -100000)
-        self.emit(EV_REL, REL_Y, -100000)
-        self.syn()
-        self.emit(EV_REL, REL_X, int(x))
-        self.emit(EV_REL, REL_Y, int(y))
-        self.syn()
-        time.sleep(0.03)
-
-    def move_rel(self, dx, dy):
-        self.emit(EV_REL, REL_X, int(dx))
-        self.emit(EV_REL, REL_Y, int(dy))
-        self.syn()
-        time.sleep(0.03)
-
-    def button(self, btn, down):
-        self.emit(EV_KEY, btn, 1 if down else 0)
-        self.syn()
-        time.sleep(0.04)
-
-    def wheel(self, n):
-        self.emit(EV_REL, REL_WHEEL, int(n))
-        self.syn()
-        time.sleep(0.05)
-
-    def close(self):
-        try:
-            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
-        except Exception:
-            pass
-        os.close(self.fd)
-
-
 # Names mapped to evdev codes. Enough for driving a UI, not a full table.
 #
 # The punctuation row is written out longhand because the obvious compact form
@@ -235,6 +139,116 @@ KEYS.update({
     "!": 2, "@": 3, "#": 4, "$": 5, "%": 6, "^": 7, "&": 8, "*": 9,
     "(": 10, ")": 11,
 })
+
+
+class Mouse:
+    def __init__(self):
+        self.fd = os.open(UINPUT_PATH, os.O_WRONLY)
+        self._setup()
+
+    def _setup(self):
+        # Via the IOCTL, not a write.
+        #
+        # Writing the struct is the legacy path and this kernel answers
+        # EINVAL for it with nothing to say why — verified by compiling the
+        # same probe in C, so it is the kernel and not this code. The
+        # uinput.h comment on UI_DEV_SETUP says exactly this: it was ADDED as
+        # the way to set device parameters. C: `write` -> EINVAL, `ioctl` -> 0.
+        setup = struct.pack(
+            UI_DEV_SETUP_FMT,
+            BUS_VIRTUAL, 0x1234, 0x5678, 0x0001,
+            b"tfg-shoot-mouse".ljust(80, b"\0"),
+            0,                               # ff_effects_max
+        )
+        import fcntl
+        fcntl.ioctl(self.fd, UI_DEV_SETUP, setup)
+
+        for ev in (EV_KEY, EV_REL, EV_ABS, EV_SYN):
+            self._ioc(UI_SET_EVBIT, ev)
+        for axis in (ABS_X, ABS_Y):
+            self._ioc(UI_SET_ABSBIT, axis)
+        for rel in (REL_X, REL_Y, REL_WHEEL, REL_HWHEEL):
+            self._ioc(UI_SET_RELBIT, rel)
+        # EVERY key this class can send, not just the buttons.
+        #
+        # libinput decides a device is a keyboard from the key bits it
+        # advertises at creation. Registering only BTN_LEFT/BTN_RIGHT and then
+        # emitting KEY_A means the events are simply dropped — the device is a
+        # mouse that occasionally makes key noises. The symptom is exact and
+        # misleading: clicks land perfectly (the coordinates were verified
+        # against the pixels) and no character ever appears.
+        for key in {BTN_LEFT, BTN_RIGHT, SHIFT, *KEYS.values()}:
+            self._ioc(UI_SET_KEYBIT, key)
+
+        # Absolute axes, declared BEFORE the device is created.
+        #
+        # The order is the whole trick. The header says UI_ABS_SETUP sets the
+        # ranges "for the input device to be created", and it means that
+        # literally: calling it afterwards is EINVAL, from C as well as from
+        # here. Getting this right is what makes positioning exact at all —
+        # as a relative device the pointer goes through libinput's
+        # acceleration curve, so a delta of 100 arrives as 200 and a large
+        # delta saturates into a corner. Measured: asking for (100,100)
+        # produced a cursor at (200,200), and asking for (1200,700) produced
+        # the bottom-right corner of the screen.
+        for code, hi in ((ABS_X, 1919), (ABS_Y, 1079)):
+            fcntl.ioctl(self.fd, UI_ABS_SETUP,
+                        struct.pack("HH6i", code, 0, 0, 0, hi, 0, 0, 0))
+
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+
+        # libinput needs the device to exist before it will report a seat, and
+        # a request sent before the hotplug lands is simply dropped.
+        time.sleep(0.4)
+
+    def _ioc(self, request, value):
+        fcntl.ioctl(self.fd, request, value)
+
+    def emit(self, etype, code, value):
+        now = time.time()
+        sec = int(now)
+        usec = int((now - sec) * 1_000_000)
+        os.write(self.fd, struct.pack(EVENT_FMT, sec, usec, etype, code, value))
+
+    def syn(self):
+        self.emit(EV_SYN, 0, 0)
+
+    def move_abs(self, x, y):
+        """Go to (x, y) in compositor pixels.
+
+        Absolute, so this is the coordinate rather than a delta from wherever
+        the pointer happened to be. That matters more than it sounds: as a
+        relative device the pointer is put through libinput's acceleration
+        curve, which is why a delta of 100 arrived as 200 and a large delta
+        saturated into a screen corner.
+        """
+        self.emit(EV_ABS, ABS_X, max(0, min(1919, int(x))))
+        self.emit(EV_ABS, ABS_Y, max(0, min(1079, int(y))))
+        self.syn()
+        time.sleep(0.03)
+
+    def move_rel(self, dx, dy):
+        self.emit(EV_REL, REL_X, int(dx))
+        self.emit(EV_REL, REL_Y, int(dy))
+        self.syn()
+        time.sleep(0.03)
+
+    def button(self, btn, down):
+        self.emit(EV_KEY, btn, 1 if down else 0)
+        self.syn()
+        time.sleep(0.04)
+
+    def wheel(self, n):
+        self.emit(EV_REL, REL_WHEEL, int(n))
+        self.syn()
+        time.sleep(0.05)
+
+    def close(self):
+        try:
+            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        except Exception:
+            pass
+        os.close(self.fd)
 
 
 def key_code(name):
