@@ -54,7 +54,7 @@ the MapLibre core.
 | The seat note's rule | `main::role_may_need_command` | a test that says exactly what the schema can support and no more |
 | Island roster is read-only, editor is in the modal | `users_roster_ui` / `roster_editor_ui` | a source-level check on the Id collision, which no screenshot would reveal |
 
-`cargo test --lib`: 286 pass. `cargo test --bin tfg`: 38 pass. Harness: 91 pass. Two failures are pre-existing and unrelated
+`cargo test --lib`: 286 pass. `cargo test --bin tfg`: 43 pass. Harness: 91 pass. Two failures are pre-existing and unrelated
 (`quad_bow_follows_the_compass`, `order_move_applies_then_higher_overrides_loudly`);
 both were confirmed failing on a stashed tree before this work.
 
@@ -128,15 +128,11 @@ the next.
    needs a held session AND a pointer. This machine has `wtype` but no
    `ydotool`/`dotool`/`xdotool`, and `hyprctl dispatch` is Lua-only and throws
    on every focus call. Someone with a mouse has to open them.
-2. **Island heights are hand-guessed constants.** `island_owned` now CLIPS and
-   now REPORTS an overflow to stderr, so a wrong height cannot pass silently
-   — but neither is measured. `side_zone` stacks by
-   heights fixed before anything is drawn, so they cannot be measured from
-   content without running each body twice — and running a body twice
-   double-fires its writes. `island_owned` now clips, so a wrong height is
-   quiet rather than corrupting its neighbour, but that is a mitigation. The
-   fix is a non-interactive measure pass, which means the bodies must stop
-   writing on a dry run.
+2. ~~Island heights are hand-guessed constants.~~ DONE — the column now
+   measures itself (see below). What remains is the CEILING: an island whose
+   content is genuinely unbounded is clipped at the window rather than
+   scrolled. That is a deliberate choice, and unlike the rest of this it is
+   not a tested one.
 
 ## Traps worth writing down
 
@@ -217,6 +213,24 @@ two candidates are nowhere near each other:
 Getting there also cost a bug: the first version of `--bright` painted
 *inside* the `island_mode` branch, after the modal's early `return`, so it
 never ran. A render that shows exactly the previous background is the tell.
+
+**The column now measures its own islands.** The overflow detector was
+already reporting "content needs more"; the fix was to USE that. Each island
+draws at whatever height it was given and publishes what it would have
+preferred, and the next frame stacks with that. One frame of lag, no
+double-run — which is the whole trick, because the alternative is running
+every body twice per frame and every write a body performs would fire twice.
+
+Verified live: with the Operator island deliberately set to 70pt it reported
+the overflow **once** and then self-corrected. Before this, 70pt would have
+overflowed on every frame forever.
+
+The measurement rides the context's TEMP storage rather than a `HashMap` on
+the app — temp storage is already scoped to one frame, so a parallel field
+would be a second source of truth that can disagree with it. The clamp (never
+below the declared constant, never past the window, and a `NaN` measurement
+refused outright, because `NaN` through `clamp` silently poisons a rect and
+drops every island under it) is a pure function with five tests.
 
 **A silent clip is worse than a loud one.** Clipping the island bodies fixed
 the corruption but turned "corrupts the island below" into "a button quietly
