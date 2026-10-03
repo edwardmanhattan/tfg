@@ -1327,6 +1327,82 @@ fn role_may_need_command(is_judge_side: bool) -> bool {
     !is_judge_side
 }
 
+/// The tail the participant condition writes, so `setup_checklist` can hang
+/// the outstanding names off the one blocker the count produces.
+///
+/// A protocol between two functions in this file, which is exactly why it is
+/// named rather than inlined at both ends.
+const NOT_READY: &str = " participant(s) not ready";
+
+/// The gate's PLAN conditions: the planned window and the map.
+///
+/// Split out from the participant conditions because these two come from the
+/// detail and the placements read alone. A client whose roster came back
+/// staff-only cannot count anybody, and it still owes an answer about a window
+/// it can plainly read. So the window blocker has to be reachable with no
+/// roster behind it.
+fn plan_gate_blockers(
+    window: &tfg::backend::TimeWindow,
+    pieces: usize,
+    unplaced: i64,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if !window.is_complete() {
+        blockers.push(
+            "the planned window is incomplete (both the real end and the exercise end are required)"
+                .to_string(),
+        );
+    }
+    if pieces == 0 {
+        blockers.push("no pieces assigned yet (step 3)".to_string());
+    }
+    if unplaced > 0 {
+        blockers.push(format!("{unplaced} unit(s) are not placed"));
+    }
+    blockers
+}
+
+/// The client's re-derivation of the server's execution gate: every blocker
+/// named, empty means the advance will be accepted.
+///
+/// FIVE conditions, in the order `GameReadiness.CanExecute` tests them: the
+/// window, the pieces, the placements, the fighters, and then readiness.
+/// `fast` waives the FIFTH and nothing else. The window is the FIRST, which
+/// is worth stating plainly because it is the condition this client spent
+/// months without — an exercise with no declared finish passed every check
+/// the client knew how to make, offered a live "Enter execution" button, and
+/// was then refused by the server with a 409 naming a field the console had
+/// no control for.
+///
+/// So: a waiver on the wrong condition is not a smaller bug. It is this bug.
+/// The order above is the server's and the test table mirrors it.
+///
+/// `pace` is an `Option` because an UNRECOGNISED pace is not a third pace. It
+/// requires the declaration. See `GamePace::parse`: reading a value this build
+/// has never heard of as `fast` waives a ceremony gate on a version skew.
+///
+/// A free function because the rule is pure and the app is not. Asking whether
+/// a window is complete requires a store, a map and a token, which is a rule
+/// that does not get asked.
+fn execution_gate_blockers(
+    window: &tfg::backend::TimeWindow,
+    pace: Option<tfg::backend::GamePace>,
+    pieces: usize,
+    unplaced: i64,
+    fighters: usize,
+    ready: usize,
+) -> Vec<String> {
+    let mut blockers = plan_gate_blockers(window, pieces, unplaced);
+    if fighters == 0 {
+        blockers.push("no exercise-side seats (step 2)".to_string());
+    } else if pace.map_or(true, tfg::backend::GamePace::requires_readiness_declaration)
+        && ready < fighters
+    {
+        blockers.push(format!("{} participant(s) not ready", fighters - ready));
+    }
+    blockers
+}
+
 /// Whether a release at `pos` should land on the map, given the modal panels
 /// currently on screen.
 ///
@@ -2228,6 +2304,17 @@ struct ShipApp {
     edit_target: String,
     edit_area: String,
     edit_map_tag: String,
+    /// Held-game edit form, the planning terms: pace and the planned window.
+    /// Same blank-means-unchanged contract as the six prose rows, and
+    /// deliberately not on the create form — see `edit_game_ui`.
+    edit_pace: String,
+    /// One date carries both ends of the real window; the exercise clock has
+    /// none of its own (see `assumed_hhmm_to_rfc3339`).
+    edit_actual_date: String,
+    edit_actual_start: String,
+    edit_actual_end: String,
+    edit_assumed_start: String,
+    edit_assumed_end: String,
     /// Register filter + assignment commander (step 3): hulls come
     /// from the synced store; each assign seats the picked commander.
     setup_reg_search: String,
@@ -6267,10 +6354,10 @@ impl ShipApp {
         // is the point of closure — so all four, not just the starts.
         let mut ends = Vec::new();
         for (label, value) in [
-            ("actual start", &d.actual_start),
-            ("assumed start", &d.assumed_start),
-            ("actual end", &d.actual_end),
-            ("assumed end", &d.assumed_end),
+            ("actual start", &d.window.actual_start),
+            ("assumed start", &d.window.assumed_start),
+            ("actual end", &d.window.actual_end),
+            ("assumed end", &d.window.assumed_end),
         ] {
             if let Some(v) = value {
                 ends.push(format!("{label} {v}"));
@@ -6280,14 +6367,34 @@ impl ShipApp {
             ui.label(egui::RichText::new(ends.join("  ·  ")).monospace().small());
             said_any = true;
         }
+        // The pace, echoed back because the edit form can set it and nothing
+        // else on screen would show what it became. `None` is an unknown
+        // value, which the gate treats as standard — saying so is more honest
+        // than printing a pace the server never sent.
+        ui.label(
+            egui::RichText::new(format!(
+                "pace {}",
+                d.pace.map_or("unknown — readiness applies", |p| p.wire())
+            ))
+            .weak()
+            .small(),
+        );
         if !said_any {
             ui.weak("Nothing written yet — the plan is authored while it is being written.");
         }
     }
 
-    /// Held-game edit form (admin ticket): six blank-means-unchanged
+    /// Held-game edit form (admin ticket): blank-means-unchanged
     /// rows; at least one filled to send. Empty area/map_tag clears
     /// (nullable columns); past planning the server refuses loudly.
+    ///
+    /// The pace and the planned window are authored HERE and not on
+    /// `setup_game_ui`'s create form, and that is a decision rather than an
+    /// oversight. Create authors a session that has a name; the window is a
+    /// planning decision made after people know when they can turn up, and
+    /// the edit form already exists for exactly that. A second authoring
+    /// surface for the same field would be two places to keep in step for a
+    /// defect that needs one.
     fn edit_game_ui(&mut self, ui: &mut egui::Ui, gid: i64) {
         ui.separator();
         ui.strong("Edit session (blank leaves alone)");
@@ -6316,6 +6423,46 @@ impl ShipApp {
             ui.text_edit_singleline(&mut self.edit_map_tag);
         });
         ui.weak("empty area / map tag clears the field.");
+        ui.separator();
+        ui.strong("Pace and planned window");
+        ui.horizontal(|ui| {
+            ui.label("pace:");
+            // Three states, and the first is the form's contract: `fast`
+            // waives the readiness declaration, so an untouched combo must
+            // mean "unchanged" and never a default somebody never chose.
+            egui::ComboBox::from_id_salt("edit-pace")
+                .selected_text(match self.edit_pace.trim() {
+                    "" => "leave alone".to_string(),
+                    raw => raw.to_string(),
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.edit_pace, String::new(), "leave alone");
+                    for p in [tfg::backend::GamePace::Standard, tfg::backend::GamePace::Fast] {
+                        ui.selectable_value(&mut self.edit_pace, p.wire().to_string(), p.wire());
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("real date:");
+            ui.text_edit_singleline(&mut self.edit_actual_date);
+        });
+        ui.horizontal(|ui| {
+            ui.label("real start:");
+            ui.text_edit_singleline(&mut self.edit_actual_start);
+        });
+        ui.horizontal(|ui| {
+            ui.label("real end:");
+            ui.text_edit_singleline(&mut self.edit_actual_end);
+        });
+        ui.horizontal(|ui| {
+            ui.label("exercise start:");
+            ui.text_edit_singleline(&mut self.edit_assumed_start);
+        });
+        ui.horizontal(|ui| {
+            ui.label("exercise end:");
+            ui.text_edit_singleline(&mut self.edit_assumed_end);
+        });
+        ui.weak("military times (0800). The exercise clock carries no date. A window crossing midnight is two sessions.");
         ui.horizontal(|ui| {
             if ui.small_button("save").clicked() {
                 self.save_game_edit(gid);
@@ -6324,6 +6471,72 @@ impl ShipApp {
                 self.edit_open = false;
             }
         });
+    }
+
+    /// The planned window the edit form's six drafts describe, converted to the
+    /// RFC3339 pairs Minos takes.
+    ///
+    /// Blank is an omission and stays silent, which is the form's contract. A
+    /// FILLED draft that will not convert is an error instead: dropping it
+    /// would save cleanly, and the execution gate would go on blocking for a
+    /// reason nothing on screen names.
+    ///
+    /// Ordering is checked with the same `hhmm_window_ok` the scenario
+    /// composer uses, for the same reason. A window that crosses midnight
+    /// cannot be written from here — one date carries both real ends, and the
+    /// exercise clock has a single base — so it is two sessions, and saying so
+    /// beats a 400 that names only the field.
+    fn edit_window(&self) -> Result<tfg::backend::TimeWindow, String> {
+        let mut w = tfg::backend::TimeWindow::default();
+        let (a0, a1) = (self.edit_actual_start.trim(), self.edit_actual_end.trim());
+        if !a0.is_empty() || !a1.is_empty() {
+            let date = self.edit_actual_date.trim();
+            if date.is_empty() {
+                return Err("the real window needs a date as well as times".to_string());
+            }
+            if a0.is_empty() || a1.is_empty() {
+                return Err("a window needs both a start and an end".to_string());
+            }
+            // Named per field, the way the scenario composer names its own:
+            // "the window is invalid" across three inputs sends the author
+            // hunting for the one that is wrong.
+            for hhmm in [a0, a1] {
+                if !tfg::backend::hhmm_ok(hhmm) {
+                    return Err(format!("{hhmm} is not a military time like 0800"));
+                }
+            }
+            if !tfg::backend::hhmm_window_ok(a0, a1) {
+                return Err(format!("{a0}-{a1} is not a window that runs forwards"));
+            }
+            // Both times are known good and the pair runs forwards, so the
+            // only thing left that `actual_to_rfc3339` can refuse is the date.
+            let (Some(s), Some(e)) = (
+                tfg::backend::actual_to_rfc3339(date, a0),
+                tfg::backend::actual_to_rfc3339(date, a1),
+            ) else {
+                return Err(format!("{date} is not a date like 2026-11-01"));
+            };
+            w.actual_start = Some(s);
+            w.actual_end = Some(e);
+        }
+        let (s0, s1) = (self.edit_assumed_start.trim(), self.edit_assumed_end.trim());
+        if !s0.is_empty() || !s1.is_empty() {
+            if s0.is_empty() || s1.is_empty() {
+                return Err("a window needs both a start and an end".to_string());
+            }
+            if !tfg::backend::hhmm_window_ok(s0, s1) {
+                return Err(format!("{s0}-{s1} is not a window that runs forwards"));
+            }
+            let (Some(s), Some(e)) = (
+                tfg::backend::assumed_hhmm_to_rfc3339(s0),
+                tfg::backend::assumed_hhmm_to_rfc3339(s1),
+            ) else {
+                return Err(format!("{s0}-{s1} is not a pair of military times"));
+            };
+            w.assumed_start = Some(s);
+            w.assumed_end = Some(e);
+        }
+        Ok(w)
     }
 
     /// Send the held-game edit off-thread. All-blank refuses before
@@ -6336,6 +6549,17 @@ impl ShipApp {
             let t = s.trim();
             if t.is_empty() { None } else { Some(t.to_string()) }
         };
+        // The combo holds exactly three states — leave alone, standard, fast
+        // — so there is nothing here to validate that the widget did not, and
+        // `parse("")` landing on `None` IS the "leave alone" case.
+        let pace = tfg::backend::GamePace::parse(self.edit_pace.trim());
+        let window = match self.edit_window() {
+            Ok(w) => w,
+            Err(problem) => {
+                self.users_status = problem;
+                return;
+            }
+        };
         let upd = tfg::backend::GameUpdate {
             name: opt(&self.edit_name.clone()),
             description: opt(&self.edit_description.clone()),
@@ -6343,13 +6567,20 @@ impl ShipApp {
             target: opt(&self.edit_target.clone()),
             area: opt(&self.edit_area.clone()),
             map_tag: opt(&self.edit_map_tag.clone()),
+            pace,
+            window,
         };
+        // The check counts every field the form owns now, not only the six
+        // prose rows: a window authored on its own is the whole point of the
+        // form, and it must not be refused as "nothing filled".
         if upd.name.is_none()
             && upd.description.is_none()
             && upd.purpose.is_none()
             && upd.target.is_none()
             && upd.area.is_none()
             && upd.map_tag.is_none()
+            && upd.pace.is_none()
+            && upd.window.is_empty()
         {
             self.users_status = "fill at least one field to update".to_string();
             return;
@@ -7495,48 +7726,77 @@ impl ShipApp {
     }
 
     /// Readiness checklist: every blocker named, empty means clear.
-    /// Counts come from the server's arithmetic and the roster; a
-    /// gapped roster falls back to the caller's own seat and hulls.
+    ///
+    /// A formatter over [`execution_gate_blockers`]. The rule lives there and
+    /// in no other place, so the checklist cannot drift from the gate it is
+    /// predicting. What is left here is the two things the function cannot be
+    /// told: the names behind the readiness count, and the roster-gap
+    /// fallback, where the participant arithmetic cannot run at all.
     fn setup_checklist(&self) -> Vec<String> {
-        let mut blockers = Vec::new();
+        let window = self.held_window();
+        let pace = self.held_pace();
         let pieces = self.users_gunits.len().max(self.commanded_hulls.len());
-        if pieces == 0 {
-            blockers.push("no pieces assigned yet (step 3)".to_string());
-        }
-        if self.placement_unplaced > 0 {
-            blockers.push(format!(
-                "{} unit(s) are not placed",
-                self.placement_unplaced
-            ));
-        }
         if self.roster_gap {
-            match self.own_roster_row() {
-                Some(p) if p.judge => {}
-                Some(p) if p.ready => {}
-                Some(_) => blockers.push("you have not declared readiness".to_string()),
-                None => blockers.push(
-                    "you hold no seat — join with the room key (step 1)".to_string(),
-                ),
+            // A gapped roster means this client cannot count anybody, so the
+            // crew conditions are replaced by the one thing it CAN see: the
+            // caller's own seat. The window and the map still stand, because
+            // neither is a fact about the roster.
+            let mut blockers = plan_gate_blockers(&window, pieces, self.placement_unplaced);
+            if pace.map_or(true, tfg::backend::GamePace::requires_readiness_declaration) {
+                match self.own_roster_row() {
+                    Some(p) if p.judge => {}
+                    Some(p) if p.ready => {}
+                    Some(_) => blockers.push("you have not declared readiness".to_string()),
+                    None => blockers.push(
+                        "you hold no seat — join with the room key (step 1)".to_string(),
+                    ),
+                }
             }
-        } else {
-            let (side, ready) = self.setup_gate_counts();
-            if side == 0 {
-                blockers.push("no exercise-side seats (step 2)".to_string());
-            } else if ready < side {
-                let waiting: Vec<String> = self
-                    .users_roster
-                    .iter()
-                    .filter(|p| !self.users_is_judge(p) && !p.ready)
-                    .map(|p| p.user_name.clone())
-                    .collect();
-                blockers.push(format!(
-                    "{} participant(s) not ready: {}",
-                    side - ready,
-                    waiting.join(", ")
-                ));
+            return blockers;
+        }
+        let (fighters, ready) = self.setup_gate_counts();
+        let mut blockers = execution_gate_blockers(
+            &window,
+            pace,
+            pieces,
+            self.placement_unplaced,
+            fighters,
+            ready,
+        );
+        // The names behind the count. Presentation on top of the rule rather
+        // than a second derivation of it — "3 participant(s) not ready" with
+        // nobody named sends the operator to the roster to find three people.
+        let waiting: Vec<String> = self
+            .users_roster
+            .iter()
+            .filter(|p| !self.users_is_judge(p) && !p.ready)
+            .map(|p| p.user_name.clone())
+            .collect();
+        if !waiting.is_empty() {
+            if let Some(b) = blockers.iter_mut().find(|b| b.ends_with(NOT_READY)) {
+                b.push_str(": ");
+                b.push_str(&waiting.join(", "));
             }
         }
         blockers
+    }
+
+    /// The held game's planned window, off the last detail read.
+    ///
+    /// `None` before the first bundle lands reads as an incomplete window and
+    /// an unknown pace, and both fail closed: a gate with no detail behind it
+    /// says the window is missing rather than waving the advance through.
+    fn held_window(&self) -> tfg::backend::TimeWindow {
+        self.held_detail
+            .as_ref()
+            .map(|d| d.window.clone())
+            .unwrap_or_default()
+    }
+
+    /// The held game's pace, or `None` when it is unknown. `None` requires the
+    /// readiness declaration — see [`tfg::backend::GamePace::parse`].
+    fn held_pace(&self) -> Option<tfg::backend::GamePace> {
+        self.held_detail.as_ref().and_then(|d| d.pace)
     }
 
     /// Exercise setup panel (#79): Planning's whole UI in one place —
@@ -15153,6 +15413,12 @@ fn main() -> Result<(), String> {
                 edit_target: String::new(),
                 edit_area: String::new(),
                 edit_map_tag: String::new(),
+                edit_pace: String::new(),
+                edit_actual_date: String::new(),
+                edit_actual_start: String::new(),
+                edit_actual_end: String::new(),
+                edit_assumed_start: String::new(),
+                edit_assumed_end: String::new(),
                 setup_reg_search: String::new(),
                 fleet_query: String::new(),
                 drill_branch: None,
@@ -15367,6 +15633,195 @@ fn main() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- the execution gate -------------------------------------------------
+    //
+    // The client used to list four of the server's five conditions and had no
+    // way to author the fifth, so "0 outstanding" could not mean what it said:
+    // an exercise with a force, a placement and nobody ready still showed
+    // clear, and the server refused the advance with a 409 naming none of it.
+    //
+    // The table mirrors the server's own, so a row added there has a row to be
+    // added here.
+
+    /// A window with both ends declared, which is the fifth condition's whole
+    /// requirement.
+    fn window_set() -> tfg::backend::TimeWindow {
+        tfg::backend::TimeWindow {
+            actual_start: Some("2026-11-01T08:00:00Z".into()),
+            actual_end: Some("2026-11-01T18:00:00Z".into()),
+            assumed_start: Some("2000-01-01T06:00:00Z".into()),
+            assumed_end: Some("2000-01-01T16:00:00Z".into()),
+        }
+    }
+
+    /// A window the gate cannot accept: no declared finish, which is the
+    /// ordinary state of a draft because the backend supplies no default.
+    fn no_window() -> tfg::backend::TimeWindow {
+        Default::default()
+    }
+
+    struct Row {
+        name: &'static str,
+        window: tfg::backend::TimeWindow,
+        pace: Option<tfg::backend::GamePace>,
+        pieces: usize,
+        unplaced: i64,
+        fighters: usize,
+        ready: usize,
+        want: &'static [&'static str],
+        why: &'static str,
+    }
+
+    /// One row per condition the server checks, asserted as a BLANKER LIST
+    /// rather than a boolean so the wording is pinned with the rule — a gate
+    /// that fires on the right conditions while saying nothing useful is
+    /// still the failure this fix exists to end.
+    ///
+    /// `unplaced` is left at zero unless it is the point, because zero is
+    /// what the field means when nothing is unplaced, and a case that had to
+    /// set it to pass would be asserting the zero value instead of the rule.
+    #[test]
+    fn the_execution_gate_is_five_conditions_and_fast_waives_one() {
+        let rows = [
+            Row {
+                name: "nothing assigned at all",
+                window: no_window(),
+                pace: Some(tfg::backend::GamePace::Standard),
+                pieces: 0,
+                unplaced: 0,
+                fighters: 0,
+                ready: 0,
+                want: &[
+                    "the planned window is incomplete (both the real end and the exercise end are required)",
+                    "no pieces assigned yet (step 3)",
+                    "no exercise-side seats (step 2)",
+                ],
+                why: "nothing to manoeuvre, no clock to run it on, nobody to command it",
+            },
+            Row {
+                name: "fast with the window missing and nobody ready",
+                window: no_window(),
+                pace: Some(tfg::backend::GamePace::Fast),
+                pieces: 1,
+                unplaced: 0,
+                fighters: 3,
+                ready: 0,
+                want: &[
+                    "the planned window is incomplete (both the real end and the exercise end are required)",
+                ],
+                why: "fast waives the readiness declaration and NOTHING else — the window is still a refusal",
+            },
+            Row {
+                name: "fast, window set, nobody ready",
+                window: window_set(),
+                pace: Some(tfg::backend::GamePace::Fast),
+                pieces: 1,
+                unplaced: 0,
+                fighters: 3,
+                ready: 0,
+                want: &[],
+                why: "the regression row: this is the exercise fast exists for, and the client used to block it",
+            },
+            Row {
+                name: "standard with the window missing",
+                window: no_window(),
+                pace: Some(tfg::backend::GamePace::Standard),
+                pieces: 1,
+                unplaced: 0,
+                fighters: 2,
+                ready: 2,
+                want: &[
+                    "the planned window is incomplete (both the real end and the exercise end are required)",
+                ],
+                why: "a ready crew does not buy an exercise with no declared finish",
+            },
+            Row {
+                name: "everything set and everyone ready",
+                window: window_set(),
+                pace: Some(tfg::backend::GamePace::Standard),
+                pieces: 1,
+                unplaced: 0,
+                fighters: 2,
+                ready: 2,
+                want: &[],
+                why: "the only state a game may leave preparation in",
+            },
+            Row {
+                name: "an unknown pace is not a fast pace",
+                window: window_set(),
+                pace: None,
+                pieces: 1,
+                unplaced: 0,
+                fighters: 1,
+                ready: 0,
+                want: &["1 participant(s) not ready"],
+                why: "reading an unrecognised pace as fast would start the exercise on a version skew",
+            },
+            Row {
+                name: "one hull of five unplaced",
+                window: window_set(),
+                pace: Some(tfg::backend::GamePace::Fast),
+                pieces: 5,
+                unplaced: 1,
+                fighters: 1,
+                ready: 1,
+                want: &["1 unit(s) are not placed"],
+                why: "a placed hull out of five satisfies the at-least-one-piece rule and still strands the other four",
+            },
+            Row {
+                name: "more pieces than commanders is fine",
+                window: window_set(),
+                pace: Some(tfg::backend::GamePace::Standard),
+                pieces: 5,
+                unplaced: 0,
+                fighters: 1,
+                ready: 1,
+                want: &[],
+                why: "one commando may hold several hulls; the schema does not forbid it",
+            },
+        ];
+        for r in &rows {
+            let got = execution_gate_blockers(
+                &r.window, r.pace, r.pieces, r.unplaced, r.fighters, r.ready,
+            );
+            assert_eq!(
+                got.iter().map(String::as_str).collect::<Vec<_>>(),
+                r.want,
+                "{}: {}",
+                r.name,
+                r.why
+            );
+        }
+    }
+
+    /// The plan conditions stand on their own, because a client whose roster
+    /// read came back staff-only can still see the window and the placement
+    /// count. Dropping them there would leave the gate blocked for a reason
+    /// the checklist never mentions.
+    #[test]
+    fn the_window_and_the_map_need_no_roster_to_be_reported() {
+        assert_eq!(plan_gate_blockers(&no_window(), 1, 0).len(), 1);
+        assert_eq!(plan_gate_blockers(&window_set(), 1, 0).len(), 0);
+        assert_eq!(plan_gate_blockers(&window_set(), 0, 2).len(), 2);
+    }
+
+    /// The names are presentation hung off the count, matched by the tail the
+    /// participant condition writes. Both halves are named, so if the wording
+    /// moves, this fails instead of quietly dropping the names.
+    #[test]
+    fn the_readiness_blocker_is_the_one_the_checklist_extends() {
+        let blockers = execution_gate_blockers(
+            &window_set(),
+            Some(tfg::backend::GamePace::Standard),
+            1,
+            0,
+            3,
+            1,
+        );
+        assert_eq!(blockers, vec!["2 participant(s) not ready"]);
+        assert!(blockers[0].ends_with(NOT_READY));
+    }
 
     // -- the composer's draft ---------------------------------------------
     //

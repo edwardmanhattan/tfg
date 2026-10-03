@@ -117,6 +117,40 @@ wrong in several places.
   the scenario *with* its steps; there is no step-list route, and no
   endpoint returns the current step to anyone.
 
+## The defect that mattered most, and what is left of it
+
+Found during this overhaul, and it is the largest thing in the log.
+
+**The console could not start an exercise. Any exercise.** `GameReadiness.CanExecute`
+(`internal/models/game_participant.go:179`) needs a planned window —
+`WindowSet` is `actual_end IS NOT NULL AND assumed_end IS NOT NULL`, read in
+the same statement as the other four values, with nothing defaulting either
+end. The only writers are `POST /games` and `PATCH /games/{id}`. The client
+sent neither — and in fact had **no write path for any of the four window
+fields**, start or end. `GameUpdate` was six `Option<String>` text fields.
+
+So the button behaviour was worse than a dead one. `zone_ready_body` gates on
+`clear = blockers.is_empty()`, and the window was not among the blockers. Once
+the four conditions the client *did* know about were satisfied, the button
+**enabled**, the operator clicked, and the server refused with a 409 naming a
+field the console had no control for. The checklist reported "0 outstanding"
+and was confidently wrong.
+
+That makes three client re-derivations of one server rule now known to drift,
+and the honest reading is structural rather than per-field: pace was the
+fourth. The client's copy has never agreed with the server's on anything more
+than the two counts the server hands it.
+
+Now: window and pace are authorable on the edit form, and the gate is ONE
+function (`execution_gate_blockers`) that `setup_checklist` formats rather
+than reimplements.
+
+Still open, and it is the real fix: **the server should publish the gate**
+rather than the client recomputing it. `ReadinessCounts` already returns all
+five values from one statement; exposing them behind a route is a projection,
+not a second implementation. Two repos, and it was deliberately not started
+before the console could start an exercise at all.
+
 ## Not built yet, in the order it should be
 
 Ordered so each unit is verifiable on its own and each one shrinks the risk of

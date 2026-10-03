@@ -723,20 +723,34 @@ impl MinosMaster {
             area: absent_when_unset("area"),
             map_tag: absent_when_unset("map_tag"),
             overlay_text: absent_when_unset("overlay_text"),
-            actual_start: v["actual_start"].as_str().map(|s| s.to_string()),
-            assumed_start: v["assumed_start"].as_str().map(|s| s.to_string()),
-            actual_end: v["actual_end"].as_str().map(|s| s.to_string()),
-            assumed_end: v["assumed_end"].as_str().map(|s| s.to_string()),
+            window: Self::parse_window(v),
+            pace: v["pace"].as_str().and_then(GamePace::parse),
             time_factor: v["time_factor"].as_f64().unwrap_or(0.0),
             room_key: v["room_key"].as_str().map(|s| s.to_string()),
         }
     }
 
+    /// The four clock fields read as one window.
+    ///
+    /// Absent is the wire's own word for unset — Minos omits rather than
+    /// nulls — so a missing key and an explicit null read alike. That is the
+    /// right answer for both: neither is a value, and neither is the empty
+    /// string, which would be a window that ran for no time at all.
+    fn parse_window(v: &serde_json::Value) -> TimeWindow {
+        let t = |key: &str| v[key].as_str().map(|s| s.to_string());
+        TimeWindow {
+            actual_start: t("actual_start"),
+            actual_end: t("actual_end"),
+            assumed_start: t("assumed_start"),
+            assumed_end: t("assumed_end"),
+        }
+    }
+
     /// Partial game edit (admin ticket): the six text fields the
-    /// create form owns — absent leaves alone, empty area/map_tag
-    /// clears (nullable columns). Admin-granted, planning-only; the
-    /// answer is the re-read detail, applied like any bundle detail.
-    /// Time fields stay server-side in this slice.
+    /// create form owns plus pace and the planned window — absent leaves
+    /// alone, empty area/map_tag clears (nullable columns).
+    /// Admin-granted, planning-only; the answer is the re-read detail,
+    /// applied like any bundle detail.
     pub fn update_game(
         &self,
         token: &str,
@@ -755,6 +769,21 @@ impl MinosMaster {
         text("target", &upd.target);
         text("area", &upd.area);
         text("map_tag", &upd.map_tag);
+        // Each clock key on its own, because the server merges them one at a
+        // time: a PATCH that moves only `actual_end` is checked against the
+        // start already ON THE GAME. Writing the pair together would be the
+        // same request, and writing only the filled one is what lets an
+        // operator fix one end without restating the other.
+        text("actual_start", &upd.window.actual_start);
+        text("actual_end", &upd.window.actual_end);
+        text("assumed_start", &upd.window.assumed_start);
+        text("assumed_end", &upd.window.assumed_end);
+        if let Some(p) = upd.pace {
+            body.insert(
+                "pace".to_string(),
+                serde_json::Value::String(p.wire().to_string()),
+            );
+        }
         let data = self.patch(
             token,
             &format!("/games/{game_id}"),
@@ -1992,8 +2021,92 @@ pub struct GameRow {
     pub state: String,
 }
 
-/// Partial game edit: the six text fields the create form owns.
-/// None means leave alone (absent on the wire, never null).
+/// A game's planned window: two clocks, each with a start and an end.
+///
+/// Incomplete is a real state and not a parse failure. The backend supplies
+/// NO default for either end — the window is the Game Master's declaration of
+/// when the exercise finishes — so a draft holding a start and no end is legal
+/// all the way to the transition, which is where the gate refuses it. Four
+/// independent options rather than two pairs is what lets an unfinished window
+/// be written without pretending the finished half is whole.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TimeWindow {
+    /// Real-world window, RFC3339 as Minos speaks it.
+    pub actual_start: Option<String>,
+    pub actual_end: Option<String>,
+    /// Exercise clock. RFC3339 too, but only its TIME is meaningful; the date
+    /// is a fixed base because nothing compares the two clocks.
+    pub assumed_start: Option<String>,
+    pub assumed_end: Option<String>,
+}
+
+impl TimeWindow {
+    /// Whether the window can carry the exercise: both ends declared.
+    ///
+    /// The only question about a window this client has to ask, because
+    /// `validateTimeBase` has already settled the rest — each end is compared
+    /// with its own start and nothing compares the two clocks — so a window
+    /// with both ends present is either valid or a rejection that reached the
+    /// author before this read did.
+    pub fn is_complete(&self) -> bool {
+        self.actual_end.is_some() && self.assumed_end.is_some()
+    }
+
+    /// Whether the window says nothing at all. The edit form's "leave alone":
+    /// six blank fields must not become a write that blanks a window somebody
+    /// else authored.
+    pub fn is_empty(&self) -> bool {
+        self.actual_start.is_none()
+            && self.actual_end.is_none()
+            && self.assumed_start.is_none()
+            && self.assumed_end.is_none()
+    }
+}
+
+/// How much ceremony an exercise carries, which is a different question from
+/// how fast its clock runs. Two values on the wire, and the second one buys
+/// exactly one thing: the readiness declaration is waived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GamePace {
+    Standard,
+    Fast,
+}
+
+impl GamePace {
+    /// Whether every non-judge participant must declare readiness before the
+    /// exercise may start. The one condition `fast` waives, and the only thing
+    /// this flag is allowed to switch off — the window, the pieces, the
+    /// placements and the fighters all still apply under it.
+    pub fn requires_readiness_declaration(self) -> bool {
+        match self {
+            GamePace::Standard => true,
+            GamePace::Fast => false,
+        }
+    }
+
+    /// The wire spelling. Read back by [`GamePace::parse`], so the two
+    /// directions are one table rather than a match each way that can drift.
+    pub fn wire(self) -> &'static str {
+        match self {
+            GamePace::Standard => "standard",
+            GamePace::Fast => "fast",
+        }
+    }
+
+    /// A pace off the wire, or `None` for a value this build has not heard of.
+    /// `None` is not a third pace — see [`GameDetail::pace`].
+    pub fn parse(s: &str) -> Option<GamePace> {
+        match s {
+            "standard" => Some(GamePace::Standard),
+            "fast" => Some(GamePace::Fast),
+            _ => None,
+        }
+    }
+}
+
+/// Partial game edit: the six text fields the create form owns, plus pace
+/// and the planned window. None means leave alone (absent on the wire, never
+/// null).
 #[derive(Debug, Clone, Default)]
 pub struct GameUpdate {
     pub name: Option<String>,
@@ -2002,6 +2115,11 @@ pub struct GameUpdate {
     pub target: Option<String>,
     pub area: Option<String>,
     pub map_tag: Option<String>,
+    /// Absent leaves the pace alone. An operator who never touched the combo
+    /// has not chosen a pace, and defaulting one here would silently re-pace
+    /// a game every time somebody renamed it.
+    pub pace: Option<GamePace>,
+    pub window: TimeWindow,
 }
 
 /// One game's authoritative projection (H1): the detail read the held
@@ -2031,10 +2149,20 @@ pub struct GameDetail {
     /// Never withheld; hidden at execution by a rule the CLIENT applies, from
     /// the state it already has. Absent means unset.
     pub overlay_text: Option<String>,
-    pub actual_end: Option<String>,
-    pub assumed_end: Option<String>,
-    pub actual_start: Option<String>,
-    pub assumed_start: Option<String>,
+    /// The planned window, both clocks. Incomplete is the ordinary state of a
+    /// draft, and it is the reason the execution transition is refused, so it
+    /// is carried as read rather than filled in with a default nobody chose.
+    pub window: TimeWindow,
+    /// The exercise's pace, off the wire.
+    ///
+    /// `None` is an UNRECOGNISED value, and it means the ceremony applies. An
+    /// unknown value is not a pace at all, so there is nothing to infer from
+    /// it. What decides the direction is the cost of being wrong. Reading it
+    /// as `fast` waives the readiness declaration on the strength of a version
+    /// skew, and an exercise that starts while half the exercise side is still
+    /// reading the brief is not a mistake you can undo. A gate that turns out
+    /// to be inconvenient is only inconvenient.
+    pub pace: Option<GamePace>,
     pub time_factor: f64,
     /// What personnel type to enter the room. Null until the game
     /// enters preparation — a planning game has no room to enter —
@@ -2514,6 +2642,84 @@ pub fn hhmm_window_ok(start: &str, end: &str) -> bool {
     hhmm_ok(start) && hhmm_ok(end) && start < end
 }
 
+/// The date the exercise clock is stamped with, and it is NOT a real date.
+///
+/// RFC3339 has no time-only form, and `validateTimeBase` compares the assumed
+/// clock ONLY with itself. Nothing in the contract compares the two clocks, so
+/// the date half of the pair is free and has one job: be the SAME on both
+/// ends. One constant does that, and `assumed_end > assumed_start` then holds
+/// exactly when `hhmm_window_ok` says the two `HHMM`s run forwards, which is
+/// the guarantee the operator was given when they typed them.
+///
+/// One consequence worth stating plainly. An assumed window that crosses
+/// midnight, 2300 to 0100, is REFUSED, because on one date 01:00 is before
+/// 23:00. `hhmm_window_ok` already forbids it for scenario steps, and
+/// forbidding it here too keeps one rule for the whole console instead of a
+/// client that accepts a window the server will reject. An overnight exercise
+/// is two steps, which is what the scenario composer has always taught.
+const ASSUMED_CLOCK_BASE_DATE: &str = "2000-01-01";
+
+/// The exercise clock's `HHMM` as Minos speaks it. The date is a fixed base
+/// because `validateTimeBase` compares the assumed clock only with itself.
+///
+/// Validated with [`hhmm_ok`] rather than a second, laxer parser, so the two
+/// authoring surfaces in this console cannot disagree about what a military
+/// time is.
+pub fn assumed_hhmm_to_rfc3339(hhmm: &str) -> Option<String> {
+    if !hhmm_ok(hhmm) {
+        return None;
+    }
+    Some(format!(
+        "{ASSUMED_CLOCK_BASE_DATE}T{}:{}:00Z",
+        &hhmm[..2],
+        &hhmm[2..]
+    ))
+}
+
+/// A real-world date plus `HHMM` as Minos speaks it.
+///
+/// The date is typed, not guessed: the real clock is the one an operator has
+/// to look up, and a default date would put the exercise on the wrong day
+/// while every local check passed.
+pub fn actual_to_rfc3339(date: &str, hhmm: &str) -> Option<String> {
+    if !date_ok(date) || !hhmm_ok(hhmm) {
+        return None;
+    }
+    Some(format!("{date}T{}:{}:00Z", &hhmm[..2], &hhmm[2..]))
+}
+
+/// Whether `s` is a calendar date the backend will accept: `YYYY-MM-DD`,
+/// real day for real month.
+///
+/// Strict for the same reason [`hhmm_ok`] is. Go's `time.Time` refuses an
+/// out-of-range day outright, so `2026-02-30` arrives as a 400 from the field
+/// rather than as something the author sees while typing. Leap years are
+/// counted because a check that waved 29 February through three years out of
+/// four would be worse than no check at all — it would look like it worked.
+fn date_ok(s: &str) -> bool {
+    if s.len() != 10
+        || !s
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit())
+    {
+        return false;
+    }
+    let part = |a: usize, b: usize| s[a..b].parse::<u32>().ok();
+    let (Some(y), Some(m), Some(d)) = (part(0, 4), part(5, 7), part(8, 10)) else {
+        return false;
+    };
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&d)
+}
+
 /// One game roster row: who holds which seat, and on which side.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Participant {
@@ -2782,7 +2988,7 @@ mod scenario_tests {
 
 #[cfg(test)]
 mod game_prose_tests {
-    use super::{GameDetail, MinosMaster};
+    use super::{GameDetail, MinosMaster, TimeWindow};
 
     fn detail(v: serde_json::Value) -> GameDetail {
         MinosMaster::parse_game_detail(&v, 7)
@@ -2873,7 +3079,9 @@ mod game_prose_tests {
 
     /// The ends ride the detail too, and comparing them with the realised
     /// finish is the whole point of closure — so the read has to carry all
-    /// four, not just the two starts.
+    /// four, not just the two starts. They arrive as one `TimeWindow` rather
+    /// than four loose fields because the gate asks one question of them and
+    /// a question about half a window is not one anybody asked.
     #[test]
     fn the_ends_ride_alongside_the_starts() {
         let d = detail(serde_json::json!({
@@ -2883,8 +3091,288 @@ mod game_prose_tests {
             "actual_end": "2026-10-02T16:30:00Z",
             "assumed_end": "2026-10-02T1630"
         }));
-        assert_eq!(d.actual_start.as_deref(), Some("2026-10-01T08:00:00Z"));
-        assert_eq!(d.actual_end.as_deref(), Some("2026-10-02T16:30:00Z"));
-        assert_eq!(d.assumed_end.as_deref(), Some("2026-10-02T1630"));
+        assert_eq!(
+            d.window,
+            TimeWindow {
+                actual_start: Some("2026-10-01T08:00:00Z".into()),
+                actual_end: Some("2026-10-02T16:30:00Z".into()),
+                assumed_start: Some("2026-10-01T0600".into()),
+                assumed_end: Some("2026-10-02T1630".into()),
+            }
+        );
+        assert!(d.window.is_complete());
+    }
+
+    /// A game with no planned window is the NORMAL state of a draft, and the
+    /// client cannot invent the missing end — the backend supplies no default
+    /// because the window is the Game Master's declaration of when the
+    /// exercise finishes. So absence reads as an all-`None` window, and the
+    /// gate refuses it, rather than as an error or a guessed finish.
+    #[test]
+    fn a_detail_with_no_window_reads_as_an_incomplete_one() {
+        let d = detail(serde_json::json!({
+            "id": 7, "name": "n", "mode": "maneuver", "state": "planning"
+        }));
+        assert_eq!(d.window, TimeWindow::default());
+        assert!(d.window.is_empty());
+        assert!(!d.window.is_complete());
+    }
+}
+
+#[cfg(test)]
+mod window_authoring_tests {
+    use super::{
+        GamePace, GameUpdate, MinosMaster, TimeWindow, actual_to_rfc3339,
+        assumed_hhmm_to_rfc3339,
+    };
+
+    /// The exercise clock has no date to speak of, so the conversion supplies
+    /// a base — and it must be the SAME base on both ends, because that is
+    /// the only thing making `assumed_end > assumed_start` hold. One constant
+    /// is the whole guarantee, which is why these two are asserted together.
+    #[test]
+    fn the_assumed_clock_uses_one_base_date_on_both_ends() {
+        let start = assumed_hhmm_to_rfc3339("0600").expect("0600 is a military time");
+        let end = assumed_hhmm_to_rfc3339("1630").expect("1630 is a military time");
+        assert_eq!(start, "2000-01-01T06:00:00Z");
+        assert_eq!(end, "2000-01-01T16:30:00Z");
+        assert_eq!(
+            start[..10],
+            end[..10],
+            "the base date has to match or the ordering the author was promised is a fiction"
+        );
+        assert!(
+            end > start,
+            "and the ordering survives the trip through RFC3339"
+        );
+    }
+
+    /// What `hhmm_ok` refuses, this refuses — the two are one rule, so a
+    /// value the scenario composer will not send is not one the exercise form
+    /// sends either.
+    #[test]
+    fn the_assumed_clock_reuses_the_scenarios_military_time_rule() {
+        for bad in ["", "900", "2400", "10:00", "1060"] {
+            assert_eq!(
+                assumed_hhmm_to_rfc3339(bad),
+                None,
+                "{bad:?} is not a military time"
+            );
+        }
+    }
+
+    /// The real window is a date and two times, and BOTH halves are checked:
+    /// a well-formed time on a nonsense date is still a request the field
+    /// rejects, which is the failure this check exists to catch.
+    #[test]
+    fn the_real_window_refuses_a_bad_date_or_a_bad_time() {
+        assert_eq!(
+            actual_to_rfc3339("2026-11-01", "0800").as_deref(),
+            Some("2026-11-01T08:00:00Z")
+        );
+        for bad_date in [
+            "",
+            "2026-11",
+            "01/11/2026",
+            "2026-13-01",
+            "2026-00-10",
+            "2026-02-30",
+            "1900-02-29",
+            "2026-11-31",
+        ] {
+            assert_eq!(
+                actual_to_rfc3339(bad_date, "0800"),
+                None,
+                "{bad_date:?} is not a calendar date"
+            );
+        }
+        // And the leap rule is real in both directions, because a check that
+        // only ever says no is indistinguishable from no check.
+        assert!(actual_to_rfc3339("2024-02-29", "0800").is_some());
+        assert!(actual_to_rfc3339("2000-02-29", "0800").is_some());
+        assert!(actual_to_rfc3339("2100-02-29", "0800").is_none());
+
+        for bad_time in ["", "800", "2400", "08:00"] {
+            assert_eq!(
+                actual_to_rfc3339("2026-11-01", bad_time),
+                None,
+                "{bad_time:?} is not a military time"
+            );
+        }
+    }
+
+    /// Both wire values parse, and nothing else does. The refusal is the point
+    /// of the test: an unrecognised pace is the case that decides whether the
+    /// readiness declaration applies, so it has to be a distinct answer rather
+    /// than a silently mapped default.
+    #[test]
+    fn a_pace_parses_the_two_wire_values_and_nothing_else() {
+        assert_eq!(GamePace::parse("standard"), Some(GamePace::Standard));
+        assert_eq!(GamePace::parse("fast"), Some(GamePace::Fast));
+        for bad in ["", "FAST", "Standard", "quick", "standard ", "1"] {
+            assert_eq!(GamePace::parse(bad), None, "{bad:?} is not a pace");
+        }
+    }
+
+    /// The direction that matters: an unknown pace must land on the value
+    /// that REQUIRES the declaration. Guessing the other way would waive a
+    /// ceremony gate on a version skew, and the failure is an exercise
+    /// starting while half the exercise side is still reading the brief.
+    #[test]
+    fn an_unknown_pace_fails_closed_onto_the_ceremony() {
+        let unknown = GamePace::parse("turbo");
+        assert!(unknown.is_none(), "an unknown pace is not a pace at all");
+        assert!(
+            GamePace::Standard.requires_readiness_declaration(),
+            "standard is the ceremony-applying value, so an unknown one falls here"
+        );
+        assert!(!GamePace::Fast.requires_readiness_declaration());
+    }
+
+    /// Wire spelling round-trips through the parser, because the two are the
+    /// only place the vocabulary lives. A `wire` that drifts from `parse` is a
+    /// write the server rejects with a 422.
+    #[test]
+    fn a_written_pace_reads_back_as_itself() {
+        for p in [GamePace::Standard, GamePace::Fast] {
+            assert_eq!(GamePace::parse(p.wire()), Some(p));
+        }
+    }
+
+    /// The window's own two questions. `is_complete` reads the two ENDS and
+    /// nothing else, because that is what the gate reads — and the fact that a
+    /// window with both ends but no starts passes is the server's own rule,
+    /// not a shortcut: `validateTimeBase` compares each end against the start
+    /// ALREADY ON THE GAME, so a client that demanded a start here would
+    /// refuse to send a PATCH the server is happy to take.
+    #[test]
+    fn a_window_is_complete_when_both_ends_are_declared() {
+        let ends_only = TimeWindow {
+            actual_end: Some("2026-11-01T18:00:00Z".into()),
+            assumed_end: Some("2000-01-01T16:00:00Z".into()),
+            ..Default::default()
+        };
+        assert!(ends_only.is_complete());
+        assert!(!ends_only.is_empty(), "it says something even without starts");
+
+        let started_only = TimeWindow {
+            actual_start: Some("2026-11-01T08:00:00Z".into()),
+            assumed_start: Some("2000-01-01T06:00:00Z".into()),
+            ..Default::default()
+        };
+        assert!(!started_only.is_complete(), "a start is not an end");
+
+        let one_end = TimeWindow {
+            actual_end: Some("2026-11-01T18:00:00Z".into()),
+            ..Default::default()
+        };
+        assert!(!one_end.is_complete(), "both ends or neither");
+
+        let finished = TimeWindow {
+            actual_start: Some("2026-11-01T08:00:00Z".into()),
+            ..ends_only.clone()
+        };
+        assert!(finished.is_complete());
+        assert!(!finished.is_empty());
+        assert!(TimeWindow::default().is_empty());
+    }
+
+    /// The bug this whole slice exists for was a PAYLOAD bug, so the payload
+    /// is what gets asserted: against a real socket, not against the type.
+    ///
+    /// Two things have to be true at once and neither implies the other. The
+    /// four window keys and `pace` reach the wire at all, which is what was
+    /// missing. And a key nobody filled is ABSENT rather than null, because
+    /// the backend merges a present key into the game and omits an absent one,
+    /// so a null would be a write the author did not ask for.
+    #[test]
+    fn update_game_writes_the_window_and_omits_what_was_not_filled() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tap = seen.clone();
+        let server = tiny_http::Server::http("127.0.0.1:18096").expect("bind test port");
+        std::thread::spawn(move || {
+            for mut rq in server.incoming_requests().take(2) {
+                let mut body = String::new();
+                rq.as_reader()
+                    .read_to_string(&mut body)
+                    .unwrap_or_default();
+                let sent = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+                tap.lock().expect("tap").push(sent.clone());
+                // The stub answers with what it was sent, the way the real
+                // PATCH does: the answer is a re-read of the merged game.
+                let mut data = sent.as_object().cloned().unwrap_or_default();
+                data.insert("id".into(), serde_json::json!(3));
+                data.insert("name".into(), serde_json::json!("n"));
+                data.insert("mode".into(), serde_json::json!("maneuver"));
+                data.insert("state".into(), serde_json::json!("planning"));
+                let envelope = serde_json::json!({ "status_code": 200, "data": data });
+                let _ = rq.respond(tiny_http::Response::from_string(envelope.to_string()));
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18096/api/v1").expect("client builds");
+
+        let full = master
+            .update_game(
+                "AT",
+                3,
+                &GameUpdate {
+                    name: Some("Operasi Batu Malang".into()),
+                    pace: Some(GamePace::Fast),
+                    window: TimeWindow {
+                        actual_start: Some("2026-11-01T08:00:00Z".into()),
+                        actual_end: Some("2026-11-01T18:00:00Z".into()),
+                        assumed_start: Some("2000-01-01T06:00:00Z".into()),
+                        assumed_end: Some("2000-01-01T16:00:00Z".into()),
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("update");
+        assert_eq!(full.pace, Some(GamePace::Fast), "the answer re-reads the pace");
+
+        let one_end = master
+            .update_game(
+                "AT",
+                3,
+                &GameUpdate {
+                    window: TimeWindow {
+                        assumed_end: Some("2000-01-01T16:00:00Z".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .expect("update");
+
+        let bodies = seen.lock().expect("tap").clone();
+        assert_eq!(bodies[0]["pace"], "fast", "the pace reaches the wire");
+        assert_eq!(
+            full.window,
+            TimeWindow {
+                actual_start: Some("2026-11-01T08:00:00Z".into()),
+                actual_end: Some("2026-11-01T18:00:00Z".into()),
+                assumed_start: Some("2000-01-01T06:00:00Z".into()),
+                assumed_end: Some("2000-01-01T16:00:00Z".into()),
+            },
+            "and the re-read carries all four back"
+        );
+        for (key, on_the_wire) in [
+            ("actual_start", "2026-11-01T08:00:00Z"),
+            ("actual_end", "2026-11-01T18:00:00Z"),
+            ("assumed_start", "2000-01-01T06:00:00Z"),
+            ("assumed_end", "2000-01-01T16:00:00Z"),
+        ] {
+            assert_eq!(bodies[0][key], on_the_wire, "{key} reaches the wire");
+        }
+        assert_eq!(
+            bodies[1].as_object().expect("an object").len(),
+            1,
+            "an untouched window contributes nothing: {bodies:?}"
+        );
+        assert_eq!(bodies[1]["assumed_end"], "2000-01-01T16:00:00Z");
+        assert!(
+            one_end.window.actual_start.is_none(),
+            "and the answer did not invent the other three"
+        );
     }
 }

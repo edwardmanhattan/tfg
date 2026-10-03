@@ -22,7 +22,7 @@ pub use error::BackendError;
 pub use auth::{AppRole, AuthenticatedUser, MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
 pub use feed::{GameMsg, MinosRest, Snapshot};
 pub use live::{LIVE_BACKOFF_BASE_SECS, LIVE_BACKOFF_CAP_SECS, LiveCmd, LiveEvent, LiveWire};
-pub use master::{BackendUser, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GameScenario, GameScenarioStep, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, hhmm_ok, hhmm_window_ok, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, Review, ScenarioRole, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
+pub use master::{BackendUser, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePace, GameScenario, GameScenarioStep, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, TimeWindow, actual_to_rfc3339, assumed_hhmm_to_rfc3339, hhmm_ok, hhmm_window_ok, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, Review, ScenarioRole, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
 pub use replay::{FileReplay, now_ts};
 // Shared with live.rs and the tests below; not public API.
 pub(crate) use feed::FeedEvent;
@@ -802,7 +802,7 @@ mod tests {
         // H2: the anchor rides the detail, so mid-exercise selects learn
         // the clock without moving it.
         assert_eq!(detail.time_factor, 2.0);
-        assert!(detail.actual_start.is_none(), "preparation has no anchor yet");
+        assert!(detail.window.actual_start.is_none(), "preparation has no anchor yet");
     }
 
     #[test]
