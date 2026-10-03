@@ -231,15 +231,19 @@ enum AppMode {
     Simulation,
 }
 
-/// Onboarding state machine (onboarding ticket, #77): the first-run
-/// path is A (Login) → B (Mode) → shell. A and B render on a clean
-/// gradient — no toolbar, islands, or wizard — and the shell is
-/// State C (Presentation) or State D (Simulation). Boots to A every
-/// launch: it doubles as the login gate.
+/// Onboarding state machine: the first-run path is A (Login) → shell.
+/// Boots to A every launch: it doubles as the login gate.
+///
+/// THERE IS NO MODE STEP, and there was never a good reason for one. It
+/// existed to ask "Command Center or Tactical Floor Game?", which is the
+/// app naming its own function to the person using it — the console's job
+/// is to run the exercise, and a card that says so before the map is even
+/// up is the app announcing itself. Simulation is the default and the only
+/// mode a launch reaches; Presentation stays reachable, but from Settings
+/// and as a toggle rather than as a question at the door.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Onboard {
     Login,
-    Mode,
     App,
 }
 
@@ -1145,22 +1149,6 @@ fn paint_unit_image(
     mesh.add_triangle(0, 2, 3);
     painter.add(mesh);
     Some(points)
-}
-
-/// Two-line label for the State B mode cards (ticket #77): title over
-/// a muted one-line promise, both painted inside one button.
-fn mode_card_text(title: &str) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
-    job.append(
-        title,
-        0.0,
-        egui::TextFormat {
-            font_id: egui::FontId::proportional(16.0),
-            color: egui::Color32::from_rgb(0xE2, 0xE8, 0xF0),
-            ..Default::default()
-        },
-    );
-    job
 }
 
 /// One desktop's order draft (slice iv, grill #25): pending waypoint,
@@ -7716,24 +7704,29 @@ impl ShipApp {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ui.ctx(), |ui| {
                 ui.set_width(340.0);
-                ui.label("Mode");
-                ui.weak("Presentation watches a backend. Simulation plays an exercise. Switching clears the view.");
-                ui.horizontal(|ui| {
-                    let mut mode = self.app_mode;
-                    if ui
-                        .selectable_value(&mut mode, AppMode::Presentation, "Presentation")
-                        .clicked()
-                        && mode != self.app_mode
-                    {
-                        self.set_app_mode(mode);
-                    }
-                    if ui
-                        .selectable_value(&mut mode, AppMode::Simulation, "Simulation")
-                        .clicked()
-                        && mode != self.app_mode
-                    {
-                        self.set_app_mode(mode);
-                    }
+                // ONE toggle, not a two-way mode switch. The console runs
+                // exercises; Presentation is the watch-only view on top of
+                // one, and a peer "Simulation" button would be the app
+                // naming its own function in a menu. Offered as a view
+                // rather than a mode, and the label says which one you are
+                // in rather than asking which you want.
+                ui.label("View");
+                let mut watching = self.app_mode == AppMode::Presentation;
+                if ui
+                    .toggle_value(&mut watching, "Watch only")
+                    .on_hover_text("read a session without running it")
+                    .changed()
+                {
+                    self.set_app_mode(if watching {
+                        AppMode::Presentation
+                    } else {
+                        AppMode::Simulation
+                    });
+                }
+                ui.weak(if watching {
+                    "watching — the map follows the session and nothing here moves it."
+                } else {
+                    "running — this machine directs the exercise."
                 });
                 ui.separator();
                 ui.label("Layout");
@@ -12517,7 +12510,6 @@ impl ShipApp {
                             ui.set_width(400.0);
                             match self.onboard {
                                 Onboard::Login => self.onboard_login(ui),
-                                Onboard::Mode => self.onboard_mode(ui),
                                 Onboard::App => {}
                             }
                         });
@@ -12584,50 +12576,12 @@ impl ShipApp {
         if status != "signed out" && !status.starts_with("signed in") {
             status_line(ui, &status);
         }
-        // Signed in this frame (or the password gate just lifted):
-        // advance to Mode Selection.
+        // Signed in this frame (or the password gate just lifted): go
+        // straight into the console.
         if self.auth_user.is_some() && !self.auth_needs_password_change {
-            self.onboard = Onboard::Mode;
-        }
-    }
-
-    /// State B (ticket #77): Presentation (→ State C) or Simulation
-    /// (→ State D / Planning), same clean card.
-    fn onboard_mode(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            egui::RichText::new("ARCONS")
-                .size(28.0)
-                .strong()
-                .color(ONBOARD_ACCENT),
-        );
-        ui.heading("Choose a mode");
-        ui.add_space(12.0);
-        let w = ui.available_width();
-        if ui
-            .add_sized(
-                [w, 64.0],
-                egui::Button::new(mode_card_text(
-                    "📡 Command Center",
-                )),
-            )
-            .clicked()
-        {
-            self.enter_shell(AppMode::Presentation);
-        }
-        if ui
-            .add_sized(
-                [w, 64.0],
-                egui::Button::new(mode_card_text(
-                    "🎮 Tactical Floor Game",
-                )),
-            )
-            .clicked()
-        {
             self.enter_shell(AppMode::Simulation);
         }
-        ui.add_space(10.0);
     }
-
 }
 
 impl eframe::App for ShipApp {
@@ -15341,6 +15295,62 @@ mod tests {
         assert!(
             !island.contains("small_button"),
             "the island roster must carry no verbs"
+        );
+    }
+
+    // -- the console does not introduce itself ---------------------------
+
+    /// Nothing on the login path asks which mode the app is in.
+    ///
+    /// The mode card existed to offer "Command Center or Tactical Floor
+    /// Game?" before the map was up, which is the app naming its own
+    /// function to the person about to use it. A source-level check,
+    /// because the regression is easy and invisible: reintroducing the
+    /// card compiles, runs, and looks deliberate.
+    #[test]
+    fn no_login_path_offers_a_mode_choice() {
+        let src = include_str!("main.rs");
+        // Assembled from parts so this test is not itself a match — not even
+        // in a comment, because a comment is in the file too.
+        let card = ["onboard", "_mode"].concat();
+        assert!(
+            !src.contains(card.as_str()),
+            "the mode card is back; Simulation is announcing itself again"
+        );
+        // Two variants, not three: Login and App.
+        let body = src
+            .split("enum Onboard {")
+            .nth(1)
+            .expect("Onboard exists")
+            .split('}')
+            .next()
+            .expect("the enum body");
+        assert_eq!(
+            body.matches("Login").count() + body.matches("App").count(),
+            2,
+            "Onboard must be Login and App and nothing else"
+        );
+    }
+
+    /// Settings offers a VIEW, not a peer mode. Presentation is a way of
+    /// watching; a "Simulation" button beside it would put the two on equal
+    /// footing as if they were things you choose between.
+    #[test]
+    fn settings_offers_a_view_rather_than_a_mode_choice() {
+        let src = include_str!("main.rs");
+        let settings = src
+            .split("fn settings_modal(")
+            .nth(1)
+            .expect("the settings modal exists");
+        let labelled = settings.split("ui.label(\"View\")").nth(1);
+        assert!(
+            labelled.is_some(),
+            "the mode switch should read as a view toggle"
+        );
+        let arm = labelled.expect("checked above");
+        assert!(
+            arm.contains("Watch only"),
+            "the toggle should name what it turns on, not the mode it leaves"
         );
     }
 
