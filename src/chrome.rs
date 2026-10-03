@@ -447,15 +447,33 @@ pub fn island_owned(
             paint_close(&painter, close_rect, close.hovered());
             clicked_close = close.clicked();
 
-            // Body, in a fixed rect. A caller whose content can exceed
-            // this must scroll it; see the contract on `island`.
+            // Body, in a fixed rect, and CLIPPED to it.
+            //
+            // The clip is the fix for a bug this primitive could not see: the
+            // Operator island is 112pt tall, its content needed rather more,
+            // and the overflow painted over the map AND underneath the next
+            // island's title band — so a status line belonging to the identity
+            // island was legible, half-occluded, in the gap between two
+            // islands. A `max_rect` alone only tells the LAYOUT where to
+            // stop; it does not stop the PAINTER. What escapes is now
+            // invisible rather than corrupting its neighbour, which is the
+            // difference between a bug and a mistake.
+            //
+            // Clipping is not the same as fitting: content that does not fit
+            // is now lost quietly instead of loudly. The honest fix is for
+            // the caller to size its island to its content, and that is a
+            // layout question this primitive deliberately does not answer —
+            // the zone stacks by fixed heights before anything is drawn.
             let content = spec.content_rect(rect);
             ui.scope_builder(
                 UiBuilder::new()
                     .max_rect(content)
                     .layout(Layout::top_down(egui::Align::LEFT))
                     .sense(Sense::hover()),
-                body,
+                |ui| {
+                    ui.set_clip_rect(content.intersect(ui.max_rect()));
+                    body(ui);
+                },
             );
 
             title_resp = Some(drag);
@@ -701,7 +719,21 @@ impl Modal {
 /// Enough that a lit map stops competing with a form, not so much that the
 /// island the modal was opened from becomes unreadable — the operator still
 /// needs to see the zone they are working in.
-pub const MODAL_BACKDROP_ALPHA: u8 = 150;
+///
+/// MEASURED, not chosen. The first value was 150 and a render showed the map
+/// essentially gone: the zone islands behind read as ghosts and the map was
+/// dark mush, which contradicts the whole premise that the map is the
+/// background and the interface floats above it. 104 keeps the grid, the
+/// symbols and the island outlines legible under the dim.
+///
+/// The one caveat, stated because it matters: 104 was judged against the
+/// harness's near-black synthetic background. The real tile map is BRIGHT —
+/// white land, pale sea — and a black overlay lands differently on it. It is
+/// much better than 150 on any background, but its exact value against the
+/// real map is still unverified, because opening a modal needs a held session
+/// and a pointer, and this machine has no pointer injection tool. See
+/// `docs/ui-overhaul-status.md`.
+pub const MODAL_BACKDROP_ALPHA: u8 = 104;
 
 /// Title row height. Smaller than an island's band because a modal has no
 /// chamfer and no drag region, so the band is carrying only a label and a

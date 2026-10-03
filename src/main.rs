@@ -8361,6 +8361,25 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     ///   island the pointer was inside, which for a column is at most one —
     ///   but "at most one by accident" is not the same guarantee as "one by
     ///   construction".
+    // zone_island_heights_are_guesses
+    //
+    // Every island height in the column is a hand-picked constant, and the
+    // column STACKS by those heights before anything is drawn. So they cannot
+    // be measured from the content without running each body twice, and
+    // running a body twice double-fires its writes.
+    //
+    // This is not hypothetical. The Operator island was 112pt, its content
+    // needed more, and the overflow painted over the map and half-occluded
+    // under the next island's title band — a render showed it, and no
+    // geometry test could, because every rect involved was correct.
+    //
+    // `island_owned` now CLIPS its body, so a wrong height is quiet rather
+    // than corrupting: that is a mitigation, not a fix. The fix is to measure
+    // — which means either a non-interactive measure pass (the bodies must
+    // stop writing on a dry run) or heights derived from an explicit content
+    // model rather than from layout. Until then, every new island height is
+    // an unverified guess and the first render of a new island should be
+    // treated as a measurement, not a confirmation.
     fn side_zone(&mut self, ui: &mut egui::Ui) {
         use tfg::chrome::{Island, island_owned, owning_island, zone_island_origins};
         let state = self.game_state();
@@ -8369,7 +8388,12 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         // The user island is first in every state, because identity is the
         // one thing that does not change with the exercise.
         let mut entries: Vec<(Island, bool)> = vec![(
-            Island::new(egui::Id::new("z.user"), "Operator", egui::vec2(w, 112.0))
+            // 140pt, measured against the real thing: the
+            // identity row (avatar 40 + pad), the email line, then the button.
+            // Found by rendering — 104 and 128 both clipped the button, and
+            // the previous 112 was too short for the whole block. See the
+            // note on `zone_island_heights_are_guesses`.
+            Island::new(egui::Id::new("z.user"), "Operator", egui::vec2(w, 140.0))
                 .with_trailing(&self.app_role_tag()),
             true,
         )];
@@ -8572,11 +8596,19 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         {
             ui.weak(email);
         }
-        ui.separator();
-        status_line(ui, &self.auth_status.clone());
         if ui.button("Sign out").clicked() {
             self.sign_out("signed out from the operator island");
         }
+        // NO status line here. It used to sit under a separator, and the
+        // island is 112pt tall while the identity block and the button
+        // already use all of it — so the status painted OUTSIDE the panel,
+        // over the map, half-occluded by the next island's title band. That
+        // is what a render showed and no geometry test could: it looked like
+        // a label belonging to the island below.
+        //
+        // The status itself is not lost. Sign-in and sign-out both report
+        // through the top zone's link state, which is where a transient
+        // connection fact belongs anyway.
     }
 
     /// The operator's picture, or the default person glyph.

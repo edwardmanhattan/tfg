@@ -122,10 +122,21 @@ wrong in several places.
 Ordered so each unit is verifiable on its own and each one shrinks the risk of
 the next.
 
-1. **Re-run every "looked at" claim on a working compositor.** Every visual
-   decision in this file was checked on a rendered frame at some point EXCEPT
-   everything from the modal primitive onward: the backdrop dim, the three
-   modals, and both drag-to-map gestures. That is a real gap, not a formality.
+1. **The three modals and both drag-to-map gestures are still unrendered.**
+   The compositor came back and the console was photographed against the real
+   map, but opening a modal needs a held session AND a pointer, and this
+   machine has `wtype` but no `ydotool`/`dotool`/`xdotool`, while
+   `hyprctl dispatch` is Lua-only and throws on every focus call. So the three
+   modals, both drag-to-map gestures, and `MODAL_BACKDROP_ALPHA` against the
+   real map are verified by tests and nothing else. Someone with a mouse has
+   to open them.
+2. **Island heights are hand-guessed constants.** `side_zone` stacks by
+   heights fixed before anything is drawn, so they cannot be measured from
+   content without running each body twice — and running a body twice
+   double-fires its writes. `island_owned` now clips, so a wrong height is
+   quiet rather than corrupting its neighbour, but that is a mitigation. The
+   fix is a non-interactive measure pass, which means the bodies must stop
+   writing on a dry run.
 
 ## Traps worth writing down
 
@@ -166,6 +177,51 @@ the next.
   across launches. The zone owns layout now, but an island can still be
   dragged out of the column, which means "the zone owns the layout" and "the
   operator may move an island" are currently both true and in tension.
+
+## Verified on the real app, and what it cost
+
+The compositor came back mid-session, so part of this was checked on the
+running console against a real tile map rather than in the harness. It found
+a bug no geometry test could have.
+
+**The Operator island overflowed.** It was 112pt; its content needed more;
+and the status line painted OUTSIDE the panel, over the map, half-occluded
+under the next island's title band. In the screenshot it read as a label
+belonging to the island *below*. Every rect involved was correct — which is
+exactly why the four zone-geometry tests passed and this still shipped.
+
+Two fixes, and the order matters:
+
+- `island_owned` now **clips its body**. A `max_rect` only tells the layout
+  where to stop; it does not stop the painter. This generalises to all seven
+  islands including the four new Execution ones, and turns "corrupts the
+  neighbour" into "a mistake". It is a mitigation, not a fit — see the
+  remaining-work note.
+- The status line came off the identity island (it was a transient connection
+  fact, which the top zone's link state already reports) and the island is
+  now 140pt, measured by rendering. 104 and 128 both clipped the button.
+
+**Also confirmed by render:** the mode card is gone and the app goes straight
+from login into the console (the keyring token still logs in, so this was a
+real end-to-end pass); the top zone is one row over a live map; the zone is
+docked left with the chamfer and the lit-rim rule reading correctly against
+a bright background; and `MODAL_BACKDROP_ALPHA` at 150 erased the map, so it
+is now 104.
+
+**How to photograph the console** — the non-obvious parts:
+
+- The app dies when the shell call that launched it ends, so launch with
+  `setsid nohup ./target/debug/tfg > log 2>&1 < /dev/null &`.
+- `grim` captures the COMPOSITED output, so a background window is not
+  capturable however mapped it is. A freshly launched window is on top for
+  about fifteen seconds, which is the window of opportunity. After that
+  whatever the user focuses covers it, and there is no way to raise it —
+  `hyprctl dispatch` is Lua-only and rejects every focus form, including
+  `address:0x…`.
+- The monitor is 1920x1080 at scale 1.25. `hyprctl clients` reports LOGICAL
+  rects, so multiply by 1.25 before cropping, or you lose ~200px and read it
+  as a layout overflow. That caused a long false chase once already.
+- Do not resize or close the user's windows to get a cleaner shot.
 
 ## Verification
 
