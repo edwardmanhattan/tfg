@@ -66,9 +66,17 @@ static void show(Window w, const char *tag) {
 static void click(int x, int y, int button) {
     XTestFakeMotionEvent(dpy, -1, x, y, CurrentTime);
     XFlush(dpy);
+    usleep(40000);
     XTestFakeButtonEvent(dpy, button, True, CurrentTime);
+    XFlush(dpy);
+    /* A held press, not a zero-length one. Press and release delivered in the
+     * same batch are dropped often enough to matter: a click on the island's
+     * name field did nothing three runs in a row, and the same click with a
+     * 70ms hold works every time. */
+    usleep(70000);
     XTestFakeButtonEvent(dpy, button, False, CurrentTime);
     XFlush(dpy);
+    usleep(40000);
 }
 
 /* XTest takes KEYCODES, so both the symbol and the modifier have to be
@@ -77,11 +85,17 @@ static void click(int x, int y, int button) {
 static void tap(KeySym ks, unsigned mods) {
     KeyCode kc = XKeysymToKeycode(dpy, ks);
     if (kc == 0) return;
+    KeyCode ctrl = XKeysymToKeycode(dpy, XK_Control_L);
+    KeyCode alt = XKeysymToKeycode(dpy, XK_Alt_L);
+    if ((mods & ControlMask) && ctrl) XTestFakeKeyEvent(dpy, ctrl, True, CurrentTime);
+    if ((mods & Mod1Mask) && alt) XTestFakeKeyEvent(dpy, alt, True, CurrentTime);
     KeyCode shift = XKeysymToKeycode(dpy, XK_Shift_L);
     if ((mods & ShiftMask) && shift) XTestFakeKeyEvent(dpy, shift, True, CurrentTime);
     XTestFakeKeyEvent(dpy, kc, True, CurrentTime);
     XTestFakeKeyEvent(dpy, kc, False, CurrentTime);
     if ((mods & ShiftMask) && shift) XTestFakeKeyEvent(dpy, shift, False, CurrentTime);
+    if ((mods & Mod1Mask) && alt) XTestFakeKeyEvent(dpy, alt, False, CurrentTime);
+    if ((mods & ControlMask) && ctrl) XTestFakeKeyEvent(dpy, ctrl, False, CurrentTime);
     XFlush(dpy);
 }
 
@@ -165,9 +179,30 @@ int main(int argc, char **argv) {
     } else if (!strcmp(cmd, "type") && argc >= 3) {
         type_ascii(argv[2]);
     } else if (!strcmp(cmd, "key") && argc >= 3) {
-        KeySym ks = XStringToKeysym(argv[2]);
+        /* "ctrl+a", "shift+Tab": XStringToKeysym wants a key NAME, so the
+         * modifier half is split off and the rest still resolves. Chords are
+         * how a field gets cleared without counting backspaces. */
+        char buf[64];
+        snprintf(buf, sizeof buf, "%s", argv[2]);
+        char *plus = strchr(buf, '+');
+        unsigned mods = 0;
+        KeySym ks;
+        if (plus) {
+            *plus = 0;
+            for (char *m = buf; m < plus; m += 1) {
+                switch (*m) {
+                case 'c': case 'C': mods |= ControlMask; break;
+                case 's': case 'S': mods |= ShiftMask; break;
+                case 'a': case 'A': mods |= Mod1Mask; break;
+                default: break;
+                }
+            }
+            ks = XStringToKeysym(plus + 1);
+        } else {
+            ks = XStringToKeysym(buf);
+        }
         if (ks == NoSymbol) { fprintf(stderr, "no such key: %s\n", argv[2]); rc = 2; }
-        else tap(ks, 0);
+        else tap(ks, mods);
     } else if (!strcmp(cmd, "focus")) {
         Window w = find(dpy, root, "egui", 0);
         if (w == None) { fprintf(stderr, "no egui window\n"); return 2; }

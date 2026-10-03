@@ -8,6 +8,10 @@ set -u
 export LD_LIBRARY_PATH=/tmp/opencode/stack/usr/lib
 export PATH=/tmp/opencode/stack/usr/bin:$PATH
 ROOT=/tmp/opencode
+# Minos validates REDIS_PASSWORD as required, so an unauthenticated valkey is not
+# an option: the API refuses to boot without one. The password is local-only.
+VALKEY_PASSWORD=local-redis-pw
+VALKEY_CLI="redis-cli -p 6380 -a $VALKEY_PASSWORD --no-auth-warning"
 
 case "${1:-up}" in
 up)
@@ -19,10 +23,14 @@ up)
   for _ in $(seq 1 30); do pg_isready -h 127.0.0.1 -p 5433 >/dev/null 2>&1 && break; sleep 1; done
   pg_isready -h 127.0.0.1 -p 5433
 
-  redis-cli -p 6380 ping >/dev/null 2>&1 || \
-    ( valkey-server --port 6380 --save '' --dir $ROOT > $ROOT/valkey.log 2>&1 & )
-  for _ in $(seq 1 20); do redis-cli -p 6380 ping >/dev/null 2>&1 && break; sleep 1; done
-  echo -n "valkey: "; redis-cli -p 6380 ping
+  # Compare the reply, do not test the exit code: valkey answers PING after a
+  # failed AUTH when the default user has no password, so a wrong password still
+  # exits 0 and reads as "up".
+  [ "$($VALKEY_CLI ping 2>/dev/null)" = PONG ] || \
+    ( valkey-server --port 6380 --requirepass "$VALKEY_PASSWORD" --save '' --dir $ROOT \
+      > $ROOT/valkey.log 2>&1 & )
+  for _ in $(seq 1 20); do [ "$($VALKEY_CLI ping 2>/dev/null)" = PONG ] && break; sleep 1; done
+  echo -n "valkey: "; $VALKEY_CLI ping 2>/dev/null || echo "no answer"
   ;;
 
 down)

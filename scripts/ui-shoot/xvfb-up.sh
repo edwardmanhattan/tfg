@@ -39,7 +39,7 @@ LD_LIBRARY_PATH="$ROOT/usr/lib" setsid "$ROOT/usr/bin/Xvfb" "$DISP" \
 sleep 3
 pgrep -f "Xvfb $DISP" >/dev/null || { tail -5 /tmp/opencode/xvfb.log; exit 1; }
 
-cc -O2 -g -o /tmp/opencode/xdrv "$(dirname "${BASH_SOURCE[0]}")/xdrv.c" \
+cc -O2 -g -o /tmp/opencode/xdrv "$REPO/scripts/ui-shoot/xdrv.c" \
   -lXtst -lX11 -lXext
 
 echo "display $DISP up, driver at /tmp/opencode/xdrv"
