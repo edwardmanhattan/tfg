@@ -334,7 +334,10 @@ pub fn island(
     let owns_input = ctx
         .input(|i| i.pointer.hover_pos())
         .is_some_and(|p| spec.rect_at(*pos).contains(p));
-    island_owned(ctx, spec, pos, open, owns_input, body)
+    // No scroll and the whole window as the band: this primitive has no column
+    // to scroll, so the band must not clip what the caller could legitimately
+    // place anywhere in the viewport.
+    island_owned(ctx, spec, pos, 0.0, ctx.viewport_rect(), open, owns_input, body)
 }
 
 /// [`island`], with ownership supplied by the caller.
@@ -345,6 +348,8 @@ pub fn island_owned(
     ctx: &egui::Context,
     spec: &Island,
     pos: &mut Pos2,
+    scroll: f32,
+    band: Rect,
     open: &mut bool,
     owns_input: bool,
     body: impl FnOnce(&mut Ui),
@@ -359,16 +364,29 @@ pub fn island_owned(
         let delta = ctx.input(|i| i.pointer.delta());
         if delta != Vec2::ZERO {
             *pos += delta;
+            // Constrained to the window, not the screen, and ONLY for a drag.
+            // A computed column position legitimately sits below the window —
+            // that is what a scrollable column IS — so clamping it would pull
+            // the island up to the window's bottom edge and then the zone's
+            // scroll would carry it off the top, which reads as an island that
+            // cannot be scrolled to.
+            let vp = ctx.viewport_rect();
+            pos.x = pos.x.clamp(vp.left(), (vp.right() - spec.size.x).max(vp.left()));
+            pos.y = pos.y.clamp(vp.top(), (vp.bottom() - spec.size.y).max(vp.top()));
         }
     }
 
-    // Constrain to the window, not the screen: an island may sit over the
-    // map but must never be draggable off the viewport.
-    let vp = ctx.viewport_rect();
-    pos.x = pos.x.clamp(vp.left(), (vp.right() - spec.size.x).max(vp.left()));
-    pos.y = pos.y.clamp(vp.top(), (vp.bottom() - spec.size.y).max(vp.top()));
-
-    let island_pos = *pos;
+    // Scroll is a VIEW transform, applied here rather than folded into `pos`.
+    //
+    // `pos` is where the island lives in the column and the clamp above is
+    // about dragging. Subtracting the scroll before the clamp would let a
+    // scroll carry an island off the top of the window, which is the one thing
+    // that clamp exists to prevent, and the two would silently undo each other
+    // in whichever direction each happened to run first.
+    let island_pos = pos2(pos.x, pos.y - scroll);
+    if !island_on_band(*pos, scroll, band, spec.size.y) {
+        return None;
+    }
     let mut title_resp: Option<Response> = None;
     let mut clicked_close = false;
     let mut overflowed = false;
@@ -387,9 +405,15 @@ pub fn island_owned(
             // Fix the footprint so the background can be painted first.
             ui.set_min_size(spec.size);
             ui.set_max_size(spec.size);
+            // The band, not the island's own rect, is the outer limit. An
+            // island half-scrolled under the top band must disappear behind it
+            // rather than paint over it, and `painter_at` takes the clip from
+            // the rect it is given, so the background and title go through the
+            // intersection too.
+            ui.set_clip_rect(ui.max_rect().intersect(band));
             let rect = ui.min_rect();
 
-            let painter = ui.painter_at(rect);
+            let painter = ui.painter_at(rect.intersect(band));
 
             // ADR-0016: the rim lights on the island that owns input, and
             // ownership arrives as a parameter rather than being decided
@@ -674,6 +698,35 @@ pub fn zone_island_origins(
             origin
         })
         .collect()
+}
+
+/// The strip of the window a side-zone island may occupy.
+///
+/// Scrolling, clipping and culling all read this, so "where an island may be"
+/// is one rectangle rather than three numbers that can disagree.
+pub fn zone_band(dock: Dock, viewport: Rect) -> Rect {
+    let x = zone_origin(dock, viewport.width()).unwrap_or(0.0);
+    Rect::from_min_max(
+        pos2(
+            x,
+            viewport.top() + tokens::ZONE_TOP_GAP - tokens::ZONE_ISLAND_GAP,
+        ),
+        pos2(
+            x + tokens::ZONE_W,
+            viewport.bottom() - tokens::ZONE_ISLAND_GAP,
+        ),
+    )
+}
+
+/// Whether an island at column position `pos` still shows once the column has
+/// been scrolled by `scroll`.
+///
+/// Culled rather than drawn off-band. An island outside the band must not own
+/// input either, and ownership is decided from a list of rects the caller
+/// builds, so the caller needs this predicate and not just the drawing.
+pub fn island_on_band(pos: Pos2, scroll: f32, band: Rect, height: f32) -> bool {
+    let y = pos.y - scroll;
+    y + height >= band.top() && y <= band.bottom()
 }
 
 /// Which island in a zone owns input, if any.
@@ -967,6 +1020,44 @@ pub fn modal(
 
 #[cfg(test)]
 mod tests {
+
+    /// The predicate that decides whether an island is reachable at all.
+    ///
+    /// This is the whole bug in one function. Planning stacks five islands into
+    /// 1642pt against a 584pt band, so everything below the first is off-band at
+    /// scroll zero — and a culled island is not merely invisible, it is GONE: no
+    /// rim, no content, no way to scroll to it. Control and Fleet were
+    /// unreachable for exactly this reason.
+    #[test]
+    fn an_island_is_reachable_only_while_it_is_on_the_band() {
+        let band = Rect::from_min_max(pos2(24.0, 40.0), pos2(344.0, 624.0));
+        let at = |y: f32| pos2(24.0, y);
+
+        let players = at(1362.0);
+        assert!(!island_on_band(players, 0.0, band, 320.0), "below the band");
+        assert!(island_on_band(players, 1058.0, band, 320.0), "scrolled to");
+
+        let operator = at(56.0);
+        assert!(island_on_band(operator, 0.0, band, 144.0), "at rest");
+        assert!(!island_on_band(operator, 300.0, band, 144.0), "scrolled past");
+
+        assert!(island_on_band(at(600.0), 0.0, band, 320.0), "straddles the bottom");
+        assert!(island_on_band(at(-40.0), 0.0, band, 144.0), "straddles the top");
+    }
+
+    /// The band excludes the top band, so nothing in the zone can paint over it.
+    #[test]
+    fn the_band_starts_below_the_top_band() {
+        let vp = Rect::from_min_size(pos2(0.0, 0.0), vec2(1040.0, 640.0));
+        let band = zone_band(Dock::Left, vp);
+        assert!(
+            band.top() >= tokens::ZONE_TOP_GAP - tokens::ZONE_ISLAND_GAP,
+            "the band must not reach into the top band"
+        );
+        assert!(band.bottom() <= vp.bottom());
+        assert_eq!(band.width(), tokens::ZONE_W, "the band is the column's width");
+    }
+
     use super::*;
 
     /// The overflow threshold is a LINE, not a hair, and the reason is a

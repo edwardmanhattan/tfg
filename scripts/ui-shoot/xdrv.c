@@ -85,28 +85,18 @@ static void tap(KeySym ks, unsigned mods) {
     XFlush(dpy);
 }
 
-/* ASCII to keysym plus the shift level, for the characters a name needs. */
+/* ASCII to keysym. Latin-1 keysyms ARE the character code, so printable ASCII
+ * needs no name lookup at all — and that matters, because XStringToKeysym("-")
+ * returns NoSymbol (it wants a keysym NAME like "minus"), which cost a login:
+ * the password field showed sixteen dots and the server said unauthorized,
+ * because both hyphens had been silently dropped on the way in. */
 static void type_ascii(const char *s) {
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
         unsigned c = *p;
         if (c == '\n') { tap(XK_Return, 0); continue; }
         if (c == '\t') { tap(XK_Tab, 0); continue; }
-        KeySym ks;
-        unsigned mods = 0;
-        if (c >= 'a' && c <= 'z') ks = XK_a + (c - 'a');
-        else if (c >= 'A' && c <= 'Z') { ks = XK_a + (c - 'A'); mods = ShiftMask; }
-        else if (c >= '0' && c <= '9') ks = XK_0 + (c - '0');
-        else {
-            const char *one = NULL;
-            char buf[2] = { (char)c, 0 };
-            one = buf;
-            ks = XStringToKeysym(one);
-            if (ks == NoSymbol) continue;
-            static const char *shifted = ")!@#$%^&*(";
-            if (c >= '!' && c <= '(') mods = ShiftMask;
-            (void)shifted;
-        }
-        tap(ks, mods);
+        if (c < 0x20 || c > 0x7e) continue;
+        tap((KeySym)c, (c >= 'A' && c <= 'Z') ? ShiftMask : 0);
         usleep(12000);
     }
 }
@@ -161,6 +151,17 @@ int main(int argc, char **argv) {
         usleep(80000);
         XTestFakeButtonEvent(dpy, 1, False, CurrentTime);
         XFlush(dpy);
+    } else if (!strcmp(cmd, "wheel") && argc >= 3) {
+        /* Buttons 4 and 5 are the X11 wheel convention. Positive N scrolls
+         * down, which is what "away from the operator" means on the wheel. */
+        int n = atoi(argv[2]);
+        int button = n > 0 ? 5 : 4;
+        for (int i = 0; i < (n > 0 ? n : -n); i++) {
+            XTestFakeButtonEvent(dpy, button, True, CurrentTime);
+            XTestFakeButtonEvent(dpy, button, False, CurrentTime);
+            XFlush(dpy);
+            usleep(30000);
+        }
     } else if (!strcmp(cmd, "type") && argc >= 3) {
         type_ascii(argv[2]);
     } else if (!strcmp(cmd, "key") && argc >= 3) {

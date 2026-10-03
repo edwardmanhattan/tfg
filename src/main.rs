@@ -2133,6 +2133,12 @@ struct ShipApp {
     /// than a settings key that silently does nothing.
     show_side_zone: bool,
     side_dock: tfg::chrome::Dock,
+    /// How far the side zone is scrolled, in points.
+    ///
+    /// The column is taller than the window in every state with four islands,
+    /// so without this the tail of it is not merely inconvenient to reach, it
+    /// is never drawn at all.
+    zone_scroll: f32,
     /// The settings modal's visibility. A bool rather than egui memory
     /// because the modal holds a mode switch that has to be able to cancel.
     settings_open: bool,
@@ -8756,25 +8762,84 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         }
 
         let dock = self.side_dock;
-        let origins = zone_island_origins(dock, ui.ctx().viewport_rect(), &entries);
+        let origins = zone_island_origins(dock, vp, &entries);
+        let band = tfg::chrome::zone_band(dock, vp);
 
-        // One pointer query for the whole column. `map` is indexed by the
-        // entries that survived the closed filter, which is why the rects are
-        // built from the same `zip` the render loop uses.
-        let rects: Vec<egui::Rect> = entries
-            .iter()
-            .zip(&origins)
-            .map(|((spec, _), pos)| spec.rect_at(*pos))
+        // `zone_island_origins` skips closed islands, so pairing entries with
+        // origins by index pairs them wrongly the moment one is closed. Build
+        // the pairs once and let everything downstream read the pairs.
+        let stacked: Vec<(Island, egui::Pos2)> = entries
+            .into_iter()
+            .filter(|(_, open)| *open)
+            .zip(origins)
+            .map(|((spec, _), pos)| (spec, pos))
             .collect();
-        let pointer = ui.ctx().input(|i| i.pointer.hover_pos());
-        let owner = owning_island(&rects, pointer);
 
-        for (i, ((spec, _), mut pos)) in entries.into_iter().zip(origins).enumerate() {
+        // The column is taller than the window in every state that has four
+        // islands — Planning declares 1170pt against 624pt at the app's own
+        // default size — so the zone scrolls rather than dropping the tail off
+        // the bottom, which is how Control and Fleet stopped rendering at all.
+        let content_h: f32 = stacked.iter().map(|(spec, _)| spec.size.y).sum::<f32>()
+            + tfg::tokens::ZONE_ISLAND_GAP * stacked.len() as f32;
+        let overflow = (content_h - band.height()).max(0.0);
+
+        // Only over the column: the map has its own wheel handling and a scroll
+        // that fired everywhere would fight it.
+        //
+        // Subtracted, not added. egui reports a POSITIVE Y for content moving
+        // DOWN, so scrolling down the column arrives here as a negative delta —
+        // and `+=` drove the offset below zero where the clamp pinned it, which
+        // looks exactly like a wheel that does nothing.
+        let hover = ui.ctx().input(|i| i.pointer.hover_pos());
+        if hover.is_some_and(|h| band.contains(h)) {
+            self.zone_scroll -= ui.ctx().input(|i| i.smooth_scroll_delta.y);
+        }
+        // Re-clamped every frame rather than only while hovering, because the
+        // overflow changes with the state: a scroll set in Planning must not
+        // strand the column past its own end in Execution.
+        self.zone_scroll = self.zone_scroll.clamp(0.0, overflow);
+        let scroll = self.zone_scroll;
+
+        if std::env::var("TFG_ZONE_DEBUG").is_ok() {
+            eprintln!(
+                "zone: band={:?} stacked={} content_h={:.0} overflow={:.0} scroll={:.0} dock={:?} hover={:?} in_band={} delta={:.1}",
+                band,
+                stacked.len(),
+                content_h,
+                overflow,
+                scroll,
+                dock,
+                hover,
+                hover.is_some_and(|h| band.contains(h)),
+                ui.ctx().input(|i| i.smooth_scroll_delta.y)
+            );
+            for (spec, pos) in &stacked {
+                eprintln!("  {:?} pos=({:.0},{:.0}) h={:.0}", spec.id, pos.x, pos.y, spec.size.y);
+            }
+        }
+
+        // Ownership is a question about what is ON SCREEN, so the rects are
+        // built from the scrolled positions. An island scrolled out of the
+        // band is dropped here as well as at draw time, or it would own input
+        // it is not showing.
+        let live: Vec<(Island, egui::Pos2)> = stacked
+            .into_iter()
+            .filter(|(spec, pos)| {
+                tfg::chrome::island_on_band(*pos, scroll, band, spec.size.y)
+            })
+            .collect();
+        let rects: Vec<egui::Rect> = live
+            .iter()
+            .map(|(spec, pos)| spec.rect_at(egui::pos2(pos.x, pos.y - scroll)))
+            .collect();
+        let owner = owning_island(&rects, hover);
+
+        for (i, (spec, mut pos)) in live.into_iter().enumerate() {
             let mut open = true;
             let owns = owner == Some(i);
             let id = spec.id;
             let title = spec.title.clone();
-            island_owned(ui.ctx(), &spec, &mut pos, &mut open, owns, |ui| match id {
+            island_owned(ui.ctx(), &spec, &mut pos, scroll, band, &mut open, owns, |ui| match id {
                 x if x == egui::Id::new("z.user") => self.zone_user_body(ui),
                 x if x == egui::Id::new("z.start") => self.zone_start_body(ui),
                 x if x == egui::Id::new("z.essentials") => self.zone_essentials_body(ui),
@@ -13521,7 +13586,15 @@ impl eframe::App for ShipApp {
         // the loaded map — Planning shows the setup panel beside it,
         // Evaluasi the assessment workspace.
         if self.app_mode == AppMode::Simulation && self.show_side_zone {
+            if std::env::var("TFG_ZONE_DEBUG").is_ok() {
+                eprintln!("GATE: calling side_zone");
+            }
             self.side_zone(ui);
+        } else if std::env::var("TFG_ZONE_DEBUG").is_ok() {
+            eprintln!(
+                "GATE: side_zone SKIPPED mode={:?} show_side_zone={}",
+                self.app_mode, self.show_side_zone
+            );
         }
         if self.settings_open {
             self.settings_modal(ui);
@@ -15344,6 +15417,7 @@ fn main() -> Result<(), String> {
                 show_roster: false,
                 roster_pos: egui::pos2(816.0, 64.0),
                 show_side_zone: true,
+                zone_scroll: 0.0,
                 side_dock: tfg::chrome::Dock::Left,
                 settings_open: false,
                 reduced_motion: false,

@@ -377,8 +377,8 @@ zero and a window nobody declared still add up to a clear gate. Deleting the
 derivation did not just remove a second opinion; it removed the only thing that
 could have answered wrongly.
 
-**2. The Planning column cannot fit its own islands at the default window
-size.** Planning declares four islands at 380 + 150 + 320 + 320 = 1170pt. The
+**2. FIXED. The Planning column could not fit its own islands, and the ones
+that did not fit were not merely clipped but GONE.** Planning declares four islands at 380 + 150 + 320 + 320 = 1170pt. The
 side zone at the app's hardcoded `1040x640` has `640 - ZONE_ISLAND_GAP` = 624pt.
 The declared height is a floor (`fitted_island_height` clamps to
 `declared.min(ceiling)`), so the shortfall cannot be absorbed: Essentials is
@@ -406,3 +406,39 @@ artefacts and a black band across the bottom. At 1040x640 it was correct. That
 is either a viewport that does not re-fit on resize, which would be a real bug,
 or an llvmpipe artefact, which would not be. One more capture at a second size
 settles it and I have not done that yet, so it stays a suspicion.
+
+### The fix, and the three bugs inside it
+
+The column now scrolls. Three things had to be true at once, and each was
+wrong on its own first:
+
+**The island's clamp fought the scroll.** `island_owned` clamped an island's
+position into the viewport so a title drag could not carry it off the window.
+In a scrollable column a position below the window is *correct* — that is what
+a column taller than its band IS — so the clamp pulled Fleet from y=1026 up to
+y=320 and the scroll then carried it off the top. The clamp now applies only
+when a drag actually happened. A computed position is trusted; a dragged one is
+constrained.
+
+**The sign was inverted.** egui reports a POSITIVE Y for content moving DOWN,
+so scrolling down the column arrives as a negative delta. `+=` drove the offset
+below zero where the clamp pinned it, and the symptom was a wheel that did
+nothing at all — with the scroll value sitting at exactly 0, which looks like
+the input never arrived rather than like arithmetic that went the wrong way.
+Instrumenting the delta settled it in one run: `delta=-96.8`.
+
+**Scroll is a view transform, not a position.** It is applied at draw time
+inside `island_owned`, so the stored position keeps meaning "where this island
+lives in the column" and the drag clamp stays a statement about dragging.
+
+Verified by driving: at scroll 0 the band shows Operator and the top of
+Essentials; at scroll 560 it shows Essentials' tail, **Control** (game time
+multiplier, with its rim lit, so ADR-0016 ownership still holds under scroll)
+and **Fleet**; at scroll 1200 it shows Players, whose checklist is now quoting
+the server's blockers verbatim — "the planned window is incomplete (both
+actual_end and assumed_end are required...)" and "no units assigned" — which is
+the published gate working end to end against a Minos that has `aaee9bf`
+deployed.
+
+**The original section 2 below is kept as written, because the arithmetic is
+what the fix is accountable to.**
