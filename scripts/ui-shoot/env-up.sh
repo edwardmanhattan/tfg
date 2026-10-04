@@ -23,6 +23,10 @@
 #   * Minos validates REDIS_PASSWORD as required, so a valkey with no
 #     requirepass is not an option: the API refuses to boot. stack.sh owns that
 #     password.
+#   * The Minos start was guarded by "something is already listening", which is
+#     the WARM case, so the first run on an empty /tmp/opencode never started
+#     it. Everything after that step then failed on a refused connection and
+#     read as a broken stack. Restarting unconditionally is the fix.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -161,20 +165,19 @@ exec /tmp/opencode/minos "$@"
 RUNNER
 chmod +x "$ROOT/run-minos.sh"
 
-if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/api/api/v1/games)" != "000" ]; then
-  # 401 is the healthy answer: /games needs a bearer token. Testing for 2xx
-  # here reads a working API as a dead one and starts a second minos onto an
-  # occupied port.
-  echo "already listening on 8099"
-  # Casbin loads its policy set at startup, so an account seeded after the
-  # process started keeps being denied. If the seed above created the
-  # superuser, this start is what makes it usable.
-  setsid "$ROOT/run-minos.sh" > "$ROOT/minos.log" 2>&1 < /dev/null &
-  for _ in $(seq 1 30); do
-    curl -sf -o /dev/null http://127.0.0.1:8099/api/api/v1/games && break
-    sleep 1
-  done
-fi
+# Restarted unconditionally, because Casbin loads its policy set at startup and
+# an account seeded after the process started keeps being denied — a just-seeded
+# superuser is unusable until Minos restarts. The old process is KILLED rather
+# than joined, so a second one never races it for port 8099. `pkill -x` matches
+# the binary name; `pkill -f minos` also matches this script's own path.
+pkill -x minos 2>/dev/null || true
+sleep 1
+setsid "$ROOT/run-minos.sh" > "$ROOT/minos.log" 2>&1 < /dev/null &
+for _ in $(seq 1 30); do
+  curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/api/api/v1/games \
+    | grep -qv 000 && break
+  sleep 1
+done
 curl -s -o /dev/null -w 'minos /games -> %{http_code}\n' \
   http://127.0.0.1:8099/api/api/v1/games
 
