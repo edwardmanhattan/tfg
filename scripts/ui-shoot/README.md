@@ -1,17 +1,79 @@
 # Photographing the console, and a Minos to photograph it against
 
-Two things this directory exists for, both of which were harder to get working
-than they look.
+## Start here
 
-- `uimouse.py` — a pointer for a Wayland compositor, written because nothing
-  installable would do. `ydotool` and `dotool` both need root; `/dev/uinput`
-  carries an ACL for this user, so the device can be made directly, which is
-  all either of them does anyway. Hyprland/libinput picks it up on creation, so
-  nothing has to be configured compositor-side.
-- `stack.sh` — the Minos stack with no root and no docker. Postgres and Valkey
-  are not installed here and `docker.sock` is not accessible, so the Arch
-  packages are fetched and extracted into a local prefix. Postgres then needs
-  `LD_LIBRARY_PATH` for `libnuma` (from `numactl`, also extracted).
+```bash
+bash scripts/ui-shoot/env-up.sh          # everything, idempotent
+bash scripts/ui-shoot/drive-to-session.sh  # launch, sign in, pick the session
+bash scripts/ui-shoot/verify-scroll.sh    # the scroll regression, 17 checks
+```
+
+`docs/ui-verify-handoff.md` has the rest, including the gotchas that each cost
+an hour.
+
+## What is here
+
+- `env-up.sh` — the whole bring-up in one command. Postgres, valkey and Xvfb
+  unpacked into local prefixes because none are installed and there is no root;
+  Minos built and started; Xvfb on `:99`; a game seeded in `planning` with a
+  scenario book and a Game Master seat.
+- `drive-to-session.sh` — launches the app, waits for it to take input, signs in,
+  picks the session, and **puts the session back into `planning` first**. The
+  zone's contents are a function of the session state, so a run that inherits
+  `Readiness` photographs a different console.
+- `verify-scroll.sh` — the zone's scroll regression. Asserts, per frame, that one
+  wheel gesture moved one thing.
+- `find-buttons.py` — finds a control in a screenshot by its fill colour, so no
+  click target is ever a remembered coordinate.
+- `check-chain.py` — the scroll-invariant walk, split out so it is testable and
+  so the `python3 -c` inside a shell script is not a hundred lines of quoting.
+- `shot.sh` — capture with a coordinate grid burned in.
+- `click-sweep.sh` — clicks a grid and stops at the first probe-pixel change.
+- `xdrv.c` — the X11 driver. XTEST, so it needs no compositor.
+- `stack.sh`, `xvfb-up.sh` — the pieces `env-up.sh` calls.
+- `seedgame.py`, `seat.py` — the seeded game and its Game Master seat.
+
+## Two dead ends, kept because they cost time
+
+`uimouse.py` is a pointer for a Wayland compositor, written because nothing
+installable would do: `ydotool` and `dotool` both need root, `/dev/uinput`
+carries an ACL for this user, so the device can be made directly. It is retained
+because it is the only thing here that drives the operator's real display, which
+is exactly why it is not the default.
+
+Three findings from that attempt, each of which fails silently:
+
+1. **A relative pointer cannot be positioned.** libinput applies its
+   acceleration curve, so a delta of 100 arrives as 200. Measured: asking for
+   (100,100) produced a cursor at (200,200), and asking for (1200,700) produced
+   the bottom-right corner of the screen, because acceleration made the delta
+   enormous and it saturated. Nothing reports an error.
+2. **Absolute axes do not take on this kernel.** `UI_ABS_SETUP` must be called
+   BEFORE `UI_DEV_CREATE` (afterwards it is EINVAL, from C as well), and even
+   then the cursor pins to the screen corner. Not chased further.
+3. **Key events need every key bit advertised.** Registering only
+   `BTN_LEFT`/`BTN_RIGHT` and emitting `KEY_A` means the device is a mouse that
+   makes key noises. Registering all of them changed nothing.
+
+The resolution was to stop driving the real display at all. `Xvfb` plus XTEST
+gives a display that is never the operator's and needs no compositor, and it is
+what every script here uses.
+
+## The Minos stack, with no root and no docker
+
+Postgres and Valkey are not installed on this machine and `docker.sock` is not
+accessible, so `stack.sh` fetches the Arch packages and extracts them into a
+local prefix. Postgres then needs `LD_LIBRARY_PATH` for `libnuma` (from
+`numactl`, also extracted). Minos validates `REDIS_PASSWORD` as required, so a
+valkey with no `requirepass` is not an option.
+
+## Getting a pointer to work
+
+On Xvfb, `xdrv.c` and XTEST. The Wayland path below is kept for reference, and
+its four `EINVAL`s are what it took to get there.
+
+Four things are wrong before it works, and each one fails as a bare `EINVAL`
+with nothing to say which field was wrong:
 
 ## Getting a pointer to work
 
@@ -97,12 +159,13 @@ Also:
 - The app dies when the shell call that launched it ends. Use
   `setsid nohup … &`.
 - Do not resize or close the user's windows to get a cleaner shot.
-## Where this stopped, and what is NOT solved
+## Where the Wayland path stopped
 
 The pointer moves the compositor's cursor — `hyprctl cursorpos` confirms it,
-and the login card's button was located by scanning for its cyan fill to
-within a pixel. But **no button press and no key press has ever reached tfg**,
-by coordinates or by Tab order. So the three modals are still unrendered.
+and the login card's button was located by scanning for its cyan fill to within a
+pixel. But **no button press and no key press ever reached tfg**, by coordinates
+or by Tab order, so the three modals were unrendered and it was replaced by the
+Xvfb path.
 
 Three findings, each of which fails silently:
 
@@ -122,15 +185,17 @@ Three findings, each of which fails silently:
    something further along — seat assignment for a hotplugged device, most
    likely — is not delivering the events to the client.
 
-## The focus guard is necessary and NOT sufficient
+## The focus guard was necessary and was NOT sufficient
 
-`drive.py` re-reads the focused window before every keystroke and aborts if it
-is not tfg. That guard did its job: the run that typed a password into a chat
-window had no guard, and the run that followed it never typed outside tfg.
+`drive.py` re-reads the focused window before every keystroke and aborted if it
+was not tfg. It did its job — the run that typed a password into a chat window
+had no guard, and the run after it never typed outside tfg — but it only proved
+tfg was focused *at the moment of the check*. It did not prove the compositor
+would deliver the event.
 
-But it only proves tfg was focused *at the moment of the check*. It does not
-prove the compositor will deliver an event to that window, which is exactly
-the gap that let a password reach a chat app in the first place. **Until
-event delivery itself is confirmed, do not drive input on this machine's
-desktop unattended** — the failure is silent and the blast radius is whatever
-window the user happened to have open.
+Which is why nothing here drives the operator's desktop now, and why
+`drive-to-session.sh` names the display rather than reading `DISPLAY` out of the
+environment. An earlier version read `${DISPLAY:-:99}`, and inside an agent shell
+`DISPLAY` is `:0`: the app opened a window on the operator's screen and the
+driver then found no egui window on `:99`. The failure is silent and the blast
+radius is whatever the user happened to have open.

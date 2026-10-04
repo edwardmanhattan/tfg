@@ -554,19 +554,6 @@ the empty state says that instead of inventing a cause.
 
 ### Not fixed, and why
 
-**An island body cannot be scrolled, so clipped content is unreachable.** The
-legacy islands wrap themselves in a `ScrollArea`; the zone's do not. `island()`
-clips the body to the island's content rect, so anything past the fold is gone,
-and the loud clip report goes to stderr where no operator is. Worse, the wheel
-over an island scrolls the *column*: the zone's scroll is a manual handler that
-reads the raw delta, so it moves whether or not the island consumed anything.
-This is why the Scenario composer's button has never been reachable at the
-default window size — it sits below the Essentials island's fold. At 1200x900
-the island measures taller, the button appears, and the composer opens. The fix
-is not small: per-island scrolling means the column scroll and the body scroll
-have to stop fighting over one wheel, and the column's is a view transform
-applied at draw time precisely so island drags keep working.
-
 **A zone island's close glyph cannot close it.** `side_zone` builds its entries
 with a literal `true` for open, and the draw loop sets `let mut open = true` per
 frame and discards `island_owned`'s return. The click lands and is thrown away.
@@ -601,6 +588,111 @@ The gestures need a seeded unit catalogue, which is a data task.
 own, so `0:00:00 to 1x PAUSED` in the heat accent sits on the sea while the
 map's own labels run through the hint text. Whether that is intended is a
 design question about the band, and it is recorded rather than decided.
+
+## The private display, third pass: nothing in the zone is out of reach
+
+Took over at `9e98784`. The one item the second pass named as unfixed and
+structural — island bodies could not scroll, so clipped content was
+unreachable — turned out to be two defects stacked, and removing both is a
+deletion.
+
+**What the operator could not reach.** At the app's own default 1040x640, in
+Planning, the Essentials island measured ~760pt of content against a 380pt
+island. The body was laid into a fixed rect and **clipped**, and the zone's
+wheel scrolled the **column**, which moves whole islands. So the composer
+button and everything below it were not on screen, and no gesture reached them:
+scrolling the column moves Essentials, and Essentials is the island whose
+contents are missing. At 1200x900 the island measures taller, the fold moves
+down, the button appears, and the composer opens — which is why the previous
+pass recorded the defect as a layout curiosity rather than a dead end.
+
+**Root cause, two halves, and the second one is the interesting one.**
+
+1. Bodies clipped. `chrome::island_owned` laid the body straight into the
+   island's content rect. Sound as paint (a `max_rect` tells the layout where
+   to stop but not the painter, so the overflow painted over the map and
+   half-occluded under the next island's title band) and broken as a surface,
+   because clipped content is unreachable content.
+
+2. The zone grew every island to whatever its content measured, one frame
+   behind, clamped to the window so a long body could not push the column past
+   the screen. That was the **workaround for half of problem 1**, and it is
+   what made the island 624pt tall against a 640pt window. An island taller
+   than the screen cannot be scrolled to by any means either.
+
+So the growth is not merely redundant once bodies scroll. It is the second half
+of the defect, and the ceiling that seemed to make it safe is what made it
+unfixable. Removing it is what `DESIGN.md` has always said: *"An island does
+not resize to fit its content. The body scrolls."*
+
+**The wheel is chained, not exclusive.** Every body now scrolls inside its own
+rect, and the column still scrolls as a whole, so one gesture has to move
+exactly one thing: the body under the pointer if it has room in the direction
+being scrolled, and the column otherwise. Exclusive would have been simpler to
+write and wrong — the column is the only way to reach the islands below the
+fold, so a body that cannot scroll must hand the gesture back rather than
+swallow it.
+
+`chrome::BodyFit` is what makes that decidable from the caller's side:
+`content_h`, `viewport_h` and `offset`, published per frame by the island that
+laid itself out. A caller cannot work any of it out for itself, because the body
+is laid out inside `island_owned`.
+
+### The slack that keeps four points of nothing from eating a gesture
+
+A layout's measured extent runs a few points past its last control for trailing
+spacing. The Operator island measures 98.4 against 94 available: 4pt of nothing
+at the bottom. With a zero tolerance that 4pt is scrollable, so the Operator
+body claims the first wheel gesture, moves four points the operator cannot see,
+and the column does not move — a gesture that appears to do nothing, which is
+the exact failure the chain exists to prevent.
+
+`BODY_SCROLL_SLACK` is 12pt, the same tolerance and for the same measurement as
+the `OVERFLOW_SLACK` this replaced, and it is pinned by a test on both sides:
+below 4pt the slack claims gestures for trailing spacing, above a text line it
+hides real content below the fold.
+
+### What was deleted, and why that was the smaller change
+
+`island_scrolled`, `island_fitted_height`, `fitted_island_height` and
+`OVERFLOW_SLACK` are all gone, plus `ISLAND_SCROLL_MAX` in both `tokens` and
+`main.rs`. Every one of them was a way of saying "the body scrolls" or "the
+height adapts" in a second place, and every one of them was reachable by
+mistake. The six `island_scrolled` call sites in `main.rs` and three in the
+prototype crate now call `island`, which scrolls unconditionally.
+
+The diff removes more than it adds in `chrome.rs`, and the whole of the
+`main.rs` change is deletions. The scroll discipline `DESIGN.md` specifies —
+*"island bodies scroll at a 420px cap so a tall island never swallows the map"*
+— is now what the code does rather than what the code approximates.
+
+### A second defect, found by driving, not by reading
+
+`composer_modal` handled its close by clearing the selected scenario and the
+draft, and never set `composer_visible = false`. The modal therefore stayed on
+screen, re-rendered with an empty book, and had no way out. The flag is written
+in `open_composer` and by `apply_login`; this was the only other place that had
+to write it, and nothing about reading `composer_modal` suggests it. Found
+because the harness clicks the composer's ✕ and then asks whether a modal is up.
+
+### Verification
+
+`scripts/ui-shoot/verify-scroll.sh`, seventeen checks, three consecutive clean
+runs. The invariant it asserts is per frame, over the numbers the app printed:
+**the column offset moved only when no body under the pointer had room**. Scoped
+to the pointer deliberately — "some island had room" is true on every frame,
+and a checker phrased that way reported fifteen violations per gesture against a
+chain behaving exactly as designed.
+
+Alongside it, and each confirmed on a render: the composer button is located in
+the frame, clicked, opens the composer, and the ✕ closes it. The wheel over a
+gap moves the column. The wheel over a body that fits moves the column. The
+wheel over the map moves neither. And with the column back at the top, the body
+takes the wheel again.
+
+`--lib` 300 pass with the same two pre-existing failures as before this work;
+`--bin tfg` 44 pass; four new chrome tests pin who owns the wheel and the
+slack.
 
 ### What the tools cost, and what they are now
 
