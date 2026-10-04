@@ -59,11 +59,6 @@ type MapReq = (u64, (f64, f64), f64, (u32, u32), u32);
 type MapResp = (u64, (f64, f64), f64, (u32, u32), egui::ColorImage);
 const CENTER: (f64, f64) = (-6.108, 106.910);
 const ZOOM: f64 = 11.0;
-/// Island scroll rule (scrollbar ticket): island bodies whose content can
-/// exceed the window scroll vertically instead of clipping. 420px fits a
-/// 640px viewport under the toolbar with room for window chrome; unbounded
-/// lists inside already-capped islands keep their own tighter cap.
-const ISLAND_SCROLL_MAX: f32 = 420.0;
 /// Inspector thumbnails are a view preference, not game state. Keep
 /// the default compact so a wide source PNG cannot expand the island;
 /// operators can still enlarge it without changing the asset or map.
@@ -1422,35 +1417,6 @@ fn add_symbol_fallbacks(ctx: &egui::Context) {
 /// map and a token is a rule that does not get checked.
 fn drop_lands_on_map(panels: &[egui::Rect], pos: egui::Pos2) -> bool {
     !panels.iter().any(|panel| panel.contains(pos))
-}
-
-/// The height a zone island should stack at, given what its content asked
-/// for.
-///
-/// `want` is the island's OWN measurement from last frame, or `None` if it
-/// has not been drawn. `declared` is the constant it was written with, which
-/// is both the first frame's height and the floor. `ceiling` keeps one
-/// unbounded body from pushing every island below it off the screen.
-///
-/// Three refusals, each for a different reason to be wrong:
-///
-/// - `None` keeps the declared height, so a column that has never been
-///   measured lays out sensibly rather than at zero.
-/// - A non-finite or non-positive `want` is the same as `None`. A layout can
-///   report nonsense — an island measured at zero height on the frame its
-///   content is empty, say — and `NaN` through `clamp` silently poisons a
-///   rect, which then drops every island under it.
-/// - The floor and ceiling are applied AFTER, so a measurement can grow an
-///   island but never shrink it below what it declared, and never past the
-///   window.
-///
-/// A free function because it is pure and this is the rule that decides
-/// whether the column is laid out at all.
-fn fitted_island_height(declared: f32, want: Option<f32>, ceiling: f32) -> f32 {
-    match want {
-        Some(w) if w.is_finite() && w > 0.0 => w.clamp(declared.min(ceiling), ceiling),
-        _ => declared.min(ceiling),
-    }
 }
 
 /// A step being written, before the server has given it an id.
@@ -8393,6 +8359,13 @@ impl ShipApp {
         );
         let kept = tfg::chrome::modal(ui.ctx(), &spec, |ui| self.composer_body(ui, open_sid));
         if !kept {
+            // `composer_visible` is what the draw loop tests, so clearing
+            // everything else without clearing it left the modal on screen
+            // with an empty book: the ✕ deselected the scenario and nothing
+            // else. Found by driving, not by reading — the flag is written in
+            // `open_composer` and by `apply_login`, and this was the only
+            // other place that had to write it.
+            self.composer_visible = false;
             self.composer_scenario = None;
             self.composer_draft = ComposerDraft::default();
             self.composer_draft_error = None;
@@ -8850,46 +8823,20 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             }
         }
 
-        // Stack by what the islands asked for LAST frame, not by the constant
-        // they were declared with.
+        // The declared height IS the height. This column used to grow every
+        // island to whatever its content measured, one frame behind, clamped
+        // to the window so a long body could not push the column past the
+        // screen. That was a workaround for bodies that could not scroll, and
+        // once they scroll it is the other half of the bug: Essentials measured
+        // ~760pt of content, so it grew to the 624pt ceiling against a 640pt
+        // window, and an island taller than the screen cannot be scrolled to
+        // by any means. Fixed footprint plus a scrolling body is the whole
+        // answer, and it is what DESIGN.md specifies.
         //
-        // The column's heights used to be hand-picked constants and they
-        // were wrong often enough that the Operator island shipped at 112pt
-        // against content needing 140 — which a render revealed and no
-        // geometry test could, because every rect involved was correct.
-        //
-        // So the column measures itself. `chrome::island_fitted_height` reads
-        // what the previous frame's draw published into the context's TEMP
-        // storage, which is why there is no field on the app holding it: temp
-        // storage is already scoped to one frame, and a parallel HashMap
-        // would be a second source of truth that can disagree with it.
-        //
-        // One frame of lag is the price, and it is the right trade against
-        // the alternative: the zone stacks by heights fixed before anything
-        // is drawn, so measuring IN ADVANCE means running every body twice,
-        // and every write a body performs would fire twice. A frame of lag
-        // cannot fire a write twice.
-        //
-        // The declared constant stays as the FIRST frame's height and as the
-        // floor, so a column that has never been measured lays out sensibly
-        // rather than at zero.
-        //
-        // Clamped both ways: an island never shrinks below what it was
-        // declared to need, and never grows past `ZONE_ISLAND_MAX` — an
-        // unbounded body (a roster of five hundred) would otherwise push the
-        // islands below it off the screen, which is worse than clipping it.
+        // So the stack is arithmetic on constants now, computed before
+        // anything is drawn, and every island is in its place on the first
+        // paint rather than growing into it over a second.
         let vp = ui.ctx().viewport_rect();
-        let ceiling = (vp.height() - tfg::tokens::ZONE_ISLAND_GAP).max(80.0);
-        let mut entries = entries;
-        for (spec, _) in entries.iter_mut() {
-            let declared = spec.size.y;
-            spec.size.y = fitted_island_height(
-                declared,
-                tfg::chrome::island_fitted_height(ui.ctx(), spec.id),
-                ceiling,
-            );
-        }
-
         let dock = self.side_dock;
         let origins = zone_island_origins(dock, vp, &entries);
         let band = tfg::chrome::zone_band(dock, vp);
@@ -8905,9 +8852,11 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             .collect();
 
         // The column is taller than the window in every state that has four
-        // islands — Planning declares 1170pt against 624pt at the app's own
-        // default size — so the zone scrolls rather than dropping the tail off
-        // the bottom, which is how Control and Fleet stopped rendering at all.
+        // islands — Planning declares 1390pt against a 584pt band at the app's
+        // own default size — so the zone scrolls rather than dropping the tail
+        // off the bottom, which is how Control and Fleet stopped rendering at
+        // all. Both scrolls are real now: this one for the column, a ScrollArea
+        // per island for the bodies.
         let content_h: f32 = stacked.iter().map(|(spec, _)| spec.size.y).sum::<f32>()
             + tfg::tokens::ZONE_ISLAND_GAP * stacked.len() as f32;
         let overflow = (content_h - band.height()).max(0.0);
@@ -8919,10 +8868,59 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         // DOWN, so scrolling down the column arrives here as a negative delta —
         // and `+=` drove the offset below zero where the clamp pinned it, which
         // looks exactly like a wheel that does nothing.
+        //
+        // CHAINED, not exclusive. Every island body scrolls inside its own rect
+        // (chrome::island_owned), and a body that can still move in the
+        // direction the wheel is turning takes the gesture; the column takes it
+        // only when no live body under the pointer can. Without the chain the
+        // two scroll at once and one gesture moves two things, which reads as
+        // a control that jumped.
+        //
+        // The measurement is last frame's, published by the island that drew
+        // it. One frame of lag on a wheel gesture is not perceptible, and it
+        // is the same trade the fitted height already makes.
         let hover = ui.ctx().input(|i| i.pointer.hover_pos());
-        if hover.is_some_and(|h| band.contains(h)) {
-            self.zone_scroll -= ui.ctx().input(|i| i.smooth_scroll_delta.y);
+        let wheel = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+        // The scroll as it stands, which is what is ON SCREEN this frame: the
+        // gesture below only decides who takes the wheel, and the offset is
+        // about to move under it either way.
+        let scroll = self.zone_scroll;
+        let body_owns_wheel = wheel != 0.0
+            && hover.is_some_and(|h| {
+                stacked.iter().any(|(spec, pos)| {
+                    if !tfg::chrome::island_on_band(*pos, scroll, band, spec.size.y) {
+                        return false;
+                    }
+                    let body = spec.content_rect(spec.rect_at(egui::pos2(pos.x, pos.y - scroll)));
+                    if !body.contains(h) {
+                        return false;
+                    }
+                    tfg::chrome::island_body_fit(ui.ctx(), spec.id).is_some_and(|fit| {
+                        // Positive wheel Y is content moving down, which is the
+                        // same direction the column subtracts towards.
+                        if wheel > 0.0 { fit.can_scroll_up() } else { fit.can_scroll_down() }
+                    })
+                })
+            });
+        let in_band = hover.is_some_and(|h| band.contains(h));
+        if in_band && !body_owns_wheel {
+            self.zone_scroll -= wheel;
         }
+        // The island whose body claimed the gesture, for the debug line. The
+        // check needs it by NAME: "did a body have room" is not the same
+        // question as "did a body under the POINTER have room", and only the
+        // second one is the invariant.
+        let wheel_owner = stacked
+            .iter()
+            .find(|(spec, pos)| {
+                hover.is_some_and(|h| {
+                    tfg::chrome::island_on_band(*pos, scroll, band, spec.size.y)
+                        && spec
+                            .content_rect(spec.rect_at(egui::pos2(pos.x, pos.y - scroll)))
+                            .contains(h)
+                })
+            })
+            .map(|(spec, _)| spec.id);
         // Re-clamped every frame rather than only while hovering, because the
         // overflow changes with the state: a scroll set in Planning must not
         // strand the column past its own end in Execution.
@@ -8931,7 +8929,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
 
         if std::env::var("TFG_ZONE_DEBUG").is_ok() {
             eprintln!(
-                "zone: band={:?} stacked={} content_h={:.0} overflow={:.0} scroll={:.0} dock={:?} hover={:?} in_band={} delta={:.1}",
+                "zone: band={:?} stacked={} content_h={:.0} overflow={:.0} scroll={:.0} dock={:?} hover={:?} in_band={} delta={:.1} wheel_owner={:?}",
                 band,
                 stacked.len(),
                 content_h,
@@ -8939,11 +8937,27 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 scroll,
                 dock,
                 hover,
-                hover.is_some_and(|h| band.contains(h)),
-                ui.ctx().input(|i| i.smooth_scroll_delta.y)
+                in_band,
+                ui.ctx().input(|i| i.smooth_scroll_delta.y),
+                wheel_owner.map(|id| format!("{id:?}"))
             );
             for (spec, pos) in &stacked {
-                eprintln!("  {:?} pos=({:.0},{:.0}) h={:.0}", spec.id, pos.x, pos.y, spec.size.y);
+                // The body measurement on the SAME line as the column offset, so
+                // one line answers "who took this gesture" without the reader
+                // having to correlate two. `verify-scroll.sh` asserts on the
+                // pair: the offset moved AND no body under the pointer had room
+                // is the whole invariant, and it is only checkable if both
+                // numbers are adjacent.
+                let fit = tfg::chrome::island_body_fit(ui.ctx(), spec.id);
+                // Width as well as height, because `verify-scroll.sh` crops to
+                // an island to find its buttons and was guessing the width from
+                // a constant while reading the height from here. Half the
+                // geometry came from one source and half from another, which is
+                // how a crop became `380x+212+320`.
+                eprintln!(
+                    "  {:?} pos=({:.0},{:.0}) size={:.0}x{:.0} body={:?}",
+                    spec.id, pos.x, pos.y, spec.size.x, spec.size.y, fit
+                );
             }
         }
 
@@ -8986,24 +9000,6 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 }
             });
 
-            // The loud half of the clip. An island whose content did not fit
-            // is a hand-picked height that is wrong, and it is reported here
-            // rather than left for a screenshot to reveal: the Operator
-            // island shipped at 112pt against content needing more, and the
-            // overflow was invisible to every geometry test because every
-            // rect involved was correct.
-            //
-            // Logged, not shown. The operator cannot act on it — the height
-            // is a constant — but a developer reading stderr can, and a
-            // silently missing button on a form looks like a bug in the form.
-            if tfg::chrome::island_overflowed(ui.ctx(), spec.id) {
-                eprintln!(
-                    "island {:?} (\"{}\") does not fit: {}pt given, content needs more",
-                    spec.id,
-                    spec.title,
-                    spec.size.y
-                );
-            }
         }
     }
 
@@ -13787,7 +13783,7 @@ impl eframe::App for ShipApp {
                 "Roster",
                 egui::vec2(300.0, 420.0),
             );
-            tfg::chrome::island_scrolled(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
+            tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
             ui.label(format!("{} ships — click a name to follow", markers.len()));
             if markers.is_empty() {
                 ui.weak("No ships in view — place hulls from Fleet, or check the feed.");
@@ -13799,10 +13795,10 @@ impl eframe::App for ShipApp {
                 ui.checkbox(&mut self.show_trail, "trails");
             }
             ui.separator();
-            // The island body scrolls as one column (chrome::island_scrolled),
-            // so the marker list no longer carries its own 300px cap. That
-            // cap existed to stop a Window growing; a fixed-footprint
-            // island does not grow.
+            // The island body scrolls as one column (chrome::island), so the
+            // marker list no longer carries its own 300px cap. That cap
+            // existed to stop a Window growing; a fixed-footprint island
+            // scrolls instead.
             {
             for m in &markers {
                 ui.horizontal(|ui| {
@@ -13914,7 +13910,7 @@ impl eframe::App for ShipApp {
                 "Inspector",
                 egui::vec2(300.0, 320.0),
             );
-            tfg::chrome::island_scrolled(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
+            tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
             ui.heading("Inspector");
             let mut follow_selected: Option<(String, (f64, f64))> = None;
             let mut focus_group: Option<(String, (f64, f64))> = None;
@@ -14210,7 +14206,7 @@ impl eframe::App for ShipApp {
                 "Orders",
                 egui::vec2(380.0, 360.0),
             );
-            tfg::chrome::island_scrolled(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
+            tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
             self.orders_body(ui);
             });
             self.show_orders = open;
@@ -14230,9 +14226,7 @@ impl eframe::App for ShipApp {
                 egui::vec2(300.0, 300.0),
             );
             tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
-                egui::ScrollArea::vertical().max_height(ISLAND_SCROLL_MAX).show(ui, |ui| {
                 self.login_island(ui);
-                });
             });
             self.show_login = open;
             self.login_pos = pos;
@@ -14249,7 +14243,7 @@ impl eframe::App for ShipApp {
                 "Log",
                 egui::vec2(420.0, 260.0),
             );
-            tfg::chrome::island_scrolled(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
+            tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
                 self.log_island(ui);
             });
             self.show_log = open;
@@ -14265,7 +14259,7 @@ impl eframe::App for ShipApp {
                 "Messages",
                 egui::vec2(420.0, 300.0),
             );
-            tfg::chrome::island_scrolled(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
+            tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
                 self.messages_island(ui);
             });
             self.show_messages = open;
@@ -16071,69 +16065,6 @@ mod tests {
     fn an_empty_step_is_not_the_drafts_business() {
         let d = ComposerDraft::default();
         assert_eq!(d.problem(), None, "content is the server's rule, not the draft's");
-    }
-
-    // -- the column measures itself -----------------------------------------
-    //
-    // The heights used to be hand-picked constants, and they were wrong often
-    // enough that the Operator island shipped at 112pt against content
-    // needing 140. The column now stacks at what each island measured last
-    // frame, so these are the rules that decide whether it lays out at all.
-
-    /// With no measurement the declared constant is used, unchanged.
-    ///
-    /// The first frame has no measurement, and a column laid out at zero is
-    /// not a transient state to be waited out — it is the first thing anyone
-    /// sees.
-    #[test]
-    fn an_unmeasured_island_keeps_its_declared_height() {
-        assert_eq!(fitted_island_height(140.0, None, 900.0), 140.0);
-    }
-
-    /// A measurement grows the island, which is the whole point.
-    #[test]
-    fn a_measurement_grows_the_island() {
-        assert_eq!(fitted_island_height(70.0, Some(140.0), 900.0), 140.0);
-        // And a small one does not shrink it past what it declared: the
-        // constant is a floor, so a frame with less content cannot make the
-        // island jump about.
-        assert_eq!(fitted_island_height(140.0, Some(98.0), 900.0), 140.0);
-    }
-
-    /// A nonsense measurement is refused rather than clamped.
-    ///
-    /// `NaN` through `clamp` silently poisons a rect, and a poisoned rect
-    /// drops every island under it — so this is the case where a bad
-    /// measurement is worse than no measurement.
-    #[test]
-    fn a_nonsense_measurement_is_refused() {
-        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -50.0] {
-            assert_eq!(
-                fitted_island_height(140.0, Some(bad), 900.0),
-                140.0,
-                "{bad} must fall back to the declared height"
-            );
-        }
-    }
-
-    /// One unbounded body must not push the islands below it off the screen.
-    #[test]
-    fn a_measurement_cannot_exceed_the_ceiling() {
-        assert_eq!(fitted_island_height(140.0, Some(5000.0), 900.0), 900.0);
-        // And a declared height above the ceiling is itself clamped, or the
-        // first frame would overflow the window before any measurement
-        // arrives.
-        assert_eq!(fitted_island_height(5000.0, None, 900.0), 900.0);
-    }
-
-    /// The picker is not a modal, so nothing about it goes in here — but the
-    /// three modals all size themselves against this same window.
-    #[test]
-    fn a_micro_window_still_yields_a_usable_ceiling() {
-        // The caller's `ceiling` is `max(80.0)`-guarded, but the function
-        // must not produce a negative or inverted range if handed one.
-        assert_eq!(fitted_island_height(140.0, Some(400.0), 0.0), 0.0);
-        assert!(fitted_island_height(140.0, Some(400.0), 0.0) >= 0.0);
     }
 
     // -- the picker's drop target -------------------------------------------

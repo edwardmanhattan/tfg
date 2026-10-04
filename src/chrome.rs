@@ -304,12 +304,14 @@ fn paint_close(painter: &Painter, rect: Rect, hot: bool) {
 /// background is painted before the content runs — an `Area` has no size
 /// until its content has been laid out, and a background painted afterwards
 /// would land on top of the content. So `spec.size` is the island's real
-/// size, and a body taller than `content_rect` is clipped, not grown.
+/// size, and content taller than `content_rect` scrolls inside it rather
+/// than growing the panel or being cut off.
 ///
-/// Put a `ScrollArea` in the body if the content can exceed the island.
-/// That is not a workaround, it is the reason a console island has a
-/// stable footprint: a panel that resizes under the cursor while the
-/// operator is reading a map is worse than one that scrolls.
+/// The body scrolls inside that fixed rect, always. That is not a
+/// workaround, it is the reason a console island has a stable footprint:
+/// a panel that resizes under the cursor while the operator is reading a
+/// map is worse than one that scrolls — and a panel that CLIPS is worse
+/// than both, because what it cuts is content nobody can scroll to.
 ///
 /// `pos` is read before the area opens and written after, so a drag from
 /// the previous frame is applied first — the same ordering `egui::Window`
@@ -389,8 +391,7 @@ pub fn island_owned(
     }
     let mut title_resp: Option<Response> = None;
     let mut clicked_close = false;
-    let mut overflowed = false;
-    let mut fitted: Option<f32> = None;
+    let mut fit: Option<BodyFit> = None;
 
     egui::Area::new(spec.id)
         .fixed_pos(island_pos)
@@ -480,31 +481,30 @@ pub fn island_owned(
             // hovering the ✕ lit it and clicking it did nothing, on every
             // island and in every modal.
 
-            // Body, in a fixed rect, and CLIPPED to it.
+            // Body, in a fixed rect, SCROLLING inside it.
             //
-            // The clip is the fix for a bug this primitive could not see: the
-            // Operator island is 112pt tall, its content needed rather more,
-            // and the overflow painted over the map AND underneath the next
-            // island's title band — so a status line belonging to the identity
-            // island was legible, half-occluded, in the gap between two
-            // islands. A `max_rect` alone only tells the LAYOUT where to
-            // stop; it does not stop the PAINTER. What escapes is now
-            // invisible rather than corrupting its neighbour, which is the
-            // difference between a bug and a mistake.
+            // The scroll is not a nicety here, it is the difference between a
+            // control that exists and one that does not. This used to lay the
+            // body straight into the rect and CLIP the overflow, which is sound
+            // as paint — a `max_rect` tells the layout where to stop but not
+            // the painter, so the Operator island's overflow painted over the
+            // map and half-occluded under the next island's title band — and
+            // broken as a surface, because clipped content is UNREACHABLE
+            // content. At the app's own default 1040x640, Essentials measured
+            // ~1000pt of content against 624 available, so the composer and
+            // everything under it were simply not on the screen, and scrolling
+            // the COLUMN could not bring them there: the column moves whole
+            // islands, and this island was taller than the window.
             //
-            // `band` in that intersection is load-bearing, and it was easy to
-            // miss: this scope re-clips to the island's own content rect, which
-            // OVERWRITES the band clip set above. Without it a scrolled island
-            // paints its body up over the top band, which the drag clamp used to
-            // make impossible because it held every island at or below the
-            // window top. The scroll removed that guarantee, so the clip carries
-            // it now.
+            // `auto_shrink([false, false])` because the FOOTPRINT is fixed by
+            // contract (DESIGN.md: "An island does not resize to fit its
+            // content. The body scrolls."). Left on, the scroll area would
+            // shrink-wrap its content and a short body would leave a gap under
+            // itself inside a panel sized for the long case.
             //
-            // Clipping is not the same as fitting: content that does not fit
-            // is now lost quietly instead of loudly. The honest fix is for
-            // the caller to size its island to its content, and that is a
-            // layout question this primitive deliberately does not answer —
-            // the zone stacks by fixed heights before anything is drawn.
+            // `id_salt`, so two islands with identical bodies keep independent
+            // offsets — which is what stops scrolling one from scrolling the
+            // other.
             let content = spec.content_rect(rect);
             ui.scope_builder(
                 UiBuilder::new()
@@ -512,31 +512,28 @@ pub fn island_owned(
                     .layout(Layout::top_down(egui::Align::LEFT))
                     .sense(Sense::hover()),
                 |ui| {
+                    // `band` in that intersection is load-bearing: this scope
+                    // re-clips to the island's own content rect, which
+                    // OVERWRITES the band clip set above, so without the band a
+                    // scrolled island paints its body up over the top band.
                     ui.set_clip_rect(content.intersect(ui.max_rect()).intersect(band));
-                    body(ui);
-                    // Whether the body needed MORE room than it was given.
-                    //
-                    // The clip above makes an overflow quiet, and quiet is
-                    // worse than loud when the height is a hand-picked
-                    // constant: the Operator island shipped at 112pt against
-                    // content needing more, and nothing said so until a
-                    // screenshot. So the fact is published rather than
-                    // swallowed — see `island_overflowed`.
-                    // A LINE, not a hair. The first threshold was 0.5pt and
-                    // it reported EVERY island, because a layout's
-                    // `min_rect` runs a few points past the last control for
-                    // trailing spacing: the Operator island measured 98.4
-                    // against 94 available and rendered with visible slack
-                    // under the button. So the tolerance has to be at least
-                    // one line, and anything below that is padding noise
-                    // rather than a cut control. 12pt separates the two cases
-                    // cleanly: the real 112pt overflow measured ~52pt over,
-                    // and this noise measures 4pt.
-                    let used = ui.min_rect().height();
-                    overflowed = used > content.height() + OVERFLOW_SLACK;
-                    // `min_rect()` reports the content's natural height even
-                    // when handed a smaller rect — measured, not assumed.
-                    fitted = Some(spec.size.y - content.height() + used);
+                    let scrolled = egui::ScrollArea::vertical()
+                        .id_salt(spec.id.with("__body_scroll"))
+                        .auto_shrink([false, false])
+                        .show(ui, body);
+                    // `content_size`, NOT `ui.min_rect()`. The rect handed to a
+                    // ScrollArea is the scroll AREA, so `min_rect` reports the
+                    // viewport and every island measures as an exact fit —
+                    // which reads as "nothing overflows" while the content is
+                    // being cut. `content_size` is the content's own natural
+                    // extent (`content_ui.min_size()`, scroll_area.rs:1082), so
+                    // this is the measurement the clipped version made, and it
+                    // stays correct with a scroll in the way.
+                    fit = Some(BodyFit {
+                        content_h: scrolled.content_size.y,
+                        viewport_h: content.height(),
+                        offset: scrolled.state.offset.y,
+                    });
                 },
             );
 
@@ -550,85 +547,88 @@ pub fn island_owned(
     if clicked_close {
         *open = false;
     }
-    ctx.data_mut(|d| {
-        d.insert_temp(island_overflow_key(spec.id), overflowed);
-        if let Some(f) = fitted {
-            d.insert_temp(island_fitted_key(spec.id), f);
-        }
-    });
+    if let Some(f) = fit {
+        ctx.data_mut(|d| d.insert_temp(island_fit_key(spec.id), f));
+    }
     title_resp
 }
 
-/// The key an island's overflow flag is filed under in the context's temp
-/// storage.
+/// What one island body measured about itself, published so the zone can
+/// decide who owns the wheel.
+///
+/// Three numbers and no more, and each one is load-bearing for a decision
+/// that cannot be made any other way. `content_h` against `viewport_h` is
+/// whether the body has anywhere to scroll at all; `offset` is where in its
+/// range it already is. Together they answer "does this body still have room
+/// in the direction the operator is turning the wheel", which is the whole
+/// of scroll chaining — and which no caller can work out for itself, because
+/// the body is laid out inside here.
+///
+/// A body that fits reports `content_h` within a few points of `viewport_h`
+/// and answers `false` to both, so a caller can ask every island the same
+/// question without first working out which of them are tall.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BodyFit {
+    /// The height the content asked for.
+    pub content_h: f32,
+    /// The height it was given.
+    pub viewport_h: f32,
+    /// How far the body is scrolled down. Positive is further down.
+    pub offset: f32,
+}
+
+impl BodyFit {
+    /// Whether the body has more content below the fold than above it.
+    ///
+    /// False for a body that fits, and for one already at the bottom — which
+    /// is the case that hands the wheel back to the column.
+    pub fn can_scroll_down(&self) -> bool {
+        self.content_h - self.viewport_h - self.offset > BODY_SCROLL_SLACK
+    }
+
+    /// Whether the body has more content above the fold than below it.
+    pub fn can_scroll_up(&self) -> bool {
+        self.offset > BODY_SCROLL_SLACK
+    }
+}
+
+/// How far a body is from its limit before it counts as being at it.
+///
+/// Half a point past the limit, to absorb floating-point residue in the offset.
+/// Larger and the last pixels of an island's content cannot be scrolled to;
+/// smaller and a body reports room it does not have, which strands the wheel on
+/// a body that will not move.
+const BODY_SCROLL_EPSILON: f32 = 0.5;
+
+/// Content a body may run past its viewport without claiming the wheel.
+///
+/// One text line, and it is the same number `OVERFLOW_SLACK` used to be for the
+/// same reason. A layout's measured extent runs a few points past the last
+/// control for trailing spacing: the Operator island measures 98.4 against 94
+/// available, 4pt of nothing at the bottom.
+///
+/// Without this, that 4pt is scrollable, so the Operator body claims the first
+/// wheel gesture, moves four points the operator cannot see, and the column
+/// does not move. A gesture that appears to do nothing is the exact failure
+/// this whole mechanism exists to avoid, and it would be reintroduced by four
+/// points of trailing spacing.
+///
+/// Twelve points is the tolerance `OVERFLOW_SLACK` was pinned at, for the same
+/// measurement and the same reason.
+const BODY_SCROLL_SLACK: f32 = 12.0;
+
+/// The key an island's body measurement is filed under.
+fn island_fit_key(id: Id) -> Id {
+    id.with("__body_fit")
+}
+
+/// What island `id`'s body measured, or `None` if it has not been drawn.
 ///
 /// TEMP, deliberately: this is a fact about one frame's layout, and a
 /// persistent entry would outlive the island that set it — a closed island
-/// would keep reporting an overflow from whenever it was last drawn, and
-/// nothing would be able to tell the difference.
-fn island_overflow_key(id: Id) -> Id {
-    id.with("__overflow")
-}
-
-/// Whether an island's body did not fit the rect it was given.
-///
-/// Published by `island_owned` and read by the zone, which reports it rather
-/// than leaving the operator to notice that a control has gone missing.
-///
-/// This is the loud half of the clip. Clipping alone turned "corrupts the
-/// island below" into "silently loses a control", which is not obviously an
-/// improvement — a form whose button has vanished looks like a bug in the
-/// form. With this, a wrong height is a line in the log the moment it
-/// happens.
-///
-/// FALSE when the island has not been drawn this frame, because "not drawn"
-/// is not "did not fit".
-pub fn island_overflowed(ctx: &Context, id: Id) -> bool {
-    ctx.data(|d| d.get_temp::<bool>(island_overflow_key(id)))
-        .unwrap_or(false)
-}
-
-/// The key an island's fitted height is filed under.
-fn island_fitted_key(id: Id) -> Id {
-    id.with("__fitted")
-}
-
-/// The island height its content actually wanted, or `None` if it has not
-/// been drawn since the last read.
-///
-/// This is what makes the zone self-sizing WITHOUT running any body twice.
-///
-/// `min_rect()` reports the content's natural height even when it was handed
-/// a smaller rect — measured, not assumed: the Operator island measured 98.4
-/// against 94 available, so the layout was not clamped. So an island can
-/// draw at whatever height it was given and then say what it would have
-/// preferred, and the column can use that on the NEXT frame.
-///
-/// One frame of lag is the whole price, and it is the right trade against the
-/// alternative: the zone stacks by heights fixed before anything is drawn, so
-/// measuring in advance means running every body twice, and running a body
-/// twice double-fires its writes. A frame of lag cannot fire a write twice.
-///
-/// TEMP storage, like the overflow flag — this is a fact about one frame.
-pub fn island_fitted_height(ctx: &Context, id: Id) -> Option<f32> {
-    ctx.data(|d| d.get_temp::<f32>(island_fitted_key(id)))
-}
-
-/// Convenience for the common shape: a fixed-size island whose body
-/// scrolls, which is every island in the console set.
-pub fn island_scrolled(
-    ctx: &egui::Context,
-    spec: &Island,
-    pos: &mut Pos2,
-    open: &mut bool,
-    body: impl FnOnce(&mut Ui),
-) -> Option<Response> {
-    island(ctx, spec, pos, open, |ui| {
-        egui::ScrollArea::vertical()
-            .id_salt(spec.id.with("__scroll"))
-            .auto_shrink([false, false])
-            .show(ui, body);
-    })
+/// would keep answering for a body nobody can see.
+pub fn island_body_fit(ctx: &Context, id: Id) -> Option<BodyFit> {
+    ctx.data(|d| d.get_temp::<BodyFit>(island_fit_key(id)))
 }
 
 // ---------------------------------------------------------------------------
@@ -895,20 +895,6 @@ impl Modal {
 /// islands behind still read as clearly recessed. 104 it is.
 pub const MODAL_BACKDROP_ALPHA: u8 = 104;
 
-/// How far an island's content may run past its rect before it counts as
-/// overflowing.
-///
-/// ONE TEXT LINE, and that is the whole argument. A layout's `min_rect`
-/// extends a few points past the last control for trailing spacing, so a
-/// zero tolerance reports every island in the column and the signal means
-/// nothing — which is worse than no signal, because the first person to see
-/// it ignores it.
-///
-/// Measured: the Operator island at 140pt reports 98.4 used against 94
-/// available and renders with slack under the button. The same island at the
-/// original 112pt ran about 52pt over, which is the case worth catching.
-pub const OVERFLOW_SLACK: f32 = 12.0;
-
 /// Title row height. Smaller than an island's band because a modal has no
 /// chamfer and no drag region, so the band is carrying only a label and a
 /// close button.
@@ -1083,38 +1069,6 @@ mod tests {
     }
 
     use super::*;
-
-    /// The overflow threshold is a LINE, not a hair, and the reason is a
-    /// measurement rather than taste.
-    ///
-    /// At 0.5pt every island in the column reported, because a layout's
-    /// `min_rect` runs a few points past the last control for trailing
-    /// spacing — the Operator island measures 98.4 against 94 available and
-    /// renders with visible slack under the button. A signal that fires on
-    /// everything is worse than no signal, because the first person to see it
-    /// learns to ignore it.
-    ///
-    /// Pinned rather than left as a judgement call, because the failure mode
-    /// is silent in both directions: too tight and every island screams, too
-    /// loose and the real overflow ships again.
-    #[test]
-    fn the_overflow_threshold_is_one_line_not_a_hair() {
-        // The padding noise this exists to absorb, measured.
-        assert!(
-            OVERFLOW_SLACK >= 4.0,
-            "trailing spacing measured ~4pt; a smaller threshold reports every island"
-        );
-        // The real overflow it must still catch, measured.
-        assert!(
-            OVERFLOW_SLACK <= 20.0,
-            "the Operator island at 112pt ran ~52pt over and must still be caught"
-        );
-        // Below a line of text, or a label would be cut before it counts.
-        assert!(
-            OVERFLOW_SLACK < 20.0,
-            "a threshold at or past the body text line hides a cut label"
-        );
-    }
 
     /// The backdrop's two jobs are independent and both are load-bearing.
     /// "No dim" must not have been implemented as "no backdrop", or a drag
@@ -1346,5 +1300,98 @@ mod tests {
         assert!(body.right() <= rect.right());
         assert!(body.top() >= rect.top() + MODAL_TITLE_H);
         assert!(body.bottom() <= rect.bottom());
+    }
+
+    // -- who owns the wheel -------------------------------------------------
+    //
+    // The rule the whole side zone's scrolling rests on, and the one thing
+    // about it that cannot be checked by looking at the picture: a body that
+    // has taken the gesture must not also have left it for the column.
+
+    fn fit(content_h: f32, viewport_h: f32, offset: f32) -> BodyFit {
+        BodyFit {
+            content_h,
+            viewport_h,
+            offset,
+        }
+    }
+
+    /// A body whose content fits takes no wheel at all, in either direction.
+    ///
+    /// This is the case that keeps the column reachable. The Operator island is
+    /// 140pt holding about 98pt, so if it swallowed the wheel the operator could
+    /// only scroll the zone by finding the 16pt gaps between islands.
+    #[test]
+    fn a_body_that_fits_takes_no_wheel() {
+        // The Operator island as measured: 98pt of content, 94pt of viewport,
+        // and 4pt of trailing spacing that is not content at all.
+        let f = fit(98.4, 94.0, 0.0);
+        assert!(
+            !f.can_scroll_down(),
+            "4pt of trailing spacing is not something to scroll to"
+        );
+        assert!(!f.can_scroll_up(), "a fitting body has nothing above the fold");
+    }
+
+    /// The slack is a line, not a hair, and the reason is the Operator island.
+    ///
+    /// At zero tolerance that island claims a gesture for four points of
+    /// nothing. At a point and a half it claims one for a control an operator
+    /// might genuinely be trying to reach. Between those, and pinned rather
+    /// than left to judgement, because both failure modes are silent.
+    #[test]
+    fn the_slack_is_one_text_line() {
+        assert!(
+            BODY_SCROLL_SLACK >= 4.0,
+            "trailing spacing measured ~4pt; less claims gestures for nothing"
+        );
+        assert!(
+            BODY_SCROLL_SLACK <= 20.0,
+            "more than a line hides real content below the fold"
+        );
+    }
+
+    /// A long body takes the wheel down, and not up, until it reaches its end.
+    ///
+    /// The Essentials case as measured: 759pt of content in a 334pt viewport.
+    /// That is 425pt of travel, and every point of it has to be reachable or the
+    /// composer's button is not on the screen.
+    #[test]
+    fn a_long_body_takes_the_wheel_down_only() {
+        let mut f = fit(759.0, 334.0, 0.0);
+        assert!(f.can_scroll_down(), "425pt of content below the fold");
+        assert!(!f.can_scroll_up(), "nothing above the fold at the top");
+
+        f.offset = 240.0;
+        assert!(f.can_scroll_down(), "still 185pt below the fold");
+        assert!(f.can_scroll_up(), "240pt above the fold now");
+
+        f.offset = 425.0;
+        assert!(
+            !f.can_scroll_down(),
+            "at the end, the column is entitled to the gesture"
+        );
+    }
+
+    /// At the limit is at the limit, within the slack.
+    ///
+    /// The gap between `BODY_SCROLL_EPSILON` and `BODY_SCROLL_SLACK` is the
+    /// whole of "close enough": residue inside the epsilon is not a limit, and
+    /// content inside the slack is not reachable. Anything that asked for
+    /// better than this would either be claiming gestures for trailing spacing
+    /// or making the last line of a form unreachable.
+    #[test]
+    fn the_limit_is_reached_within_the_slack() {
+        let room = 425.0;
+        assert!(
+            !fit(759.0, 334.0, room - BODY_SCROLL_EPSILON).can_scroll_down(),
+            "inside the epsilon of the end is the end"
+        );
+        assert!(
+            fit(759.0, 334.0, room - BODY_SCROLL_SLACK - BODY_SCROLL_EPSILON).can_scroll_down(),
+            "a line short of the end is not the end"
+        );
+        assert!(!fit(759.0, 334.0, BODY_SCROLL_EPSILON).can_scroll_up());
+        assert!(fit(759.0, 334.0, BODY_SCROLL_SLACK + BODY_SCROLL_EPSILON).can_scroll_up());
     }
 }

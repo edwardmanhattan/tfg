@@ -184,10 +184,7 @@ pub const ZONE_TOP_GAP: f32 = 56.0;
 /// by half of `w`.
 pub const CAMERA_OFFSET_FRACTION: f32 = 0.5;
 
-/// An island body caps its scroll here so a tall island cannot swallow the
-/// map. A panel that grows under the cursor while someone is reading a map
-/// is worse than one that scrolls.
-pub const ISLAND_SCROLL_MAX: f32 = 420.0;
+
 
 /// The rhythm. Item spacing 10 × 8, button padding 10 × 6, indent 20.
 pub const ITEM_SPACING: Vec2 = vec2(10.0, 8.0);

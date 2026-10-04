@@ -33,8 +33,7 @@ That leaves three options, and two of them are bad:
 
 ## Decision
 
-Islands are an owned `Area` — `tfg::chrome::island` / `island_scrolled` — not
-`egui::Window`.
+Islands are an owned `Area` — `tfg::chrome::island` — not `egui::Window`.
 
 `Area` supplies position memory, viewport constraining, layer ordering and
 sizing, so what is actually written by hand is the title band, the drag

@@ -1300,7 +1300,7 @@ impl eframe::App for Proto {
                     let trailing = spec.trailing.clone();
                     let z = chrome::zone_width();
                     if title == "Roster" {
-                        chrome::island_scrolled(&ctx, spec, &mut pos, &mut open, |ui| {
+                        chrome::island(&ctx, spec, &mut pos, &mut open, |ui| {
                             roster_ui(ui, &mut selected);
                         });
                     } else {
@@ -1322,7 +1322,7 @@ impl eframe::App for Proto {
             let mut open = self.island_open;
             let selected = self.selected;
             let mut selected = selected;
-            chrome::island_scrolled(&ctx, &spec, &mut pos, &mut open, |ui| {
+            chrome::island(&ctx, &spec, &mut pos, &mut open, |ui| {
                 ui.label(format!("{} ships — click a name to follow", ROSTER.len()));
                 ui.separator();
                 roster_ui(ui, &mut selected);
