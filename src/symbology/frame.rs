@@ -293,6 +293,89 @@ fn quatrefoil_polygon(cx: f64, cy: f64, box_px: f64) -> Vec<(f64, f64)> {
     out
 }
 
+/// The radius of the largest disc that clears EVERY frame, in logical pixels.
+///
+/// This is the radius of the base circle the map paints under whichever glyph
+/// a hull wears: a marker is drawn once, for whichever allegiance it resolves
+/// to, so a disc sized off any one frame would cross the other three.
+///
+/// MEASURED against the four polygons rather than computed, and the diamond
+/// is the winner — its edge passes `box / (2 * sqrt 2)` from the centre, which
+/// is less than the half-height the rectangle and square offer and less than
+/// the quatrefoil's filleted core.
+///
+/// Measured rather than derived because the measurement is the only version
+/// that survives the outline being a polyline: the quatrefoil is flattened
+/// from a curve, and reading its clearance off the curve rather than the
+/// stroked segments is how a disc ends up sized to a shape nobody paints.
+/// Two things had to be got right for that, and both were wrong first: the
+/// four runs are concatenated into one vector, so `i -> i + 1 mod len` joins
+/// the end of one lobe to the start of the next in a chord across the middle
+/// of the shape; and each run repeats its first point as its last, so the
+/// trailing pair is zero-length. Neither is an edge, and treating either as
+/// one reports a clearance of zero — which is a disc of no size at all.
+///
+/// Deriving it at all is what caught the bug it replaced: the disc was a
+/// literal 8.0 while the tightest frame cleared 7.78 at the old 22 px box, so
+/// the hostile frame was already being painted over by a fifth of a pixel.
+pub fn tightest_clearance_px(box_px: f64) -> f64 {
+    frame_clearances_px(box_px)
+        .into_iter()
+        .map(|(_, radius)| radius)
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// The clearance the four frames give, as `(frame, radius)` pairs.
+///
+/// Split out from [`tightest_clearance_px`] so a caller can see WHICH frame is
+/// the tight one, and so a test can assert the winner rather than only the
+/// minimum. That distinction is the whole content of this module's arithmetic:
+/// the tight case is the quatrefoil's fillets, not the diamond, and both a
+/// hand-picked constant and a plausible closed form get it wrong.
+pub fn frame_clearances_px(box_px: f64) -> Vec<(SymbolFrame, f64)> {
+    Affiliation::ALL
+        .iter()
+        .map(|a| frame_for(*a))
+        .map(|frame| (frame, frame_clearance_px(frame, box_px)))
+        .collect()
+}
+
+/// One frame's own clearance: the distance from the centre to the nearest edge
+/// it is actually stroked from.
+pub fn frame_clearance_px(frame: SymbolFrame, box_px: f64) -> f64 {
+    let poly = frame_polygon(frame, (0.0, 0.0), box_px);
+    // A REAL EDGE LIST, not `i -> i + 1 mod len`. The quatrefoil comes back as
+    // several flattened runs concatenated into one vector, so the wrap-around
+    // segment would join the end of one lobe to the start of the next — a chord
+    // straight across the middle of the shape, passing through the centre.
+    // Measuring that gives a clearance of zero. Consecutive points within a run
+    // are the edges that are actually stroked.
+    poly.windows(2)
+        .map(|w| {
+            let (a, b) = (w[0], w[1]);
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let len2 = dx * dx + dy * dy;
+            if len2 < 1e-18 {
+                // NOT AN EDGE: `quatrefoil_polygon` repeats each flattened
+                // run's first point as its last, so every run ends in a
+                // zero-length pair. Reporting it as a clearance of zero would
+                // make the tightest frame read as 0 px and the disc derived
+                // from it collapse. A degenerate segment has no distance to
+                // report, so it is skipped and the real edges decide.
+                return f64::INFINITY;
+            }
+            // Clamped, because the quatrefoil turns sharply at each inner
+            // corner: the perpendicular foot from the centre onto the segment
+            // leaving that corner falls OUTSIDE it, so the distance to the
+            // infinite line over-reports the real clearance and would let the
+            // disc cross the frame.
+            let t = ((-a.0) * dx + (-a.1) * dy) / len2;
+            let t = t.clamp(0.0, 1.0);
+            (-(a.0 + t * dx)).hypot(-(a.1 + t * dy))
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// The largest radius an icon may occupy inside a frame.
 ///
 /// 2525 builds a symbol by filling its frame rather than floating a small glyph
@@ -584,3 +667,4 @@ mod tests {
         assert!(FRAME_TOLERANCE_UNITS * (EM_BOX / REFERENCE_SIDE) - MIN_ARC_SAGITTA_EM < 1e-9);
     }
 }
+

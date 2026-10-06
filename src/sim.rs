@@ -101,6 +101,16 @@ pub enum SimCommand {
     /// Unknown ids are refused, never fallen back (H10): inventing a
     /// ship's abilities is worse than standing it down.
     TakeControl { ship_id: String, pos: GeoPosition, class_id: String },
+    /// A standing hull's STARTING position moved — the operator dragging a
+    /// placement to a new spot on the map, which is editable until the
+    /// exercise begins and frozen after it.
+    ///
+    /// Separate from [`TakeControl`](Self::TakeControl) because that one
+    /// stands a hull up and never moves one: `or_insert_with` leaves an
+    /// existing hull exactly where it was, which was right while placement
+    /// could only ever happen once and has stopped being true now that a
+    /// placed hull is a thing you can pick up.
+    MovePlacement { ship_id: String, pos: GeoPosition },
     /// Push Minos-synced figures into the sim's catalog (H10): the sim
     /// owns a catalog of its own, and UI-side runtime classes would
     /// otherwise resolve to nothing here. Same namespaced shape as
@@ -386,6 +396,26 @@ impl SimSource {
                         class,
                         held_by: Authority::UNIT,
                     });
+                }
+                SimCommand::MovePlacement { ship_id, pos } => {
+                    // A hull that is not standing is not moved: there is
+                    // nothing on the map to move, and inventing one here
+                    // would put a ship up with no class behind it.
+                    let Some(ship) = self.ships.get_mut(&ship_id) else { continue };
+                    if ship.pos == pos {
+                        continue;
+                    }
+                    // Journaled beside the take-control placement (#41):
+                    // a session log that replays where the force STARTED
+                    // has to carry the moves too, or the replay puts every
+                    // hull at the position it was first dropped at.
+                    self.journal.append(
+                        self.clock.game_now_ts(),
+                        "organizer",
+                        LogKind::Command,
+                        serde_json::json!({"event": "move-placement", "ship": ship_id, "lat": pos.latitude, "lon": pos.longitude}),
+                    );
+                    ship.pos = pos;
                 }
                 SimCommand::UpsertClass {
                     minos_class_id,

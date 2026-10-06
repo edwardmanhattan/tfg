@@ -27,8 +27,8 @@ Rendered as a contact sheet and looked at, which is the only way to see this:
 
 - Eight sea roles — cargo, tow, tug, fishing, trawler, merchant, container,
   roll-on/roll-off — are **the same trapezoid hull**, differing only in a
-  superstructure box that is absent or identical. At the 22 px the map draws,
-  they are one icon.
+  superstructure box that is absent or identical. At the size the map drew when
+  this was written (22 px), they are one icon.
 - Surface combatant, patrol, amphibious warfare ship, carrier and mine warfare
   vessel are **the same downward arrow**, differing by one or two steps in the
   tail. Mine warfare adds three bumps and is the only one that reads.
@@ -37,27 +37,44 @@ Rendered as a contact sheet and looked at, which is the only way to see this:
   M1/M2 distinction is about table slot, not about the glyph.
 
 So the constraint on the vocabulary is not "which icons exist" but **"which
-icons survive being 22 pixels wide"**. A port that took all 689 would ship 689
-icons of which most are indistinguishable, and the invariants would pass all
-of them because every one of them is individually well-formed.
+icons survive being as wide as the map draws them"**. A port that took all 689
+would ship 689 icons of which most are indistinguishable, and the invariants
+would pass all of them because every one of them is individually well-formed.
 
 The curated selection in `icons.tsv` is therefore a judgement about
 distinguishability, and the contact sheet is what it is judged on.
 
+**The box has since gone to 32 px**, and that is a real improvement on the
+second bullet rather than a change of the criterion: the same downward arrow is
+now 45 percent wider, and the fillets the flattening produced gained the
+vertices that let them read. What did NOT improve is the third bullet, and
+neither would any size — text-only modifiers are a property of the upstream
+table, not of how large we draw it. A larger box relaxes this section's
+constraint; it does not discharge it, and the selection would want re-judging
+against a fresh contact sheet rather than inherited on the strength of a
+number.
+
 ## 3. Our stroke is five times heavier than upstream's, and it costs two icons
 
 Upstream strokes at 3 units in a 200 box: 1.5 percent, which is **0.33 px** at
-the 22 px this map draws. Anything that thin vanishes, so this project strokes
-at `STROKE_RATIO` = 0.072 of the box, 1.58 px. That five-fold difference is
-what closes fine gaps, and the gap invariant caught exactly two icons:
+the 22 px box this was measured against. Anything that thin vanishes, so this
+project strokes at `STROKE_RATIO` = 0.072 of the box — 1.58 px there, and
+**2.30 px now** that the box is 32. That five-fold difference is what closes
+fine gaps, and the gap invariant caught exactly two icons:
 
     SE.IC.SEA SURFACE DECOY   three chevrons 1.50 px apart
     SE.IC.DISTRESSED VESSEL   features 1.25 px apart
 
 Both were dropped. This is the price of being legible at theatre zoom, and it
-is worth stating plainly rather than widening the invariant: a 22 px symbol
+is worth stating plainly rather than widening the invariant: a symbol this size
 cannot carry detail finer than a pixel, and the standard has detail finer than
 a pixel. Neither role is in the client's domain.
+
+The stroke is a RATIO, so the raise did not rescue either icon — the gap
+between their features grew by exactly the same 45 percent the box did, and
+they are still below one stroke wide. Regenerating at the new box changed three
+icons and dropped none: an arc flattened finer gains vertices, and nothing that
+fitted before stopped fitting.
 
 ## 4. The coverage floor had to change metric, not value
 

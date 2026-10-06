@@ -164,6 +164,11 @@ _Avoid_: LOD, detail level, zoom level (that's the input, not the answer)
 One scope's command view: the four panes (map, roster, inspector, orders) with action panes filtered to the scope's jurisdiction. Multi-scope players switch between desktops; organizer and observers get a single merged one.
 _Avoid_: window (that's the OS frame, not the scope view), screen
 
+**Force draft**:
+The force as the operator has it on the client, before Minos has been told any of it: which hulls are in the exercise, where each STARTS, and who commands each. Placing, moving a placement, and handing a hull to a player are all draft edits and none of them is a backend write. Minos holds the record, so a Force draft is written through in one ordered diff at a stage advance — assignment before placement, because a hull Minos has never heard of has no position to set; removals last, so nothing is briefly absent while it moves.
+_Avoid_: staged force (that is not a state Minos has either), local force (every force on screen is local until it is not), unsaved force
+_A Force draft tolerates a hull with no commander, which Minos does not: `game_units.id_commander` is NOT NULL, so the advance refuses and names the hulls rather than seating whoever happened to be free._
+
 **Setup**:
 The session phase for windows, roster, placements, and seats. Nothing moves, nothing is ordered; booting into Setup is the lobby.
 _Avoid_: lobby (that's Setup with defaults), staging

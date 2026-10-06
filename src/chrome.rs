@@ -631,6 +631,34 @@ pub fn island_body_fit(ctx: &Context, id: Id) -> Option<BodyFit> {
     ctx.data(|d| d.get_temp::<BodyFit>(island_fit_key(id)))
 }
 
+/// The key the top band's measured bottom is filed under.
+fn top_band_key() -> Id {
+    Id::new("__top_band")
+}
+
+/// File where the top band ended this frame.
+///
+/// Set by `top_zone`, read by `modal`'s backdrop, and the reason it is a
+/// round trip through temp storage rather than a constant is in `modal`.
+///
+/// The context is a parameter rather than reached for, because a fresh
+/// `Context::default()` here would be a different context and the value would
+/// be filed where nobody reads it.
+pub fn publish_top_band(ctx: &Context, bottom: f32) {
+    ctx.data_mut(|d| d.insert_temp(top_band_key(), bottom));
+}
+
+/// Where the top band ends, or the whole viewport top when it has not been drawn.
+///
+/// A backdrop that cannot find the band must not guess: it claims the full
+/// viewport, which is the older and safer behaviour — the map stays inert and a
+/// modal has its own ✕. Being wrong in that direction costs a dead Settings
+/// button on one frame; being wrong the other way costs a modal that quietly
+/// lets clicks through to the map.
+fn top_band_bottom(ctx: &Context) -> f32 {
+    ctx.data(|d| d.get_temp::<f32>(top_band_key()).unwrap_or(0.0))
+}
+
 // ---------------------------------------------------------------------------
 // The side zone
 // ---------------------------------------------------------------------------
@@ -788,6 +816,9 @@ pub struct Modal {
     pub open: bool,
     /// Whether the backdrop paints its dim.
     pub backdrop: Backdrop,
+    /// The panel steps out of the way entirely: no backdrop, no panel, no
+    /// input claimed. See [`Modal::step_aside`].
+    pub aside: bool,
 }
 
 /// What the backdrop behind a modal does about the map.
@@ -815,16 +846,33 @@ impl Modal {
             size,
             open: true,
             backdrop: Backdrop::Dim,
+            aside: false,
         }
     }
 
-    /// A modal whose backdrop swallows input without darkening.
+    /// The panel stops existing for this frame: no backdrop, no panel, and
+    /// nothing claimed.
     ///
-    /// Only correct where something behind the modal is the target of the
-    /// pointer's next move. Everywhere else the dim is what tells the
-    /// operator that the map is inert.
-    pub fn clear_backdrop(mut self) -> Self {
-        self.backdrop = Backdrop::Clear;
+    /// For a PALETTE rather than a dialog. A palette exists to start something
+    /// that happens on the map — the Fleet picker arms a placement, the Player
+    /// picker assigns a piece — and for the whole of that gesture the palette is
+    /// in the way of the thing it is pointing at. It covers the map the operator
+    /// is aiming at, a release over it is refused by `drop_lands_on_map`, and
+    /// the drag ghost is painted underneath it.
+    ///
+    /// The backdrop is the deeper half of the problem. It swallows input across
+    /// the viewport by design — that is how a drag that leaves the panel is
+    /// stopped from landing a hull behind the form — but a palette whose gesture
+    /// ENDS on the map is stopped by the very rule meant to protect it. The code
+    /// already half-knew this: `clear_backdrop` existed for exactly one caller,
+    /// the Fleet picker, for exactly this reason, and it only dropped the dim.
+    /// The panel itself was still there.
+    ///
+    /// So while the gesture is in flight the whole surface goes, and comes back
+    /// the moment it ends. Nothing is lost: the drag's state is on `ShipApp`, not
+    /// in the panel, and a drag that is cancelled restores the panel with it.
+    pub fn step_aside(mut self) -> Self {
+        self.aside = true;
         self
     }
 
@@ -835,6 +883,11 @@ impl Modal {
     pub fn backdrop_alpha(&self) -> u8 {
         match self.backdrop {
             Backdrop::Dim => MODAL_BACKDROP_ALPHA,
+            // `Clear` is unreachable now and `step_aside` is what a palette
+            // uses. Kept so the enum can say what it means, but nothing sets it:
+            // a "clear but still swallowing" backdrop was the halfway answer
+            // that left the panel covering the target, and `step_aside` replaced
+            // it rather than sitting beside it.
             Backdrop::Clear => 0,
         }
     }
@@ -925,17 +978,60 @@ pub fn modal(
     let viewport = ctx.viewport_rect();
     let rect = spec.rect_in(viewport);
 
+    // A stepped-aside panel claims nothing and paints nothing, and returns
+    // BEFORE the backdrop so it does not even dim the map it is getting out of
+    // the way for. `open` is returned unchanged: the caller keeps its state, and
+    // the panel is back the frame the gesture ends.
+    if spec.aside {
+        return spec.open;
+    }
+
     let mut clicked_close = false;
+    // The top band stays OUTSIDE the backdrop.
+    //
+    // The backdrop claims the whole viewport, which is what makes the map inert
+    // behind a modal — correct, and it is why a drag that leaves the panel dies
+    // on the backdrop instead of dropping a hull on the map. But it also made
+    // the top band inert, and the top band is where Settings and Sign out live.
+    // So a modal had exactly one way out, its own ✕, and everything else on
+    // screen looked present and dead: click a control you can plainly see, get
+    // nothing, and conclude there is an overlay stuck on the app.
+    //
+    // The band is the app's chrome rather than the map, it is above the modal in
+    // the operator's mind ("the frame is still live, the form is what is modal"),
+    // and leaving it live gives a modal a second exit that costs no panel
+    // geometry. The band is also the one place the pointer can be while a
+    // backdrop is up without being over the map, so a drag cannot escape through
+    // it by accident — the drag ends on the map or nowhere.
+    //
+    // FROM the band's bottom, not to it. The first version of this read the band
+    // as the backdrop's top edge and built a rect from the viewport origin down
+    // to it — which covered the band and left the whole map clickable through.
+    // Inverted, and the render said so at once: the band stayed inert and the map
+    // stopped dimming.
+    let backdrop_rect = Rect::from_min_max(
+        pos2(viewport.left(), top_band_bottom(ctx)),
+        viewport.max,
+    );
     egui::Area::new(spec.id.with("__backdrop"))
-        .fixed_pos(viewport.min)
+        // Positioned AT the rect it is going to claim, not at the viewport
+        // origin. An `Area`'s inner cursor starts at its own `fixed_pos`, so
+        // allocating from an Area at the origin hands back a rect at the origin
+        // whatever size is asked for — and the version before this one painted
+        // the correct rect while interacting with that one. The difference is
+        // invisible in a screenshot: the map dimmed where it should and the band
+        // stayed bright, while the backdrop went on eating every click on the
+        // screen, the panel included. So the Area goes where the rect is.
+        .fixed_pos(backdrop_rect.min)
         .movable(false)
         .constrain(false)
         .interactable(true)
         .order(Order::Foreground)
         .show(ctx, |ui| {
-            // Claim the whole viewport before the panel exists, so the panel
-            // is drawn over a region that already belongs to the backdrop.
-            let (full, _) = ui.allocate_exact_size(viewport.size(), Sense::click_and_drag());
+            // Claim the region below the band before the panel exists, so the
+            // panel is drawn over ground that already belongs to the backdrop.
+            let (full, _) =
+                ui.allocate_exact_size(backdrop_rect.size(), Sense::click_and_drag());
             // The sense is unconditional and the fill is not: a clear
             // backdrop must still block the map underneath, and that is a
             // separate decision from how dark it looks.
@@ -1055,7 +1151,50 @@ mod tests {
         assert!(island_on_band(at(-40.0), 0.0, band, 144.0), "straddles the top");
     }
 
-    /// The band excludes the top band, so nothing in the zone can paint over it.
+    /// The backdrop starts BELOW the top band, and does not start above it.
+///
+/// Two halves of one property, and both were wrong at different times in
+/// opposite directions. The backdrop claimed the whole viewport, so Settings and
+/// Sign out were inert behind any modal — the screen looked alive and nothing
+/// responded, which reads as a stuck overlay rather than a modal. Then, fixing
+/// that, the rect was built from the viewport origin *down to* the band instead
+/// of *from* the band down: the band stayed blocked and the whole map went
+/// click-through.
+///
+/// Pinned as arithmetic because a screenshot cannot see it. Both failures dimmed
+/// and blocked in ways that render plausibly; only the interact rect differs.
+#[test]
+fn the_backdrop_begins_under_the_top_band() {
+    for (w, h) in [(1040.0_f32, 640.0_f32), (1920.0, 1080.0), (1280.0, 800.0)] {
+        let vp = Rect::from_min_size(pos2(0.0, 0.0), vec2(w, h));
+        let band_bottom = 27.0_f32.min(vp.height());
+        let backdrop = Rect::from_min_max(pos2(vp.left(), band_bottom), vp.max);
+        // The band is above the backdrop: Settings stays clickable.
+        assert!(
+            backdrop.min.y >= band_bottom,
+            "{w}x{h}: the backdrop must start at or below the band"
+        );
+        // And the band itself is outside it, not merely above its top edge.
+        assert!(
+            !backdrop.contains(pos2(vp.right() - 20.0, band_bottom * 0.5)),
+            "{w}x{h}: the backdrop covers the top band"
+        );
+        // The map below the band is inside it, so a drag still dies there
+        // rather than dropping a hull behind the form.
+        assert!(
+            backdrop.contains(pos2(vp.center().x, vp.bottom() - 20.0)),
+            "{w}x{h}: the map must stay inert behind a modal"
+        );
+        // And the panel is drawn over the backdrop, so the panel is reachable.
+        let panel = Modal::new(Id::new("t"), "t", vec2(980.0, 620.0)).rect_in(vp);
+        assert!(
+            backdrop.intersects(panel),
+            "{w}x{h}: the backdrop and the panel must overlap for the panel to win"
+        );
+    }
+}
+
+/// The band excludes the top band, so nothing in the zone can paint over it.
     #[test]
     fn the_band_starts_below_the_top_band() {
         let vp = Rect::from_min_size(pos2(0.0, 0.0), vec2(1040.0, 640.0));
@@ -1070,22 +1209,32 @@ mod tests {
 
     use super::*;
 
-    /// The backdrop's two jobs are independent and both are load-bearing.
-    /// "No dim" must not have been implemented as "no backdrop", or a drag
-    /// out of the modal clicks the map underneath it.
+    /// A palette's panel stops existing for the duration of its gesture, and a
+    /// dialog's does not.
+    ///
+    /// The property that was actually needed, and the one `clear_backdrop` could
+    /// not give: a palette's gesture ENDS on the map, so for its duration the
+    /// panel must not be there to cover the target, must not dim it, and must
+    /// not swallow the pointer. `step_aside` says all three at once, and returns
+    /// `open` untouched so the caller keeps its state and the panel returns the
+    /// frame the gesture ends.
     #[test]
-    fn a_clear_backdrop_drops_the_dim_and_nothing_else() {
-        let dimmed = Modal::new(Id::new("m"), "M", vec2(100.0, 100.0));
-        assert_eq!(dimmed.backdrop_alpha(), MODAL_BACKDROP_ALPHA);
+    fn a_stepped_aside_palette_claims_nothing() {
+        let dialog = Modal::new(Id::new("m"), "M", vec2(100.0, 100.0));
+        assert!(!dialog.aside, "a dialog is never aside");
+        assert_eq!(dialog.backdrop_alpha(), MODAL_BACKDROP_ALPHA);
 
-        let clear = dimmed.clone().clear_backdrop();
-        assert_eq!(clear.backdrop_alpha(), 0);
-
-        // Everything else about the modal is untouched, so clearing is a
-        // painting decision and not a different kind of window.
-        assert_eq!(clear.rect_in(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
-                   dimmed.rect_in(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))));
-        assert_eq!(clear.title, dimmed.title);
+        let palette = dialog.clone().step_aside();
+        assert!(palette.aside, "the palette steps aside");
+        // Everything else about it is untouched, so stepping aside is a decision
+        // about this frame and not a different kind of window.
+        assert_eq!(palette.title, dialog.title);
+        assert_eq!(
+            palette.rect_in(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            dialog.rect_in(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)))
+        );
+        // Still open, so the caller does not tear its state down mid-gesture.
+        assert!(palette.open);
     }
 
     /// A dim of zero would read as "no backdrop was drawn" to anything that

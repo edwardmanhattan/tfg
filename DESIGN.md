@@ -414,9 +414,20 @@ objects on the map. Nothing mixes them.
 **The cut edge is never cyan at rest.** It brightens, and it turns cyan, only
 on the island that owns input.
 
-- **Map symbology is pure circle geometry** — an 8px filled marker with a 2px
-  white ring; a 12px ring for focus; a 2px trail dot trail at 55% of the unit
-  colour; 2px zone strokes over 70/255 fills.
+- **Map symbology** — a 32px symbol box. The affiliation frame is an outline
+  AND a fill: the shape carries allegiance, the fill repeats it redundantly in
+  the same hue, darkened toward map ink so it survives being drawn over water
+  and land. The glyph sits inside that fill in a lightened type accent, because
+  an accent drawn straight onto the map lands near 1:1 contrast and vanishes.
+  The outline is CASED — a 1.25px dark keyline drawn just outside the hue,
+  never a wider stroke centred on it, which would grow inward and eat the
+  glyph. A frame reads by the weaker of its two edges, and the outer one, hue
+  against water, was 1.03:1; the keyline puts it at 9:1 on both water and
+  land, which is why the hue does not have to be darkened out of recognition.
+  Dashed frame for planned, solid for present; a 2px trail dot at 55% of the
+  affiliation ink; 2px zone strokes over 70/255 fills. State rings sit at 1.5,
+  1.75 and 2.0 disc radii, so they stay outside the symbol rather than closing
+  around its middle.
 
 ## Components
 
@@ -448,8 +459,9 @@ named on the adjacent control.
 ### Signature components
 - **Status line** — one row of state ink, text only. The most-used component
   in the app.
-- **Unit marker** — filled circle, 2px white ring, 12px focus ring, Map Ink
-  label.
+- **Unit marker** — affiliation frame (shape + fill, stroke cased in dark)
+  with the type glyph inside it, the name offset off the box's corner, and
+  state rings at 1.5/1.75/2 disc radii.
 - **User island** — a default person glyph at 32px, the display name, and the
   app role as a small mono tag. It is the only surface in the app that is
   about a person rather than about state.

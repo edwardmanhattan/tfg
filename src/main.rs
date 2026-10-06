@@ -32,13 +32,13 @@ use tfg::map_render::LiveMap;
 use tfg::paths::AppPaths;
 use tfg::map_render::{
     FRAME_VIEWPORT_FRACTION, GROUP_ZONE_MIN_PX, GroupRepresentation, MIN_HIT_PX,
-    ProjectedUnitGeometry, SYMBOL_BOX_PX, SYMBOL_FOOTPRINT_RADIUS_PX, SymbolFrame, UnitLod,
+    GLYPH_AUTHORING_RADIUS_PX, ProjectedUnitGeometry, SYMBOL_BOX_PX, SymbolFrame, UnitLod,
     ZONE_HIT_BAND_PX, anchor_center, battle_dimension, frame_for, frame_icon_radius, frame_polygon,
     frame_strokes, grid_spacing_deg, hit_polygon, meters_per_pixel, project_mercator,
     projected_group_extent, projected_unit_geometry, rotated_unit_quad_with_forward_heading,
     select_group_representation, select_unit_lod, should_paint_group_text, should_paint_unit_label,
-    unit_is_planned, unproject_mercator, zone_pad_px, zone_polygon, zone_width_px,
-    zoom_for_group_frame, zoom_for_ground_resolution,
+    symbol_footprint_radius_px, unit_is_planned, unproject_mercator, zone_pad_px, zone_polygon,
+    zone_width_px, zoom_for_group_frame, zoom_for_ground_resolution,
 };
 use tfg::land::Land;
 use tfg::sim::{
@@ -67,9 +67,105 @@ const INSPECTOR_IMAGE_MIN_WIDTH: f32 = 160.0;
 const INSPECTOR_IMAGE_MAX_WIDTH: f32 = 640.0;
 const INSPECTOR_IMAGE_MAX_HEIGHT: f32 = 180.0;
 const MILLER_COL_WIDTH: f32 = 150.0;
-const MILLER_COL_MIN_HEIGHT: f32 = 180.0;
-const MILLER_COL_MAX_HEIGHT: f32 = 420.0;
-const MILLER_COL_HEIGHT: f32 = 220.0;
+/// The drill's leaf holds a thumbnail, a name and a verb, where the four
+/// taxonomy columns hold a name each. Wider for that reason, not to
+/// emphasise it — and the five together still fit the panel, which is a
+/// property `drill_columns_fit_the_picker_width` pins.
+const MILLER_LEAF_WIDTH: f32 = 232.0;
+/// The panel's fixed size. Named because the layout below is arithmetic
+/// against it: the strip takes what the header rows leave and the tail
+/// reserves what is left over.
+const FLEET_PICKER_SIZE: egui::Vec2 = egui::vec2(980.0, 620.0);
+/// The strip of map the picker yields so a drag has somewhere to land.
+///
+/// The Fleet picker is where placement is ARMED, but the gesture that completes
+/// it ends on the map — and a centred modal 980x620 in a 1040x640 window leaves
+/// a 30pt frame of map around itself, which is not a target. Every drop on it
+/// came back "placement needs water", correctly, because the frame is wherever
+/// the frame happens to be. A form that covers the thing it is a form about
+/// cannot have a drag gesture onto that thing.
+///
+/// So the panel is sized off the window rather than fixed, always giving this
+/// much map back. The columns then size themselves from what is left, which is
+/// what `picker_strip_height` already does.
+const PICKER_MAP_BAND: f32 = 160.0;
+/// The panel never gets shorter than this, whatever the window: below it the
+/// five columns stop being columns and the form starts losing rows.
+const PICKER_MIN_H: f32 = 420.0;
+
+/// The panel's size for a window of `viewport_h`.
+///
+/// Width is fixed — the five columns need it, and `drill_columns_fit_the_picker_width`
+/// is what says so. Height is the window minus the map band, capped at the
+/// declared size, because a window with room to spare should not get a taller
+/// panel than the design has.
+fn fleet_picker_size(viewport_h: f32) -> egui::Vec2 {
+    egui::vec2(
+        FLEET_PICKER_SIZE.x,
+        (viewport_h - PICKER_MAP_BAND).clamp(PICKER_MIN_H, FLEET_PICKER_SIZE.y),
+    )
+}
+/// Worst-case rows of chrome below the columns.
+///
+/// Three: the count, the last placement's outcome, and the place/cancel pair.
+/// The unarmed branch shares one row for its status and its arm button, so the
+/// tail's height does not change with the engine's state — which matters,
+/// because a tail that grew and shrank would move the controls under the
+/// operator's cursor.
+///
+/// It was five, then four, then three, then two, and every revision was wrong
+/// in the same way: the number described what the tail happened to be doing
+/// that week rather than what it is allowed to do. Anything new in the tail has
+/// to fit in these three rows or the strip gives, and the strip giving is
+/// visible.
+const PICKER_TAIL_ROWS: f32 = 3.0;
+/// Floor for the strip, so a short panel shows a usable column rather than a
+/// sliver, and the tail is still reachable under it.
+const PICKER_STRIP_MIN: f32 = 120.0;
+
+/// The height of one row of the tail, measured off egui rather than assumed.
+///
+/// The taller of a label and a button, plus the gap under it — because the tail
+/// is a mix of the two and a budget built out of the label alone is short by
+/// however much a button is taller. That was the last version's mistake: it
+/// measured a 12pt label, reserved three of them, and left the button row
+/// hanging off the bottom of the panel.
+///
+/// Asked of the widgets' own `desired_size`, NOT by adding them to the panel and
+/// throwing them away. `add_visible(false)` looks like it would do that and does
+/// not: egui's own note on `set_invisible` says widgets stay invisible "yet
+/// still allocate space", so the probe was quietly eating a row of the very
+/// layout it was measuring. Every strip that grew between one frame and the
+/// next was that probe, and the symptom was the tail sliding off the bottom
+/// again — the defect returning by a different route.
+///
+/// Asked of a scratch `Ui` built at a zero rect, so the probe lays the widgets
+/// out somewhere that is not the panel. `Ui::new` is the 0.36 spelling, and the
+/// rect is `ZERO` precisely because nothing is read from it but the widgets'
+/// own sizes.
+fn picker_row_height(ui: &egui::Ui) -> f32 {
+    let mut scratch = egui::Ui::new(
+        ui.ctx().clone(),
+        ui.id().with("picker-row-probe"),
+        egui::UiBuilder::new().max_rect(egui::Rect::ZERO),
+    );
+    use egui::Widget as _;
+    let label = egui::Label::new(egui::RichText::new("M")).ui(&mut scratch);
+    let button = egui::Button::new("M").ui(&mut scratch);
+    label.rect.height().max(button.rect.height()) + ui.spacing().item_spacing.y
+}
+
+/// The height of the column strip, given the height the panel has left.
+///
+/// Derived rather than stored. It used to be a slider, and a slider is how
+/// the tail was pushed off the panel: the operator could make the columns any
+/// height they liked, and every height above the panel's remaining space put
+/// the count and the placement controls past the bottom edge, where a modal
+/// body with no scroll cannot reach them. So the control is gone and the
+/// number comes from the panel.
+fn picker_strip_height(available: f32, row: f32) -> f32 {
+    (available - PICKER_TAIL_ROWS * row).max(PICKER_STRIP_MIN)
+}
 const STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Session stub pace (session flow): 7 real hours play 7 game days.
 /// Full windows UI lands with the organizer flow; the ratio is the load-
@@ -633,11 +729,20 @@ fn map_symbol_accent(shape: MapSymbolShape) -> egui::Color32 {
     }
 }
 
-/// Blend the live side color with a stable type accent. The circle
-/// still carries side identity; the glyph's hue and outline make a
-/// known type distinguishable without replacing either channel.
+/// The ink a Far symbol's glyph is drawn in.
+///
+/// The type accent, LIGHTENED toward white so it reads against the frame's
+/// dark interior fill. This used to blend the accent only 32 percent into a
+/// mid-tone base, which put every one of the ten accents between 1.0 and 2.1
+/// contrast against the map's own water and land — `Auxiliary` at 1.02 is the
+/// sea, drawn on the sea. On the dark fill those same hues reach 6.8 to 9.8
+/// against white, so the type channel is finally visible.
+///
+/// Type is still carried primarily by SHAPE, which is the invariant
+/// `every_map_symbol_has_a_distinct_shape_and_fill` holds; this is the
+/// redundant channel beside it, and being redundant is why lightening it is
+/// safe. A greyscale screenshot reads the shape.
 fn map_symbol_fill(
-    base: egui::Color32,
     shape: MapSymbolShape,
     stale: bool,
 ) -> egui::Color32 {
@@ -645,15 +750,13 @@ fn map_symbol_fill(
         return egui::Color32::GRAY;
     }
     let accent = map_symbol_accent(shape);
-    let mix = |base: u8, accent: u8| {
-        (base as f32 * 0.68 + accent as f32 * 0.32)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
+    // 55 percent of the accent, 45 percent white. Enough hue to tell a
+    // corvette's cyan from a landing ship's green, bright enough to read as
+    // ink against the fill rather than as another dark shape.
     egui::Color32::from_rgb(
-        mix(base.r(), accent.r()),
-        mix(base.g(), accent.g()),
-        mix(base.b(), accent.b()),
+        (accent.r() as f32 * 0.55 + 255.0 * 0.45).round() as u8,
+        (accent.g() as f32 * 0.55 + 255.0 * 0.45).round() as u8,
+        (accent.b() as f32 * 0.55 + 255.0 * 0.45).round() as u8,
     )
 }
 
@@ -682,12 +785,39 @@ fn paint_group_symbol(
         .icon
         .map(battle_dimension)
         .unwrap_or(tfg::map_render::BattleDimension::LandAndSeaSurface);
+    // The interior is filled in the LEVEL ink, on the same reasoning as a unit's:
+    // the glyph sits inside this frame and the map shows through everything
+    // around it, so a glyph painted straight onto the water lands at about
+    // 1.07:1 and disappears. Filled from the closed polygon, because a
+    // battle-dimension frame is open at one edge and its runs would leak the
+    // fill out of the notch.
+    let interior = frame_polygon(frame, (c.x as f64, c.y as f64), SYMBOL_BOX_PX);
+    painter.add(egui::Shape::convex_polygon(
+        interior
+            .into_iter()
+            .map(|(x, y)| egui::pos2(x as f32, y as f32))
+            .collect(),
+        darkened_ink(symbol.level_ink),
+        egui::Stroke::NONE,
+    ));
     for run in frame_strokes(dimension, frame, (c.x as f64, c.y as f64), SYMBOL_BOX_PX) {
+        // Cased exactly as a unit's frame is, and for the same reason: a
+        // group's outline sits on the same map and would otherwise be the same
+        // 1.03:1 against it. A group reading as an outline while its members
+        // read as solid objects is the inconsistency this whole pass exists to
+        // remove.
+        let points: Vec<egui::Pos2> = run
+            .into_iter()
+            .map(|(x, y)| egui::pos2(x as f32, y as f32))
+            .collect();
+        let cased = offset_run_outward(&points, c, FRAME_KEYLINE_OFFSET_PX);
         painter.add(egui::Shape::line(
-            run.into_iter()
-                .map(|(x, y)| egui::pos2(x as f32, y as f32))
-                .collect(),
-            egui::Stroke::new(1.5, symbol.level_ink),
+            cased,
+            egui::Stroke::new(FRAME_KEYLINE_PX, FRAME_KEYLINE),
+        ));
+        painter.add(egui::Shape::line(
+            points,
+            egui::Stroke::new(FRAME_STROKE_PX, symbol.level_ink),
         ));
     }
     match symbol.icon {
@@ -698,10 +828,9 @@ fn paint_group_symbol(
             painter,
             c,
             icon,
-            symbol.level_ink,
             false,
             frame_icon_radius(frame, SYMBOL_BOX_PX) as f32
-                / (SYMBOL_FOOTPRINT_RADIUS_PX as f32),
+                / (GLYPH_AUTHORING_RADIUS_PX as f32),
         ),
     }
     // `name (count)`, unchanged from the Flag: the theatre-zoom read the
@@ -765,21 +894,44 @@ fn affiliation_ink(affiliation: tfg::store::Affiliation) -> egui::Color32 {
 }
 
 /// Paint a unit's affiliation frame: the shape carries allegiance, the
-/// stroke its hue.
+/// fill and stroke its hue.
 ///
-/// The frame is NEVER greyed for staleness — the glyph greys, the frame
-/// keeps its hue, because "who stopped reporting" and "whose side" are
+/// The frame's OUTLINE is never greyed for staleness — the glyph greys, the
+/// frame keeps its hue, because "who stopped reporting" and "whose side" are
 /// two different questions, and a stale hostile hull must still read as
-/// hostile. Status keeps the rings and the halo.
+/// hostile. The FILL does grey, which is not a contradiction: the outline is
+/// the statement of allegiance and it stays true, while the fill is a large
+/// area of colour that would otherwise keep shouting it. Status keeps the
+/// rings and the halo.
 fn paint_affiliation_frame(
     painter: &egui::Painter,
     center: egui::Pos2,
     affiliation: tfg::store::Affiliation,
     dimension: tfg::map_render::BattleDimension,
     planned: bool,
+    stale: bool,
 ) -> SymbolFrame {
     let frame = frame_for(affiliation);
-    let stroke = egui::Stroke::new(1.5, affiliation_ink(affiliation));
+    let ink = affiliation_ink(affiliation);
+    let stroke = egui::Stroke::new(FRAME_STROKE_PX, ink);
+    // The interior is filled in the affiliation's hue, which is what the
+    // removed base disc should have been doing. Filled from the CLOSED
+    // polygon rather than from `frame_strokes`, because a battle-dimension
+    // frame is open at one edge and its runs would leak fill out of the
+    // notch: an aircraft's open-bottom rectangle would spill onto the map.
+    // So openness stays a stroke property and the fill is always the whole
+    // shape — which is correct, since a closed fill is what "interior" means
+    // regardless of which edges are stroked.
+    let interior = frame_polygon(frame, (center.x as f64, center.y as f64), SYMBOL_BOX_PX);
+    let points: Vec<egui::Pos2> = interior
+        .into_iter()
+        .map(|(x, y)| egui::pos2(x as f32, y as f32))
+        .collect();
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        affiliation_fill(affiliation, stale),
+        egui::Stroke::NONE,
+    ));
     for run in frame_strokes(
         dimension,
         frame,
@@ -790,18 +942,110 @@ fn paint_affiliation_frame(
             .into_iter()
             .map(|(x, y)| egui::pos2(x as f32, y as f32))
             .collect();
-        // Planned status, the symbology's own channel: a dashed frame
-        // for a piece in the exercise but not yet in the task
-        // organisation. NOT the stale channel — a hull that has stopped
-        // reporting keeps a solid frame, because "planned" and "we have
-        // not heard from it" are different facts.
+        // A frame reads by its EDGE, and an outline has two: the fill on the
+        // inside, the map on the outside. It is visible in proportion to the
+        // WEAKER of the two, and the outside was the one at 1.03:1 — Unknown's
+        // yellow on the sea is the sea. So the stroke is CASED: a wider dark
+        // pass first, the hue on top. This is the ordinary cartographic answer
+        // for a coloured line on busy ground, and it is why the outline reads
+        // on water, on land and over a coastline without the hue having to be
+        // dark enough to stop looking like itself.
+        //
+        // The case is drawn for the SAME runs as the hue, including the
+        // planned dash, so the two never disagree about where the frame is.
+        let keyline = egui::Stroke::new(
+            FRAME_KEYLINE_PX,
+            if stale { FRAME_KEYLINE_STALE } else { FRAME_KEYLINE },
+        );
+        // The casing is the same run pushed OUTWARD, never a wider centred
+        // stroke: a centred wider stroke grows inward too and takes a
+        // measurable bite out of the glyph.
+        let cased = offset_run_outward(&points, center, FRAME_KEYLINE_OFFSET_PX);
         if planned {
-            painter.add(egui::Shape::dashed_line(&points, stroke, 3.0, 2.5));
+            painter.add(egui::Shape::dashed_line(
+                &cased,
+                keyline,
+                FRAME_DASH_PX,
+                FRAME_DASH_GAP_PX,
+            ));
+            painter.add(egui::Shape::dashed_line(
+                &points,
+                stroke,
+                FRAME_DASH_PX,
+                FRAME_DASH_GAP_PX,
+            ));
         } else {
+            painter.add(egui::Shape::line(cased, keyline));
             painter.add(egui::Shape::line(points, stroke));
         }
     }
     frame
+}
+
+/// The dark casing drawn under a symbol frame's stroke.
+///
+/// Sits 8.02:1 against the map's water and 12.92:1 against its land, so the
+/// edge it protects is legible on any terrain, and every affiliation's hue
+/// clears 5.5:1 against it — so the hue is what an operator reads and the
+/// casing is only ever a means of seeing it.
+const FRAME_KEYLINE: egui::Color32 = egui::Color32::from_rgb(0x1c, 0x1c, 0x22);
+
+/// A stale hull's casing greys a little, so a hull that has stopped reporting
+/// does not keep a crisp edge. Deliberately NOT the full stale grey: the
+/// outline is still the statement of allegiance and it stays true.
+const FRAME_KEYLINE_STALE: egui::Color32 = egui::Color32::from_rgb(0x3a, 0x3a, 0x40);
+
+/// The stroke width of the affiliation hue itself.
+const FRAME_STROKE_PX: f32 = 1.5;
+
+/// How far the casing extends OUTSIDE the hue, in px.
+///
+/// OUTSIDE, and this is the whole subtlety. A casing centred on the same path
+/// as the stroke it backs — which is what "wider by N" means — eats N/2 px of
+/// the frame's INTERIOR, and at this size that is not a rounding error: it
+/// took 55 percent of the glyph's pixels off it (191 down to 87, measured on
+/// the capture), because the glyph already reaches most of the way to the
+/// frame. The casing exists to give the hue an edge against the MAP, which is
+/// outside the frame, so it is placed entirely outside and the interior is
+/// left alone.
+///
+/// 1.25 px of dark outside a 1.5 px hue is the sliver that does the work.
+const FRAME_KEYLINE_OUT_PX: f32 = 1.25;
+
+/// The casing's width: the hue, plus the sliver that shows on its outer side.
+///
+/// Drawn with an explicit offset rather than by being wider, because egui
+/// strokes are centred on the path and a wider centred stroke necessarily
+/// grows inward as well as outward.
+const FRAME_KEYLINE_PX: f32 = FRAME_STROKE_PX + FRAME_KEYLINE_OUT_PX;
+
+/// Where the casing's centre sits, in px outside the frame path.
+const FRAME_KEYLINE_OFFSET_PX: f32 = (FRAME_KEYLINE_PX - FRAME_STROKE_PX) / 2.0;
+
+/// The planned-status dash, in px, and the gap between dashes.
+const FRAME_DASH_PX: f32 = 3.0;
+const FRAME_DASH_GAP_PX: f32 = 2.5;
+
+/// Push a run of points outward from the frame's centre by `offset` px.
+///
+/// Normalised, because a frame is not round: pushing a rectangle's corners by
+/// a fixed number of pixels makes it a different, larger rectangle rather than
+/// the same outline with a casing, and a diamond's vertices would visibly
+/// separate from its edges. Scaling the direction by the distance to the centre
+/// keeps the shape and grows it.
+fn offset_run_outward(points: &[egui::Pos2], center: egui::Pos2, offset: f32) -> Vec<egui::Pos2> {
+    points
+        .iter()
+        .map(|&p| {
+            let d = p - center;
+            let len = d.length();
+            if len <= f32::EPSILON {
+                p
+            } else {
+                p + d / len * offset
+            }
+        })
+        .collect()
 }
 
 /// The redundant affiliation channel where the icon is a photograph.
@@ -824,9 +1068,66 @@ fn paint_affiliation_tint(
     ));
 }
 
-/// Paint the universal far-map fallback. The existing radius-8 circle
-/// remains underneath; this smaller glyph sits inside its white
-/// outline, and every branch terminates in a shape.
+/// The fill a Far symbol's frame interior carries, in the affiliation's own hue.
+///
+/// This is what the base disc was supposed to be and never was. The disc was
+/// painted in `ship_color`, which matched only the literal ids `"nordwind"`
+/// and `"ostsee"` — the sandbox fixture names — and returned ONE green for
+/// every real hull. So it was not a channel at all: it carried no
+/// information, and all it did was hide the glyph.
+///
+/// Filling the interior instead is the APP-6 arrangement the standard already
+/// uses for affiliation ("fill colour is a redundant indication"), and it
+/// gives the frame's SHAPE and its FILL the same meaning rather than leaving
+/// the shape to carry affiliation alone.
+///
+/// DARKENED toward the map's own ink, and that is load-bearing rather than a
+/// taste call. Measured against the map's own water and land:
+///
+///     affiliation ink     vs sea    vs land
+///     Friendly              1.76       2.17
+///     Hostile                1.89       2.33
+///     Neutral                1.19       1.48
+///     Unknown                1.02       1.26
+///
+/// Unknown at 1.02 is the sea, drawn on the sea. Mixed toward dark it becomes
+/// 4.2–6.7 against the map and 6.8–9.8 against a white glyph, so the shape
+/// survives a greyscale screenshot AND the symbol survives the map underneath
+/// it. The type accents are in the same trap — every one of the ten sits
+/// between 1.0 and 2.1 against sea and land — so they are used as the glyph's
+/// outline-and-fill ON this fill, never against the map directly.
+fn affiliation_fill(
+    affiliation: tfg::store::Affiliation,
+    stale: bool,
+) -> egui::Color32 {
+    if stale {
+        // Stale greys the glyph and keeps a solid frame, so the fill greys
+        // with it rather than staying saturated: a hull that has stopped
+        // reporting should not keep advertising which side it is on.
+        return egui::Color32::from_rgb(0x4a, 0x4a, 0x4a);
+    }
+    darkened_ink(affiliation_ink(affiliation))
+}
+
+/// The map's own darkest ink: what a fill is mixed toward so it survives being
+/// drawn on top of water and land, both of which are pale.
+const MAP_INK_DARK: egui::Color32 = egui::Color32::from_rgb(0x0d, 0x1b, 0x2b);
+
+/// An ink pulled 62 percent of the way toward [`MAP_INK_DARK`].
+///
+/// One function rather than a mix written out per caller, because the two
+/// callers are a unit's affiliation fill and a group's level fill and they
+/// must agree: a group that reads as a solid object while its members read as
+/// outlines is the inconsistency this whole change exists to remove.
+fn darkened_ink(ink: egui::Color32) -> egui::Color32 {
+    const KEEP: f32 = 0.38;
+    egui::Color32::from_rgb(
+        (ink.r() as f32 * KEEP + MAP_INK_DARK.r() as f32 * (1.0 - KEEP)).round() as u8,
+        (ink.g() as f32 * KEEP + MAP_INK_DARK.g() as f32 * (1.0 - KEEP)).round() as u8,
+        (ink.b() as f32 * KEEP + MAP_INK_DARK.b() as f32 * (1.0 - KEEP)).round() as u8,
+    )
+}
+
 /// The member symbol a group draws, if its members agree on one.
 ///
 /// A strict MAJORITY, not a plurality and not the fattest member: one
@@ -855,23 +1156,33 @@ fn plurality_icon(symbols: &[tfg::store::MapSymbol]) -> Option<tfg::store::MapSy
         })
 }
 
+/// Paint a taxonomy glyph inside a symbol's frame.
+///
+/// Every branch terminates in a shape, which is the visual half of the
+/// universal-fallback contract: a symbol with no type assigned still draws
+/// something rather than nothing.
+///
+/// `scale` is the glyph's reach relative to the frame it sits in, and it is
+/// the SAME rule for the four frames on purpose — an icon FILLS its frame
+/// rather than floating inside a border, so the diamond (which gives its
+/// interior less room) gets a smaller glyph than the rectangle, from one
+/// vocabulary and one authoring radius.
 fn paint_map_symbol(
     painter: &egui::Painter,
     center: egui::Pos2,
     symbol: tfg::store::MapSymbol,
-    base: egui::Color32,
     stale: bool,
     scale: f32,
 ) {
-    // The shape decides the accent and the fill; `scale` decides how far
-    // the glyph reaches. The two are separate on purpose: an icon FILLS
-    // its frame rather than floating inside a border, so the four frames
-    // need four icon reaches from ONE glyph vocabulary.
+    // The shape decides the ink; `scale` decides how far the glyph
+    // reaches. The two are separate on purpose: an icon FILLS its frame
+    // rather than floating inside a border, so the four frames need four
+    // icon reaches from ONE glyph vocabulary.
     let shape = map_symbol_shape(symbol);
-    let fill = map_symbol_fill(base, shape, stale);
-    // Every literal below was drawn against the radius-8 circle the
-    // marker already carries, so `scale` is a multiplier on that
-    // reference rather than a new radius to remember per glyph.
+    let fill = map_symbol_fill(shape, stale);
+    // Every literal below was drawn against the radius-8 circle the glyphs
+    // were authored at, so `scale` is a multiplier on that reference rather
+    // than a new radius to remember per glyph.
     let reach = |value: f32| value * scale;
     let polygon = |points: Vec<egui::Pos2>| {
         painter.add(egui::Shape::convex_polygon(points, fill, egui::Stroke::NONE));
@@ -1495,18 +1806,6 @@ struct GameBundle {
     readiness: Result<tfg::backend::GameReadinessView, tfg::backend::BackendError>,
 }
 
-/// Deferred map drop for an async placement (#100): the local
-/// TakeControl follows a successful PUT, a frame later, so no
-/// phantom ship ever stands on a refused write.
-struct PlaceDrop {
-    pid: String,
-    name: String,
-    hull: String,
-    class_id: String,
-    la: f64,
-    lo: f64,
-}
-
 /// What kind of asset a visual carries.
 ///
 /// Minos publishes this discriminator in the manifest so a future
@@ -1954,9 +2253,63 @@ enum ImageOut {
 /// A command result kept in the Inspector/Orders surface. The transport
 /// worker classifies failures before they reach the UI; no raw error
 /// string is mistaken for an accepted HelmOrder.
+impl ShipApp {
+    /// Record a placement outcome, where it will survive until it is read.
+    ///
+    /// Writes `users_status` as well, because that is what the rest of the app
+    /// already shows — but `users_status` is a shared slot a background sync
+    /// rewrites, so the copy in `placement_note` is the one that survives. See
+    /// [`PlacementNote`].
+    fn note_placement(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.placement_note = PlacementNote(msg.clone());
+        self.users_status = msg;
+    }
+}
+
+/// Why the last placement attempt ended the way it did.
+///
+/// SEPARATE from `users_status`, and it has to be. A placement outcome and a
+/// register sync both used to write `users_status`, and the sync runs on a
+/// timer — so the one line that explains why the hull did not appear got
+/// overwritten by "pictures: 0 hull(s) listed" before the operator could read
+/// it. The refusal was still happening; it was just gone by the time anyone
+/// looked, which is exactly what makes a refusal read as a dead control.
+///
+/// Same slot, two unrelated facts, and the one that mattered lost every time.
+#[derive(Default)]
+struct PlacementNote(String);
+
+/// Which modal is open. At most one at a time; see `ShipApp::open_only`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhichModal {
+    Settings,
+    Composer,
+    Fleet,
+    Player,
+}
+
 #[derive(Debug, Clone)]
 struct UnitDrag {
     id: String,
+    name: String,
+    start: egui::Pos2,
+    moved: bool,
+}
+
+/// A placed hull being dragged to a new starting position.
+///
+/// THE GESTURE IS A PRESS ON THE HULL, NOT A MODE. A double-click to arm a
+/// move was the first shape considered and it is two gestures with an armed
+/// state between them, which is a state to get stuck in and a cue to maintain;
+/// picking the hull up is one gesture and the pointer already says which it is.
+/// The cost is that a drag which starts on a hull stops panning the map — so
+/// this is armed only in Setup, where the hull is a starting position and
+/// moving it is a real edit, and never in Live, where that same spot on the map
+/// is the heading handle and the hull's position is a fix rather than a claim.
+#[derive(Debug, Clone)]
+struct UnitMoveDrag {
+    unit_id: i64,
     name: String,
     start: egui::Pos2,
     moved: bool,
@@ -2024,11 +2377,15 @@ enum SetupDone {
     Users(Vec<tfg::backend::BackendUser>),
     Bundle(GameBundle),
     Roster(Vec<tfg::backend::Participant>, String),
-    Units(Vec<tfg::backend::GameUnit>, String),
-    Assign(Vec<tfg::backend::GameUnit>, String, i64),
-    Unassign(Vec<tfg::backend::GameUnit>, String, i64),
-    Place(tfg::backend::PlacementList, PlaceDrop),
-    Lift(tfg::backend::PlacementList, String, i64),
+    /// One force-sync write answered with the refreshed unit list.
+    ForceUnits(Vec<tfg::backend::GameUnit>),
+    /// One force-sync write answered with the refreshed setup view.
+    ForcePlacements(tfg::backend::PlacementList),
+    /// A force-sync write refused; the write is kept so the note names
+    /// which hull it was about. The queue is dropped — the live mirror
+    /// already carries the writes that succeeded, so the next attempt is
+    /// a fresh diff, not a replay.
+    ForceFailed(String, tfg::force::ForceWrite),
     Game(String, tfg::backend::GameRow),
     GameCreate(tfg::backend::GameRow, String),
     /// Admin game writes: the update answer is the re-read detail
@@ -2251,9 +2608,6 @@ struct ShipApp {
     fleet: Fleet,
     /// Map placement pick: a register hull awaiting its map click.
     fleet_pick: Option<String>,
-    /// A catalog Unit waiting for its GameUnit assignment to finish
-    /// before the requested map position is applied.
-    pending_placement: Option<(String, f64, f64)>,
     /// Exercise setup flow (#79): Planning in four steps — game,
     /// players, fleet, ready. One step renders at a time; the backend
     /// game in users_game is what every step reads and writes.
@@ -2300,7 +2654,11 @@ struct ShipApp {
     drill_category: Option<i64>,
     drill_type: Option<i64>,
     drill_class: Option<i64>,
-    miller_height: f32,
+    /// An assign raised by a leaf-column row, drained by `picker_tail_ui`.
+    ///
+    /// The row that carries the verb is drawn inside a column's scroll area, so
+    /// there is no return value to hand back the way the old list had one.
+    pending_assign: Option<(i64, String)>,
     /// Fleet render cache (blocking ticket): register rows plus
     /// branch mapping + names, reloaded on sync and first show —
     /// never queried per frame. SQLite leaves the render path.
@@ -2308,7 +2666,6 @@ struct ShipApp {
     fleet_branches: std::collections::HashMap<i64, i64>,
     fleet_branch_names: std::collections::HashMap<i64, String>,
     fleet_loaded: bool,
-    setup_commander: Option<i64>,
     /// Session users (build ticket): memory-held game plus live lists —
     /// directory and game reads are blocking operator actions, the role
     /// vocabulary comes from the synced helpers mirror.
@@ -2447,12 +2804,36 @@ struct ShipApp {
     upress: Option<(i64, String, egui::Pos2)>,
     udrag: Option<(i64, String)>,
     unit_drag: Option<UnitDrag>,
+    /// Why the last placement attempt ended as it did. Rendered by the picker
+    /// and the Fleet island, and never written by anything but a placement.
+    placement_note: PlacementNote,
     /// Selected map unit currently being rotated by its on-map handle.
     map_heading_drag: Option<String>,
     placed_fleet: HashSet<String>,
+    /// Latch: the last pointer release ended a genuine move drag. The
+    /// map click that rides the same release must be swallowed by the
+    /// selection step rather than selecting or deselecting.
+    released_move_drag: bool,
     /// Labels captured at placement (both picker sources), so register
     /// hulls keep their name + hull after the picker moves on.
     placed_labels: HashMap<String, (String, String)>,
+    /// The force as the operator has it, staged locally. The map and the
+    /// islands read from THIS, and Minos catches up at a stage advance.
+    /// See `tfg::force` for why the diff and not the writes are the rule.
+    force: tfg::force::ForceDraft,
+    /// Which held game the force draft was seeded from. A held-game change
+    /// resets it, so the next bundle seeds from the new hold; a re-read
+    /// against the same hold must not clobber the operator's edits.
+    force_seeded_for: Option<i64>,
+    /// Writes the flush owes Minos, issued one at a time through the
+    /// `setup_op` slot. Each answer advances or aborts the chain.
+    force_queue: Vec<tfg::force::ForceWrite>,
+    /// What to do when the queue drains: a stage to advance to, or just
+    /// a sync. `None` while no flush is owed.
+    force_flush_then: Option<String>,
+    /// A placed hull being dragged to a new starting position, if the
+    /// gesture is in flight.
+    map_unit_move: Option<UnitMoveDrag>,
     /// Setup slice (ii): WIB-entered windows, stored as UTC.
     time_real_start: String,
     time_real_end: String,
@@ -2745,14 +3126,6 @@ fn parse_windows(rs: &str, re: &str, gs: &str, ge: &str) -> Option<Windows> {
 }
 
 impl ShipApp {
-    fn ship_color(id: &str) -> egui::Color32 {
-        match id {
-            "nordwind" => egui::Color32::from_rgb(0x25, 0x63, 0xeb),
-            "ostsee" => egui::Color32::from_rgb(0xdc, 0x26, 0x26),
-            _ => egui::Color32::from_rgb(0x16, 0xa3, 0x4a),
-        }
-    }
-
     /// Drain pending poll rounds, then derive marker geometry for this frame.
     fn markers(&mut self, pixels_per_point: f32) -> Vec<ShipMarker> {
         let mut rounds = 0;
@@ -3477,6 +3850,9 @@ impl ShipApp {
             self.clear_visual_cache();
             self.reset_registry_view();
             self.users_game_state = None;
+            // A different game's force is not this game's force. The next
+            // bundle seeds the draft from whatever that hold already holds.
+            self.force_seeded_for = None;
             // The book belongs to a game, so holding another one has to
             // clear it: otherwise the composer opens showing the previous
             // session's scenarios, and a write against them would be
@@ -3603,6 +3979,11 @@ impl ShipApp {
         self.units_gap = false;
         self.placements_gap = false;
         self.users_placements.clear();
+        self.force.clear();
+        self.force_seeded_for = None;
+        self.force_queue.clear();
+        self.force_flush_then = None;
+        self.map_unit_move = None;
         self.placement_unplaced = 0;
         self.placement_ready = false;
         self.users_list.clear();
@@ -4165,13 +4546,17 @@ impl ShipApp {
         self.minos_tree.clear();
         self.tree_gap = false;
         self.users_placements.clear();
+        self.force.clear();
+        self.force_seeded_for = None;
+        self.force_queue.clear();
+        self.force_flush_then = None;
+        self.map_unit_move = None;
         self.placement_unplaced = 0;
         self.placement_ready = false;
         self.roster_gap = false;
         self.units_gap = false;
         self.placements_gap = false;
         self.clear_fleet_pick();
-        self.pending_placement = None;
         self.edit_open = false;
         self.delete_armed = false;
         // The pictures belonged to the exercise just released: their
@@ -4365,6 +4750,11 @@ impl ShipApp {
             self.users_gunits.clear();
             self.commanded_hulls.clear();
             self.users_placements.clear();
+            self.force.clear();
+            self.force_seeded_for = None;
+            self.force_queue.clear();
+            self.force_flush_then = None;
+            self.map_unit_move = None;
             self.placement_unplaced = 0;
             self.placement_ready = false;
             self.roster_gap = false;
@@ -4435,8 +4825,10 @@ impl ShipApp {
                 format!("readiness unreadable: {e}")
             }
         };
+        let mut units_ok = false;
         let units_seg = match b.units {
             Ok(u) => {
+                units_ok = true;
                 self.users_gunits = u;
                 self.refresh_unassigned_units();
                 self.units_gap = false;
@@ -4469,10 +4861,87 @@ impl ShipApp {
             }
             Err(e) => format!("placements failed: {e}"),
         };
+        // Seed the local force draft ONCE per hold, from the server's copy.
+        // The draft is what the operator edits; a hold that already has a
+        // force on it must show that force, or the islands would read empty
+        // over a game Minos knows holds six hulls. Later re-reads refresh the
+        // live mirror and leave the draft alone — the diff is computed
+        // against the mirror, so the operator's unsaved edits survive.
+        if units_ok && self.force_seeded_for != Some(d.id) {
+            self.seed_force_from_live();
+            self.force_seeded_for = Some(d.id);
+        }
         self.users_status = format!(
             "session synced ({}) · {roster_seg} · {units_seg} · {placements_seg} · {readiness_seg}",
             d.state
         );
+    }
+
+    /// Build the local force draft from what Minos already holds, and stand
+    /// the placed hulls up on the local map. Called once per hold.
+    fn seed_force_from_live(&mut self) {
+        self.force.clear();
+        let live = self.users_gunits.clone();
+        for gu in &live {
+            let start = self
+                .users_placements
+                .iter()
+                .find(|p| p.unit_id == gu.unit_id)
+                .map(|p| tfg::force::Start {
+                    lat: p.latitude,
+                    lon: p.longitude,
+                });
+            let class_id = self
+                .placement_seed(&gu.unit_id.to_string())
+                .and_then(|(_, _, class_id)| class_id)
+                .unwrap_or_default();
+            let mut hull = tfg::force::DraftHull::new(
+                gu.unit_id,
+                gu.unit_name.clone(),
+                gu.hull_number.clone(),
+                class_id,
+            );
+            hull.start = start;
+            hull.commander_id = gu.commander_id;
+            self.force.upsert(hull);
+        }
+        // The map's half: a hull Minos placed has to draw, or the force is a
+        // list of names over an empty sea.
+        let placed: Vec<(i64, String, String, String, f64, f64)> = self
+            .force
+            .hulls()
+            .filter_map(|h| {
+                let start = h.start?;
+                Some((
+                    h.unit_id,
+                    h.name.clone(),
+                    h.hull_number.clone(),
+                    h.class_id.clone(),
+                    start.lat,
+                    start.lon,
+                ))
+            })
+            .collect();
+        for (unit_id, name, hull_number, class_id, lat, lon) in placed {
+            if class_id.is_empty() {
+                // No sim stats resolved for this hull, so standing it up
+                // would be inventing its abilities. It stays in the list
+                // and off the map until the register supplies figures.
+                continue;
+            }
+            let id = unit_id.to_string();
+            if let Some(tx) = &self.sim_cmd_tx {
+                let _ = tx.send(SimCommand::TakeControl {
+                    ship_id: id.clone(),
+                    pos: GeoPosition { latitude: lat, longitude: lon },
+                    class_id,
+                });
+            }
+            self.controlled.insert(id.clone());
+            self.placed_labels.insert(id.clone(), (name, hull_number));
+            self.placed_fleet.insert(id);
+        }
+        self.refresh_unassigned_units();
     }
 
     fn users_add(&mut self, user_id: i64) {
@@ -4574,7 +5043,16 @@ impl ShipApp {
         }));
     }
 
+    /// Hand a hull to a commander. LOCAL FIRST for a staged hull — the
+    /// draft records it and Minos hears about it at a stage advance. A hull
+    /// the draft does not hold is a commanded hull in the staff-gap path,
+    /// whose force lives only on the server, so that one is written through
+    /// as it always was.
     fn users_command(&mut self, unit_id: i64, commander_id: i64) {
+        if self.force.set_commander(unit_id, Some(commander_id)) {
+            self.users_status = format!("unit {unit_id} now commanded by {commander_id}");
+            return;
+        }
         let Some((gid, _)) = self.users_game.clone() else {
             self.users_status = "hold a session first".to_string();
             return;
@@ -4589,13 +5067,11 @@ impl ShipApp {
                 return;
             }
         };
-        // The commander response IS the refreshed units array.
-        let note = format!("unit {unit_id} now commanded by {commander_id}");
         self.setup_op = Some(spawn_rest("command", move || {
             master
                 .set_unit_commander(&tok, gid, unit_id, commander_id)
+                .map(SetupDone::ForceUnits)
                 .map_err(|e| e.to_string())
-                .map(|u| SetupDone::Units(u, note))
         }));
     }
 
@@ -4997,70 +5473,47 @@ impl ShipApp {
         self.mode.tool = SetupTool::Select;
     }
 
-    /// Step 3 write: put a register hull into the game under the
-    /// picked commander. Mirrors the hull to the map engine as a
-    /// placement pick — click the map to drop it.
+    /// Step 3: put a register hull into the force (and out of the
+    /// register list). LOCAL FIRST — the backend write happens at a stage
+    /// advance, so this is a draft edit, not a write.
+    ///
+    /// Mirrors the hull to the map engine as a placement pick — click the
+    /// map to drop it. The commander is not asked here; that is the
+    /// Player picker's question, and Minos is only told at the advance.
     fn setup_assign_unit(&mut self, unit_id: i64, unit_name: &str) {
-        let Some((gid, _)) = self.users_game.clone() else {
-            self.users_status = "hold a session first".to_string();
+        let Some((name, hull, Some(class_id))) = self.placement_seed_for(unit_id) else {
+            self.users_status = format!("cannot stage {unit_name}: no sim stats");
             return;
         };
-        let Some(cmdr) = self.setup_commander else {
-            self.users_status = "pick a commander first".to_string();
-            return;
-        };
-        if self.setup_busy("assign") {
-            return;
-        }
-        let (master, tok) = match self.users_client() {
-            Ok(t) => t,
-            Err(e) => {
-                self.users_status = format!("assign failed: {e}");
-                return;
-            }
-        };
-        let name = unit_name.to_string();
-        self.setup_op = Some(spawn_rest("assign", move || {
-            master
-                .assign_unit(&tok, gid, unit_id, cmdr)
-                .map_err(|e| e.to_string())
-                .map(|u| {
-                    SetupDone::Assign(
-                        u,
-                        format!("{name} assigned — click the map to place it"),
-                        unit_id,
-                    )
-                })
-        }));
-        // Arm the map click for placement (the click handler only
-        // stands hulls up while the Place tool is active). The pick
-        // itself lands on apply, once the piece exists server-side.
+        let commander_id = self.force.get(unit_id).and_then(|h| h.commander_id);
+        let mut entry = self
+            .force
+            .get(unit_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                tfg::force::DraftHull::new(unit_id, name.clone(), hull, class_id)
+            });
+        entry.name = name.clone();
+        entry.commander_id = commander_id;
+        self.force.upsert(entry);
         self.arm_fleet_pick(unit_id.to_string());
+        self.refresh_unassigned_units();
+        self.users_status = format!("{name} added — click the map to place it");
     }
 
-    /// Step 3 write: take a hull back out of the game (idempotent).
+    /// Step 3: take a hull back out of the force. LOCAL FIRST.
     fn setup_remove_unit(&mut self, unit_id: i64, unit_name: &str) {
-        let Some((gid, _)) = self.users_game.clone() else {
-            self.users_status = "hold a session first".to_string();
-            return;
-        };
-        if self.setup_busy("remove") {
-            return;
-        }
-        let (master, tok) = match self.users_client() {
-            Ok(t) => t,
-            Err(e) => {
-                self.users_status = format!("remove failed: {e}");
-                return;
-            }
-        };
-        let name = unit_name.to_string();
-        self.setup_op = Some(spawn_rest("unassign", move || {
-            master
-                .remove_unit(&tok, gid, unit_id)
-                .map_err(|e| e.to_string())
-                .map(|u| SetupDone::Unassign(u, format!("{name} removed from the session"), unit_id))
-        }));
+        self.force.remove(unit_id);
+        self.release_hull(&unit_id.to_string());
+        self.refresh_unassigned_units();
+        self.users_status = format!("{unit_name} removed from the force");
+    }
+
+    /// Resolve a register hull to (name, hull, class_id) for a local
+    /// staging act. Separate from `placement_seed`, which is keyed by the
+    /// string pick id; this one is keyed by the numeric unit id.
+    fn placement_seed_for(&self, unit_id: i64) -> Option<(String, String, Option<String>)> {
+        self.placement_seed(&unit_id.to_string())
     }
 
     /// Gate arithmetic for step 4 and the Persiapan bar: exercise-side
@@ -5088,11 +5541,154 @@ impl ShipApp {
             .collect()
     }
 
-    /// Step 4 write: planning → preparation needs no gate (the Game
-    /// Master decides planning is done). Flips the local stage too.
+    /// Planning → preparation, after the force is written through.
+    /// LOCAL FIRST: every locally-staged change is synced to Minos first;
+    /// only when nothing is owed (or everything landed) does the stage
+    /// flip. The Game Master decides planning is done — this step has no
+    /// gate of its own, but it has a SYNC of what was built.
     fn setup_advance_prep(&mut self) {
+        self.begin_force_sync(Some("preparation".to_string()));
+    }
+
+    /// Preparation → execution, after the force is written through.
+    /// LOCAL FIRST: same sync-then-advance, then the gate runs on the
+    /// authoritative force Minos has just been handed.
+    fn setup_advance_execution(&mut self) {
+        self.begin_force_sync(Some("execution".to_string()));
+    }
+
+    /// Sync the staged force to Minos and then, when `then` is set,
+    /// run the stage transition. Nothing to sync means the transition
+    /// runs immediately. A gap (hulls nobody commands) or a request
+    /// failure refuses the advance and says why, with the goal left in
+    /// `then` until the next attempt.
+    fn begin_force_sync(&mut self, then: Option<String>) {
+        if self.setup_busy("sync") {
+            return;
+        }
+        let Some((_, _)) = self.users_game.clone() else {
+            self.phase_note = Some("hold a session first".to_string());
+            return;
+        };
+        let live = self.live_hulls();
+        match tfg::force::plan(&self.force, &live) {
+            Err(gap) => {
+                self.phase_note = Some(format!("sync refused: {}", gap));
+            }
+            Ok(writes) if writes.is_empty() => {
+                if let Some(to) = then {
+                    self.transition_to(&to);
+                } else {
+                    self.users_status = "nothing to sync".to_string();
+                }
+            }
+            Ok(writes) => {
+                if let Err(e) = self.users_client() {
+                    self.phase_note = Some(format!("sync refused: {e}"));
+                    return;
+                }
+                self.force_queue = writes;
+                self.force_flush_then = then;
+                self.users_status = format!("syncing {} change(s) to Minos…", self.force_queue.len());
+                self.pump_force_flush();
+            }
+        }
+    }
+
+    /// The local view of one hull Minos holds, used for the diff.
+    fn live_hulls(&self) -> Vec<tfg::force::LiveHull> {
+        self.users_gunits
+            .iter()
+            .map(|g| tfg::force::LiveHull {
+                unit_id: g.unit_id,
+                name: g.unit_name.clone(),
+                commander_id: g.commander_id,
+                start: self
+                    .users_placements
+                    .iter()
+                    .find(|p| p.unit_id == g.unit_id)
+                    .map(|p| tfg::force::Start { lat: p.latitude, lon: p.longitude }),
+            })
+            .collect()
+    }
+
+    /// One force write answered: retire it from the queue and issue the next.
+    /// A write that came from a standalone control rather than the flush —
+    /// a commander change in the staff-gap path — leaves the queue empty,
+    /// and then this is a no-op instead of a panic.
+    fn force_write_done(&mut self) {
+        if self.force_queue.is_empty() {
+            return;
+        }
+        self.force_queue.remove(0);
+        self.pump_force_flush();
+    }
+
+    /// Issue one staged write through the slot, and when the queue
+    /// frees, the deferred transition (if any) is the last step.
+    fn pump_force_flush(&mut self) {
+        if self.setup_op.is_some() {
+            return;
+        }
+        let Some(write) = self.force_queue.first().cloned() else {
+            if let Some(to) = self.force_flush_then.take() {
+                self.users_status = format!("synced — advancing to {to}");
+                self.transition_to(&to);
+            }
+            return;
+        };
         let Some((gid, _)) = self.users_game.clone() else {
-            self.users_status = "hold a session first".to_string();
+            self.phase_note = Some("hold a session first".to_string());
+            self.force_queue.clear();
+            self.force_flush_then = None;
+            return;
+        };
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.phase_note = Some(format!("sync refused: {e}"));
+                self.force_queue.clear();
+                self.force_flush_then = None;
+                return;
+            }
+        };
+        let w = write.clone();
+        self.setup_op = Some(spawn_rest("sync", move || {
+            let res = match &w {
+                tfg::force::ForceWrite::Assign { unit_id, commander_id, .. } => master
+                    .assign_unit(&tok, gid, *unit_id, *commander_id)
+                    .map(SetupDone::ForceUnits)
+                    .map_err(|e| e.to_string()),
+                tfg::force::ForceWrite::HandOver { unit_id, commander_id, .. } => master
+                    .set_unit_commander(&tok, gid, *unit_id, *commander_id)
+                    .map(SetupDone::ForceUnits)
+                    .map_err(|e| e.to_string()),
+                tfg::force::ForceWrite::Place { unit_id, lat, lon, .. } => master
+                    .set_placement(&tok, gid, *unit_id, *lat, *lon)
+                    .map(SetupDone::ForcePlacements)
+                    .map_err(|e| e.to_string()),
+                tfg::force::ForceWrite::Lift { unit_id, .. } => master
+                    .clear_placement(&tok, gid, *unit_id)
+                    .map(SetupDone::ForcePlacements)
+                    .map_err(|e| e.to_string()),
+                tfg::force::ForceWrite::Remove { unit_id, .. } => master
+                    .remove_unit(&tok, gid, *unit_id)
+                    .map(SetupDone::ForceUnits)
+                    .map_err(|e| e.to_string()),
+            };
+            match res {
+                Ok(done) => Ok(done),
+                Err(e) => Ok(SetupDone::ForceFailed(e, w)),
+            }
+        }));
+    }
+
+    /// The stage transition itself, once the force is on the server.
+    /// Generalized from the two old call sites; a refusal keeps the
+    /// local machine where it is and names why.
+    fn transition_to(&mut self, to: &str) {
+        let Some((gid, _)) = self.users_game.clone() else {
+            self.phase_note = Some("hold a session first".to_string());
             return;
         };
         if self.setup_busy("advance") {
@@ -5105,50 +5701,18 @@ impl ShipApp {
                 return;
             }
         };
+        let to = to.to_string();
         self.setup_op = Some(spawn_rest("advance", move || {
-            Ok(match master.transition_game(&tok, gid, "preparation") {
-                Ok(g) => SetupDone::Game("preparation".to_string(), g),
+            let res = match master.transition_game(&tok, gid, &to) {
+                Ok(g) => SetupDone::Game(to.clone(), g),
                 Err(tfg::backend::BackendError::Forbidden { .. }) => SetupDone::GameFailed(
-                    "preparation".to_string(),
+                    to.clone(),
                     "forbidden".to_string(),
                     true,
                 ),
-                Err(e) => SetupDone::GameFailed("preparation".to_string(), e.to_string(), false),
-            })
-        }));
-    }
-
-    /// Persiapan bar write: preparation → execution runs the gate
-    /// (pieces, exercise-side seats, every one ready — the refusal
-    /// names all of them). The bundle inside the refresh projects the
-    /// execution state onto Live; the guarded start below is only the
-    /// fallback for a failed detail read after a successful transition.
-    fn setup_advance_execution(&mut self) {
-        let Some((gid, _)) = self.users_game.clone() else {
-            self.phase_note = Some("hold a session first".to_string());
-            return;
-        };
-        if self.setup_busy("execution") {
-            self.phase_note = Some("execution already running…".to_string());
-            return;
-        }
-        let (master, tok) = match self.users_client() {
-            Ok(t) => t,
-            Err(e) => {
-                self.phase_note = Some(format!("execution refused: {e}"));
-                return;
-            }
-        };
-        self.setup_op = Some(spawn_rest("execution", move || {
-            Ok(match master.transition_game(&tok, gid, "execution") {
-                Ok(g) => SetupDone::Game("execution".to_string(), g),
-                Err(tfg::backend::BackendError::Forbidden { .. }) => SetupDone::GameFailed(
-                    "execution".to_string(),
-                    "forbidden".to_string(),
-                    true,
-                ),
-                Err(e) => SetupDone::GameFailed("execution".to_string(), e.to_string(), false),
-            })
+                Err(e) => SetupDone::GameFailed(to.clone(), e.to_string(), false),
+            };
+            Ok(res)
         }));
     }
 
@@ -5437,28 +6001,73 @@ impl ShipApp {
 
     /// C2: lift a hull off the map (placement DELETE, idempotent). The
     /// piece stays in the exercise and in the task organisation.
+    ///
+    /// LOCAL FIRST: the draft loses its start and the local sim ship is
+    /// released. Minos catches up at a stage advance.
+    /// Local lift for the normal (staff) path: the draft drops its start.
     fn lift_placement(&mut self, unit_id: i64, unit_name: &str) {
+        self.force.set_start(unit_id, None);
+        self.release_hull(&unit_id.to_string());
+        self.users_status = format!("{unit_name} lifted off the map");
+    }
+
+    /// Direct server lift for the staff-gap (participant) path, where the
+    /// hull is a commanded hull, not a locally staged one. The answer's
+    /// setup view replaces the mirror.
+    fn lift_placement_remote(&mut self, unit_id: i64, unit_name: &str) {
         let Some((gid, _)) = self.users_game.clone() else {
-            self.users_status = "hold a session first".to_string();
             return;
         };
-        if self.setup_busy("lift") {
-            return;
-        }
         let (master, tok) = match self.users_client() {
             Ok(t) => t,
             Err(e) => {
-                self.users_status = format!("lift failed: {e}");
+                self.users_status = format!("lift refused: {e}");
                 return;
             }
         };
-        let name = unit_name.to_string();
         self.setup_op = Some(spawn_rest("lift", move || {
             master
                 .clear_placement(&tok, gid, unit_id)
+                .map(SetupDone::ForcePlacements)
                 .map_err(|e| e.to_string())
-                .map(|view| SetupDone::Lift(view, format!("{name} lifted off the map"), unit_id))
         }));
+        self.users_status = format!("lifting {unit_name}…");
+    }
+
+    /// Move a placed hull's starting position. Placements are editable
+    /// while the exercise has not begun (planning|preparation); after
+    /// that the first leg of the fix chain is frozen and moving a hull
+    /// means giving it an order, which is a new leg rather than an edit.
+    ///
+    /// LOCAL FIRST: the draft's start moves, and the local sim ship is
+    /// moved too — Minos catches up at a stage advance.
+    fn move_placement(&mut self, unit_id: i64, unit_name: &str, la: f64, lo: f64) {
+        if self.mode.phase != Phase::Setup {
+            self.note_placement("placements are frozen once the exercise begins");
+            return;
+        }
+        if !self.placement_valid(la, lo) {
+            self.note_placement("placement needs water");
+            return;
+        }
+        if !self.force.set_start(unit_id, Some(tfg::force::Start { lat: la, lon: lo })) {
+            return;
+        }
+        let id = unit_id.to_string();
+        let pos = GeoPosition { latitude: la, longitude: lo };
+        if let Some(tx) = &self.sim_cmd_tx {
+            let _ = tx.send(SimCommand::MovePlacement {
+                ship_id: id.clone(),
+                pos,
+            });
+        }
+        // The map's half. The setup sim is frozen, so no tick will carry
+        // the new position to the registry: the display is moved here or
+        // the hull sits where it used to be while the status line says it
+        // moved.
+        self.registry.set_position(&id, pos);
+        self.fix_animation_started.remove(&id);
+        self.users_status = format!("{unit_name} moved to ({la:.4}, {lo:.4})");
     }
 
     /// C3: the held game's piece for this ship, if the caller commands
@@ -6927,7 +7536,7 @@ impl ShipApp {
                 .on_hover_text("seat accounts into game roles")
                 .clicked()
             {
-                self.player_picker_open = true;
+                self.open_only(WhichModal::Player);
                 // Read what the modal exists to show, on the way in.
                 //
                 // The composer already does this (`open_composer` calls
@@ -7031,7 +7640,6 @@ impl ShipApp {
                 &painter,
                 rect.center(),
                 tfg::store::MapSymbol::UnknownShip,
-                egui::Color32::LIGHT_BLUE,
                 false,
                 1.0,
             );
@@ -7055,17 +7663,16 @@ impl ShipApp {
                 &painter,
                 rect.center(),
                 symbol,
-                egui::Color32::LIGHT_BLUE,
                 false,
                 1.0,
             );
         }
     }
 
-    /// Fleet picker for the setup step. The operator keeps the four
+    /// Fleet picker for the setup step. The operator keeps the five
     /// Miller columns visible; the result row is the only place a unit
     /// is selected or dragged.
-    fn unit_picker_ui(&mut self, ui: &mut egui::Ui, crew: &[(i64, String)]) -> Vec<(i64, String)> {
+    fn unit_picker_ui(&mut self, ui: &mut egui::Ui) -> Vec<(i64, String)> {
         ui.horizontal(|ui| {
             if ui.small_button("sync register").clicked() {
                 self.sync_now();
@@ -7082,28 +7689,6 @@ impl ShipApp {
             }
         });
         status_line(ui, &self.sync_status.clone());
-
-        let mut commander = self.setup_commander;
-        if commander.is_none() {
-            commander = crew.first().map(|(id, _)| *id);
-            self.setup_commander = commander;
-        }
-        ui.horizontal(|ui| {
-            let commander_name = commander
-                .and_then(|id| crew.iter().find(|(crew_id, _)| *crew_id == id))
-                .map(|(_, name)| name.clone())
-                .unwrap_or_else(|| "choose".to_string());
-            egui::ComboBox::from_label("commander")
-                .selected_text(commander_name)
-                .show_ui(ui, |ui| {
-                    for (id, name) in crew {
-                        ui.selectable_value(&mut self.setup_commander, Some(*id), name);
-                    }
-                });
-        });
-        if crew.is_empty() {
-            ui.weak("No eligible commander — seat someone in step 2 first.");
-        }
 
         if !self.fleet_loaded {
             self.reload_fleet_cache();
@@ -7183,6 +7768,25 @@ impl ShipApp {
                     }
                 }
             }
+            // A search is not a drill, so there is no column to put these in —
+            // the point of the query is to skip the narrowing. They are drawn
+            // here, at the width the panel has, rather than returned for
+            // someone else to draw: the leaf column is the drill's, and a
+            // search result that borrowed it would be a column whose contents
+            // do not belong to the level it claims to be.
+            let strip_h = picker_strip_height(ui.available_height(), picker_row_height(&ui));
+            ui.label(format!("{} match{}", out.len(), if out.len() == 1 { "" } else { "es" }));
+            egui::ScrollArea::vertical()
+                .id_salt("drill-search")
+                .max_height(strip_h)
+                .show(ui, |ui| {
+                    if out.is_empty() {
+                        ui.weak("No unit matches that.");
+                    }
+                    for row in out.iter() {
+                        self.picker_leaf_row_ui(ui, row);
+                    }
+                });
             return out;
         }
 
@@ -7250,7 +7854,63 @@ impl ShipApp {
             self.drill_class = None;
         }
 
-        egui::ScrollArea::horizontal()
+        // The leaf, read before it is drawn rather than after the strip.
+        //
+        // It used to be gathered into a `rows` vec AFTER the columns and
+        // handed to `picker_tail_ui`, which drew it as a list UNDER the
+        // columns. Two things were wrong with that and both are the same
+        // mistake. The drill is five levels deep and `tax_units` is documented
+        // as the leaf, so the one level that is actually selectable was not a
+        // column — the columns narrowed to a class and stopped, with dead
+        // space to the right of the fourth. And the list it went to was
+        // painted below the panel's bottom edge: a modal body is a fixed rect
+        // with no scroll, so the units were not merely below the others, they
+        // were unreachable. Nothing in the panel could bring them on screen.
+        let mut rows = Vec::new();
+        if let (Some(conn), Some(class_id)) = (self.store.as_ref(), self.drill_class) {
+            if let Ok(units) = tfg::store::tax_units(conn, class_id) {
+                for unit in units {
+                    rows.push(PickerRow {
+                        id: unit.id,
+                        name: unit.name,
+                        hull: unit.hull,
+                        class_name: unit.class_name.clone(),
+                        stat_class: self
+                            .catalog
+                            .find_class_by_name(&unit.class_name)
+                            .map(|class| class.id.clone()),
+                        trail: String::new(),
+                    });
+                }
+            }
+        }
+
+        // The strip's height is what the panel has left, less the tail's
+        // reserve. A stored height with a slider let the columns grow into
+        // the tail's space, which is how the tail came to be off the panel
+        // in the first place.
+        let strip_h = picker_strip_height(ui.available_height(), picker_row_height(&ui));
+        let rows = rows.clone();
+        // The strip's rect is ALLOCATED, not left to whatever the columns
+        // happen to measure to.
+        //
+        // Three attempts at this all failed the same way: a `max_height` on
+        // the inner scroll area, and then a label height subtracted from it,
+        // and both left the columns consuming every point available and the
+        // tail with none. `max_height` bounds the list inside a column; it does
+        // not bound the column, and the column is what the parent lays out.
+        // The honest arrangement is to give the strip the rect it is allowed
+        // and let the columns live inside it, which is what
+        // `scope_builder` with a `max_rect` does — the same thing the modal
+        // body already does for itself, for the same reason.
+        let (strip_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), strip_h),
+            egui::Sense::hover(),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(strip_rect),
+            |ui| {
+                egui::ScrollArea::horizontal()
             .id_salt("drill-miller")
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -7269,7 +7929,6 @@ impl ShipApp {
                             egui::ScrollArea::vertical()
                                 .id_salt(("drill", *title))
                                 .auto_shrink([false, false])
-                                .max_height(self.miller_height)
                                 .show(ui, |ui| {
                                     ui.set_min_width(MILLER_COL_WIDTH - 16.0);
                                     if !active {
@@ -7307,125 +7966,147 @@ impl ShipApp {
                         });
                         ui.separator();
                     }
+                    // The leaf column: the fifth level, and the only one whose
+                    // rows are draggable, so it is the one that gets the width
+                    // for a thumbnail, a name and a verb.
+                    ui.vertical(|ui| {
+                        ui.set_min_width(MILLER_LEAF_WIDTH);
+                        ui.set_max_width(MILLER_LEAF_WIDTH);
+                        ui.strong(format!("Hull ({})", rows.len()));
+                        egui::ScrollArea::vertical()
+                            .id_salt("drill-leaf")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(MILLER_LEAF_WIDTH - 16.0);
+                                if self.drill_class.is_none() {
+                                    ui.weak("Pick a class");
+                                } else if rows.is_empty() {
+                                    ui.weak("None yet");
+                                } else {
+                                    for row in rows.iter() {
+                                        self.picker_leaf_row_ui(ui, row);
+                                    }
+                                }
+                            });
+                    });
                 });
             });
-        ui.horizontal(|ui| {
-            ui.weak("Column height");
-            ui.add(
-                egui::Slider::new(
-                    &mut self.miller_height,
-                    MILLER_COL_MIN_HEIGHT..=MILLER_COL_MAX_HEIGHT,
-                )
-                .show_value(true),
-            );
-        });
-
-        let mut rows = Vec::new();
-        if let (Some(conn), Some(class_id)) = (self.store.as_ref(), self.drill_class) {
-            if let Ok(units) = tfg::store::tax_units(conn, class_id) {
-                for unit in units {
-                    rows.push(PickerRow {
-                        id: unit.id,
-                        name: unit.name,
-                        hull: unit.hull,
-                        class_name: unit.class_name.clone(),
-                        stat_class: self
-                            .catalog
-                            .find_class_by_name(&unit.class_name)
-                            .map(|class| class.id.clone()),
-                        trail: String::new(),
-                    });
-                }
-            }
-        }
+            },
+        );
         rows
     }
 
-    fn picker_tail_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        rows: &[PickerRow],
-    ) -> Vec<(i64, String)> {
+    /// One row of the leaf column: thumbnail, name, hull, and the assign verb.
+    ///
+    /// Split out of `picker_tail_ui` so the drag and the click are registered
+    /// against the row wherever it is drawn, rather than being a property of
+    /// the list that happened to be below the columns.
+    fn picker_leaf_row_ui(&mut self, ui: &mut egui::Ui, row: &PickerRow) {
+        let assigned = row
+            .id
+            .parse::<i64>()
+            .ok()
+            .is_some_and(|uid| self.force.contains(uid));
+        let armed = self.fleet_pick.as_deref() == Some(row.id.as_str());
+        let response = ui.horizontal(|ui| {
+            self.unit_thumbnail_ui(ui, &row.id, 28.0);
+            ui.vertical(|ui| {
+                ui.label(row.name.clone());
+                ui.weak(format!(
+                    "{} ({}){}",
+                    row.class_name,
+                    row.hull,
+                    if row.stat_class.is_some() {
+                        " · stats ready"
+                    } else {
+                        " · no sim stats"
+                    }
+                ));
+            });
+            if armed {
+                ui.label(egui::RichText::new("armed").weak().small());
+            } else if assigned {
+                ui.label(egui::RichText::new("assigned").weak().small());
+            } else if ui.small_button("assign").clicked() {
+                self.pending_assign = row.id.parse::<i64>().ok().map(|id| (id, row.name.clone()));
+            }
+        });
+        // Selected state painted by hand, because `selectable_label` is not
+        // available on a row that also has to be a drag source and a button.
+        if armed {
+            ui.painter().rect_stroke(
+                response.response.rect.expand(2.0),
+                egui::CornerRadius::same(3),
+                egui::Stroke::new(1.0, tfg::tokens::RADAR_CYAN),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let row_response = ui.interact(
+            response.response.rect,
+            ui.id().with(("unit-row", row.id.as_str())),
+            egui::Sense::click_and_drag(),
+        );
+        if row_response.is_pointer_button_down_on() && self.unit_drag.is_none() {
+            self.arm_fleet_pick(row.id.clone());
+            if let Some(start) = row_response.interact_pointer_pos() {
+                self.unit_drag = Some(UnitDrag {
+                    id: row.id.clone(),
+                    name: row.name.clone(),
+                    start,
+                    moved: false,
+                });
+            }
+        }
+        if row_response.clicked() && self.pending_assign.is_none() {
+            self.arm_fleet_pick(row.id.clone());
+            self.note_placement(format!("{} selected · click the map to place", row.name));
+        }
+    }
+
+    /// The count, and the placement controls.
+    ///
+    /// Only those two things. It used to also draw the rows, as a list under
+    /// the columns, and that is the whole defect: the drill's leaf belongs in
+    /// the column set beside the four levels that narrow to it, and a list
+    /// painted below a fixed-height panel with no scroll is a list nobody can
+    /// reach. What is left here is what genuinely is not a row.
+    fn picker_tail_ui(&mut self, ui: &mut egui::Ui, rows: &[PickerRow]) -> Vec<(i64, String)> {
         ui.label(format!(
             "{} shown · {} placed",
             rows.len(),
             self.placed_fleet.len()
         ));
-        let mut assigning = Vec::new();
-        egui::ScrollArea::vertical()
-            .id_salt("picker-rows")
-            .max_height(240.0)
-            .show(ui, |ui| {
-                for row in rows {
-                    let assigned = self.users_gunits.iter().any(|unit| {
-                        unit.unit_id.to_string() == row.id
-                    });
-                    let mut assignment = None;
-                    let response = ui.horizontal(|ui| {
-                        self.unit_thumbnail_ui(ui, &row.id, 34.0);
-                        ui.vertical(|ui| {
-                            ui.label(row.name.clone());
-                            let trail = if row.trail.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" · {}", row.trail)
-                            };
-                            ui.weak(format!(
-                                "{} ({}) · {}{trail} · {}",
-                                row.class_name,
-                                row.hull,
-                                row.name,
-                                if row.stat_class.is_some() {
-                                    "stats ready"
-                                } else {
-                                    "no sim stats"
-                                }
-                            ));
-                        });
-                        if assigned {
-                            ui.label(egui::RichText::new("assigned").weak().small());
-                        } else if ui.small_button("assign").clicked() {
-                            assignment = row
-                                .id
-                                .parse::<i64>()
-                                .ok()
-                                .map(|id| (id, row.name.clone()));
-                        }
-                    });
-                    let row_response = ui.interact(
-                        response.response.rect,
-                        ui.id().with(("unit-row", row.id.as_str())),
-                        egui::Sense::click_and_drag(),
-                    );
-                    if row_response.is_pointer_button_down_on() && self.unit_drag.is_none() {
-                        self.arm_fleet_pick(row.id.clone());
-                        if let Some(start) = row_response.interact_pointer_pos() {
-                            self.unit_drag = Some(UnitDrag {
-                                id: row.id.clone(),
-                                name: row.name.clone(),
-                                start,
-                                moved: false,
-                            });
-                        }
-                    }
-                    if row_response.clicked() && assignment.is_none() {
-                        self.arm_fleet_pick(row.id.clone());
-                        self.users_status = format!("{} selected · click the map to place", row.name);
-                    }
-                    if let Some((id, name)) = assignment {
-                        assigning.push((id, name));
-                    }
-                }
-            });
+
+        // Why the last placement did not happen, said HERE.
+        //
+        // A drag out of this picker ends on the map, and every way that can end
+        // — refused for land, refused for a disarmed engine, released over the
+        // form instead of the map, dropped on a hull already placed — is a fact
+        // about the PLACEMENT. It reads from `placement_note` and not from
+        // `users_status`, because `users_status` is shared with the register
+        // sync and the sync runs on a timer: the first version of this line read
+        // `users_status`, and the refusal was overwritten by "pictures: 0 hull(s)
+        // listed" before the operator could look at it. The reason was there and
+        // it vanished, which is the same thing as never saying it.
+        let note = self.placement_note.0.clone();
+        if !note.is_empty() {
+            status_line(ui, &note);
+        }
 
         let armed = self.mode.armed.load(Ordering::SeqCst);
         if self.mode.phase == Phase::Closed {
             ui.label("Placement is unavailable once the session is closed.");
         } else if !armed {
-            ui.label("Engine is presentation-only: placed units stay invisible until it runs.");
-            if ui.small_button("arm engine").clicked() {
-                self.mode.armed.store(true, Ordering::SeqCst);
-            }
+            // One row, for the reason `PICKER_TAIL_ROWS` gives: the tail's
+            // height is a budget the strip is sized against, so a branch that
+            // prints a line and then offers a button underneath it spends a row
+            // the columns needed.
+            ui.horizontal(|ui| {
+                ui.label("Engine is presentation-only: placed units stay invisible until it runs.");
+                if ui.small_button("arm engine").clicked() {
+                    self.mode.armed.store(true, Ordering::SeqCst);
+                }
+            });
         } else if self.acting_as.is_some() {
             ui.label("Placement is organizer-only.");
         } else if self
@@ -7437,34 +8118,49 @@ impl ShipApp {
         } else if let Some(pick) = self.fleet_pick.clone() {
             if let Some(row) = rows.iter().find(|row| row.id == pick) {
                 let placing = self.mode.tool == SetupTool::Place;
-                if ui
-                    .small_button(if placing {
-                        format!("cancel placing {}…", row.name)
-                    } else {
-                        format!("place {}", row.name)
-                    })
-                    .clicked()
-                {
-                    if placing {
-                        self.clear_fleet_pick();
-                        self.users_status = "placement cancelled".to_string();
-                    } else {
-                        self.arm_fleet_pick(pick.clone());
+                // Side by side, and this is a layout requirement rather than a
+                // tidy-up: the tail sits under a fixed-height strip whose budget
+                // is a row count, so two buttons stacked are two rows and the
+                // second one falls off the bottom of the panel — which is the
+                // defect this whole arrangement exists to end, reproduced one
+                // row down.
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(if placing {
+                            format!("cancel placing {}…", row.name)
+                        } else {
+                            format!("place {}", row.name)
+                        })
+                        .clicked()
+                    {
+                        if placing {
+                            self.clear_fleet_pick();
+                            self.users_status = "placement cancelled".to_string();
+                        } else {
+                            self.arm_fleet_pick(pick.clone());
+                        }
                     }
-                }
-                if ui.button("place at map center").clicked() {
-                    let (la, lo) = self.center;
-                    self.try_place_picked(la, lo);
-                    self.mode.tool = SetupTool::Select;
-                }
+                    if ui.button("place at map center").clicked() {
+                        let (la, lo) = self.center;
+                        self.try_place_picked(la, lo);
+                        self.mode.tool = SetupTool::Select;
+                    }
+                });
             } else {
                 self.clear_fleet_pick();
-                ui.label("Pick a unit above to arm placement.");
+                ui.label("Pick a hull from the last column to arm placement.");
             }
         } else {
-            ui.label("Pick a unit above to arm placement.");
+            ui.label("Pick a hull from the last column to arm placement.");
         }
-        assigning
+        // The leaf column cannot return a value out of a layout closure the
+        // way the old list could, so an assign is parked here and drained here.
+        // Taken after the placement controls, which read `fleet_pick` and would
+        // otherwise see the row armed by the same click that assigned it.
+        match self.pending_assign.take() {
+            Some(assign) => vec![assign],
+            None => Vec::new(),
+        }
     }
 
     /// Setup flow step 3 (#79): assign register hulls as commanded
@@ -7521,7 +8217,7 @@ impl ShipApp {
                     });
                 }
                 for (unit, name) in lifts {
-                    self.lift_placement(unit, &name);
+                    self.lift_placement_remote(unit, &name);
                 }
             }
             status_line(ui, &self.users_status.clone());
@@ -7529,22 +8225,22 @@ impl ShipApp {
         }
         let crew = self.setup_crew();
         // The picker is a modal, so the island offers the door and keeps the
-        // RESULT. The list of assigned pieces is the thing the operator comes
+        // RESULT. The list of staged pieces is the thing the operator comes
         // back to read — the register with its four Miller columns is a
         // means, not a summary, and in a 320-point column it would be the only
         // thing on the island.
         ui.horizontal(|ui| {
-            let assigned = self.users_gunits.len();
+            let staged = self.force.len();
             if ui
-                .button(if assigned > 0 {
-                    format!("Fleet picker ({assigned} assigned)")
+                .button(if staged > 0 {
+                    format!("Fleet picker ({staged} in the draft)")
                 } else {
                     "Fleet picker".to_string()
                 })
                 .on_hover_text("browse the register and drag a hull onto the map")
                 .clicked()
             {
-                self.fleet_picker_open = true;
+                self.open_only(WhichModal::Fleet);
             }
             if self.fleet_pick.is_some() {
                 ui.weak(
@@ -7554,35 +8250,33 @@ impl ShipApp {
             }
         });
         ui.strong("Pieces");
-        if self.users_gunits.is_empty() {
+        if self.force.is_empty() {
             ui.weak("No pieces yet — assign register hulls above.");
         } else {
             let mut commanding: Vec<(i64, i64)> = Vec::new();
             let mut removals: Vec<(i64, String)> = Vec::new();
             let mut lifts: Vec<(i64, String)> = Vec::new();
-            for gu in &self.users_gunits {
-                let placed = self
-                    .users_placements
-                    .iter()
-                    .any(|p| p.unit_id == gu.unit_id);
-                let unit_id = gu.unit_id.to_string();
-                ui.push_id(gu.unit_id, |ui| {
+            for hull in self.force.hulls().cloned().collect::<Vec<_>>() {
+                let placed = hull.start.is_some();
+                let unit_id = hull.unit_id.to_string();
+                let on_server = self.users_gunits.iter().any(|g| g.unit_id == hull.unit_id);
+                ui.push_id(hull.unit_id, |ui| {
                     ui.horizontal(|ui| {
                         self.unit_thumbnail_ui(ui, &unit_id, 28.0);
                         ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(gu.unit_name.as_str()).strong());
-                            if !gu.hull_number.is_empty() {
-                                ui.weak(format!("Hull {}", gu.hull_number));
+                            ui.label(egui::RichText::new(hull.name.as_str()).strong());
+                            if !hull.hull_number.is_empty() {
+                                ui.weak(format!("Hull {}", hull.hull_number));
                             }
                         });
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 if ui.small_button("remove").clicked() {
-                                    removals.push((gu.unit_id, gu.unit_name.clone()));
+                                    removals.push((hull.unit_id, hull.name.clone()));
                                 }
                                 if placed && ui.small_button("lift").clicked() {
-                                    lifts.push((gu.unit_id, gu.unit_name.clone()));
+                                    lifts.push((hull.unit_id, hull.name.clone()));
                                 }
                             },
                         );
@@ -7595,22 +8289,28 @@ impl ShipApp {
                             egui::RichText::new("Unplaced").color(egui::Color32::GRAY)
                         };
                         ui.label(state.small());
+                        if !on_server {
+                            ui.weak(egui::RichText::new("· local, not on Minos").small());
+                        }
+                    });
+                    ui.horizontal(|ui| {
                         ui.weak("Commander");
-                        let mut tmp = gu.commander_id;
+                        let mut tmp = hull.commander_id;
+                        let cmdr_name = hull
+                            .commander_id
+                            .and_then(|id| crew.iter().find(|(cid, _)| *cid == id))
+                            .map(|(_, name)| name.clone())
+                            .unwrap_or_else(|| "Unassigned".to_string());
                         egui::ComboBox::from_id_salt("commander")
-                            .selected_text(if gu.commander_name.is_empty() {
-                                "Unassigned".to_string()
-                            } else {
-                                gu.commander_name.clone()
-                            })
+                            .selected_text(cmdr_name)
                             .show_ui(ui, |ui| {
                                 for (uid, name) in &crew {
-                                    if gu.commander_id != Some(*uid)
+                                    if hull.commander_id != Some(*uid)
                                         && ui
                                             .selectable_value(&mut tmp, Some(*uid), name)
                                             .clicked()
                                     {
-                                        commanding.push((gu.unit_id, *uid));
+                                        commanding.push((hull.unit_id, *uid));
                                     }
                                 }
                             });
@@ -7626,6 +8326,36 @@ impl ShipApp {
             }
             for (unit, name) in lifts {
                 self.lift_placement(unit, &name);
+            }
+            let pending = self.force.pending(&self.live_hulls());
+            if pending > 0 {
+                // The note and the verbs are stacked, not side by side: the
+                // island is 320pt and the note plus two buttons in one row
+                // overflows it, which pushes the last button past the clip
+                // rectangle — where egui still draws it and the pointer no
+                // longer reaches it. A dead control is worse than a taller
+                // island.
+                ui.weak(format!("{pending} change(s) not yet on Minos"));
+                ui.horizontal(|ui| {
+                    if !self.force.uncommanded().is_empty() {
+                        if ui.small_button("fill commanders").clicked() {
+                            if let Some((cid, _)) = crew.first() {
+                                let uncommanded: Vec<i64> = self
+                                    .force
+                                    .uncommanded()
+                                    .iter()
+                                    .map(|h| h.unit_id)
+                                    .collect();
+                                for uid in uncommanded {
+                                    self.force.set_commander(uid, Some(*cid));
+                                }
+                            }
+                        }
+                    }
+                    if ui.small_button("sync to Minos").clicked() {
+                        self.begin_force_sync(None);
+                    }
+                });
             }
         }
         status_line(ui, &self.users_status.clone());
@@ -7784,7 +8514,7 @@ impl ShipApp {
                 }
             }
             _ => {
-                if self.users_gunits.is_empty() && self.commanded_hulls.is_empty() {
+                if self.users_gunits.is_empty() && self.commanded_hulls.is_empty() && self.force.is_empty() {
                     Some("assign pieces in Fleet first".to_string())
                 } else {
                     None
@@ -7913,11 +8643,21 @@ impl ShipApp {
                             self.sign_out("signed out from the top zone");
                         }
                         if ui.button("Settings").clicked() {
-                            self.settings_open = true;
+                            self.open_only(WhichModal::Settings);
                         }
                         self.clock_ui(ui);
                     });
                 });
+                // Where the band ends, published for the modal backdrop.
+                //
+                // The backdrop has to leave the top band clickable, and the
+                // band's height is whatever its one row of controls measured —
+                // so it is measured and published here rather than assumed
+                // there. A constant would be wrong by however much the row is
+                // tall, and the failure is invisible: too small and the band's
+                // own buttons go inert again, too large and the backdrop eats
+                // into the map.
+                tfg::chrome::publish_top_band(ui.ctx(), ui.min_rect().bottom());
             });
     }
 
@@ -8133,7 +8873,7 @@ impl ShipApp {
         } else if self.composer_scenario.is_none() {
             self.composer_scenario = self.scenarios.first().map(|s| s.id);
         }
-        self.composer_visible = true;
+        self.open_only(WhichModal::Composer);
         self.composer_draft = ComposerDraft::default();
         self.composer_draft_error = None;
         self.load_scenarios();
@@ -8261,26 +9001,54 @@ impl ShipApp {
 
     /// The Fleet Picker modal.
     ///
+    /// Open exactly one modal, closing whichever other was up.
+    ///
+    /// A modal is a modal: two at once is not two forms, it is one form on top
+    /// of another with no way to say which. And it happened here. Settings is
+    /// opened from the top band, which the backdrop deliberately leaves live so
+    /// a modal is never a dead end — so Settings could be opened while the Fleet
+    /// picker was up, and it was drawn UNDERNEATH it, because `Order::Foreground`
+    /// puts the later-drawn modal on top and the picker draws later. The operator
+    /// clicked Settings, watched nothing appear, and concluded the click had been
+    /// swallowed. Nothing was swallowed; the Settings panel was there the whole
+    /// time, under a form of the same size.
+    ///
+    /// Closing the others is the honest reading of one click on "Settings". The
+    /// alternative is stacking by open order, which needs a z-order egui's
+    /// `Order` cannot express and a modal stack nothing else in this app keeps.
+    fn open_only(&mut self, which: WhichModal) {
+        self.settings_open = which == WhichModal::Settings;
+        self.composer_visible = which == WhichModal::Composer;
+        self.fleet_picker_open = which == WhichModal::Fleet;
+        self.player_picker_open = which == WhichModal::Player;
+        // A drag does not survive the modal that armed it: the release would
+        // land on the map with no panel to have started it, which is a command
+        // nobody asked for.
+        self.unit_drag = None;
+    }
+
     /// Not a picker over the register alone: it is also where placement is
     /// armed and where the caller's own hulls are lifted, because all three
     /// act on the same `fleet_pick` and splitting them puts the state in one
     /// modal and its effect on the map in another.
     fn fleet_picker_modal(&mut self, ui: &egui::Ui) {
-        let crew = self.setup_crew();
         let mut spec = tfg::chrome::Modal::new(
             egui::Id::new("fleet-picker"),
             "Fleet picker",
-            egui::vec2(980.0, 620.0),
+            fleet_picker_size(ui.ctx().viewport_rect().height()),
         );
-        // A drag in flight means the pointer is about to be over the map, and
-        // the ghost it is aiming with is painted there. Dimming now would
-        // dim the one thing the operator is looking at.
-        if self.unit_drag.is_some() {
-            spec = spec.clear_backdrop();
+        // A drag in flight means the pointer is about to be over the map, and the
+        // ghost it is aiming with is painted there — so the whole panel steps
+        // aside, not just the dim. It is the thing covering the target, and a
+        // release over it is refused by `drop_lands_on_map`, so leaving it up
+        // would take away exactly the ground the gesture is for.
+        let dragging = self.unit_drag.is_some();
+        if dragging {
+            spec = spec.step_aside();
         }
         let panel = spec.rect_in(ui.ctx().viewport_rect());
         let kept = tfg::chrome::modal(ui.ctx(), &spec, |ui| {
-            let picked = self.unit_picker_ui(ui, &crew);
+            let picked = self.unit_picker_ui(ui);
             for (hull, name) in picked {
                 self.setup_assign_unit(hull, &name);
             }
@@ -8288,7 +9056,13 @@ impl ShipApp {
         // Published even when the modal is closing: the drop handler runs
         // later in the same frame, on the release that closed it, and on that
         // frame the panel is still where the pointer left it.
-        self.modal_panel_rects.push(panel);
+        //
+        // NOT published while the panel is stepped aside. There is nothing on
+        // screen to drop "over the form" onto, so refusing a drop there would be
+        // refusing a drop on open water the operator can plainly see.
+        if !dragging {
+            self.modal_panel_rects.push(panel);
+        }
         if !kept {
             self.fleet_picker_open = false;
             self.clear_fleet_pick();
@@ -8321,11 +9095,13 @@ impl ShipApp {
             "Player picker",
             egui::vec2(940.0, 600.0),
         );
-        // The drag ghost is painted by the map, which is under the
-        // backdrop. Same reasoning as the Fleet picker: do not dim the thing
-        // the operator is aiming.
-        if self.player_drag_in_flight() {
-            spec = spec.clear_backdrop();
+        // The drag ghost is painted by the map, which is under the panel, and the
+        // release lands on a marker or a group flag the panel is covering. Same
+        // reasoning as the Fleet picker, so the same answer: the whole surface
+        // steps aside for the duration of the gesture.
+        let dragging = self.player_drag_in_flight();
+        if dragging {
+            spec = spec.step_aside();
         }
         let panel = spec.rect_in(ui.ctx().viewport_rect());
         // Indexed rather than bound: `&mut cols[0]` and `&mut cols[1]` are
@@ -8338,7 +9114,9 @@ impl ShipApp {
             });
             status_line(ui, &self.users_status.clone());
         });
-        self.modal_panel_rects.push(panel);
+        if !dragging {
+            self.modal_panel_rects.push(panel);
+        }
         if !kept {
             self.player_picker_open = false;
             // A person-drag does not survive the modal that started it: the
@@ -8764,7 +9542,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 ));
                 entries.push((
                     Island::new(egui::Id::new("z.fleet"), "Fleet", egui::vec2(w, 320.0))
-                        .with_trailing(&format!("{} PIECES", self.users_gunits.len())),
+                        .with_trailing(&format!("{} PIECES", self.force.len())),
                     true,
                 ));
                 entries.push((
@@ -9457,8 +10235,12 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         self.minos_tree.clear();
         self.tree_gap = false;
         self.clear_fleet_pick();
-        self.pending_placement = None;
         self.users_placements.clear();
+        self.force.clear();
+        self.force_seeded_for = None;
+        self.force_queue.clear();
+        self.force_flush_then = None;
+        self.map_unit_move = None;
         self.placement_unplaced = 0;
         self.placement_ready = false;
         // Pictures belong to the ended exercise, not the new one.
@@ -10533,7 +11315,6 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 match res {
                     Ok(done) => self.apply_setup(done),
                     Err(e) => {
-                        self.pending_placement = None;
                         let line = match setup_label {
                             Some(l) => format!("{l} failed: {e}"),
                             None => format!("setup failed: {e}"),
@@ -10543,7 +11324,6 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                     }
                 }
                 self.dispatch_queued_refresh();
-                self.resume_pending_placement();
             }
         }
         // The WebSocket game-position stream is an accelerator. The
@@ -10586,32 +11366,27 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 self.users_roster = roster;
                 self.users_status = note;
             }
-            SetupDone::Units(units, note) => {
+            SetupDone::ForceUnits(units) => {
                 self.users_gunits = units;
                 self.refresh_unassigned_units();
-                self.users_status = note;
+                // The unit list is the authority; the write is retired.
+                self.force_write_done();
             }
-            SetupDone::Assign(units, note, pick) => {
-                self.users_gunits = units;
-                self.refresh_unassigned_units();
-                self.arm_fleet_pick(pick.to_string());
-                self.users_status = note;
-                if let Some((_, la, lo)) = self.pending_placement.take() {
-                    self.try_place_picked(la, lo);
-                }
-            }
-            SetupDone::Unassign(units, note, removed) => {
-                self.users_gunits = units;
-                self.refresh_unassigned_units();
-                // Out of the game entirely: the local half goes too.
-                self.release_hull(&removed.to_string());
-                self.users_status = note;
-            }
-            SetupDone::Place(view, drop_) => self.apply_placed(view, drop_),
-            SetupDone::Lift(view, note, lifted) => {
+            SetupDone::ForcePlacements(view) => {
                 self.apply_placements(view);
-                self.release_hull(&lifted.to_string());
-                self.users_status = note;
+                self.force_write_done();
+            }
+            SetupDone::ForceFailed(e, write) => {
+                // The successful earlier writes are already reflected in
+                // the live mirror; this one is not. Drop the queue so the
+                // transition does not advance on a half-written force,
+                // and say which hull held the whole thing up.
+                self.force_queue.clear();
+                self.force_flush_then = None;
+                let line = format!("sync refused at {}: {e}", write.name());
+                self.feed(line.clone());
+                self.users_status = line.clone();
+                self.phase_note = Some(line);
             }
             SetupDone::Game(to, row) => self.apply_transition(&to, row),
             SetupDone::GameUpdated(d) => {
@@ -10764,7 +11539,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             return "Choose or join a session";
         }
         match self.users_game_state.as_deref() {
-            Some("planning") => "Assign a commander, then place units",
+            Some("planning") => "Place units, then assign helm players",
             Some("preparation") => "Declare readiness, then start the exercise",
             Some("execution") => "Issue helm orders",
             Some("closure") => "Review the assessment",
@@ -11078,13 +11853,30 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     }
 
     /// Recompute which exercise pieces are unassigned in the tree.
+    /// Staged (locally drafted) hulls are unassigned by definition — the
+    /// tree only learns of them at a stage advance — so they ride along,
+    /// which paints the dashed "nobody's placed me in the organisation"
+    /// frame. A staged hull the server already knows and has placed in the
+    /// tree keeps the server's answer, or every piece would wear the
+    /// dashed frame for as long as the draft holds it.
     fn refresh_unassigned_units(&mut self) {
-        self.unassigned_units = self
+        let mut set: std::collections::HashSet<i64> = self
             .users_gunits
             .iter()
             .filter(|g| g.hierarchy_node.is_none())
             .map(|g| g.unit_id)
             .collect();
+        for hull in self.force.hulls() {
+            let known = self
+                .users_gunits
+                .iter()
+                .find(|g| g.unit_id == hull.unit_id)
+                .is_some_and(|g| g.hierarchy_node.is_some());
+            if !known {
+                set.insert(hull.unit_id);
+            }
+        }
+        self.unassigned_units = set;
     }
 
     /// Reload every affiliation declaration for this session. An empty
@@ -11614,6 +12406,75 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             .map(|marker| marker.id.clone())
     }
 
+    /// Setup counterpart to `map_heading_target`: which placed hull's
+    /// body the Setup-phase pointer is over, to be lifted and moved.
+    /// Keyed like the heading handle — hit the marker's pixel body, not
+    /// its label or a surrounding water pixel.
+    fn map_move_target(
+        &self,
+        markers: &[ShipMarker],
+        px: f64,
+        py: f64,
+        pixels_per_point: f32,
+        pos: egui::Pos2,
+    ) -> Option<UnitMoveDrag> {
+        if self.mode.phase != Phase::Setup {
+            return None;
+        }
+        markers
+            .iter()
+            .find(|marker| {
+                !self.hidden.contains(&marker.id)
+                    && marker
+                        .id
+                        .parse::<i64>()
+                        .ok()
+                        .and_then(|uid| self.force.get(uid))
+                        .is_some_and(|hull| hull.start.is_some())
+                    && marker_body_hit(marker, px, py, self.zoom, pixels_per_point)
+            })
+            .and_then(|marker| {
+                let uid = marker.id.parse::<i64>().ok()?;
+                let hull = self.force.get(uid)?;
+                Some(UnitMoveDrag {
+                    unit_id: uid,
+                    name: hull.name.clone(),
+                    start: pos,
+                    moved: false,
+                })
+            })
+    }
+
+    /// Commit a move-drag when the pointer is released. Only a drag that
+    /// actually moved past the dead-zone commits; a release within a few
+    /// pixels is the ordinary map click and selects whatever is there.
+    fn finish_unit_move(&mut self, ui: &egui::Ui, rect: egui::Rect) {
+        let Some(m) = self.map_unit_move.take() else { return };
+        if !m.moved {
+            return;
+        }
+        // A genuine drag just ended, whichever way it commits: the pointer
+        // came up, so the map click that rides the same release must not
+        // turn into a select (or a deselect, when it lands on empty
+        // water). The click block consumes and clears this flag.
+        self.released_move_drag = true;
+        let Some(pos) = ui.input(|input| input.pointer.interact_pos()) else { return };
+        if !rect.contains(pos) || !drop_lands_on_map(&self.modal_panel_rects, pos) {
+            self.note_placement(format!("{} move cancelled — release over the map", m.name));
+            return;
+        }
+        let (mw, mh) = self.map_dims();
+        let (la, lo) = unproject_mercator(
+            (pos.x - rect.min.x) as f64,
+            (pos.y - rect.min.y) as f64,
+            self.center,
+            self.zoom,
+            mw,
+            mh,
+        );
+        self.move_placement(m.unit_id, &m.name, la, lo);
+    }
+
     fn update_map_heading_draft(&mut self, id: &str, heading_deg: f32) {
         let speed_kn = self
             .helm_drafts
@@ -11717,6 +12578,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             }
         }
     }
+
 
 
     /// Apply finished map frames (last-writer-wins by sequence). The
@@ -12028,91 +12890,65 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     }
 
     /// Shared place core (click + drag-and-drop): the click path's
-    /// guards, then TakeControl for a picked, unplaced hull with stats.
-    /// Returns the placed id, if any.
+    /// guards, then take-control for a picked, unplaced hull with stats.
+    ///
+    /// LOCAL FIRST (force draft): the drop goes straight into `self.force`
+    /// and the local drop — no backend write in the gesture, and no
+    /// commander to name on the way in. Minos catches up at a stage
+    /// advance, which is the one place the server's commander rule is
+    /// written as a rule instead of a blocker.
     fn try_place_picked(&mut self, la: f64, lo: f64) -> Option<String> {
         if !(self.mode.phase == Phase::Setup || self.mode.phase == Phase::Live) {
             return None;
         }
         if !self.mode.armed.load(Ordering::SeqCst) {
             self.feed("place refused: engine disarmed".to_string());
-            self.users_status = "place refused: engine disarmed".to_string();
+            self.note_placement("place refused: engine disarmed");
             return None;
         }
         if self.acting_as.is_some() {
             return None;
         }
         if !self.placement_valid(la, lo) {
-            self.users_status = "placement needs water".to_string();
+            self.note_placement("placement needs water");
             return None;
         }
         let pid = self.fleet_pick.clone()?;
         let (name, hull, class_id) = self.placement_seed(&pid)?;
+        // A hull already placed is not a second placement — it is a move.
         if self.placed_fleet.contains(&pid) {
             return None;
         }
         match class_id {
             Some(class_id) => {
-                let id = pid.clone();
-                // C2 + #100: a held game owns the starting position —
-                // the PUT runs off-thread and the local drop follows on
-                // success, a frame later. A refusal (frozen execution
-                // legs, unassigned hull, bad water) leaves no phantom
-                // ship on the map. With no game held the drop stays a
-                // local sandbox act, applied at once below.
-                if let Some((gid, _)) = self.users_game.clone() {
-                    let Ok(uid) = pid.parse::<i64>() else {
-                        let msg = format!("place refused: {name} is not a register hull");
-                        self.feed(msg.clone());
-                        self.users_status = msg;
-                        return None;
-                    };
-                    if !self.users_gunits.iter().any(|g| g.unit_id == uid) {
-                        if self.setup_op.is_some() {
-                            self.pending_placement = Some((pid.clone(), la, lo));
-                            self.users_status = "placement queued behind the current setup action…".to_string();
-                        } else if self.setup_commander.is_none() {
-                            self.users_status = "pick a commander before placing".to_string();
-                        } else if let Err(e) = self.users_client() {
-                            self.users_status = format!("cannot create GameUnit: {e}");
-                        } else {
-                            self.pending_placement = Some((pid.clone(), la, lo));
-                            self.setup_assign_unit(uid, &name);
-                            self.mode.tool = SetupTool::Select;
-                            self.users_status = format!("creating GameUnit for {name}…");
-                        }
-                        return None;
-                    }
-                    if self.setup_busy("place") {
-                        return None;
-                    }
-                    let (master, tok) = match self.users_client() {
-                        Ok(t) => t,
-                        Err(e) => {
-                            let msg = format!("place refused: {e}");
-                            self.feed(msg.clone());
-                            self.users_status = msg;
-                            return None;
-                        }
-                    };
-                    let drop_ = PlaceDrop {
-                        pid: pid.clone(),
-                        name: name.clone(),
-                        hull: hull.clone(),
-                        class_id: class_id.clone(),
-                        la,
-                        lo,
-                    };
-                    self.users_status = format!("placing {name}…");
-                    self.setup_op = Some(spawn_rest("place", move || {
-                        master
-                            .set_placement(&tok, gid, uid, la, lo)
-                            .map_err(|e| e.to_string())
-                            .map(|view| SetupDone::Place(view, drop_))
-                    }));
+                let Ok(uid) = pid.parse::<i64>() else {
+                    let msg = format!("place refused: {name} is not a register hull");
+                    self.feed(msg.clone());
+                    self.users_status = msg;
                     return None;
-                }
-                self.apply_local_drop(&id, &pid, &name, &hull, &class_id, la, lo);
+                };
+                // Carry a commander the Player picker already named, so
+                // re-placing a hull does not strip one.
+                let commander_id = self.force.get(uid).and_then(|h| h.commander_id);
+                let mut entry = self
+                    .force
+                    .get(uid)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        tfg::force::DraftHull::new(
+                            uid,
+                            name.clone(),
+                            hull.clone(),
+                            class_id.clone(),
+                        )
+                    });
+                entry.name = name.clone();
+                entry.hull_number = hull.clone();
+                entry.class_id = class_id.clone();
+                entry.start = Some(tfg::force::Start { lat: la, lon: lo });
+                entry.commander_id = commander_id;
+                self.force.upsert(entry);
+                self.apply_local_drop(&pid, &pid, &name, &hull, &class_id, la, lo);
                 Some(pid)
             }
             None => {
@@ -12122,16 +12958,6 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 None
             }
         }
-    }
-
-    fn resume_pending_placement(&mut self) {
-        if self.setup_op.is_some() {
-            return;
-        }
-        let Some((_, la, lo)) = self.pending_placement.clone() else {
-            return;
-        };
-        self.try_place_picked(la, lo);
     }
 
     /// The local half of a placement (shared by the sandbox drop and
@@ -12161,6 +12987,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         self.placed_labels.insert(id.to_string(), (name.to_string(), hull.to_string()));
         self.placed_fleet.insert(pid.to_string());
         self.clear_fleet_pick();
+        self.refresh_unassigned_units();
         // The event feed only renders in an execution window;
         // the setup flow owns its own status line too. The spec
         // source rides the message (H10): Minos figures name
@@ -12178,8 +13005,10 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             .unwrap_or_else(|| "unknown class".to_string());
         let msg = format!(
             "placed {name} ({hull}) at ({la:.4}, {lo:.4}) · {authority} · exercise: {} placed, {} to go",
-            self.users_placements.len(),
-            self.placement_unplaced,
+            self.force.hulls().filter(|h| h.start.is_some()).count(),
+            self.force
+                .len()
+                .saturating_sub(self.force.hulls().filter(|h| h.start.is_some()).count()),
         );
         self.feed(msg.clone());
         self.users_status = msg;
@@ -12209,15 +13038,6 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         if self.following.as_deref() == Some(id) {
             self.following = None;
         }
-    }
-
-    /// Apply a finished placement PUT: setup view first, then the
-    /// deferred local drop (whose message carries the Minos counts).
-    /// A refusal leaves nothing behind.
-    fn apply_placed(&mut self, view: tfg::backend::PlacementList, drop_: PlaceDrop) {
-        self.apply_placements(view);
-        let pid = drop_.pid.clone();
-        self.apply_local_drop(&pid, &pid, &drop_.name, &drop_.hull, &drop_.class_id, drop_.la, drop_.lo);
     }
 
     /// Socket URL for a Minos REST base (live-wire ticket): same host,
@@ -13746,12 +14566,15 @@ impl eframe::App for ShipApp {
                 self.app_mode, self.show_side_zone
             );
         }
+        // Only ever one modal at a time — see `open_only`.
+        //
+        // `modal_panel_rects` is cleared before any panel publishes rather than
+        // by each modal on close, so it is cleared once here, ahead of all of
+        // them. See `modal_panel_rects`.
+        self.modal_panel_rects.clear();
         if self.settings_open {
             self.settings_modal(ui);
         }
-        // Cleared here, before any panel publishes, rather than by each modal
-        // on close. See `modal_panel_rects`.
-        self.modal_panel_rects.clear();
         if self.composer_visible {
             self.composer_modal(ui);
         }
@@ -14402,7 +15225,7 @@ impl eframe::App for ShipApp {
                                 // The two refusals are different and the
                                 // operator needs to know which: off the map
                                 // is a miss, over the form is a correction.
-                                self.users_status = if drop
+                                let note = if drop
                                     .is_some_and(|d| !drop_lands_on_map(&self.modal_panel_rects, d))
                                 {
                                     format!(
@@ -14415,13 +15238,14 @@ impl eframe::App for ShipApp {
                                         drag.name
                                     )
                                 };
+                                self.note_placement(note);
                             }
                         } else {
                             self.arm_fleet_pick(drag.id);
-                            self.users_status = format!(
+                            self.note_placement(format!(
                                 "{} selected · click the map to place",
                                 drag.name
-                            );
+                            ));
                         }
                     }
                 }
@@ -14461,7 +15285,6 @@ impl eframe::App for ShipApp {
                                     &painter,
                                     local,
                                     self.symbol_for_unit(uid),
-                                    egui::Color32::LIGHT_BLUE,
                                     false,
                                     1.0,
                                 );
@@ -14481,10 +15304,52 @@ impl eframe::App for ShipApp {
                         );
                     }
                 }
+                // Ghost for a placed-hull move drag: the same tinting cue as
+                // the fleet-picker drop, so the two map-write gestures read
+                // with one grammar — green means water, amber means the land
+                // it would be refused on.
+                if let (Some(m), Some(pos)) = (
+                    self.map_unit_move.as_ref(),
+                    ui.input(|input| input.pointer.interact_pos()),
+                ) {
+                    if rect.contains(pos) && m.moved {
+                        let local = pos - rect.min.to_vec2();
+                        let (la, lo) = unproject_mercator(
+                            local.x as f64,
+                            local.y as f64,
+                            self.center,
+                            self.zoom,
+                            self.map_dims().0,
+                            self.map_dims().1,
+                        );
+                        let valid = self.placement_valid(la, lo);
+                        let tint = if valid {
+                            egui::Color32::from_rgb(74, 222, 128)
+                        } else {
+                            egui::Color32::from_rgb(246, 197, 107)
+                        };
+                        let painter = ui.painter_at(rect);
+                        painter.circle_stroke(local, 27.0, egui::Stroke::new(2.0, tint));
+                        painter.text(
+                            local + egui::vec2(32.0, 2.0),
+                            egui::Align2::LEFT_TOP,
+                            &m.name,
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
                 // The selected unit's map body is the primary heading
                 // handle. A drag that starts on that body changes the
                 // local draft; every other map drag keeps pan behavior.
-                if self.mode.phase != Phase::Closed
+                //
+                // LIVE ONLY: a heading is an order-facing fact, and the
+                // local sim only takes orders once the exercise runs. In
+                // Setup that same body is the move handle for a placed
+                // hull's starting position — the two gestures share a
+                // pointer location but never a phase, so they never
+                // compete for the same drag.
+                if self.mode.phase == Phase::Live
                     && (response.is_pointer_button_down_on() || response.drag_started())
                     && self.map_heading_drag.is_none()
                 {
@@ -14496,6 +15361,28 @@ impl eframe::App for ShipApp {
                             px,
                             py,
                             pixels_per_point,
+                        );
+                    }
+                }
+                // Setup counterpart: a drag that starts on a placed
+                // hull's body picks the hull up to move it. Only while
+                // nothing is armed for placement, so the two map-write
+                // gestures never share a pointer.
+                if self.mode.phase == Phase::Setup
+                    && (response.is_pointer_button_down_on() || response.drag_started())
+                    && self.map_unit_move.is_none()
+                    && self.fleet_pick.is_none()
+                    && !self.placing
+                {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let px = (pos.x - rect.min.x) as f64;
+                        let py = (pos.y - rect.min.y) as f64;
+                        self.map_unit_move = self.map_move_target(
+                            &markers,
+                            px,
+                            py,
+                            pixels_per_point,
+                            pos,
                         );
                     }
                 }
@@ -14518,6 +15405,20 @@ impl eframe::App for ShipApp {
                                     }
                                 }
                             }
+                        }
+                    } else if self.map_unit_move.is_some() {
+                        // A placed hull is in hand: mark it moved and keep the
+                        // pointer grabbing. Nothing commits until release.
+                        if let Some(pos) =
+                            ui.input(|input| input.pointer.interact_pos())
+                        {
+                            if let Some(m) = self.map_unit_move.as_mut() {
+                                if m.start.distance(pos) > 6.0 {
+                                    m.moved = true;
+                                }
+                            }
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                            ui.ctx().request_repaint();
                         }
                     } else {
                         if response.drag_started() && self.following.is_some() {
@@ -14553,6 +15454,7 @@ impl eframe::App for ShipApp {
                 }
                 if ui.input(|input| input.pointer.any_released()) {
                     self.map_heading_drag = None;
+                    self.finish_unit_move(ui, rect);
                 }
                 // Paint order and pick order are the same list: the body
                 // layer draws Far, Middle, Near, and picking walks it
@@ -14570,7 +15472,8 @@ impl eframe::App for ShipApp {
                 let clicked = response.clicked();
                 let double_clicked = response.double_clicked();
                 let single = clicked && !double_clicked;
-                if self.mode.phase != Phase::Closed && (single || double_clicked) {
+                let skip_release_click = std::mem::replace(&mut self.released_move_drag, false);
+                if !skip_release_click && self.mode.phase != Phase::Closed && (single || double_clicked) {
                     if let Some(pos) = response.interact_pointer_pos() {
                         let px = (pos.x - rect.min.x) as f64;
                         let py = (pos.y - rect.min.y) as f64;
@@ -14723,7 +15626,7 @@ impl eframe::App for ShipApp {
                                 "{uname} not assigned \u{2014} release over a unit marker, not the form"
                             ));
                         }
-                        (Some(p), Some((gid, _))) if rect.contains(p) => {
+                        (Some(p), Some(_)) if rect.contains(p) => {
                             let px = (p.x - rect.min.x) as f64;
                             let py = (p.y - rect.min.y) as f64;
                             let near_marker = markers
@@ -14754,33 +15657,28 @@ impl eframe::App for ShipApp {
                                     )),
                                 }
                             } else if let Some(group) = near_group {
+                                // Bulk-assign through the local draft, the
+                                // same as dropping onto one marker: the
+                                // commander lands in `self.force`, and
+                                // Minos catches up at a stage advance.
                                 let members = self.groups.group_units(&group);
-                                match self.users_client() {
-                                    Ok((m, t)) => {
-                                        let mut ok = 0;
-                                        let mut fail = 0;
-                                        for mid in members {
-                                            match mid.parse::<i64>() {
-                                                Ok(hull) => match m.set_unit_commander(&t, gid, hull, uid) {
-                                                    // Each write answers with the whole
-                                                    // units array; the loop's final re-sync
-                                                    // below settles both collections.
-                                                    Ok(_) => ok += 1,
-                                                    Err(e) => {
-                                                        fail += 1;
-                                                        eprintln!("group drop: hull {hull} refused: {e}");
-                                                    }
-                                                },
-                                                Err(_) => fail += 1,
+                                let mut ok = 0;
+                                let mut fail = 0;
+                                for mid in members {
+                                    match mid.parse::<i64>() {
+                                        Ok(hull) => {
+                                            if self.force.set_commander(hull, Some(uid)) {
+                                                ok += 1;
+                                            } else {
+                                                fail += 1;
                                             }
                                         }
-                                        self.feed(format!(
-                                            "{uname} takes group: {ok} commanded, {fail} refused"
-                                        ));
-                                        self.users_refresh_game();
+                                        Err(_) => fail += 1,
                                     }
-                                    Err(e) => self.users_status = e.to_string(),
                                 }
+                                self.feed(format!(
+                                    "{uname} takes group: {ok} commanded, {fail} not in the force"
+                                ));
                             } else {
                                 self.feed(
                                     "drop cancelled: release over a unit marker or group flag"
@@ -14927,25 +15825,32 @@ impl eframe::App for ShipApp {
                     if m.lod == UnitLod::Far {
                         continue;
                     }
-                    let color = if m.stale { egui::Color32::GRAY } else { Self::ship_color(&m.id) };
+                    // Trails wear the affiliation's own ink rather than the per-unit
+                    // green that is gone: a trail is a path on the map, and
+                    // whose side that path is for is a real question the old
+                    // fixture colour could not answer.
+                    let trail_ink = if m.stale {
+                        egui::Color32::GRAY
+                    } else {
+                        affiliation_ink(m.affiliation)
+                    };
                     for (tx, ty) in &m.trail {
                         painter.circle_filled(
                             rect.min + egui::vec2(*tx as f32, *ty as f32),
                             2.0,
-                            color.linear_multiply(0.55),
+                            trail_ink.linear_multiply(0.55),
                         );
                     }
                 }
                 // Layer 2: all symbol-or-image bodies. An eligible
-                // Middle/Near texture replaces the circle; otherwise
-                // the universal circle + taxonomy glyph remains.
+                // Middle/Near texture replaces the symbol; otherwise
+                // the frame + taxonomy glyph remains.
                 for &index in &body_order {
                     let m = &markers[index];
                     if self.hidden.contains(&m.id) {
                         continue;
                     }
                     let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
-                    let color = if m.stale { egui::Color32::GRAY } else { Self::ship_color(&m.id) };
                     image_quads[index] = paint_unit_image(
                         &painter,
                         m,
@@ -14960,22 +15865,27 @@ impl eframe::App for ShipApp {
                         // a rotated quad.
                         paint_affiliation_tint(&painter, quad, m.affiliation);
                     } else {
-                        painter.circle_filled(c, 8.0, color);
+                        // NO base disc. It was painted in `ship_color`, which
+                        // matched only the sandbox fixture ids and so gave
+                        // every real hull the same green — no correlation with
+                        // anything, and it covered the glyph. The frame's own
+                        // interior is the fill now, which is the channel it
+                        // was standing in for.
                         let frame = paint_affiliation_frame(
                             &painter,
                             c,
                             m.affiliation,
                             battle_dimension(m.map_symbol),
                             m.planned,
+                            m.stale,
                         );
                         paint_map_symbol(
                             &painter,
                             c,
                             m.map_symbol,
-                            color,
                             m.stale,
                             frame_icon_radius(frame, SYMBOL_BOX_PX) as f32
-                                / (SYMBOL_FOOTPRINT_RADIUS_PX as f32),
+                                / (GLYPH_AUTHORING_RADIUS_PX as f32),
                         );
                     }
                 }
@@ -14995,6 +15905,12 @@ impl eframe::App for ShipApp {
                 // pass lands on top of them, and skipped entirely at
                 // Quality::Low — the epaint rings are the whole visual then.
                 let mut halos: Vec<(egui::Pos2, tfg::fx::Halo, f32)> = Vec::new();
+                // Rings are multiples of the base disc, which is how they were
+                // spaced when they were literals (12/14/16 over a radius-8 disc)
+                // and is what keeps them OUTSIDE the symbol now that both it and
+                // the box have grown: a ring stated as a pixel count silently
+                // becomes a ring around the middle of the glyph.
+                let ring = |multiple: f32| multiple * symbol_footprint_radius_px() as f32;
                 for m in &markers {
                     if self.hidden.contains(&m.id) {
                         continue;
@@ -15003,13 +15919,17 @@ impl eframe::App for ShipApp {
                     if self.selection == Some(Selection::Ship(m.id.clone())) {
                         painter.circle_stroke(
                             c,
-                            12.0,
+                            ring(1.5),
                             egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE),
                         );
                         halos.push((c, tfg::fx::Halo::Signal, 0.55));
                     }
                     if Some(&m.id) == self.following.as_ref() {
-                        painter.circle_stroke(c, 14.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
+                        painter.circle_stroke(
+                            c,
+                            ring(1.75),
+                            egui::Stroke::new(2.0, egui::Color32::YELLOW),
+                        );
                         // Following is a louder state than selected: it is
                         // where the camera is going.
                         halos.push((c, tfg::fx::Halo::Signal, 0.75));
@@ -15017,7 +15937,7 @@ impl eframe::App for ShipApp {
                     if m.old_data {
                         painter.circle_stroke(
                             c,
-                            16.0,
+                            ring(2.0),
                             egui::Stroke::new(
                                 2.0,
                                 egui::Color32::from_rgb(0xF5, 0x9E, 0x0B),
@@ -15169,8 +16089,14 @@ impl eframe::App for ShipApp {
                         continue;
                     }
                     let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
+                    // Offset off the FRAME, not off the disc: a name is
+                    // anchored to the symbol's corner, and the friendly
+                    // rectangle is the widest frame there is. Half the box
+                    // clears all four, where a fixed 10 px sat inside a
+                    // 32 px symbol's own body.
+                    let offset = SYMBOL_BOX_PX as f32 * 0.5 + 2.0;
                     painter.text(
-                        c + egui::vec2(10.0, -10.0),
+                        c + egui::vec2(offset, -offset),
                         egui::Align2::LEFT_TOP,
                         &m.label,
                         egui::FontId::proportional(MAP_LABEL_PX),
@@ -15607,7 +16533,6 @@ fn main() -> Result<(), String> {
                 selected_class: 0,
                 fleet: Fleet::from_default_asset().expect("fleet asset valid"),
                 fleet_pick: None,
-                pending_placement: None,
                 setup_step: 0,
                 assessment_tab: 0,
                 setup_name: String::new(),
@@ -15636,12 +16561,11 @@ fn main() -> Result<(), String> {
                 drill_category: None,
                 drill_type: None,
                 drill_class: None,
-                miller_height: MILLER_COL_HEIGHT,
+                pending_assign: None,
                 fleet_cache: Vec::new(),
                 fleet_branches: std::collections::HashMap::new(),
                 fleet_branch_names: std::collections::HashMap::new(),
                 fleet_loaded: false,
-                setup_commander: None,
                 users_game: None,
                 users_game_state: None,
                 minos_clock: None,
@@ -15687,9 +16611,16 @@ fn main() -> Result<(), String> {
                 upress: None,
                 udrag: None,
                 unit_drag: None,
+                placement_note: PlacementNote::default(),
                 map_heading_drag: None,
                 placed_fleet: HashSet::new(),
+                released_move_drag: false,
                 placed_labels: HashMap::new(),
+                force: tfg::force::ForceDraft::new(),
+                force_seeded_for: None,
+                force_queue: Vec::new(),
+                force_flush_then: None,
+                map_unit_move: None,
                 time_real_start: (Utc::now() + chrono::Duration::hours(7)).format("%Y-%m-%d %H:%M").to_string(),
                 time_real_end: (Utc::now() + chrono::Duration::hours(14)).format("%Y-%m-%d %H:%M").to_string(),
                 time_game_start: "2026-11-01 00:00".to_string(),
@@ -15846,6 +16777,136 @@ fn main() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- the Fleet picker's column set --------------------------------------
+    //
+    // Two defects, one cause. The drill is five levels deep and `tax_units` is
+    // the leaf, but only four levels were columns: the fifth was a list drawn
+    // UNDER the columns, in a modal body that is a fixed rect with no scroll,
+    // so it was painted past the panel's bottom edge and nothing in the panel
+    // could bring it on screen. The leaf was not misplaced, it was
+    // unreachable, and no unit could be picked or dragged at all.
+    //
+    // These are arithmetic, so they are pinned without a renderer. What a
+    // screenshot cannot tell you — that the five columns fit the panel's
+    // width, and that the tail's reserve survives the strip's height — is
+    // exactly what a screenshot showed as "looks fine".
+
+    /// The five columns fit the panel, with the leaf wider than the rest.
+    ///
+    /// The leaf is wider because its rows carry a thumbnail, a name and a verb
+    /// rather than a name alone. The failure this pins is silent and severe:
+    /// the columns are in a horizontal scroll area, so five that do not fit do
+    /// not clip, they push the leaf off the right of the panel behind a
+    /// scrollbar nobody is going to find for a list they can see is cut off.
+    #[test]
+    fn drill_columns_fit_the_picker_width() {
+        let body = FLEET_PICKER_SIZE.x - 2.0 * tfg::tokens::PAD;
+        let columns = 4.0 * MILLER_COL_WIDTH + MILLER_LEAF_WIDTH;
+        // Four separators between five columns, plus the frame each column
+        // reserves against its own scrollbar.
+        let chrome = 4.0 * (tfg::tokens::ITEM_SPACING.x + 18.0);
+        assert!(
+            columns + chrome <= body,
+            "five columns need {:.0}pt of a {:.0}pt body",
+            columns + chrome,
+            body
+        );
+        assert!(
+            MILLER_LEAF_WIDTH > MILLER_COL_WIDTH,
+            "the leaf holds a thumbnail and a verb; the others hold a name"
+        );
+    }
+
+    /// The count and the placement controls stay on the panel.
+    ///
+    /// The bug, as a number. The strip used to take a stored height the
+    /// operator could raise with a slider, and every height past the panel's
+    /// remaining space pushed the tail off the bottom — where, again, nothing
+    /// could reach it. So the strip is now given what is left over the tail's
+    /// reserve, and this is the property that makes that true at the panel's
+    /// own size rather than at whatever the window happened to be.
+    ///
+    /// Run against a RANGE of row heights rather than one, because the row
+    /// height is a font measurement and the point of measuring it is that the
+    /// layout does not care what it comes out at. `16.0` is a small label and
+    /// `32.0` a large one; the budget has to hold for both.
+    /// Rows above the columns — search, status, commander, breadcrumbs.
+    ///
+    /// Modelled here rather than declared in the layout, because the layout
+    /// does not use it: the live path asks egui how much room is left, which is
+    /// the honest number and the reason the strip cannot drift. This is what
+    /// stands in for that measurement so the arithmetic can be checked without
+    /// a renderer.
+    const HEADER_ROWS_MODELLED: f32 = 96.0;
+
+    #[test]
+    fn the_picker_tail_stays_on_the_panel() {
+        // The TIGHTEST panel, not the declared one: the height is now a
+        // function of the window, and the small window is where the columns and
+        // the tail compete for the same points.
+        let panel_h = fleet_picker_size(640.0).y;
+        assert!(
+            panel_h < FLEET_PICKER_SIZE.y,
+            "a 640pt window must leave map for the drag to land on"
+        );
+        let body = panel_h - tfg::chrome::MODAL_TITLE_H - 2.0 * tfg::tokens::PAD;
+        let available = body - HEADER_ROWS_MODELLED;
+        for row in [12.0_f32, 16.0, 20.0, 24.0, 32.0] {
+            let reserve = PICKER_TAIL_ROWS * row;
+            let strip = picker_strip_height(available, row);
+            assert!(
+                strip + reserve <= available,
+                "at a {:.0}pt row: strip {:.0} + tail {:.0} exceeds the {:.0}pt left",
+                row,
+                strip,
+                reserve,
+                available
+            );
+            assert!(
+                available - reserve > PICKER_STRIP_MIN,
+                "at a {:.0}pt row the tail reserve leaves room on the tightest panel",
+                row
+            );
+        }
+    }
+
+    /// The picker always leaves a droppable strip of map.
+    ///
+    /// Without this the drag has no target: a centred 980x620 panel in a 1040x640
+    /// window leaves 30pt of map, every drop on it was refused for land, and the
+    /// refusal was invisible. The map band is what makes the gesture the design
+    /// is built around performable at all.
+    #[test]
+    fn the_picker_always_leaves_room_to_drop_on() {
+        for window in [480.0_f32, 640.0, 800.0, 1000.0, 1400.0] {
+            let panel = fleet_picker_size(window);
+            let free = window - panel.y;
+            assert!(
+                free >= PICKER_MAP_BAND - 1.0 || panel.y <= PICKER_MIN_H,
+                "a {:.0}pt window leaves only {:.0}pt of map beside the picker",
+                window,
+                free
+            );
+            assert!(panel.x <= FLEET_PICKER_SIZE.x, "the width never grows");
+        }
+    }
+
+    /// A short window degrades to a shorter strip, not to a missing tail.
+    ///
+    /// The floor exists so a cramped panel shows a usable column, and this is
+    /// the direction it is allowed to fail in: the strip gives way, because
+    /// the alternative is the count and the placement controls going off the
+    /// bottom again.
+    #[test]
+    fn a_short_panel_shortens_the_strip() {
+        let row = 18.0;
+        let cramped = PICKER_TAIL_ROWS * row + 40.0;
+        assert_eq!(picker_strip_height(cramped, row), PICKER_STRIP_MIN);
+        // Below the floor the tail is still owed its reserve, so the strip
+        // cannot go under the floor without the tail being the thing at risk.
+        assert!(picker_strip_height(0.0, row) >= PICKER_STRIP_MIN);
+    }
 
     // -- the execution gate -------------------------------------------------
     //
@@ -16410,6 +17471,166 @@ mod tests {
         assert_eq!(map_symbol_shape(tfg::store::MapSymbol::UnknownShip), MapSymbolShape::Dot);
     }
 
+    /// The glyph ink must stay readable against the fill it is painted on.
+    ///
+    /// The ten type accents were originally blended only 32 percent into a
+    /// mid-tone base, which measured between 1.02 and 2.11 contrast against the
+    /// map's own water and land — `Auxiliary` at 1.02 is the sea, drawn on the
+    /// sea. Lightening them onto the frame's dark interior fixed that, and
+    /// nothing else would notice if it regressed: no other test touches the
+    /// rendered colour, and the symbols still look like symbols when they are
+    /// too faint to read.
+    ///
+    /// So this is a contrast check, against the fill the glyph actually sits
+    /// on rather than against the map. 3.0 is the floor the map's own tokens
+    /// use for ink on a panel; anything under it and the shape stops being a
+    /// channel.
+    #[test]
+    fn the_frame_outline_reads_on_both_of_its_edges() {
+        // An outline has two edges and is visible in proportion to the WEAKER
+        // of them. This test exists because only one of them was ever checked:
+        // the hue clears 3.10:1 against its own fill and 1.03:1 against the
+        // sea, so the frame's real legibility was the sea — and the fill is
+        // what a reviewer looks at when they ask whether a symbol is clear.
+        //
+        // The casing is what fixes the outer edge, so the property to hold is
+        // the FULL stack: hue against keyline (is the hue readable at all),
+        // keyline against both terrains (is the hue findable at all), and the
+        // glyph against the fill (did we spend the fill's contrast to get
+        // here). 3.0 is the floor the map's own tokens use for ink on a panel.
+        let sea = egui::Color32::from_rgb(0xa8, 0xd0, 0xf0);
+        let land = egui::Color32::from_rgb(0xe8, 0xe0, 0xd0);
+        for affiliation in tfg::store::Affiliation::ALL {
+            let hue = affiliation_ink(affiliation);
+            let fill = affiliation_fill(affiliation, false);
+            assert!(
+                contrast_ratio(hue, FRAME_KEYLINE) >= 3.0,
+                "{affiliation:?} hue is {:.2}:1 on its keyline",
+                contrast_ratio(hue, FRAME_KEYLINE)
+            );
+            for (what, terrain) in [("sea", sea), ("land", land)] {
+                assert!(
+                    contrast_ratio(FRAME_KEYLINE, terrain) >= 3.0,
+                    "{affiliation:?} keyline is {:.2}:1 against {what}",
+                    contrast_ratio(FRAME_KEYLINE, terrain)
+                );
+            }
+            assert!(
+                contrast_ratio(hue, fill) >= 3.0,
+                "{affiliation:?} hue is {:.2}:1 on its own fill",
+                contrast_ratio(hue, fill)
+            );
+        }
+        // The casing must actually show outside the hue, or the whole arrangement is
+        // a wider single line with extra steps.
+        assert!(
+            FRAME_KEYLINE_OUT_PX > 0.0,
+            "a casing with no outer sliver protects nothing"
+        );
+        assert_eq!(FRAME_KEYLINE_PX, FRAME_STROKE_PX + FRAME_KEYLINE_OUT_PX);
+        // AND it must not be drawn as a wider CENTRED stroke, which is the
+        // version that works in the abstract and eats the glyph on screen:
+        // centred, a casing this wide extends FRAME_KEYLINE_OUT_PX / 2 into
+        // the interior, which measured 55 percent of the glyph's pixels gone.
+        // The offset must therefore equal half the difference between the two
+        // widths, which is what makes the casing sit wholly outside.
+        assert_eq!(
+            FRAME_KEYLINE_OFFSET_PX,
+            (FRAME_KEYLINE_PX - FRAME_STROKE_PX) / 2.0
+        );
+        // The run offset is what actually protects the interior: push a point
+        // outward and it must move, and only outward.
+        let center = egui::pos2(0.0, 0.0);
+        let run = vec![egui::pos2(10.0, 0.0), egui::pos2(0.0, 10.0)];
+        let cased = offset_run_outward(&run, center, 2.0);
+        for (original, moved) in run.iter().zip(&cased) {
+            let before = (*original - center).length();
+            let after = (*moved - center).length();
+            assert!(
+                after > before,
+                "the casing moved a point inward: {before} -> {after}"
+            );
+        }
+        // A degenerate point at the centre has no outward direction and must be
+        // left alone rather than producing a NaN coordinate.
+        let at_centre = offset_run_outward(&[center], center, 2.0);
+        assert!(at_centre[0] == center, "a point on the centre moved");
+        // A stale hull greys its casing but must keep an edge that reads,
+        // because "this hull stopped reporting" is still a thing to see.
+        for (what, terrain) in [("sea", sea), ("land", land)] {
+            assert!(
+                contrast_ratio(FRAME_KEYLINE_STALE, terrain) >= 3.0,
+                "the stale keyline is {:.2}:1 against {what}",
+                contrast_ratio(FRAME_KEYLINE_STALE, terrain)
+            );
+        }
+    }
+
+    /// WCAG relative-luminance contrast between two opaque colours.
+    fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f32 {
+        fn channel(v: u8) -> f32 {
+            let v = v as f32 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        let lum = |c: egui::Color32| {
+            0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+        };
+        let (hi, lo) = {
+            let (x, y) = (lum(a), lum(b));
+            if x > y {
+                (x, y)
+            } else {
+                (y, x)
+            }
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn every_glyph_ink_reads_against_every_affiliation_fill() {
+        for affiliation in tfg::store::Affiliation::ALL {
+            let fill = affiliation_fill(affiliation, false);
+            for symbol in tfg::store::MapSymbol::ALL {
+                let ink = map_symbol_fill(map_symbol_shape(symbol), false);
+                let ratio = contrast_ratio(ink, fill);
+                assert!(
+                    ratio >= 3.0,
+                    "{symbol:?} on {affiliation:?} fill is {ratio:.2}:1, under 3:1"
+                );
+            }
+        }
+        // And the fill itself must survive the map underneath it, which is the
+        // other half: a symbol that reads against its own glyph but vanishes
+        // into the sea has not been fixed. Both terrains, because the map is
+        // pale in both and the numbers are close enough to be worth pinning.
+        let sea = egui::Color32::from_rgb(0xa8, 0xd0, 0xf0);
+        let land = egui::Color32::from_rgb(0xe8, 0xe0, 0xd0);
+        for affiliation in tfg::store::Affiliation::ALL {
+            let fill = affiliation_fill(affiliation, false);
+            for (what, terrain) in [("sea", sea), ("land", land)] {
+                let ratio = contrast_ratio(fill, terrain);
+                assert!(
+                    ratio >= 3.0,
+                    "{affiliation:?} fill is {ratio:.2}:1 against {what}, under 3:1"
+                );
+            }
+        }
+        // Stale greys the fill AND the glyph, and they must still separate —
+        // a stale hull is exactly the one an operator needs to pick out.
+        let stale_fill = affiliation_fill(tfg::store::Affiliation::Friendly, true);
+        for symbol in tfg::store::MapSymbol::ALL {
+            let ink = map_symbol_fill(map_symbol_shape(symbol), true);
+            assert!(
+                contrast_ratio(ink, stale_fill) >= 3.0,
+                "stale {symbol:?} is under 3:1 against the stale fill"
+            );
+        }
+    }
+
     /// Every affiliation gets its own frame AND its own hue: the shape
     /// is primary (it survives a greyscale screenshot), the colour is
     /// the redundant second cue. Two states sharing either would make
@@ -16442,13 +17663,69 @@ mod tests {
         for affiliation in tfg::store::Affiliation::ALL {
             let frame = frame_for(affiliation);
             let radius = frame_icon_radius(frame, SYMBOL_BOX_PX);
-            let scale = radius / SYMBOL_FOOTPRINT_RADIUS_PX;
+            let scale = radius / GLYPH_AUTHORING_RADIUS_PX;
             assert!(scale > 0.0 && scale < 2.0, "{affiliation:?} scale {scale}");
-            // The reference glyph reaches 5.5 of the 8 px circle, so a
-            // scale of 1 keeps today's look and never grows a glyph past
-            // the circle the marker already paints.
-            assert!(5.5 * scale <= SYMBOL_FOOTPRINT_RADIUS_PX + 1e-9);
+            // A glyph never grows past the disc it sits on.
+            assert!(5.5 * scale <= symbol_footprint_radius_px() + 1e-9);
         }
+        // The widest glyph FILLS its frame, and that is a property of the
+        // authored literals rather than of the size or the affiliation:
+        //
+        //     reach == literal * (icon_radius / GLYPH_AUTHORING_RADIUS_PX)
+        //
+        // so `reach / icon_radius` is `literal / 8` for every frame at every
+        // box, and asserting it against the measured radius measures a
+        // constant. That is what the 0.70 floor did, and it failed the tight
+        // frames at 0.6875 while telling you it had measured something.
+        //
+        // So the honest statements are the two that CAN move: the literal has
+        // to be most of the authoring radius, or the vocabulary is drawn as a
+        // speck in a border; and the result at the box the map actually uses
+        // has to be above what the renderer can show as a shape at all.
+        assert!(
+            5.5 >= 0.65 * GLYPH_AUTHORING_RADIUS_PX,
+            "the widest glyph fills only {} of its frame",
+            5.5 / GLYPH_AUTHORING_RADIUS_PX
+        );
+        assert!(
+            3.0 >= 0.35 * GLYPH_AUTHORING_RADIUS_PX,
+            "the smallest glyph fills only {} of its frame",
+            3.0 / GLYPH_AUTHORING_RADIUS_PX
+        );
+    }
+
+    /// The glyphs must GROW when the symbol does.
+    ///
+    /// Separate from the test above because that one passes on a scale which is
+    /// constant in the box — and a constant scale is exactly the bug: the icon
+    /// radius and the painted disc are both linear in the box, so dividing one
+    /// by the other cancels, and the raise enlarged the frame around glyphs
+    /// that never moved. Every assertion in the painter can hold while the map
+    /// looks exactly as illegible as before, so the growth itself is pinned:
+    /// the reaches were authored against an 8 px radius, so doubling the box
+    /// must double them.
+    #[test]
+    fn glyphs_grow_with_the_symbol_box() {
+        let reach_at = |box_px: f64| {
+            frame_icon_radius(frame_for(tfg::store::Affiliation::Friendly), box_px)
+                / GLYPH_AUTHORING_RADIUS_PX
+                * 5.5
+        };
+        let small = reach_at(SYMBOL_BOX_PX / 2.0);
+        let full = reach_at(SYMBOL_BOX_PX);
+        assert!(
+            full > small * 1.9,
+            "doubling the box moved a glyph from {small} px to only {full} px"
+        );
+        // And the box the map actually draws at is one an operator can read,
+        // which the ratio above cannot tell you: a ratio is equally satisfied
+        // by a legible symbol and by a 4 px one.
+        assert!(
+            reach_at(SYMBOL_BOX_PX) >= 6.0,
+            "at {SYMBOL_BOX_PX} px the widest glyph reaches only {} px, which is \
+             below the ~6 px the renderer can show as a shape",
+            reach_at(SYMBOL_BOX_PX)
+        );
     }
 
     /// A marker with nothing but an identity and a Representation. The

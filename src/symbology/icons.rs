@@ -46,7 +46,16 @@ pub const EM_HALF: f64 = EM_BOX / 2.0;
 /// re-exports this. Two literals would drift, and the readability
 /// invariants below are stated as fractions of this number, so a drift
 /// would silently re-define what "one stroke" means.
-pub const BOX_PX: f64 = 22.0;
+///
+/// WAS 22, and the raise was driven by what 22 px looks like rather than
+/// by the standard: at 22 the largest glyph in the vocabulary reached 11 px
+/// of ink, so a destroyer triangle and a corvette diamond differed by about
+/// one pixel of reach and the map read as one anonymous dot per hull. What
+/// is NOT derivable from this number alone is the disc the glyph sits on,
+/// the LOD threshold that hands a hull from symbol to silhouette, and the
+/// state rings around it — all three were stated against 22 and are now
+/// derived, so they cannot drift away from it again.
+pub const BOX_PX: f64 = 32.0;
 
 /// Em units per logical pixel at [`BOX_PX`]. Every readability threshold
 /// is a pixel figure converted through this, so none of them is stated

@@ -85,20 +85,36 @@ replaces it. Four new tests came with the move: the canonical extents against
 the canonical outlines, no frame wider than the box it is fitted to, the
 tolerance conversion, and the stroke gap inside the icon box.
 
-The numbers, all measured rather than asserted:
+The numbers, all measured rather than asserted. **The box has since gone to
+32 px** — the left-hand figures are what the frame module was measured at when
+this was written, and are kept because they are what the arithmetic was checked
+against; the right-hand pair is what it measures now:
 
-| frame | canonical (of 200) | at `BOX_PX` | icon radius | clearance |
-| --- | --- | --- | --- | --- |
-| friendly | 150 x 100 | 33 x 22 | 9.416 | 11.000 |
-| hostile | 144 x 144 | 22 x 22 | 6.055 | 7.778 |
-| neutral | 110 x 110 | 22 x 22 | 8.416 | 11.000 |
-| unknown | 138.5 x 138.5 | 22 x 22 | 6.358 | 8.312 |
+| frame | canonical (of 200) | at 22 px | icon radius | clearance | at 32 px | icon radius | clearance |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| friendly | 150 x 100 | 33 x 22 | 9.416 | 11.000 | 48 x 32 | 13.696 | 16.000 |
+| hostile | 144 x 144 | 22 x 22 | 6.055 | 7.778 | 32 x 32 | 8.807 | **11.314** |
+| neutral | 110 x 110 | 22 x 22 | 8.416 | 11.000 | 32 x 32 | 12.241 | 16.000 |
+| unknown | 138.5 x 138.5 | 22 x 22 | 6.358 | 8.312 | 32 x 32 | 9.248 | 12.090 |
 
 Every one of those radii is within 7 percent of the four hand-tuned
 multipliers it replaces, which is the point: the sizes did not move, the
 arithmetic did. The diamond is still the tight case and the quatrefoil's core
 is the cubic lobe's corner at 52.33 reference units, not the circular lobe's
 48.9.
+
+**The diamond being tight is now load-bearing rather than incidental.** The
+base disc the map paints under every glyph is sized from it
+(`tightest_clearance_px`), because one marker is drawn once for whichever of
+the four affiliations it resolves to and the disc must clear all four. Two
+things had to be right to measure it, and both were wrong first: the quatrefoil
+comes back as several flattened runs concatenated into one vector, so
+`i -> i + 1 mod len` bridges a chord across the middle of the shape; and each
+run repeats its first point as its last, so the trailing pair is zero-length.
+Neither is an edge, and treating either as one reports a clearance of **zero**
+— a disc of no size. That is also what caught the literal it replaced: the disc
+was 8.0 while the diamond cleared only 7.78, so the hostile frame was already
+being painted over by a fifth of a pixel.
 
 ### Three findings better than the brief
 
@@ -236,9 +252,11 @@ Setup drill (`:6256`); delete the re-exports in `map_render.rs:739-779`.
 ### The contact sheet ships before the editor.
 
 In `proto/p5-epaint`, rendering the SAME geometry the map draws: every icon,
-four affiliations, the 22 px the map actually draws, plus a nearest-neighbour
-blow-up of that same raster. Dark background, because the map is dark.
-`render-icons.py` is the throwaway that stood in for it and is not it.
+four affiliations, the size the map actually draws (**32 px**, and that figure
+should be read off `BOX_PX` rather than typed, for the reason the disc radius is
+derived), plus a nearest-neighbour blow-up of that same raster. Dark background,
+because the map is dark. `render-icons.py` is the throwaway that stood in for it
+and is not it.
 
 ### Docs.
 
@@ -251,6 +269,40 @@ If hull class leaves the icon, then at **Far** zoom a destroyer and a corvette
 are genuinely indistinguishable, because Far is the only zoom where the symbol
 draws and `should_paint_unit_label` is `focused || Near` so no label paints
 there. Hull class is a Near-zoom and Inspector fact only.
+
+**Partly answered, and not by the answer anyone expected.** The box went from
+22 px to 32 px, and the question was read as "the symbols are too small to tell
+apart". That is true but it is the *second* reason. The first is that the map
+still paints `MapSymbolShape` — ten glyphs hand-drawn against a radius-8 disc,
+with reaches of 3.0 to 5.5 that differ from each other by about a pixel — while
+the curated `icons.tsv` vocabulary that exists precisely to fix this is
+generated, checked in, and still never painted. Raising the box made those ten
+glyphs 45 percent larger and legible as shapes without changing which one you
+are looking at. **Enlarging is necessary and not sufficient**; retiring
+`MapSymbolShape` for the curated table is the half that actually answers the
+question, and it is the Unit 6 work already on the list.
+
+### The disc under the symbol was a fixture wearing a channel's clothes
+
+`ship_color` returned blue for the id `"nordwind"` and red for `"ostsee"` —
+the two vessel names in `tests/fixtures/tracks.json` — and **one green for
+every other id**, which is every real hull. So the disc under every symbol
+carried no information at all, and all it did was cover the glyph. It is gone,
+and `ship_color` with it.
+
+What replaced it is not "nothing", and that was the part worth measuring. The
+glyph alone, drawn straight onto the map, is **1.07:1** against the sea — the
+Accent hues were never a channel; they were decorative tints blended 32 percent
+into a mid-tone base, and all ten sit between 1.02 and 2.11 against water and
+land. The frame's INTERIOR is the fill now, in the affiliation's own hue
+darkened toward map ink, which is the standard's own arrangement ("fill colour
+is a redundant indication") and gives the shape and the fill the same meaning.
+Measured off a capture afterwards: glyph on fill 3.88:1, fill on map 3.64:1.
+
+The generalisable part: **a colour that never varied is not a channel, and
+deleting it is a design change rather than a cleanup.** The four affiliation
+inks had the same defect in milder form — Unknown was 1.02:1, the sea drawn on
+the sea — and it survived because the disc was covering for it.
 
 Three answers: accept it (Far reads allegiance, dimension and role, which is
 what a real chart does); paint a compact hull number at Far (fixes it, at the

@@ -1239,10 +1239,17 @@ impl eframe::App for Proto {
                     chrome::owning_island(&rects, ui.ctx().input(|i| i.pointer.hover_pos()));
                 for (i, ((spec, _), mut pos)) in specs.iter().cloned().zip(origins).enumerate() {
                     let mut open = true;
+                    // No scroll and the whole window as the band, which is
+                    // what `chrome::island` passes for the same reason: this
+                    // stage has no column to scroll and nothing here may be
+                    // clipped. The two arguments arrived with the zone scroll
+                    // (`1f96f1e`) and this call site was missed by it.
                     chrome::island_owned(
                         ui.ctx(),
                         &spec,
                         &mut pos,
+                        0.0,
+                        ui.ctx().viewport_rect(),
                         &mut open,
                         owner == Some(i),
                         |ui| {

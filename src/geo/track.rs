@@ -537,6 +537,29 @@ impl Registry {
         self.known.remove(ship_id);
     }
 
+    /// Move a ship's displayed position outright and drop its interpolation
+    /// history, so the marker IS the new position on the next frame.
+    ///
+    /// FOR A POSITION THAT LEGITIMATELY JUMPED. A placement the operator
+    /// picked up and dropped somewhere else is not a transit: gliding would
+    /// animate the hull crossing its own starting position over a poll
+    /// interval, and the trail would draw a line across the map from where it
+    /// used to be — a statement about where the hull went, which is exactly
+    /// the thing a placement is not. A setup sim is frozen, so no fix arrives
+    /// to move the marker for us either.
+    ///
+    /// `remove_ship` cannot do this job: it refuses sim identities, and a
+    /// sim hull is precisely the one that moves here.
+    pub fn set_position(&mut self, ship_id: &str, pos: GeoPosition) {
+        if let Some(ship) = self.ships.get_mut(ship_id) {
+            ship.latest.position = pos;
+            ship.previous = None;
+            ship.track.clear();
+            ship.trail.clear();
+            ship.trail_dirty = false;
+        }
+    }
+
     /// Where to draw the marker at wall-clock `now_epoch`: lerp
     /// previous -> latest, holding on sub-guard jumps. A backfilled
     /// latest never moves the marker while a previous live fix exists

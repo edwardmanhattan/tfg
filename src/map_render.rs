@@ -295,13 +295,30 @@ pub enum UnitLod {
 }
 
 /// Footprint below which a hull is a symbol, in logical pixels.
-const LOD_FAR_MAX_PX: f64 = 16.0;
+///
+/// EQUAL to the symbol box, and that equality is the invariant rather than a
+/// coincidence. A Far hull is painted at the box's size whatever its real
+/// footprint is, so if the Far threshold sits BELOW it, a hull crossing into
+/// Middle visibly SHRINKS — from the symbol it was drawn as down to the
+/// silhouette that replaces it. At the old pairing (16 px threshold, 22 px box)
+/// that pop was already 6 px and had never been named; raising the box without
+/// raising this would have turned it into 16 px, which is not a size change an
+/// operator should have to notice to be annoyed by.
+///
+/// Tied to the box so the two cannot drift apart again.
+const LOD_FAR_MAX_PX: f64 = SYMBOL_BOX_PX;
 /// Footprint at which a hull earns its full image.
-const LOD_NEAR_MIN_PX: f64 = 48.0;
+///
+/// NOT derived from the box, deliberately: this one is about the hull being
+/// large enough in ITSELF to read as a photograph, which is a property of the
+/// world rather than of our drawing. It is stated relative to the Far
+/// threshold instead, so the ladder stays proportional if the box moves again.
+const LOD_NEAR_MIN_PX: f64 = LOD_FAR_MAX_PX * 1.5;
 /// Footprint at which a hull drops back off Near. Below the entry
 /// threshold, so a hull sitting exactly on the boundary does not
-/// oscillate as the zoom jitters around it.
-const LOD_NEAR_EXIT_PX: f64 = 44.0;
+/// oscillate as the zoom jitters around it. The same 8 percent of slack the
+/// unit ladder keeps, expressed as a fraction so it survives a move.
+const LOD_NEAR_EXIT_PX: f64 = LOD_NEAR_MIN_PX * 0.92;
 
 /// The largest projected dimension — the one that decides when a hull
 /// is big enough to read. Length dominates for every hull, but the
@@ -427,14 +444,24 @@ pub enum GroupRepresentation {
 ///
 /// Twice `LOD_NEAR_MIN_PX`, because a Zone has to hold its members,
 /// carry its own padding AND stay distinct from the Zone beside it —
-/// none of which an image has to do.
-pub const GROUP_ZONE_MIN_PX: f64 = 96.0;
+/// none of which an image has to do. Derived rather than stated for the
+/// same reason the unit ladder is: the two ladders are supposed to behave
+/// alike, and a literal here quietly stopped doing that the moment
+/// `LOD_NEAR_MIN_PX` moved.
+pub const GROUP_ZONE_MIN_PX: f64 = LOD_NEAR_MIN_PX * 2.0;
 
 /// Screen extent at which a Group drops back off Zone. Below the entry
-/// line by the SAME gap the unit ladder keeps (48 -> 44 is 4 px, so
-/// 96 -> 92), so a formation sitting on the boundary does not oscillate
-/// as the view moves, and the two ladders behave alike.
-pub const GROUP_ZONE_EXIT_PX: f64 = 92.0;
+/// line by the SAME FRACTION the unit ladder keeps, so a formation sitting
+/// on the boundary does not oscillate as the view moves, and the two
+/// ladders behave alike.
+///
+/// The fraction rather than the old 4 px, and the difference is load-bearing:
+/// a 4 px gap is 8 percent of 48 but only 5 percent of 96, so the old pair
+/// did not actually share a gap — it shared a number that happened to be
+/// small. `exit_line_sits_below_entry_line` caught that the moment the unit
+/// ladder's slack was expressed as a fraction, which is the only reason to
+/// prefer a fraction.
+pub const GROUP_ZONE_EXIT_PX: f64 = GROUP_ZONE_MIN_PX * 0.92;
 
 /// A Group's ground, measured once per frame.
 ///
@@ -563,9 +590,37 @@ pub const ZONE_CAP_SAMPLES: usize = 16;
 /// Margin beyond the members' own drawn size, in logical pixels.
 pub const ZONE_MARGIN_PX: f64 = 8.0;
 
-/// The radius a Far unit actually paints at: the base circle every
-/// marker carries, under whichever glyph sits on it.
-pub const SYMBOL_FOOTPRINT_RADIUS_PX: f64 = 8.0;
+/// The radius of the base circle a Far unit paints under its glyph.
+///
+/// DERIVED from the frames rather than stated, and that is the whole point of
+/// it: one marker is painted once for whichever of the four affiliations the
+/// hull resolves to, so the disc has to clear all four. The diamond is the
+/// tight case, and a literal here was a fifth of a pixel wider than the
+/// diamond's clearance at the old 22 px box — the hostile frame was already
+/// being painted over before anyone noticed.
+pub fn symbol_footprint_radius_px() -> f64 {
+    tightest_clearance_px(SYMBOL_BOX_PX)
+}
+
+/// The disc radius the glyph reaches were AUTHORED against, in pixels.
+///
+/// NOT the disc that is painted, and the difference is the whole reason the
+/// glyphs grow when the box grows.
+///
+/// `paint_map_symbol` takes every one of its reaches (3.0, 5.2, 5.5, 9.0)
+/// from a hand-tuned table written against a radius-8 circle, so the painter
+/// multiplies them by `icon_radius / GLYPH_AUTHORING_RADIUS_PX`. The icon
+/// radius is linear in the symbol box, which is what makes a glyph fill its
+/// frame at any size.
+///
+/// Dividing by [`symbol_footprint_radius_px`] instead looks like the tidier
+/// choice — one number, and it is the disc actually on screen — and it is
+/// wrong, because that radius is linear in the box TOO. The ratio cancels, the
+/// scale stops depending on the box at all, and raising the box enlarges the
+/// frame around glyphs that never move. It is the same class of bug as
+/// replacing a derived constant with a literal: two quantities that agreed by
+/// coincidence stop agreeing the moment one of them moves.
+pub const GLYPH_AUTHORING_RADIUS_PX: f64 = 8.0;
 
 /// The radius genuinely inside a Zone polygon for a given pad.
 ///
@@ -586,7 +641,7 @@ pub fn zone_inscribed_radius(pad_px: f64) -> f64 {
 /// constant-looking at every zoom and makes "no marker pokes out" a
 /// testable invariant instead of an aesthetic judgement.
 pub fn zone_pad_px(fattest_member_footprint_px: f64) -> f64 {
-    SYMBOL_FOOTPRINT_RADIUS_PX.max(fattest_member_footprint_px / 2.0) + ZONE_MARGIN_PX
+    symbol_footprint_radius_px().max(fattest_member_footprint_px / 2.0) + ZONE_MARGIN_PX
 }
 
 /// Monotone-chain convex hull, the same construction the Zone overlay
@@ -759,8 +814,9 @@ pub use crate::symbology::BattleDimension;
 // compiling untouched; they are the thing to delete once the callers have
 // moved over.
 pub use crate::symbology::frame::{
-    SYMBOL_FRAME_ASPECT, SymbolFrame, frame_for, frame_extent, frame_icon_radius, frame_polygon,
-    frame_strokes, symbol_box_px,
+    SYMBOL_FRAME_ASPECT, SymbolFrame, frame_clearance_px, frame_clearances_px, frame_for,
+    frame_extent, frame_icon_radius, frame_polygon, frame_strokes, symbol_box_px,
+    tightest_clearance_px,
 };
 
 /// A symbol frame's HEIGHT, in logical pixels.
@@ -1134,10 +1190,15 @@ mod tests {
         // Inverting the two would make Zone unescapable, which deserves
         // its own assertion rather than a comment.
         assert!(GROUP_ZONE_EXIT_PX < GROUP_ZONE_MIN_PX);
-        assert_eq!(
-            (GROUP_ZONE_EXIT_PX - GROUP_ZONE_MIN_PX).abs(),
-            (LOD_NEAR_EXIT_PX - LOD_NEAR_MIN_PX).abs(),
-            "the group band keeps the unit ladder's 4 px jitter gap"
+        // The SAME FRACTION of slack, not the same number of pixels. Both ladders
+        // are 92 percent of their entry line; a shared pixel gap would drift
+        // the moment either entry line moved, which is exactly what happened
+        // when the unit ladder's slack became a fraction.
+        let group_slack = 1.0 - GROUP_ZONE_EXIT_PX / GROUP_ZONE_MIN_PX;
+        let unit_slack = 1.0 - LOD_NEAR_EXIT_PX / LOD_NEAR_MIN_PX;
+        assert!(
+            (group_slack - unit_slack).abs() < 1e-9,
+            "the group band keeps the unit ladder's slack: {group_slack} vs {unit_slack}"
         );
     }
 
@@ -1364,12 +1425,12 @@ mod tests {
     #[test]
     fn the_pad_never_lets_a_marker_poke_out() {
         // The invariant the derived pad exists for: a Far unit paints a
-        // footprint circle of SYMBOL_FOOTPRINT_RADIUS_PX, so the pad is
+        // footprint circle of `symbol_footprint_radius_px`, so the pad is
         // never smaller than it — at any member size.
         for footprint in [0.0, 4.0, 16.0, 48.0, 400.0] {
             let pad = zone_pad_px(footprint);
             assert!(
-                pad >= SYMBOL_FOOTPRINT_RADIUS_PX + ZONE_MARGIN_PX,
+                pad >= symbol_footprint_radius_px() + ZONE_MARGIN_PX,
                 "pad {pad} too small for a {footprint} px member"
             );
             assert!(pad >= footprint / 2.0 + ZONE_MARGIN_PX, "pad {pad} for {footprint}");
@@ -1377,6 +1438,57 @@ mod tests {
         // The fattest member decides, not an average: a 400 px member
         // needs more than the bare symbol radius.
         assert!(zone_pad_px(400.0) > zone_pad_px(0.0));
+    }
+
+    /// The three couplings that made the symbol's size four separate numbers,
+    /// asserted as one relationship so a future raise cannot half-apply again.
+    ///
+    /// Each of these was stated against a 22 px box independently: the disc
+    /// was a literal, the LOD threshold sat six pixels BELOW the box it hands
+    /// off at, and the rings were literals too. Raising one and not the
+    /// others is the failure this test exists to catch.
+    #[test]
+    fn the_symbol_is_one_size_rather_than_four() {
+        // The base disc clears every frame, measured against the polygons
+        // rather than against the formula that produced it.
+        let disc = symbol_footprint_radius_px();
+        for affiliation in Affiliation::ALL {
+            let frame = frame_for(affiliation);
+            // The production measurement, not this module's own
+            // `min_distance_to_edges`. That helper walks `i -> i + 1 mod len`,
+            // which is wrong for the quatrefoil twice over — it bridges the gap
+            // between concatenated runs and reads the trailing duplicate point
+            // as an edge — so using it here made the assertion stricter than
+            // the geometry and it failed against a correct disc.
+            let clearance = frame_clearance_px(frame, SYMBOL_BOX_PX);
+            assert!(
+                disc <= clearance,
+                "{affiliation:?} clears only {clearance} but the disc is {disc}"
+            );
+        }
+        // And WHICH frame is tight is pinned, because it is not the one the
+        // shape suggests: the quatrefoil looks tightest and is not. Getting
+        // this wrong does not fail the disc — it fails the next person who
+        // sizes something else against the same assumption.
+        let tightest = frame_clearances_px(SYMBOL_BOX_PX)
+            .into_iter()
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("four frames");
+        assert_eq!(
+            tightest.0,
+            SymbolFrame::Diamond,
+            "the diamond is the tight frame, at {}",
+            tightest.1
+        );
+        assert_eq!(disc, tightest.1, "the disc is exactly the tight clearance");
+        // The Far threshold is the box, so a hull crossing into Middle does
+        // not visibly shrink. This is the pop that existed at 22/16.
+        assert_eq!(LOD_FAR_MAX_PX, SYMBOL_BOX_PX);
+        // And the ladder above it still has its proportional slack, so the
+        // hysteresis is the same fraction it was rather than a coincidence.
+        assert_eq!(LOD_NEAR_MIN_PX, LOD_FAR_MAX_PX * 1.5);
+        assert!(LOD_NEAR_EXIT_PX < LOD_NEAR_MIN_PX);
+        assert!(LOD_NEAR_EXIT_PX >= LOD_FAR_MAX_PX);
     }
 
     /// Distance from a point to a triangle, in METRES — zero inside.
@@ -1761,11 +1873,26 @@ mod tests {
     /// test is about the bands rather than their edges.
     #[test]
     fn footprint_selects_far_middle_near() {
-        assert_eq!(lod_at(4.0, None), UnitLod::Far, "a speck");
-        assert_eq!(lod_at(15.0, None), UnitLod::Far, "just under the line");
-        assert_eq!(lod_at(20.0, None), UnitLod::Middle, "silhouette");
-        assert_eq!(lod_at(47.0, None), UnitLod::Middle, "just under Near");
-        assert_eq!(lod_at(60.0, None), UnitLod::Near, "full image");
+        // Proportional to the thresholds rather than stated beside them: these
+        // three bands move whenever the box does, and a test that hardcodes
+        // 15/20/47 makes every future raise look like a regression here.
+        assert_eq!(lod_at(LOD_FAR_MAX_PX * 0.5, None), UnitLod::Far, "a speck");
+        assert_eq!(
+            lod_at(LOD_FAR_MAX_PX - 1.0, None),
+            UnitLod::Far,
+            "just under the line"
+        );
+        assert_eq!(
+            lod_at(LOD_FAR_MAX_PX + 1.0, None),
+            UnitLod::Middle,
+            "just over the line"
+        );
+        assert_eq!(
+            lod_at(LOD_NEAR_MIN_PX - 1.0, None),
+            UnitLod::Middle,
+            "just under Near"
+        );
+        assert_eq!(lod_at(LOD_NEAR_MIN_PX + 12.0, None), UnitLod::Near, "full image");
         assert_eq!(lod_at(400.0, None), UnitLod::Near, "close in");
     }
 
@@ -1773,8 +1900,12 @@ mod tests {
     /// deliberate edit rather than an accident.
     #[test]
     fn thresholds_land_where_documented() {
-        assert_eq!(lod_at(LOD_FAR_MAX_PX, None), UnitLod::Middle, "16 enters Middle");
-        assert_eq!(lod_at(LOD_NEAR_MIN_PX, None), UnitLod::Near, "48 enters Near");
+        assert_eq!(
+            lod_at(LOD_FAR_MAX_PX, None),
+            UnitLod::Middle,
+            "the Far threshold enters Middle"
+        );
+        assert_eq!(lod_at(LOD_NEAR_MIN_PX, None), UnitLod::Near, "Near enters");
     }
 
     /// The hysteresis band: a hull between the exit and entry lines
@@ -1860,15 +1991,31 @@ mod tests {
         // Near, including above the entry line it would otherwise
         // have needed to climb through.
         let mut near = Some(UnitLod::Near);
-        for fp in [48.0_f64, 47.5, 46.0, 45.0, 44.0, 47.0, 45.5, 46.5] {
+        // Positions are PLACED IN THE BAND, not written out: the band's two
+        // ends move with the ladder, and a list of round numbers stops
+        // describing it the moment they do — which is how this test failed
+        // after the box was raised and 44 fell a sixteenth of a pixel below
+        // the new exit line.
+        let exit = LOD_NEAR_EXIT_PX;
+        let entry = LOD_NEAR_MIN_PX;
+        let band = [
+            entry,
+            entry - (entry - exit) * 0.1,
+            (entry + exit) / 2.0,
+            entry - (entry - exit) * 0.8,
+            exit,
+            entry - (entry - exit) * 0.3,
+            (entry + exit) / 2.0 + 0.25,
+        ];
+        for fp in band {
             near = Some(lod_at(fp, near));
             assert_eq!(near, Some(UnitLod::Near), "stayed Near at {fp}");
         }
         // Already Middle, jittering below the entry line: stays
         // Middle even at the top of the band.
         let mut mid = Some(UnitLod::Middle);
-        for fp in [44.0_f64, 44.5, 45.0, 46.0, 47.0, 47.5] {
-            mid = Some(lod_at(fp, mid));
+        for fp in band.iter().rev().take(6) {
+            mid = Some(lod_at(*fp, mid));
             assert_eq!(mid, Some(UnitLod::Middle), "stayed Middle at {fp}");
         }
         // Reaching the entry line from Middle IS an upgrade: the band

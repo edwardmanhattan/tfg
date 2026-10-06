@@ -7,6 +7,7 @@
 //! - [`chrome`]: island and zone chrome — the floating-panel shell (see ADR-0014, ADR-0016).
 //! - [`tokens`]: the palette and the measurements. Leaf: egui only (see ADR-0016).
 //! - [`gamestate`]: the exercise lifecycle as one axis. Leaf: no tfg types.
+//! - [`force`]: the operator's force before Minos hears of it, and the diff a stage advance writes.
 //! - [`backend`]: v0 poll contract: `PollSource`, file replay, HTTP stub.
 //! - [`symbology`]: APP-6C symbol model + generated icon geometry. Leaf: depends on nothing.
 
@@ -18,6 +19,7 @@ pub mod chrome;
 pub mod clock;
 pub mod command;
 pub mod fleet;
+pub mod force;
 pub mod fx;
 pub mod gamestate;
 pub mod gpuprobe;
