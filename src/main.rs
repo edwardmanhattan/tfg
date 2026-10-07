@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use chrono::{TimeZone, Utc};
+use chrono::{Datelike, TimeZone, Utc};
 use tfg::backend::{BackendError, FileReplay, GameFix, GameMsg, GamePositionUpdate, LiveCmd, LiveEvent, LiveWire, MinosAuth, MinosMaster, MinosRest, MockPoll, PollSource, TokenPair};
 use tfg::catalog::Catalog;
 use tfg::fleet::Fleet;
@@ -572,6 +572,38 @@ fn status_line(ui: &mut egui::Ui, msg: &str) {
 /// Warning line: names the problem; the adjacent control names the recovery.
 fn warn_line(ui: &mut egui::Ui, msg: String) {
     ui.label(egui::RichText::new(format!("⚠ {msg}")).color(egui::Color32::YELLOW));
+}
+
+/// Whether RFC3339 instant `start` runs before `end`. `None` when either
+/// end does not parse: the caller says unreadable rather than comparing
+/// two strings whose offsets may differ.
+fn rfc3339_runs_forwards(start: &str, end: &str) -> Option<bool> {
+    let (Ok(a), Ok(b)) = (
+        chrono::DateTime::parse_from_rfc3339(start),
+        chrono::DateTime::parse_from_rfc3339(end),
+    ) else {
+        return None;
+    };
+    Some(a < b)
+}
+
+/// The commander's dashboard footprint: four narrow columns across the
+/// bottom, clamped to the viewport so a small window gets a smaller
+/// station rather than one hanging off-screen.
+fn dashboard_size(ctx: &egui::Context) -> egui::Vec2 {
+    let vp = ctx.viewport_rect();
+    egui::vec2((vp.width() - 24.0).min(1060.0).max(400.0), 300.0)
+}
+
+/// Where the dashboard first anchors: bottom-center with a small margin.
+/// Recomputed only until the first drag pins it (see `dashboard_pos`).
+fn dashboard_default_pos(ctx: &egui::Context) -> egui::Pos2 {
+    let vp = ctx.viewport_rect();
+    let size = dashboard_size(ctx);
+    egui::pos2(
+        ((vp.width() - size.x) / 2.0).max(0.0),
+        (vp.height() - size.y - 12.0).max(0.0),
+    )
 }
 
 /// Human-readable freshness for the context strip. A bare `162s` reads like
@@ -1607,15 +1639,81 @@ struct LoginDone {
     probe_note: Option<String>,
 }
 
-/// What a book read or write answered with.
-///
-/// A step write answers with the whole scenario and a book read with the
-/// whole book, so one slot has to carry both. `One` is spliced into the
-/// local list rather than replacing it: replacing would drop every OTHER
-/// scenario the author was not looking at.
+/// What a book read answered with: the whole book. Writes flush
+/// through the stage queue and splice per answer there.
 enum Book {
     List(Vec<tfg::backend::GameScenario>),
-    One(tfg::backend::GameScenario),
+}
+
+/// One write the stage flush owes Minos, in the order the server
+/// accepts the whole session: roster seats (an assign names a commander
+/// who must already be a participant), force writes, roster unseats
+/// (nobody goes seatless while their hull is still being handed over),
+/// then book writes — all before the deferred transition, because the
+/// book is planning-only on the server.
+#[derive(Debug, Clone)]
+enum StageWrite {
+    Roster(tfg::roster::RosterWrite),
+    Force(tfg::force::ForceWrite),
+    Book(tfg::book::BookWrite),
+}
+
+impl StageWrite {
+    /// What this write is about, for a line that has to say which item
+    /// held the whole advance up.
+    fn label(&self) -> String {
+        match self {
+            Self::Roster(w) => w.label(),
+            Self::Force(w) => format!("sync {}", w.name()),
+            Self::Book(w) => w.label(),
+        }
+    }
+}
+
+/// One scenario row as the composer shows it: server-held or staged-new
+/// (negative id, never colliding with a server id).
+#[derive(Debug, Clone)]
+struct ScenarioView {
+    id: i64,
+    title: String,
+    staged: bool,
+    steps: Vec<StepView>,
+}
+
+/// One step row as the composer shows it.
+#[derive(Debug, Clone)]
+struct StepView {
+    id: i64,
+    content: String,
+    window: Option<(String, String)>,
+    staged: bool,
+}
+
+impl StepView {
+    fn window_label(&self) -> String {
+        match &self.window {
+            Some((s, e)) => format!("{s}-{e}"),
+            None => "-".to_string(),
+        }
+    }
+}
+
+/// One hull the dashboard can follow or list: unit-id string plus the
+/// label the map and Inspector use for it.
+#[derive(Debug, Clone)]
+struct DashShip {
+    id: String,
+    label: String,
+}
+
+/// Everything the commander's dashboard reads, computed fresh per frame
+/// so it never disagrees with the mirrors.
+struct DashboardData {
+    role_name: String,
+    ready: bool,
+    execution: bool,
+    ships: Vec<DashShip>,
+    attached: Vec<DashShip>,
 }
 
 /// Whether a game role may need a fleet before the exercise can run.
@@ -1804,6 +1902,9 @@ struct GameBundle {
     placements: Result<tfg::backend::PlacementList, tfg::backend::BackendError>,
     /// The server's verdict on the execution gate.
     readiness: Result<tfg::backend::GameReadinessView, tfg::backend::BackendError>,
+    /// The game's own seating roles: the ids roster writes validate
+    /// against. Degrades like any other subordinate.
+    game_roles: Result<Vec<tfg::backend::GameRole>, tfg::backend::BackendError>,
 }
 
 /// What kind of asset a visual carries.
@@ -2376,16 +2477,28 @@ enum SetupDone {
     GamesDenied,
     Users(Vec<tfg::backend::BackendUser>),
     Bundle(GameBundle),
-    Roster(Vec<tfg::backend::Participant>, String),
     /// One force-sync write answered with the refreshed unit list.
     ForceUnits(Vec<tfg::backend::GameUnit>),
     /// One force-sync write answered with the refreshed setup view.
     ForcePlacements(tfg::backend::PlacementList),
-    /// A force-sync write refused; the write is kept so the note names
-    /// which hull it was about. The queue is dropped — the live mirror
-    /// already carries the writes that succeeded, so the next attempt is
-    /// a fresh diff, not a replay.
-    ForceFailed(String, tfg::force::ForceWrite),
+    /// One stage-flush roster write answered with the whole roster.
+    /// Applied to the server mirror, which re-converges whatever staged
+    /// seats it now holds.
+    StageRoster(Vec<tfg::backend::Participant>),
+    /// A stage-flush seat answered 409 and the re-read holds the seat:
+    /// whoever got there first is the record, so adopt it and continue.
+    /// Carries the adoptee's user id for the line.
+    StageRosterAdopted(Vec<tfg::backend::Participant>, i64),
+    /// One stage-flush book write answered with the whole scenario. The
+    /// local id rides along so a staged-new create maps to the server id
+    /// its steps resolve against; step writes carry none.
+    StageBook(tfg::backend::GameScenario, Option<i64>),
+    /// A stage-flush write refused; the item's label is kept so the note
+    /// names which seat, hull or page it was about. The queue is dropped
+    /// — the live mirrors already carry the writes that succeeded, and
+    /// the drafts still hold what did not, so the next attempt re-plans
+    /// a fresh diff instead of replaying a stale one.
+    StageFailed(String, String),
     Game(String, tfg::backend::GameRow),
     GameCreate(tfg::backend::GameRow, String),
     /// Admin game writes: the update answer is the re-read detail
@@ -2553,6 +2666,17 @@ struct ShipApp {
     fx: tfg::fx::Fx,
     show_orders: bool,
     show_log: bool,
+    /// The commander's dashboard: bottom station for seated non-GM
+    /// players from preparation onward — own ship, attached units, helm
+    /// (armed at ready + execution), comms summary. Closed persistently
+    /// with the island X; a stage entry reopens it.
+    dashboard_open: bool,
+    /// Where the dashboard floats. `None` anchors bottom-center every
+    /// frame until the first drag pins it.
+    dashboard_pos: Option<egui::Pos2>,
+    /// Which commanded hull the dashboard follows, by unit-id string.
+    /// Revalidated every frame; falls back to the first hull held.
+    dashboard_ship: Option<String>,
     /// Onboarding (ticket #77): boots to State A (Login), through
     /// State B (Mode), into the shell — C for Presentation, D for
     /// Simulation. This is the one directing layer at first run.
@@ -2646,6 +2770,12 @@ struct ShipApp {
     edit_actual_end: String,
     edit_assumed_start: String,
     edit_assumed_end: String,
+    /// The calendar popup behind the real-date row: open flag plus the
+    /// month it shows. Seeded from the field when it parses, else today
+    /// WIB; the popup writes `YYYY-MM-DD` straight into the field.
+    cal_open: bool,
+    cal_year: i32,
+    cal_month: u32,
     /// Register filter + assignment commander (step 3): hulls come
     /// from the synced store; each assign seats the picked commander.
     setup_reg_search: String,
@@ -2705,6 +2835,10 @@ struct ShipApp {
     users_search: String,
     users_role: Option<i64>,
     users_roles: Vec<(i64, String, String, bool)>,
+    /// The held game's own seating roles, read with the bundle. The only
+    /// ids the roster writes validate against — the helpers mirror above
+    /// is the vocabulary fallback, never the write authority.
+    users_game_roles: Vec<tfg::backend::GameRole>,
     users_roster: Vec<tfg::backend::Participant>,
     users_gunits: Vec<tfg::backend::GameUnit>,
     /// The held game's scenario book, and which scenario the composer has
@@ -2726,6 +2860,10 @@ struct ShipApp {
     /// `users_status` because a half-typed window is not a backend refusal
     /// and must not overwrite the last real status line.
     composer_draft_error: Option<String>,
+    /// The new-scenario title being typed. Persistent state, not a
+    /// frame-local: a local `String::new()` rebound every frame is
+    /// why one typed letter vanished on the next paint.
+    composer_new_title: String,
     /// Whether the Fleet Picker modal is showing.
     fleet_picker_open: bool,
     /// Whether the Player Picker modal is showing.
@@ -2827,10 +2965,30 @@ struct ShipApp {
     force_seeded_for: Option<i64>,
     /// Writes the flush owes Minos, issued one at a time through the
     /// `setup_op` slot. Each answer advances or aborts the chain.
-    force_queue: Vec<tfg::force::ForceWrite>,
+    /// Roster seats first (an assign names a commander who must already
+    /// be a participant), then force writes, then roster unseats, then
+    /// book writes — every one of them before the deferred transition,
+    /// because the book is planning-only on the server.
+    stage_queue: Vec<StageWrite>,
     /// What to do when the queue drains: a stage to advance to, or just
     /// a sync. `None` while no flush is owed.
-    force_flush_then: Option<String>,
+    stage_then: Option<String>,
+    /// A stage sync armed and waiting for fresh mirrors: `begin_stage_sync`
+    /// re-reads the bundle first and plans once it lands, so a seat the
+    /// server already holds converges instead of answering 409 mid-flush.
+    stage_armed: bool,
+    /// The roster as the operator has it, staged locally. The islands
+    /// read the merged view (see `visible_roster`), and Minos catches up
+    /// at a stage advance. See `tfg::roster` for why the diff and not
+    /// the writes are the rule.
+    roster_draft: tfg::roster::RosterDraft,
+    /// The scenario book as the operator has it, staged locally. The
+    /// composer reads the merged view, and Minos catches up at a stage
+    /// advance. See `tfg::book`.
+    book_draft: tfg::book::BookDraft,
+    /// Server ids dealt for staged-new scenarios by the running flush,
+    /// local id → server id. Lives only for the flush that made it.
+    book_id_map: std::collections::HashMap<i64, i64>,
     /// A placed hull being dragged to a new starting position, if the
     /// gesture is in flight.
     map_unit_move: Option<UnitMoveDrag>,
@@ -2889,6 +3047,10 @@ struct ShipApp {
     /// the OS pixels-per-point, captured once so re-applying never
     /// compounds. Field laptops and glare-heavy displays get Larger
     /// without touching layout code.
+    ///
+    /// Boots at [`tfg::tokens::TEXT_SCALE_LARGER`] — the default text size is
+    /// the larger one — and the Settings row picks it up from there rather
+    /// than starting a session at "Default" it never was.
     text_scale: f32,
     base_ppp: Option<f32>,
     /// Top-level mode (task #39): session only in Simulation.
@@ -3858,11 +4020,24 @@ impl ShipApp {
             // session's scenarios, and a write against them would be
             // refused by a boundary the author cannot see on screen.
             self.scenarios.clear();
+            self.users_game_roles.clear();
             self.composer_scenario = None;
             self.composer_visible = false;
             self.held_detail = None;
             self.composer_draft = ComposerDraft::default();
             self.composer_draft_error = None;
+            self.composer_new_title.clear();
+            // Staged seats and scenarios belong to the old hold too: a
+            // flush against the new game would seat strangers into it.
+            // (The force draft reseeds instead of clearing, via
+            // `force_seeded_for` — the roster and book have no live
+            // half to reseed from, only staged intent.)
+            self.roster_draft.clear();
+            self.book_draft.clear();
+            self.book_id_map.clear();
+            self.stage_queue.clear();
+            self.stage_then = None;
+            self.stage_armed = false;
         }
         self.users_game = game;
         if old_id != new_id && self.users_game.is_some() {
@@ -3972,6 +4147,7 @@ impl ShipApp {
         self.users_games.clear();
         self.games_gap = false;
         self.games_loaded = false;
+        self.users_game_roles.clear();
         self.users_roster.clear();
         self.users_gunits.clear();
         self.commanded_hulls.clear();
@@ -3981,8 +4157,12 @@ impl ShipApp {
         self.users_placements.clear();
         self.force.clear();
         self.force_seeded_for = None;
-        self.force_queue.clear();
-        self.force_flush_then = None;
+        self.stage_queue.clear();
+        self.stage_then = None;
+        self.stage_armed = false;
+        self.roster_draft.clear();
+        self.book_draft.clear();
+        self.book_id_map.clear();
         self.map_unit_move = None;
         self.placement_unplaced = 0;
         self.placement_ready = false;
@@ -4432,13 +4612,49 @@ impl ShipApp {
     /// a player wearing a referee's shirt). The roster row's flag is
     /// primary, and the synced `game_roles` mirror backs it — that
     /// lookup is the authority on `is_judge_side`, and a flag that
-    /// failed to parse must never read as "not a judge".
+    /// failed to parse must never read as "not a judge". Matched by id
+    /// AND by name: a game-scoped role id is meaningless to the helpers
+    /// mirror, but its canonical name still resolves the flag.
     fn users_is_judge(&self, p: &tfg::backend::Participant) -> bool {
         p.judge
             || self
                 .users_roles
                 .iter()
                 .any(|(id, _, _, judge)| *id == p.role_id && *judge)
+            || self
+                .users_roles
+                .iter()
+                .any(|(_, name, _, judge)| name == &p.role_name && *judge)
+    }
+
+    /// Whether a game role is judge-side. The helpers mirror by name
+    /// wins (it is the authority on the flag); the game row's own flag
+    /// backs it; unknown reads as exercise-side, with the command
+    /// warning showing rather than a judge silently commanding.
+    fn role_judge(&self, name: &str, game_flag: Option<bool>) -> bool {
+        self.users_roles
+            .iter()
+            .find(|(_, n, _, _)| n == name)
+            .map(|(_, _, _, judge)| *judge)
+            .unwrap_or(game_flag.unwrap_or(false))
+    }
+
+    /// Roles for seating as (id, name, judge): the game's own ids first
+    /// — the only ids the roster writes validate against — with the
+    /// helpers vocabulary as the fallback while the bundle has not read
+    /// them (or the server does not publish them).
+    fn seating_roles(&self) -> Vec<(i64, String, bool)> {
+        if self.users_game_roles.is_empty() {
+            self.users_roles
+                .iter()
+                .map(|(id, name, _, judge)| (*id, name.clone(), *judge))
+                .collect()
+        } else {
+            self.users_game_roles
+                .iter()
+                .map(|r| (r.id, r.name.clone(), self.role_judge(&r.name, r.judge)))
+                .collect()
+        }
     }
 
     /// #100: one setup op at a time — queue refreshes, refuse writes.
@@ -4540,6 +4756,7 @@ impl ShipApp {
         self.minos_room_key = None;
         self.clock_denied = false;
         self.watch_game_channel();
+        self.users_game_roles.clear();
         self.users_roster.clear();
         self.users_gunits.clear();
         self.commanded_hulls.clear();
@@ -4548,8 +4765,12 @@ impl ShipApp {
         self.users_placements.clear();
         self.force.clear();
         self.force_seeded_for = None;
-        self.force_queue.clear();
-        self.force_flush_then = None;
+        self.stage_queue.clear();
+        self.stage_then = None;
+        self.stage_armed = false;
+        self.roster_draft.clear();
+        self.book_draft.clear();
+        self.book_id_map.clear();
         self.map_unit_move = None;
         self.placement_unplaced = 0;
         self.placement_ready = false;
@@ -4594,7 +4815,8 @@ impl ShipApp {
             let units = master.game_units_list(&tok, gid);
             let placements = master.placements_list(&tok, gid);
             let readiness = master.game_readiness(&tok, gid);
-            Ok(SetupDone::Bundle(GameBundle { detail, roster, units, placements, readiness }))
+            let game_roles = master.game_roles(&tok, gid);
+            Ok(SetupDone::Bundle(GameBundle { detail, roster, units, placements, readiness, game_roles }))
         }));
     }
 
@@ -4608,11 +4830,20 @@ impl ShipApp {
             self.users_approles = tfg::store::helper_list(conn, "app_roles").unwrap_or_default();
             self.msg_degrees = tfg::store::helper_list(conn, "message_degrees").unwrap_or_default();
             if self.users_role.is_none() {
+                // The game's own Commando first (its id is what the
+                // roster writes take); the helpers vocabulary backs it
+                // while the bundle has not read the game's roles.
                 self.users_role = self
-                    .users_roles
+                    .users_game_roles
                     .iter()
-                    .find(|(_, n, _, _)| n == "Commando")
-                    .map(|(id, _, _, _)| *id);
+                    .find(|r| r.name == "Commando")
+                    .map(|r| r.id)
+                    .or_else(|| {
+                        self.users_roles
+                            .iter()
+                            .find(|(_, n, _, _)| n == "Commando")
+                            .map(|(id, _, _, _)| *id)
+                    });
             }
         }
         let query = self.users_search.clone();
@@ -4746,14 +4977,19 @@ impl ShipApp {
         self.watch_game_channel();
         if self.users_game.is_none() {
             self.held_detail = None;
-            self.users_roster.clear();
+            self.users_game_roles.clear();
+        self.users_roster.clear();
             self.users_gunits.clear();
             self.commanded_hulls.clear();
             self.users_placements.clear();
             self.force.clear();
             self.force_seeded_for = None;
-            self.force_queue.clear();
-            self.force_flush_then = None;
+            self.stage_queue.clear();
+            self.stage_then = None;
+            self.stage_armed = false;
+            self.roster_draft.clear();
+            self.book_draft.clear();
+            self.book_id_map.clear();
             self.map_unit_move = None;
             self.placement_unplaced = 0;
             self.placement_ready = false;
@@ -4801,6 +5037,9 @@ impl ShipApp {
             Ok(r) => {
                 self.users_roster = r;
                 self.roster_gap = false;
+                // A re-read converges whatever staged seats the server
+                // now holds, so the draft only ever says what is owed.
+                self.reconcile_roster_draft();
                 format!("roster: {}", self.users_roster.len())
             }
             Err(tfg::backend::BackendError::Forbidden { .. }) => {
@@ -4824,6 +5063,32 @@ impl ShipApp {
                 self.readiness_gap = ReadinessGap::of(&e);
                 format!("readiness unreadable: {e}")
             }
+        };
+        // The game's own role ids: the only ids the roster writes take.
+        // A failed read keeps the last good list (or the helpers
+        // fallback), never an empty picker presented as having no roles.
+        let roles_seg = match b.game_roles {
+            Ok(roles) => {
+                self.users_game_roles = roles;
+                // A carried-over pick names an id from another game (or
+                // the helpers vocabulary), which this game would 409 —
+                // re-seat it on the game's own Commando when present. An
+                // empty game list says nothing, so it changes nothing.
+                if !self.users_game_roles.is_empty()
+                    && !self
+                        .users_game_roles
+                        .iter()
+                        .any(|r| Some(r.id) == self.users_role)
+                {
+                    self.users_role = self
+                        .users_game_roles
+                        .iter()
+                        .find(|r| r.name == "Commando")
+                        .map(|r| r.id);
+                }
+                format!("roles: {}", self.users_game_roles.len())
+            }
+            Err(e) => format!("roles unreadable: {e}"),
         };
         let mut units_ok = false;
         let units_seg = match b.units {
@@ -4872,9 +5137,15 @@ impl ShipApp {
             self.force_seeded_for = Some(d.id);
         }
         self.users_status = format!(
-            "session synced ({}) · {roster_seg} · {units_seg} · {placements_seg} · {readiness_seg}",
+            "session synced ({}) · {roster_seg} · {units_seg} · {placements_seg} · {readiness_seg} · {roles_seg}",
             d.state
         );
+        // An armed stage sync waited for exactly this: fresh mirrors to
+        // plan against, so a seat the server already holds converges
+        // instead of answering 409 mid-flush.
+        if self.stage_armed {
+            self.plan_and_pump_stage();
+        }
     }
 
     /// Build the local force draft from what Minos already holds, and stand
@@ -4944,103 +5215,275 @@ impl ShipApp {
         self.refresh_unassigned_units();
     }
 
+    /// Refuse a local draft edit while a stage flush is in flight: the
+    /// plan is already on the wire and an edit now would half-apply.
+    /// The queue alone is the signal — the arming re-read plans nothing
+    /// yet, so authoring stays fluid while it loads.
+    fn stage_guard(&mut self, what: &str) -> bool {
+        if !self.stage_queue.is_empty() {
+            self.users_status = format!("{what} waiting — a sync is already running");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The roster as the operator has it: server rows minus staged
+    /// removals, with staged role changes applied, plus staged-new seats.
+    /// Counts, crews and pickers read THIS; the server mirror stays the
+    /// record of what Minos holds until the advance writes it through.
+    fn visible_roster(&self) -> Vec<tfg::backend::Participant> {
+        let mut out = Vec::new();
+        for p in &self.users_roster {
+            if self.roster_draft.is_removed(p.user_id) {
+                continue;
+            }
+            match self.roster_draft.get(p.user_id) {
+                Some(st) if st.role_id != p.role_id => out.push(tfg::backend::Participant {
+                    user_id: p.user_id,
+                    user_name: p.user_name.clone(),
+                    role_id: st.role_id,
+                    role_name: st.role_name.clone(),
+                    judge: st.judge,
+                    // A role change clears readiness on the server, so a
+                    // staged row never shows the stale badge as kept.
+                    ready: false,
+                    joined_at: p.joined_at.clone(),
+                    call_sign: p.call_sign.clone(),
+                }),
+                _ => out.push(p.clone()),
+            }
+        }
+        for st in self.roster_draft.staged() {
+            if self.users_roster.iter().any(|p| p.user_id == st.user_id) {
+                continue;
+            }
+            out.push(tfg::backend::Participant {
+                user_id: st.user_id,
+                user_name: st.user_name.clone(),
+                role_id: st.role_id,
+                role_name: st.role_name.clone(),
+                judge: st.judge,
+                ready: false,
+                joined_at: None,
+                call_sign: st.call_sign.clone(),
+            });
+        }
+        out
+    }
+
+    /// Whether a seat still owes the server a write (staged and not yet
+    /// converged with the mirror). Badges read this, never the draft
+    /// alone, so a converged row stops claiming to be staged.
+    fn is_staged_seat(&self, user_id: i64) -> bool {
+        let Some(st) = self.roster_draft.get(user_id) else {
+            return false;
+        };
+        match self.users_roster.iter().find(|p| p.user_id == user_id) {
+            Some(p) => p.role_id != st.role_id,
+            None => true,
+        }
+    }
+
+    /// Drop staged intent the server mirror already satisfies: same-role
+    /// staged seats and removals of nobody. Runs after every roster
+    /// answer and every bundle, so the draft only ever holds what is
+    /// still owed to Minos.
+    fn reconcile_roster_draft(&mut self) {
+        let converged: Vec<i64> = self
+            .roster_draft
+            .staged()
+            .filter(|st| {
+                self.users_roster
+                    .iter()
+                    .any(|p| p.user_id == st.user_id && p.role_id == st.role_id)
+            })
+            .map(|st| st.user_id)
+            .collect();
+        for uid in converged {
+            self.roster_draft.remove(uid, false);
+        }
+        let gone: Vec<i64> = self
+            .roster_draft
+            .removals()
+            .copied()
+            .filter(|uid| !self.users_roster.iter().any(|p| p.user_id == *uid))
+            .collect();
+        for uid in gone {
+            self.roster_draft.restore(uid);
+        }
+    }
+
+    fn live_seats(&self) -> Vec<tfg::roster::LiveSeat> {
+        self.users_roster
+            .iter()
+            .map(|p| tfg::roster::LiveSeat {
+                user_id: p.user_id,
+                user_name: p.user_name.clone(),
+                role_id: p.role_id,
+            })
+            .collect()
+    }
+
+    /// Look a seating role up by id: canonical name plus the
+    /// judge-side flag the readiness gate reads. The game's own roles
+    /// first (seats are staged with game ids); the helpers vocabulary
+    /// backs it while the bundle has not read them.
+    fn role_lookup(&self, role_id: i64) -> Option<(String, bool)> {
+        if let Some(r) = self.users_game_roles.iter().find(|r| r.id == role_id) {
+            return Some((r.name.clone(), self.role_judge(&r.name, r.judge)));
+        }
+        self.users_roles
+            .iter()
+            .find(|(id, _, _, _)| *id == role_id)
+            .map(|(_, n, _, judge)| (n.clone(), *judge))
+    }
+
+    /// Stage somebody into the session. LOCAL FIRST: no write fires —
+    /// the directory row becomes draft intent and Minos hears about it
+    /// at the stage advance, after every staged seat ahead of it.
+    /// Re-picking somebody the server already holds in the same role
+    /// stages nothing and says so, instead of answering 409.
     fn users_add(&mut self, user_id: i64) {
-        let Some((gid, _)) = self.users_game.clone() else {
+        if self.users_game.is_none() {
             self.users_status = "hold a session first".to_string();
             return;
-        };
-        let Some(role) = self.users_role else {
+        }
+        let Some(role_id) = self.users_role else {
             self.users_status = "pick a role first".to_string();
             return;
         };
-        if self.setup_busy("seat") {
+        if self.stage_guard("seat") {
             return;
         }
-        let (master, tok) = match self.users_client() {
-            Ok(t) => t,
-            Err(e) => {
-                self.users_status = format!("add failed: {e}");
-                return;
-            }
+        let dir = self.users_list.iter().find(|u| u.id == user_id);
+        let user_name = dir
+            .map(|u| u.name.clone())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                self.users_roster
+                    .iter()
+                    .find(|p| p.user_id == user_id)
+                    .map(|p| p.user_name.clone())
+            })
+            .unwrap_or_else(|| format!("user {user_id}"));
+        // The roster write requires `call_sign`: keep a staged sign if
+        // the operator already set one, else the username-derived
+        // default — same convention as the seed scripts
+        // (`name.upper()[:16]`).
+        let call_sign = self
+            .roster_draft
+            .get(user_id)
+            .map(|st| st.call_sign.clone())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| dir.map(|u| u.seat_call_sign()))
+            .unwrap_or_else(|| format!("USER-{user_id}"));
+        let Some((role_name, judge)) = self.role_lookup(role_id) else {
+            self.users_status = "that role is no longer listed — re-sync and re-pick it".to_string();
+            return;
         };
-        // The seat response IS the roster — no read-after-write.
-        let note = format!("seated {user_id} in game {gid}");
-        self.setup_op = Some(spawn_rest("seat", move || {
-            master
-                .add_participant(&tok, gid, user_id, role)
-                .map_err(|e| e.to_string())
-                .map(|r| SetupDone::Roster(r, note))
-        }));
+        if let Some(p) = self.users_roster.iter().find(|p| p.user_id == user_id)
+            && p.role_id == role_id
+        {
+            self.roster_draft.remove(user_id, false);
+            self.users_status = format!("{user_name} is already seated as {role_name}");
+            return;
+        }
+        self.roster_draft.stage(tfg::roster::StagedSeat {
+            user_id,
+            user_name: user_name.clone(),
+            role_id,
+            role_name: role_name.clone(),
+            call_sign: call_sign.clone(),
+            judge,
+        });
+        self.users_status =
+            format!("staged {user_name} as {role_name} ({call_sign}) — syncs on advance");
     }
 
-    /// Move a seated person to another game role. The write clears that
-    /// seat's readiness, so the status line says so out loud.
+    /// Move a seated person to another game role. LOCAL FIRST: the draft
+    /// records it and Minos hears about it at the stage advance, where
+    /// the server clears that seat's readiness.
     fn users_change_role(&mut self, user_id: i64, role_id: i64) {
-        let Some((gid, _)) = self.users_game.clone() else {
+        if self.users_game.is_none() {
             self.users_status = "hold a session first".to_string();
             return;
-        };
-        let who = self
-            .users_roster
-            .iter()
-            .find(|p| p.user_id == user_id)
-            .map(|p| p.user_name.clone())
-            .unwrap_or_else(|| format!("user {user_id}"));
-        let role = self
-            .users_roles
-            .iter()
-            .find(|(id, _, _, _)| *id == role_id)
-            .map(|(_, n, _, _)| n.clone())
-            .unwrap_or_else(|| format!("role {role_id}"));
-        if self.setup_busy("role change") {
+        }
+        if self.stage_guard("role change") {
             return;
         }
-        let (master, tok) = match self.users_client() {
-            Ok(t) => t,
-            Err(e) => {
-                self.users_status = format!("role change failed: {e}");
-                return;
-            }
+        let Some((role_name, judge)) = self.role_lookup(role_id) else {
+            self.users_status = "that role is no longer listed — re-sync and re-pick it".to_string();
+            return;
         };
-        let note = format!("{who} → {role} (readiness cleared)");
-        self.setup_op = Some(spawn_rest("role", move || {
-            master
-                .set_participant_role(&tok, gid, user_id, role_id)
-                .map_err(|e| e.to_string())
-                .map(|r| SetupDone::Roster(r, note))
-        }));
+        let staged = self.roster_draft.get(user_id).cloned();
+        let (user_name, call_sign) = match (staged, self.users_roster.iter().find(|p| p.user_id == user_id)) {
+            (Some(st), _) => (st.user_name.clone(), st.call_sign.clone()),
+            (None, Some(p)) => (
+                p.user_name.clone(),
+                p.call_sign.clone(),
+            ),
+            (None, None) => (format!("user {user_id}"), format!("USER-{user_id}")),
+        };
+        if let Some(p) = self.users_roster.iter().find(|p| p.user_id == user_id)
+            && p.role_id == role_id
+        {
+            self.roster_draft.remove(user_id, false);
+            self.users_status = format!("{user_name} is already seated as {role_name}");
+            return;
+        }
+        self.roster_draft.stage(tfg::roster::StagedSeat {
+            user_id,
+            user_name: user_name.clone(),
+            role_id,
+            role_name: role_name.clone(),
+            call_sign,
+            judge,
+        });
+        self.users_status =
+            format!("staged {user_name} → {role_name} (readiness clears on sync)");
     }
 
-    /// Take a person off the roster. Removal of an absent seat is not
+    /// Take a person off the roster. LOCAL FIRST: a staged-new seat
+    /// simply vanishes (no write); a server-held seat is marked for
+    /// unseating at the stage advance. Removal of an absent seat is not
     /// an error upstream (idempotent), so the button never lies.
     fn users_remove(&mut self, user_id: i64) {
-        let Some((gid, _)) = self.users_game.clone() else {
+        if self.users_game.is_none() {
             self.users_status = "hold a session first".to_string();
             return;
-        };
-        let who = self
-            .users_roster
-            .iter()
-            .find(|p| p.user_id == user_id)
-            .map(|p| p.user_name.clone())
-            .unwrap_or_else(|| format!("user {user_id}"));
-        if self.setup_busy("remove") {
+        }
+        if self.stage_guard("remove") {
             return;
         }
-        let (master, tok) = match self.users_client() {
-            Ok(t) => t,
-            Err(e) => {
-                self.users_status = format!("remove failed: {e}");
-                return;
+        let on_server = self.users_roster.iter().any(|p| p.user_id == user_id);
+        let who = self
+            .roster_draft
+            .get(user_id)
+            .map(|st| st.user_name.clone())
+            .or_else(|| {
+                self.users_roster
+                    .iter()
+                    .find(|p| p.user_id == user_id)
+                    .map(|p| p.user_name.clone())
+            })
+            .unwrap_or_else(|| format!("user {user_id}"));
+        self.roster_draft.remove(user_id, on_server);
+        // Unseating a commander orphans whatever draft hulls still name
+        // them: the flush would post a commander Minos does not hold.
+        // Say so now, while re-handing is one picker gesture.
+        let orphaned = self.force.hulls().filter(|h| h.commander_id == Some(user_id)).count();
+        self.users_status = if on_server {
+            if orphaned > 0 {
+                format!(
+                    "staged removal of {who} — {orphaned} hull(s) still name them; re-hand those first — syncs on advance"
+                )
+            } else {
+                format!("staged removal of {who} — syncs on advance")
             }
+        } else {
+            format!("unstaged {who}")
         };
-        let note = format!("removed {who} from game {gid}");
-        self.setup_op = Some(spawn_rest("unseat", move || {
-            master
-                .remove_participant(&tok, gid, user_id)
-                .map_err(|e| e.to_string())
-                .map(|r| SetupDone::Roster(r, note))
-        }));
     }
 
     /// Hand a hull to a commander. LOCAL FIRST for a staged hull — the
@@ -5145,46 +5588,53 @@ impl ShipApp {
                         ui.selectable_value(&mut self.users_filter_role, Some(*id), name);
                     }
                 });
+            // The game's own role ids: the only ids the roster writes
+            // take. Computed up front so the boxes below borrow a local
+            // instead of the app through the popup closures.
+            let seat_roles = self.seating_roles();
             let seat_role = self
                 .users_role
-                .and_then(|r| self.users_roles.iter().find(|(id, _, _, _)| *id == r))
-                .map(|(_, n, _, _)| n.clone())
+                .and_then(|r| seat_roles.iter().find(|(id, _, _)| *id == r))
+                .map(|(_, n, _)| n.clone())
                 .unwrap_or_else(|| "pick".to_string());
             egui::ComboBox::from_label("seat as")
                 .selected_text(seat_role)
                 .show_ui(ui, |ui| {
-                    for (id, name, _, _) in &self.users_roles {
+                    for (id, name, _) in &seat_roles {
                         ui.selectable_value(&mut self.users_role, Some(*id), name);
                     }
                 });
-            // Say what the chosen role will imply BEFORE the seat is taken.
-            // A commander with no fleet is discovered when the exercise
-            // starts, which is the worst possible moment; saying it here
-            // costs one line and the operator can ignore it.
-            if let Some((_, name, _, judge)) = self
-                .users_role
-                .and_then(|r| self.users_roles.iter().find(|(id, _, _, _)| *id == r))
-                .cloned()
-            {
-                if role_may_need_command(judge) {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{name} may need a command \u{2014} assign a hull after seating"
-                        ))
-                        .weak()
-                        .small(),
-                    );
-                } else {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{name} is judge side \u{2014} no command, exempt from readiness"
-                        ))
-                        .weak()
-                        .small(),
-                    );
-                }
-            }
         });
+        // Say what the chosen role will imply BEFORE the seat is taken.
+        // A commander with no fleet is discovered when the exercise
+        // starts, which is the worst possible moment; saying it here
+        // costs one line and the operator can ignore it. On its own
+        // line: inside the combos row it drew over the boxes in a
+        // 470-point column.
+        let seat_roles = self.seating_roles();
+        if let Some((_, name, judge)) = self
+            .users_role
+            .and_then(|r| seat_roles.iter().find(|(id, _, _)| *id == r))
+            .cloned()
+        {
+            if role_may_need_command(judge) {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{name} may need a command \u{2014} assign a hull after seating"
+                    ))
+                    .weak()
+                    .small(),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{name} is judge side \u{2014} no command, exempt from readiness"
+                    ))
+                    .weak()
+                    .small(),
+                );
+            }
+        }
         let mut seating: Vec<i64> = Vec::new();
         egui::ScrollArea::vertical().id_salt("users-dir").max_height(170.0).show(
             ui,
@@ -5272,14 +5722,18 @@ impl ShipApp {
             ui.weak("Pick a session to see its roster.");
             return;
         }
-        if self.users_roster.is_empty() {
+        let roster = self.visible_roster();
+        if roster.is_empty() {
             ui.weak("Nobody seated yet.");
             return;
         }
-        for p in self.users_roster.clone() {
+        for p in &roster {
             ui.horizontal(|ui| {
                 ui.label(p.user_name.clone());
                 ui.label(egui::RichText::new(p.role_name.clone()).weak());
+                if self.is_staged_seat(p.user_id) {
+                    ui.label(egui::RichText::new("staged").small().weak());
+                }
                 if p.judge {
                     ui.label(egui::RichText::new("judge").weak().small());
                 } else if p.ready {
@@ -5292,6 +5746,15 @@ impl ShipApp {
                     ui.label(egui::RichText::new("not ready").weak().small());
                 }
             });
+        }
+        let leaving: Vec<String> = self
+            .users_roster
+            .iter()
+            .filter(|p| self.roster_draft.is_removed(p.user_id))
+            .map(|p| p.user_name.clone())
+            .collect();
+        if !leaving.is_empty() {
+            ui.weak(format!("leaving on sync: {}", leaving.join(", ")));
         }
         let uncommanded = self.seated_without_command();
         if !uncommanded.is_empty() {
@@ -5308,58 +5771,111 @@ impl ShipApp {
     /// One accessor because the roster row, the island summary and the
     /// readiness gate all need this answer, and three copies of the
     /// judge-then-filtered-count is three places to forget the judge side.
+    /// Reads the merged roster and both hull lists: a staged seat
+    /// commanding a draft hull holds a command even before the sync.
     fn seated_without_command(&self) -> Vec<String> {
-        self.users_roster
-            .iter()
+        self.visible_roster()
+            .into_iter()
             .filter(|p| !self.users_is_judge(p))
             .filter(|p| {
                 !self
                     .commanded_hulls
                     .iter()
                     .any(|h| h.commander_id == Some(p.user_id))
+                    && !self
+                        .force
+                        .hulls()
+                        .any(|h| h.commander_id == Some(p.user_id))
             })
             .map(|p| p.user_name.clone())
             .collect()
     }
 
     /// The editable roster, inside the Player Picker: who holds which seat,
-    /// role changes (each clears readiness), and removals.
+    /// role changes (each clears readiness on sync), removals, and the
+    /// call signs of staged-new seats. Every control stages draft intent;
+    /// Minos hears about all of it at the stage advance.
     fn roster_editor_ui(&mut self, ui: &mut egui::Ui) {
         ui.strong("Roster");
         if self.users_game.is_none() {
             ui.weak("Pick a session to see its roster.");
-        } else if self.users_roster.is_empty() {
+            return;
+        }
+        let roster = self.visible_roster();
+        if roster.is_empty() {
             ui.weak("Nobody seated yet.");
         } else {
-            ui.weak("one role per person — a role change clears readiness");
-            // Collect first, apply after the loop: every write answers
-            // with the whole roster, so one pass per action is enough.
+            ui.weak("one role per person — a role change clears readiness on sync");
+            // The game's own role ids, computed up front so the popups
+            // below borrow a local instead of the app mid-draw.
+            let seat_roles = self.seating_roles();
+            // Collect first, apply after the loop: the loop borrows the
+            // draft to draw, so it cannot stage through it mid-pass.
             let mut role_changes: Vec<(i64, i64)> = Vec::new();
             let mut removals: Vec<i64> = Vec::new();
-            for p in &self.users_roster {
-                ui.horizontal(|ui| {
-                    ui.label(p.user_name.clone());
+            let mut sign_edits: Vec<(i64, String)> = Vec::new();
+            for p in &roster {
+                let staged = self.is_staged_seat(p.user_id);
+                let on_server =
+                    self.users_roster.iter().any(|q| q.user_id == p.user_id);
+                // Two lines per seat: identity + role + remove on the
+                // first, call sign + standing on the second. One strip
+                // held seven widgets and they drew over each other in a
+                // 470-point column.
+                ui.horizontal(|row| {
+                    row.label(p.user_name.clone());
                     // Re-picking the current role is a no-op, so it
                     // never renders as an option.
                     let mut tmp = p.role_id;
                     egui::ComboBox::from_id_salt(("roster-role", p.user_id))
                         .selected_text(p.role_name.clone())
-                        .show_ui(ui, |ui| {
-                            for (id, name, _, _) in &self.users_roles {
+                        .show_ui(row, |menu| {
+                            for (id, name, _) in &seat_roles {
                                 if *id != p.role_id
-                                    && ui.selectable_value(&mut tmp, *id, name).clicked()
+                                    && menu.selectable_value(&mut tmp, *id, name).clicked()
                                 {
                                     role_changes.push((p.user_id, *id));
                                 }
                             }
                         });
+                    if staged {
+                        row.label(egui::RichText::new("staged").small().weak());
+                    }
+                    row.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |tail| {
+                            if tail.small_button("remove").clicked() {
+                                removals.push(p.user_id);
+                            }
+                        },
+                    );
+                });
+                ui.horizontal(|row| {
+                    // The call sign rides the seat write, so only a
+                    // staged-new seat has one worth editing: a held
+                    // seat's sign is the server's, and no endpoint
+                    // rewrites it.
+                    if staged && !on_server {
+                        row.label(egui::RichText::new("sign:").weak().small());
+                        let mut sign = p.call_sign.clone();
+                        row.add(
+                            egui::TextEdit::singleline(&mut sign)
+                                .desired_width(72.0)
+                                .hint_text("CALL-SIGN"),
+                        );
+                        if sign != p.call_sign {
+                            sign_edits.push((p.user_id, sign));
+                        }
+                    } else if !p.call_sign.is_empty() {
+                        row.label(egui::RichText::new(p.call_sign.clone()).weak().small());
+                    }
                     // Judge side is the only positive fact the helpers
                     // mirror carries, so `role_may_need_command` on it is the
                     // whole of what can be known here — hence the branch, and
                     // hence the softer wording on the other side.
                     let judge_side = self.users_is_judge(p);
                     if judge_side {
-                        ui.label(egui::RichText::new("(judge)").weak().small());
+                        row.label(egui::RichText::new("(judge)").weak().small());
                     } else if role_may_need_command(false)
                         && !self
                             .commanded_hulls
@@ -5370,7 +5886,7 @@ impl ShipApp {
                         // exercise-side seat from holding no hull, and the
                         // server does not refuse it. Amber says so without
                         // claiming the exercise cannot start.
-                        ui.label(
+                        row.label(
                             egui::RichText::new("no command yet")
                                 .color(egui::Color32::from_rgb(246, 197, 107))
                                 .small(),
@@ -5380,16 +5896,13 @@ impl ShipApp {
                         // Judge side is exempt from readiness: nothing to
                         // say, which is why this branch is empty.
                     } else if p.ready {
-                        ui.label(
+                        row.label(
                             egui::RichText::new("ready")
                                 .small()
                                 .color(egui::Color32::from_rgb(0x4A, 0xDE, 0x80)),
                         );
                     } else {
-                        ui.label(egui::RichText::new("not ready").weak().small());
-                    }
-                    if ui.small_button("remove").clicked() {
-                        removals.push(p.user_id);
+                        row.label(egui::RichText::new("not ready").weak().small());
                     }
                 });
             }
@@ -5398,6 +5911,42 @@ impl ShipApp {
             }
             for uid in removals {
                 self.users_remove(uid);
+            }
+            for (uid, sign) in sign_edits {
+                let norm = sign.trim().to_uppercase();
+                if norm.is_empty() {
+                    self.users_status =
+                        "a call sign cannot be empty — the seat keeps its old one".to_string();
+                } else if self.roster_draft.set_call_sign(uid, &norm) {
+                    self.users_status =
+                        format!("call sign → {norm} — syncs on advance");
+                }
+            }
+        }
+        // Staged removals stand apart with their way back: dropping the
+        // row outright would strand the operator with no undo before the
+        // flush posts the unseat.
+        let leaving: Vec<(i64, String)> = self
+            .users_roster
+            .iter()
+            .filter(|p| self.roster_draft.is_removed(p.user_id))
+            .map(|p| (p.user_id, p.user_name.clone()))
+            .collect();
+        if !leaving.is_empty() {
+            ui.weak("leaving on sync:");
+            let mut restores: Vec<i64> = Vec::new();
+            for (uid, name) in &leaving {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(name).weak().small());
+                    if ui.small_button("keep").clicked() {
+                        restores.push(*uid);
+                    }
+                });
+            }
+            for uid in restores {
+                if !self.stage_guard("restore") && self.roster_draft.restore(uid) {
+                    self.users_status = "seat restored".to_string();
+                }
             }
         }
     }
@@ -5517,11 +6066,13 @@ impl ShipApp {
     }
 
     /// Gate arithmetic for step 4 and the Persiapan bar: exercise-side
-    /// seats and how many of them are ready. Judges are exempt.
+    /// seats and how many of them are ready. Judges are exempt. Reads
+    /// the merged roster, so staged seats count before the sync posts
+    /// them — they are joining, and the gate will see them right after.
     fn setup_gate_counts(&self) -> (usize, usize) {
         let mut side = 0;
         let mut ready = 0;
-        for p in &self.users_roster {
+        for p in &self.visible_roster() {
             if !self.users_is_judge(p) {
                 side += 1;
                 if p.ready {
@@ -5532,37 +6083,60 @@ impl ShipApp {
         (side, ready)
     }
 
-    /// Non-judge roster members: the only people who may command.
+    /// Non-judge roster members: the only people who may command. Merged,
+    /// so a staged seat can take a hull before the sync posts either.
     fn setup_crew(&self) -> Vec<(i64, String)> {
-        self.users_roster
-            .iter()
+        self.visible_roster()
+            .into_iter()
             .filter(|p| !self.users_is_judge(p))
             .map(|p| (p.user_id, p.user_name.clone()))
             .collect()
     }
 
-    /// Planning → preparation, after the force is written through.
-    /// LOCAL FIRST: every locally-staged change is synced to Minos first;
-    /// only when nothing is owed (or everything landed) does the stage
-    /// flip. The Game Master decides planning is done — this step has no
-    /// gate of its own, but it has a SYNC of what was built.
+    /// Planning → preparation, after the staged session is written
+    /// through. LOCAL FIRST: every locally-staged change — seats, force,
+    /// book — is synced to Minos first; only when nothing is owed (or
+    /// everything landed) does the stage flip.
+    ///
+    /// Gated on an entry checklist: terms, roster, force and book freeze
+    /// at preparation, so an incomplete setup must refuse here, where
+    /// every one of them is still fixable, rather than strand the
+    /// exercise past the point of correction.
     fn setup_advance_prep(&mut self) {
-        self.begin_force_sync(Some("preparation".to_string()));
+        let blockers = self.setup_prep_checklist();
+        if !blockers.is_empty() {
+            let line = format!("not ready for preparation: {}", blockers.join("; "));
+            self.phase_note = Some(line.clone());
+            self.users_status = line;
+            return;
+        }
+        self.begin_stage_sync(Some("preparation".to_string()));
     }
 
-    /// Preparation → execution, after the force is written through.
-    /// LOCAL FIRST: same sync-then-advance, then the gate runs on the
-    /// authoritative force Minos has just been handed.
+    /// Preparation → execution, after the staged session is written
+    /// through. LOCAL FIRST: same sync-then-advance, then the gate runs
+    /// on the authoritative session Minos has just been handed.
     fn setup_advance_execution(&mut self) {
-        self.begin_force_sync(Some("execution".to_string()));
+        self.begin_stage_sync(Some("execution".to_string()));
     }
 
-    /// Sync the staged force to Minos and then, when `then` is set,
+    /// Sync the staged session to Minos and then, when `then` is set,
     /// run the stage transition. Nothing to sync means the transition
     /// runs immediately. A gap (hulls nobody commands) or a request
     /// failure refuses the advance and says why, with the goal left in
     /// `then` until the next attempt.
-    fn begin_force_sync(&mut self, then: Option<String>) {
+    ///
+    /// Seats plan before force assigns (a piece IS a hull commanded by
+    /// a participant, so the participant has to exist first), unseats
+    /// plan after the force (nobody goes seatless while their hull is
+    /// still being handed over), and the book plans last — still before
+    /// the transition, because the server only takes pages in planning.
+    ///
+    /// Two passes: this one arms the goal and re-reads the bundle, and
+    /// `plan_and_pump_stage` plans once those fresh mirrors land. A seat
+    /// the server already holds then converges instead of answering 409
+    /// mid-flush.
+    fn begin_stage_sync(&mut self, then: Option<String>) {
         if self.setup_busy("sync") {
             return;
         }
@@ -5570,29 +6144,87 @@ impl ShipApp {
             self.phase_note = Some("hold a session first".to_string());
             return;
         };
-        let live = self.live_hulls();
-        match tfg::force::plan(&self.force, &live) {
+        // The book is planning-only on the server: staged pages can only
+        // ever flush while the game is still in planning. A non-empty
+        // book draft outside planning is a leftover, not a plan — say so
+        // instead of posting it at a 403.
+        if self.users_game_state.as_deref() != Some("planning") && !self.book_draft.is_empty() {
+            self.phase_note = Some(
+                "scenario drafts only sync from planning — abandon them in the composer".to_string(),
+            );
+            return;
+        }
+        if self.stage_armed {
+            // A re-read is already in flight; retarget its goal rather
+            // than stacking another read behind it.
+            self.stage_then = then;
+            self.users_status = "reading the session before sync…".to_string();
+            return;
+        }
+        self.stage_armed = true;
+        self.stage_then = then;
+        self.users_status = "reading the session before sync…".to_string();
+        self.users_refresh_game();
+    }
+
+    /// Plan the armed stage sync against the fresh mirrors and pump it.
+    /// Runs from `apply_bundle` once the arming re-read lands — never
+    /// straight from a button, so the diff is always decided on what
+    /// Minos just said rather than on cached lists.
+    fn plan_and_pump_stage(&mut self) {
+        self.stage_armed = false;
+        let Some((_, _)) = self.users_game.clone() else {
+            self.phase_note = Some("hold a session first".to_string());
+            self.stage_queue.clear();
+            self.stage_then = None;
+            return;
+        };
+        let live_hulls = self.live_hulls();
+        let live_seats = self.live_seats();
+        let live_book: Vec<tfg::book::LiveScenario> =
+            self.scenarios.iter().map(|s| tfg::book::LiveScenario { id: s.id }).collect();
+        let force_plan = match tfg::force::plan(&self.force, &live_hulls) {
             Err(gap) => {
                 self.phase_note = Some(format!("sync refused: {}", gap));
+                self.stage_then = None;
+                return;
             }
-            Ok(writes) if writes.is_empty() => {
-                if let Some(to) = then {
-                    self.transition_to(&to);
-                } else {
-                    self.users_status = "nothing to sync".to_string();
-                }
-            }
-            Ok(writes) => {
-                if let Err(e) = self.users_client() {
-                    self.phase_note = Some(format!("sync refused: {e}"));
-                    return;
-                }
-                self.force_queue = writes;
-                self.force_flush_then = then;
-                self.users_status = format!("syncing {} change(s) to Minos…", self.force_queue.len());
-                self.pump_force_flush();
+            Ok(writes) => writes,
+        };
+        let mut queue: Vec<StageWrite> = Vec::new();
+        let (mut seats, mut roles, mut unseats) = (Vec::new(), Vec::new(), Vec::new());
+        for w in tfg::roster::plan(&self.roster_draft, &live_seats) {
+            match w {
+                tfg::roster::RosterWrite::Seat { .. } => seats.push(w),
+                tfg::roster::RosterWrite::Role { .. } => roles.push(w),
+                tfg::roster::RosterWrite::Unseat { .. } => unseats.push(w),
             }
         }
+        queue.extend(seats.into_iter().map(StageWrite::Roster));
+        queue.extend(roles.into_iter().map(StageWrite::Roster));
+        queue.extend(force_plan.into_iter().map(StageWrite::Force));
+        queue.extend(unseats.into_iter().map(StageWrite::Roster));
+        queue.extend(
+            tfg::book::plan(&self.book_draft, &live_book).into_iter().map(StageWrite::Book),
+        );
+        if queue.is_empty() {
+            if let Some(to) = self.stage_then.take() {
+                self.transition_to(&to);
+            } else {
+                self.users_status = "nothing to sync".to_string();
+            }
+            return;
+        }
+        if let Err(e) = self.users_client() {
+            self.phase_note = Some(format!("sync refused: {e}"));
+            self.stage_then = None;
+            return;
+        }
+        let n = queue.len();
+        self.stage_queue = queue;
+        self.book_id_map.clear();
+        self.users_status = format!("syncing {n} change(s) to Minos…");
+        self.pump_stage_flush();
     }
 
     /// The local view of one hull Minos holds, used for the diff.
@@ -5612,26 +6244,48 @@ impl ShipApp {
             .collect()
     }
 
-    /// One force write answered: retire it from the queue and issue the next.
-    /// A write that came from a standalone control rather than the flush —
-    /// a commander change in the staff-gap path — leaves the queue empty,
-    /// and then this is a no-op instead of a panic.
-    fn force_write_done(&mut self) {
-        if self.force_queue.is_empty() {
+    /// One stage write answered: retire it from the queue and issue the next.
+    fn stage_write_done(&mut self) {
+        if self.stage_queue.is_empty() {
             return;
         }
-        self.force_queue.remove(0);
-        self.pump_force_flush();
+        self.stage_queue.remove(0);
+        self.pump_stage_flush();
+    }
+
+    /// Drop the stage queue with one loud line: the mirrors already carry
+    /// whatever landed, and the drafts still hold whatever did not, so the
+    /// next attempt re-plans a fresh diff instead of replaying a stale one.
+    fn fail_stage(&mut self, line: String) {
+        self.stage_queue.clear();
+        self.stage_then = None;
+        self.stage_armed = false;
+        self.feed(line.clone());
+        self.users_status = line.clone();
+        self.phase_note = Some(line);
+    }
+
+    /// Re-resolve a staged role name against the current helpers mirror:
+    /// the mirror may have refreshed since the seat was staged, and an id
+    /// that no longer exists is the 409 the picker used to produce.
+    fn resolve_stage_role(&self, role_name: &str) -> Option<(i64, bool)> {
+        if let Some(r) = self.users_game_roles.iter().find(|r| r.name == role_name) {
+            return Some((r.id, self.role_judge(&r.name, r.judge)));
+        }
+        self.users_roles
+            .iter()
+            .find(|(_, n, _, _)| n == role_name)
+            .map(|(id, _, _, judge)| (*id, *judge))
     }
 
     /// Issue one staged write through the slot, and when the queue
     /// frees, the deferred transition (if any) is the last step.
-    fn pump_force_flush(&mut self) {
+    fn pump_stage_flush(&mut self) {
         if self.setup_op.is_some() {
             return;
         }
-        let Some(write) = self.force_queue.first().cloned() else {
-            if let Some(to) = self.force_flush_then.take() {
+        let Some(write) = self.stage_queue.first().cloned() else {
+            if let Some(to) = self.stage_then.take() {
                 self.users_status = format!("synced — advancing to {to}");
                 self.transition_to(&to);
             }
@@ -5639,51 +6293,203 @@ impl ShipApp {
         };
         let Some((gid, _)) = self.users_game.clone() else {
             self.phase_note = Some("hold a session first".to_string());
-            self.force_queue.clear();
-            self.force_flush_then = None;
+            self.stage_queue.clear();
+            self.stage_then = None;
+            self.stage_armed = false;
             return;
         };
         let (master, tok) = match self.users_client() {
             Ok(t) => t,
             Err(e) => {
                 self.phase_note = Some(format!("sync refused: {e}"));
-                self.force_queue.clear();
-                self.force_flush_then = None;
+                self.stage_queue.clear();
+                self.stage_then = None;
+            self.stage_armed = false;
                 return;
             }
         };
+        // Late-bind what only the flush can know: role ids against the
+        // current mirror, and staged-new scenarios against the create
+        // answers already banked in `book_id_map`.
+        let write = match write {
+            StageWrite::Roster(tfg::roster::RosterWrite::Seat {
+                user_id,
+                user_name,
+                role_name,
+                call_sign,
+                ..
+            }) => match self.resolve_stage_role(&role_name) {
+                Some((role_id, _)) => {
+                    StageWrite::Roster(tfg::roster::RosterWrite::Seat {
+                        user_id,
+                        user_name,
+                        role_id,
+                        role_name,
+                        call_sign,
+                    })
+                }
+                None => {
+                    self.fail_stage(format!(
+                        "sync refused at seat {user_name} as {role_name}: that role is no longer listed — re-pick it and retry"
+                    ));
+                    return;
+                }
+            },
+            StageWrite::Roster(tfg::roster::RosterWrite::Role {
+                user_id,
+                user_name,
+                role_name,
+                ..
+            }) => match self.resolve_stage_role(&role_name) {
+                Some((role_id, _)) => {
+                    StageWrite::Roster(tfg::roster::RosterWrite::Role {
+                        user_id,
+                        user_name,
+                        role_id,
+                        role_name,
+                    })
+                }
+                None => {
+                    self.fail_stage(format!(
+                        "sync refused at move {user_name} to {role_name}: that role is no longer listed — re-pick it and retry"
+                    ));
+                    return;
+                }
+            },
+            StageWrite::Book(tfg::book::BookWrite::AddStep {
+                scenario: tfg::book::ScenarioRef::New(local),
+                content,
+                window,
+            }) => match self.book_id_map.get(&local).copied() {
+                Some(sid) => StageWrite::Book(tfg::book::BookWrite::AddStep {
+                    scenario: tfg::book::ScenarioRef::Live(sid),
+                    content,
+                    window,
+                }),
+                None => {
+                    self.fail_stage(
+                        "sync refused at a staged step: its scenario has no server id yet — retry the advance"
+                            .to_string(),
+                    );
+                    return;
+                }
+            },
+            other => other,
+        };
         let w = write.clone();
+        let label = w.label();
         self.setup_op = Some(spawn_rest("sync", move || {
-            let res = match &w {
-                tfg::force::ForceWrite::Assign { unit_id, commander_id, .. } => master
-                    .assign_unit(&tok, gid, *unit_id, *commander_id)
-                    .map(SetupDone::ForceUnits)
+            let res: Result<SetupDone, String> = match &w {
+                StageWrite::Roster(tfg::roster::RosterWrite::Seat {
+                    user_id,
+                    user_name,
+                    role_name,
+                    role_id,
+                    call_sign,
+                }) => {
+                    match master.add_participant(&tok, gid, *user_id, *role_id, call_sign) {
+                        Ok(roster) => Ok(SetupDone::StageRoster(roster)),
+                        Err(tfg::backend::BackendError::Api { status: 409, .. }) => {
+                            // Somebody — this client on a stale mirror, or
+                            // another operator — seated them first. Re-read:
+                            // whoever holds the seat now is the record, so
+                            // adopt it and continue the flush instead of
+                            // aborting it.
+                            match master.game_participants(&tok, gid) {
+                                Ok(fresh)
+                                    if fresh.iter().any(|p| p.user_id == *user_id) =>
+                                {
+                                    Ok(SetupDone::StageRosterAdopted(fresh, *user_id))
+                                }
+                                Ok(fresh) => Err(format!(
+                                    "that seat is taken on the server ({} seat(s) held, none of them {user_name}) — the sign {call_sign} may belong to another seat, or the {role_name} role id is stale; edit the sign in the picker or re-pick the role",
+                                    fresh.len()
+                                )),
+                                Err(_) => Err(
+                                    "that seat is taken on the server — re-read the roster and retry"
+                                        .to_string(),
+                                ),
+                            }
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                StageWrite::Roster(tfg::roster::RosterWrite::Role {
+                    user_id, role_id, ..
+                }) => master
+                    .set_participant_role(&tok, gid, *user_id, *role_id)
+                    .map(SetupDone::StageRoster)
                     .map_err(|e| e.to_string()),
-                tfg::force::ForceWrite::HandOver { unit_id, commander_id, .. } => master
+                StageWrite::Roster(tfg::roster::RosterWrite::Unseat { user_id, .. }) => master
+                    .remove_participant(&tok, gid, *user_id)
+                    .map(SetupDone::StageRoster)
+                    .map_err(|e| e.to_string()),
+                StageWrite::Force(tfg::force::ForceWrite::Assign { unit_id, commander_id, .. }) => {
+                    master
+                        .assign_unit(&tok, gid, *unit_id, *commander_id)
+                        .map(SetupDone::ForceUnits)
+                        .map_err(|e| e.to_string())
+                }
+                StageWrite::Force(tfg::force::ForceWrite::HandOver {
+                    unit_id,
+                    commander_id,
+                    ..
+                }) => master
                     .set_unit_commander(&tok, gid, *unit_id, *commander_id)
                     .map(SetupDone::ForceUnits)
                     .map_err(|e| e.to_string()),
-                tfg::force::ForceWrite::Place { unit_id, lat, lon, .. } => master
-                    .set_placement(&tok, gid, *unit_id, *lat, *lon)
-                    .map(SetupDone::ForcePlacements)
-                    .map_err(|e| e.to_string()),
-                tfg::force::ForceWrite::Lift { unit_id, .. } => master
+                StageWrite::Force(tfg::force::ForceWrite::Place { unit_id, lat, lon, .. }) => {
+                    master
+                        .set_placement(&tok, gid, *unit_id, *lat, *lon)
+                        .map(SetupDone::ForcePlacements)
+                        .map_err(|e| e.to_string())
+                }
+                StageWrite::Force(tfg::force::ForceWrite::Lift { unit_id, .. }) => master
                     .clear_placement(&tok, gid, *unit_id)
                     .map(SetupDone::ForcePlacements)
                     .map_err(|e| e.to_string()),
-                tfg::force::ForceWrite::Remove { unit_id, .. } => master
+                StageWrite::Force(tfg::force::ForceWrite::Remove { unit_id, .. }) => master
                     .remove_unit(&tok, gid, *unit_id)
                     .map(SetupDone::ForceUnits)
+                    .map_err(|e| e.to_string()),
+                StageWrite::Book(tfg::book::BookWrite::Create { local_id, title }) => master
+                    .create_game_scenario(&tok, gid, title, "")
+                    .map(|sc| SetupDone::StageBook(sc, Some(*local_id)))
+                    .map_err(|e| e.to_string()),
+                StageWrite::Book(tfg::book::BookWrite::AddStep {
+                    scenario: tfg::book::ScenarioRef::Live(sid),
+                    content,
+                    window,
+                }) => master
+                    .add_scenario_step(
+                        &tok,
+                        gid,
+                        *sid,
+                        content,
+                        window.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+                    )
+                    .map(|sc| SetupDone::StageBook(sc, None))
+                    .map_err(|e| e.to_string()),
+                StageWrite::Book(tfg::book::BookWrite::AddStep {
+                    scenario: tfg::book::ScenarioRef::New(_),
+                    ..
+                }) => Err("staged scenario has no server id yet".to_string()),
+                StageWrite::Book(tfg::book::BookWrite::RemoveStep {
+                    scenario_id,
+                    step_id,
+                }) => master
+                    .delete_scenario_step(&tok, gid, *scenario_id, *step_id)
+                    .map(|sc| SetupDone::StageBook(sc, None))
                     .map_err(|e| e.to_string()),
             };
             match res {
                 Ok(done) => Ok(done),
-                Err(e) => Ok(SetupDone::ForceFailed(e, w)),
+                Err(e) => Ok(SetupDone::StageFailed(label, e)),
             }
         }));
     }
 
-    /// The stage transition itself, once the force is on the server.
+    /// The stage transition itself, once the staged session is on the server.
     /// Generalized from the two old call sites; a refusal keeps the
     /// local machine where it is and names why.
     fn transition_to(&mut self, to: &str) {
@@ -5760,12 +6566,15 @@ impl ShipApp {
                 self.sim_ready = true;
                 self.phase_note = None;
                 self.users_status = format!("{} → {}", g.name, g.state);
+                // The commanders' station opens with the phase it serves.
+                self.dashboard_open = true;
                 self.users_refresh_games();
                 self.users_refresh_game();
             }
             "execution" => {
                 self.phase_note = None;
                 self.users_status = format!("{} → {}", g.name, g.state);
+                self.dashboard_open = true;
                 self.users_refresh_games();
                 self.users_refresh_game();
                 if !self.session_live() {
@@ -5938,6 +6747,9 @@ impl ShipApp {
             // room by construction. The server stamps the instant; the
             // headcount only needs to know it is not absent.
             joined_at: Some("now".to_string()),
+            // The join answer carries no call sign; the next bundle
+            // re-read fills it in from the roster row.
+            call_sign: String::new(),
         };
         match self.users_roster.iter_mut().find(|p| p.user_id == j.user_id) {
             Some(slot) => *slot = row,
@@ -7090,7 +7902,30 @@ impl ShipApp {
         ui.horizontal(|ui| {
             ui.label("real date:");
             ui.text_edit_singleline(&mut self.edit_actual_date);
+            if ui
+                .small_button(if self.cal_open { "close" } else { "pick" })
+                .on_hover_text("choose the date the real window sits on")
+                .clicked()
+            {
+                if !self.cal_open {
+                    self.seed_calendar();
+                }
+                self.cal_open = !self.cal_open;
+            }
         });
+        // Live format check, same voice as the save path: a filled field
+        // that will not convert is an error now, not a 400 later.
+        if !self.edit_actual_date.trim().is_empty()
+            && !tfg::backend::date_ok(self.edit_actual_date.trim())
+        {
+            warn_line(
+                ui,
+                format!("{} is not a date like 2026-11-01", self.edit_actual_date.trim()),
+            );
+        }
+        if self.cal_open {
+            self.calendar_ui(ui);
+        }
         ui.horizontal(|ui| {
             ui.label("real start:");
             ui.text_edit_singleline(&mut self.edit_actual_start);
@@ -7116,6 +7951,112 @@ impl ShipApp {
                 self.edit_open = false;
             }
         });
+    }
+
+    /// Point the calendar at the field when it parses as a date, else at
+    /// today WIB — the same +7 the session stub stamps new games with.
+    fn seed_calendar(&mut self) {
+        let today = (Utc::now() + chrono::Duration::hours(7)).date_naive();
+        let (mut year, mut month) = (today.year(), today.month());
+        let trimmed = self.edit_actual_date.trim().to_string();
+        // `date_ok` already proved the shape, so the slices parse and the
+        // month is real; the year is narrowed to what the popup shows.
+        if tfg::backend::date_ok(&trimmed)
+            && let (Ok(y), Ok(m)) = (
+                trimmed[0..4].parse::<i32>(),
+                trimmed[5..7].parse::<u32>(),
+            )
+            && (2000..=2100).contains(&y)
+        {
+            year = y;
+            month = m;
+        }
+        self.cal_year = year;
+        self.cal_month = month;
+    }
+
+    /// One month grid writing `YYYY-MM-DD` into the real-date draft.
+    /// Monday-first (ISO): the field orders year-month-day the same way.
+    /// Typing stays available — the popup is for picking, not a gate,
+    /// and blank stays the form's leave-alone.
+    fn calendar_ui(&mut self, ui: &mut egui::Ui) {
+        self.cal_year = self.cal_year.clamp(2000, 2100);
+        self.cal_month = self.cal_month.clamp(1, 12);
+        let (mut year, mut month) = (self.cal_year, self.cal_month);
+        ui.horizontal(|ui| {
+            if ui.small_button("‹").clicked() {
+                (year, month) = if month == 1 { (year - 1, 12) } else { (year, month - 1) };
+            }
+            ui.label(egui::RichText::new(format!("{year:04}-{month:02}")).strong());
+            if ui.small_button("›").clicked() {
+                (year, month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+            }
+            if ui.small_button("today").clicked() {
+                let today = (Utc::now() + chrono::Duration::hours(7)).date_naive();
+                self.edit_actual_date = today.format("%Y-%m-%d").to_string();
+                self.cal_open = false;
+                return;
+            }
+            if ui.small_button("clear").clicked() {
+                self.edit_actual_date.clear();
+                self.cal_open = false;
+                return;
+            }
+        });
+        self.cal_year = year.clamp(2000, 2100);
+        self.cal_month = month;
+        let Some(first) =
+            chrono::NaiveDate::from_ymd_opt(self.cal_year, self.cal_month, 1)
+        else {
+            self.cal_open = false;
+            return;
+        };
+        let lead = first.weekday().num_days_from_monday() as usize;
+        let mut days = 0u32;
+        let mut cursor = first;
+        while cursor.month() == self.cal_month {
+            days += 1;
+            match cursor.checked_add_days(chrono::Days::new(1)) {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        let mut picked: Option<String> = None;
+        egui::Grid::new("real-date-calendar")
+            .num_columns(7)
+            .spacing([2.0, 2.0])
+            .show(ui, |ui| {
+                for wd in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] {
+                    ui.label(egui::RichText::new(wd).weak().small());
+                }
+                ui.end_row();
+                for _ in 0..lead {
+                    ui.add_sized([26.0, 20.0], egui::Label::new(" "));
+                }
+                let mut col = lead;
+                for day in 1..=days {
+                    let value = format!("{:04}-{:02}-{day:02}", self.cal_year, self.cal_month);
+                    let selected = self.edit_actual_date.trim() == value;
+                    if ui
+                        .add_sized(
+                            [26.0, 20.0],
+                            egui::Button::new(format!("{day}")).selected(selected),
+                        )
+                        .clicked()
+                    {
+                        picked = Some(value);
+                    }
+                    col += 1;
+                    if col == 7 {
+                        ui.end_row();
+                        col = 0;
+                    }
+                }
+            });
+        if let Some(value) = picked {
+            self.edit_actual_date = value;
+            self.cal_open = false;
+        }
     }
 
     /// The planned window the edit form's six drafts describe, converted to the
@@ -7343,6 +8284,23 @@ impl ShipApp {
         self.can_manage_sessions() && !self.users_games.is_empty()
     }
 
+    /// Room-key join: the personnel front door. The key is the only
+    /// input — the answer says which game was entered, and the hold +
+    /// stage follow it. Rendered everywhere a session-less account can
+    /// stand: the no-session island first, the Session island beside
+    /// the held key. One helper because two copies of a join form is
+    /// two forms waiting to disagree about the hint.
+    fn room_key_join_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("room key:");
+            ui.text_edit_singleline(&mut self.join_key);
+            if ui.small_button("join").clicked() {
+                self.join_with_key();
+            }
+        });
+        ui.weak("joining needs a seat first — a valid key without one is refused (ask the Game Master).");
+    }
+
     /// Setup flow step 1 (#79): hold a game — pick a listed one or
     /// create a session. Only `name` is required; blank optionals are
     /// omitted, never sent empty.
@@ -7426,14 +8384,7 @@ impl ShipApp {
                 });
             }
         }
-        ui.horizontal(|ui| {
-            ui.label("room key:");
-            ui.text_edit_singleline(&mut self.join_key);
-            if ui.small_button("join").clicked() {
-                self.join_with_key();
-            }
-        });
-        ui.weak("joining needs a seat first — a valid key without one is refused (ask the Game Master).");
+        self.room_key_join_ui(ui);
         // Planning → preparation carries no gate (the Game Master
         // decides planning is done), and it is what mints the key —
         // so the action sits beside the key it produces, not behind
@@ -7526,7 +8477,7 @@ impl ShipApp {
         // some roles which fleet — and in a 320-point column that decision
         // needs room the island does not have.
         ui.horizontal(|ui| {
-            let seated = self.users_roster.len();
+            let seated = self.visible_roster().len();
             if ui
                 .button(if seated > 0 {
                     format!("Player picker ({seated} seated)")
@@ -8353,7 +9304,7 @@ impl ShipApp {
                         }
                     }
                     if ui.small_button("sync to Minos").clicked() {
-                        self.begin_force_sync(None);
+                        self.begin_stage_sync(None);
                     }
                 });
             }
@@ -8459,6 +9410,42 @@ impl ShipApp {
             self.placement_unplaced,
             if self.placement_ready { " · ready" } else { "" },
         ));
+        // What the advance will post before the transition: seats, force
+        // writes and book pages staged locally. The server counts above
+        // do not include them yet — this line is the difference.
+        let staged_seats = tfg::roster::plan(&self.roster_draft, &self.live_seats()).len();
+        let staged_force = self.force.pending(&self.live_hulls());
+        let staged_book = tfg::book::plan(
+            &self.book_draft,
+            &self
+                .scenarios
+                .iter()
+                .map(|s| tfg::book::LiveScenario { id: s.id })
+                .collect::<Vec<_>>(),
+        )
+        .len();
+        if staged_seats + staged_force + staged_book > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "staged — syncs on advance: {staged_seats} seat(s), {staged_force} force change(s), {staged_book} book page(s)"
+                ))
+                .weak(),
+            );
+        }
+        ui.separator();
+        // Entering preparation freezes terms, roster, force and book, so
+        // the missing pieces name themselves here — while every one of
+        // them is still fixable — rather than at the button past the
+        // point of correction.
+        ui.strong("Preparation");
+        let prep = self.setup_prep_checklist();
+        if prep.is_empty() {
+            ui.label(egui::RichText::new("complete — ready to enter preparation").strong());
+        } else {
+            for b in &prep {
+                ui.label(format!("• {b}"));
+            }
+        }
         ui.separator();
         // The checklist names every blocker; the button names its
         // consequence. The server still gates the advance itself.
@@ -8507,7 +9494,7 @@ impl ShipApp {
         match step {
             0 | 1 => None,
             2 => {
-                if self.users_roster.is_empty() {
+                if self.visible_roster().is_empty() {
                     Some("seat someone in Players first".to_string())
                 } else {
                     None
@@ -8553,6 +9540,71 @@ impl ShipApp {
                 b.push_str(" Not yet: ");
                 b.push_str(&waiting.join(", "));
             }
+        }
+        blockers
+    }
+
+    /// Planning → preparation entry gate: everything preparation freezes.
+    ///
+    /// Terms (the window), the roster, the force and the book can only be
+    /// authored in planning — past it the server fixes terms and takes
+    /// pages no longer, while the execution gate demands the window
+    /// complete. An advance past an incomplete setup strands the exercise
+    /// between those two rules, so the button refuses here and names every
+    /// missing piece instead. Roster, force and book read merged views:
+    /// staged work counts, because the flush posts it before the
+    /// transition fires. The window reads the held detail — terms cannot
+    /// stage, so only what Minos holds decides that line.
+    fn setup_prep_checklist(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+        if self.users_game.is_none() {
+            return vec!["hold a session in Essentials first".to_string()];
+        }
+        match self.held_detail.as_ref().map(|d| &d.window) {
+            None => blockers.push("session detail unread — sync the session first".to_string()),
+            Some(w) => {
+                let mut missing = false;
+                for (clock, start, end) in [
+                    ("real", &w.actual_start, &w.actual_end),
+                    ("exercise", &w.assumed_start, &w.assumed_end),
+                ] {
+                    match (start.as_deref(), end.as_deref()) {
+                        (Some(s), Some(e)) => match rfc3339_runs_forwards(s, e) {
+                            Some(true) => {}
+                            Some(false) => blockers.push(format!(
+                                "the {clock} window runs backwards — end must be after start"
+                            )),
+                            None => blockers.push(format!(
+                                "the {clock} window is unreadable — re-save it in Essentials"
+                            )),
+                        },
+                        _ => missing = true,
+                    }
+                }
+                if missing {
+                    blockers.push(
+                        "the planned window is incomplete — set real and exercise start and end in Essentials"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        let side = self
+            .visible_roster()
+            .iter()
+            .filter(|p| !self.users_is_judge(p))
+            .count();
+        if side == 0 {
+            blockers.push("seat an exercise-side player in Players first".to_string());
+        }
+        if self.force.is_empty() && self.users_gunits.is_empty() && self.commanded_hulls.is_empty() {
+            blockers.push("assign pieces in Fleet first".to_string());
+        }
+        let steps: usize = self.book_view().iter().map(|s| s.steps.len()).sum();
+        if self.book_view().is_empty() {
+            blockers.push("author a scenario in the composer".to_string());
+        } else if steps == 0 {
+            blockers.push("add at least one step to the book".to_string());
         }
         blockers
     }
@@ -8825,8 +9877,11 @@ impl ShipApp {
                 ui.separator();
                 ui.label("Text size");
                 ui.horizontal(|ui| {
-                    for (label, scale) in
-                        [("Smaller", 0.875), ("Default", 1.0), ("Larger", 1.15)]
+                    for (label, scale) in [
+                        ("Smaller", 0.875),
+                        ("Default", 1.0),
+                        ("Larger", tfg::tokens::TEXT_SCALE_LARGER),
+                    ]
                     {
                         if ui
                             .selectable_label(
@@ -8871,11 +9926,12 @@ impl ShipApp {
         if let Some(id) = scenario_id {
             self.composer_scenario = Some(id);
         } else if self.composer_scenario.is_none() {
-            self.composer_scenario = self.scenarios.first().map(|s| s.id);
+            self.composer_scenario = self.book_view().first().map(|s| s.id);
         }
         self.open_only(WhichModal::Composer);
         self.composer_draft = ComposerDraft::default();
         self.composer_draft_error = None;
+        self.composer_new_title.clear();
         self.load_scenarios();
     }
 
@@ -8900,13 +9956,19 @@ impl ShipApp {
         }));
     }
 
+    /// Stage a step onto the open scenario. LOCAL FIRST: the draft
+    /// records it and Minos hears about it at the stage advance — never
+    /// a write per click, so authoring never answers 403 mid-sentence.
     fn add_scenario_step(&mut self) {
         let Some(sid) = self.composer_scenario else {
             return;
         };
-        let Some((gid, _)) = self.users_game.clone() else {
+        if self.users_game.is_none() {
             return;
-        };
+        }
+        if self.stage_guard("step") {
+            return;
+        }
         if let Some(problem) = self.composer_draft.problem() {
             self.composer_draft_error = Some(problem);
             return;
@@ -8915,54 +9977,55 @@ impl ShipApp {
         let window = self.composer_draft.window().map(|(a, b)| (a.to_string(), b.to_string()));
         self.composer_draft = ComposerDraft::default();
         self.composer_draft_error = None;
-        let (master, tok) = match self.users_client() {
-            Ok(t) => t,
-            Err(e) => {
-                self.users_status = format!("step refused: {e}");
-                return;
+        if sid < 0 {
+            if self.book_draft.stage_step_new(sid, &content, window).is_none() {
+                // The staged scenario vanished mid-frame: hand the
+                // typing back rather than eating it.
+                self.composer_draft.content = content;
+                self.composer_draft_error =
+                    Some("that scenario is no longer staged".to_string());
             }
-        };
-        let window = window.map(|(a, b)| (a, b));
-        self.scenarios_op = Some(spawn_rest("scenario-step", move || {
-            master
-                .add_scenario_step(
-                    &tok,
-                    gid,
-                    sid,
-                    &content,
-                    window.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
-                )
-                .map_err(|e| e.to_string())
-                .map(Book::One)
-        }));
+            return;
+        }
+        self.book_draft.stage_step_add(sid, &content, window);
+        self.users_status = "staged a step — syncs on advance".to_string();
     }
 
+    /// Stage the removal of a step. LOCAL FIRST. A staged step (negative
+    /// id) simply leaves the draft; a server-held step is marked for
+    /// deletion at the stage advance, standing apart in the composer
+    /// with its way back until then.
     fn delete_scenario_step(&mut self, step_id: i64) {
         let Some(sid) = self.composer_scenario else {
             return;
         };
-        let Some((gid, _)) = self.users_game.clone() else {
+        if self.users_game.is_none() {
             return;
-        };
-        let (master, tok) = match self.users_client() {
-            Ok(t) => t,
-            Err(e) => {
-                self.users_status = format!("delete refused: {e}");
-                return;
+        }
+        if self.stage_guard("delete") {
+            return;
+        }
+        if step_id < 0 {
+            if sid < 0 {
+                self.book_draft.drop_new_step(sid, step_id);
+            } else {
+                self.book_draft.drop_added_step(sid, step_id);
             }
-        };
-        self.scenarios_op = Some(spawn_rest("scenario-step-del", move || {
-            master
-                .delete_scenario_step(&tok, gid, sid, step_id)
-                .map_err(|e| e.to_string())
-                .map(Book::One)
-        }));
+            return;
+        }
+        if sid < 0 {
+            return;
+        }
+        self.book_draft.stage_step_cut(sid, step_id);
     }
 
+    /// Stage a new scenario at the book's end. LOCAL FIRST: the title
+    /// becomes a draft row the composer opens at once, and Minos hears
+    /// about it at the stage advance.
     fn create_scenario(&mut self, title: &str) {
-        let Some((gid, _)) = self.users_game.clone() else {
+        if self.users_game.is_none() {
             return;
-        };
+        }
         let title = title.trim();
         if title.is_empty() {
             // The backend requires a title, and it is the one field on this
@@ -8970,20 +10033,13 @@ impl ShipApp {
             self.composer_draft_error = Some("a scenario needs a title".into());
             return;
         }
-        let title = title.to_string();
-        let (master, tok) = match self.users_client() {
-            Ok(t) => t,
-            Err(e) => {
-                self.users_status = format!("scenario refused: {e}");
-                return;
-            }
-        };
-        self.scenarios_op = Some(spawn_rest("scenario-create", move || {
-            master
-                .create_game_scenario(&tok, gid, &title, "")
-                .map_err(|e| e.to_string())
-                .map(Book::One)
-        }));
+        if self.stage_guard("scenario") {
+            return;
+        }
+        let local = self.book_draft.stage_scenario(title);
+        self.composer_scenario = Some(local);
+        self.composer_draft_error = None;
+        self.users_status = format!("staged {title:?} — syncs on advance");
     }
 
     // -- the Fleet Picker ----------------------------------------------------
@@ -9147,6 +10203,7 @@ impl ShipApp {
             self.composer_scenario = None;
             self.composer_draft = ComposerDraft::default();
             self.composer_draft_error = None;
+            self.composer_new_title.clear();
         }
     }
 
@@ -9157,32 +10214,107 @@ impl ShipApp {
     /// mutable borrows of the same `Vec<Ui>`, which the borrow checker
     /// refuses, and splitting it into two closures means calling `columns`
     /// twice, which draws two 50/50 splits instead of one pair of columns.
+    /// The book as the operator has it: server scenarios with staged
+    /// step adds applied and staged cuts hidden, plus staged-new
+    /// scenarios at the end, oldest staged first.
+    fn book_view(&self) -> Vec<ScenarioView> {
+        let mut out = Vec::new();
+        for sc in &self.scenarios {
+            let mut steps: Vec<StepView> = sc
+                .steps
+                .iter()
+                .filter(|st| !self.book_draft.is_cut(sc.id, st.id))
+                .map(|st| StepView {
+                    id: st.id,
+                    content: st.content.clone(),
+                    window: st.window().map(|(a, b)| (a.to_string(), b.to_string())),
+                    staged: false,
+                })
+                .collect();
+            for st in self.book_draft.added_steps(sc.id) {
+                steps.push(StepView {
+                    id: st.local_id,
+                    content: st.content.clone(),
+                    window: st.start.clone().zip(st.end.clone()),
+                    staged: true,
+                });
+            }
+            out.push(ScenarioView { id: sc.id, title: sc.title.clone(), staged: false, steps });
+        }
+        for news in self.book_draft.staged_news() {
+            out.push(ScenarioView {
+                id: news.local_id,
+                title: news.title.clone(),
+                staged: true,
+                steps: news
+                    .steps
+                    .iter()
+                    .map(|st| StepView {
+                        id: st.local_id,
+                        content: st.content.clone(),
+                        window: st.start.clone().zip(st.end.clone()),
+                        staged: true,
+                    })
+                    .collect(),
+            });
+        }
+        out
+    }
+
     fn composer_body(&mut self, ui: &mut egui::Ui, open_sid: Option<i64>) {
-        let scenarios = self.scenarios.clone();
+        let scenarios = self.book_view();
         ui.columns(2, |cols| {
             cols[0].label("This game's book");
             cols[0].separator();
             if scenarios.is_empty() {
                 cols[0].weak("No scenarios yet. One game has one book.");
             }
+            let mut abandon: Option<i64> = None;
             for sc in scenarios.iter() {
                 let selected = Some(sc.id) == open_sid;
-                if cols[0]
-                    .selectable_label(
-                        selected,
-                        format!("{}  -  {} step(s)", sc.title, sc.steps.len()),
-                    )
-                    .clicked()
-                    && !selected
-                {
-                    self.composer_scenario = Some(sc.id);
+                cols[0].horizontal(|row| {
+                    if row
+                        .selectable_label(
+                            selected,
+                            format!("{}  -  {} step(s)", sc.title, sc.steps.len()),
+                        )
+                        .clicked()
+                        && !selected
+                    {
+                        self.composer_scenario = Some(sc.id);
+                    }
+                    if sc.staged {
+                        row.label(egui::RichText::new("staged").small().weak());
+                        if row.small_button("abandon").clicked() {
+                            abandon = Some(sc.id);
+                        }
+                    }
+                });
+            }
+            if let Some(local) = abandon
+                && !self.stage_guard("abandon")
+            {
+                self.book_draft.drop_scenario(local);
+                if self.composer_scenario == Some(local) {
+                    self.composer_scenario = None;
                 }
+                self.users_status = "abandoned the staged scenario".to_string();
             }
             cols[0].add_space(8.0);
-            let mut new_title = String::new();
-            ui_input(&mut cols[0], &mut new_title, "New scenario title");
+            ui_input(&mut cols[0], &mut self.composer_new_title, "New scenario title");
+            if let Some(err) = self.composer_draft_error.clone() {
+                // The title is the one field that can be refused before
+                // any scenario is open, so its error lives here too —
+                // the right column only shows it once a scenario is.
+                if open_sid.is_none() || err == "a scenario needs a title" {
+                    warn_line(&mut cols[0], err);
+                }
+            }
             if cols[0].button("Add scenario").clicked() {
-                self.create_scenario(&new_title);
+                // Taken, not cloned: a second click while the write is
+                // in flight must not re-send the same title.
+                let title = std::mem::take(&mut self.composer_new_title);
+                self.create_scenario(&title);
             }
 
             cols[1].separator();
@@ -9191,15 +10323,21 @@ impl ShipApp {
                     cols[1].weak("Pick a scenario, or add one.");
                 }
                 Some(open) => {
-                    let steps = open.steps.clone();
-                    cols[1].label(format!("Steps - {}", open.title));
+                    cols[1].horizontal(|row| {
+                        row.label(format!("Steps - {}", open.title));
+                        if open.staged {
+                            row.label(egui::RichText::new("staged — syncs on advance").small().weak());
+                        }
+                    });
                     cols[1].weak("Each step is one thing that must happen, in order.");
-                    if steps.is_empty() {
+                    if open.steps.is_empty() {
                         cols[1].weak("No steps yet. A plan may be authored while it is written.");
                     }
-                    for step in steps.iter() {
+                    let mut count = 0;
+                    for step in open.steps.iter() {
+                        count += 1;
                         cols[1].horizontal(|row| {
-                            row.monospace(format!("{:>2}", step.position + 1));
+                            row.monospace(format!("{:>2}", count));
                             // A step with no text reads as weak ink, because
                             // "(not written yet)" is a placeholder the author
                             // supplied rather than something anyone decided.
@@ -9214,6 +10352,9 @@ impl ShipApp {
                             } else {
                                 label
                             });
+                            if step.staged {
+                                row.label(egui::RichText::new("staged").small().weak());
+                            }
                             row.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |tail| {
@@ -9224,6 +10365,41 @@ impl ShipApp {
                                 },
                             );
                         });
+                    }
+                    // Staged cuts stand apart with their way back: hiding
+                    // them outright would strand the operator with no undo
+                    // before the flush posts the deletion.
+                    let mut restore: Option<i64> = None;
+                    if open.id > 0
+                        && let Some(live) = self.scenarios.iter().find(|s| s.id == open.id)
+                    {
+                        for st in live.steps.iter().filter(|st| self.book_draft.is_cut(open.id, st.id)) {
+                            let content = if st.content.is_empty() {
+                                "(not written yet)".to_string()
+                            } else {
+                                st.content.clone()
+                            };
+                            cols[1].horizontal(|row| {
+                                row.label(
+                                    egui::RichText::new(format!("cut: {content}"))
+                                        .weak()
+                                        .small(),
+                                );
+                                row.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |tail| {
+                                        if tail.small_button("keep").clicked() {
+                                            restore = Some(st.id);
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                    }
+                    if let Some(step_id) = restore
+                        && !self.stage_guard("restore")
+                    {
+                        self.book_draft.lift_cut(open.id, step_id);
                     }
                     cols[1].separator();
                     cols[1].label("New step");
@@ -9505,28 +10681,34 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         // The user island is first in every state, because identity is the
         // one thing that does not change with the exercise.
         let mut entries: Vec<(Island, bool)> = vec![(
-            // 140pt, measured against the real thing: the
-            // identity row (avatar 40 + pad), the email line, then the button.
-            // Found by rendering — 104 and 128 both clipped the button, and
-            // the previous 112 was too short for the whole block. See the
-            // note on `zone_island_heights_are_guesses`.
-            Island::new(egui::Id::new("z.user"), "Operator", egui::vec2(w, 140.0))
+            // 156pt, measured against the real thing with the enlarged base
+            // text (`tokens::TEXT_*_PT`): identity row (avatar 40 + pad), the
+            // email line, then the button — 105.6pt in the no-session state,
+            // 104.0 in Planning. Was 140pt, measured the same way against
+            // egui's stock 13pt body where the same three rows came to 98pt.
+            // The content grew by more than the old slack covered, and an
+            // overflow sitting UNDER `chrome::BODY_SCROLL_SLACK` cannot be
+            // scrolled back into view, so the button's bottom edge would have
+            // been cut and unreachable. See `zone_island_heights_are_guesses`.
+            Island::new(egui::Id::new("z.user"), "Operator", egui::vec2(w, 156.0))
                 .with_trailing(&self.app_role_tag()),
             true,
         )];
 
         match state {
             GameState::NoSession => entries.push((
-                // 168 is the create-only form. The session picker adds a row and a
-                // separator on top of it, and a declared height is a FLOOR the
-                // measured height cannot exceed — so the taller case has to be
-                // declared taller or the picker is drawn into a clipped box.
-                // 272 is what the picker case measures, rounded up: at 212 the
-                // clip report said "212pt given, content needs more".
+                // 288 is what the picker case measures with the enlarged base
+                // text (238pt of body content + 46pt of band and padding, plus
+                // the 4pt of trailing slack this column keeps). The picker row
+                // and its separator grew with the text, and 272pt — the height
+                // measured against egui's stock sizes — left exactly 12pt over,
+                // which is the one number `chrome::BodyFit` refuses to scroll.
+                // The 168pt create-only case is unchanged: its body still
+                // overflows by far more than the slack, so it scrolls.
                 Island::new(
                     egui::Id::new("z.start"),
                     "New session",
-                    egui::vec2(w, if self.session_picker_visible() { 272.0 } else { 168.0 }),
+                    egui::vec2(w, if self.session_picker_visible() { 288.0 } else { 168.0 }),
                 ),
                 true,
             )),
@@ -9537,7 +10719,15 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                     true,
                 ));
                 entries.push((
-                    Island::new(egui::Id::new("z.control"), "Control", egui::vec2(w, 150.0)),
+                    // 166pt, measured with the enlarged base text: the
+                    // multiplier row, the pace note and Apply come to 117.6pt
+                    // against the 120pt a 150pt island leaves. It was 150pt at
+                    // egui's stock sizes, where the same three rows measured
+                    // 108 against 104 — 4pt of trailing slack. The larger text
+                    // took it to 12pt over, which is exactly the number
+                    // `chrome::BodyFit` refuses to scroll, so Apply's bottom
+                    // edge would have been cut with no gesture to reach it.
+                    Island::new(egui::Id::new("z.control"), "Control", egui::vec2(w, 166.0)),
                     true,
                 ));
                 entries.push((
@@ -9547,15 +10737,30 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 ));
                 entries.push((
                     Island::new(egui::Id::new("z.players"), "Players", egui::vec2(w, 320.0))
-                        .with_trailing(&format!("{} SEATED", self.users_roster.len())),
+                        .with_trailing(&format!("{} SEATED", self.visible_roster().len())),
                     true,
                 ));
             }
-            GameState::Preparation => entries.push((
-                Island::new(egui::Id::new("z.ready"), "Readiness", egui::vec2(w, 360.0))
-                    .with_trailing("STEP 2"),
-                true,
-            )),
+            // Preparation keeps the working surface (readiness, key
+            // share-out, the execution verb) above session admin: the
+            // execution gate names missing terms (an incomplete planned
+            // window), and those are fixed in Essentials' edit form — so
+            // Essentials rides along instead of stranding the correction
+            // in a phase the column no longer shows. Everything inside it
+            // already gates itself by state (delete and the preparation
+            // advance stay planning-only); a past-planning edit the
+            // server refuses still reports loudly rather than hiding.
+            GameState::Preparation => {
+                entries.push((
+                    Island::new(egui::Id::new("z.ready"), "Readiness", egui::vec2(w, 360.0))
+                        .with_trailing("STEP 2"),
+                    true,
+                ));
+                entries.push((
+                    Island::new(egui::Id::new("z.essentials"), "Essentials", egui::vec2(w, 380.0)),
+                    true,
+                ));
+            }
             // Execution is the state the console spends its life in, so the
             // column is a working surface rather than a summary: what time it
             // is, what you can order, who is actually here, and what just
@@ -9989,12 +11194,26 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     /// game exists. Creating here hands the game over, the zone becomes
     /// Planning, and the rest of the plan is authored from there.
     fn zone_start_body(&mut self, ui: &mut egui::Ui) {
+        // Personnel front door first: a player with a room key holds no
+        // session yet, and this island is the only surface that state
+        // ever renders — the join input used to live only in the Session
+        // island, which requires holding a session to see.
+        ui.strong("Join with room key");
+        ui.weak("Ask your Game Master for the room key and enter it — no list needed.");
+        self.room_key_join_ui(ui);
+        ui.separator();
         if self.session_picker_visible() {
             self.session_picker_row(ui);
             ui.separator();
         }
         ui.label("No session held.");
         ui.weak("A session is a plan the Game Master authors: a force, a roster and a window.");
+        // Creating is organizer-only like the picker above it: a player
+        // would only 403 behind it, same rule as the Session island.
+        if !self.can_manage_sessions() {
+            status_line(ui, &self.users_status.clone());
+            return;
+        }
         ui.separator();
         ui.label(egui::RichText::new("name").weak().small());
         ui.add(
@@ -10059,10 +11278,57 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         self.setup_ready_ui(ui);
     }
 
+    /// Whether the execution button may fire: the checklist is clear,
+    /// or the only line on it is the unpublished-readiness notice. A
+    /// server that never published the check (404, `Absent`) cannot be
+    /// waited out — retrying what does not exist strands the exercise —
+    /// so the advance goes through and the server gates it on its own
+    /// terms. Transient gaps (`NotRead`, `Unread`) still hold the
+    /// button: another attempt might actually answer.
+    fn readiness_gate_clear(&self, blockers: &[String]) -> bool {
+        if blockers.is_empty() {
+            return true;
+        }
+        self.readiness.is_none()
+            && self.readiness_gap == ReadinessGap::Absent
+            && blockers.len() == 1
+    }
+
     fn zone_ready_body(&mut self, ui: &mut egui::Ui) {
         let blockers = self.setup_checklist();
-        ui.label(format!("{} outstanding", blockers.len()));
+        let clear = self.readiness_gate_clear(&blockers);
+        // An enabled button beside "1 outstanding" would read as a
+        // contradiction: when the single line is the unpublished-check
+        // notice, the header says what it means instead of counting it.
+        if clear && !blockers.is_empty() {
+            ui.label("readiness unpublished — the server decides at advance");
+        } else {
+            ui.label(format!("{} outstanding", blockers.len()));
+        }
         ui.separator();
+        // The room key is the invitation: Minos minted it on entry to
+        // preparation, and the Game Master reads it here and shares it
+        // out of band — personnel type it into step 1 to join the room.
+        // Same readout as the planning Review; this island is where the
+        // Game Master stands while personnel arrive.
+        match self.minos_room_key.clone() {
+            Some(key) => {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("room key:").strong());
+                    ui.label(egui::RichText::new(&key).monospace().strong());
+                    if ui.small_button("copy").clicked() {
+                        ui.ctx().copy_text(key.clone());
+                        self.users_status = "room key copied".to_string();
+                    }
+                });
+                ui.weak("share this with your personnel — they enter it in step 1 to join the room.");
+                ui.separator();
+            }
+            None => {
+                ui.weak("no room key on this session — ask its Game Master.");
+                ui.separator();
+            }
+        }
         self.readiness_ui(ui);
         if let Some(note) = self.phase_note.clone() {
             warn_line(ui, note);
@@ -10071,7 +11337,6 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         // Entering execution is the Preparation island's one verb. It was
         // the phase bar's, and the bar went away with the wizard, so without
         // this an exercise could never leave preparation.
-        let clear = blockers.is_empty();
         if ui
             .add_enabled(
                 clear,
@@ -10092,6 +11357,266 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             }
         }
         status_line(ui, &self.users_status.clone());
+    }
+
+    /// The dashboard's world, or why there is none: Simulation only,
+    /// preparation onward, seated non-GM with at least one hull. The
+    /// Game Master runs the exercise from the side islands and judges
+    /// hold no helm — this station is the commanders'.
+    fn dashboard_data(&self) -> Option<DashboardData> {
+        if self.app_mode != AppMode::Simulation {
+            return None;
+        }
+        let execution = self.game_state() == tfg::gamestate::GameState::Execution;
+        match self.game_state() {
+            tfg::gamestate::GameState::Preparation | tfg::gamestate::GameState::Execution => {}
+            _ => return None,
+        }
+        let own = self.own_roster_row()?;
+        if own.role_name == "Game Master" || self.users_is_judge(&own) {
+            return None;
+        }
+        let me = self.auth_user_id?;
+        // Own pieces first (the join/readiness answer), then the staff
+        // unit list filtered to my command — whichever half this account
+        // is allowed to see.
+        let mut ships: Vec<DashShip> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for g in self.commanded_hulls.iter().chain(
+            self.users_gunits.iter().filter(|g| g.commander_id == Some(me)),
+        ) {
+            let id = g.unit_id.to_string();
+            if seen.insert(id.clone()) {
+                ships.push(DashShip { id: id.clone(), label: self.unit_label(&id) });
+            }
+        }
+        if ships.is_empty() {
+            return None;
+        }
+        // Attached: fellow members of task groups I command. The group
+        // commander reads as a user id or a seat name depending on who
+        // authored the group, so both match.
+        let mine: std::collections::HashSet<String> =
+            ships.iter().map(|s| s.id.clone()).collect();
+        let who = [me.to_string(), own.user_name.clone()];
+        let mut attached: Vec<DashShip> = Vec::new();
+        let mut seen_att = mine;
+        for g in self.groups.group_list() {
+            if !g.commander.as_deref().is_some_and(|c| who.iter().any(|w| w == c)) {
+                continue;
+            }
+            for u in self.groups.group_units(&g.id) {
+                if seen_att.insert(u.clone()) {
+                    attached.push(DashShip { id: u.clone(), label: self.unit_label(&u) });
+                }
+            }
+        }
+        Some(DashboardData {
+            role_name: own.role_name.clone(),
+            ready: own.ready,
+            execution,
+            ships,
+            attached,
+        })
+    }
+
+    /// Bottom station for seated commanders: own ship, attached units,
+    /// helm, comms. Shown from preparation onward; the helm orders
+    /// nothing before it arms (ready + execution), and
+    /// `minos_order_target` re-checks execution + command at send time,
+    /// so a stale arm can never fire.
+    fn dashboard_island(&mut self, ui: &mut egui::Ui) {
+        let Some(data) = self.dashboard_data() else {
+            return;
+        };
+        if !self.dashboard_open {
+            return;
+        }
+        // Follow a valid hull: the stored pick, else the first held.
+        let active = match self.dashboard_ship.clone() {
+            Some(id) if data.ships.iter().any(|s| s.id == id) => id,
+            _ => data.ships.first().map(|s| s.id.clone()).unwrap_or_default(),
+        };
+        self.dashboard_ship = Some(active.clone());
+        let armed = data.ready && data.execution;
+        let trailing = format!(
+            "{} · {}",
+            data.role_name,
+            if armed {
+                "armed"
+            } else if !data.ready {
+                "not ready"
+            } else {
+                "preparation"
+            }
+        );
+        let spec = tfg::chrome::Island::new(egui::Id::new("dashboard"), "My command", dashboard_size(ui.ctx()))
+            .with_trailing(&trailing);
+        let mut pos = self.dashboard_pos.unwrap_or_else(|| dashboard_default_pos(ui.ctx()));
+        let mut open = self.dashboard_open;
+        // The active hull's latest fix, cloned out before the columns:
+        // the arms below borrow `self` freely and must not hold the
+        // registry borrow across them.
+        let fix = self
+            .registry
+            .ship(&active)
+            .map(|s| (s.latest.clone(), s.stale));
+        // Collect-then-apply: the columns borrow to draw and cannot
+        // stage through `self` mid-pass. `follow` moves the dashboard
+        // to one of my hulls; `select` only opens the Inspector.
+        let mut follow: Option<String> = None;
+        let mut select: Option<String> = None;
+        let mut open_messages = false;
+        tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
+            ui.columns(4, |cols| {
+                // -- own ship --
+                cols[0].label("Ship");
+                if data.ships.len() > 1 {
+                    let mut pick = active.clone();
+                    egui::ComboBox::from_id_salt("dashboard-ship")
+                        .selected_text(
+                            data.ships
+                                .iter()
+                                .find(|s| s.id == pick)
+                                .map(|s| s.label.clone())
+                                .unwrap_or_default(),
+                        )
+                        .show_ui(&mut cols[0], |menu| {
+                            for s in &data.ships {
+                                if menu
+                                    .selectable_value(&mut pick, s.id.clone(), &s.label)
+                                    .clicked()
+                                {
+                                    follow = Some(s.id.clone());
+                                }
+                            }
+                        });
+                }
+                match &fix {
+                    Some((latest, stale)) => {
+                        cols[0].label(self.unit_label(&active));
+                        cols[0].label(format!(
+                            "{:.4} {:.4}",
+                            latest.position.latitude, latest.position.longitude
+                        ));
+                        cols[0].label(format!(
+                            "hdg {} · spd {}",
+                            latest
+                                .heading_deg
+                                .map(|h| format!("{h:.0}°"))
+                                .unwrap_or_else(|| "—".to_string()),
+                            latest
+                                .speed_kn
+                                .map(|s| format!("{s:.0} kn"))
+                                .unwrap_or_else(|| "—".to_string()),
+                        ));
+                        if *stale {
+                            cols[0].label(egui::RichText::new("stale").weak().small());
+                        }
+                    }
+                    None => {
+                        cols[0].label(self.unit_label(&active));
+                        cols[0].weak("no fix yet");
+                    }
+                }
+                // -- attached units --
+                cols[1].label("Attached");
+                let others: Vec<&DashShip> =
+                    data.attached.iter().filter(|a| a.id != active).collect();
+                let mine: Vec<&DashShip> = data
+                    .ships
+                    .iter()
+                    .filter(|s| s.id != active)
+                    .collect();
+                if others.is_empty() && mine.is_empty() {
+                    cols[1].weak("no attached units");
+                }
+                for a in mine.iter().chain(others.iter()) {
+                    cols[1].horizontal(|row| {
+                        row.label(a.label.clone());
+                        if row.small_button("inspect").clicked() {
+                            select = Some(a.id.clone());
+                        }
+                    });
+                }
+                // -- helm --
+                cols[2].label("Helm");
+                if armed && self.minos_order_target(&active).is_some() {
+                    self.minos_order_ui(&mut cols[2], &active);
+                } else {
+                    match &fix {
+                        Some((latest, _)) => {
+                            cols[2].weak(format!(
+                                "reported hdg {} · spd {}",
+                                latest
+                                    .heading_deg
+                                    .map(|h| format!("{h:.0}°"))
+                                    .unwrap_or_else(|| "—".to_string()),
+                                latest
+                                    .speed_kn
+                                    .map(|s| format!("{s:.0} kn"))
+                                    .unwrap_or_else(|| "—".to_string()),
+                            ));
+                        }
+                        None => {
+                            cols[2].weak("no fix yet");
+                        }
+                    }
+                    cols[2].label(
+                        egui::RichText::new(if !data.ready {
+                            "declare readiness in Readiness to arm helm"
+                        } else if !data.execution {
+                            "helm arms at execution"
+                        } else {
+                            "this hull is not orderable"
+                        })
+                        .weak()
+                        .small(),
+                    );
+                }
+                // -- comms --
+                cols[3].label("Comms");
+                cols[3].label(format!("{} message(s)", self.inbox_total));
+                match self
+                    .inbox
+                    .iter()
+                    .max_by(|a, b| a.created_at.cmp(&b.created_at))
+                {
+                    Some(latest) => {
+                        let mut snippet: String =
+                            latest.content.chars().take(64).collect();
+                        if latest.content.chars().count() > 64 {
+                            snippet.push('…');
+                        }
+                        cols[3].weak(format!("latest: {} — {snippet}", latest.sender));
+                    }
+                    None => {
+                        cols[3].weak("no messages yet");
+                    }
+                }
+                if cols[3].button("Open messages").clicked() {
+                    open_messages = true;
+                }
+                // The floating mail island yields to a left-docked side
+                // zone, so in the default layout the button above arms an
+                // island that never draws. Say where its mail is instead
+                // of leaving a dead control.
+                if self.zone_owns_left_edge() {
+                    cols[3].weak("mail docks left — move the side zone right to read it");
+                }
+            });
+        });
+        self.dashboard_pos = Some(pos);
+        self.dashboard_open = open;
+        if let Some(id) = follow {
+            self.dashboard_ship = Some(id);
+        }
+        if let Some(id) = select {
+            self.select_ship(id);
+        }
+        if open_messages {
+            self.show_messages = true;
+        }
     }
 
     fn zone_exercise_body(&mut self, ui: &mut egui::Ui) {
@@ -10226,6 +11751,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         self.minos_room_key = None;
         self.clock_denied = false;
         self.watch_game_channel();
+        self.users_game_roles.clear();
         self.users_roster.clear();
         self.users_gunits.clear();
         // The caller's pieces belonged to the released hold — the next
@@ -10238,8 +11764,12 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         self.users_placements.clear();
         self.force.clear();
         self.force_seeded_for = None;
-        self.force_queue.clear();
-        self.force_flush_then = None;
+        self.stage_queue.clear();
+        self.stage_then = None;
+        self.stage_armed = false;
+        self.roster_draft.clear();
+        self.book_draft.clear();
+        self.book_id_map.clear();
         self.map_unit_move = None;
         self.placement_unplaced = 0;
         self.placement_ready = false;
@@ -11200,10 +12730,11 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             self.dirty = true;
             self.apply_specs(res);
         }
-        // The scenario book. A step write answers with ONE scenario, so it
-        // is spliced into the local list rather than replacing it:
-        // replacing would drop every other scenario the author was not
-        // looking at, and the composer is a whole-book tool.
+        // The scenario book. The read replaces the whole list; writes
+        // flush through the stage queue and splice per answer there.
+        // A re-read also prunes staged step ops against scenarios the
+        // server no longer lists, so a deleted scenario cannot hold
+        // orphaned steps in the draft.
         if let Some(res) = self.scenarios_op.as_ref().and_then(|op| op.poll()) {
             self.scenarios_op = None;
             // A completed request is invisible until a frame asks for it.
@@ -11211,18 +12742,9 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             match res {
                 Ok(Book::List(list)) => {
                     self.scenarios = list;
+                    let ids: Vec<i64> = self.scenarios.iter().map(|s| s.id).collect();
+                    self.book_draft.prune(&ids);
                     self.users_status = format!("{} scenario(s).", self.scenarios.len());
-                }
-                Ok(Book::One(one)) => {
-                    if let Some(slot) = self.scenarios.iter_mut().find(|s| s.id == one.id) {
-                        *slot = one.clone();
-                    } else {
-                        self.scenarios.push(one.clone());
-                    }
-                    if self.composer_scenario.is_none() {
-                        self.composer_scenario = Some(one.id);
-                    }
-                    self.users_status = format!("saved \u{201c}{}\u{201d}.", one.title);
                 }
                 Err(e) => self.users_status = format!("book refused: {e}"),
             }
@@ -11362,31 +12884,67 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             }
             SetupDone::Users(users) => self.apply_users(users),
             SetupDone::Bundle(b) => self.apply_bundle(b),
-            SetupDone::Roster(roster, note) => {
+            SetupDone::StageRoster(roster) => {
+                // The seat response IS the roster — no read-after-write.
+                // Whatever staged seats it now holds are converged and
+                // leave the draft; the rest stays for the next attempt.
                 self.users_roster = roster;
-                self.users_status = note;
+                self.reconcile_roster_draft();
+                self.stage_write_done();
+            }
+            SetupDone::StageRosterAdopted(roster, user_id) => {
+                self.users_roster = roster;
+                self.reconcile_roster_draft();
+                // Name the server role when it differs from what was
+                // staged: the seat landed, the role change did not — the
+                // next advance plans it once the operator re-stages.
+                let held = self.users_roster.iter().find(|p| p.user_id == user_id);
+                let want = self.roster_draft.get(user_id).map(|st| st.role_name.clone());
+                self.users_status = match (held, want) {
+                    (Some(p), Some(w)) if p.role_name != w => format!(
+                        "{} is already seated as {} — adopted the server row; re-stage to move them to {w}",
+                        p.user_name, p.role_name
+                    ),
+                    (Some(p), _) => format!(
+                        "{} is already seated as {} — adopted the server row",
+                        p.user_name, p.role_name
+                    ),
+                    (None, _) => "seat landed on the server — continuing".to_string(),
+                };
+                self.stage_write_done();
+            }
+            SetupDone::StageBook(one, local) => {
+                // Spliced like any book answer: replacing would drop every
+                // other scenario the author was not looking at.
+                if let Some(slot) = self.scenarios.iter_mut().find(|s| s.id == one.id) {
+                    *slot = one.clone();
+                } else {
+                    self.scenarios.push(one.clone());
+                }
+                if let Some(local_id) = local {
+                    self.book_id_map.insert(local_id, one.id);
+                    self.book_draft.drop_scenario(local_id);
+                    if self.composer_scenario == Some(local_id) {
+                        self.composer_scenario = Some(one.id);
+                    }
+                }
+                let ids: Vec<i64> = self.scenarios.iter().map(|s| s.id).collect();
+                self.book_draft.prune(&ids);
+                self.users_status = format!("saved \u{201c}{}\u{201d}.", one.title);
+                self.stage_write_done();
             }
             SetupDone::ForceUnits(units) => {
                 self.users_gunits = units;
                 self.refresh_unassigned_units();
                 // The unit list is the authority; the write is retired.
-                self.force_write_done();
+                self.stage_write_done();
             }
             SetupDone::ForcePlacements(view) => {
                 self.apply_placements(view);
-                self.force_write_done();
+                self.stage_write_done();
             }
-            SetupDone::ForceFailed(e, write) => {
-                // The successful earlier writes are already reflected in
-                // the live mirror; this one is not. Drop the queue so the
-                // transition does not advance on a half-written force,
-                // and say which hull held the whole thing up.
-                self.force_queue.clear();
-                self.force_flush_then = None;
-                let line = format!("sync refused at {}: {e}", write.name());
-                self.feed(line.clone());
-                self.users_status = line.clone();
-                self.phase_note = Some(line);
+            SetupDone::StageFailed(label, e) => {
+                self.fail_stage(format!("sync refused at {label}: {e}"));
             }
             SetupDone::Game(to, row) => self.apply_transition(&to, row),
             SetupDone::GameUpdated(d) => {
@@ -14566,6 +16124,10 @@ impl eframe::App for ShipApp {
                 self.app_mode, self.show_side_zone
             );
         }
+        // The commanders' station: bottom dashboard for seated non-GM
+        // players from preparation onward. Independent of the side zone
+        // toggle — it is their helm, not an organizer island.
+        self.dashboard_island(ui);
         // Only ever one modal at a time — see `open_only`.
         //
         // `modal_panel_rects` is cleared before any panel publishes rather than
@@ -15599,7 +17161,10 @@ impl eframe::App for ShipApp {
                     // nothing to seat against, and the match below says so.
                     let refusal = match self.users_game.as_ref() {
                         None => None,
-                        Some(_) => match self.users_roster.iter().find(|p| p.user_id == uid) {
+                        // The merged roster: a staged seat takes a hull
+                        // before the sync posts either, so the drop cannot
+                        // demand a server row yet.
+                        Some(_) => match self.visible_roster().iter().find(|p| p.user_id == uid) {
                             None => Some(format!(
                                 "drop refused: {uname} is not in this session's roster"
                             )),
@@ -16151,6 +17716,33 @@ fn apply_ops_theme(ctx: &egui::Context) {
         style.spacing.item_spacing = tokens::ITEM_SPACING;
         style.spacing.button_padding = tokens::BUTTON_PADDING;
         style.spacing.indent = tokens::INDENT;
+        // The base text sizes, replacing egui's stock ones. Without this the
+        // console draws every label, button and heading at the framework's
+        // desktop default, and the Settings text scale then has nothing of its
+        // own to multiply — it would scale a stock size rather than the app's.
+        // The scale runs on top of THESE, in pixels-per-point, so the two are
+        // layered rather than either replacing the other.
+        use egui::TextStyle;
+        style.text_styles.insert(
+            TextStyle::Small,
+            egui::FontId::proportional(tokens::TEXT_SMALL_PT),
+        );
+        style.text_styles.insert(
+            TextStyle::Body,
+            egui::FontId::proportional(tokens::TEXT_BODY_PT),
+        );
+        style.text_styles.insert(
+            TextStyle::Button,
+            egui::FontId::proportional(tokens::TEXT_BUTTON_PT),
+        );
+        style.text_styles.insert(
+            TextStyle::Heading,
+            egui::FontId::proportional(tokens::TEXT_HEADING_PT),
+        );
+        style.text_styles.insert(
+            TextStyle::Monospace,
+            egui::FontId::monospace(tokens::TEXT_MONO_PT),
+        );
     });
 }
 
@@ -16507,6 +18099,9 @@ fn main() -> Result<(), String> {
                 fx: tfg::fx::Fx::new(tfg::fx::Quality::Low, eframe::egui_wgpu::wgpu::TextureFormat::Rgba8Unorm),
                 show_orders: false,
                 show_log: false,
+                dashboard_open: true,
+                dashboard_pos: None,
+                dashboard_ship: None,
                 onboard: Onboard::Login,
                 sim_ready: false,
                 connect_card: false,
@@ -16555,6 +18150,9 @@ fn main() -> Result<(), String> {
                 edit_actual_end: String::new(),
                 edit_assumed_start: String::new(),
                 edit_assumed_end: String::new(),
+                cal_open: false,
+                cal_year: 0,
+                cal_month: 0,
                 setup_reg_search: String::new(),
                 fleet_query: String::new(),
                 drill_branch: None,
@@ -16580,6 +18178,7 @@ fn main() -> Result<(), String> {
                 users_search: String::new(),
                 users_role: None,
                 users_roles: Vec::new(),
+                users_game_roles: Vec::new(),
                 users_roster: Vec::new(),
                 fleet_picker_open: false,
                 player_picker_open: false,
@@ -16592,6 +18191,7 @@ fn main() -> Result<(), String> {
                 composer_visible: false,
                 composer_draft: ComposerDraft::default(),
                 composer_draft_error: None,
+                composer_new_title: String::new(),
                 scenarios_op: None,
                 users_gunits: Vec::new(),
                 unassigned_units: std::collections::HashSet::new(),
@@ -16618,8 +18218,12 @@ fn main() -> Result<(), String> {
                 placed_labels: HashMap::new(),
                 force: tfg::force::ForceDraft::new(),
                 force_seeded_for: None,
-                force_queue: Vec::new(),
-                force_flush_then: None,
+                stage_queue: Vec::new(),
+                stage_then: None,
+                stage_armed: false,
+                roster_draft: tfg::roster::RosterDraft::new(),
+                book_draft: tfg::book::BookDraft::new(),
+                book_id_map: std::collections::HashMap::new(),
                 map_unit_move: None,
                 time_real_start: (Utc::now() + chrono::Duration::hours(7)).format("%Y-%m-%d %H:%M").to_string(),
                 time_real_end: (Utc::now() + chrono::Duration::hours(14)).format("%Y-%m-%d %H:%M").to_string(),
@@ -16659,7 +18263,9 @@ fn main() -> Result<(), String> {
                 last_zoom_req: Instant::now(),
                 last_track_req: Instant::now(),
                 zoom_dirty: false,
-                text_scale: 1.0,
+                // Boots at Larger, so the default text size IS the larger one;
+                // Settings still offers Smaller and Default from there.
+                text_scale: tfg::tokens::TEXT_SCALE_LARGER,
                 base_ppp: None,
                 app_mode: AppMode::Simulation,
                 // Boot is the lobby: the mode toggle plus the setup flow.
@@ -17384,6 +18990,68 @@ mod tests {
     fn only_the_judge_side_is_known_not_to_need_a_command() {
         assert!(!role_may_need_command(true), "judge side never commands");
         assert!(role_may_need_command(false), "everything else may");
+    }
+
+    /// The console's own base text sizes reach the style, and they are the
+    /// larger ones rather than egui's stock desktop defaults.
+    ///
+    /// Two halves of one property. Without the insert, every `ui.label`,
+    /// button and heading silently draws at egui's sizes (Body 9/13, Heading
+    /// 18, Monospace 13) — invisible to every test that does not paint, and
+    /// invisible to a compile. And without the `>` guards the insert could
+    /// carry the stock numbers and still satisfy the equality half, which is
+    /// the change quietly not having happened.
+    #[test]
+    fn the_theme_installs_larger_text_than_egui_ships() {
+        let ctx = egui::Context::default();
+        apply_ops_theme(&ctx);
+        use egui::{FontId, TextStyle};
+        let style = ctx.global_style();
+        let font = |s: TextStyle| {
+            style
+                .text_styles
+                .get(&s)
+                .unwrap_or_else(|| panic!("{s:?} has no size after apply_ops_theme"))
+                .clone()
+        };
+        assert_eq!(font(TextStyle::Body), FontId::proportional(tfg::tokens::TEXT_BODY_PT));
+        assert_eq!(font(TextStyle::Button), FontId::proportional(tfg::tokens::TEXT_BUTTON_PT));
+        assert_eq!(font(TextStyle::Small), FontId::proportional(tfg::tokens::TEXT_SMALL_PT));
+        assert_eq!(font(TextStyle::Heading), FontId::proportional(tfg::tokens::TEXT_HEADING_PT));
+        assert_eq!(font(TextStyle::Monospace), FontId::monospace(tfg::tokens::TEXT_MONO_PT));
+
+        // egui 0.36's stock: Small 9, Body/Button/Monospace 13, Heading 18.
+        assert!(tfg::tokens::TEXT_BODY_PT > 13.0, "body must be larger than stock");
+        assert!(tfg::tokens::TEXT_BUTTON_PT > 13.0, "button must be larger than stock");
+        assert!(tfg::tokens::TEXT_SMALL_PT > 9.0, "small must be larger than stock");
+        assert!(tfg::tokens::TEXT_HEADING_PT > 18.0, "heading must be larger than stock");
+        assert!(tfg::tokens::TEXT_MONO_PT > 13.0, "monospace must be larger than stock");
+        // A button is a label that can be pressed: at different sizes the two
+        // side by side read as two kinds of control where the design means one.
+        assert_eq!(tfg::tokens::TEXT_BODY_PT, tfg::tokens::TEXT_BUTTON_PT);
+    }
+
+    /// The session boots at the SAME number the Settings row names "Larger",
+    /// and both are the token rather than a pair of literals.
+    ///
+    /// The failure this pins is a selector that lies: two copies of 1.15 is how
+    /// the boot value and the label drift, leaving a console that starts larger
+    /// with no step selected, or starts at Default while claiming Larger.
+    #[test]
+    fn the_console_boots_at_the_larger_text_step() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("text_scale: tfg::tokens::TEXT_SCALE_LARGER"),
+            "the constructor should boot from the token, not a literal"
+        );
+        assert!(
+            src.contains("(\"Larger\", tfg::tokens::TEXT_SCALE_LARGER)"),
+            "the Settings row should name the same token"
+        );
+        assert!(
+            tfg::tokens::TEXT_SCALE_LARGER > 1.0,
+            "the default text size is supposed to be the LARGER one"
+        );
     }
 
     fn entry(unit_id: i64, w: Option<u32>, h: Option<u32>) -> tfg::backend::UnitImageEntry {

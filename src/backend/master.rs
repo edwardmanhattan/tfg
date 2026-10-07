@@ -504,6 +504,11 @@ impl MinosMaster {
                         .as_str()
                         .filter(|s| !s.trim().is_empty())
                         .map(|s| s.to_string()),
+                    call_sign: p["call_sign"]
+                        .as_str()
+                        .or_else(|| p["callsign"].as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 })
             })
             .collect()
@@ -544,11 +549,12 @@ impl MinosMaster {
         game_id: i64,
         user_id: i64,
         role_id: i64,
+        call_sign: &str,
     ) -> Result<Vec<Participant>, BackendError> {
         let data = self.post(
             token,
             &format!("/games/{game_id}/participants"),
-            serde_json::json!({ "id_user": user_id, "id_game_role": role_id }),
+            serde_json::json!({ "id_user": user_id, "id_game_role": role_id, "call_sign": call_sign }),
         )?;
         Ok(Self::parse_roster(&data))
     }
@@ -581,6 +587,37 @@ impl MinosMaster {
     ) -> Result<Vec<Participant>, BackendError> {
         let data = self.delete(token, &format!("/games/{game_id}/participants/{user_id}"))?;
         Ok(Self::parse_roster(&data))
+    }
+
+    /// A game's seating roles: the ids the roster writes validate
+    /// against. The helpers mirror carries the global vocabulary; the
+    /// GAME carries the ids, and the two are only equal by coincidence —
+    /// seating with a helper id answers 409 when they differ.
+    pub fn game_roles(&self, token: &str, game_id: i64) -> Result<Vec<GameRole>, BackendError> {
+        let data = self.get(token, &format!("/games/{game_id}/roles"))?;
+        Ok(Self::parse_game_roles(&data))
+    }
+
+    /// Game roles arrive two ways — a bare array, or an object holding
+    /// `game_roles` — so both shapes read rather than one assumed.
+    fn parse_game_roles(v: &serde_json::Value) -> Vec<GameRole> {
+        let rows = v.as_array().cloned().unwrap_or_else(|| {
+            v["game_roles"]
+                .as_array()
+                .or_else(|| v["data"].as_array())
+                .cloned()
+                .unwrap_or_default()
+        });
+        rows.iter()
+            .filter_map(|r| {
+                Some(GameRole {
+                    id: r["id"].as_i64()?,
+                    name: Self::str_of(r, "name").unwrap_or_default(),
+                    id_name: Self::str_of(r, "id_name").unwrap_or_default(),
+                    judge: r["is_judge_side"].as_bool(),
+                })
+            })
+            .collect()
     }
 
     /// A game's order of battle with current commanders.
@@ -2047,6 +2084,33 @@ pub struct BackendUser {
     pub status_name: String,
 }
 
+impl BackendUser {
+    /// What to send as `call_sign` when seating this account.
+    ///
+    /// The roster write requires it and the directory is the only
+    /// identity the picker holds, so the username is the honest
+    /// default: stable, unique, and already what the seed scripts
+    /// send (`name.upper()[:16]`). Upper-cased and bounded to 16
+    /// characters to match that convention; falls back to the
+    /// display name, then to `USER-<id>`, so it never sends empty.
+    pub fn seat_call_sign(&self) -> String {
+        let base = if !self.username.trim().is_empty() {
+            self.username.trim().to_string()
+        } else if !self.name.trim().is_empty() {
+            self.name.trim().to_string()
+        } else {
+            return format!("USER-{}", self.id);
+        };
+        let upper = base.to_uppercase();
+        let clipped: String = upper.chars().take(16).collect();
+        if clipped.trim().is_empty() {
+            format!("USER-{}", self.id)
+        } else {
+            clipped
+        }
+    }
+}
+
 /// Game summary row for the session-users game picker.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GameRow {
@@ -2581,6 +2645,18 @@ pub struct ScenarioRole {
     pub name: String,
 }
 
+/// One game-scoped seating role: the id the roster writes validate
+/// against, with both names for display. `judge` rides along when the
+/// server publishes it; the helpers mirror stays the authority on the
+/// flag, so absence here never reads as exercise-side on its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameRole {
+    pub id: i64,
+    pub name: String,
+    pub id_name: String,
+    pub judge: Option<bool>,
+}
+
 /// One scenario: a titled beat in a game's book, with ordered steps.
 ///
 /// A game has exactly one book and the book is its ordered scenarios. There
@@ -2719,7 +2795,7 @@ pub fn actual_to_rfc3339(date: &str, hhmm: &str) -> Option<String> {
 /// rather than as something the author sees while typing. Leap years are
 /// counted because a check that waved 29 February through three years out of
 /// four would be worse than no check at all — it would look like it worked.
-fn date_ok(s: &str) -> bool {
+pub fn date_ok(s: &str) -> bool {
     if s.len() != 10
         || !s
             .bytes()
@@ -2795,6 +2871,10 @@ pub struct Participant {
     /// the client used to throw this field away and then had nothing honest
     /// to show for "how many are online".
     pub joined_at: Option<String>,
+    /// The seat's call sign, as Minos holds it. Empty when the server
+    /// does not report one — the roster write requires it, so a staged
+    /// seat always carries its own.
+    pub call_sign: String,
 }
 
 /// One game piece with its current commander, if any.

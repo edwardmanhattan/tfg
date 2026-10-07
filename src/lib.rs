@@ -13,6 +13,7 @@
 
 pub mod assets;
 pub mod backend;
+pub mod book;
 pub mod camera;
 pub mod catalog;
 pub mod chrome;
@@ -30,6 +31,7 @@ pub mod log;
 pub mod map_render;
 pub mod overlay;
 pub mod paths;
+pub mod roster;
 pub mod sim;
 pub mod store;
 pub mod symbology;

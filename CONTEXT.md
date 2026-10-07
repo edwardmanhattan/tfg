@@ -169,6 +169,14 @@ The force as the operator has it on the client, before Minos has been told any o
 _Avoid_: staged force (that is not a state Minos has either), local force (every force on screen is local until it is not), unsaved force
 _A Force draft tolerates a hull with no commander, which Minos does not: `game_units.id_commander` is NOT NULL, so the advance refuses and names the hulls rather than seating whoever happened to be free._
 
+**Roster draft**:
+The roster as the operator has it on the client, before Minos has been told any of it: who is seated, as what, under which call sign, and who is leaving. Staging a seat, changing a role and unseating are all draft edits and none of them is a backend write. A Roster draft is written through in one ordered diff at a stage advance — seats before force assigns, because a piece IS a hull commanded by a participant, and unseats after the force, so nobody goes seatless while their hull is still being handed over.
+_Avoid_: staged roster, local roster, unsaved roster_
+
+**Book draft**:
+The scenario book as the operator has it on the client, before Minos has been told any of it: brand-new scenarios with their steps, plus step adds and step cuts against scenarios Minos already holds. Authoring a scenario or a step is a draft edit, never a backend write. A Book draft is written through in one ordered diff at a stage advance — creates before their steps, because a step belongs to a scenario the server has to hold first — and always before the transition, because the server only takes pages in planning.
+_Avoid_: staged book, local book, unsaved book_
+
 **Setup**:
 The session phase for windows, roster, placements, and seats. Nothing moves, nothing is ordered; booting into Setup is the lobby.
 _Avoid_: lobby (that's Setup with defaults), staging

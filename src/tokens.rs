@@ -154,6 +154,51 @@ pub const TITLE_SIZE: f32 = 12.5;
 pub const TITLE_TRACKING: f32 = 1.8;
 
 // ---------------------------------------------------------------------------
+// Text.
+//
+// egui's stock sizes — Small 9, Body/Button/Monospace 13, Heading 18 — are a
+// desktop default for a 1x display read at arm's length. This console is read
+// across a room, in glare, on field laptops, which is the same fact that puts
+// text size in Settings ("Settings owns mode, layout preferences, text size
+// and reduced motion", docs/decisions/ui-overhaul.tsv).
+//
+// So these are the BASE the app lays out in, and the Settings scale multiplies
+// them on top in pixels-per-point — layered, never either one overwriting the
+// other. The five move together as one proportion (about +15 percent) because
+// the styles are read against each other: a body that grows while its button
+// does not turns a form into a staircase.
+//
+// The island TITLE band is deliberately absent. Its size is set against
+// `TITLE_H`, a fixed 30pt band, not against egui's default text — growing it
+// here would push the tracked caps through the band's own scanline texture.
+// Map labels are absent for the same reason: `MAP_LABEL_PX` in `main.rs` is
+// measured against a painted ground extent, so it is not free to move with a
+// chrome preference.
+// ---------------------------------------------------------------------------
+
+/// egui's stock 9. The `ui.weak` / `ui.small` register — hints and asides.
+pub const TEXT_SMALL_PT: f32 = 10.5;
+/// egui's stock 13. What a plain `ui.label` draws in.
+pub const TEXT_BODY_PT: f32 = 15.0;
+/// egui's stock 13.
+///
+/// Equal to [`TEXT_BODY_PT`] on purpose: a button is a label that can be
+/// pressed, and the two sitting side by side at different sizes reads as two
+/// different kinds of control where the design means one.
+pub const TEXT_BUTTON_PT: f32 = 15.0;
+/// egui's stock 18. Modal and section headings.
+pub const TEXT_HEADING_PT: f32 = 21.0;
+/// egui's stock 13, in the monospace family. Readouts and code.
+pub const TEXT_MONO_PT: f32 = 15.0;
+
+/// The Settings row's "Larger" step, which is also what the app BOOTS at.
+///
+/// One constant because two copies of this number is how the boot value and
+/// the row that is supposed to name it drift apart: the selector would then
+/// show "Larger" unselected on a boot that is already larger.
+pub const TEXT_SCALE_LARGER: f32 = 1.15;
+
+// ---------------------------------------------------------------------------
 // Zone metrics.
 //
 // The side zone floats OVER the map rather than sitting beside it, which is

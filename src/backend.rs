@@ -22,7 +22,7 @@ pub use error::BackendError;
 pub use auth::{AppRole, AuthenticatedUser, MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
 pub use feed::{GameMsg, MinosRest, Snapshot};
 pub use live::{LIVE_BACKOFF_BASE_SECS, LIVE_BACKOFF_CAP_SECS, LiveCmd, LiveEvent, LiveWire};
-pub use master::{BackendUser, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePace, GameScenario, GameScenarioStep, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameReadinessView, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, TimeWindow, actual_to_rfc3339, assumed_hhmm_to_rfc3339, hhmm_ok, hhmm_window_ok, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, Review, ScenarioRole, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
+pub use master::{BackendUser, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePace, GameRole, GameScenario, GameScenarioStep, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameReadinessView, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, TimeWindow, actual_to_rfc3339, assumed_hhmm_to_rfc3339, date_ok, hhmm_ok, hhmm_window_ok, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, Review, ScenarioRole, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
 pub use replay::{FileReplay, now_ts};
 // Shared with live.rs and the tests below; not public API.
 pub(crate) use feed::FeedEvent;
@@ -721,8 +721,13 @@ mod tests {
     fn session_users_list_search_add_and_command() {
         let server = tiny_http::Server::http("127.0.0.1:18088").expect("bind test port");
         std::thread::spawn(move || {
-            for rq in server.incoming_requests().take(8) {
+            for mut rq in server.incoming_requests().take(8) {
                 let (method, url) = (rq.method().as_str().to_string(), rq.url().to_string());
+                let mut text = String::new();
+                if method == "POST" {
+                    use std::io::Read as _;
+                    let _ = rq.as_reader().read_to_string(&mut text);
+                }
                 let body = if method == "GET"
                     && url.contains("/users")
                     && url.contains("page_number=1")
@@ -744,6 +749,13 @@ mod tests {
                 } else if method == "POST" && url.contains("/units") {
                     r#"{"status_code":200,"message":"Successfull","data":[{"id_unit":13,"unit_name":"KRI Ahmad Yani","hull_number":"KRI-AH-YN","id_commander":6,"commander_name":"Budi Santoso"}]}"#
                 } else if method == "POST" {
+                    // The roster write requires `call_sign`: a seat
+                    // without one is a 400 from the server.
+                    let v: serde_json::Value =
+                        serde_json::from_str(&text).unwrap_or_default();
+                    assert_eq!(v["id_user"].as_i64(), Some(6));
+                    assert_eq!(v["id_game_role"].as_i64(), Some(1));
+                    assert_eq!(v["call_sign"].as_str(), Some("BUDI"));
                     r#"{"status_code":201,"message":"Created","data":[{"id_user":6,"user_name":"Budi Santoso","id_game_role":1,"role_name":"Commando","is_judge_side":false,"is_ready":false},{"id_user":7,"user_name":"Rina Wijaya","id_game_role":4,"role_name":"Referee","is_judge_side":true,"is_ready":false}]}"#
                 } else {
                     r#"{"status_code":200,"message":"Successfull","data":[{"id_unit":13,"unit_name":"KRI Ahmad Yani","hull_number":"KRI-AH-YN","id_commander":6,"commander_name":"Budi Santoso"}]}"#
@@ -769,7 +781,7 @@ mod tests {
                 status_name: "Active".into(),
             }]
         );
-        let seated = master.add_participant("AT", 3, 6, 1).expect("seat");
+        let seated = master.add_participant("AT", 3, 6, 1, "BUDI").expect("seat");
         assert_eq!(seated.len(), 2, "seat answers with the whole roster");
         assert!(!seated[0].ready, "fresh seat is never ready");
         // The judge flag has to parse: the UI's commander exclusions
@@ -803,6 +815,33 @@ mod tests {
         // the clock without moving it.
         assert_eq!(detail.time_factor, 2.0);
         assert!(detail.window.actual_start.is_none(), "preparation has no anchor yet");
+    }
+
+    #[test]
+    fn game_roles_read_both_shapes() {
+        // The roster writes validate against the GAME's role ids, not the
+        // helpers vocabulary — seating with a helper id answers 409 when
+        // they differ. The list arrives bare or wrapped; both read.
+        let server = tiny_http::Server::http("127.0.0.1:18096").expect("bind test port");
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests().take(2) {
+                let url = rq.url().to_string();
+                let body = if url.ends_with("/games/3/roles") {
+                    r#"{"status_code":200,"message":"Successfull","data":[{"id":11,"name":"Commando","id_name":"Kommando"},{"id":14,"name":"Referee","id_name":"Wasit","is_judge_side":true}]}"#
+                } else {
+                    r#"{"status_code":200,"message":"Successfull","data":{"game_roles":[{"id":11,"name":"Commando","id_name":"Kommando"}]}}"#
+                };
+                let _ = rq.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18096/api/v1").expect("client builds");
+        let roles = master.game_roles("AT", 3).expect("bare array reads");
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles[0].name, "Commando");
+        assert_eq!(roles[1].judge, Some(true));
+        let roles = master.game_roles("AT", 9).expect("wrapped object reads");
+        assert_eq!(roles.len(), 1, "wrapper holds the rows, not the envelope");
+        assert_eq!(roles[0].id, 11);
     }
 
     #[test]
