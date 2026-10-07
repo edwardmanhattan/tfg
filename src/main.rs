@@ -670,7 +670,7 @@ fn comms_default_pos(ctx: &egui::Context) -> egui::Pos2 {
 }
 
 /// The commander's dashboard footprint: full width across the bottom
-/// (ship, attached, helm share it), clamped to the viewport so a small
+/// (ship, task group, helm share it), clamped to the viewport so a small
 /// window gets a smaller station rather than one hanging off-screen.
 fn dashboard_size(ctx: &egui::Context) -> egui::Vec2 {
     let vp = ctx.viewport_rect();
@@ -1829,7 +1829,11 @@ struct DashboardData {
     /// the server would only refuse.
     static_mode: bool,
     ships: Vec<DashShip>,
-    attached: Vec<DashShip>,
+    /// Fellow members of task groups this commander leads. Named for
+    /// what it is — "Attached" used to mean this, but that word now
+    /// means embarked units (hulls carried inside another hull), and
+    /// the two meanings must not collide on one screen.
+    task_group: Vec<DashShip>,
 }
 
 /// Whether a game role may need a fleet before the exercise can run.
@@ -2589,6 +2593,22 @@ enum SetupDone {
     /// One unit's published speeds, fetched for the helm slider and the
     /// order's medium. Keyed by unit id.
     UnitSpeeds(i64, tfg::backend::UnitSpeeds),
+    /// One deployed hull's pinned spec version, fetched for the helm
+    /// header. Keyed by unit id; the version is what the game judges
+    /// against, re-readable via `GET /units/:id?version=`.
+    UnitSpecVersion(i64, i64),
+    /// One host's direct contents (`GET /units/:id/embarkations`).
+    EmbarkedLoaded(i64, Vec<tfg::backend::EmbarkedUnit>),
+    /// One host's attach picker (`GET .../embarkation-candidates`).
+    EmbarkCandidates(i64, Vec<tfg::backend::EmbarkationCandidate>),
+    /// One hull's declared complements (`GET /units/:id/capacities`).
+    CapacitiesLoaded(i64, Vec<tfg::backend::UnitCapacity>),
+    /// A host's contents after an attach or detach batch, with any
+    /// complement the batch went past (a 201 warning, not a refusal —
+    /// the operation happened).
+    EmbarkChanged(i64, tfg::backend::EmbarkationResult),
+    /// Capacities as stored after a whole-list PUT.
+    CapacitiesSaved(i64, Vec<tfg::backend::UnitCapacity>),
     Games(Vec<tfg::backend::GameRow>),
     /// The game list needs a staff read the account lacks: not an
     /// error to retry loudly, but the player-flow signal — room key
@@ -2810,7 +2830,7 @@ struct ShipApp {
     show_orders: bool,
     show_log: bool,
     /// The commander's dashboard: bottom station for seated
-    /// exercise-side players from preparation onward — own ship, attached units, helm
+    /// exercise-side players from preparation onward — own ship, task group units, helm
     /// (armed at ready + execution). Mail lives in the top band.
     /// Closed persistently
     /// with the island X; a stage entry reopens it.
@@ -2863,6 +2883,41 @@ struct ShipApp {
     /// order names none). Amphibious hulls have no default, so the UI
     /// forces a selection and this is `Some` for them.
     helm_medium: HashMap<String, String>,
+    /// Pinned spec version per deployed hull, from `GET /units/:id`
+    /// (`current_specification.version`). A game references a
+    /// (unit, version) pair; the helm shows which version the deployed
+    /// unit is judged against, and the review screens re-read that
+    /// version via `?version=` so a corrected figure never rewrites a
+    /// judged game. `None` here means not yet fetched, not version zero.
+    unit_spec_versions: HashMap<String, i64>,
+    /// Embarkation + capacities (register authoring, per hull not per
+    /// class): what a hull carries, what is directly inside it, and
+    /// what could be put inside. Keyed by hull id. An empty candidates
+    /// list is a real answer — the host declared nothing, and
+    /// capacities are the first thing an operator sets.
+    embarked: HashMap<i64, Vec<tfg::backend::EmbarkedUnit>>,
+    embark_candidates: HashMap<i64, Vec<tfg::backend::EmbarkationCandidate>>,
+    embark_over: HashMap<i64, Vec<tfg::backend::OverCapacity>>,
+    unit_capacities: HashMap<i64, Vec<tfg::backend::UnitCapacity>>,
+    /// Capacities edits not yet saved. The PUT replaces the whole list,
+    /// so the cache is the draft and this flag is the only "unsaved"
+    /// state — a hull absent here matches the server.
+    capacities_dirty: std::collections::HashSet<i64>,
+    /// Attach-picker open per host. Candidates (capped at 200) load
+    /// only while this is open — a picker the operator never asked for
+    /// costs no request.
+    embark_attach_open: std::collections::HashSet<i64>,
+    /// Checked rows per host for the all-or-nothing attach / detach
+    /// batches. Cleared when the batch lands.
+    embark_attach_sel: HashMap<i64, Vec<i64>>,
+    embark_detach_sel: HashMap<i64, Vec<i64>>,
+    /// New-capacity inputs per host: taxonomy level, level id, max
+    /// aboard. The kind is a level AND an id ("four helicopters" vs
+    /// "four aircraft of any kind"), resolved against the synced
+    /// taxonomy the picker already reads.
+    cap_level: HashMap<i64, String>,
+    cap_id: HashMap<i64, String>,
+    cap_max: HashMap<i64, String>,
     /// Accepted helm intents stay visually pinned to the commander draft
     /// until the authoritative position animation has completed.
     helm_preview_pending: HashSet<String>,
@@ -2935,6 +2990,14 @@ struct ShipApp {
     /// from the synced store; each assign seats the picked commander.
     setup_reg_search: String,
     fleet_query: String,
+    /// Top rung of the fleet drill (Domain > Kategori > Tipe > Kelas >
+    /// Aset): the asset group the drill is filtered by. `None` is the
+    /// whole register. Stored on the category server-side
+    /// (`/unit-categories.id_asset_group`), backfilled onto local hulls
+    /// at sync — the drill stays on the local store (offline-first),
+    /// and the backend's `/units` filters already cover the same drill
+    /// should the picker ever move onto live queries.
+    drill_asset_group: Option<i64>,
     drill_branch: Option<i64>,
     drill_category: Option<i64>,
     drill_type: Option<i64>,
@@ -7621,12 +7684,323 @@ impl ShipApp {
         }));
     }
 
+    /// Pinned spec version for one deployed hull, fetched when the helm
+    /// opens. The version is what the game judges this hull against —
+    /// shown in the helm header and re-readable for review via
+    /// `GET /units/:id?version=`.
+    fn ensure_unit_spec_version(&mut self, id: &str) {
+        if self.unit_spec_versions.contains_key(id) {
+            return;
+        }
+        let Ok(uid) = id.parse::<i64>() else {
+            return;
+        };
+        if self.setup_busy("unit-spec-version") {
+            return;
+        }
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        self.setup_op = Some(spawn_rest("unit-spec-version", move || {
+            master
+                .hull_spec(&tok, uid)
+                .map_err(|e| e.to_string())
+                .map(|spec| SetupDone::UnitSpecVersion(uid, spec.version))
+        }));
+    }
+
+    /// Load one host's direct contents, once. All-or-nothing batches
+    /// answer with the same shape, so the load and the write converge
+    /// on one map.
+    fn ensure_embarked(&mut self, host: i64) {
+        if self.embarked.contains_key(&host) || self.setup_busy("embarkations") {
+            return;
+        }
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        self.setup_op = Some(spawn_rest("embarkations", move || {
+            master
+                .embarkations(&tok, host)
+                .map_err(|e| e.to_string())
+                .map(|units| SetupDone::EmbarkedLoaded(host, units))
+        }));
+    }
+
+    /// Load one host's attach picker, once. Empty is a real answer —
+    /// the host declared nothing, and capacities are the first thing
+    /// an operator sets.
+    fn ensure_candidates(&mut self, host: i64) {
+        if self.embark_candidates.contains_key(&host) || self.setup_busy("embarkation-candidates")
+        {
+            return;
+        }
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        self.setup_op = Some(spawn_rest("embarkation-candidates", move || {
+            master
+                .embarkation_candidates(&tok, host)
+                .map_err(|e| e.to_string())
+                .map(|units| SetupDone::EmbarkCandidates(host, units))
+        }));
+    }
+
+    /// Load one hull's declared complements, once.
+    fn ensure_capacities(&mut self, host: i64) {
+        if self.unit_capacities.contains_key(&host) || self.setup_busy("capacities") {
+            return;
+        }
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        self.setup_op = Some(spawn_rest("capacities", move || {
+            master
+                .unit_capacities(&tok, host)
+                .map_err(|e| e.to_string())
+                .map(|caps| SetupDone::CapacitiesLoaded(host, caps))
+        }));
+    }
+
+    /// Attach a batch of hulls to a host. All of it or none of it: a
+    /// ring, an already-inside unit, an unknown id or a duplicate
+    /// refuses the whole batch with `unit_ids[<index>]` errors, loudly.
+    /// Going over capacity is a warning in the answer, not a refusal.
+    fn embark_attach(&mut self, host: i64, units: Vec<i64>) {
+        if self.setup_busy("embark") {
+            return;
+        }
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        self.setup_op = Some(spawn_rest("embark", move || {
+            master
+                .attach_units(&tok, host, &units)
+                .map_err(|e| e.to_string())
+                .map(|result| SetupDone::EmbarkChanged(host, result))
+        }));
+    }
+
+    /// Detach a batch of hulls from a host. A physical delete,
+    /// all-or-nothing like the attach.
+    fn embark_detach(&mut self, host: i64, units: Vec<i64>) {
+        if self.setup_busy("embark-detach") {
+            return;
+        }
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        self.setup_op = Some(spawn_rest("embark-detach", move || {
+            master
+                .detach_units(&tok, host, &units)
+                .map_err(|e| e.to_string())
+                .map(|result| SetupDone::EmbarkChanged(host, result))
+        }));
+    }
+
+    /// Save one hull's complements as a whole. The body is the complete
+    /// set, not a delta — a complement the list no longer names has
+    /// been taken away, and an empty list means the hull carries
+    /// nothing.
+    fn save_capacities(&mut self, host: i64, caps: Vec<tfg::backend::UnitCapacity>) {
+        if self.setup_busy("capacities-save") {
+            return;
+        }
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        self.setup_op = Some(spawn_rest("capacities-save", move || {
+            master
+                .set_unit_capacities(&tok, host, &caps)
+                .map_err(|e| e.to_string())
+                .map(|stored| SetupDone::CapacitiesSaved(host, stored))
+        }));
+    }
+
+    /// Per-hull embarkation + capacities panel for the setup fleet
+    /// pieces. Register authoring, per hull not per class: two ships
+    /// of one class may be fitted differently. "Embarked" here means
+    /// hulls carried inside this hull — not to be confused with the
+    /// dashboard's task-group fellows, which is why that column is
+    /// named "Task group".
+    fn embark_ui(&mut self, ui: &mut egui::Ui, host: i64) {
+        self.ensure_embarked(host);
+        self.ensure_capacities(host);
+        let inside = self.embarked.get(&host).cloned().unwrap_or_default();
+        let over = self.embark_over.get(&host).cloned().unwrap_or_default();
+        egui::CollapsingHeader::new(format!("Embarked ({})", inside.len()))
+            .id_salt(format!("embarked-{host}"))
+            .show(ui, |ui| {
+                if inside.is_empty() {
+                    ui.weak("nothing embarked");
+                } else {
+                    let mut sel = self.embark_detach_sel.get(&host).cloned().unwrap_or_default();
+                    for u in &inside {
+                        let mut on = sel.contains(&u.id);
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut on, "");
+                            ui.label(format!("{} ({}) · {}", u.name, u.hull_number, u.class_name));
+                        });
+                        if on && !sel.contains(&u.id) {
+                            sel.push(u.id);
+                        } else if !on {
+                            sel.retain(|id| *id != u.id);
+                        }
+                    }
+                    self.embark_detach_sel.insert(host, sel.clone());
+                    if !sel.is_empty() && ui.small_button(format!("detach {} selected", sel.len())).clicked()
+                    {
+                        self.embark_detach(host, sel);
+                    }
+                }
+                for o in &over {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!(
+                            "over capacity: {} {} holds {} (max {})",
+                            o.level, o.id_level, o.would_hold, o.max_aboard
+                        ),
+                    );
+                }
+                let open = self.embark_attach_open.contains(&host);
+                if ui.small_button(if open { "close attach picker" } else { "attach…" }).clicked() {
+                    if open {
+                        self.embark_attach_open.remove(&host);
+                    } else {
+                        self.embark_attach_open.insert(host);
+                    }
+                }
+                if self.embark_attach_open.contains(&host) {
+                    self.ensure_candidates(host);
+                    let cands =
+                        self.embark_candidates.get(&host).cloned().unwrap_or_default();
+                    if cands.is_empty() {
+                        ui.weak("no candidates — this hull declares no complements; set capacities first");
+                    } else {
+                        ui.weak(format!("{} candidate(s), capped at 200", cands.len()));
+                        let mut sel =
+                            self.embark_attach_sel.get(&host).cloned().unwrap_or_default();
+                        for c in &cands {
+                            let mut on = sel.contains(&c.id);
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut on, "");
+                                ui.label(format!(
+                                    "{} ({}) · {}",
+                                    c.name, c.hull_number, c.class_name
+                                ));
+                            });
+                            if on && !sel.contains(&c.id) {
+                                sel.push(c.id);
+                            } else if !on {
+                                sel.retain(|id| *id != c.id);
+                            }
+                        }
+                        self.embark_attach_sel.insert(host, sel.clone());
+                        if !sel.is_empty()
+                            && ui.small_button(format!("attach {} selected", sel.len())).clicked()
+                        {
+                            self.embark_attach(host, sel);
+                        }
+                    }
+                }
+            });
+        let caps = self.unit_capacities.get(&host).cloned().unwrap_or_default();
+        let dirty = self.capacities_dirty.contains(&host);
+        egui::CollapsingHeader::new(format!(
+            "Capacities{}{}",
+            if caps.is_empty() { " — none declared".to_string() } else { format!(" ({})", caps.len()) },
+            if dirty { " · unsaved".to_string() } else { String::new() }
+        ))
+        .id_salt(format!("capacities-{host}"))
+        .show(ui, |ui| {
+            ui.weak("what this hull carries, and how many — per hull, not per class");
+            let mut remove: Option<usize> = None;
+            for (i, c) in caps.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} {} · max {}", c.level, c.id_level, c.max_aboard));
+                    if ui.small_button("remove").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                let mut next = caps.clone();
+                next.remove(i);
+                self.unit_capacities.insert(host, next);
+                self.capacities_dirty.insert(host);
+            }
+            ui.horizontal(|ui| {
+                let mut level =
+                    self.cap_level.get(&host).cloned().unwrap_or_else(|| "class".to_string());
+                egui::ComboBox::from_id_salt(format!("cap-level-{host}"))
+                    .selected_text(level.clone())
+                    .show_ui(ui, |ui| {
+                        for l in ["category", "type", "class", "unit"] {
+                            ui.selectable_value(&mut level, l.to_string(), l);
+                        }
+                    });
+                self.cap_level.insert(host, level.clone());
+                let mut id = self.cap_id.get(&host).cloned().unwrap_or_default();
+                ui.add(
+                    egui::TextEdit::singleline(&mut id)
+                        .hint_text("level id")
+                        .desired_width(70.0),
+                );
+                self.cap_id.insert(host, id.clone());
+                let mut max = self.cap_max.get(&host).cloned().unwrap_or_default();
+                ui.add(
+                    egui::TextEdit::singleline(&mut max)
+                        .hint_text("max")
+                        .desired_width(50.0),
+                );
+                self.cap_max.insert(host, max.clone());
+                if ui.small_button("add").clicked() {
+                    if let (Ok(id_level), Ok(max_aboard)) =
+                        (id.trim().parse::<i64>(), max.trim().parse::<i64>())
+                    {
+                        if id_level > 0 && max_aboard >= 0 {
+                            let mut next = caps.clone();
+                            next.push(tfg::backend::UnitCapacity {
+                                level,
+                                id_level,
+                                max_aboard,
+                            });
+                            self.unit_capacities.insert(host, next);
+                            self.capacities_dirty.insert(host);
+                            self.cap_id.insert(host, String::new());
+                            self.cap_max.insert(host, String::new());
+                        } else {
+                            self.users_status =
+                                "capacity needs a positive level id and a non-negative max"
+                                    .to_string();
+                        }
+                    } else {
+                        self.users_status =
+                            "capacity needs a numeric level id and max".to_string();
+                    }
+                }
+            });
+            if dirty && ui.small_button("save capacities").clicked() {
+                self.save_capacities(host, caps.clone());
+            }
+        });
+    }
+
     /// Direct helm control for a caller-commanded piece in an executing
     /// MinOS game. The server receives only heading and speed; the
     /// authoritative GameFix and next plot update the marker.
     fn minos_order_ui(&mut self, ui: &mut egui::Ui, id: &str) {
         self.ensure_unit_speeds(id);
-        ui.label(format!("Unit {id} · direct helm control"));
+        // Serialized behind the speeds fetch: the setup slot holds one
+        // op, so starting both at once would only spam the busy line.
+        if self.unit_speeds.contains_key(id) {
+            self.ensure_unit_spec_version(id);
+        }
+        let spec_line = match self.unit_spec_versions.get(id) {
+            Some(v) => format!(" · spec v{v}"),
+            None => String::new(),
+        };
+        ui.label(format!("Unit {id}{spec_line} · direct helm control"));
         let reported = self
             .registry
             .ship(id)
@@ -9175,6 +9549,7 @@ impl ShipApp {
             ui.text_edit_singleline(&mut self.fleet_query);
             if ui.small_button("clear").clicked() {
                 self.fleet_query.clear();
+                self.drill_asset_group = None;
                 self.drill_branch = None;
                 self.drill_category = None;
                 self.drill_type = None;
@@ -9285,11 +9660,65 @@ impl ShipApp {
 
         let (branch, category, unit_type) =
             (self.drill_branch, self.drill_category, self.drill_type);
+        // Top rung: asset-group tabs (Domain > Kategori > Tipe > Kelas >
+        // Aset reads bottom-up here — the group sits above the category).
+        // Counts are the local live-hull counts, which agree with
+        // `GET /units/asset-groups` tab-for-tab after a sync (unclassified
+        // folds into Aset Lainnya on both sides). Tabs rather than a
+        // sixth Miller column: five taxonomy columns plus the leaf
+        // already fill the panel.
+        let asset_groups = self
+            .store
+            .as_ref()
+            .and_then(|conn| tfg::store::asset_groups(conn).ok())
+            .unwrap_or_default();
+        if !asset_groups.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Asset");
+                if ui
+                    .selectable_value(
+                        &mut self.drill_asset_group,
+                        None,
+                        format!("All ({})", asset_groups.iter().map(|g| g.count).sum::<i64>()),
+                    )
+                    .clicked()
+                {
+                    self.drill_branch = None;
+                    self.drill_category = None;
+                    self.drill_type = None;
+                    self.drill_class = None;
+                }
+                for group in &asset_groups {
+                    let text = if group.id_name.is_empty() || group.id_name == group.name {
+                        format!("{} ({})", group.name, group.count)
+                    } else {
+                        format!("{} ({}) ({})", group.name, group.id_name, group.count)
+                    };
+                    if ui
+                        .selectable_value(
+                            &mut self.drill_asset_group,
+                            Some(group.id),
+                            text,
+                        )
+                        .clicked()
+                    {
+                        self.drill_branch = None;
+                        self.drill_category = None;
+                        self.drill_type = None;
+                        self.drill_class = None;
+                    }
+                }
+            });
+        }
         let (branches, categories, types, classes) = match self.store.as_ref() {
             Some(conn) => (
-                tfg::store::tax_branches(conn).unwrap_or_default(),
+                tfg::store::tax_branches_in_asset_group(conn, self.drill_asset_group)
+                    .unwrap_or_default(),
                 branch
-                    .map(|id| tfg::store::tax_categories(conn, id).unwrap_or_default())
+                    .map(|id| {
+                        tfg::store::tax_categories_in(conn, id, self.drill_asset_group)
+                            .unwrap_or_default()
+                    })
                     .unwrap_or_default(),
                 category
                     .map(|id| tfg::store::tax_types(conn, id).unwrap_or_default())
@@ -9313,6 +9742,7 @@ impl ShipApp {
                 .map(label)
         };
         let crumbs: Vec<String> = [
+            crumb(&asset_groups, self.drill_asset_group),
             crumb(&branches, self.drill_branch),
             crumb(&categories, self.drill_category),
             crumb(&types, self.drill_type),
@@ -9323,6 +9753,7 @@ impl ShipApp {
         .collect();
         ui.horizontal_wrapped(|ui| {
             if ui.small_button("Fleet").clicked() {
+                self.drill_asset_group = None;
                 self.drill_branch = None;
                 self.drill_category = None;
                 self.drill_type = None;
@@ -9808,6 +10239,12 @@ impl ShipApp {
                                 }
                             });
                     });
+                    // Register-side complement + contents authoring, per
+                    // hull: "this ship carries N helicopters", and what is
+                    // directly inside it. Nothing an exercise runs reads
+                    // this — a game takes its own copy — so it sits with
+                    // the pieces, not the helm.
+                    self.embark_ui(ui, hull.unit_id);
                     ui.separator();
                 });
             }
@@ -11620,7 +12057,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             // that answer "is this going right" underneath both.
             //
             // Seated players get none of it: their station is the bottom
-            // dashboard (own ship, attached units, helm), and the organizer
+            // dashboard (own ship, task group units, helm), and the organizer
             // column answers questions they never ask. The Operator island
             // above still shows — identity and sign-out belong to everyone.
             GameState::Execution => {
@@ -12320,13 +12757,13 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         if ships.is_empty() {
             return None;
         }
-        // Attached: fellow members of task groups I command. The group
+        // Task group: fellow members of task groups I command. The group
         // commander reads as a user id or a seat name depending on who
         // authored the group, so both match.
         let mine: std::collections::HashSet<String> =
             ships.iter().map(|s| s.id.clone()).collect();
         let who = [me.to_string(), own.user_name.clone()];
-        let mut attached: Vec<DashShip> = Vec::new();
+        let mut task_group: Vec<DashShip> = Vec::new();
         let mut seen_att = mine;
         for g in self.groups.group_list() {
             if !g.commander.as_deref().is_some_and(|c| who.iter().any(|w| w == c)) {
@@ -12334,7 +12771,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             }
             for u in self.groups.group_units(&g.id) {
                 if seen_att.insert(u.clone()) {
-                    attached.push(DashShip { id: u.clone(), label: self.unit_label(&u) });
+                    task_group.push(DashShip { id: u.clone(), label: self.unit_label(&u) });
                 }
             }
         }
@@ -12347,11 +12784,11 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 .as_ref()
                 .is_some_and(|d| d.mode == "static"),
             ships,
-            attached,
+            task_group,
         })
     }
 
-    /// Bottom station for seated commanders: own ship, attached units,
+    /// Bottom station for seated commanders: own ship, task group units,
     /// helm. Shown from preparation onward; the helm orders
     /// nothing before execution (and never in a static game), and
     /// `minos_order_target` re-checks execution + command at send time,
@@ -12475,17 +12912,17 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                         cols[0].weak("no fix yet");
                     }
                 }
-                // -- attached units --
-                cols[1].label("Attached");
+                // -- task group --
+                cols[1].label("Task group");
                 let others: Vec<&DashShip> =
-                    data.attached.iter().filter(|a| a.id != active).collect();
+                    data.task_group.iter().filter(|a| a.id != active).collect();
                 let mine: Vec<&DashShip> = data
                     .ships
                     .iter()
                     .filter(|s| s.id != active)
                     .collect();
                 if others.is_empty() && mine.is_empty() {
-                    cols[1].weak("no attached units");
+                    cols[1].weak("no other units in your task group");
                 }
                 for a in mine.iter().chain(others.iter()) {
                     cols[1].horizontal(|row| {
@@ -14696,6 +15133,32 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             SetupDone::FixBatch(outs) => self.apply_fix_batch(outs),
             SetupDone::UnitSpeeds(uid, speeds) => {
                 self.unit_speeds.insert(uid.to_string(), speeds);
+            }
+            SetupDone::UnitSpecVersion(uid, version) => {
+                self.unit_spec_versions.insert(uid.to_string(), version);
+            }
+            SetupDone::EmbarkedLoaded(host, units) => {
+                self.embarked.insert(host, units);
+            }
+            SetupDone::EmbarkCandidates(host, units) => {
+                self.embark_candidates.insert(host, units);
+            }
+            SetupDone::CapacitiesLoaded(host, caps) => {
+                // A dirty draft is the operator's unsaved work — a load
+                // landing after an edit must not clobber it.
+                if !self.capacities_dirty.contains(&host) {
+                    self.unit_capacities.insert(host, caps);
+                }
+            }
+            SetupDone::EmbarkChanged(host, result) => {
+                self.embarked.insert(host, result.units);
+                self.embark_over.insert(host, result.over_capacity);
+                self.embark_attach_sel.remove(&host);
+                self.embark_detach_sel.remove(&host);
+            }
+            SetupDone::CapacitiesSaved(host, caps) => {
+                self.unit_capacities.insert(host, caps);
+                self.capacities_dirty.remove(&host);
             }
             SetupDone::Timeline(page, append) => {
                 if append {
@@ -19877,6 +20340,18 @@ fn main() -> Result<(), String> {
                 helm_drafts: HashMap::new(),
                 unit_speeds: HashMap::new(),
                 helm_medium: HashMap::new(),
+                unit_spec_versions: HashMap::new(),
+                embarked: HashMap::new(),
+                embark_candidates: HashMap::new(),
+                embark_over: HashMap::new(),
+                unit_capacities: HashMap::new(),
+                capacities_dirty: std::collections::HashSet::new(),
+                embark_attach_open: std::collections::HashSet::new(),
+                embark_attach_sel: HashMap::new(),
+                embark_detach_sel: HashMap::new(),
+                cap_level: HashMap::new(),
+                cap_id: HashMap::new(),
+                cap_max: HashMap::new(),
                 helm_preview_pending: HashSet::new(),
                 controlled: HashSet::new(),
                 pending_waypoint: None,
@@ -19917,6 +20392,7 @@ fn main() -> Result<(), String> {
                 cal_month: 0,
                 setup_reg_search: String::new(),
                 fleet_query: String::new(),
+                drill_asset_group: None,
                 drill_branch: None,
                 drill_category: None,
                 drill_type: None,

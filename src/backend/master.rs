@@ -3228,6 +3228,19 @@ pub struct GameUnit {
     pub hierarchy_node: Option<i64>,
 }
 
+/// One row of a vessel's command history. The entry with no `to_at`
+/// is the current commander; there is no separate "who commands this
+/// now" read, because two ways to ask would be free to disagree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitCommander {
+    pub unit_id: i64,
+    pub user_id: i64,
+    pub user_name: String,
+    pub from_at: String,
+    pub to_at: Option<String>,
+    pub note: String,
+}
+
 /// One hull's published speed figures for one medium. `is_default`
 /// marks the medium an order naming none is judged in — the hull's own
 /// movement domain, when that is also a medium. Amphibious hulls carry
@@ -3361,8 +3374,53 @@ impl MinosMaster {
     /// Current specification for one hull. Absent when the hull has no
     /// published version yet — the API invents no speed, neither do we.
     pub fn hull_spec(&self, token: &str, unit_id: i64) -> Result<HullSpec, BackendError> {
-        let data = self.get(token, &format!("/units/{unit_id}"))?;
+        self.hull_spec_at(token, unit_id, None)
+    }
+
+    /// One hull with a specification version: the current one when
+    /// `version` is `None`, or the pinned one a game referenced when it
+    /// is `Some`. The review and closure screens read the pinned
+    /// version so a figure corrected in October leaves a game judged in
+    /// September showing the numbers the judges actually saw.
+    pub fn hull_spec_at(
+        &self,
+        token: &str,
+        unit_id: i64,
+        version: Option<i64>,
+    ) -> Result<HullSpec, BackendError> {
+        let path = match version {
+            Some(v) => format!("/units/{unit_id}?version={v}"),
+            None => format!("/units/{unit_id}"),
+        };
+        let data = self.get(token, &path)?;
         Self::parse_hull_spec(&data, unit_id)
+    }
+
+    /// A vessel's command history, newest first. The current commander
+    /// is the entry with no `to_at`; a vessel nobody ever commanded
+    /// reads as an empty list, never a 404.
+    pub fn unit_commander_history(
+        &self,
+        token: &str,
+        unit_id: i64,
+    ) -> Result<Vec<UnitCommander>, BackendError> {
+        let data = self.get(token, &format!("/units/{unit_id}/commander"))?;
+        Ok(data
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|c| {
+                Some(UnitCommander {
+                    unit_id: c["id_unit"].as_i64().unwrap_or(unit_id),
+                    user_id: c["id_user"].as_i64()?,
+                    user_name: c["user_name"].as_str().unwrap_or("").to_string(),
+                    from_at: c["from_at"].as_str().unwrap_or("").to_string(),
+                    to_at: c["to_at"].as_str().map(|s| s.to_string()),
+                    note: c["note"].as_str().unwrap_or("").to_string(),
+                })
+            })
+            .collect())
     }
 
     /// The spec read, split from the transport so it is testable

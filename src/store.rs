@@ -402,53 +402,152 @@ pub fn tax_branches(conn: &Connection) -> Result<Vec<TaxRow>, String> {
     )
 }
 
-/// Asset groups from the helpers table, for the picker's top rung.
-/// The counts come from the backend's `/units/asset-groups` (live
-/// hulls), not from a local column — the group is stored on the
-/// category, and a local count would drift from the server's.
-pub fn asset_groups(conn: &Connection) -> Result<Vec<TaxRow>, String> {
-    tax_rows(
-        conn,
-        "SELECT h.id, h.name, h.id_name, 0
-         FROM helpers h
-         WHERE h.table_name = 'asset_groups'
-         GROUP BY h.id ORDER BY h.name",
-        None,
-    )
+/// The asset group that unclassified categories fold into. The backend
+/// counts a category with no group (`id_asset_group: null`) as `Aset
+/// Lainnya`, and `GET /units?id_asset_group=` applies the same fold —
+/// so a tab's number and the rows behind it agree. Resolved by name
+/// (never hardcoded to an id): the operator may rename the row, and
+/// the fold follows the meaning, not the number.
+pub fn asset_group_other_id(conn: &Connection) -> Option<i64> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM helpers WHERE table_name = 'asset_groups'
+              AND (LOWER(name) LIKE '%other%' OR LOWER(name) LIKE '%lain%'
+                   OR LOWER(id_name) LIKE '%other%' OR LOWER(id_name) LIKE '%lain%')
+              ORDER BY id LIMIT 1",
+        )
+        .ok()?;
+    stmt.query_row([], |r| r.get(0)).optional().unwrap_or(None)
 }
 
-/// Unit ids belonging to an asset group, resolved via class → type →
-/// category. Used to filter the picker's drill when a group is
-/// selected.
+/// Asset groups from the helpers table, for the picker's top rung.
+///
+/// Counts are LOCAL live-hull counts over the backfilled
+/// `units.asset_group_id`, with unclassified hulls folded into the
+/// Other group — the same fold `GET /units/asset-groups` applies, so a
+/// fresh sync agrees with the backend's `hull_count` tab-for-tab. Local
+/// counting keeps the drill offline-capable; the backend stays the
+/// source of truth and the backfill in `sync_from` is what keeps the
+/// two from drifting.
+pub fn asset_groups(conn: &Connection) -> Result<Vec<TaxRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, id_name FROM helpers
+              WHERE table_name = 'asset_groups' ORDER BY name",
+        )
+        .map_err(|e| e.to_string())?;
+    let groups = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for (id, name, id_name) in groups {
+        let ids = unit_ids_in_asset_group(conn, id).unwrap_or_default();
+        out.push(TaxRow { id, name, id_name, count: ids.len() as i64 });
+    }
+    Ok(out)
+}
+
+/// Unit ids belonging to an asset group, resolved via the backfilled
+/// `units.asset_group_id` (class → type → category). A group nobody
+/// classified yet has no rows of its own: asking for the Other group
+/// also returns hulls whose category carries no group, because that is
+/// how the backend counts them — a tab whose badge and contents
+/// disagreed would be worse than either answer alone.
 pub fn unit_ids_in_asset_group(
     conn: &Connection,
     asset_group_id: i64,
 ) -> Result<Vec<i64>, String> {
+    let other = asset_group_other_id(conn);
+    let fold_nulls = Some(asset_group_id) == other;
     let mut stmt = conn
         .prepare(
-            "SELECT u.id FROM units u
-             LEFT JOIN unit_classes c ON c.id = u.class_id
-             LEFT JOIN unit_types t ON t.id = c.type_id
-             LEFT JOIN unit_categories cat ON cat.id = t.category_id
-             WHERE cat.id_asset_group = ?1",
+            "SELECT id FROM units
+              WHERE asset_group_id = ?1
+                 OR (?2 = 1 AND asset_group_id IS NULL)",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([asset_group_id], |r| r.get::<_, i64>(0))
+        .query_map(rusqlite::params![asset_group_id, if fold_nulls { 1 } else { 0 }], |r| {
+            r.get::<_, i64>(0)
+        })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<i64>, _>>()
         .map_err(|e| e.to_string())
 }
 
+/// Service branches owning at least one category in an asset group,
+/// with hull counts restricted to that group. `None` is the whole
+/// register (the unfiltered `tax_branches`). Used to narrow the
+/// picker's second column once the top rung is chosen.
+pub fn tax_branches_in_asset_group(
+    conn: &Connection,
+    asset_group_id: Option<i64>,
+) -> Result<Vec<TaxRow>, String> {
+    let Some(group) = asset_group_id else {
+        return tax_branches(conn);
+    };
+    let other = asset_group_other_id(conn);
+    let fold_nulls = Some(group) == other;
+    let mut stmt = conn
+        .prepare(
+            "SELECT h.id, h.name, h.id_name, COUNT(u.id)
+              FROM helpers h LEFT JOIN units u
+                ON u.branch_id = h.id
+               AND (u.asset_group_id = ?1 OR (?2 = 1 AND u.asset_group_id IS NULL))
+              WHERE h.table_name = 'service_branches'
+              GROUP BY h.id ORDER BY h.name",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![group, if fold_nulls { 1 } else { 0 }], tax_row)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
 /// One branch's declared categories, with server type counts.
+/// Unfiltered: every category the branch owns, whatever its group.
 pub fn tax_categories(conn: &Connection, branch_id: i64) -> Result<Vec<TaxRow>, String> {
-    tax_rows(
-        conn,
-        "SELECT c.id, c.name, c.id_name, c.type_count
-         FROM unit_categories c JOIN branch_categories b ON b.category_id = c.id
-         WHERE b.branch_id = ?1 ORDER BY c.name",
-        Some(branch_id),
-    )
+    tax_categories_in(conn, branch_id, None)
+}
+
+/// One branch's declared categories, narrowed to an asset group when
+/// one is chosen. A category with no group folds into Other, the same
+/// fold the counts use — so the Other tab lists exactly the categories
+/// it counts.
+pub fn tax_categories_in(
+    conn: &Connection,
+    branch_id: i64,
+    asset_group_id: Option<i64>,
+) -> Result<Vec<TaxRow>, String> {
+    let Some(group) = asset_group_id else {
+        return tax_rows(
+            conn,
+            "SELECT c.id, c.name, c.id_name, c.type_count
+             FROM unit_categories c JOIN branch_categories b ON b.category_id = c.id
+             WHERE b.branch_id = ?1 ORDER BY c.name",
+            Some(branch_id),
+        );
+    };
+    let other = asset_group_other_id(conn);
+    let fold_nulls = Some(group) == other;
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.id, c.name, c.id_name, c.type_count
+             FROM unit_categories c JOIN branch_categories b ON b.category_id = c.id
+             WHERE b.branch_id = ?1
+               AND (c.id_asset_group = ?2 OR (?3 = 1 AND c.id_asset_group IS NULL))
+             ORDER BY c.name",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![branch_id, group, if fold_nulls { 1 } else { 0 }],
+            tax_row,
+        )
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 /// One category's types, with server class counts.
