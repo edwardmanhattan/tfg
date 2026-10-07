@@ -91,8 +91,14 @@ impl Island {
     /// Where the body content goes: below the title band, inside the pad.
     pub fn content_rect(&self, rect: Rect) -> Rect {
         Rect::from_min_max(
-            pos2(rect.left() + tokens::PAD, rect.top() + tokens::TITLE_H + 4.0),
-            pos2(rect.right() - tokens::PAD, rect.bottom() - tokens::PAD),
+            pos2(
+                rect.left() + tokens::ISLAND_PAD,
+                rect.top() + tokens::TITLE_H + tokens::ISLAND_PAD,
+            ),
+            pos2(
+                rect.right() - tokens::ISLAND_PAD,
+                rect.bottom() - tokens::ISLAND_PAD,
+            ),
         )
     }
 }
@@ -440,7 +446,7 @@ pub fn island_owned(
             tracked_caps(
                 ctx,
                 &painter,
-                pos2(title_band.left() + tokens::PAD, title_band.center().y - 7.0),
+                pos2(title_band.left() + tokens::ISLAND_PAD, title_band.center().y - 7.0),
                 &spec.title,
                 tokens::TITLE_SIZE,
                 tokens::MAP_INK,
@@ -462,7 +468,7 @@ pub fn island_owned(
                 // the band's edge lands underneath the button — which is
                 // what the first pass did.
                 painter.text(
-                    pos2(close_rect.left() - tokens::PAD, title_band.center().y + 4.0),
+                    pos2(close_rect.left() - tokens::ISLAND_PAD, title_band.center().y + 4.0),
                     egui::Align2::RIGHT_BOTTOM,
                     &spec.trailing,
                     FontId::monospace(11.0),
@@ -673,23 +679,36 @@ pub enum Dock {
     Right,
 }
 
-/// How wide the zone takes, in px, given the window.
-///
-/// The zone is a constant width rather than a resizable one. It has to be
-/// constant because a floating zone over a map means the map's visible centre
-/// moves when the zone resizes, and the camera has to compensate for that on
-/// every recentre; a width that never moves is a compensation that can be
-/// right once instead of right every frame.
+/// The zone's default width, in px. Also the reset value for the resize
+/// grip: the live width lives on the app's `side_zone_w`, because a floating
+/// zone over a map moves the map's visible centre when it resizes and the
+/// camera compensates from the actual width every frame
+/// ([`camera_centre_offset_with`]).
 pub fn zone_width() -> f32 {
     tokens::ZONE_W
+}
+
+/// Clamp a candidate zone width: inside the resize limits, and never wider
+/// than the window minus both edge gaps and a 200px map strip.
+///
+/// The floor wins on a narrow window: `min <= max` always, so this never
+/// panics and a tiny window gets a 240px zone rather than a crash.
+pub fn clamp_zone_width(w: f32, viewport_w: f32) -> f32 {
+    let max = (viewport_w - tokens::ZONE_EDGE_GAP * 2.0 - 200.0).max(tokens::ZONE_MIN_W);
+    w.clamp(tokens::ZONE_MIN_W, max.min(tokens::ZONE_MAX_W))
 }
 
 /// The zone's horizontal origin for a window of `viewport_w`, or `None` when
 /// the zone is hidden.
 pub fn zone_origin(dock: Dock, viewport_w: f32) -> Option<f32> {
+    zone_origin_with(dock, viewport_w, tokens::ZONE_W)
+}
+
+/// [`zone_origin`] for a live (possibly resized) zone width.
+pub fn zone_origin_with(dock: Dock, viewport_w: f32, zone_w: f32) -> Option<f32> {
     let x = match dock {
         Dock::Left => tokens::ZONE_EDGE_GAP,
-        Dock::Right => viewport_w - tokens::ZONE_W - tokens::ZONE_EDGE_GAP,
+        Dock::Right => viewport_w - zone_w - tokens::ZONE_EDGE_GAP,
     };
     (x >= 0.0).then_some(x)
 }
@@ -705,13 +724,20 @@ pub fn zone_origin(dock: Dock, viewport_w: f32) -> Option<f32> {
 /// Returns `0.0` when the zone is hidden, because then the window centre is
 /// the visible centre and no correction applies.
 pub fn camera_centre_offset(dock: Dock, hidden: bool) -> f32 {
+    camera_centre_offset_with(dock, hidden, tokens::ZONE_W)
+}
+
+/// [`camera_centre_offset`] for a live (possibly resized) zone width. The
+/// caller passes the same clamped width the column is drawn at, so a resize
+/// never parks a framed hull under the chrome.
+pub fn camera_centre_offset_with(dock: Dock, hidden: bool, zone_w: f32) -> f32 {
     if hidden {
         return 0.0;
     }
     match dock {
         // The zone covers the left, so the visible centre is to its right.
-        Dock::Left => tokens::ZONE_W * tokens::CAMERA_OFFSET_FRACTION,
-        Dock::Right => -tokens::ZONE_W * tokens::CAMERA_OFFSET_FRACTION,
+        Dock::Left => zone_w * tokens::CAMERA_OFFSET_FRACTION,
+        Dock::Right => -zone_w * tokens::CAMERA_OFFSET_FRACTION,
     }
 }
 
@@ -732,7 +758,17 @@ pub fn zone_island_origins(
     viewport: Rect,
     islands: &[(Island, bool)],
 ) -> Vec<Pos2> {
-    let Some(x) = zone_origin(dock, viewport.width()) else {
+    zone_island_origins_with(dock, viewport, islands, tokens::ZONE_W)
+}
+
+/// [`zone_island_origins`] for a live (possibly resized) zone width.
+pub fn zone_island_origins_with(
+    dock: Dock,
+    viewport: Rect,
+    islands: &[(Island, bool)],
+    zone_w: f32,
+) -> Vec<Pos2> {
+    let Some(x) = zone_origin_with(dock, viewport.width(), zone_w) else {
         return Vec::new();
     };
     let mut y = viewport.top() + tokens::ZONE_TOP_GAP;
@@ -752,14 +788,19 @@ pub fn zone_island_origins(
 /// Scrolling, clipping and culling all read this, so "where an island may be"
 /// is one rectangle rather than three numbers that can disagree.
 pub fn zone_band(dock: Dock, viewport: Rect) -> Rect {
-    let x = zone_origin(dock, viewport.width()).unwrap_or(0.0);
+    zone_band_with(dock, viewport, tokens::ZONE_W)
+}
+
+/// [`zone_band`] for a live (possibly resized) zone width.
+pub fn zone_band_with(dock: Dock, viewport: Rect, zone_w: f32) -> Rect {
+    let x = zone_origin_with(dock, viewport.width(), zone_w).unwrap_or(0.0);
     Rect::from_min_max(
         pos2(
             x,
             viewport.top() + tokens::ZONE_TOP_GAP - tokens::ZONE_ISLAND_GAP,
         ),
         pos2(
-            x + tokens::ZONE_W,
+            x + zone_w,
             viewport.bottom() - tokens::ZONE_ISLAND_GAP,
         ),
     )
@@ -1335,6 +1376,37 @@ fn the_backdrop_begins_under_the_top_band() {
     #[test]
     fn camera_offset_is_half_the_zone() {
         assert!((camera_centre_offset(Dock::Left, false) - tokens::ZONE_W / 2.0).abs() < 0.01);
+    }
+
+    /// The sidebar clamps to its rails, follows a resized width, and never
+    /// panics on a narrow window: the floor always wins, so a tiny viewport
+    /// gets a 240px zone rather than a crash.
+    #[test]
+    fn zone_width_clamps_to_its_rails() {
+        assert_eq!(clamp_zone_width(320.0, 1040.0), 320.0);
+        assert_eq!(clamp_zone_width(100.0, 1040.0), tokens::ZONE_MIN_W);
+        assert_eq!(clamp_zone_width(900.0, 1040.0), tokens::ZONE_MAX_W);
+        assert_eq!(clamp_zone_width(900.0, 500.0), 252.0);
+        assert_eq!(clamp_zone_width(900.0, 300.0), tokens::ZONE_MIN_W);
+    }
+
+    /// The resized width moves the column, the band and the camera together.
+    /// Checked as one property because three numbers that can disagree are
+    /// how a resized sidebar parks a hull under itself.
+    #[test]
+    fn resized_width_moves_origins_band_and_camera_together() {
+        let vp = Rect::from_min_size(pos2(0.0, 0.0), vec2(1040.0, 640.0));
+        let specs = [island(100.0)];
+        let narrow = zone_island_origins_with(Dock::Right, vp, &specs, 240.0);
+        let wide = zone_island_origins_with(Dock::Right, vp, &specs, 480.0);
+        assert!((narrow[0].x - wide[0].x - 240.0).abs() < 0.01);
+        assert_eq!(
+            zone_band_with(Dock::Left, vp, 480.0).width(),
+            480.0
+        );
+        assert!(
+            (camera_centre_offset_with(Dock::Left, false, 480.0) - 240.0).abs() < 0.01
+        );
     }
 
     /// ADR-0016's load-bearing claim: one owner, never two. Checked over the

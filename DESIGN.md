@@ -60,7 +60,7 @@ components:
     backgroundColor: "{colors.console-night}"
     textColor: "{colors.body-silver}"
     typography: "{typography.body}"
-    padding: "12px"
+    padding: "16px"
   seam:
     restColor: "{colors.cut-grey}"
     restAlpha: 1.0
@@ -188,7 +188,9 @@ reading. The camera's visible centre moves instead, by the offset rule above.
 
 The zone docks **left or right** and remembers which. A commander who steers
 with the right hand and an organiser scanning rows with the left should not
-have to argue about it.
+have to argue about it. Its inner edge drags to resize (240–600px); the
+column, the band and the camera offset all read the live width, and Settings
+holds a slider twin plus the reset to default.
 
 ### Modal zone — above everything
 
@@ -373,10 +375,13 @@ There is no grid and no breakpoint set. This is a native desktop window, so
 the spatial model is a **stage**, not a page.
 
 - **Spacing rhythm** — item spacing 8 × 6px, button padding 12 × 8px, island
-  inner margin 12px. Rows are horizontal groups separated by 1px dividers
-  rather than by large gaps. Island verbs are full-width 32px rows.
+  inner margin 16px on all four sides. Rows are horizontal groups separated
+  by 1px dividers rather than by large gaps. Island verbs are full-width
+  32px rows.
 - **Zone rhythm** — 2px between islands in the side zone, 24px between a
-  zone and the window edge.
+  zone and the window edge. The zone is resizable by its inner edge
+  (240–600px, default 320); islands stretch to the live width and the camera
+  offset follows it, so a resize never covers a framed hull.
 - **Scroll discipline** — island bodies scroll at a 420px cap so a tall
   island never swallows the map. Dense inner lists get their own tighter cap
   with their header pinned outside it.

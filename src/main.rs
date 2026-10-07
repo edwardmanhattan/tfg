@@ -2790,6 +2790,12 @@ struct ShipApp {
     /// than a settings key that silently does nothing.
     show_side_zone: bool,
     side_dock: tfg::chrome::Dock,
+    /// The side zone's live width, in points. Dragging the zone's inner edge
+    /// writes it (clamped by `chrome::clamp_zone_width`); the column, the
+    /// band and the camera offset all read the same value every frame, so a
+    /// resize moves them together rather than disagreeing about where the
+    /// zone is.
+    side_zone_w: f32,
     /// How far the side zone is scrolled, in points.
     ///
     /// The column is taller than the window in every state with four islands,
@@ -10970,6 +10976,26 @@ impl ShipApp {
                             }
                         }
                     });
+                    // The drag grip is the primary resize; this is the
+                    // keyboard-reachable twin plus the way back to default.
+                    ui.horizontal(|ui| {
+                        ui.label("Width");
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.side_zone_w,
+                                tfg::tokens::ZONE_MIN_W..=tfg::tokens::ZONE_MAX_W,
+                            )
+                            .show_value(false),
+                        )
+                        .on_hover_text("drag the zone's inner edge, or slide here");
+                        self.side_zone_w = tfg::chrome::clamp_zone_width(
+                            self.side_zone_w,
+                            ui.ctx().viewport_rect().width(),
+                        );
+                        if ui.small_button("reset").clicked() {
+                            self.side_zone_w = tfg::tokens::ZONE_W;
+                        }
+                    });
                 }
                 ui.separator();
                 ui.label("Text size");
@@ -11963,23 +11989,28 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     // an unverified guess and the first render of a new island should be
     // treated as a measurement, not a confirmation.
     fn side_zone(&mut self, ui: &mut egui::Ui) {
-        use tfg::chrome::{Island, island_owned, owning_island, zone_island_origins};
+        use tfg::chrome::{
+            Island, clamp_zone_width, island_owned, owning_island, zone_band_with,
+            zone_island_origins_with,
+        };
         let state = self.game_state();
-        let w = tfg::chrome::zone_width();
+        let vp = ui.ctx().viewport_rect();
+        let w = clamp_zone_width(self.side_zone_w, vp.width());
 
         // The user island is first in every state, because identity is the
         // one thing that does not change with the exercise.
         let mut entries: Vec<(Island, bool)> = vec![(
-            // 156pt, measured against the real thing with the enlarged base
+            // 172pt, measured against the real thing with the enlarged base
             // text (`tokens::TEXT_*_PT`): identity row (avatar 40 + pad), the
             // email line, then the button — 105.6pt in the no-session state,
-            // 104.0 in Planning. Was 140pt, measured the same way against
-            // egui's stock 13pt body where the same three rows came to 98pt.
-            // The content grew by more than the old slack covered, and an
-            // overflow sitting UNDER `chrome::BODY_SCROLL_SLACK` cannot be
-            // scrolled back into view, so the button's bottom edge would have
-            // been cut and unreachable. See `zone_island_heights_are_guesses`.
-            Island::new(egui::Id::new("z.user"), "Operator", egui::vec2(w, 156.0))
+            // 104.0 in Planning — against the 110pt a 172pt island leaves
+            // (172 − 30 band − 16 − 16 pad). Was 156pt at 12px pad, where the
+            // same rows came to 98pt; the roomier 16px pad eats 16pt of
+            // viewport, and an overflow sitting UNDER
+            // `chrome::BODY_SCROLL_SLACK` cannot be scrolled back into view,
+            // so the button's bottom edge would have been cut and
+            // unreachable. See `zone_island_heights_are_guesses`.
+            Island::new(egui::Id::new("z.user"), "Operator", egui::vec2(w, 172.0))
                 .with_trailing(&self.app_role_tag()),
             true,
         )];
@@ -12008,15 +12039,14 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                     true,
                 ));
                 entries.push((
-                    // 166pt, measured with the enlarged base text: the
+                    // 182pt, measured with the enlarged base text: the
                     // multiplier row, the pace note and Apply come to 117.6pt
-                    // against the 120pt a 150pt island leaves. It was 150pt at
-                    // egui's stock sizes, where the same three rows measured
-                    // 108 against 104 — 4pt of trailing slack. The larger text
-                    // took it to 12pt over, which is exactly the number
-                    // `chrome::BodyFit` refuses to scroll, so Apply's bottom
-                    // edge would have been cut with no gesture to reach it.
-                    Island::new(egui::Id::new("z.control"), "Control", egui::vec2(w, 166.0)),
+                    // against the 120pt a 182pt island leaves (182 − 30 band −
+                    // 16 − 16 pad). The 16px island pad eats 16pt of viewport
+                    // versus the old 12px, so the previous 166pt would have
+                    // left Apply's bottom edge cut with no gesture to reach
+                    // it (see `chrome::BODY_SCROLL_SLACK`).
+                    Island::new(egui::Id::new("z.control"), "Control", egui::vec2(w, 182.0)),
                     true,
                 ));
                 entries.push((
@@ -12139,11 +12169,12 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         //
         // So the stack is arithmetic on constants now, computed before
         // anything is drawn, and every island is in its place on the first
-        // paint rather than growing into it over a second.
-        let vp = ui.ctx().viewport_rect();
+        // paint rather than growing into it over a second. `vp` and `w` come
+        // from the top of this function: the width is the live clamped value,
+        // so a resize moves the whole column at once.
         let dock = self.side_dock;
-        let origins = zone_island_origins(dock, vp, &entries);
-        let band = tfg::chrome::zone_band(dock, vp);
+        let origins = zone_island_origins_with(dock, vp, &entries, w);
+        let band = zone_band_with(dock, vp, w);
 
         // `zone_island_origins` skips closed islands, so pairing entries with
         // origins by index pairs them wrongly the moment one is closed. Build
@@ -12307,6 +12338,57 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             });
 
         }
+
+        // Resize grip on the zone's inner edge: a 10px draggable strip over
+        // the full band height. Dragging writes `side_zone_w`, which the next
+        // frame's origins, band and camera offset all read — so the resize is
+        // live and nothing disagrees about the width mid-drag. Registered
+        // after the islands, so the edge wins where the strip overlaps them.
+        let grip_w = tfg::tokens::ZONE_GRIP_W;
+        let grip_x = match dock {
+            tfg::chrome::Dock::Left => band.left() + band.width() - grip_w * 0.5,
+            tfg::chrome::Dock::Right => band.left() - grip_w * 0.5,
+        };
+        egui::Area::new(egui::Id::new("zone-resize"))
+            .fixed_pos(egui::pos2(grip_x, band.top()))
+            .movable(false)
+            .constrain(false)
+            .interactable(true)
+            .order(egui::Order::Middle)
+            .show(ui.ctx(), |ui| {
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(grip_w, band.height()), egui::Sense::drag());
+                let painter = ui.painter_at(rect);
+                let cx = rect.center().x;
+                let ink = if resp.dragged() {
+                    tfg::tokens::RADAR_CYAN
+                } else if resp.hovered() {
+                    tfg::tokens::CUT_GREY
+                } else {
+                    tfg::tokens::CUT_GREY.linear_multiply(0.35)
+                };
+                painter.line_segment(
+                    [
+                        egui::pos2(cx, rect.top() + 8.0),
+                        egui::pos2(cx, rect.bottom() - 8.0),
+                    ],
+                    egui::Stroke::new(2.0, ink),
+                );
+                if resp.dragged() {
+                    let dx = ui.ctx().input(|i| i.pointer.delta().x);
+                    let dw = match dock {
+                        tfg::chrome::Dock::Left => dx,
+                        tfg::chrome::Dock::Right => -dx,
+                    };
+                    if dw != 0.0 {
+                        let vp_w = ui.ctx().viewport_rect().width();
+                        self.side_zone_w = clamp_zone_width(self.side_zone_w + dw, vp_w);
+                    }
+                }
+                if resp.hovered() || resp.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+            });
     }
 
     /// Whether the side zone already carries the surface the free-floating
@@ -16428,8 +16510,16 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     /// zone's half-width is the shift, and it is positive when the zone is on
     /// the left so that the visible centre moves right.
     fn visible_center(&self, at: (f64, f64)) -> (f64, f64) {
-        let shift_px =
-            tfg::chrome::camera_centre_offset(self.side_dock, !self.show_side_zone);
+        // The live clamped width, not the default: a resized sidebar must
+        // move the correction with it or framed hulls slide underneath it.
+        let shift_px = tfg::chrome::camera_centre_offset_with(
+            self.side_dock,
+            !self.show_side_zone,
+            tfg::chrome::clamp_zone_width(
+                self.side_zone_w,
+                self.map_view.0 as f32,
+            ),
+        );
         if shift_px == 0.0 {
             return at;
         }
@@ -20355,6 +20445,7 @@ fn main() -> Result<(), String> {
                 show_side_zone: true,
                 zone_scroll: 0.0,
                 side_dock: tfg::chrome::Dock::Left,
+                side_zone_w: tfg::tokens::ZONE_W,
                 settings_open: false,
                 reduced_motion: false,
                 motion_secs: 0.2,

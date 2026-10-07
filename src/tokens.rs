@@ -135,7 +135,13 @@ pub fn rim(active: bool) -> Color32 {
 /// Chamfer depth at the top-right corner.
 pub const CUT: f32 = 20.0;
 pub const TITLE_H: f32 = 30.0;
+/// Generic chrome inset: modals, title-band text, miscellaneous breathing
+/// room. Islands do NOT use this for their bodies — see `ISLAND_PAD`.
 pub const PAD: f32 = 12.0;
+/// Island body inset, all four sides. Roomy on purpose: the body is dense
+/// controls and readouts, and 12px left text and buttons feeling pasted to
+/// the border.
+pub const ISLAND_PAD: f32 = 16.0;
 pub const CLOSE: f32 = 18.0;
 /// The close button's inset from the panel's right edge. It has to clear the
 /// chamfer, because a button centred closer than the cut lands on the
@@ -217,6 +223,14 @@ pub const TEXT_SCALE_LARGER: f32 = 1.15;
 
 /// The zone's width. Wide enough for the widest island body plus its pad.
 pub const ZONE_W: f32 = 320.0;
+/// Sidebar resize limits, in px. The zone is resizable by dragging its inner
+/// edge; the camera offset and the band follow the live width every frame,
+/// so a resize never parks a framed hull under the chrome.
+pub const ZONE_MIN_W: f32 = 240.0;
+pub const ZONE_MAX_W: f32 = 600.0;
+/// The resize grip's hit width. Generous on purpose: a 2px line is
+/// ungrabbable on a field laptop trackpad.
+pub const ZONE_GRIP_W: f32 = 10.0;
 /// Gap from the window edge to the zone.
 pub const ZONE_EDGE_GAP: f32 = 24.0;
 /// Gap between stacked islands inside the zone. Near-zero on purpose: the
