@@ -152,7 +152,7 @@ pub fn paint_island(painter: &Painter, rect: Rect, owns_input: bool) {
     painter.add(Shape::convex_polygon(
         pts.clone(),
         tokens::CONSOLE_NIGHT,
-        Stroke::new(1.5, tokens::CUT_GREY),
+        Stroke::new(2.0, tokens::CUT_GREY),
     ));
 
     // Title band, clipped to the panel so it never crosses the diagonal.

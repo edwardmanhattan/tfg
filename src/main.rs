@@ -6075,7 +6075,7 @@ impl ShipApp {
     /// one frame are ONE widget, which opens one popup in the wrong place
     /// and lets a click land in the other.
     fn users_roster_ui(&mut self, ui: &mut egui::Ui) {
-        ui.strong("Seated");
+        ui.label(egui::RichText::new("Seated").weak().small());
         if self.users_game.is_none() {
             ui.weak("Pick a session to see its roster.");
             return;
@@ -9371,7 +9371,7 @@ impl ShipApp {
     /// Setup flow step 2 (#79): seat accounts into game roles. One
     /// role per person; a role change clears readiness.
     fn setup_players_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("2 · Players");
+        // No inner title: the island band already says Players.
         if self.users_game.is_none() {
             ui.weak("Pick or create a session in step 1 first.");
             return;
@@ -10091,7 +10091,7 @@ impl ShipApp {
     /// pieces. The commander must already be seated (step 2) and never
     /// judge-side — the contract refuses anything else.
     fn setup_fleet_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("3 · Fleet");
+        // No inner title: the island band already says Fleet.
         if self.users_game.is_none() {
             ui.weak("Pick or create a session in step 1 first.");
             return;
@@ -10173,7 +10173,7 @@ impl ShipApp {
                 );
             }
         });
-        ui.strong("Pieces");
+        ui.label(egui::RichText::new("Pieces").weak().small());
         if self.force.is_empty() {
             ui.weak("No pieces yet — assign register hulls above.");
         } else {
@@ -10332,7 +10332,7 @@ impl ShipApp {
     /// planning → preparation. The Game Master decides planning is
     /// done — this step carries no gate of its own.
     fn setup_ready_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("4 · Review");
+        // No inner title: the island band already says Review.
         let game = self
             .users_game
             .clone()
@@ -10420,7 +10420,7 @@ impl ShipApp {
         // the missing pieces name themselves here — while every one of
         // them is still fixable — rather than at the button past the
         // point of correction.
-        ui.strong("Preparation");
+        ui.label(egui::RichText::new("Preparation").weak().small());
         let prep = self.setup_prep_checklist();
         if prep.is_empty() {
             ui.label(egui::RichText::new("complete — ready to enter preparation").strong());
@@ -10432,7 +10432,7 @@ impl ShipApp {
         ui.separator();
         // The checklist names every blocker; the button names its
         // consequence. The server still gates the advance itself.
-        ui.strong("Checklist");
+        ui.label(egui::RichText::new("Checklist").weak().small());
         let blockers = self.setup_checklist();
         if blockers.is_empty() {
             ui.label(egui::RichText::new("clear — ready to enter preparation").strong());
@@ -12025,8 +12025,13 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                     true,
                 ));
                 entries.push((
-                    Island::new(egui::Id::new("z.players"), "Players", egui::vec2(w, 320.0))
+                    Island::new(egui::Id::new("z.players"), "Players", egui::vec2(w, 280.0))
                         .with_trailing(&format!("{} SEATED", self.visible_roster().len())),
+                    true,
+                ));
+                entries.push((
+                    Island::new(egui::Id::new("z.review"), "Review", egui::vec2(w, 380.0))
+                        .with_trailing("STEP 4"),
                     true,
                 ));
             }
@@ -12288,6 +12293,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 x if x == egui::Id::new("z.control") => self.zone_control_body(ui),
                 x if x == egui::Id::new("z.fleet") => self.zone_fleet_body(ui),
                 x if x == egui::Id::new("z.players") => self.zone_players_body(ui),
+                x if x == egui::Id::new("z.review") => self.zone_review_body(ui),
                 x if x == egui::Id::new("z.ready") => self.zone_ready_body(ui),
                 x if x == egui::Id::new("z.clock") => self.zone_exercise_body(ui),
                 x if x == egui::Id::new("z.orders") => self.zone_orders_body(ui),
@@ -12603,11 +12609,16 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             ui.separator();
         }
         self.setup_players_ui(ui);
-        // The checklist and the advance live at the END of the column,
-        // under the last island in dependency order. They were the wizard's
-        // fourth step; ending the sequence is still what they mean, and
-        // putting them under Players keeps that reading.
-        ui.separator();
+        // Review lives in its own island now: seating and the advance gate
+        // are different jobs, and sharing one panel buried the gate below
+        // the roster.
+    }
+
+    fn zone_review_body(&mut self, ui: &mut egui::Ui) {
+        if let Some(reason) = self.setup_step_lock(3) {
+            ui.weak(format!("Not yet — {reason}."));
+            ui.separator();
+        }
         self.setup_ready_ui(ui);
     }
 

@@ -98,20 +98,20 @@ pub const RANK_OPERASI_GABUNGAN: Color32 = Color32::from_rgb(0xEA, 0x58, 0x0C);
 /// separate the panel from a moving map. High alpha on purpose: over a
 /// bright tile map a faint rim vanishes and stacked islands blur together.
 pub const RESTING_RIM: Color32 = CUT_GREY;
-/// A resting island's rim opacity. Near-opaque so the panel edge reads as
-/// a clear border at a glance, while staying neutral grey (never the cyan
-/// accent, see ADR-0016).
-pub const RESTING_RIM_ALPHA: f32 = 0.85;
+/// A resting island's rim opacity. Fully opaque: the rim is the border, so
+/// a translucent one reads as a smudge over a bright tile map. Still neutral
+/// grey, never the cyan accent (see ADR-0016).
+pub const RESTING_RIM_ALPHA: f32 = 1.0;
 
 /// The lit rim, on the single island that currently owns input.
 pub const ACTIVE_RIM: Color32 = RADAR_CYAN;
 pub const ACTIVE_RIM_ALPHA: f32 = 0.50;
 
-/// The rim's geometry: a 2px band inset from the island's own polygon.
+/// The rim's geometry: a 3px band inset from the island's own polygon.
 /// Insetting rather than stroking is what makes it read as a rim rather than
 /// as a border, and it is why it can trace the chamfer without the chamfer
 /// reading as thicker than the panel.
-pub const RIM_BAND: f32 = 2.0;
+pub const RIM_BAND: f32 = 3.0;
 pub const RIM_INSET: f32 = 1.0;
 
 /// The island's rim colour for a given input state.
@@ -219,9 +219,10 @@ pub const TEXT_SCALE_LARGER: f32 = 1.15;
 pub const ZONE_W: f32 = 320.0;
 /// Gap from the window edge to the zone.
 pub const ZONE_EDGE_GAP: f32 = 24.0;
-/// Gap between stacked islands inside the zone. Tight, so adjacent islands
-/// read as one stacked column rather than floating fragments.
-pub const ZONE_ISLAND_GAP: f32 = 8.0;
+/// Gap between stacked islands inside the zone. Near-zero on purpose: the
+/// column reads as one stacked surface and islands touch without merging —
+/// the bolder border keeps each edge distinct.
+pub const ZONE_ISLAND_GAP: f32 = 2.0;
 /// Gap from the window's top edge to the zone's first island, clearing the
 /// top zone's band.
 pub const ZONE_TOP_GAP: f32 = 56.0;

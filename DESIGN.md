@@ -63,12 +63,12 @@ components:
     padding: "12px"
   seam:
     restColor: "{colors.cut-grey}"
-    restAlpha: 0.85
+    restAlpha: 1.0
     activeColor: "{colors.radar-cyan}"
     activeAlpha: 0.5
-    width: "2px"
+    width: "3px"
     inset: "1px"
-    outerBorder: "1.5px {colors.cut-grey}"
+    outerBorder: "2px {colors.cut-grey}"
   band-scanline:
     pitch: "4px"
     alpha: 0.067
@@ -134,7 +134,8 @@ not perform.
 **Key Characteristics:**
 - One radar-cyan signal, and it means "live or yours". Nothing else is cyan.
 - The heat lives on the island rim and the title band, never across a body.
-- Depth is tonal (chrome → slate → well) plus a 1px hairline, and one 2px rim.
+- Depth is tonal (chrome → slate → well) plus a bold cut-grey border: a 2px
+  outer edge and a 3px inset rim.
 - Ubuntu Light for people, Hack for machines; two type roles, no more.
 - Circles are map objects, rectangles are controls. The chamfer means a
   surface that moves.
@@ -204,7 +205,7 @@ There are five, and the zone is never empty.
 | State | Source | The side zone holds |
 | --- | --- | --- |
 | **No session** | no held game | The user island, then one island whose only verb is *start a new session*. |
-| **Planning** | `planning` | Essentials, Control, Fleet, Players. |
+| **Planning** | `planning` | Essentials, Control, Fleet, Players, Review. |
 | **Preparation** | `preparation` | Readiness: who is in, what is placed, what is outstanding. |
 | **Execution** | `execution` | Orders, Roster, Log. No setup, no pickers. |
 | **Closure** | `closure` | The assessment surface: summary, timeline, judgements. |
@@ -233,6 +234,8 @@ order of dependencies, not the order of importance.
    after the exercise begins.
 3. **Fleet.** What is deployed, with a button that opens the Fleet Picker.
 4. **Players.** Who is in, with a button that opens the Player Picker.
+5. **Review.** The gate checklist and the advance into preparation. Its own
+   island: sharing Players buried the gate below the roster.
 
 ## Islands
 
@@ -266,7 +269,7 @@ reading "cyan" learned nothing, because cyan was everywhere.
 So the rim has two states, and this is the rule extension ADR-0014
 anticipated and left as a one-line change:
 
-- **At rest**, the rim is Cut Grey at 85% plus a 1.5px cut-grey outer
+- **At rest**, the rim is Cut Grey at full opacity plus a 2px cut-grey outer
   border, so stacked islands hold a clear edge over a bright tile map. It
   separates the panel from the moving map and says nothing else.
 - **Owning input**, the rim is Radar Cyan at 50%. Exactly one island is in
@@ -372,7 +375,7 @@ the spatial model is a **stage**, not a page.
 - **Spacing rhythm** — item spacing 8 × 6px, button padding 12 × 8px, island
   inner margin 12px. Rows are horizontal groups separated by 1px dividers
   rather than by large gaps. Island verbs are full-width 32px rows.
-- **Zone rhythm** — 8px between islands in the side zone, 24px between a
+- **Zone rhythm** — 2px between islands in the side zone, 24px between a
   zone and the window edge.
 - **Scroll discipline** — island bodies scroll at a 420px cap so a tall
   island never swallows the map. Dense inner lists get their own tighter cap
@@ -525,7 +528,7 @@ duration stays at the low end for that reason.
 ### Do:
 - Route every state-bearing message through the status ink function.
 - Keep Radar Cyan to live state and the focused surface.
-- Separate panels with a 1px hairline and step a tone for depth.
+- Separate panels with a bold cut-grey border and step a tone for depth.
 - Light a rim only on the island that owns input.
 - Keep texture and hardware detail on a title band, never across a body.
 - Put machine output in Hack and give every island a fixed footprint.
