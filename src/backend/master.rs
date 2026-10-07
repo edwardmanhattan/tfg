@@ -139,7 +139,7 @@ impl MinosMaster {
                     StoredValue::Text(c["description_en"].as_str().unwrap_or("").to_string()),
                     StoredValue::Int(b2i(Self::bool_of(c, "is_system"))),
                     StoredValue::Int(c["type_count"].as_i64().unwrap_or(0)),
-                    opt_int(c.get("id_asset_group").cloned()),
+                    opt_int(Self::int_of(c, "id_asset_group")),
                 ]
             })
             .collect();
@@ -358,21 +358,6 @@ impl MinosMaster {
             self.client
                 .delete(&format!("{}{}", self.base_url, path))
                 .bearer_auth(token)
-                .send()?,
-        )
-    }
-
-    fn put(
-        &self,
-        token: &str,
-        path: &str,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, BackendError> {
-        unwrap_envelope(
-            self.client
-                .put(&format!("{}{}", self.base_url, path))
-                .bearer_auth(token)
-                .json(&body)
                 .send()?,
         )
     }
@@ -3555,7 +3540,22 @@ impl MinosMaster {
         unit_id: i64,
     ) -> Result<Vec<EmbarkedUnit>, BackendError> {
         let data = self.get(token, &format!("/units/{unit_id}/embarkations"))?;
-        Ok(Self::parse_embarkation_units(&data))
+        Ok(Self::parse_embarked_units(&data))
+    }
+
+    fn parse_embarked_units(data: &serde_json::Value) -> Vec<EmbarkedUnit> {
+        data["units"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|u| EmbarkedUnit {
+                id: u["id"].as_i64().unwrap_or(0),
+                name: u["name"].as_str().unwrap_or("").to_string(),
+                hull_number: u["hull_number"].as_str().unwrap_or("").to_string(),
+                class_name: u["class_name"].as_str().unwrap_or("").to_string(),
+            })
+            .collect()
     }
 
     fn parse_embarkation_units(data: &serde_json::Value) -> Vec<EmbarkationCandidate> {

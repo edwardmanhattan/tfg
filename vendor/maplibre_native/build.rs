@@ -635,7 +635,11 @@ fn build_local(
             .filter_map(|l| l.trim().strip_prefix("path"))
             .filter_map(|l| l.split_once('=').map(|(_, v)| v.trim()))
             .collect();
-        !paths.is_empty() && paths.iter().all(|p| maplibre_native_dir.join(p).is_dir())
+        let populated = |rel: &str| -> bool {
+            let p = maplibre_native_dir.join(rel);
+            fs::read_dir(&p).map_or(false, |mut it| it.next().is_some())
+        };
+        !paths.is_empty() && paths.iter().all(|p| populated(p))
     };
 
     // Re-evaluated on every call rather than hoisted: `submodule_update` only
