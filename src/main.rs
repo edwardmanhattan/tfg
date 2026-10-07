@@ -11739,7 +11739,8 @@ impl ShipApp {
 // Direct HelmOrder surface: one selected unit at a time,
 // with MinOS authority in Live mode and a labelled local
 // sandbox projection in Simulation mode.
-ui.heading("Helm");
+ui.strong("Helm");
+ui.separator();
 // Group selection is inspectable here, but the first slice
 // deliberately avoids a multi-unit helm fan-out.
 if let Some(Selection::Group(_gid)) = self.selection.clone() {
@@ -12398,7 +12399,13 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         {
             ui.weak(email);
         }
-        if ui.button("Sign out").clicked() {
+        if ui
+            .add_sized(
+                egui::vec2(ui.available_width(), 32.0),
+                egui::Button::new("Sign out"),
+            )
+            .clicked()
+        {
             self.sign_out("signed out from the operator island");
         }
         // NO status line here. It used to sit under a separator, and the
@@ -12535,10 +12542,14 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         ui.add(
             egui::TextEdit::singleline(&mut self.setup_name)
                 .desired_width(f32::INFINITY)
+                .min_size(egui::vec2(0.0, 32.0))
                 .hint_text("the exercise's name"),
         );
         if ui
-            .button("Create session →")
+            .add_sized(
+                egui::vec2(ui.available_width(), 32.0),
+                egui::Button::new("Create session →"),
+            )
             .on_hover_text("create it and hold it; the rest of the plan is authored in Planning")
             .clicked()
         {
@@ -12564,7 +12575,13 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             self.factor_draft = factor;
         }
         ui.weak(format!("Pace {:.0}× — read from Minos.", self.game_ratio));
-        if ui.button("Apply").clicked() {
+        if ui
+            .add_sized(
+                egui::vec2(ui.available_width(), 32.0),
+                egui::Button::new("Apply"),
+            )
+            .clicked()
+        {
             self.set_minos_factor(self.factor_draft);
         }
     }
@@ -12661,18 +12678,23 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         // on purpose (see above): the server 403s seats without the grant,
         // and the verdict that follows already says whose seat advances a
         // session.
-        if ui
-            .add_enabled(
-                clear,
-                egui::Button::new("Enter execution →"),
-            )
-            .on_hover_text(if clear {
-                "the server gates this itself"
-            } else {
-                "readiness is not clear"
+        // Full-width web-style primary: fixed 32px row so it aligns
+        // with every other island verb.
+        let enter_clicked = ui
+            .add_enabled_ui(clear, |ui| {
+                ui.add_sized(
+                    egui::vec2(ui.available_width(), 32.0),
+                    egui::Button::new("Enter execution →"),
+                )
+                .on_hover_text(if clear {
+                    "the server gates this itself"
+                } else {
+                    "readiness is not clear"
+                })
+                .clicked()
             })
-            .clicked()
-        {
+            .inner;
+        if enter_clicked {
             self.setup_advance_execution();
         }
         if !clear {
@@ -13027,7 +13049,13 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             );
         }
         ui.separator();
-        if ui.button("End session →").clicked() {
+        if ui
+            .add_sized(
+                egui::vec2(ui.available_width(), 32.0),
+                egui::Button::new("End session →"),
+            )
+            .clicked()
+        {
             self.close_game();
         }
         if let Some(note) = self.phase_note.clone() {
@@ -19927,6 +19955,14 @@ fn apply_ops_theme(ctx: &egui::Context) {
                 egui::CornerRadius::same(tokens::CONTROL_RADIUS);
             w.weak_bg_fill = tokens::BUTTON_GRAPHITE;
         }
+        // Tidy web-UI control edges: every button/field carries its own
+        // 1px border, so controls read as distinct rows rather than flat
+        // graphite on navy. Resting is the hairline, hover lifts to cut
+        // grey, press/active is the cyan signal.
+        v.widgets.inactive.bg_stroke =
+            egui::Stroke::new(1.0, tokens::HAIRLINE_SLATE);
+        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, tokens::CUT_GREY);
+        v.widgets.active.bg_stroke = egui::Stroke::new(1.0, tokens::RADAR_CYAN);
         // Hover and press wake up in the accent. Alpha, not `gamma_multiply`,
         // because gamma-multiplying a bright cyan at low intensity lands it
         // in the reds and the wash stops reading as the accent at all.

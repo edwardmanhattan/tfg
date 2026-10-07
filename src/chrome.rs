@@ -152,7 +152,7 @@ pub fn paint_island(painter: &Painter, rect: Rect, owns_input: bool) {
     painter.add(Shape::convex_polygon(
         pts.clone(),
         tokens::CONSOLE_NIGHT,
-        Stroke::new(1.0, tokens::HAIRLINE_SLATE),
+        Stroke::new(1.5, tokens::CUT_GREY),
     ));
 
     // Title band, clipped to the panel so it never crosses the diagonal.
@@ -166,7 +166,7 @@ pub fn paint_island(painter: &Painter, rect: Rect, owns_input: bool) {
             pos2(band.left(), band.bottom()),
             pos2(band.right(), band.bottom()),
         ],
-        Stroke::new(1.0, tokens::HAIRLINE_SLATE),
+        Stroke::new(1.0, tokens::CUT_GREY.linear_multiply(0.6)),
     );
 
     // The rim: the polygon's own outline, offset inward. Insetting rather

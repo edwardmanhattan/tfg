@@ -95,11 +95,13 @@ pub const RANK_OPERASI_GABUNGAN: Color32 = Color32::from_rgb(0xEA, 0x58, 0x0C);
 // ---------------------------------------------------------------------------
 
 /// A resting island's rim: CUT_GREY, lifted just enough off the hairline to
-/// separate the panel from a moving map.
+/// separate the panel from a moving map. High alpha on purpose: over a
+/// bright tile map a faint rim vanishes and stacked islands blur together.
 pub const RESTING_RIM: Color32 = CUT_GREY;
-/// A resting island's rim opacity. Low on purpose. A rim you can read across
-/// a room is a rim that has become the accent.
-pub const RESTING_RIM_ALPHA: f32 = 0.34;
+/// A resting island's rim opacity. Near-opaque so the panel edge reads as
+/// a clear border at a glance, while staying neutral grey (never the cyan
+/// accent, see ADR-0016).
+pub const RESTING_RIM_ALPHA: f32 = 0.85;
 
 /// The lit rim, on the single island that currently owns input.
 pub const ACTIVE_RIM: Color32 = RADAR_CYAN;
@@ -217,8 +219,9 @@ pub const TEXT_SCALE_LARGER: f32 = 1.15;
 pub const ZONE_W: f32 = 320.0;
 /// Gap from the window edge to the zone.
 pub const ZONE_EDGE_GAP: f32 = 24.0;
-/// Gap between stacked islands inside the zone.
-pub const ZONE_ISLAND_GAP: f32 = 16.0;
+/// Gap between stacked islands inside the zone. Tight, so adjacent islands
+/// read as one stacked column rather than floating fragments.
+pub const ZONE_ISLAND_GAP: f32 = 8.0;
 /// Gap from the window's top edge to the zone's first island, clearing the
 /// top zone's band.
 pub const ZONE_TOP_GAP: f32 = 56.0;
@@ -231,9 +234,11 @@ pub const CAMERA_OFFSET_FRACTION: f32 = 0.5;
 
 
 
-/// The rhythm. Item spacing 10 × 8, button padding 10 × 6, indent 20.
-pub const ITEM_SPACING: Vec2 = vec2(10.0, 8.0);
-pub const BUTTON_PADDING: Vec2 = vec2(10.0, 6.0);
+/// The rhythm. Item spacing 8 × 6, button padding 12 × 8, indent 20.
+/// Tight rows with roomy controls: the web-UI register (full-width fields
+/// and 32px buttons) rather than dense console packing.
+pub const ITEM_SPACING: Vec2 = vec2(8.0, 6.0);
+pub const BUTTON_PADDING: Vec2 = vec2(12.0, 8.0);
 pub const INDENT: f32 = 20.0;
 
 /// Control radius, uniform across the whole widget family so a control is

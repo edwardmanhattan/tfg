@@ -63,11 +63,12 @@ components:
     padding: "12px"
   seam:
     restColor: "{colors.cut-grey}"
-    restAlpha: 0.34
+    restAlpha: 0.85
     activeColor: "{colors.radar-cyan}"
     activeAlpha: 0.5
     width: "2px"
     inset: "1px"
+    outerBorder: "1.5px {colors.cut-grey}"
   band-scanline:
     pitch: "4px"
     alpha: 0.067
@@ -77,24 +78,27 @@ components:
     textColor: "{colors.button-label}"
     typography: "{typography.button}"
     rounded: "{shapes.control-radius}"
-    padding: "6px 10px"
+    padding: "8px 12px"
+    border: "1px {colors.hairline-slate}"
   button-hover:
     backgroundColor: "rgba(34, 211, 238, 0.16)"
     textColor: "#F0F0F0"
     rounded: "{shapes.control-radius}"
-    padding: "6px 10px"
+    padding: "8px 12px"
+    border: "1px {colors.cut-grey}"
   button-selected:
     backgroundColor: "{colors.radar-cyan}"
     textColor: "{colors.deep-well}"
     typography: "{typography.button}"
     rounded: "{shapes.control-radius}"
-    padding: "6px 10px"
+    padding: "8px 12px"
   text-field:
     backgroundColor: "{colors.deep-well}"
     textColor: "{colors.body-silver}"
     typography: "{typography.body}"
     rounded: "{shapes.control-radius}"
-    padding: "6px 10px"
+    padding: "8px 12px"
+    border: "1px {colors.hairline-slate}"
     width: "280px"
   top-zone:
     backgroundColor: "{colors.console-night}"
@@ -262,7 +266,8 @@ reading "cyan" learned nothing, because cyan was everywhere.
 So the rim has two states, and this is the rule extension ADR-0014
 anticipated and left as a one-line change:
 
-- **At rest**, the rim is Cut Grey at 34%, one step above the hairline. It
+- **At rest**, the rim is Cut Grey at 85% plus a 1.5px cut-grey outer
+  border, so stacked islands hold a clear edge over a bright tile map. It
   separates the panel from the moving map and says nothing else.
 - **Owning input**, the rim is Radar Cyan at 50%. Exactly one island is in
   this state at a time, and it is the one under the pointer.
@@ -364,10 +369,10 @@ produced it, it is Hack. No third family, and no monospace for effect.
 There is no grid and no breakpoint set. This is a native desktop window, so
 the spatial model is a **stage**, not a page.
 
-- **Spacing rhythm** — item spacing 10 × 8px, button padding 10 × 6px, island
+- **Spacing rhythm** — item spacing 8 × 6px, button padding 12 × 8px, island
   inner margin 12px. Rows are horizontal groups separated by 1px dividers
-  rather than by large gaps.
-- **Zone rhythm** — 16px between islands in the side zone, 24px between a
+  rather than by large gaps. Island verbs are full-width 32px rows.
+- **Zone rhythm** — 8px between islands in the side zone, 24px between a
   zone and the window edge.
 - **Scroll discipline** — island bodies scroll at a 420px cap so a tall
   island never swallows the map. Dense inner lists get their own tighter cap
