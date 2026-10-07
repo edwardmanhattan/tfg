@@ -173,6 +173,18 @@ _A Force draft tolerates a hull with no commander, which Minos does not: `game_u
 The roster as the operator has it on the client, before Minos has been told any of it: who is seated, as what, under which call sign, and who is leaving. Staging a seat, changing a role and unseating are all draft edits and none of them is a backend write. A Roster draft is written through in one ordered diff at a stage advance — seats before force assigns, because a piece IS a hull commanded by a participant, and unseats after the force, so nobody goes seatless while their hull is still being handed over.
 _Avoid_: staged roster, local roster, unsaved roster_
 
+**Planned helm**:
+A scenario commander's helm order held on their own client until the Game Master plays the step. The server applies an accepted order at once and queues nothing, so in a scenario game "Plan helm" stages locally and the order is posted when the step-start marker arrives. Maneuver games send at once; only scenario games hold.
+_Avoid_: queued order, pending order (the server queues nothing — this lives on the client)_
+
+**Step-start marker**:
+The broadcast message, callsign `STEP-START`, that the Game Master's client sends when a Play succeeds. It is the only signal commanders get that a step began (the server publishes no step event), and each client acts on it once: post the planned helm, then clear its own readiness so the next step asks again. A convention to be replaced by a real step event, not a feature of the server.
+_Avoid_: step event (that would be the server's)_
+
+**Step ready**:
+A commander's statement that their helm for the coming step is set. The server holds one readiness flag per participant and the step gate counts it, so it is the same flag as session readiness; the client separates the two by when each is offered (session readiness in preparation, step ready in execution) and clears it at each step start. Distinct from **Session ready**, which is a player's declaration that the exercise may begin.
+_Avoid_: ready (unqualified — two different declarations share the server's one flag)_
+
 **Book draft**:
 The scenario book as the operator has it on the client, before Minos has been told any of it: brand-new scenarios with their steps, plus step adds and step cuts against scenarios Minos already holds. Authoring a scenario or a step is a draft edit, never a backend write. A Book draft is written through in one ordered diff at a stage advance — creates before their steps, because a step belongs to a scenario the server has to hold first — and always before the transition, because the server only takes pages in planning.
 _Avoid_: staged book, local book, unsaved book_

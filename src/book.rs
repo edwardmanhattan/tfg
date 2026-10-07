@@ -45,12 +45,16 @@ pub struct StagedScenario {
 /// plus step adds and step cuts against scenarios the server holds.
 ///
 /// Step edits to a staged-new scenario live on the scenario itself; only
-/// edits to server-held scenarios need the side maps.
+/// edits to server-held scenarios need the side maps. Relations ride a
+/// side map too, keyed by (scenario, step) with either half staged
+/// (negative) or live — authoring links hulls to steps that do not exist
+/// yet is the ordinary planning flow, not an edge.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BookDraft {
     news: BTreeMap<i64, StagedScenario>,
     step_adds: BTreeMap<i64, Vec<StagedStep>>,
     step_cuts: Vec<(i64, i64)>,
+    step_relations: BTreeMap<(i64, i64), Vec<(String, i64)>>,
     next_local: i64,
 }
 
@@ -77,8 +81,11 @@ impl BookDraft {
 
     /// Abandon a staged-new scenario outright. Server-held scenarios are
     /// never deleted from here — the composer has no delete-scenario
-    /// control, so there is no write to plan for one.
+    /// control, so there is no write to plan for one. Its staged
+    /// relations go with it: posting links for a scenario that will
+    /// never exist would 404 every one.
     pub fn drop_scenario(&mut self, local_id: i64) -> bool {
+        self.step_relations.retain(|(sid, _), _| *sid != local_id);
         self.news.remove(&local_id).is_some()
     }
 
@@ -107,7 +114,12 @@ impl BookDraft {
         };
         let before = slot.steps.len();
         slot.steps.retain(|s| s.local_id != step_local);
-        slot.steps.len() != before
+        let dropped = slot.steps.len() != before;
+        if dropped {
+            // A step that never posts takes its staged links with it.
+            self.step_relations.remove(&(local_id, step_local));
+        }
+        dropped
     }
 
     /// Stage a step onto a server-held scenario.
@@ -137,6 +149,9 @@ impl BookDraft {
         let dropped = steps.len() != before;
         if steps.is_empty() {
             self.step_adds.remove(&scenario_id);
+        }
+        if dropped {
+            self.step_relations.remove(&(scenario_id, step_local));
         }
         dropped
     }
@@ -173,15 +188,62 @@ impl BookDraft {
         self.step_cuts.contains(&(scenario_id, step_id))
     }
 
+    /// Stage a step's whole related list: hulls of the exercise and nodes
+    /// of its task organisation, in authoring order. Either half of the
+    /// key may be staged (negative) — linking a hull to a step that does
+    /// not exist yet is the planning flow, and the flush posts it after
+    /// the step lands. An empty list is a real write (it clears), so
+    /// presence of the entry, not its length, is what plans.
+    pub fn stage_relations(&mut self, scenario_id: i64, step_id: i64, refs: Vec<(String, i64)>) {
+        self.step_relations.insert((scenario_id, step_id), refs);
+    }
+
+    /// The staged related list for a step, if the author touched it.
+    pub fn related(&self, scenario_id: i64, step_id: i64) -> Option<&Vec<(String, i64)>> {
+        self.step_relations.get(&(scenario_id, step_id))
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.news.is_empty() && self.step_adds.is_empty() && self.step_cuts.is_empty()
+        self.news.is_empty()
+            && self.step_adds.is_empty()
+            && self.step_cuts.is_empty()
+            && self.step_relations.is_empty()
     }
 
     /// Drop staged ops against scenarios the server no longer lists, so
-    /// a deleted scenario cannot hold orphaned steps in the draft.
+    /// a deleted scenario cannot hold orphaned steps in the draft. Cuts
+    /// take their staged links with them: posting relations for a step
+    /// being deleted would race its own removal.
     pub fn prune(&mut self, live_ids: &[i64]) {
         self.step_adds.retain(|sid, _| live_ids.contains(sid));
         self.step_cuts.retain(|(sid, _)| live_ids.contains(sid));
+        // Relations follow the same rule, but posting links for a staged
+        // row that no longer exists would 404 — so staged entries are
+        // checked against the draft itself, live ones against the server.
+        let draft_has = |sid: i64, step: i64| {
+            if sid < 0 {
+                return self
+                    .news
+                    .get(&sid)
+                    .is_some_and(|sc| sc.steps.iter().any(|s| s.local_id == step));
+            }
+            if step < 0 {
+                return self
+                    .step_adds
+                    .get(&sid)
+                    .is_some_and(|steps| steps.iter().any(|s| s.local_id == step));
+            }
+            !self.step_cuts.contains(&(sid, step))
+        };
+        self.step_relations.retain(|(sid, step), _| {
+            if *sid < 0 {
+                draft_has(*sid, *step)
+            } else if *step < 0 {
+                live_ids.contains(sid) && draft_has(*sid, *step)
+            } else {
+                live_ids.contains(sid) && draft_has(*sid, *step)
+            }
+        });
     }
 
     /// Drop the whole draft: a released hold, a closed session, a hold
@@ -190,6 +252,7 @@ impl BookDraft {
         self.news.clear();
         self.step_adds.clear();
         self.step_cuts.clear();
+        self.step_relations.clear();
         self.next_local = 0;
     }
 
@@ -217,21 +280,41 @@ pub enum ScenarioRef {
     New(i64),
 }
 
+/// Which step a staged write addresses: one the server holds, or one
+/// the same flush just posted (resolved from the step-add answer's diff
+/// at apply time — exactly one unknown step appears per answer, and any
+/// other count fails the flush loudly rather than guessing).
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepRef {
+    Live(i64),
+    New(i64),
+}
+
 /// One book write the sync owes Minos. Each is one endpoint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BookWrite {
     /// Append a scenario to the book's end. The answer carries the
     /// server id the staged steps resolve against.
     Create { local_id: i64, title: String },
-    /// Append a step to the end of a scenario.
+    /// Append a step to the end of a scenario. `step` is always staged
+    /// (live steps are never added) and resolves like the scenario.
     AddStep {
         scenario: ScenarioRef,
+        step: StepRef,
         content: String,
         window: Option<(String, String)>,
     },
     /// Delete one step. Positions are never renumbered, so no
     /// sibling write depends on this one.
     RemoveStep { scenario_id: i64, step_id: i64 },
+    /// Replace one step's related list: hulls of the exercise and nodes
+    /// of its task organisation. Last, because every row it names — the
+    /// scenario, the step, the pieces — has to exist first.
+    SetRelated {
+        scenario: ScenarioRef,
+        step: StepRef,
+        refs: Vec<(String, i64)>,
+    },
 }
 
 impl BookWrite {
@@ -245,6 +328,7 @@ impl BookWrite {
                 format!("add step {short:?}")
             }
             Self::RemoveStep { step_id, .. } => format!("remove step {step_id}"),
+            Self::SetRelated { refs, .. } => format!("relate {} post(s)", refs.len()),
         }
     }
 }
@@ -265,6 +349,7 @@ pub fn plan(draft: &BookDraft, live: &[LiveScenario]) -> Vec<BookWrite> {
         for step in &news.steps {
             writes.push(BookWrite::AddStep {
                 scenario: ScenarioRef::New(news.local_id),
+                step: StepRef::New(step.local_id),
                 content: step.content.clone(),
                 window: step.start.clone().zip(step.end.clone()),
             });
@@ -279,6 +364,7 @@ pub fn plan(draft: &BookDraft, live: &[LiveScenario]) -> Vec<BookWrite> {
         for step in steps {
             writes.push(BookWrite::AddStep {
                 scenario: ScenarioRef::Live(*sid),
+                step: StepRef::New(step.local_id),
                 content: step.content.clone(),
                 window: step.start.clone().zip(step.end.clone()),
             });
@@ -289,6 +375,24 @@ pub fn plan(draft: &BookDraft, live: &[LiveScenario]) -> Vec<BookWrite> {
             continue;
         }
         writes.push(BookWrite::RemoveStep { scenario_id: *sid, step_id: *step_id });
+    }
+    // Relations last: every row they name — the scenario, the step — is
+    // posted ahead of them.
+    for ((sid, step), refs) in &draft.step_relations {
+        let (scenario, step) = if *sid < 0 {
+            (ScenarioRef::New(*sid), StepRef::New(*step))
+        } else if *step < 0 {
+            if !live.iter().any(|l| l.id == *sid) {
+                continue;
+            }
+            (ScenarioRef::Live(*sid), StepRef::New(*step))
+        } else {
+            if !live.iter().any(|l| l.id == *sid) {
+                continue;
+            }
+            (ScenarioRef::Live(*sid), StepRef::Live(*step))
+        };
+        writes.push(BookWrite::SetRelated { scenario, step, refs: refs.clone() });
     }
     writes
 }
@@ -318,11 +422,19 @@ mod tests {
                 BookWrite::Create { local_id: local, title: "First light".into() },
                 BookWrite::AddStep {
                     scenario: ScenarioRef::New(local),
+                    step: StepRef::New(draft
+                        .get_new(local)
+                        .and_then(|sc| sc.steps.first().map(|s| s.local_id))
+                        .unwrap_or(0)),
                     content: "sweep north".into(),
                     window: Some(("0600".into(), "0700".into())),
                 },
                 BookWrite::AddStep {
                     scenario: ScenarioRef::New(local),
+                    step: StepRef::New(draft
+                        .get_new(local)
+                        .and_then(|sc| sc.steps.get(1).map(|s| s.local_id))
+                        .unwrap_or(0)),
                     content: "hold".into(),
                     window: None,
                 },
@@ -346,6 +458,13 @@ mod tests {
             plan(&draft, &[live(11)]),
             vec![BookWrite::AddStep {
                 scenario: ScenarioRef::Live(11),
+                step: StepRef::New(
+                    draft
+                        .added_steps(11)
+                        .next()
+                        .map(|s| s.local_id)
+                        .unwrap_or(0),
+                ),
                 content: "screen the lanes".into(),
                 window: None,
             }]
@@ -375,5 +494,100 @@ mod tests {
         let step = draft.stage_step_add(11, "screen the lanes", None);
         assert!(draft.drop_added_step(11, step));
         assert_eq!(plan(&draft, &[live(11)]), Vec::new());
+    }
+
+    #[test]
+    fn relations_post_after_creates_and_step_adds() {
+        // The ordinary planning flow: scenario and steps are staged, so
+        // their links are too — the flush must post the rows those links
+        // name BEFORE the links themselves.
+        let mut draft = BookDraft::new();
+        let local = draft.stage_scenario("First light");
+        let step = draft.stage_step_new(local, "sweep", None).unwrap();
+        draft.stage_relations(local, step, vec![("hull".into(), 13), ("node".into(), 5)]);
+        let writes = plan(&draft, &[]);
+        let kinds: Vec<&str> = writes
+            .iter()
+            .map(|w| match w {
+                BookWrite::Create { .. } => "create",
+                BookWrite::AddStep { .. } => "addstep",
+                BookWrite::RemoveStep { .. } => "remove",
+                BookWrite::SetRelated { .. } => "relate",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["create", "addstep", "relate"]);
+        assert!(matches!(
+            writes[2],
+            BookWrite::SetRelated {
+                scenario: ScenarioRef::New(_),
+                step: StepRef::New(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn live_relations_post_last() {
+        let mut draft = BookDraft::new();
+        draft.stage_step_add(11, "screen the lanes", None);
+        // One staged add and one link on a live step: add first, relate
+        // last, so the link names a step the server already holds.
+        draft.stage_relations(11, 3, vec![("hull".into(), 13)]);
+        let writes = plan(&draft, &[live(11)]);
+        let kinds: Vec<&str> = writes
+            .iter()
+            .map(|w| match w {
+                BookWrite::AddStep { .. } => "addstep",
+                BookWrite::SetRelated { .. } => "relate",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["addstep", "relate"]);
+        assert!(matches!(
+            writes[1],
+            BookWrite::SetRelated {
+                scenario: ScenarioRef::Live(11),
+                step: StepRef::Live(3),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cutting_a_step_drops_its_staged_links_at_prune() {
+        // Posting a link for a step being deleted would race its own
+        // removal, so the cut wins and the link goes with it.
+        let mut draft = BookDraft::new();
+        draft.stage_step_cut(11, 3);
+        draft.stage_relations(11, 3, vec![("hull".into(), 13)]);
+        draft.prune(&[11]);
+        let kinds: Vec<&str> = plan(&draft, &[live(11)])
+            .iter()
+            .map(|w| match w {
+                BookWrite::RemoveStep { .. } => "remove",
+                BookWrite::SetRelated { .. } => "relate",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["remove"], "the cut stands and its link is gone");
+    }
+
+    #[test]
+    fn an_empty_staged_list_is_a_real_write() {
+        // Clearing a step's relations is an edit: presence of the entry,
+        // not its length, is what plans.
+        let mut draft = BookDraft::new();
+        draft.stage_relations(11, 3, Vec::new());
+        assert_eq!(plan(&draft, &[live(11)]).len(), 1);
+    }
+
+    #[test]
+    fn prune_drops_relations_for_vanished_drafts() {
+        let mut draft = BookDraft::new();
+        let local = draft.stage_scenario("Temp");
+        let step = draft.stage_step_new(local, "x", None).unwrap();
+        draft.stage_relations(local, step, vec![("hull".into(), 13)]);
+        draft.prune(&[]);
+        assert!(draft.step_relations.is_empty());
     }
 }

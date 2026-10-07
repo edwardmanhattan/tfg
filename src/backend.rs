@@ -22,7 +22,7 @@ pub use error::BackendError;
 pub use auth::{AppRole, AuthenticatedUser, MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
 pub use feed::{GameMsg, MinosRest, Snapshot};
 pub use live::{LIVE_BACKOFF_BASE_SECS, LIVE_BACKOFF_CAP_SECS, LiveCmd, LiveEvent, LiveWire};
-pub use master::{BackendUser, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePace, GameRole, GameScenario, GameScenarioStep, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameReadinessView, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, TimeWindow, actual_to_rfc3339, assumed_hhmm_to_rfc3339, date_ok, hhmm_ok, hhmm_window_ok, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, Review, ScenarioRole, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
+pub use master::{AssetGroup, BackendUser, EmbarkationCandidate, EmbarkationResult, EmbarkedUnit, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePace, GameRole, GameScenario, GameScenarioStep, GameStepRun, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameReadinessView, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, OverCapacity, ServiceBranchCount, TimeWindow, UnitCapacity, UnitSpeedEntry, UnitSpeeds, actual_to_rfc3339, assumed_hhmm_to_rfc3339, date_ok, hhmm_ok, hhmm_window_ok, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, RelatedPerson, RelatedPost, Review, ScenarioRole, StepReadiness, StepReadinessPerson, StepRelated, StepRewind, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
 pub use replay::{FileReplay, now_ts};
 // Shared with live.rs and the tests below; not public API.
 pub(crate) use feed::FeedEvent;
@@ -795,7 +795,7 @@ mod tests {
         // Game lifecycle for the setup flow: create, assign, remove,
         // advance — every write answers with the collection it changed.
         let game = master
-            .create_game("AT", "Operasi Batu Malang", "", "", "", "", "")
+            .create_game("AT", "Operasi Batu Malang", "maneuver", "", "", "", "", "")
             .expect("create");
         assert_eq!(game.id, 3);
         assert_eq!(game.state, "planning", "games are born in planning");
@@ -842,6 +842,59 @@ mod tests {
         let roles = master.game_roles("AT", 9).expect("wrapped object reads");
         assert_eq!(roles.len(), 1, "wrapper holds the rows, not the envelope");
         assert_eq!(roles[0].id, 11);
+    }
+
+    #[test]
+    fn step_controls_answer_runs_and_readiness_counts() {
+        // Play/skip/end/rewind answer the run (no second call needed to
+        // draw the panel); the readiness read answers may-start plus who
+        // holds it back. Bodies are empty — everything rides the path.
+        let server = tiny_http::Server::http("127.0.0.1:18097").expect("bind test port");
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests().take(2) {
+                let url = rq.url().to_string();
+                let body = if url.ends_with("/readiness") {
+                    r#"{"status_code":200,"message":"Successfull","data":{"may_start":false,"reason":"2 of 3 participant(s) related to this step have not declared themselves ready.","related":2,"required":3,"ready":1,"outstanding":2,"excluded":1,"personnel":[{"id_user":6,"call_sign":"BUDI","is_ready":true,"asked":true},{"id_user":7,"call_sign":"MARKUS","is_ready":false,"asked":true}]}}"#
+                } else {
+                    r#"{"status_code":201,"message":"Created","data":{"id":4,"id_scenario":11,"id_step":31,"epoch":0,"state":"playing","assumed_start":"2026-11-01T07:00:00Z","assumed_end":null,"outstanding_at_start":0,"overrode_readiness":false}}"#
+                };
+                let _ = rq.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18097/api/v1").expect("client builds");
+        let run = master.play_step("AT", 3, 11, 31).expect("play answers the run");
+        assert_eq!(run.state, "playing");
+        assert_eq!(run.step_id, 31);
+        assert!(run.assumed_end.is_none(), "a playing run has no end yet");
+        let gate = master.step_readiness("AT", 3, 11, 31).expect("readiness reads");
+        assert!(!gate.may_start);
+        assert_eq!(gate.outstanding, 2);
+        assert_eq!(gate.personnel.len(), 2);
+        assert!(!gate.personnel[1].ready, "the outstanding name is named");
+    }
+
+    #[test]
+    fn step_related_reads_resolved_posts_and_people() {
+        // The related list answers posts with server-resolved names plus
+        // the personnel they oblige; the write replaces the whole list
+        // and answers the same shape.
+        let server = tiny_http::Server::http("127.0.0.1:18098").expect("bind test port");
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests().take(2) {
+                let body = r#"{"status_code":200,"message":"Successfull","data":{"related":[{"kind":"hull","id":13,"name":"KRI Ahmad Yani"},{"kind":"node","id":5,"name":"Unsur A"}],"personnel":[{"id_user":6,"call_sign":"BUDI"},{"id_user":9,"call_sign":""}]}}"#;
+                let _ = rq.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18098/api/v1").expect("client builds");
+        let view = master.step_related("AT", 3, 11, 31).expect("related reads");
+        assert_eq!(view.posts.len(), 2);
+        assert_eq!(view.posts[0].name, "KRI Ahmad Yani");
+        assert_eq!(view.personnel.len(), 2);
+        assert_eq!(view.personnel[0].call_sign, "BUDI");
+        let view = master
+            .set_step_related("AT", 3, 11, 31, &[("hull".to_string(), 13)])
+            .expect("related writes");
+        assert_eq!(view.posts.len(), 2, "the answer is the resolved list, not the echo");
     }
 
     #[test]

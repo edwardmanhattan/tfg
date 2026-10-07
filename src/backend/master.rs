@@ -139,13 +139,14 @@ impl MinosMaster {
                     StoredValue::Text(c["description_en"].as_str().unwrap_or("").to_string()),
                     StoredValue::Int(b2i(Self::bool_of(c, "is_system"))),
                     StoredValue::Int(c["type_count"].as_i64().unwrap_or(0)),
+                    opt_int(c.get("id_asset_group").cloned()),
                 ]
             })
             .collect();
         Ok(TableData {
             table: "unit_categories",
-            columns: "id, name, id_name, description_en, is_system, type_count",
-            placeholders: "?1, ?2, ?3, ?4, ?5, ?6",
+            columns: "id, name, id_name, description_en, is_system, type_count, id_asset_group",
+            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7",
             rows,
         })
     }
@@ -241,16 +242,19 @@ impl MinosMaster {
                     opt_int(Self::int_of(&u["unit_status"], "id")),
                     opt_int(Self::int_of(&u["service_branch"], "id")),
                     opt_int(Self::int_of(&u["movement_domain"], "id")),
+                    StoredValue::Null,
                 ]);
             }
             if list.len() < 200 {
                 break;
             }
         }
+        // asset_group_id is backfilled after sync (it lives on the
+        // category, not the hull); the column is written NULL here.
         Ok(TableData {
             table: "units",
-            columns: "id, name, hull_number, class_id, status_id, branch_id, domain_id",
-            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7",
+            columns: "id, name, hull_number, class_id, status_id, branch_id, domain_id, asset_group_id",
+            placeholders: "?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8",
             rows,
         })
     }
@@ -328,6 +332,21 @@ impl MinosMaster {
         unwrap_envelope(
             self.client
                 .patch(&format!("{}{}", self.base_url, path))
+                .bearer_auth(token)
+                .json(&body)
+                .send()?,
+        )
+    }
+
+    fn put(
+        &self,
+        token: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, BackendError> {
+        unwrap_envelope(
+            self.client
+                .put(&format!("{}{}", self.base_url, path))
                 .bearer_auth(token)
                 .json(&body)
                 .send()?,
@@ -647,18 +666,21 @@ impl MinosMaster {
     /// Create a game session (the concept's "Create Game"): born in
     /// `planning`, nothing else exists yet — participants, units and
     /// hierarchy attach afterwards, while planning lasts. Only `name`
-    /// is required; blank optionals are omitted, never sent empty.
+    /// and `mode` are required; blank optionals are omitted, never sent
+    /// empty. Mode is fixed at creation — no operation changes it after,
+    /// so the picker lives on the create form and nowhere else.
     pub fn create_game(
         &self,
         token: &str,
         name: &str,
+        mode: &str,
         description: &str,
         purpose: &str,
         target: &str,
         area: &str,
         map_tag: &str,
     ) -> Result<GameRow, BackendError> {
-        let mut body = serde_json::json!({ "name": name, "mode": "maneuver" });
+        let mut body = serde_json::json!({ "name": name, "mode": mode });
         for (k, v) in [
             ("description", description),
             ("purpose", purpose),
@@ -938,6 +960,11 @@ impl MinosMaster {
     /// client learns where the hull had reached when the order landed.
     /// Refused loudly outside execution, while paused, or for a hull
     /// the caller does not command: never queued, never synthesised.
+    /// Order a unit to steer. `medium` names the medium the order is
+    /// judged in; the server clamps the speed to the hull's maximum
+    /// for that medium (or the hull's own movement domain when the
+    /// order names none). An Amphibious hull has no default medium and
+    /// is refused until the order names one — the caller must send it.
     pub fn order_unit(
         &self,
         token: &str,
@@ -945,11 +972,16 @@ impl MinosMaster {
         unit_id: i64,
         heading_deg: f64,
         speed_kn: f64,
+        medium: Option<&str>,
     ) -> Result<GameFix, BackendError> {
+        let mut body = serde_json::json!({ "heading_deg": heading_deg, "speed_kn": speed_kn });
+        if let Some(m) = medium {
+            body["medium"] = serde_json::Value::String(m.to_string());
+        }
         let data = self.post_created(
             token,
             &format!("/games/{game_id}/units/{unit_id}/order"),
-            serde_json::json!({ "heading_deg": heading_deg, "speed_kn": speed_kn }),
+            body,
         )?;
         let malformed = |field: &str| {
             BackendError::Other(format!(
@@ -1902,6 +1934,233 @@ impl MinosMaster {
         Self::parse_scenario(&data, game_id)
     }
 
+    /// Read whether a step may start, and who is holding it back. Readable
+    /// in every state — the gate only bites when something starts the step,
+    /// but the answer is worth having while it is still answerable, because
+    /// that is how the Game Master finds out the node they picked obliges
+    /// only a referee.
+    pub fn step_readiness(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+    ) -> Result<StepReadiness, BackendError> {
+        let data = self.get(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}/readiness"),
+        )?;
+        Ok(Self::parse_step_readiness(&data))
+    }
+
+    /// Start a step. No body: everything play needs is in the path, and the
+    /// instant is stamped from the exercise clock. Answers the run, so no
+    /// second call is needed to draw the panel.
+    pub fn play_step(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+    ) -> Result<GameStepRun, BackendError> {
+        self.step_run_command(token, game_id, scenario_id, step_id, "play")
+    }
+
+    /// Move past a step without playing it. Allowed while people are
+    /// outstanding, and recorded as an override — the marker and the clock
+    /// jump land together.
+    pub fn skip_step(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+    ) -> Result<GameStepRun, BackendError> {
+        self.step_run_command(token, game_id, scenario_id, step_id, "skip")
+    }
+
+    /// Close a playing step. Nothing about the clock moves — a skip is the
+    /// control that jumps it.
+    pub fn end_step(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+    ) -> Result<GameStepRun, BackendError> {
+        self.step_run_command(token, game_id, scenario_id, step_id, "end")
+    }
+
+    /// Replay a step: the clock goes back to where it began and the
+    /// abandoned attempt is erased — orders, drags, reports, judgements
+    /// of that span included. Answers what the operation cost and
+    /// changed, not a run: a Game Master who just erased an attempt is
+    /// entitled to know how much of one.
+    pub fn rewind_step(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+    ) -> Result<StepRewind, BackendError> {
+        let data = self.post_empty(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}/rewind"),
+        )?;
+        Ok(Self::parse_step_rewind(&data))
+    }
+
+    fn step_run_command(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+        verb: &str,
+    ) -> Result<GameStepRun, BackendError> {
+        let data = self.post_empty(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}/{verb}"),
+        )?;
+        Self::parse_step_run(&data)
+    }
+
+    /// Read a step's related list: the posts it names plus the personnel
+    /// those oblige. Readable wherever the book reads.
+    pub fn step_related(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+    ) -> Result<StepRelated, BackendError> {
+        let data = self.get(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}/related"),
+        )?;
+        Ok(Self::parse_step_related(&data))
+    }
+
+    /// Replace a step's whole related list: hulls of the exercise and
+    /// nodes of its task organisation, nothing else. An empty list is
+    /// legal and clears it. Answers the same resolved shape the read
+    /// gives, so the editor redraws from what the server resolved rather
+    /// than from what it sent. Refusals name the entry (`related[i]`)
+    /// before the transaction opens; a post that left the exercise
+    /// between read and write is a 409, which is a race nobody caused.
+    pub fn set_step_related(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+        related: &[(String, i64)],
+    ) -> Result<StepRelated, BackendError> {
+        let refs: Vec<serde_json::Value> = related
+            .iter()
+            .map(|(kind, id)| serde_json::json!({ "kind": kind, "id": id }))
+            .collect();
+        let data = self.put(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}/related"),
+            serde_json::json!({ "related": refs }),
+        )?;
+        Ok(Self::parse_step_related(&data))
+    }
+
+    /// A step's related list, resolved: posts with server-resolved names
+    /// plus the personnel they oblige.
+    fn parse_step_related(v: &serde_json::Value) -> StepRelated {
+        StepRelated {
+            posts: v["related"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|r| {
+                    Some(RelatedPost {
+                        kind: r["kind"].as_str().unwrap_or("").to_string(),
+                        id: r["id"].as_i64()?,
+                        name: r["name"].as_str().unwrap_or("").to_string(),
+                    })
+                })
+                .collect(),
+            personnel: v["personnel"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|p| {
+                    Some(RelatedPerson {
+                        user_id: p["id_user"].as_i64()?,
+                        call_sign: p["call_sign"].as_str().unwrap_or("").to_string(),
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// One step run, as the control answers it.
+    fn parse_step_run(v: &serde_json::Value) -> Result<GameStepRun, BackendError> {
+        let id = v["id"]
+            .as_i64()
+            .ok_or_else(|| BackendError::Other("step run answer without an id".to_string()))?;
+        Ok(GameStepRun {
+            id,
+            scenario_id: v["id_scenario"].as_i64().unwrap_or(0),
+            step_id: v["id_step"].as_i64().unwrap_or(0),
+            epoch: v["epoch"].as_i64().unwrap_or(0),
+            state: v["state"].as_str().unwrap_or("").to_string(),
+            assumed_start: v["assumed_start"].as_str().map(|s| s.to_string()),
+            assumed_end: v["assumed_end"].as_str().map(|s| s.to_string()),
+            outstanding_at_start: v["outstanding_at_start"].as_i64().unwrap_or(0),
+            overrode_readiness: v["overrode_readiness"].as_bool().unwrap_or(false),
+        })
+    }
+
+    /// A rewind's answer: what it cost and changed, flat so the client
+    /// renders one sentence from it.
+    fn parse_step_rewind(v: &serde_json::Value) -> StepRewind {
+        StepRewind {
+            step_id: v["step"].as_i64().unwrap_or(0),
+            run_id: v["run"].as_i64().unwrap_or(0),
+            abandoned_attempt: v["abandoned_attempt"].as_i64().unwrap_or(0),
+            attempt: v["attempt"].as_i64().unwrap_or(0),
+            erased_orders: v["erased_orders"].as_i64().unwrap_or(0),
+            erased_reports: v["erased_reports"].as_i64().unwrap_or(0),
+            erased_telegrams: v["erased_telegrams"].as_i64().unwrap_or(0),
+            erased_judgements: v["erased_judgements"].as_i64().unwrap_or(0),
+            erased_steps: v["erased_steps"].as_i64().unwrap_or(0),
+        }
+    }
+
+    /// B4's answer: whether the step may start, and who holds it back.
+    fn parse_step_readiness(v: &serde_json::Value) -> StepReadiness {
+        StepReadiness {
+            may_start: v["may_start"].as_bool().unwrap_or(false),
+            reason: v["reason"].as_str().unwrap_or("").to_string(),
+            related: v["related"].as_i64().unwrap_or(0),
+            required: v["required"].as_i64().unwrap_or(0),
+            ready: v["ready"].as_i64().unwrap_or(0),
+            outstanding: v["outstanding"].as_i64().unwrap_or(0),
+            excluded: v["excluded"].as_i64().unwrap_or(0),
+            personnel: v["personnel"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|p| {
+                    Some(StepReadinessPerson {
+                        user_id: p["id_user"].as_i64()?,
+                        call_sign: p["call_sign"].as_str().unwrap_or("").to_string(),
+                        ready: p["is_ready"].as_bool().unwrap_or(false),
+                        asked: p["asked"].as_bool().unwrap_or(false),
+                    })
+                })
+                .collect(),
+        }
+    }
+
     /// The book, from either envelope shape.
     fn parse_scenarios(
         v: &serde_json::Value,
@@ -2211,7 +2470,8 @@ pub struct GameUpdate {
 
 /// One game's authoritative projection (H1): the detail read the held
 /// game's local stage derives from. `state` is one of planning,
-/// preparation, execution, closure; `mode` is always maneuver today.
+/// preparation, execution, closure; `mode` is maneuver, scenario or
+/// static, fixed at creation.
 /// The anchor + factor (H2) ride along: Minos stamps both on the
 /// execution transition, so a client selecting mid-exercise learns
 /// what the clock started from without ever being able to move it.
@@ -2696,6 +2956,98 @@ pub struct GameScenarioStep {
     pub end_hour: Option<String>,
 }
 
+/// One step run: what happened to one step in one attempt, on the assumed
+/// clock. The record rather than a state: `state` says playing, played or
+/// skipped, `epoch` says which attempt, and `assumed_end` exists only for
+/// a played step — a skip carries the single decision instant elsewhere.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameStepRun {
+    pub id: i64,
+    pub scenario_id: i64,
+    pub step_id: i64,
+    pub epoch: i64,
+    pub state: String,
+    pub assumed_start: Option<String>,
+    pub assumed_end: Option<String>,
+    /// How many related personnel had not declared when the step started
+    /// or was skipped — the skip's record pairs it with the override.
+    pub outstanding_at_start: i64,
+    pub overrode_readiness: bool,
+}
+
+/// One person a step obliges, with the two facts a screen needs to explain
+/// them: whether they have declared, and whether they are asked at all. A
+/// judge-side name on the resolution is never waited for: showing them as
+/// "not ready" would send the Game Master to chase a referee.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepReadinessPerson {
+    pub user_id: i64,
+    pub call_sign: String,
+    pub ready: bool,
+    pub asked: bool,
+}
+
+/// B4's answer: whether a step may start, and who is holding it back. The
+/// counts are both the screen and the sentence: `required` and `ready` are
+/// what a progress line draws, `outstanding` what the refusal reports, and
+/// `reason` the same sentence the refusal uses — a screen showing one
+/// wording and a refusal using another would be two rules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepReadiness {
+    pub may_start: bool,
+    pub reason: String,
+    pub related: i64,
+    pub required: i64,
+    pub ready: i64,
+    pub outstanding: i64,
+    pub excluded: i64,
+    pub personnel: Vec<StepReadinessPerson>,
+}
+
+/// A rewind's answer: what the erased attempt cost, table by table, plus
+/// which attempt was abandoned and which one the replay writes in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepRewind {
+    pub step_id: i64,
+    pub run_id: i64,
+    pub abandoned_attempt: i64,
+    pub attempt: i64,
+    pub erased_orders: i64,
+    pub erased_reports: i64,
+    pub erased_telegrams: i64,
+    pub erased_judgements: i64,
+    pub erased_steps: i64,
+}
+
+/// One related post as the read renders it: the ref plus the name the
+/// spine knows it by — a client rendering "related to 12" would have to
+/// hold the whole task organisation to say what 12 is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelatedPost {
+    pub kind: String,
+    pub id: i64,
+    pub name: String,
+}
+
+/// One person a step's related list resolves to, and the call sign to
+/// hail them by. `via` names the ref that brought them in — the node
+/// the author picked, not a hull two levels down they never mentioned.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelatedPerson {
+    pub user_id: i64,
+    pub call_sign: String,
+}
+
+/// A step's related list, resolved: the posts it names plus the
+/// personnel those oblige. The same shape answers the read and the
+/// write, so the editor redraws from what the server resolved rather
+/// than from what it sent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepRelated {
+    pub posts: Vec<RelatedPost>,
+    pub personnel: Vec<RelatedPerson>,
+}
+
 impl GameScenarioStep {
     /// The window, if both ends are present.
     ///
@@ -2891,6 +3243,97 @@ pub struct GameUnit {
     pub hierarchy_node: Option<i64>,
 }
 
+/// One hull's published speed figures for one medium. `is_default`
+/// marks the medium an order naming none is judged in — the hull's own
+/// movement domain, when that is also a medium. Amphibious hulls carry
+/// no default entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitSpeedEntry {
+    pub medium: String,
+    pub medium_id_name: String,
+    pub is_default: bool,
+    pub speed_max_kn: Option<f64>,
+    pub speed_cruise_kn: Option<f64>,
+    pub turn_rate_max_deg_s: Option<f64>,
+}
+
+/// A hull's speeds across every medium in the vocabulary, not only
+/// the ones it holds a figure for. An entry whose figures are absent
+/// says "no figure" — the same answer the order clamp gives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitSpeeds {
+    pub id_unit: i64,
+    pub name: String,
+    pub movement_domain: String,
+    pub speeds: Vec<UnitSpeedEntry>,
+}
+
+/// What a unit carries, and how many. `level` is a taxonomy level
+/// (class, type, …) and `id_level` its id; a client resolves the id
+/// against the taxonomy endpoints it already reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitCapacity {
+    pub level: String,
+    pub id_level: i64,
+    pub max_aboard: i64,
+}
+
+/// A hull that could be put inside a host, or that is already inside
+/// one. The picker list and the contents list share the shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbarkationCandidate {
+    pub id: i64,
+    pub name: String,
+    pub hull_number: String,
+    pub class_name: String,
+}
+
+/// A unit directly inside a host, as the contents list draws it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbarkedUnit {
+    pub id: i64,
+    pub name: String,
+    pub hull_number: String,
+    pub class_name: String,
+}
+
+/// A complement the whole attach or detach batch went past. A warning,
+/// not a refusal — the operation happened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverCapacity {
+    pub level: String,
+    pub id_level: i64,
+    pub max_aboard: i64,
+    pub would_hold: i64,
+}
+
+/// The host's contents after an attach or detach, with any complement
+/// the batch went past.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbarkationResult {
+    pub units: Vec<EmbarkedUnit>,
+    pub over_capacity: Vec<OverCapacity>,
+}
+
+/// One asset group (Aset Darat / Laut / Udara / Lainnya) with the
+/// number of live hulls in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssetGroup {
+    pub id: i64,
+    pub name: String,
+    pub id_name: String,
+    pub hull_count: i64,
+}
+
+/// One service branch with the number of live hulls in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServiceBranchCount {
+    pub id: i64,
+    pub name: String,
+    pub id_name: String,
+    pub hull_count: i64,
+}
+
 fn b2i(b: bool) -> i64 {
     if b { 1 } else { 0 }
 }
@@ -3003,6 +3446,241 @@ impl MinosMaster {
         crate::store::store_spec(conn, unit_id, spec.version, true, &body)
             .map_err(BackendError::Other)?;
         Ok(spec)
+    }
+
+    // ── Deployed-unit reads: speeds, capacities, embarkations ──────────
+
+    /// One hull's published speeds, one entry per medium in the
+    /// vocabulary. `is_default` marks the medium an order naming none is
+    /// judged in (the hull's own movement domain, when that is also a
+    /// medium). Amphibious hulls carry no default — an order must name
+    /// one. This is the same table the order clamp reads, so a screen
+    /// and an order cannot disagree about the limit.
+    pub fn unit_speeds(&self, token: &str, unit_id: i64) -> Result<UnitSpeeds, BackendError> {
+        let data = self.get(token, &format!("/units/{unit_id}/speeds"))?;
+        Ok(Self::parse_unit_speeds(&data, unit_id))
+    }
+
+    pub fn parse_unit_speeds(data: &serde_json::Value, unit_id: i64) -> UnitSpeeds {
+        let speeds = data["speeds"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| UnitSpeedEntry {
+                medium: entry["medium"].as_str().unwrap_or("").to_string(),
+                medium_id_name: entry["medium_id_name"].as_str().unwrap_or("").to_string(),
+                is_default: entry["is_default"].as_bool().unwrap_or(false),
+                speed_max_kn: entry["speed_max_kn"].as_f64(),
+                speed_cruise_kn: entry["speed_cruise_kn"].as_f64(),
+                turn_rate_max_deg_s: entry["turn_rate_max_deg_s"].as_f64(),
+            })
+            .collect();
+        UnitSpeeds {
+            id_unit: data["id_unit"].as_i64().unwrap_or(unit_id),
+            name: data["name"].as_str().unwrap_or("").to_string(),
+            movement_domain: data["movement_domain"].as_str().unwrap_or("").to_string(),
+            speeds,
+        }
+    }
+
+    /// What a unit carries, and how many — per hull, not per class.
+    /// `level` is a taxonomy level and `id_level` its id; a client
+    /// resolves the id against the taxonomy endpoints it already reads.
+    pub fn unit_capacities(
+        &self,
+        token: &str,
+        unit_id: i64,
+    ) -> Result<Vec<UnitCapacity>, BackendError> {
+        let data = self.get(token, &format!("/units/{unit_id}/capacities"))?;
+        Ok(Self::parse_capacities(&data))
+    }
+
+    pub fn parse_capacities(data: &serde_json::Value) -> Vec<UnitCapacity> {
+        data["capacities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|c| UnitCapacity {
+                level: c["level"].as_str().unwrap_or("").to_string(),
+                id_level: c["id_level"].as_i64().unwrap_or(0),
+                max_aboard: c["max_aboard"].as_i64().unwrap_or(0),
+            })
+            .collect()
+    }
+
+    /// Set what a unit carries, as a whole. The response is the stored
+    /// list, so the caller can confirm what landed.
+    pub fn set_unit_capacities(
+        &self,
+        token: &str,
+        unit_id: i64,
+        capacities: &[UnitCapacity],
+    ) -> Result<Vec<UnitCapacity>, BackendError> {
+        let body = serde_json::json!({
+            "capacities": capacities
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "level": c.level,
+                        "id_level": c.id_level,
+                        "max_aboard": c.max_aboard,
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        let data = self.put(token, &format!("/units/{unit_id}/capacities"), body)?;
+        Ok(Self::parse_capacities(&data))
+    }
+
+    /// What could be put inside a unit: live, not the host, not already
+    /// inside something, not an ancestor of the host, and of a kind the
+    /// host has declared it carries. Capped at 200. Empty means the
+    /// host declared no complements — capacities are the first thing an
+    /// operator sets.
+    pub fn embarkation_candidates(
+        &self,
+        token: &str,
+        unit_id: i64,
+    ) -> Result<Vec<EmbarkationCandidate>, BackendError> {
+        let data = self.get(token, &format!("/units/{unit_id}/embarkation-candidates"))?;
+        Ok(Self::parse_embarkation_units(&data))
+    }
+
+    /// What is directly inside a unit.
+    pub fn embarkations(
+        &self,
+        token: &str,
+        unit_id: i64,
+    ) -> Result<Vec<EmbarkedUnit>, BackendError> {
+        let data = self.get(token, &format!("/units/{unit_id}/embarkations"))?;
+        Ok(Self::parse_embarkation_units(&data))
+    }
+
+    fn parse_embarkation_units(data: &serde_json::Value) -> Vec<EmbarkationCandidate> {
+        data["units"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|u| EmbarkationCandidate {
+                id: u["id"].as_i64().unwrap_or(0),
+                name: u["name"].as_str().unwrap_or("").to_string(),
+                hull_number: u["hull_number"].as_str().unwrap_or("").to_string(),
+                class_name: u["class_name"].as_str().unwrap_or("").to_string(),
+            })
+            .collect()
+    }
+
+    /// Put units directly inside another. All-or-nothing: a ring, a unit
+    /// already inside something, an unknown id, or a duplicate id
+    /// refuses the whole batch with `unit_ids[<index>]` errors. Going
+    /// over a declared complement is a WARNING, not a refusal — the
+    /// answer reports which complement was exceeded. The response is
+    /// the host's contents after the attach.
+    pub fn attach_units(
+        &self,
+        token: &str,
+        unit_id: i64,
+        unit_ids: &[i64],
+    ) -> Result<EmbarkationResult, BackendError> {
+        let body = serde_json::json!({ "unit_ids": unit_ids });
+        let data = self.post(
+            token,
+            &format!("/units/{unit_id}/embarkations"),
+            body,
+        )?;
+        Ok(Self::parse_embarkation_result(&data))
+    }
+
+    /// Take units out of a hull. A physical delete, all-or-nothing, with
+    /// the same refusal shape as the attach. The response is the host's
+    /// remaining contents.
+    pub fn detach_units(
+        &self,
+        token: &str,
+        unit_id: i64,
+        unit_ids: &[i64],
+    ) -> Result<EmbarkationResult, BackendError> {
+        let body = serde_json::json!({ "unit_ids": unit_ids });
+        let data = self.post(
+            token,
+            &format!("/units/{unit_id}/embarkations/detach"),
+            body,
+        )?;
+        Ok(Self::parse_embarkation_result(&data))
+    }
+
+    fn parse_embarkation_result(data: &serde_json::Value) -> EmbarkationResult {
+        let units = data["units"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|u| EmbarkedUnit {
+                id: u["id"].as_i64().unwrap_or(0),
+                name: u["name"].as_str().unwrap_or("").to_string(),
+                hull_number: u["hull_number"].as_str().unwrap_or("").to_string(),
+                class_name: u["class_name"].as_str().unwrap_or("").to_string(),
+            })
+            .collect();
+        let over_capacity = data["over_capacity"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|c| OverCapacity {
+                level: c["level"].as_str().unwrap_or("").to_string(),
+                id_level: c["id_level"].as_i64().unwrap_or(0),
+                max_aboard: c["max_aboard"].as_i64().unwrap_or(0),
+                would_hold: c["would_hold"].as_i64().unwrap_or(0),
+            })
+            .collect();
+        EmbarkationResult { units, over_capacity }
+    }
+
+    // ── Fleet picker: asset groups and service-branch counts ───────────
+
+    /// Every asset group with the number of live hulls in it. Every
+    /// group is returned, including one holding nothing, so a tab with
+    /// no hulls renders a zero rather than a missing number. An
+    /// unclassified category is counted as `Aset Lainnya`.
+    pub fn asset_groups(&self, token: &str) -> Result<Vec<AssetGroup>, BackendError> {
+        let data = self.get(token, "/units/asset-groups")?;
+        Ok(data
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|g| AssetGroup {
+                id: g["id"].as_i64().unwrap_or(0),
+                name: g["name"].as_str().unwrap_or("").to_string(),
+                id_name: g["id_name"].as_str().unwrap_or("").to_string(),
+                hull_count: g["hull_count"].as_i64().unwrap_or(0),
+            })
+            .collect())
+    }
+
+    /// Every service branch with the number of live hulls in it. Every
+    /// branch is returned, including one holding nothing.
+    pub fn service_branch_counts(
+        &self,
+        token: &str,
+    ) -> Result<Vec<ServiceBranchCount>, BackendError> {
+        let data = self.get(token, "/units/service-branches")?;
+        Ok(data
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|b| ServiceBranchCount {
+                id: b["id"].as_i64().unwrap_or(0),
+                name: b["name"].as_str().unwrap_or("").to_string(),
+                id_name: b["id_name"].as_str().unwrap_or("").to_string(),
+                hull_count: b["hull_count"].as_i64().unwrap_or(0),
+            })
+            .collect())
     }
 }
 
@@ -3415,6 +4093,123 @@ mod window_authoring_tests {
     fn an_unrecognised_roster_envelope_is_empty_rather_than_wrong() {
         assert!(MinosMaster::parse_roster(&serde_json::json!({})).is_empty());
         assert!(MinosMaster::parse_roster(&serde_json::json!(null)).is_empty());
+    }
+
+    // ── Deployed-unit reads: speeds, capacities, embarkations ──────────
+
+    #[test]
+    fn unit_speeds_parse_every_medium_with_default_flag() {
+        let data = serde_json::json!({
+            "id_unit": 42,
+            "name": "KRI Ahmad Yani",
+            "movement_domain": "Sea",
+            "speeds": [
+                {
+                    "medium": "Sea",
+                    "medium_id_name": "Laut",
+                    "is_default": true,
+                    "speed_max_ms": 15.4,
+                    "speed_max_kn": 29.9,
+                    "speed_cruise_ms": 7.7,
+                    "speed_cruise_kn": 15.0,
+                    "turn_rate_max_deg_s": 3.5
+                },
+                {
+                    "medium": "Land",
+                    "medium_id_name": "Darat",
+                    "is_default": false,
+                    "speed_max_ms": null,
+                    "speed_max_kn": null,
+                    "speed_cruise_ms": null,
+                    "speed_cruise_kn": null,
+                    "turn_rate_max_deg_s": null
+                }
+            ]
+        });
+        let speeds = MinosMaster::parse_unit_speeds(&data, 42);
+        assert_eq!(speeds.id_unit, 42);
+        assert_eq!(speeds.name, "KRI Ahmad Yani");
+        assert_eq!(speeds.movement_domain, "Sea");
+        assert_eq!(speeds.speeds.len(), 2);
+        assert_eq!(speeds.speeds[0].medium, "Sea");
+        assert!(speeds.speeds[0].is_default);
+        assert_eq!(speeds.speeds[0].speed_max_kn, Some(29.9));
+        assert_eq!(speeds.speeds[1].medium, "Land");
+        assert!(!speeds.speeds[1].is_default);
+        assert_eq!(speeds.speeds[1].speed_max_kn, None);
+    }
+
+    #[test]
+    fn unit_speeds_empty_when_no_speeds_key() {
+        let speeds = MinosMaster::parse_unit_speeds(&serde_json::json!({}), 7);
+        assert_eq!(speeds.id_unit, 7);
+        assert!(speeds.speeds.is_empty());
+    }
+
+    #[test]
+    fn capacities_parse_level_id_and_max() {
+        let data = serde_json::json!({
+            "capacities": [
+                { "level": "class", "id_level": 555, "max_aboard": 4 },
+                { "level": "type", "id_level": 3321, "max_aboard": 2 }
+            ]
+        });
+        let caps = MinosMaster::parse_capacities(&data);
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0].level, "class");
+        assert_eq!(caps[0].id_level, 555);
+        assert_eq!(caps[0].max_aboard, 4);
+        assert_eq!(caps[1].level, "type");
+        assert_eq!(caps[1].id_level, 3321);
+        assert_eq!(caps[1].max_aboard, 2);
+    }
+
+    #[test]
+    fn embarkation_candidates_parse_units_list() {
+        let data = serde_json::json!({
+            "units": [
+                { "id": 9987, "name": "KRI Heli", "hull_number": "H-01", "class_name": "AS565" }
+            ]
+        });
+        let units = MinosMaster::parse_embarkation_units(&data);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].id, 9987);
+        assert_eq!(units[0].name, "KRI Heli");
+        assert_eq!(units[0].hull_number, "H-01");
+        assert_eq!(units[0].class_name, "AS565");
+    }
+
+    #[test]
+    fn embarkation_result_parses_units_and_over_capacity() {
+        let data = serde_json::json!({
+            "units": [
+                { "id": 9335, "name": "KRI Heli", "hull_number": "H-01", "class_name": "AS565" }
+            ],
+            "over_capacity": [
+                { "level": "type", "id_level": 5322, "max_aboard": 4, "would_hold": 5 }
+            ]
+        });
+        let result = MinosMaster::parse_embarkation_result(&data);
+        assert_eq!(result.units.len(), 1);
+        assert_eq!(result.units[0].id, 9335);
+        assert_eq!(result.over_capacity.len(), 1);
+        assert_eq!(result.over_capacity[0].level, "type");
+        assert_eq!(result.over_capacity[0].max_aboard, 4);
+        assert_eq!(result.over_capacity[0].would_hold, 5);
+    }
+
+    #[test]
+    fn asset_groups_parse_id_name_and_count() {
+        let data = serde_json::json!([
+            { "id": 2, "name": "Sea", "id_name": "Aset Laut", "hull_count": 88 }
+        ]);
+        // asset_groups returns a Vec directly, not wrapped in an envelope key
+        let groups: Vec<serde_json::Value> = data.as_array().cloned().unwrap_or_default();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["id"], 2);
+        assert_eq!(groups[0]["name"], "Sea");
+        assert_eq!(groups[0]["id_name"], "Aset Laut");
+        assert_eq!(groups[0]["hull_count"], 88);
     }
 
 }

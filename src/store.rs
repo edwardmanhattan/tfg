@@ -29,7 +29,8 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
         CREATE TABLE IF NOT EXISTS unit_categories (
             id INTEGER PRIMARY KEY, name TEXT NOT NULL,
             id_name TEXT NOT NULL DEFAULT '', description_en TEXT NOT NULL DEFAULT '',
-            is_system INTEGER NOT NULL DEFAULT 0, type_count INTEGER NOT NULL DEFAULT 0
+            is_system INTEGER NOT NULL DEFAULT 0, type_count INTEGER NOT NULL DEFAULT 0,
+            id_asset_group INTEGER
         );
         CREATE TABLE IF NOT EXISTS unit_types (
             id INTEGER PRIMARY KEY, name TEXT NOT NULL,
@@ -51,7 +52,8 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
         CREATE TABLE IF NOT EXISTS units (
             id INTEGER PRIMARY KEY, name TEXT NOT NULL, hull_number TEXT,
             class_id INTEGER, status_id INTEGER,
-            branch_id INTEGER, domain_id INTEGER
+            branch_id INTEGER, domain_id INTEGER,
+            asset_group_id INTEGER
         );
         -- Operator-authored branch → category ownership (setup-overhaul
         -- picker): declared mapping, not derived from hulls. Synced per
@@ -122,6 +124,31 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
         ",
     )
     .map_err(|e| e.to_string())?;
+    // Migration: add asset_group_id to existing units tables that
+    // predate the column. A fresh database gets it from the schema
+    // above; an older file needs the ALTER.
+    let has_column: bool = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('units') WHERE name = 'asset_group_id'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_column {
+        conn.execute_batch("ALTER TABLE units ADD COLUMN asset_group_id INTEGER")
+            .map_err(|e| e.to_string())?;
+    }
+    let has_cat_column: bool = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('unit_categories') WHERE name = 'id_asset_group'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_cat_column {
+        conn.execute_batch("ALTER TABLE unit_categories ADD COLUMN id_asset_group INTEGER")
+            .map_err(|e| e.to_string())?;
+    }
     Ok(conn)
 }
 
@@ -202,6 +229,25 @@ pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>, String> 
     .map_err(|e| e.to_string())
 }
 
+/// Resolve each unit's asset_group_id via its class → category.
+/// The /units list does not carry id_asset_group; it lives on the
+/// category. Runs after both tables are synced.
+fn backfill_unit_asset_groups(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "UPDATE units SET asset_group_id = (
+                SELECT c.id_asset_group
+                FROM unit_classes cl
+                JOIN unit_types t ON t.id = cl.type_id
+                JOIN unit_categories c ON c.id = t.category_id
+                WHERE cl.id = units.class_id
+            ) WHERE class_id IS NOT NULL",
+        )
+        .map_err(|e| e.to_string())?;
+    stmt.execute([]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Row counts per mirrored table, for the sync status line.
 pub fn table_counts(conn: &Connection) -> Result<Vec<(String, i64)>, String> {
     let mut out = Vec::new();
@@ -260,6 +306,11 @@ pub fn sync_from(
         map_n += replace_branch_categories(conn, bid, &ids)?;
     }
     counts.push(("branch_categories".to_string(), map_n));
+    // Backfill each unit's asset_group_id from its class → category.
+    // The /units list does not carry id_asset_group (it lives on the
+    // category), so the resolution happens here after both tables are
+    // synced.
+    backfill_unit_asset_groups(conn)?;
     meta_set(conn, "last_sync", &crate::backend::now_ts())?;
     Ok(counts)
 }
@@ -349,6 +400,44 @@ pub fn tax_branches(conn: &Connection) -> Result<Vec<TaxRow>, String> {
          GROUP BY h.id ORDER BY h.name",
         None,
     )
+}
+
+/// Asset groups from the helpers table, for the picker's top rung.
+/// The counts come from the backend's `/units/asset-groups` (live
+/// hulls), not from a local column — the group is stored on the
+/// category, and a local count would drift from the server's.
+pub fn asset_groups(conn: &Connection) -> Result<Vec<TaxRow>, String> {
+    tax_rows(
+        conn,
+        "SELECT h.id, h.name, h.id_name, 0
+         FROM helpers h
+         WHERE h.table_name = 'asset_groups'
+         GROUP BY h.id ORDER BY h.name",
+        None,
+    )
+}
+
+/// Unit ids belonging to an asset group, resolved via class → type →
+/// category. Used to filter the picker's drill when a group is
+/// selected.
+pub fn unit_ids_in_asset_group(
+    conn: &Connection,
+    asset_group_id: i64,
+) -> Result<Vec<i64>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT u.id FROM units u
+             LEFT JOIN unit_classes c ON c.id = u.class_id
+             LEFT JOIN unit_types t ON t.id = c.type_id
+             LEFT JOIN unit_categories cat ON cat.id = t.category_id
+             WHERE cat.id_asset_group = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([asset_group_id], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<i64>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 /// One branch's declared categories, with server type counts.

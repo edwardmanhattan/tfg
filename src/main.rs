@@ -574,6 +574,69 @@ fn warn_line(ui: &mut egui::Ui, msg: String) {
     ui.label(egui::RichText::new(format!("⚠ {msg}")).color(egui::Color32::YELLOW));
 }
 
+/// An RFC3339 instant read in WIB (+7, the zone this console operates
+/// in). `None` when it does not parse — server data is never hidden
+/// behind a failed parse; callers fall back to the raw string.
+fn wib_naive(raw: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.naive_utc() + chrono::Duration::hours(7))
+}
+
+/// One instant as the plan reads it: with its date for the real clock
+/// (`01 Nov 2026 · 1100`), bare military time for the exercise clock
+/// (`0000`) whose date is a fixed base — printing it would be noise.
+fn short_instant(raw: &str, with_date: bool) -> String {
+    match wib_naive(raw) {
+        Some(wib) if with_date => {
+            format!("{} · {}", wib.format("%d %b %Y"), wib.format("%H%M"))
+        }
+        Some(wib) => wib.format("%H%M").to_string(),
+        None => raw.to_string(),
+    }
+}
+
+/// A step's content as one browser row: truncated past sixty
+/// characters, and never blank — an unwritten step reads as unwritten
+/// rather than as an empty row that looks broken.
+fn short_step_text(content: &str) -> String {
+    if content.is_empty() {
+        return "(not written yet)".to_string();
+    }
+    let short: String = content.chars().take(60).collect();
+    if content.chars().count() > 60 {
+        format!("{short}…")
+    } else {
+        short
+    }
+}
+
+/// One clock's window as one readable line. A shared WIB day names its
+/// date once (`01 Nov 2026 · 1100–1200 WIB`); a spanning window names
+/// both. `None` only when both ends are absent; a half window names the
+/// missing end out loud.
+fn window_line(start: &Option<String>, end: &Option<String>, with_date: bool) -> Option<String> {
+    match (start.as_deref(), end.as_deref()) {
+        (None, None) => None,
+        (Some(s), None) => Some(format!("{} – end missing", short_instant(s, with_date))),
+        (None, Some(e)) => Some(format!("start missing – {}", short_instant(e, with_date))),
+        (Some(s), Some(e)) => {
+            if !with_date {
+                return Some(format!("{}–{}", short_instant(s, false), short_instant(e, false)));
+            }
+            match (wib_naive(s), wib_naive(e)) {
+                (Some(a), Some(b)) if a.date() == b.date() => Some(format!(
+                    "{} · {}–{} WIB",
+                    a.format("%d %b %Y"),
+                    a.format("%H%M"),
+                    b.format("%H%M")
+                )),
+                _ => Some(format!("{} – {} WIB", short_instant(s, true), short_instant(e, true))),
+            }
+        }
+    }
+}
+
 /// Whether RFC3339 instant `start` runs before `end`. `None` when either
 /// end does not parse: the caller says unreadable rather than comparing
 /// two strings whose offsets may differ.
@@ -587,23 +650,40 @@ fn rfc3339_runs_forwards(start: &str, end: &str) -> Option<bool> {
     Some(a < b)
 }
 
-/// The commander's dashboard footprint: four narrow columns across the
-/// bottom, clamped to the viewport so a small window gets a smaller
-/// station rather than one hanging off-screen.
-fn dashboard_size(ctx: &egui::Context) -> egui::Vec2 {
+/// The comms hub footprint: a fixed-width column down the right edge,
+/// clamped to the window so a short screen gets a shorter hub rather than
+/// one hanging below the fold.
+fn comms_size(ctx: &egui::Context) -> egui::Vec2 {
     let vp = ctx.viewport_rect();
-    egui::vec2((vp.width() - 24.0).min(1060.0).max(400.0), 300.0)
+    egui::vec2(
+        460.0_f32.min((vp.width() - 24.0).max(300.0)),
+        560.0_f32.min((vp.height() - 72.0).max(240.0)),
+    )
 }
 
-/// Where the dashboard first anchors: bottom-center with a small margin.
-/// Recomputed only until the first drag pins it (see `dashboard_pos`).
+/// Where the hub first anchors: top-right, just under the top band.
+/// Recomputed only until the first drag pins it (see `comms_pos`).
+fn comms_default_pos(ctx: &egui::Context) -> egui::Pos2 {
+    let vp = ctx.viewport_rect();
+    let size = comms_size(ctx);
+    egui::pos2((vp.width() - size.x - 12.0).max(0.0), 44.0)
+}
+
+/// The commander's dashboard footprint: full width across the bottom
+/// (ship, attached, helm share it), clamped to the viewport so a small
+/// window gets a smaller station rather than one hanging off-screen.
+fn dashboard_size(ctx: &egui::Context) -> egui::Vec2 {
+    let vp = ctx.viewport_rect();
+    egui::vec2((vp.width() - 24.0).max(400.0), 300.0)
+}
+
+/// Where the dashboard first anchors: bottom edge, full width with a
+/// small margin. Recomputed only until the first drag pins it (see
+/// `dashboard_pos`).
 fn dashboard_default_pos(ctx: &egui::Context) -> egui::Pos2 {
     let vp = ctx.viewport_rect();
     let size = dashboard_size(ctx);
-    egui::pos2(
-        ((vp.width() - size.x) / 2.0).max(0.0),
-        (vp.height() - size.y - 12.0).max(0.0),
-    )
+    egui::pos2(12.0, (vp.height() - size.y - 12.0).max(0.0))
 }
 
 /// Human-readable freshness for the context strip. A bare `162s` reads like
@@ -1706,12 +1786,48 @@ struct DashShip {
     label: String,
 }
 
+/// The callsign a step-started marker message carries. The server
+/// publishes no event when a step starts, so the Game Master's client
+/// broadcasts one: scenario commanders hold their helm orders until a
+/// message with this callsign arrives. A callsign rather than a body
+/// match because both the socket event and the inbox row carry it, and
+/// a convention in free text would be one rename away from silence.
+/// When the backend ships a real step event this constant and its two
+/// readers are the whole of what gets replaced.
+const STEP_START_CALLSIGN: &str = "STEP-START";
+
+/// A GM step control: play, skip, end or rewind one step. No body on the
+/// wire — everything the action needs is in the path, and instants come
+/// from the exercise clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepVerb {
+    Play,
+    Skip,
+    End,
+    Rewind,
+}
+
+impl StepVerb {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Play => "play",
+            Self::Skip => "skip",
+            Self::End => "end",
+            Self::Rewind => "rewind",
+        }
+    }
+}
+
 /// Everything the commander's dashboard reads, computed fresh per frame
 /// so it never disagrees with the mirrors.
 struct DashboardData {
     role_name: String,
     ready: bool,
     execution: bool,
+    /// A static exercise takes hand-set positions and refuses helm
+    /// orders, so the helm section previews instead of offering a form
+    /// the server would only refuse.
+    static_mode: bool,
     ships: Vec<DashShip>,
     attached: Vec<DashShip>,
 }
@@ -2470,6 +2586,9 @@ struct OrderOut {
 /// applies them. Notes render on the status line; multi-step reads
 /// bundle like SyncDone carries its connection.
 enum SetupDone {
+    /// One unit's published speeds, fetched for the helm slider and the
+    /// order's medium. Keyed by unit id.
+    UnitSpeeds(i64, tfg::backend::UnitSpeeds),
     Games(Vec<tfg::backend::GameRow>),
     /// The game list needs a staff read the account lacks: not an
     /// error to retry loudly, but the player-flow signal — room key
@@ -2490,15 +2609,39 @@ enum SetupDone {
     /// Carries the adoptee's user id for the line.
     StageRosterAdopted(Vec<tfg::backend::Participant>, i64),
     /// One stage-flush book write answered with the whole scenario. The
-    /// local id rides along so a staged-new create maps to the server id
-    /// its steps resolve against; step writes carry none.
-    StageBook(tfg::backend::GameScenario, Option<i64>),
+    /// scenario's local id rides along so a staged-new create maps to the
+    /// server id its steps resolve against, and a step-add carries the
+    /// staged step's local id so its server id can be learned from the
+    /// answer; every other write carries neither.
+    StageBook(tfg::backend::GameScenario, Option<i64>, Option<i64>),
+    /// One stage-flush related-list write answered with the resolved
+    /// list, held against the live (scenario, step) it landed on.
+    StageRelated((i64, i64), tfg::backend::StepRelated),
     /// A stage-flush write refused; the item's label is kept so the note
     /// names which seat, hull or page it was about. The queue is dropped
     /// — the live mirrors already carry the writes that succeeded, and
     /// the drafts still hold what did not, so the next attempt re-plans
     /// a fresh diff instead of replaying a stale one.
     StageFailed(String, String),
+    /// A GM step control answered with the run it made or closed.
+    StepRun(tfg::backend::GameStepRun),
+    /// The step-started marker landed. Its own variant because a plain
+    /// `MsgSent` clears the compose draft — which may be the very tasking
+    /// the Game Master is still writing for the next step.
+    StepMarkerSent(i64),
+    /// A rewind's answer: what the erased attempt cost, table by table.
+    StepRewound(tfg::backend::StepRewind),
+    /// B4's answer for one step: the gate plus who holds it back. Keyed,
+    /// because an answer that arrives after the operator moved on must
+    /// not paint another step's verdict.
+    StepGate((i64, i64), tfg::backend::StepReadiness),
+    /// A step's related list, resolved: posts with names plus the
+    /// personnel they oblige. Keyed like the gate; the flag says whether
+    /// this answer saved (seed the status line) or only read (seed the
+    /// draft quietly).
+    Related((i64, i64), tfg::backend::StepRelated, bool),
+    /// A GM step control refused; the verb is kept so the note names it.
+    StepFailed(String, String),
     Game(String, tfg::backend::GameRow),
     GameCreate(tfg::backend::GameRow, String),
     /// Admin game writes: the update answer is the re-read detail
@@ -2666,9 +2809,10 @@ struct ShipApp {
     fx: tfg::fx::Fx,
     show_orders: bool,
     show_log: bool,
-    /// The commander's dashboard: bottom station for seated non-GM
-    /// players from preparation onward — own ship, attached units, helm
-    /// (armed at ready + execution), comms summary. Closed persistently
+    /// The commander's dashboard: bottom station for seated
+    /// exercise-side players from preparation onward — own ship, attached units, helm
+    /// (armed at ready + execution). Mail lives in the top band.
+    /// Closed persistently
     /// with the island X; a stage entry reopens it.
     dashboard_open: bool,
     /// Where the dashboard floats. `None` anchors bottom-center every
@@ -2710,6 +2854,15 @@ struct ShipApp {
     order_result: HashMap<String, HelmOrderUiResult>,
     helm_submissions: HashMap<String, HelmSubmission>,
     helm_drafts: HashMap<String, HelmDraft>,
+    /// Per-unit published speeds from `/units/:id/speeds`, fetched when
+    /// the helm opens. The slider's upper bound and the order's medium
+    /// come from here — the same table the server's order clamp reads.
+    unit_speeds: HashMap<String, tfg::backend::UnitSpeeds>,
+    /// The medium selected for the next order, per unit. `None` means
+    /// "judge in the hull's default medium" (the server's rule when the
+    /// order names none). Amphibious hulls have no default, so the UI
+    /// forces a selection and this is `Some` for them.
+    helm_medium: HashMap<String, String>,
     /// Accepted helm intents stay visually pinned to the commander draft
     /// until the authoritative position animation has completed.
     helm_preview_pending: HashSet<String>,
@@ -2741,12 +2894,14 @@ struct ShipApp {
     /// session and sign-out.
     assessment_tab: usize,
     /// New-game form (step 1): name is required, the rest optional.
-    /// Mode is always maneuver (the only mode this release).
+    /// Mode is fixed at creation — no operation changes it after — so
+    /// the picker lives here and defaults to maneuver.
     setup_name: String,    setup_description: String,
     setup_purpose: String,
     setup_target: String,
     setup_area: String,
     setup_map_tag: String,
+    setup_mode: String,
     /// Held-game edit form (admin ticket): blank means leave alone
     /// (absent on the wire) — the detail carries no text fields to
     /// prefill from. Separate drafts from create; delete arms on
@@ -2841,6 +2996,49 @@ struct ShipApp {
     users_game_roles: Vec<tfg::backend::GameRole>,
     users_roster: Vec<tfg::backend::Participant>,
     users_gunits: Vec<tfg::backend::GameUnit>,
+    /// Step runs learned from the GM controls this hold, by answer —
+    /// play, skip, end and rewind all answer what they did, so the panel
+    /// never needs a second call. There is no listing route; a restart
+    /// re-derives the current step from the next answer, not from memory.
+    step_runs: Vec<tfg::backend::GameStepRun>,
+    /// Helm orders a scenario commander has planned but not sent: ship id
+    /// → (heading, speed). The server applies an accepted order at once
+    /// and queues nothing, so the hold has to live here until the Game
+    /// Master's Play is signalled.
+    staged_helm: HashMap<String, (f32, f32)>,
+    /// A step-started marker arrived: post the staged orders (retried per
+    /// frame while the setup slot is busy, never dropped).
+    pending_step_release: bool,
+    /// …and withdraw this commander's own readiness once released, so the
+    /// next step asks them to declare again. The server holds ONE
+    /// readiness flag and only a rewind resets it, so without this a
+    /// commander would stay "ready" for every later step.
+    pending_step_unready: bool,
+    /// When the Steps island last read the gate. The count of who is
+    /// ready changes by other people's hands, so the island re-reads on a
+    /// short timer rather than showing the number it saw once.
+    step_gate_read_at: Option<Instant>,
+    /// Marker message ids already acted on, and whether the inbox has been
+    /// read once. The first inbox read only BASELINES old markers —
+    /// otherwise opening the app mid-exercise would replay every earlier
+    /// step's release.
+    step_signals_seen: HashSet<i64>,
+    step_signals_primed: bool,
+    /// The comms hub, anchored top-right: step instructions plus the
+    /// whole inbox in one place. Replaces the floating Messages island
+    /// inside a session, whose default position sat under the side zone.
+    show_comms: bool,
+    comms_pos: Option<egui::Pos2>,
+    /// When the inbox was last read for the comms hub or the step-signal
+    /// poll, so a failing read is retried on a timer and never per frame.
+    comms_load_at: Option<Instant>,
+    /// Which step the Steps island has open, as (scenario, step). The
+    /// composer keeps its own selection — this one drives the execution
+    /// controls, and the two must never fight over a highlight.
+    /// B4's answer for the open step: the gate plus who holds it back.
+    /// Keyed, because an answer that arrives after the operator moved on
+    /// must not paint another step's verdict.
+    step_gate: Option<((i64, i64), tfg::backend::StepReadiness)>,
     /// The held game's scenario book, and which scenario the composer has
     /// open. The book is loaded with the rest of the Planning bundle; the
     /// open id is `None` when the composer is closed.
@@ -2986,9 +3184,31 @@ struct ShipApp {
     /// composer reads the merged view, and Minos catches up at a stage
     /// advance. See `tfg::book`.
     book_draft: tfg::book::BookDraft,
+    /// A step's related list as the server resolved it, keyed by
+    /// (scenario, step): posts with names plus the personnel they oblige.
+    /// Read on demand in the composer — the whole book's relations are
+    /// not worth a bundle slot.
+    related_cache: std::collections::HashMap<(i64, i64), tfg::backend::StepRelated>,
+    /// Which step's relate editor stands open, as (scenario, step):
+    /// server ids only, since relating addresses server rows.
+    relate_open: Option<(i64, i64)>,
+    /// The step whose cached list the draft was seeded from. Save is
+    /// only armed for a seeded draft — posting toggles against an
+    /// unread list would wipe relations the author never saw.
+    relate_loaded: Option<(i64, i64)>,
+    /// The relate working set: (kind, id) pairs in authoring order.
+    /// Order matters — a person reached twice is attributed to the
+    /// first ref that named them — so this is a Vec, not a set.
+    relate_draft: Vec<(String, i64)>,
     /// Server ids dealt for staged-new scenarios by the running flush,
     /// local id → server id. Lives only for the flush that made it.
     book_id_map: std::collections::HashMap<i64, i64>,
+    /// Server ids dealt for staged steps by the running flush: staged
+    /// step local id → server step id. Learned from each step-add
+    /// answer by diffing the scenario's step ids against what the
+    /// mirror held before — one new id per answer, or the flush fails
+    /// loudly rather than guessing which step it was.
+    book_step_map: std::collections::HashMap<i64, i64>,
     /// A placed hull being dragged to a new starting position, if the
     /// gesture is in flight.
     map_unit_move: Option<UnitMoveDrag>,
@@ -3539,6 +3759,11 @@ impl ShipApp {
                     self.feed("live token expired (109): refreshing".to_string());
                     self.refresh_now();
                 }
+                LiveEvent::Message(m) if m.callsign == STEP_START_CALLSIGN => {
+                    // A signal, not mail: it releases planned helm orders
+                    // and never opens or fills the inbox island.
+                    self.step_started(m.id);
+                }
                 LiveEvent::Message(m) => {
                     // H11: broadcast or addressed — drawn, filed, and
                     // the island opens itself once for the new mail.
@@ -3554,6 +3779,11 @@ impl ShipApp {
                         self.game_messages.pop_front();
                     }
                     self.show_messages = true;
+                    // The unread count and the instruction card read the
+                    // inbox, which a socket arrival does not touch.
+                    if self.setup_op.is_none() {
+                        self.refresh_inbox();
+                    }
                 }
                 LiveEvent::Resynced => {
                     let ids: Vec<String> = self.registry.ship_ids();
@@ -4021,6 +4251,14 @@ impl ShipApp {
             // refused by a boundary the author cannot see on screen.
             self.scenarios.clear();
             self.users_game_roles.clear();
+            self.step_runs.clear();
+            self.staged_helm.clear();
+            self.pending_step_release = false;
+            self.pending_step_unready = false;
+            self.step_gate_read_at = None;
+            self.step_signals_seen.clear();
+            self.step_signals_primed = false;
+            self.step_gate = None;
             self.composer_scenario = None;
             self.composer_visible = false;
             self.held_detail = None;
@@ -4034,7 +4272,12 @@ impl ShipApp {
             // half to reseed from, only staged intent.)
             self.roster_draft.clear();
             self.book_draft.clear();
+            self.related_cache.clear();
+            self.relate_open = None;
+            self.relate_loaded = None;
+            self.relate_draft.clear();
             self.book_id_map.clear();
+        self.book_step_map.clear();
             self.stage_queue.clear();
             self.stage_then = None;
             self.stage_armed = false;
@@ -4149,6 +4392,14 @@ impl ShipApp {
         self.games_loaded = false;
         self.users_game_roles.clear();
         self.users_roster.clear();
+        self.step_runs.clear();
+        self.staged_helm.clear();
+        self.pending_step_release = false;
+        self.pending_step_unready = false;
+        self.step_gate_read_at = None;
+        self.step_signals_seen.clear();
+        self.step_signals_primed = false;
+        self.step_gate = None;
         self.users_gunits.clear();
         self.commanded_hulls.clear();
         self.roster_gap = false;
@@ -4162,7 +4413,12 @@ impl ShipApp {
         self.stage_armed = false;
         self.roster_draft.clear();
         self.book_draft.clear();
+        self.related_cache.clear();
+        self.relate_open = None;
+        self.relate_loaded = None;
+        self.relate_draft.clear();
         self.book_id_map.clear();
+        self.book_step_map.clear();
         self.map_unit_move = None;
         self.placement_unplaced = 0;
         self.placement_ready = false;
@@ -4758,6 +5014,14 @@ impl ShipApp {
         self.watch_game_channel();
         self.users_game_roles.clear();
         self.users_roster.clear();
+        self.step_runs.clear();
+        self.staged_helm.clear();
+        self.pending_step_release = false;
+        self.pending_step_unready = false;
+        self.step_gate_read_at = None;
+        self.step_signals_seen.clear();
+        self.step_signals_primed = false;
+        self.step_gate = None;
         self.users_gunits.clear();
         self.commanded_hulls.clear();
         self.minos_tree.clear();
@@ -4770,7 +5034,12 @@ impl ShipApp {
         self.stage_armed = false;
         self.roster_draft.clear();
         self.book_draft.clear();
+        self.related_cache.clear();
+        self.relate_open = None;
+        self.relate_loaded = None;
+        self.relate_draft.clear();
         self.book_id_map.clear();
+        self.book_step_map.clear();
         self.map_unit_move = None;
         self.placement_unplaced = 0;
         self.placement_ready = false;
@@ -4979,6 +5248,14 @@ impl ShipApp {
             self.held_detail = None;
             self.users_game_roles.clear();
         self.users_roster.clear();
+        self.step_runs.clear();
+        self.staged_helm.clear();
+        self.pending_step_release = false;
+        self.pending_step_unready = false;
+        self.step_gate_read_at = None;
+        self.step_signals_seen.clear();
+        self.step_signals_primed = false;
+        self.step_gate = None;
             self.users_gunits.clear();
             self.commanded_hulls.clear();
             self.users_placements.clear();
@@ -4989,7 +5266,12 @@ impl ShipApp {
             self.stage_armed = false;
             self.roster_draft.clear();
             self.book_draft.clear();
+            self.related_cache.clear();
+            self.relate_open = None;
+            self.relate_loaded = None;
+            self.relate_draft.clear();
             self.book_id_map.clear();
+        self.book_step_map.clear();
             self.map_unit_move = None;
             self.placement_unplaced = 0;
             self.placement_ready = false;
@@ -5145,6 +5427,19 @@ impl ShipApp {
         // instead of answering 409 mid-flush.
         if self.stage_armed {
             self.plan_and_pump_stage();
+        }
+        // The step console reads the book, which the composer only loads
+        // in planning: the first bundle that seats this hold's step
+        // audience loads it, so the island is runnable without a trip to
+        // the composer. Personnel would only 403 behind the read
+        // (migration 000062), hence the gate — and an in-flight read is
+        // never doubled.
+        if self.game_state() == tfg::gamestate::GameState::Execution
+            && self.steps_audience()
+            && self.scenarios.is_empty()
+            && self.scenarios_op.is_none()
+        {
+            self.load_scenarios();
         }
     }
 
@@ -5972,6 +6267,7 @@ impl ShipApp {
         let targ = self.setup_target.clone();
         let area = self.setup_area.clone();
         let tag = self.setup_map_tag.clone();
+        let mode = self.setup_mode.clone();
         let (master, tok) = match self.users_client() {
             Ok(t) => t,
             Err(e) => {
@@ -5981,7 +6277,7 @@ impl ShipApp {
         };
         self.setup_op = Some(spawn_rest("create", move || {
             master
-                .create_game(&tok, &name, &desc, &purp, &targ, &area, &tag)
+                .create_game(&tok, &name, &mode, &desc, &purp, &targ, &area, &tag)
                 .map_err(|e| e.to_string())
                 .map(|g| {
                     let note = format!("created {} (planning)", g.name);
@@ -6208,6 +6504,9 @@ impl ShipApp {
             tfg::book::plan(&self.book_draft, &live_book).into_iter().map(StageWrite::Book),
         );
         if queue.is_empty() {
+            // Nothing owed: any book entries left are stale (their
+            // scenario vanished), and would only block the next advance.
+            self.book_draft.clear();
             if let Some(to) = self.stage_then.take() {
                 self.transition_to(&to);
             } else {
@@ -6223,6 +6522,7 @@ impl ShipApp {
         let n = queue.len();
         self.stage_queue = queue;
         self.book_id_map.clear();
+        self.book_step_map.clear();
         self.users_status = format!("syncing {n} change(s) to Minos…");
         self.pump_stage_flush();
     }
@@ -6285,6 +6585,14 @@ impl ShipApp {
             return;
         }
         let Some(write) = self.stage_queue.first().cloned() else {
+            // A drained queue means everything the plan owed has landed
+            // (ops against vanished scenarios were skipped at plan time),
+            // so the book draft is spent. Left standing it would refuse
+            // the next advance — drafts only sync from planning — and
+            // re-post the same pages on a retry.
+            self.book_draft.clear();
+            self.book_id_map.clear();
+            self.book_step_map.clear();
             if let Some(to) = self.stage_then.take() {
                 self.users_status = format!("synced — advancing to {to}");
                 self.transition_to(&to);
@@ -6358,11 +6666,13 @@ impl ShipApp {
             },
             StageWrite::Book(tfg::book::BookWrite::AddStep {
                 scenario: tfg::book::ScenarioRef::New(local),
+                step,
                 content,
                 window,
             }) => match self.book_id_map.get(&local).copied() {
                 Some(sid) => StageWrite::Book(tfg::book::BookWrite::AddStep {
                     scenario: tfg::book::ScenarioRef::Live(sid),
+                    step,
                     content,
                     window,
                 }),
@@ -6374,6 +6684,38 @@ impl ShipApp {
                     return;
                 }
             },
+            // A related list names a scenario and a step that may both be
+            // staged: each resolves from what the flush has learned so
+            // far, or the flush fails loudly rather than link a hull to
+            // a row it cannot name.
+            StageWrite::Book(tfg::book::BookWrite::SetRelated {
+                scenario,
+                step,
+                refs,
+            }) => {
+                let sid = match &scenario {
+                    tfg::book::ScenarioRef::Live(id) => Some(*id),
+                    tfg::book::ScenarioRef::New(local) => self.book_id_map.get(local).copied(),
+                };
+                let step_id = match &step {
+                    tfg::book::StepRef::Live(id) => Some(*id),
+                    tfg::book::StepRef::New(local) => self.book_step_map.get(local).copied(),
+                };
+                match (sid, step_id) {
+                    (Some(sid), Some(step_id)) => StageWrite::Book(tfg::book::BookWrite::SetRelated {
+                        scenario: tfg::book::ScenarioRef::Live(sid),
+                        step: tfg::book::StepRef::Live(step_id),
+                        refs,
+                    }),
+                    _ => {
+                        self.fail_stage(
+                            "sync refused at a related list: its scenario or step has no server id yet — retry the advance"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                }
+            }
             other => other,
         };
         let w = write.clone();
@@ -6454,10 +6796,11 @@ impl ShipApp {
                     .map_err(|e| e.to_string()),
                 StageWrite::Book(tfg::book::BookWrite::Create { local_id, title }) => master
                     .create_game_scenario(&tok, gid, title, "")
-                    .map(|sc| SetupDone::StageBook(sc, Some(*local_id)))
+                    .map(|sc| SetupDone::StageBook(sc, Some(*local_id), None))
                     .map_err(|e| e.to_string()),
                 StageWrite::Book(tfg::book::BookWrite::AddStep {
                     scenario: tfg::book::ScenarioRef::Live(sid),
+                    step,
                     content,
                     window,
                 }) => master
@@ -6468,18 +6811,35 @@ impl ShipApp {
                         content,
                         window.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
                     )
-                    .map(|sc| SetupDone::StageBook(sc, None))
+                    .map(|sc| {
+                        let step_local = match step {
+                            tfg::book::StepRef::New(local) => Some(*local),
+                            tfg::book::StepRef::Live(_) => None,
+                        };
+                        SetupDone::StageBook(sc, None, step_local)
+                    })
                     .map_err(|e| e.to_string()),
                 StageWrite::Book(tfg::book::BookWrite::AddStep {
                     scenario: tfg::book::ScenarioRef::New(_),
                     ..
                 }) => Err("staged scenario has no server id yet".to_string()),
+                StageWrite::Book(tfg::book::BookWrite::SetRelated {
+                    scenario: tfg::book::ScenarioRef::Live(sid),
+                    step: tfg::book::StepRef::Live(step_id),
+                    refs,
+                }) => master
+                    .set_step_related(&tok, gid, *sid, *step_id, refs)
+                    .map(|view| SetupDone::StageRelated((*sid, *step_id), view))
+                    .map_err(|e| e.to_string()),
+                StageWrite::Book(tfg::book::BookWrite::SetRelated { .. }) => {
+                    Err("a related list still names an unresolved scenario or step".to_string())
+                }
                 StageWrite::Book(tfg::book::BookWrite::RemoveStep {
                     scenario_id,
                     step_id,
                 }) => master
                     .delete_scenario_step(&tok, gid, *scenario_id, *step_id)
-                    .map(|sc| SetupDone::StageBook(sc, None))
+                    .map(|sc| SetupDone::StageBook(sc, None, None))
                     .map_err(|e| e.to_string()),
             };
             match res {
@@ -6907,7 +7267,13 @@ impl ShipApp {
     /// scenario time, clamping, and accepted Fix; no local SetOrder
     /// follows. Refusals (paused clock, wrong commander) stay loud and
     /// local. The draft is marked pending before the worker starts.
-    fn order_via_minos(&mut self, ship_id: &str, heading_deg: f32, speed_kn: f32) {
+    fn order_via_minos(
+        &mut self,
+        ship_id: &str,
+        heading_deg: f32,
+        speed_kn: f32,
+        medium: Option<String>,
+    ) {
         let Some(uid) = self.minos_order_target(ship_id) else {
             let msg = format!("unit {ship_id} is not available for commands");
             self.feed(msg.clone());
@@ -6919,13 +7285,14 @@ impl ShipApp {
             ship_id.to_string(),
             f64::from(heading_deg),
             speed_kn,
+            medium,
         )]);
     }
 
     /// #100: fire one batch op carrying every (unit, ship, heading,
     /// speed) leg. The worker fills each outcome; the apply reports
     /// them all and pulls the plot once.
-    fn spawn_order_batch(&mut self, legs: Vec<(i64, String, f64, f32)>) {
+    fn spawn_order_batch(&mut self, legs: Vec<(i64, String, f64, f32, Option<String>)>) {
         if legs.is_empty() {
             return;
         }
@@ -6944,13 +7311,20 @@ impl ShipApp {
                 return;
             }
         };
-        for (_, ship, heading, speed) in &legs {
+        for (_, ship, heading, speed, _) in &legs {
             self.mark_helm_pending(ship, *heading as f32, *speed);
         }
         self.setup_op = Some(spawn_rest("order", move || {
             let mut outs = Vec::with_capacity(legs.len());
-            for (uid, ship, heading, speed) in legs {
-                let result = match master.order_unit(&tok, gid, uid, heading, f64::from(speed)) {
+            for (uid, ship, heading, speed, medium) in legs {
+                let result = match master.order_unit(
+                    &tok,
+                    gid,
+                    uid,
+                    heading,
+                    f64::from(speed),
+                    medium.as_deref(),
+                ) {
                     Ok(fix) => Ok(fix),
                     Err(error) => {
                         let unknown = match &error {
@@ -7222,10 +7596,36 @@ impl ShipApp {
         }
     }
 
+    /// Fetch a unit's published speeds if not already loaded. The helm
+    /// slider's upper bound and the order's medium come from here —
+    /// the same table the server's order clamp reads, so a screen and
+    /// an order cannot disagree about the limit.
+    fn ensure_unit_speeds(&mut self, id: &str) {
+        if self.unit_speeds.contains_key(id) {
+            return;
+        }
+        let Ok(uid) = id.parse::<i64>() else {
+            return;
+        };
+        if self.setup_busy("unit-speeds") {
+            return;
+        }
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        self.setup_op = Some(spawn_rest("unit-speeds", move || {
+            master
+                .unit_speeds(&tok, uid)
+                .map_err(|e| e.to_string())
+                .map(|speeds| SetupDone::UnitSpeeds(uid, speeds))
+        }));
+    }
+
     /// Direct helm control for a caller-commanded piece in an executing
     /// MinOS game. The server receives only heading and speed; the
     /// authoritative GameFix and next plot update the marker.
     fn minos_order_ui(&mut self, ui: &mut egui::Ui, id: &str) {
+        self.ensure_unit_speeds(id);
         ui.label(format!("Unit {id} · direct helm control"));
         let reported = self
             .registry
@@ -7243,10 +7643,72 @@ impl ShipApp {
             .map(|draft| draft.speed_kn)
             .unwrap_or(reported_speed.unwrap_or(0.0))
             .max(0.0);
+        // The published speeds drive the slider's upper bound and the
+        // order's medium. `is_default` marks the medium an order naming
+        // none is judged in; amphibious hulls have no default, so the
+        // medium must be chosen.
+        let speeds = self.unit_speeds.get(id);
+        let default_medium = speeds.and_then(|sp| {
+            sp.speeds
+                .iter()
+                .find(|e| e.is_default)
+                .map(|e| e.medium.clone())
+        });
+        let max_kn = speeds.and_then(|sp| {
+            let medium = self
+                .helm_medium
+                .get(id)
+                .cloned()
+                .or_else(|| default_medium.clone());
+            sp.speeds
+                .iter()
+                .find(|e| Some(&e.medium) == medium.as_ref())
+                .and_then(|e| e.speed_max_kn)
+        });
         ui.horizontal(|ui| {
             Self::helm_heading_input(ui, &mut heading, true);
-            Self::helm_speed_control(ui, &mut speed, None, true);
+            Self::helm_speed_control(ui, &mut speed, max_kn.map(|m| m as f32), true);
         });
+        // Medium selector: always shown when the hull has multiple
+        // media, forced when amphibious (no default). The selected
+        // medium is sent with the order.
+        if let Some(sp) = speeds {
+            if sp.speeds.len() > 1 || default_medium.is_none() {
+                let mut selected = self
+                    .helm_medium
+                    .get(id)
+                    .cloned()
+                    .or_else(|| default_medium.clone())
+                    .unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label("medium");
+                    egui::ComboBox::from_id_salt(format!("medium-{id}"))
+                        .selected_text(if selected.is_empty() {
+                            "—"
+                        } else {
+                            selected.as_str()
+                        })
+                        .show_ui(ui, |ui| {
+                            for entry in &sp.speeds {
+                                ui.selectable_value(
+                                    &mut selected,
+                                    entry.medium.clone(),
+                                    format!(
+                                        "{} ({})",
+                                        entry.medium, entry.medium_id_name
+                                    ),
+                                );
+                            }
+                        });
+                });
+                if selected.is_empty() {
+                    ui.weak("select a medium — this hull has no default");
+                }
+                self.helm_medium.insert(id.to_string(), selected);
+            }
+        } else {
+            ui.weak("loading published speeds…");
+        }
         speed = speed.max(0.0);
         if draft.is_some_and(|draft| {
             (draft.heading_deg - heading).abs() > 0.01
@@ -7305,18 +7767,43 @@ impl ShipApp {
         {
             self.helm_drafts.remove(id);
         }
+        // In a scenario the fleet waits for the Game Master's Play: the
+        // server would apply an accepted order at once and queue nothing,
+        // so the buttons PLAN here and the order is posted when the step
+        // starts. Everywhere else they send, as before.
+        let hold = self.scenario_hold();
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!pending, egui::Button::new("Set helm"))
+                .add_enabled(
+                    !pending,
+                    egui::Button::new(if hold { "Plan helm" } else { "Set helm" }),
+                )
                 .clicked()
             {
-                self.order_via_minos(id, heading, speed);
+                let medium = self.helm_medium.get(id).cloned().filter(|m| !m.is_empty());
+                if hold {
+                    self.stage_helm(id, heading, speed);
+                } else {
+                    self.order_via_minos(id, heading, speed, medium);
+                }
             }
             if ui
-                .add_enabled(!pending, egui::Button::new("Hold position"))
+                .add_enabled(
+                    !pending,
+                    egui::Button::new(if hold { "Plan hold" } else { "Hold position" }),
+                )
                 .clicked()
             {
-                self.order_via_minos(id, reported_heading, 0.0);
+                if hold {
+                    self.stage_helm(id, reported_heading, 0.0);
+                } else {
+                    self.order_via_minos(
+                        id,
+                        reported_heading,
+                        0.0,
+                        self.helm_medium.get(id).cloned().filter(|m| !m.is_empty()),
+                    );
+                }
                 self.helm_drafts.insert(
                     id.to_string(),
                     HelmDraft {
@@ -7326,7 +7813,24 @@ impl ShipApp {
                 );
             }
         });
-        ui.weak("No waypoint: heading and speed remain in force until replaced.");
+        if hold {
+            match self.staged_helm.get(id) {
+                Some((h, sp)) => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "planned: {h:.0}° · {sp:.0} kn — the ship holds until the Game Master plays the step"
+                        ))
+                        .color(tfg::tokens::ALERT_YELLOW)
+                        .small(),
+                    );
+                }
+                None => {
+                    ui.weak("nothing planned — the ship holds until the Game Master plays the step");
+                }
+            }
+        } else {
+            ui.weak("No waypoint: heading and speed remain in force until replaced.");
+        }
     }
 
     fn helm_heading_input(ui: &mut egui::Ui, heading_deg: &mut f32, enabled: bool) {
@@ -7807,22 +8311,34 @@ impl ShipApp {
             });
             said_any = true;
         }
+        // The mode is fixed at creation, so it reads as a fact here
+        // rather than a control: maneuver integrates helm orders,
+        // scenario steers the same way around the Game Master's steps,
+        // static takes hand-set positions and refuses orders.
+        ui.label(
+            egui::RichText::new(format!("mode {}", d.mode))
+                .weak()
+                .small(),
+        );
         // The ends are the plan, and comparing them with the realised finish
-        // is the point of closure — so all four, not just the starts.
-        let mut ends = Vec::new();
-        for (label, value) in [
-            ("actual start", &d.window.actual_start),
-            ("assumed start", &d.window.assumed_start),
-            ("actual end", &d.window.actual_end),
-            ("assumed end", &d.window.assumed_end),
-        ] {
-            if let Some(v) = value {
-                ends.push(format!("{label} {v}"));
+        // is the point of closure — so both clocks read as one line each,
+        // in the zone the console operates in, with a missing end named
+        // rather than blank: the execution gate demands both ends, and a
+        // blank is the exact lie that strands a game in preparation.
+        let real = window_line(&d.window.actual_start, &d.window.actual_end, true);
+        let assumed = window_line(&d.window.assumed_start, &d.window.assumed_end, false);
+        match (&real, &assumed) {
+            (None, None) => {
+                ui.label(egui::RichText::new("window").weak().small());
+                ui.weak("no window set — execution needs both ends of both clocks");
             }
-        }
-        if !ends.is_empty() {
-            ui.label(egui::RichText::new(ends.join("  ·  ")).monospace().small());
-            said_any = true;
+            _ => {
+                ui.label(egui::RichText::new("real window").weak().small());
+                ui.label(real.as_deref().unwrap_or("not set"));
+                ui.label(egui::RichText::new("exercise window").weak().small());
+                ui.label(assumed.as_deref().unwrap_or("not set"));
+                said_any = true;
+            }
         }
         // The pace, echoed back because the edit form can set it and nothing
         // else on screen would show what it became. `None` is an unknown
@@ -7901,7 +8417,14 @@ impl ShipApp {
         });
         ui.horizontal(|ui| {
             ui.label("real date:");
-            ui.text_edit_singleline(&mut self.edit_actual_date);
+            // Fixed width: a full-width field eats the row and pushes
+            // the picker off-screen, which is how the calendar went
+            // undiscoverable. 110pt holds ten digits plus padding.
+            ui.add(
+                egui::TextEdit::singleline(&mut self.edit_actual_date)
+                    .desired_width(110.0)
+                    .hint_text("2026-11-01"),
+            );
             if ui
                 .small_button(if self.cal_open { "close" } else { "pick" })
                 .on_hover_text("choose the date the real window sits on")
@@ -8424,7 +8947,26 @@ impl ShipApp {
                 ui.label("map tag:");
                 ui.text_edit_singleline(&mut self.setup_map_tag);
             });
-            ui.weak("mode is always maneuver — the only mode this release.");
+            // Mode is fixed at creation — no operation changes it after —
+            // so this picker is the one place it is ever chosen. Maneuver
+            // integrates helm orders; scenario steers the same way while
+            // the Game Master plots steps around it; static takes hand-set
+            // positions and refuses orders.
+            ui.horizontal(|ui| {
+                ui.label("mode:");
+                egui::ComboBox::from_id_salt("setup-mode")
+                    .selected_text(self.setup_mode.clone())
+                    .show_ui(ui, |ui| {
+                        for m in ["maneuver", "scenario", "static"] {
+                            ui.selectable_value(&mut self.setup_mode, m.to_string(), m);
+                        }
+                    });
+            });
+            ui.weak(match self.setup_mode.as_str() {
+                "scenario" => "scenario: personnel steer like maneuver; the Game Master plays steps around them.",
+                "static" => "static: positions are set by hand — helm orders are refused.",
+                _ => "maneuver: the exercise integrates helm orders.",
+            });
         // The scenario book's entry point, on the island that already owns
         // the held session's own facts.
         //
@@ -9325,7 +9867,7 @@ impl ShipApp {
             }
             Some(p) if p.ready => {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} · {} — ready", p.user_name, p.role_name));
+                    ui.label(format!("{} · {} — ready to start", p.user_name, p.role_name));
                     if ui.small_button("withdraw").clicked() {
                         self.set_own_readiness(false);
                     }
@@ -9334,7 +9876,11 @@ impl ShipApp {
             Some(p) => {
                 ui.horizontal(|ui| {
                     ui.label(format!("{} · {}", p.user_name, p.role_name));
-                    if ui.button("declare ready").clicked() {
+                    if ui
+                        .button("ready to start")
+                        .on_hover_text("declares you ready for the exercise to begin — step readiness comes later, in My command")
+                        .clicked()
+                    {
                         self.set_own_readiness(true);
                     }
                 });
@@ -9605,6 +10151,28 @@ impl ShipApp {
             blockers.push("author a scenario in the composer".to_string());
         } else if steps == 0 {
             blockers.push("add at least one step to the book".to_string());
+        } else if self.held_detail.as_ref().is_some_and(|d| d.mode == "scenario") {
+            // The server refuses to play a step that relates nobody, and
+            // relations close with the book at execution — so this is the
+            // last moment the gap is fixable. `None` (a live step whose
+            // list was never read) is unknown, not empty: never a guess.
+            let bare: Vec<String> = self
+                .book_view()
+                .iter()
+                .flat_map(|sc| {
+                    sc.steps.iter().enumerate().filter_map(move |(i, st)| {
+                        Some((sc.id, st.id, format!("{} — step {}", sc.title, i + 1)))
+                    })
+                })
+                .filter(|(sid, step, _)| self.step_related_count(*sid, *step) == Some(0))
+                .map(|(_, _, label)| label)
+                .collect();
+            if !bare.is_empty() {
+                blockers.push(format!(
+                    "link hulls to every step — nothing is related for: {}",
+                    bare.join(", ")
+                ));
+            }
         }
         blockers
     }
@@ -9698,6 +10266,7 @@ impl ShipApp {
                             self.open_only(WhichModal::Settings);
                         }
                         self.clock_ui(ui);
+                        self.mail_ui(ui);
                     });
                 });
                 // Where the band ends, published for the modal backdrop.
@@ -9711,6 +10280,97 @@ impl ShipApp {
                 // into the map.
                 tfg::chrome::publish_top_band(ui.ctx(), ui.min_rect().bottom());
             });
+    }
+
+    /// The comms control in the top band, top-right: one button to the
+    /// hub, an unread count, and the latest instruction on a wide window.
+    /// ALWAYS present in a session — hiding it until mail existed left a
+    /// new player with no visible channel and no way to learn where
+    /// instructions would arrive.
+    fn mail_ui(&mut self, ui: &mut egui::Ui) {
+        if self.users_game.is_none() {
+            return;
+        }
+        let unread = self.unread_mail();
+        let instruction = self.current_instruction();
+        let label = if unread > 0 {
+            format!("comms ({unread})")
+        } else {
+            "comms".to_string()
+        };
+        let mut hover = match &instruction {
+            Some((who, text, _)) => {
+                let snippet: String = text.chars().take(80).collect();
+                format!("latest instruction — {who}: {snippet}")
+            }
+            None => "no instructions yet — the Game Master's tasking for a step arrives here".to_string(),
+        };
+        hover.push_str(" · click to open the comms hub");
+        if ui.button(label).on_hover_text(hover).clicked() {
+            self.show_comms = !self.show_comms;
+        }
+        // The instruction line is the first thing to go on a narrow
+        // window, same rule as the hint: a left group that eats the width
+        // pushes the sign-out button off the edge.
+        if ui.ctx().viewport_rect().width() > 1250.0
+            && let Some((who, text, _)) = instruction
+        {
+            let mut snippet: String = text.chars().take(48).collect();
+            if text.chars().count() > 48 {
+                snippet.push('…');
+            }
+            ui.label(egui::RichText::new(format!("{who}: {snippet}")).weak().small());
+        }
+    }
+
+    /// The comms hub body: what this player has been told to do for the
+    /// step, any helm they have planned, then the whole inbox and
+    /// composer. One surface in a session — the floating Messages
+    /// island's default spot sat under the side zone.
+    fn comms_body(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Step instructions");
+        match self.current_instruction() {
+            Some((who, text, at)) => {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("from {who}")).small().weak());
+                    if !at.is_empty() {
+                        ui.label(egui::RichText::new(short_timestamp(Some(at.as_str()))).small().weak());
+                    }
+                });
+                ui.label(text);
+            }
+            None => {
+                ui.weak("No instructions yet. The Game Master's tasking for the upcoming step appears here.");
+            }
+        }
+        // Honest about the plumbing, in the one place a player would look
+        // for a step feed: today tasking is ordinary mail.
+        ui.label(
+            egui::RichText::new(
+                "Instructions arrive as messages for now; a dedicated per-step feed will take over once the server publishes one.",
+            )
+            .small()
+            .weak(),
+        );
+        if self.scenario_hold() {
+            if self.staged_helm.is_empty() {
+                ui.label(
+                    egui::RichText::new("Helm: nothing planned — set it in My command, then press Ready for step.")
+                        .small(),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Helm: {} order(s) planned — released when the Game Master plays the step.",
+                        self.staged_helm.len()
+                    ))
+                    .small()
+                    .color(tfg::tokens::ALERT_YELLOW),
+                );
+            }
+        }
+        ui.separator();
+        self.messages_island(ui);
     }
 
     /// The link's state: a dot and one word.
@@ -10207,6 +10867,169 @@ impl ShipApp {
         }
     }
 
+    /// The task organisation flattened for the relate picker: (node id,
+    /// name, depth). Depth-indented at render; recursion is bounded by
+    /// the tree the organizer built.
+    fn flat_nodes(&self) -> Vec<(i64, String, usize)> {
+        fn walk(
+            nodes: &[tfg::backend::HierarchyNode],
+            depth: usize,
+            out: &mut Vec<(i64, String, usize)>,
+        ) {
+            for n in nodes {
+                out.push((n.id, n.name.clone(), depth));
+                walk(&n.children, depth + 1, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.minos_tree, 0, &mut out);
+        out
+    }
+
+    /// Open (or close) one step's relate editor, seeding the working set
+    /// from the best answer there is: the staged list when the author
+    /// touched it, else what the server resolved for a live step, else
+    /// nothing for a staged one. A live step with no cached read asks
+    /// the server and seeds when it answers.
+    fn toggle_relate(&mut self, sid: i64, step: i64) {
+        let key = (sid, step);
+        if self.relate_open == Some(key) {
+            self.relate_open = None;
+            return;
+        }
+        self.relate_open = Some(key);
+        if let Some(staged) = self.book_draft.related(sid, step) {
+            self.relate_draft = staged.clone();
+            self.relate_loaded = Some(key);
+        } else if let Some(view) = self.related_cache.get(&key) {
+            self.relate_draft = view.posts.iter().map(|p| (p.kind.clone(), p.id)).collect();
+            self.relate_loaded = Some(key);
+        } else if sid < 0 || step < 0 {
+            // Nothing on the server to read: a staged step starts empty.
+            self.relate_draft.clear();
+            self.relate_loaded = Some(key);
+        } else {
+            self.relate_draft.clear();
+            self.relate_loaded = None;
+            self.load_step_related(sid, step);
+        }
+    }
+
+    /// Every hull the author may link a step to: the local force draft
+    /// first (that is what the operator is looking at, and its pieces
+    /// reach the server before the book does in the flush), then any
+    /// server piece the draft does not hold. (unit id, label).
+    fn relatable_hulls(&self) -> Vec<(i64, String)> {
+        let mut out: Vec<(i64, String)> = self
+            .force
+            .hulls()
+            .map(|h| (h.unit_id, format!("{} ({})", h.name, h.hull_number)))
+            .collect();
+        for g in &self.users_gunits {
+            if !out.iter().any(|(id, _)| *id == g.unit_id) {
+                out.push((g.unit_id, format!("{} ({})", g.unit_name, g.hull_number)));
+            }
+        }
+        out
+    }
+
+    /// One step's related-list editor: hulls of the exercise and nodes
+    /// of its task organisation, checked against the working set, staged
+    /// whole. Nothing is posted from here — the advance writes the list
+    /// after the rows it names exist.
+    fn relate_editor_ui(&mut self, ui: &mut egui::Ui, sid: i64, step: i64) {
+        let key = (sid, step);
+        ui.label(egui::RichText::new("relate — hulls and nodes this step obliges").small());
+        // Who the list obliges. A staged list cannot be resolved until the
+        // server holds it; a live one shows the server's own resolution.
+        if self.book_draft.related(sid, step).is_some() {
+            ui.weak("staged — the server resolves who this obliges when it syncs");
+        } else {
+            match self.related_cache.get(&key) {
+                Some(view) if view.personnel.is_empty() => {
+                    ui.weak("obliges nobody yet — the gate refuses an empty list, so name something");
+                }
+                Some(view) => {
+                    let names: Vec<String> = view
+                        .personnel
+                        .iter()
+                        .map(|p| {
+                            if p.call_sign.trim().is_empty() {
+                                format!("user {}", p.user_id)
+                            } else {
+                                p.call_sign.clone()
+                            }
+                        })
+                        .collect();
+                    ui.weak(format!("obliges: {}", names.join(", ")));
+                }
+                None if sid > 0 && step > 0 => {
+                    ui.weak("reading the related list…");
+                }
+                None => {}
+            }
+        }
+        ui.label(egui::RichText::new("hulls").weak().small());
+        let hulls = self.relatable_hulls();
+        if hulls.is_empty() {
+            ui.weak("no hulls in the exercise yet — assign some in Fleet first");
+        }
+        for (unit_id, label) in hulls {
+            let item = ("hull".to_string(), unit_id);
+            let mut on = self.relate_draft.contains(&item);
+            if ui.checkbox(&mut on, label).changed() {
+                if on {
+                    if !self.relate_draft.contains(&item) {
+                        self.relate_draft.push(item);
+                    }
+                } else {
+                    self.relate_draft.retain(|k| k != &item);
+                }
+            }
+        }
+        ui.label(egui::RichText::new("task-organisation nodes").weak().small());
+        let nodes = self.flat_nodes();
+        if nodes.is_empty() {
+            ui.weak("no task organisation loaded");
+        }
+        for (id, name, depth) in nodes {
+            let item = ("node".to_string(), id);
+            let mut on = self.relate_draft.contains(&item);
+            if ui
+                .checkbox(&mut on, format!("{}{}", "  ".repeat(depth), name))
+                .changed()
+            {
+                if on {
+                    if !self.relate_draft.contains(&item) {
+                        self.relate_draft.push(item);
+                    }
+                } else {
+                    self.relate_draft.retain(|k| k != &item);
+                }
+            }
+        }
+        ui.horizontal(|ui| {
+            // A live step is armed only for a seeded draft: staging
+            // toggles against an unread list would clear relations the
+            // author never saw. A staged step has nothing to read.
+            let armed = self.relate_loaded == Some(key);
+            if ui
+                .add_enabled(armed, egui::Button::new("save"))
+                .on_hover_text(if armed {
+                    "stage the step's whole related list"
+                } else {
+                    "wait for the related list to load"
+                })
+                .clicked()
+            {
+                self.save_step_related(sid, step);
+            }
+            if ui.small_button("close").clicked() {
+                self.relate_open = None;
+            }
+        });
+    }
+
     /// The composer body, in two columns.
     ///
     /// Written as ONE `columns` closure with `cols[0]`/`cols[1]` indexed at
@@ -10334,6 +11157,7 @@ impl ShipApp {
                         cols[1].weak("No steps yet. A plan may be authored while it is written.");
                     }
                     let mut count = 0;
+                    let mut relate_toggle: Option<(i64, i64)> = None;
                     for step in open.steps.iter() {
                         count += 1;
                         cols[1].horizontal(|row| {
@@ -10361,10 +11185,37 @@ impl ShipApp {
                                     if tail.small_button("remove").clicked() {
                                         self.delete_scenario_step(step.id);
                                     }
+                                    // Any step can be linked, staged or live: the
+                                    // list is staged with the rest of the book and
+                                    // posted after the rows it names exist.
+                                    let rkey = (open.id, step.id);
+                                    let staged_links = self.book_draft.related(rkey.0, rkey.1);
+                                    let count = self.step_related_count(rkey.0, rkey.1);
+                                    if let Some(n) = count {
+                                        let label = if staged_links.is_some() {
+                                            format!("{n} post(s) · staged")
+                                        } else {
+                                            format!("{n} post(s)")
+                                        };
+                                        tail.label(egui::RichText::new(label).small().weak());
+                                    }
+                                    if tail
+                                        .small_button("relate")
+                                        .on_hover_text("hulls and nodes this step obliges")
+                                        .clicked()
+                                    {
+                                        relate_toggle = Some(rkey);
+                                    }
                                     tail.monospace(step.window_label());
                                 },
                             );
                         });
+                        if self.relate_open == Some((open.id, step.id)) {
+                            self.relate_editor_ui(&mut cols[1], open.id, step.id);
+                        }
+                    }
+                    if let Some((rsid, rstep)) = relate_toggle {
+                        self.toggle_relate(rsid, rstep);
                     }
                     // Staged cuts stand apart with their way back: hiding
                     // them outright would strand the operator with no undo
@@ -10767,7 +11618,13 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             // happened. Four islands in that order — the clock because it is
             // read most, the orders because they are the verb, and the two
             // that answer "is this going right" underneath both.
+            //
+            // Seated players get none of it: their station is the bottom
+            // dashboard (own ship, attached units, helm), and the organizer
+            // column answers questions they never ask. The Operator island
+            // above still shows — identity and sign-out belong to everyone.
             GameState::Execution => {
+                if !self.player_station() {
                 entries.push((
                     Island::new(egui::Id::new("z.clock"), "Exercise", egui::vec2(w, 200.0))
                         .with_trailing(&format!("G+{:02}:{:02}",
@@ -10780,6 +11637,26 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                         .with_trailing(&self.selection_label()),
                     true,
                 ));
+                // The Game Master's step console: play, skip, end, rewind
+                // plus what each step needs. Personnel must not see the
+                // plan, so the audience is the Game Master by canonical
+                // name plus judge-side seats, who hold the book's read
+                // grant (migration 000062) — controls additionally
+                // require the Game Master name (see `is_game_master`).
+                if self.steps_audience() {
+                    let step_trail = self
+                        .playing_run()
+                        .and_then(|r| {
+                            self.step_detail(r.scenario_id, r.step_id)
+                                .map(|(_, _, p)| format!("STEP {}", p + 1))
+                        })
+                        .unwrap_or_else(|| "—".to_string());
+                    entries.push((
+                        Island::new(egui::Id::new("z.steps"), "Steps", egui::vec2(w, 420.0))
+                            .with_trailing(&step_trail),
+                        true,
+                    ));
+                }
                 entries.push((
                     Island::new(egui::Id::new("z.crew"), "Crew", egui::vec2(w, 240.0))
                         .with_trailing(&format!("{} IN ROOM", self.crew_in_room())),
@@ -10789,6 +11666,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                     Island::new(egui::Id::new("z.log"), "Log", egui::vec2(w, 260.0)),
                     true,
                 ));
+                }
             }
             // Closure is read-only, so the column is what you debrief with:
             // the assessment workspace, and the log it is read out of.
@@ -10975,6 +11853,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 x if x == egui::Id::new("z.ready") => self.zone_ready_body(ui),
                 x if x == egui::Id::new("z.clock") => self.zone_exercise_body(ui),
                 x if x == egui::Id::new("z.orders") => self.zone_orders_body(ui),
+                x if x == egui::Id::new("z.steps") => self.zone_steps_body(ui),
                 x if x == egui::Id::new("z.crew") => self.zone_crew_body(ui),
                 x if x == egui::Id::new("z.log") => self.zone_log_body(ui),
                 x if x == egui::Id::new("z.assessment") => self.zone_assessment_body(ui),
@@ -11310,7 +12189,12 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         // preparation, and the Game Master reads it here and shares it
         // out of band — personnel type it into step 1 to join the room.
         // Same readout as the planning Review; this island is where the
-        // Game Master stands while personnel arrive.
+        // Game Master stands while personnel arrive. Shown to every seat:
+        // who may advance is the server's policy call (a renamed Game
+        // Master role still runs its exercise), so gating this island on
+        // the role NAME would strand exactly the session it claims to
+        // help — a 403 behind the button already says whose seat advances
+        // it, with the verdict to match.
         match self.minos_room_key.clone() {
             Some(key) => {
                 ui.horizontal(|ui| {
@@ -11336,7 +12220,10 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         ui.separator();
         // Entering execution is the Preparation island's one verb. It was
         // the phase bar's, and the bar went away with the wizard, so without
-        // this an exercise could never leave preparation.
+        // this an exercise could never leave preparation. Ungated by role
+        // on purpose (see above): the server 403s seats without the grant,
+        // and the verdict that follows already says whose seat advances a
+        // session.
         if ui
             .add_enabled(
                 clear,
@@ -11359,10 +12246,50 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         status_line(ui, &self.users_status.clone());
     }
 
+    /// Whether the caller sits in the Game Master seat, matched by the
+    /// canonical role name. Best effort, NOT authority: game roles may be
+    /// renamed (one deployment's organizer seat reads `Penyelenggara`),
+    /// while the server arbitrates the real grant by policy — the minos
+    /// transition check replaced its own name comparison for exactly this
+    /// reason. So this only ever hides EXTRA controls (safe direction),
+    /// and anything it gates degrades to read-only plus a loud refusal
+    /// rather than a silent dead end. Never use it for a verb whose
+    /// refusal would strand the exercise: the advance stays ungated.
+    fn is_game_master(&self) -> bool {
+        self.own_roster_row()
+            .is_some_and(|p| p.role_name == "Game Master")
+    }
+
+    /// Seated exercise-side players run the exercise from the bottom
+    /// dashboard, not the side column: the organizer islands (exercise
+    /// clock, orders, crew) answer questions/commanders never ask — the
+    /// dashboard answers theirs. Matched by the judge flag, never by
+    /// role name (see `is_game_master`): a renamed seat still steers.
+    fn player_station(&self) -> bool {
+        self.own_roster_row()
+            .is_some_and(|p| !self.users_is_judge(&p))
+    }
+
+    /// Who gets the Steps island: the Game Master by canonical name, or
+    /// judge-side seats, who hold the book's read grant and assess the
+    /// plan against the play. Personnel (exercise-side, unnamed by the
+    /// grant) never see it — the plan is what they are exercised
+    /// against. Controls additionally require the Game Master name (see
+    /// `is_game_master`); everyone else in this audience gets the book
+    /// and its gates read-only.
+    fn steps_audience(&self) -> bool {
+        self.is_game_master()
+            || self
+                .own_roster_row()
+                .is_some_and(|p| self.users_is_judge(&p))
+    }
+
     /// The dashboard's world, or why there is none: Simulation only,
-    /// preparation onward, seated non-GM with at least one hull. The
-    /// Game Master runs the exercise from the side islands and judges
-    /// hold no helm — this station is the commanders'.
+    /// preparation onward, seated exercise-side players with at least
+    /// one hull. Judges hold no helm, so the flag excludes them; the
+    /// Game Master runs from the side islands, and a hull-holding Game
+    /// Master simply gets both stations — matched by capability, never
+    /// by role name (see `is_game_master`).
     fn dashboard_data(&self) -> Option<DashboardData> {
         if self.app_mode != AppMode::Simulation {
             return None;
@@ -11372,10 +12299,10 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             tfg::gamestate::GameState::Preparation | tfg::gamestate::GameState::Execution => {}
             _ => return None,
         }
-        let own = self.own_roster_row()?;
-        if own.role_name == "Game Master" || self.users_is_judge(&own) {
+        if !self.player_station() {
             return None;
         }
+        let own = self.own_roster_row()?;
         let me = self.auth_user_id?;
         // Own pieces first (the join/readiness answer), then the staff
         // unit list filtered to my command — whichever half this account
@@ -11415,14 +12342,18 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             role_name: own.role_name.clone(),
             ready: own.ready,
             execution,
+            static_mode: self
+                .held_detail
+                .as_ref()
+                .is_some_and(|d| d.mode == "static"),
             ships,
             attached,
         })
     }
 
     /// Bottom station for seated commanders: own ship, attached units,
-    /// helm, comms. Shown from preparation onward; the helm orders
-    /// nothing before it arms (ready + execution), and
+    /// helm. Shown from preparation onward; the helm orders
+    /// nothing before execution (and never in a static game), and
     /// `minos_order_target` re-checks execution + command at send time,
     /// so a stale arm can never fire.
     fn dashboard_island(&mut self, ui: &mut egui::Ui) {
@@ -11432,22 +12363,47 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         if !self.dashboard_open {
             return;
         }
+        // The fallback for a step-started marker the socket dropped: while
+        // orders are planned (and until the inbox has been read once, to
+        // baseline old markers) the inbox is re-read on a timer. Without
+        // it a missed signal would hold a commander's helm forever.
+        if self.scenario_hold() {
+            let wanted = !self.step_signals_primed || !self.staged_helm.is_empty();
+            if wanted {
+                let due = self
+                    .comms_load_at
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
+                if due && self.setup_op.is_none() {
+                    self.comms_load_at = Some(Instant::now());
+                    self.refresh_inbox();
+                }
+                ui.ctx().request_repaint_after(Duration::from_secs(5));
+            }
+        }
         // Follow a valid hull: the stored pick, else the first held.
         let active = match self.dashboard_ship.clone() {
             Some(id) if data.ships.iter().any(|s| s.id == id) => id,
             _ => data.ships.first().map(|s| s.id.clone()).unwrap_or_default(),
         };
         self.dashboard_ship = Some(active.clone());
-        let armed = data.ready && data.execution;
+        // The helm opens with execution, not with readiness: a commander
+        // plans first and declares after, and (in a scenario) the step
+        // start clears the declaration — a form gated on it would vanish
+        // exactly when the next step needs it.
+        let armed = data.execution && !data.static_mode;
         let trailing = format!(
             "{} · {}",
             data.role_name,
-            if armed {
-                "armed"
-            } else if !data.ready {
-                "not ready"
+            if data.static_mode {
+                "static"
+            } else if data.execution && data.ready {
+                "ready for step"
+            } else if data.execution {
+                "set helm, then ready"
+            } else if data.ready {
+                "ready to start"
             } else {
-                "preparation"
+                "not ready to start"
             }
         );
         let spec = tfg::chrome::Island::new(egui::Id::new("dashboard"), "My command", dashboard_size(ui.ctx()))
@@ -11466,9 +12422,9 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         // to one of my hulls; `select` only opens the Inspector.
         let mut follow: Option<String> = None;
         let mut select: Option<String> = None;
-        let mut open_messages = false;
+        let mut declare: Option<bool> = None;
         tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
-            ui.columns(4, |cols| {
+            ui.columns(3, |cols| {
                 // -- own ship --
                 cols[0].label("Ship");
                 if data.ships.len() > 1 {
@@ -11541,6 +12497,40 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 }
                 // -- helm --
                 cols[2].label("Helm");
+                // READY FOR THE STEP, in execution only. Not the readiness a
+                // player declares to enter the session (that lives in the
+                // Readiness island, in preparation): this one says "my
+                // helm for this step is set". The server keeps ONE flag per
+                // participant and the step gate counts it, so it is the
+                // same declaration — the client clears it when each step
+                // starts (see `step_started`), which is what makes it a
+                // per-step statement. Before execution the control would
+                // be indistinguishable from the session one, so it is not
+                // offered here at all.
+                if data.execution {
+                    cols[2].horizontal(|row| {
+                        if data.ready {
+                            row.label(
+                                egui::RichText::new("✓ ready for this step")
+                                    .small()
+                                    .color(egui::Color32::from_rgb(0x4A, 0xDE, 0x80)),
+                            );
+                            if row.small_button("not ready").clicked() {
+                                declare = Some(false);
+                            }
+                        } else if row
+                            .button("Ready for step")
+                            .on_hover_text(
+                                "after planning your helm — the Game Master plays the step once everyone is ready",
+                            )
+                            .clicked()
+                        {
+                            declare = Some(true);
+                        }
+                    });
+                } else {
+                    cols[2].weak("session readiness is declared in the Readiness island");
+                }
                 if armed && self.minos_order_target(&active).is_some() {
                     self.minos_order_ui(&mut cols[2], &active);
                 } else {
@@ -11563,46 +12553,16 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                         }
                     }
                     cols[2].label(
-                        egui::RichText::new(if !data.ready {
-                            "declare readiness in Readiness to arm helm"
-                        } else if !data.execution {
-                            "helm arms at execution"
+                        egui::RichText::new(if !data.execution {
+                            "helm opens when the Game Master starts the exercise"
+                        } else if data.static_mode {
+                            "static exercise — positions are set by hand"
                         } else {
                             "this hull is not orderable"
                         })
                         .weak()
                         .small(),
                     );
-                }
-                // -- comms --
-                cols[3].label("Comms");
-                cols[3].label(format!("{} message(s)", self.inbox_total));
-                match self
-                    .inbox
-                    .iter()
-                    .max_by(|a, b| a.created_at.cmp(&b.created_at))
-                {
-                    Some(latest) => {
-                        let mut snippet: String =
-                            latest.content.chars().take(64).collect();
-                        if latest.content.chars().count() > 64 {
-                            snippet.push('…');
-                        }
-                        cols[3].weak(format!("latest: {} — {snippet}", latest.sender));
-                    }
-                    None => {
-                        cols[3].weak("no messages yet");
-                    }
-                }
-                if cols[3].button("Open messages").clicked() {
-                    open_messages = true;
-                }
-                // The floating mail island yields to a left-docked side
-                // zone, so in the default layout the button above arms an
-                // island that never draws. Say where its mail is instead
-                // of leaving a dead control.
-                if self.zone_owns_left_edge() {
-                    cols[3].weak("mail docks left — move the side zone right to read it");
                 }
             });
         });
@@ -11614,8 +12574,8 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         if let Some(id) = select {
             self.select_ship(id);
         }
-        if open_messages {
-            self.show_messages = true;
+        if let Some(ready) = declare {
+            self.set_own_readiness(ready);
         }
     }
 
@@ -11654,6 +12614,612 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             .id_salt("zone-orders")
             .max_height(360.0)
             .show(ui, |ui| self.orders_body(ui));
+    }
+
+    /// Whether this client holds helm orders for the Game Master's Play.
+    /// Scenario games only, in execution, for seated commanders: the
+    /// server applies an accepted order at once and queues nothing, so in
+    /// a scenario — where the Game Master releases the fleet step by
+    /// step — the hold lives on the commander's side until a step-started
+    /// marker arrives (see `STEP_START_CALLSIGN`).
+    fn scenario_hold(&self) -> bool {
+        self.game_state() == tfg::gamestate::GameState::Execution
+            && self.held_detail.as_ref().is_some_and(|d| d.mode == "scenario")
+            && self.player_station()
+    }
+
+    /// Plan a helm order instead of sending it: held here until the
+    /// step starts. Replacing a plan for the same hull is the point —
+    /// the last thing the commander set before declaring ready is what
+    /// runs.
+    fn stage_helm(&mut self, id: &str, heading: f32, speed: f32) {
+        self.staged_helm.insert(id.to_string(), (heading, speed));
+        self.users_status = format!(
+            "planned {:.0}° at {:.0} kn — released when the Game Master plays the step",
+            heading, speed
+        );
+    }
+
+    /// A step-started marker arrived (socket or inbox). Each marker acts
+    /// once: it releases this commander's planned orders and clears their
+    /// readiness, so the NEXT step asks them to set helm and declare
+    /// again. The server holds one flag per participant and resets it
+    /// only on a rewind, which is why the clearing is done here.
+    fn step_started(&mut self, msg_id: i64) {
+        if !self.step_signals_seen.insert(msg_id) {
+            return;
+        }
+        if !self.player_station() {
+            return;
+        }
+        if !self.staged_helm.is_empty() {
+            self.pending_step_release = true;
+        }
+        self.pending_step_unready = true;
+        self.dirty = true;
+    }
+
+    /// Post released orders, then withdraw readiness — one slot, so one
+    /// per frame, and never dropped: a busy slot just retries next frame.
+    fn drive_step_release(&mut self) {
+        if !self.pending_step_release && !self.pending_step_unready {
+            return;
+        }
+        if self.setup_op.is_some() {
+            self.dirty = true;
+            return;
+        }
+        if self.pending_step_release {
+            self.pending_step_release = false;
+            let planned: Vec<(String, (f32, f32))> = self.staged_helm.drain().collect();
+            let mut legs: Vec<(i64, String, f64, f32, Option<String>)> = Vec::new();
+            let mut unresolved = 0;
+            for (id, (heading, speed)) in planned {
+                match self.minos_order_target(&id) {
+                    Some(uid) => legs.push((uid, id, f64::from(heading), speed, None)),
+                    None => unresolved += 1,
+                }
+            }
+            if unresolved > 0 {
+                let line = format!(
+                    "{unresolved} planned order(s) could not be sent — the hull is not yours to command now"
+                );
+                self.feed(line.clone());
+                self.users_status = line;
+            }
+            if !legs.is_empty() {
+                self.spawn_order_batch(legs);
+            }
+            self.dirty = true;
+            return;
+        }
+        self.pending_step_unready = false;
+        if self.own_roster_row().is_some_and(|p| p.ready) {
+            self.set_own_readiness(false);
+        }
+    }
+
+    /// Tell every commander's client a step started. Scenario games
+    /// only; broadcast (no audience), carrying `STEP_START_CALLSIGN`.
+    /// Loud on failure: a commander whose client never hears this holds
+    /// their orders forever.
+    fn send_step_marker(&mut self, run: &tfg::backend::GameStepRun) {
+        if !self.held_detail.as_ref().is_some_and(|d| d.mode == "scenario") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        let Some(degree) = self.msg_degree.or(self.msg_degrees.first().map(|d| d.0)) else {
+            let line = "step started, but no message degree is available to announce it — commanders' planned orders will not release"
+                .to_string();
+            self.feed(line.clone());
+            self.users_status = line;
+            return;
+        };
+        let title = self
+            .step_detail(run.scenario_id, run.step_id)
+            .map(|(t, _, p)| format!("{t} — step {}", p + 1))
+            .unwrap_or_else(|| format!("step {}", run.step_id));
+        let draft = tfg::backend::MsgDraft {
+            kind: "telegram".to_string(),
+            classification: "TERBUKA".to_string(),
+            content: format!("Step started: {title}. Planned helm orders are released."),
+            to: Vec::new(),
+            cc: Vec::new(),
+            assumed_role: None,
+            reply_to: None,
+            degree,
+            msg_type: None,
+            callsign: STEP_START_CALLSIGN.to_string(),
+            sending_note: format!("step {}", run.step_id),
+            group_name: String::new(),
+            per: String::new(),
+            registration_number: String::new(),
+        };
+        self.setup_op = Some(spawn_rest("step-marker", move || {
+            master
+                .send_message(&tok, gid, &draft)
+                .map_err(|e| e.to_string())
+                .map(|m| SetupDone::StepMarkerSent(m.id))
+        }));
+    }
+
+    /// Mail that is not the step marker: the marker is a signal, not
+    /// something to read, so it counts and displays as neither.
+    fn is_marker(m: &tfg::backend::InboxMsg) -> bool {
+        m.callsign == STEP_START_CALLSIGN
+    }
+
+    /// What the Game Master last told this player to do: the newest mail
+    /// from somebody else that is not the step marker, from the inbox or
+    /// the socket (whichever has seen it). The server has no step-
+    /// instruction feed yet, so tasking arrives as ordinary messages;
+    /// this is the seam a real feed replaces. (sender, content, created).
+    fn current_instruction(&self) -> Option<(String, String, String)> {
+        let me = self.own_roster_row().map(|p| p.user_name);
+        let from_other = |sender: &str| me.as_deref().is_none_or(|n| sender != n);
+        let inbox = self
+            .inbox
+            .iter()
+            .filter(|m| !Self::is_marker(m) && from_other(&m.sender))
+            .map(|m| (m.sender.clone(), m.content.clone(), m.created_at.clone()));
+        let socket = self
+            .game_messages
+            .iter()
+            .filter(|m| m.callsign != STEP_START_CALLSIGN && from_other(&m.sender))
+            .map(|m| (m.sender.clone(), m.content.clone(), m.created_at.clone()));
+        inbox.chain(socket).max_by(|a, b| a.2.cmp(&b.2))
+    }
+
+    /// Unread mail addressed to this account, markers excluded.
+    fn unread_mail(&self) -> usize {
+        self.inbox
+            .iter()
+            .filter(|m| !Self::is_marker(m) && self.msg_is_unread(m))
+            .count()
+    }
+
+    /// The step currently playing, if this hold has learned of one: runs
+    /// arrive from the controls' answers, and the server runs one step at
+    /// a time, so the first playing run is the exercise's step.
+    fn playing_run(&self) -> Option<&tfg::backend::GameStepRun> {
+        self.step_runs.iter().find(|r| r.state == "playing")
+    }
+
+    /// Whether a tracked run closes its step: played and skipped runs are
+    /// terminal; a playing run is the exercise's current step.
+    fn run_is_terminal(state: &str) -> bool {
+        state == "played" || state == "skipped"
+    }
+
+    /// The next step to play, in book order: the first step with no
+    /// terminal run tracked. None while a step is playing (the exercise
+    /// is on it) or when the book is exhausted — between steps the fleet
+    /// keeps steering, so nothing auto-advances onto it.
+    fn next_step(&self) -> Option<(i64, i64)> {
+        if self.playing_run().is_some() {
+            return None;
+        }
+        for sc in &self.scenarios {
+            for st in &sc.steps {
+                let done = self.step_runs.iter().any(|r| {
+                    r.scenario_id == sc.id && r.step_id == st.id && Self::run_is_terminal(&r.state)
+                });
+                if !done {
+                    return Some((sc.id, st.id));
+                }
+            }
+        }
+        None
+    }
+
+    /// The latest terminal run's step, for rewind: newest across epochs,
+    /// since a replayed step carries several runs and only the newest
+    /// decides.
+    fn latest_terminal(&self) -> Option<(i64, i64)> {
+        self.step_runs
+            .iter()
+            .filter(|r| Self::run_is_terminal(&r.state))
+            .max_by_key(|r| (r.epoch, r.id))
+            .map(|r| (r.scenario_id, r.step_id))
+    }
+
+    /// Look a scenario step up in the loaded book: title, content,
+    /// position. None when the book has not loaded it (yet).
+    fn step_detail(&self, sid: i64, step: i64) -> Option<(String, String, i64)> {
+        let sc = self.scenarios.iter().find(|s| s.id == sid)?;
+        let st = sc.steps.iter().find(|s| s.id == step)?;
+        Some((sc.title.clone(), st.content.clone(), st.position))
+    }
+
+    /// Read a step's related list: the posts it names plus the personnel
+    /// those oblige, with server-resolved names. Held against the step it
+    /// was asked for, like the gate.
+    fn load_step_related(&mut self, sid: i64, step: i64) {
+        if self.setup_busy("related") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("related read failed: {e}");
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("step-related", move || {
+            master
+                .step_related(&tok, gid, sid, step)
+                .map(|v| SetupDone::Related((sid, step), v, false))
+                .map_err(|e| e.to_string())
+        }));
+    }
+
+    /// Stage a step's whole related list from the relate draft. LOCAL
+    /// FIRST like every other planning edit: the draft records it and the
+    /// advance posts it — after the scenario, the step and the hulls it
+    /// names exist, which is why a staged step can be linked at all. An
+    /// empty list is a real write (it clears), so for a LIVE step save is
+    /// only armed once the server's list has been read: staging toggles
+    /// against an unread list would clear relations the author never saw.
+    fn save_step_related(&mut self, sid: i64, step: i64) {
+        let live = sid > 0 && step > 0;
+        if live && self.relate_loaded != Some((sid, step)) {
+            self.users_status = "reading the related list first — save waits for it".to_string();
+            self.load_step_related(sid, step);
+            return;
+        }
+        if self.stage_guard("relate") {
+            return;
+        }
+        let n = self.relate_draft.len();
+        self.book_draft
+            .stage_relations(sid, step, self.relate_draft.clone());
+        self.users_status = format!("staged {n} related post(s) — syncs on advance");
+    }
+
+    /// How many posts a step relates, as far as this client can tell:
+    /// the staged list when the author touched it, else the server's
+    /// cached read, else a staged step nobody linked (definitely none),
+    /// else unknown. `None` means "cannot say" — never a guess.
+    fn step_related_count(&self, sid: i64, step: i64) -> Option<usize> {
+        if let Some(staged) = self.book_draft.related(sid, step) {
+            return Some(staged.len());
+        }
+        if let Some(view) = self.related_cache.get(&(sid, step)) {
+            return Some(view.posts.len());
+        }
+        if sid < 0 || step < 0 {
+            return Some(0);
+        }
+        None
+    }
+
+    /// Read whether a step may start, and hold the answer against the
+    /// step it was asked for. Refuses while the slot is busy rather than
+    /// orphaning a read behind the in-flight op.
+    fn load_step_readiness(&mut self, sid: i64, step: i64) {
+        if self.setup_busy("steps") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("step readiness failed: {e}");
+                return;
+            }
+        };
+        self.step_gate_read_at = Some(Instant::now());
+        self.setup_op = Some(spawn_rest("step-readiness", move || {
+            master
+                .step_readiness(&tok, gid, sid, step)
+                .map(|g| SetupDone::StepGate((sid, step), g))
+                .map_err(|e| e.to_string())
+        }));
+    }
+
+    /// Fire one GM step control. A successful Play in a scenario game
+    /// also broadcasts the step-started marker (see the StepRun arm).
+    fn step_control(&mut self, sid: i64, step: i64, verb: StepVerb) {
+        if self.setup_busy("step") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("step {} failed: {e}", verb.label());
+                return;
+            }
+        };
+        let label = verb.label().to_string();
+        self.setup_op = Some(spawn_rest("step-control", move || {
+            let res: Result<SetupDone, String> = match verb {
+                StepVerb::Play => master
+                    .play_step(&tok, gid, sid, step)
+                    .map(SetupDone::StepRun)
+                    .map_err(|e| e.to_string()),
+                StepVerb::Skip => master
+                    .skip_step(&tok, gid, sid, step)
+                    .map(SetupDone::StepRun)
+                    .map_err(|e| e.to_string()),
+                StepVerb::End => master
+                    .end_step(&tok, gid, sid, step)
+                    .map(SetupDone::StepRun)
+                    .map_err(|e| e.to_string()),
+                StepVerb::Rewind => master
+                    .rewind_step(&tok, gid, sid, step)
+                    .map(SetupDone::StepRewound)
+                    .map_err(|e| e.to_string()),
+            };
+            match res {
+                Ok(done) => Ok(done),
+                Err(e) => Ok(SetupDone::StepFailed(label, e)),
+            }
+        }));
+    }
+
+    /// The Game Master's step console, in execution: what is playing,
+    /// what is next, and the verbs. Steps run in book order and are not
+    /// opened: the exercise is either on the playing step or between
+    /// steps, and one Play moves it onto the next. Personnel never see
+    /// this island — the plan is what they are exercised against, so the
+    /// book, its gates and these controls are GM-side by backend design
+    /// (migration 000062), and their tasking arrives as messages.
+    fn zone_steps_body(&mut self, ui: &mut egui::Ui) {
+        // Controls follow the island's audience, NOT the role name: this
+        // deployment's organizer seat reads `Penyelenggara`, and a name
+        // match left Play greyed while the server's own gate said "may
+        // start". The server arbitrates a seat that may not run steps —
+        // its refusal lands in the status line.
+        let gm = self.steps_audience();
+        // Now playing, resolved through the loaded book.
+        let playing = self.playing_run().cloned();
+        match &playing {
+            Some(run) => {
+                let title = self
+                    .step_detail(run.scenario_id, run.step_id)
+                    .map(|(t, c, p)| format!("{t} — step {}: {}", p + 1, short_step_text(&c)))
+                    .unwrap_or_else(|| format!("step {}", run.step_id));
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("NOW: {title}")).strong());
+                    if gm && ui.small_button("end").clicked() {
+                        self.step_control(run.scenario_id, run.step_id, StepVerb::End);
+                    }
+                });
+            }
+            None => {
+                ui.weak("no step playing");
+            }
+        }
+        ui.separator();
+        // Next in book order with its gate. Collected, then applied —
+        // the rows below borrow to draw.
+        let mut acts: Vec<(i64, i64, StepVerb)> = Vec::new();
+        let mut tasking: Option<(i64, i64)> = None;
+        if let Some((sid, step)) = self.next_step() {
+            match self.step_detail(sid, step) {
+                Some((title, content, pos)) => {
+                    ui.label(egui::RichText::new(format!("NEXT: {title} — step {}", pos + 1)).strong());
+                    ui.label(if content.is_empty() {
+                        egui::RichText::new("(not written yet)").weak()
+                    } else {
+                        egui::RichText::new(content.clone())
+                    });
+                }
+                None => {
+                    ui.weak("the next step is no longer in the book");
+                }
+            }
+            let gate = match &self.step_gate {
+                Some(((gs, gt), g)) if *gs == sid && *gt == step => Some(g.clone()),
+                _ => None,
+            };
+            match &gate {
+                Some(g) => {
+                    let mut line =
+                        format!("{} of {} ready · {} outstanding", g.ready, g.required, g.outstanding);
+                    if g.excluded > 0 {
+                        line.push_str(&format!(" · {} excluded", g.excluded));
+                    }
+                    ui.label(egui::RichText::new(line).strong());
+                    if g.may_start {
+                        ui.label(
+                            egui::RichText::new("may start")
+                                .small()
+                                .color(egui::Color32::from_rgb(0x4A, 0xDE, 0x80)),
+                        );
+                    } else {
+                        warn_line(ui, g.reason.clone());
+                    }
+                    // Everyone the step asks, by name, with their state: the
+                    // Game Master needs to see who is holding Play, not only
+                    // that somebody is. Judge-side names are on the list but
+                    // never waited for, so they are left off it.
+                    for p in g.personnel.iter().filter(|p| p.asked) {
+                        let name = if p.call_sign.trim().is_empty() {
+                            format!("user {}", p.user_id)
+                        } else {
+                            p.call_sign.clone()
+                        };
+                        if p.ready {
+                            ui.label(
+                                egui::RichText::new(format!("✓ {name}"))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(0x4A, 0xDE, 0x80)),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new(format!("○ {name} — not ready"))
+                                    .small()
+                                    .color(tfg::tokens::ALERT_YELLOW),
+                            );
+                        }
+                    }
+                }
+                None => {
+                    ui.weak("readiness unread — checking…");
+                }
+            }
+            let may = gate.as_ref().is_some_and(|g| g.may_start);
+            // Controls follow the island's audience (see `gm` above): a
+            // read-only seat gets them visible-but-off with the rule
+            // attached, rather than a 403 chase.
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        may && gm,
+                        egui::Button::new("Play"),
+                    )
+                    .on_hover_text(if !gm {
+                        "this seat is read-only for steps"
+                    } else if !may {
+                        "readiness does not allow it — the gate above names who"
+                    } else {
+                        "start the next step on the exercise clock"
+                    })
+                    .clicked()
+                {
+                    acts.push((sid, step, StepVerb::Play));
+                }
+                // A skip jumps the clock, so the server refuses one while
+                // a step is playing — this panel only exists when none
+                // is, which is exactly when a skip is legal.
+                if ui
+                    .add_enabled(gm, egui::Button::new("Skip"))
+                    .on_hover_text(if !gm {
+                        "this seat is read-only for steps"
+                    } else {
+                        "allowed with people outstanding — recorded as an override"
+                    })
+                    .clicked()
+                {
+                    acts.push((sid, step, StepVerb::Skip));
+                }
+                // The instruction goes out BEFORE Play: commanders plan
+                // their helm from it and declare ready, and Play waits
+                // for that. Staged into Messages, never sent blind — the
+                // audience (the people this step obliges) deserves one
+                // look first.
+                if ui
+                    .add_enabled(gm, egui::Button::new("Send tasking"))
+                    .on_hover_text("prefill Messages with this step's instruction for the people it obliges")
+                    .clicked()
+                {
+                    tasking = Some((sid, step));
+                }
+            });
+        } else if playing.is_none() && !self.scenarios.is_empty() {
+            ui.weak("every step has run");
+        }
+        // Rewind the latest terminal run, when nothing is playing: back
+        // to its start, erasing the attempt.
+        if playing.is_none()
+            && let Some((rsid, rstep)) = self.latest_terminal()
+        {
+            let title = self
+                .step_detail(rsid, rstep)
+                .map(|(t, _, p)| format!("{t} — step {}", p + 1))
+                .unwrap_or_else(|| format!("step {rstep}"));
+            ui.horizontal(|ui| {
+                ui.weak(format!("last ended: {title}"));
+                if ui
+                    .add_enabled(gm, egui::Button::new("Rewind"))
+                    .on_hover_text(if !gm {
+                        "this seat is read-only for steps"
+                    } else {
+                        "erase the attempt — orders, reports and judgements of that span go with it"
+                    })
+                    .clicked()
+                {
+                    acts.push((rsid, rstep, StepVerb::Rewind));
+                }
+            });
+        }
+        ui.separator();
+        ui.label("Book");
+        if self.scenarios.is_empty() {
+            ui.horizontal(|ui| {
+                ui.weak("no book loaded");
+                if ui.small_button("load").clicked() {
+                    self.load_scenarios();
+                }
+            });
+        }
+        for sc in self.scenarios.clone() {
+            ui.collapsing(format!("{} ({} step(s))", sc.title, sc.steps.len()), |ui| {
+                for st in &sc.steps {
+                    // Latest tracked state across replays: a rewound step
+                    // carries several runs, and only the newest decides.
+                    let badge = self
+                        .step_runs
+                        .iter()
+                        .filter(|r| r.step_id == st.id)
+                        .max_by_key(|r| (r.epoch, r.id))
+                        .map(|r| r.state.as_str());
+                    ui.horizontal(|ui| {
+                        ui.monospace(format!("{:>2}", st.position + 1));
+                        ui.label(short_step_text(&st.content));
+                        if let Some(state) = badge {
+                            ui.label(egui::RichText::new(state).small().weak());
+                        }
+                    });
+                }
+            });
+        }
+        // The gate follows the next step on its own: whenever the tracked
+        // runs move it elsewhere, the read re-fires once the slot frees.
+        // No manual check, no polling — one read per new next.
+        // The count of who is ready changes by other people's hands, so
+        // the gate re-reads on a short timer as well as on a new next —
+        // otherwise Play would sit greyed on the number seen once.
+        if let Some((sid, step)) = self.next_step() {
+            let stale = match &self.step_gate {
+                Some(((gs, gt), _)) => *gs != sid || *gt != step,
+                None => true,
+            };
+            let due = self
+                .step_gate_read_at
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(3));
+            if (stale || due) && self.setup_op.is_none() {
+                self.load_step_readiness(sid, step);
+            }
+            ui.ctx().request_repaint_after(Duration::from_secs(3));
+        }
+        if let Some((sid, step)) = tasking {
+            let content = self
+                .step_detail(sid, step)
+                .map(|(_, c, _)| c)
+                .unwrap_or_default();
+            let audience: Vec<i64> = match &self.step_gate {
+                Some(((gs, gt), g)) if *gs == sid && *gt == step => g
+                    .personnel
+                    .iter()
+                    .filter(|p| p.asked)
+                    .map(|p| p.user_id)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            self.msg_content = content;
+            self.msg_to = audience.into_iter().collect();
+            self.show_comms = true;
+            self.users_status = "tasking prefilled in Comms — review the audience and send it".to_string();
+        }
+        for (sid, step, verb) in acts {
+            self.step_control(sid, step, verb);
+        }
+        status_line(ui, &self.users_status.clone());
     }
 
     fn zone_log_body(&mut self, ui: &mut egui::Ui) {
@@ -11753,6 +13319,14 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         self.watch_game_channel();
         self.users_game_roles.clear();
         self.users_roster.clear();
+        self.step_runs.clear();
+        self.staged_helm.clear();
+        self.pending_step_release = false;
+        self.pending_step_unready = false;
+        self.step_gate_read_at = None;
+        self.step_signals_seen.clear();
+        self.step_signals_primed = false;
+        self.step_gate = None;
         self.users_gunits.clear();
         // The caller's pieces belonged to the released hold — the next
         // join re-deals them, with the tree. Gap flags are
@@ -11769,7 +13343,12 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         self.stage_armed = false;
         self.roster_draft.clear();
         self.book_draft.clear();
+        self.related_cache.clear();
+        self.relate_open = None;
+        self.relate_loaded = None;
+        self.relate_draft.clear();
         self.book_id_map.clear();
+        self.book_step_map.clear();
         self.map_unit_move = None;
         self.placement_unplaced = 0;
         self.placement_ready = false;
@@ -12848,6 +14427,9 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 self.dispatch_queued_refresh();
             }
         }
+        // Planned helm orders released by a step-started marker, then the
+        // readiness withdrawal — one per frame through the shared slot.
+        self.drive_step_release();
         // The WebSocket game-position stream is an accelerator. The
         // documented interim source is the REST plot; if the socket is
         // quiet, recover through REST once per second.
@@ -12913,7 +14495,16 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 };
                 self.stage_write_done();
             }
-            SetupDone::StageBook(one, local) => {
+            SetupDone::StageBook(one, local, step_local) => {
+                // The step ids the mirror held for this scenario BEFORE
+                // the answer lands: the new step is the one the answer
+                // has that the mirror did not.
+                let before: Vec<i64> = self
+                    .scenarios
+                    .iter()
+                    .find(|s| s.id == one.id)
+                    .map(|s| s.steps.iter().map(|st| st.id).collect())
+                    .unwrap_or_default();
                 // Spliced like any book answer: replacing would drop every
                 // other scenario the author was not looking at.
                 if let Some(slot) = self.scenarios.iter_mut().find(|s| s.id == one.id) {
@@ -12928,9 +14519,37 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                         self.composer_scenario = Some(one.id);
                     }
                 }
+                if let Some(step_local) = step_local {
+                    let fresh: Vec<i64> = one
+                        .steps
+                        .iter()
+                        .map(|st| st.id)
+                        .filter(|id| !before.contains(id))
+                        .collect();
+                    match fresh.as_slice() {
+                        [id] => {
+                            self.book_step_map.insert(step_local, *id);
+                        }
+                        // Not exactly one: guessing would link a hull to
+                        // the wrong step, so fail loudly instead. A step
+                        // nobody staged a link for does not care — but
+                        // the flush cannot tell, so it names the count.
+                        other => {
+                            self.fail_stage(format!(
+                                "sync refused after a step add: the answer held {} new step(s), expected one — re-read the book and retry",
+                                other.len()
+                            ));
+                            return;
+                        }
+                    }
+                }
                 let ids: Vec<i64> = self.scenarios.iter().map(|s| s.id).collect();
                 self.book_draft.prune(&ids);
                 self.users_status = format!("saved \u{201c}{}\u{201d}.", one.title);
+                self.stage_write_done();
+            }
+            SetupDone::StageRelated(key, view) => {
+                self.related_cache.insert(key, view);
                 self.stage_write_done();
             }
             SetupDone::ForceUnits(units) => {
@@ -12945,6 +14564,101 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             }
             SetupDone::StageFailed(label, e) => {
                 self.fail_stage(format!("sync refused at {label}: {e}"));
+            }
+            SetupDone::StepGate(key, gate) => {
+                self.step_gate = Some((key, gate));
+            }
+            SetupDone::Related((sid, step), view, true) => {
+                // A saved related list replaces what was cached and seeds
+                // the working set for the editor that is still open.
+                self.related_cache.insert((sid, step), view);
+                if self.relate_open == Some((sid, step)) {
+                    self.relate_draft = self
+                        .related_cache
+                        .get(&(sid, step))
+                        .map(|view| {
+                            view.posts
+                                .iter()
+                                .map(|p| (p.kind.clone(), p.id))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.relate_loaded = Some((sid, step));
+                }
+                self.users_status = "related list saved".to_string();
+            }
+            SetupDone::Related((sid, step), view, false) => {
+                self.related_cache.insert((sid, step), view);
+                // A read that lands while its editor stands open seeds the
+                // working set from what the server resolved — never from
+                // what the author guessed.
+                if self.relate_open == Some((sid, step)) {
+                    self.relate_draft = self
+                        .related_cache
+                        .get(&(sid, step))
+                        .map(|view| {
+                            view.posts
+                                .iter()
+                                .map(|p| (p.kind.clone(), p.id))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.relate_loaded = Some((sid, step));
+                }
+            }
+            SetupDone::StepRun(run) => {
+                match self.step_runs.iter_mut().find(|r| r.id == run.id) {
+                    Some(slot) => *slot = run.clone(),
+                    None => self.step_runs.push(run.clone()),
+                }
+                self.users_status = match run.state.as_str() {
+                    "playing" => "step playing".to_string(),
+                    "skipped" => {
+                        let mut line = "step skipped".to_string();
+                        if run.overrode_readiness {
+                            line.push_str(" (override recorded)");
+                        }
+                        line
+                    }
+                    "played" => "step ended".to_string(),
+                    other => format!("step {}: {other}", run.step_id),
+                };
+                // The server publishes nothing when a step starts, and
+                // scenario commanders are holding their helm orders for
+                // exactly this moment — so the Game Master's client says
+                // so, as a marker message every commander's client reads.
+                // Only a PLAY starts movement (a skip jumps the clock),
+                // and only a scenario game holds orders at all.
+                if run.state == "playing" {
+                    self.send_step_marker(&run);
+                }
+            }
+            SetupDone::StepMarkerSent(_) => {
+                // Quiet on purpose: no compose-draft clear, no popup. The
+                // inbox re-read keeps the Game Master's own mail honest.
+                self.refresh_inbox();
+            }
+            SetupDone::StepRewound(rewind) => {
+                // The erasure took the attempt's runs with it, so the
+                // local record drops them too rather than badging steps
+                // with runs that no longer exist. The gate follows on its
+                // own: the next step moves on a rewind, and the island
+                // re-reads once for the new next.
+                self.step_runs.retain(|r| r.step_id != rewind.step_id);
+                self.users_status = format!(
+                    "step {} rewound to attempt {} — {} order(s), {} report(s), {} telegram(s), {} judgement(s) erased",
+                    rewind.step_id,
+                    rewind.attempt,
+                    rewind.erased_orders,
+                    rewind.erased_reports,
+                    rewind.erased_telegrams,
+                    rewind.erased_judgements
+                );
+            }
+            SetupDone::StepFailed(label, e) => {
+                let line = format!("step {label} refused: {e}");
+                self.feed(line.clone());
+                self.users_status = line;
             }
             SetupDone::Game(to, row) => self.apply_transition(&to, row),
             SetupDone::GameUpdated(d) => {
@@ -12980,6 +14694,9 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                         .to_string();
             }
             SetupDone::FixBatch(outs) => self.apply_fix_batch(outs),
+            SetupDone::UnitSpeeds(uid, speeds) => {
+                self.unit_speeds.insert(uid.to_string(), speeds);
+            }
             SetupDone::Timeline(page, append) => {
                 if append {
                     self.timeline_events.extend(page.events);
@@ -13038,6 +14755,23 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 Err(e) => self.users_status = format!("task organisation failed: {e}"),
             },
             SetupDone::MsgPage(page) => {
+                // Markers the socket missed still release planned orders.
+                // The FIRST read only baselines: opening the app mid-
+                // exercise must not replay every earlier step's release.
+                let markers: Vec<i64> = page
+                    .messages
+                    .iter()
+                    .filter(|m| m.callsign == STEP_START_CALLSIGN)
+                    .map(|m| m.id)
+                    .collect();
+                if self.step_signals_primed {
+                    for id in markers {
+                        self.step_started(id);
+                    }
+                } else {
+                    self.step_signals_seen.extend(markers);
+                    self.step_signals_primed = true;
+                }
                 self.inbox = page.messages;
                 self.inbox_total = page.total_records;
                 self.inbox_pages = page.total_pages.max(1);
@@ -16124,9 +17858,9 @@ impl eframe::App for ShipApp {
                 self.app_mode, self.show_side_zone
             );
         }
-        // The commanders' station: bottom dashboard for seated non-GM
-        // players from preparation onward. Independent of the side zone
-        // toggle — it is their helm, not an organizer island.
+        // The commanders' station: bottom dashboard for seated
+        // exercise-side players from preparation onward. Independent of
+        // the side zone toggle — it is their helm, not an organizer island.
         self.dashboard_island(ui);
         // Only ever one modal at a time — see `open_only`.
         //
@@ -16634,21 +18368,46 @@ impl eframe::App for ShipApp {
             self.show_log = open;
             self.log_pos = pos;
         }
-        // Messages island (H11): socket-arrived game mail. Visible in
-        // both modes once mail exists or the session opens it.
-        if self.show_messages && !self.zone_owns_left_edge() {
-            let mut open = self.show_messages;
-            let mut pos = self.messages_pos;
-            let spec = tfg::chrome::Island::new(
-                egui::Id::new("Messages"),
-                "Messages",
-                egui::vec2(420.0, 300.0),
-            );
+        // The comms hub (H11, reworked): socket-arrived and inbox mail in
+        // one island, anchored top-right where the control lives. Mail
+        // has ONE surface now — a fresh arrival that used to open the
+        // floating Messages island opens this instead, and the old island
+        // (default spot under the side zone) is gone.
+        if self.show_messages {
+            self.show_comms = true;
+            self.show_messages = false;
+        }
+        if self.show_comms {
+            // First open reads the inbox once (and baselines step
+            // markers); a failing read retries on a timer, never per
+            // frame.
+            if !self.step_signals_primed
+                && self.setup_op.is_none()
+                && self
+                    .comms_load_at
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(5))
+            {
+                self.comms_load_at = Some(Instant::now());
+                self.refresh_inbox();
+            }
+            let size = comms_size(ui.ctx());
+            let unread = self.unread_mail();
+            let spec = tfg::chrome::Island::new(egui::Id::new("comms"), "Comms", size)
+                .with_trailing(&if unread > 0 {
+                    format!("{unread} UNREAD")
+                } else {
+                    String::new()
+                });
+            let mut pos = self.comms_pos.unwrap_or_else(|| comms_default_pos(ui.ctx()));
+            let mut open = true;
             tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
-                self.messages_island(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("comms-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.comms_body(ui));
             });
-            self.show_messages = open;
-            self.messages_pos = pos;
+            self.comms_pos = Some(pos);
+            self.show_comms = open;
         }
         if let Some((ship, at)) = follow_req {
             self.request_frame(&ship, at);
@@ -18116,6 +19875,8 @@ fn main() -> Result<(), String> {
                 order_result: HashMap::new(),
                 helm_submissions: HashMap::new(),
                 helm_drafts: HashMap::new(),
+                unit_speeds: HashMap::new(),
+                helm_medium: HashMap::new(),
                 helm_preview_pending: HashSet::new(),
                 controlled: HashSet::new(),
                 pending_waypoint: None,
@@ -18136,6 +19897,7 @@ fn main() -> Result<(), String> {
                 setup_target: String::new(),
                 setup_area: String::new(),
                 setup_map_tag: String::new(),
+                setup_mode: "maneuver".to_string(),
                 edit_open: false,
                 delete_armed: false,
                 edit_name: String::new(),
@@ -18179,6 +19941,17 @@ fn main() -> Result<(), String> {
                 users_role: None,
                 users_roles: Vec::new(),
                 users_game_roles: Vec::new(),
+                step_runs: Vec::new(),
+                staged_helm: HashMap::new(),
+                pending_step_release: false,
+                pending_step_unready: false,
+                step_gate_read_at: None,
+                step_signals_seen: HashSet::new(),
+                step_signals_primed: false,
+                show_comms: false,
+                comms_pos: None,
+                comms_load_at: None,
+                step_gate: None,
                 users_roster: Vec::new(),
                 fleet_picker_open: false,
                 player_picker_open: false,
@@ -18223,7 +19996,12 @@ fn main() -> Result<(), String> {
                 stage_armed: false,
                 roster_draft: tfg::roster::RosterDraft::new(),
                 book_draft: tfg::book::BookDraft::new(),
+                related_cache: std::collections::HashMap::new(),
+                relate_open: None,
+                relate_loaded: None,
+                relate_draft: Vec::new(),
                 book_id_map: std::collections::HashMap::new(),
+                book_step_map: std::collections::HashMap::new(),
                 map_unit_move: None,
                 time_real_start: (Utc::now() + chrono::Duration::hours(7)).format("%Y-%m-%d %H:%M").to_string(),
                 time_real_end: (Utc::now() + chrono::Duration::hours(14)).format("%Y-%m-%d %H:%M").to_string(),
