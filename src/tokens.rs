@@ -112,12 +112,11 @@ pub const RESTING_RIM_ALPHA: f32 = 1.0;
 pub const ACTIVE_RIM: Color32 = RADAR_CYAN;
 pub const ACTIVE_RIM_ALPHA: f32 = 0.50;
 
-/// The rim's geometry: a 3px band inset from the island's own polygon.
+/// The rim's geometry: a 2px band inset from the island's own edge.
 /// Insetting rather than stroking is what makes it read as a rim rather than
-/// as a border, and it is why it can trace the chamfer without the chamfer
-/// reading as thicker than the panel.
-pub const RIM_BAND: f32 = 3.0;
-pub const RIM_INSET: f32 = 1.0;
+/// as a border.
+pub const RIM_BAND: f32 = 2.0;
+pub const RIM_INSET: f32 = 3.0;
 
 /// The island's rim colour for a given input state.
 pub fn rim(active: bool) -> Color32 {
@@ -131,13 +130,26 @@ pub fn rim(active: bool) -> Color32 {
 // ---------------------------------------------------------------------------
 // Island metrics.
 //
-// One chamfer, one title band, one pad. The chamfer is a polygon painted
+// One rounding, one title band, one pad. The body is a rounded rect painted
 // around an axis-aligned content rect, which is the property that lets the
-// cut exist at all: it costs paint and not layout, so nothing inside an
-// island has to know about it.
+// silhouette exist at all: it costs paint and not layout, so nothing
+// inside an island has to know about it.
 // ---------------------------------------------------------------------------
 
-/// Chamfer depth at the top-right corner.
+/// Island corner radius: softly rounded, not a bubble. (The silhouette
+/// used to be a top-right chamfer — ADR-0014's "moves" signal. The title
+/// band remains the drag handle, so the rounding costs no affordance.)
+pub const ISLAND_RADIUS: u8 = 12;
+/// Brushed-steel bevel tones for the island edge: a dark bed with a bright
+/// wire centred on it, plus a top light and a bottom shade, so the border
+/// reads as metal catching light rather than as a drawn line.
+pub const STEEL_LO: Color32 = Color32::from_rgb(0x2B, 0x33, 0x3E);
+pub const STEEL: Color32 = Color32::from_rgb(0x8E, 0x99, 0xA8);
+pub const STEEL_HI: Color32 = Color32::from_rgb(0xE6, 0xEB, 0xF2);
+
+/// Chamfer depth. No longer cut into island bodies (see ISLAND_RADIUS);
+/// kept because the close button's inset is still measured from it and a
+/// test pins the relation.
 pub const CUT: f32 = 20.0;
 pub const TITLE_H: f32 = 30.0;
 /// Generic chrome inset: modals, title-band text, miscellaneous breathing
@@ -157,8 +169,8 @@ pub const CLOSE_INSET: f32 = CUT + 14.0;
 /// cost proportional to kernel radius and is the first thing that stops
 /// being affordable on a software rasteriser; a hard edge is also the
 /// graphic-design shadow rather than a drop shadow.
-pub const ISLAND_CAST: Color32 = Color32::from_black_alpha(120);
-pub const ISLAND_CAST_OFFSET: Vec2 = vec2(5.0, 6.0);
+pub const ISLAND_CAST: Color32 = Color32::from_black_alpha(80);
+pub const ISLAND_CAST_OFFSET: Vec2 = vec2(3.0, 4.0);
 
 /// Island title: monospace, tracked, short caps. The tracking is the whole
 /// trick and needs an explicit layout job, because `TextFormat` is the only
@@ -328,6 +340,24 @@ mod tests {
     #[test]
     fn zone_fits_an_island_plus_its_pad() {
         assert!(ZONE_W > 300.0, "the fleet picker's taxonomy column is 176px and its result rows need the rest");
+    }
+
+    /// The steel bevel must read as metal, not as a grey line: the wire
+    /// clearly lighter than the panel fill, the bed clearly darker than
+    /// the wire. A bevel whose tones crowd together is a smudge.
+    #[test]
+    fn steel_bevel_reads_as_metal() {
+        fn luma(c: Color32) -> f32 {
+            0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
+        }
+        assert!(
+            luma(STEEL_HI) - luma(CONSOLE_NIGHT) > 120.0,
+            "the wire melts into the panel fill"
+        );
+        assert!(
+            luma(STEEL_HI) - luma(STEEL_LO) > 120.0,
+            "the wire melts into its own bed"
+        );
     }
 
     /// The island edge must part from BOTH grounds it can sit on: dark

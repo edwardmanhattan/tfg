@@ -32,6 +32,7 @@ pub mod map_render;
 pub mod overlay;
 pub mod paths;
 pub mod roster;
+pub mod sfx;
 pub mod sim;
 pub mod store;
 pub mod symbology;

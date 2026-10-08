@@ -31,6 +31,11 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 # Token-shape diagnosis (transport ticket): payload inspection for the
 # no-expiry refusal rule (§3). Already in the tree transitively.
 base64 = "0.22"
+# UI sounds (sfx module): synthesized clicks/dings/buzzes through rodio on
+# a background thread, no audio assets. Needs the ALSA dev headers at
+# build time on Linux (this host has them); a machine with no audio
+# device at RUNTIME stays silent, never broken.
+rodio = "0.22"
 
 # Vendored socket SDK (see vendor/tokio-centrifuge): upstream 0.2.6 cannot
 # set the connect command's `data`, which is where Minos reads our token

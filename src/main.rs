@@ -2613,18 +2613,15 @@ enum SetupDone {
     /// header. Keyed by unit id; the version is what the game judges
     /// against, re-readable via `GET /units/:id?version=`.
     UnitSpecVersion(i64, i64),
-    /// One host's direct contents (`GET /units/:id/embarkations`).
+    /// One host's direct contents, from the exercise's own composition
+    /// (`GET /games/:id/units/:unit_id/embarkations`).
     EmbarkedLoaded(i64, Vec<tfg::backend::EmbarkedUnit>),
-    /// One host's attach picker (`GET .../embarkation-candidates`).
-    EmbarkCandidates(i64, Vec<tfg::backend::EmbarkationCandidate>),
-    /// One hull's declared complements (`GET /units/:id/capacities`).
-    CapacitiesLoaded(i64, Vec<tfg::backend::UnitCapacity>),
-    /// A host's contents after an attach or detach batch, with any
+    /// One host's declared complements (`GET /units/:id/capacities`).
+    CapsLoaded(i64, Vec<tfg::backend::UnitCapacity>),
+    /// A host's contents after an embark drop's attach, with any
     /// complement the batch went past (a 201 warning, not a refusal —
     /// the operation happened).
     EmbarkChanged(i64, tfg::backend::EmbarkationResult),
-    /// Capacities as stored after a whole-list PUT.
-    CapacitiesSaved(i64, Vec<tfg::backend::UnitCapacity>),
     Games(Vec<tfg::backend::GameRow>),
     /// The game list needs a staff read the account lacks: not an
     /// error to retry loudly, but the player-flow signal — room key
@@ -2678,6 +2675,18 @@ enum SetupDone {
     Related((i64, i64), tfg::backend::StepRelated, bool),
     /// A GM step control refused; the verb is kept so the note names it.
     StepFailed(String, String),
+    /// The echelon vocabulary, lowest first: the words new groups are
+    /// mustered under. Read once per hold; the picker falls back to
+    /// the seeded four while it is unread.
+    Echelons(Vec<tfg::backend::EchelonLevel>),
+    /// The participant's door onto the plan: where the exercise is and
+    /// what this caller owes it. Unkeyed — there is exactly one door,
+    /// so a late answer can only repaint it, never misaddress it.
+    CurrentStep(tfg::backend::CurrentStepView),
+    /// The caller's own step declaration landed: ready or withdrawn.
+    /// The poll re-reads right after (the counts moved under us), so
+    /// this only seeds the status line.
+    StepDeclared(String),
     Game(String, tfg::backend::GameRow),
     GameCreate(tfg::backend::GameRow, String),
     /// Admin game writes: the update answer is the re-read detail
@@ -2829,7 +2838,6 @@ struct ShipApp {
     /// for the whole console, so the taste is tunable in one place and the
     /// reduced-motion path is literally this set to zero.
     motion_secs: f32,
-    inspector_pos: egui::Pos2,
     orders_pos: egui::Pos2,
     login_pos: egui::Pos2,
     log_pos: egui::Pos2,
@@ -2912,34 +2920,37 @@ struct ShipApp {
     /// version via `?version=` so a corrected figure never rewrites a
     /// judged game. `None` here means not yet fetched, not version zero.
     unit_spec_versions: HashMap<String, i64>,
-    /// Embarkation + capacities (register authoring, per hull not per
-    /// class): what a hull carries, what is directly inside it, and
-    /// what could be put inside. Keyed by hull id. An empty candidates
-    /// list is a real answer — the host declared nothing, and
-    /// capacities are the first thing an operator sets.
+    /// Embarkation reads (this app never authors complements — the
+    /// register app does): what is directly inside a hull, and what
+    /// could be put inside it. Keyed by hull id. An empty candidates
+    /// list is a real answer — the host declares no complements.
+    /// Embarking itself is a drag-and-drop gesture (picker row onto a
+    /// deployed hull), gated on the candidates list.
     embarked: HashMap<i64, Vec<tfg::backend::EmbarkedUnit>>,
     embark_candidates: HashMap<i64, Vec<tfg::backend::EmbarkationCandidate>>,
     embark_over: HashMap<i64, Vec<tfg::backend::OverCapacity>>,
-    unit_capacities: HashMap<i64, Vec<tfg::backend::UnitCapacity>>,
-    /// Capacities edits not yet saved. The PUT replaces the whole list,
-    /// so the cache is the draft and this flag is the only "unsaved"
-    /// state — a hull absent here matches the server.
-    capacities_dirty: std::collections::HashSet<i64>,
-    /// Attach-picker open per host. Candidates (capped at 200) load
-    /// only while this is open — a picker the operator never asked for
-    /// costs no request.
-    embark_attach_open: std::collections::HashSet<i64>,
-    /// Checked rows per host for the all-or-nothing attach / detach
-    /// batches. Cleared when the batch lands.
-    embark_attach_sel: HashMap<i64, Vec<i64>>,
-    embark_detach_sel: HashMap<i64, Vec<i64>>,
-    /// New-capacity inputs per host: taxonomy level, level id, max
-    /// aboard. The kind is a level AND an id ("four helicopters" vs
-    /// "four aircraft of any kind"), resolved against the synced
-    /// taxonomy the picker already reads.
-    cap_level: HashMap<i64, String>,
-    cap_id: HashMap<i64, String>,
-    cap_max: HashMap<i64, String>,
+    /// One host's declared complements (`GET /units/:id/capacities`),
+    /// read-only: authored in the register app, enforced here before
+    /// the drop so a full category refuses with a badge instead of a
+    /// server warning after the fact.
+    unit_caps: HashMap<i64, Vec<tfg::backend::UnitCapacity>>,
+    /// The embarked-contents island's host, if open. Set by a
+    /// successful embark drop and by the per-piece "embarked" button;
+    /// cleared when the island closes.
+    embark_island_host: Option<i64>,
+    embark_island_pos: Option<egui::Pos2>,
+    /// Rejected embark drops: host → when the rejection landed. Drawn
+    /// as a ✕ badge beside the destination marker for a few seconds,
+    /// then forgotten — it is a gesture echo, not state.
+    embark_reject: HashMap<i64, Instant>,
+    /// Accepted embarks: host → when the attach landed. A green flash
+    /// on the destination marker while its alpha decays — the shader
+    /// halo on machines that afford one, an expanding epaint ring
+    /// everywhere else, so the effect exists on every tier.
+    embark_flash: HashMap<i64, Instant>,
+    /// A drop onto a host whose candidates had not loaded yet: (host,
+    /// child). Evaluated when the candidates answer lands.
+    pending_embark: Option<(i64, i64)>,
     /// Accepted helm intents stay visually pinned to the commander draft
     /// until the authoritative position animation has completed.
     helm_preview_pending: HashSet<String>,
@@ -3103,6 +3114,14 @@ struct ShipApp {
     /// ready changes by other people's hands, so the island re-reads on a
     /// short timer rather than showing the number it saw once.
     step_gate_read_at: Option<Instant>,
+    /// The participant's own door onto the plan: where the exercise is
+    /// (`current`) and what this caller is being asked to declare
+    /// (`asking`). Polled on a timer like the gate — the Game Master's
+    /// Play and other people's declarations move it under us.
+    current_step: Option<tfg::backend::CurrentStepView>,
+    /// When `current_step` was last read, so the banner re-reads on a
+    /// timer and never per frame.
+    current_step_read_at: Option<Instant>,
     /// Marker message ids already acted on, and whether the inbox has been
     /// read once. The first inbox read only BASELINES old markers —
     /// otherwise opening the app mid-exercise would replay every earlier
@@ -3563,6 +3582,19 @@ struct ShipApp {
     /// Session groups: unified group forest (Satuan Tugas of units,
     /// Gugus of groups), drawn on the map.
     groups: Groups,
+    /// Group authoring in the Planning column: whether map clicks pick
+    /// units/groups into `group_picked` instead of selecting, the
+    /// picked ids, the name being typed, and the vocabulary index the
+    /// kind picker holds. Kinds come from the echelon vocabulary, not
+    /// from a hardcoded list (see `zone_groups_body`).
+    group_select: bool,
+    group_picked: std::collections::HashSet<String>,
+    group_name: String,
+    group_kind_idx: usize,
+    /// The echelon vocabulary as the server lists it, lowest first.
+    /// Empty until read; the group picker falls back to the seeded
+    /// four and says so, rather than refusing to author offline.
+    echelons: Vec<tfg::backend::EchelonLevel>,
     /// Desktops (slice iv, grill #25): act-as identity + scope tabs.
     /// No identity = organizer with the merged All desktop.
     acting_as: Option<String>,
@@ -4349,8 +4381,32 @@ impl ShipApp {
             self.step_signals_seen.clear();
             self.step_signals_primed = false;
             self.step_gate = None;
+            self.current_step = None;
+            self.current_step_read_at = None;
             self.composer_scenario = None;
             self.composer_visible = false;
+            // A parked embark belongs to the old hold's hosts: a late
+            // candidates answer must not decide it afterwards. The
+            // mirrors belong to it too — composition is per game, so
+            // old hosts' contents, pickers, complements and warnings
+            // must not answer for the new hold's hulls.
+            self.pending_embark = None;
+            self.embark_island_host = None;
+            self.embarked.clear();
+            self.embark_candidates.clear();
+            self.unit_caps.clear();
+            self.embark_over.clear();
+            // Picks name this hold's hulls; the vocabulary belongs to
+            // it too. The forest itself is session-local scratch and
+            // goes with the hold — the server tree is a later slice.
+            self.group_select = false;
+            self.group_picked.clear();
+            self.group_name.clear();
+            self.group_kind_idx = 0;
+            self.echelons.clear();
+            self.groups = Groups::default();
+            self.embark_flash.clear();
+            self.embark_reject.clear();
             self.held_detail = None;
             self.composer_draft = ComposerDraft::default();
             self.composer_draft_error = None;
@@ -4476,6 +4532,11 @@ impl ShipApp {
         self.deselect();
         self.following = None;
         self.users_game = None;
+        self.group_select = false;
+        self.group_picked.clear();
+        self.group_name.clear();
+        self.echelons.clear();
+        self.groups = Groups::default();
         self.users_game_state = None;
         self.users_games.clear();
         self.games_gap = false;
@@ -4490,6 +4551,8 @@ impl ShipApp {
         self.step_signals_seen.clear();
         self.step_signals_primed = false;
         self.step_gate = None;
+        self.current_step = None;
+        self.current_step_read_at = None;
         self.users_gunits.clear();
         self.commanded_hulls.clear();
         self.roster_gap = false;
@@ -5112,6 +5175,8 @@ impl ShipApp {
         self.step_signals_seen.clear();
         self.step_signals_primed = false;
         self.step_gate = None;
+        self.current_step = None;
+        self.current_step_read_at = None;
         self.users_gunits.clear();
         self.commanded_hulls.clear();
         self.minos_tree.clear();
@@ -5346,6 +5411,8 @@ impl ShipApp {
         self.step_signals_seen.clear();
         self.step_signals_primed = false;
         self.step_gate = None;
+        self.current_step = None;
+        self.current_step_read_at = None;
             self.users_gunits.clear();
             self.commanded_hulls.clear();
             self.users_placements.clear();
@@ -7736,46 +7803,30 @@ impl ShipApp {
         }));
     }
 
-    /// Load one host's direct contents, once. All-or-nothing batches
-    /// answer with the same shape, so the load and the write converge
-    /// on one map.
-    fn ensure_embarked(&mut self, host: i64) {
-        if self.embarked.contains_key(&host) || self.setup_busy("embarkations") {
+    /// Read the echelon vocabulary once per hold: the ordered levels
+    /// new groups are mustered under. A failing read retries when the
+    /// island reopens, never per frame; meanwhile the picker falls
+    /// back to the seeded four and says so.
+    fn ensure_echelons(&mut self) {
+        if !self.echelons.is_empty() || self.setup_busy("echelons") {
             return;
         }
         let Ok((master, tok)) = self.users_client() else {
             return;
         };
-        self.setup_op = Some(spawn_rest("embarkations", move || {
+        self.setup_op = Some(spawn_rest("echelons", move || {
             master
-                .embarkations(&tok, host)
+                .echelon_levels(&tok)
+                .map(SetupDone::Echelons)
                 .map_err(|e| e.to_string())
-                .map(|units| SetupDone::EmbarkedLoaded(host, units))
         }));
     }
 
-    /// Load one host's attach picker, once. Empty is a real answer —
-    /// the host declared nothing, and capacities are the first thing
-    /// an operator sets.
-    fn ensure_candidates(&mut self, host: i64) {
-        if self.embark_candidates.contains_key(&host) || self.setup_busy("embarkation-candidates")
-        {
-            return;
-        }
-        let Ok((master, tok)) = self.users_client() else {
-            return;
-        };
-        self.setup_op = Some(spawn_rest("embarkation-candidates", move || {
-            master
-                .embarkation_candidates(&tok, host)
-                .map_err(|e| e.to_string())
-                .map(|units| SetupDone::EmbarkCandidates(host, units))
-        }));
-    }
-
-    /// Load one hull's declared complements, once.
-    fn ensure_capacities(&mut self, host: i64) {
-        if self.unit_capacities.contains_key(&host) || self.setup_busy("capacities") {
+    /// Load one host's declared complements, once. Read-only — the
+    /// register app authors them; this client only enforces them before
+    /// a drop.
+    fn ensure_unit_caps(&mut self, host: i64) {
+        if self.unit_caps.contains_key(&host) || self.setup_busy("capacities") {
             return;
         }
         let Ok((master, tok)) = self.users_client() else {
@@ -7785,14 +7836,96 @@ impl ShipApp {
             master
                 .unit_capacities(&tok, host)
                 .map_err(|e| e.to_string())
-                .map(|caps| SetupDone::CapacitiesLoaded(host, caps))
+                .map(|caps| SetupDone::CapsLoaded(host, caps))
         }));
     }
 
-    /// Attach a batch of hulls to a host. All of it or none of it: a
-    /// ring, an already-inside unit, an unknown id or a duplicate
-    /// refuses the whole batch with `unit_ids[<index>]` errors, loudly.
-    /// Going over capacity is a warning in the answer, not a refusal.
+    /// Load one host's direct contents, once, from the exercise's OWN
+    /// composition. All-or-nothing batches answer with the same shape,
+    /// so the load and the write converge on one map. Without a held
+    /// game there is no exercise composition to read — the island says
+    /// so instead of guessing one.
+    fn ensure_embarked(&mut self, host: i64) {
+        if self.embarked.contains_key(&host) || self.setup_busy("embarkations") {
+            return;
+        }
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        let Some((game_id, _)) = self.users_game.clone() else {
+            return;
+        };
+        self.setup_op = Some(spawn_rest("embarkations", move || {
+            master
+                .game_embarkations(&tok, game_id, host)
+                .map_err(|e| e.to_string())
+                .map(|units| SetupDone::EmbarkedLoaded(host, units))
+        }));
+    }
+
+    /// Derive one host's attach picker from the game's own pieces. No
+    /// request: the exercise has no candidates endpoint (that read is
+    /// the register's copy, and a CMS detach under a running game must
+    /// not change who declares ready). The list is game pieces minus
+    /// the host itself minus hulls known-embarked anywhere in the
+    /// exercise, kept to kinds the host declares it carries. Unknown
+    /// taxonomy passes through — the server stays the final arbiter
+    /// and refuses rings, strangers and double-musters loudly.
+    fn ensure_candidates(&mut self, host: i64) {
+        if self.embark_candidates.contains_key(&host) {
+            return;
+        }
+        if !self.unit_caps.contains_key(&host) {
+            self.ensure_unit_caps(host);
+            return;
+        }
+        self.embark_candidates.insert(host, self.derive_candidates(host));
+    }
+
+    /// The picker's list for one host, from local mirrors only. Empty
+    /// for a host that declares no complements — a hull that carries
+    /// nothing offers nothing — and empty when the pieces mirror is
+    /// itself empty, which the drop path reads as "unknown, ask the
+    /// server" rather than as a refusal.
+    fn derive_candidates(&self, host: i64) -> Vec<tfg::backend::EmbarkationCandidate> {
+        let caps = self.unit_caps.get(&host).cloned().unwrap_or_default();
+        if caps.is_empty() {
+            return Vec::new();
+        }
+        let aboard: std::collections::HashSet<i64> = self
+            .embarked
+            .values()
+            .flatten()
+            .map(|u| u.id)
+            .collect();
+        self.users_gunits
+            .iter()
+            .filter(|g| g.unit_id != host && !aboard.contains(&g.unit_id))
+            .filter(|g| {
+                match self.unit_taxonomy(g.unit_id) {
+                    // Of a declared kind: the child must match at least
+                    // one complement the host carries.
+                    Some(tax) => caps.iter().any(|cap| {
+                        Self::tax_matches(g.unit_id, &tax, &cap.level, cap.id_level)
+                    }),
+                    // Unresolvable locally — let the server decide.
+                    None => true,
+                }
+            })
+            .map(|g| tfg::backend::EmbarkationCandidate {
+                id: g.unit_id,
+                name: g.unit_name.clone(),
+                hull_number: g.hull_number.clone(),
+                class_name: String::new(),
+            })
+            .collect()
+    }
+
+    /// Attach a batch of hulls to a host, in the exercise's own
+    /// composition. All of it or none of it: a ring, an already-inside
+    /// unit, a stranger to the game or a duplicate refuses the whole
+    /// batch with `unit_ids[<index>]` errors, loudly. Going over
+    /// capacity is a warning in the answer, not a refusal.
     fn embark_attach(&mut self, host: i64, units: Vec<i64>) {
         if self.setup_busy("embark") {
             return;
@@ -7800,217 +7933,366 @@ impl ShipApp {
         let Ok((master, tok)) = self.users_client() else {
             return;
         };
+        let Some((game_id, _)) = self.users_game.clone() else {
+            self.users_status = "embark refused: no held game".to_string();
+            return;
+        };
         self.setup_op = Some(spawn_rest("embark", move || {
             master
-                .attach_units(&tok, host, &units)
+                .game_attach_units(&tok, game_id, host, &units)
                 .map_err(|e| e.to_string())
                 .map(|result| SetupDone::EmbarkChanged(host, result))
         }));
     }
 
-    /// Detach a batch of hulls from a host. A physical delete,
-    /// all-or-nothing like the attach.
-    fn embark_detach(&mut self, host: i64, units: Vec<i64>) {
-        if self.setup_busy("embark-detach") {
+    /// Take hulls out of a host, in the exercise's own composition:
+    /// the answer is the host's remaining contents, and the landing
+    /// arm tells the two apart by whether a drop was pending for the
+    /// host.
+    fn unembark(&mut self, host: i64, units: Vec<i64>) {
+        if units.is_empty() {
+            return;
+        }
+        if self.setup_op.is_some() {
+            self.users_status = "unembark refused: another request is in flight".to_string();
             return;
         }
         let Ok((master, tok)) = self.users_client() else {
             return;
         };
-        self.setup_op = Some(spawn_rest("embark-detach", move || {
+        let Some((game_id, _)) = self.users_game.clone() else {
+            self.users_status = "unembark refused: no held game".to_string();
+            return;
+        };
+        self.setup_op = Some(spawn_rest("unembark", move || {
             master
-                .detach_units(&tok, host, &units)
+                .game_detach_units(&tok, game_id, host, &units)
                 .map_err(|e| e.to_string())
                 .map(|result| SetupDone::EmbarkChanged(host, result))
         }));
     }
 
-    /// Save one hull's complements as a whole. The body is the complete
-    /// set, not a delta — a complement the list no longer names has
-    /// been taken away, and an empty list means the hull carries
+    /// Let embarked pieces act: the host's permission for them to take
+    /// orders and hold positions of their own. They stay aboard for
+    /// messages and readiness — clearing is permission, not release.
+    fn embark_clear(&mut self, host: i64, units: Vec<i64>) {
+        if units.is_empty() {
+            return;
+        }
+        if self.setup_op.is_some() {
+            self.users_status = "clear refused: another request is in flight".to_string();
+            return;
+        }
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        let Some((game_id, _)) = self.users_game.clone() else {
+            self.users_status = "clear refused: no held game".to_string();
+            return;
+        };
+        self.setup_op = Some(spawn_rest("embark-clear", move || {
+            master
+                .game_clear_aboard(&tok, game_id, host, &units)
+                .map_err(|e| e.to_string())
+                .map(|result| SetupDone::EmbarkChanged(host, result))
+        }));
+    }
+
+    /// Take the host's permission back. Legs already sailed stay
+    /// sailed; the piece takes no further orders until cleared again.
+    fn embark_revoke(&mut self, host: i64, units: Vec<i64>) {
+        if units.is_empty() {
+            return;
+        }
+        if self.setup_op.is_some() {
+            self.users_status = "revoke refused: another request is in flight".to_string();
+            return;
+        }
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        let Some((game_id, _)) = self.users_game.clone() else {
+            self.users_status = "revoke refused: no held game".to_string();
+            return;
+        };
+        self.setup_op = Some(spawn_rest("embark-revoke", move || {
+            master
+                .game_revoke_clearance(&tok, game_id, host, &units)
+                .map_err(|e| e.to_string())
+                .map(|result| SetupDone::EmbarkChanged(host, result))
+        }));
+    }
+
+    /// Which deployed hull the pointer is over, if any: the topmost
+    /// marker hit that is a placed register hull and not the dragged
+    /// one. Paint order and pick order are the same list, so the walk
+    /// is backwards — the marker the operator sees on top wins.
+    fn map_deployed_host_at(
+        &self,
+        markers: &[ShipMarker],
+        px: f64,
+        py: f64,
+        pixels_per_point: f32,
+        exclude: &str,
+    ) -> Option<i64> {
+        paint_order(markers)
+            .iter()
+            .rev()
+            .map(|&i| &markers[i])
+            .filter(|m| !self.hidden.contains(&m.id) && m.id != exclude)
+            .filter(|m| self.placed_fleet.contains(&m.id))
+            .find(|m| marker_body_hit(m, px, py, self.zoom, pixels_per_point))
+            .and_then(|m| m.id.parse::<i64>().ok())
+    }
+
+    /// A picker drop landed on a deployed hull: embark the dragged unit
+    /// aboard it, gated on the host's derived candidates. A drop the
+    /// complements have not loaded for yet parks in `pending_embark`
+    /// and is decided when the answer lands — never guessed. With no
+    /// pieces mirror to derive from, the gate is skipped and the
+    /// server arbitrates the attach loudly.
+    fn try_embark_drop(&mut self, host: i64, child: i64) {
+        if host == child {
+            return;
+        }
+        // One attach at a time through the shared slot. A second drop
+        // while one is in flight must not overwrite the pending pair —
+        // the EmbarkChanged answer would then unmap a hull whose
+        // attach never ran.
+        if self.setup_op.is_some() {
+            self.note_placement("embark in flight — drop again once it lands");
+            return;
+        }
+        if self.users_gunits.is_empty() {
+            self.pending_embark = Some((host, child));
+            self.embark_attach(host, vec![child]);
+            return;
+        }
+        let mut waiting = false;
+        if !self.embark_candidates.contains_key(&host) {
+            self.ensure_candidates(host);
+            waiting = !self.embark_candidates.contains_key(&host);
+        }
+        if !self.unit_caps.contains_key(&host) {
+            self.ensure_unit_caps(host);
+            waiting = true;
+        }
+        if waiting {
+            self.pending_embark = Some((host, child));
+            self.note_placement("checking whether the hull may embark there…");
+            return;
+        }
+        self.evaluate_embark(host, child);
+    }
+
+    /// Decide a (host, child) pair against the loaded candidates and
+    /// complements. Not a candidate → ✕ badge; a full category → ✕
+    /// badge naming what is full; otherwise attach. Never a silent
     /// nothing.
-    fn save_capacities(&mut self, host: i64, caps: Vec<tfg::backend::UnitCapacity>) {
-        if self.setup_busy("capacities-save") {
+    fn evaluate_embark(&mut self, host: i64, child: i64) {
+        let allowed = self
+            .embark_candidates
+            .get(&host)
+            .is_some_and(|cands| cands.iter().any(|c| c.id == child));
+        if !allowed {
+            self.flag_embark_reject(host, child);
             return;
         }
-        let Ok((master, tok)) = self.users_client() else {
+        if let Some(reason) = self.capacity_blocker(host, child) {
+            self.flag_embark_full(host, child, reason);
             return;
-        };
-        self.setup_op = Some(spawn_rest("capacities-save", move || {
-            master
-                .set_unit_capacities(&tok, host, &caps)
-                .map_err(|e| e.to_string())
-                .map(|stored| SetupDone::CapacitiesSaved(host, stored))
-        }));
+        }
+        self.pending_embark = Some((host, child));
+        self.embark_attach(host, vec![child]);
     }
 
-    /// Per-hull embarkation + capacities panel for the setup fleet
-    /// pieces. Register authoring, per hull not per class: two ships
-    /// of one class may be fitted differently. "Embarked" here means
-    /// hulls carried inside this hull — not to be confused with the
-    /// dashboard's task-group fellows, which is why that column is
-    /// named "Task group".
-    fn embark_ui(&mut self, ui: &mut egui::Ui, host: i64) {
+    /// Whether the drop would overfill a declared complement: the first
+    /// full one, as a reason line. Counts the hulls already aboard whose
+    /// taxonomy resolves plus the child itself; a hull whose taxonomy
+    /// the local register cannot resolve is skipped rather than
+    /// guessed, and an unresolvable child is allowed through — the
+    /// server stays the final arbiter and reports `over_capacity`.
+    fn capacity_blocker(&self, host: i64, child: i64) -> Option<String> {
+        let caps = self.unit_caps.get(&host)?;
+        let child_tax = self.unit_taxonomy(child);
+        for cap in caps {
+            let aboard = self
+                .embarked
+                .get(&host)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter(|u| {
+                    self.unit_taxonomy(u.id).is_some_and(|t| {
+                        Self::tax_matches(u.id, &t, &cap.level, cap.id_level)
+                    })
+                })
+                .count() as i64;
+            let child_matches = child_tax.as_ref().is_some_and(|t| {
+                Self::tax_matches(child, t, &cap.level, cap.id_level)
+            });
+            if !child_matches {
+                continue;
+            }
+            let would_hold = aboard + 1;
+            if would_hold > cap.max_aboard {
+                return Some(format!(
+                    "{} {} holds {} (max {})",
+                    cap.level, cap.id_level, would_hold, cap.max_aboard
+                ));
+            }
+        }
+        None
+    }
+
+    /// A unit id's (class, type, category) from the synced register.
+    /// `None` when the register does not know the hull — the register
+    /// app owns that truth, and an unknown hull is not provable either
+    /// way.
+    fn unit_taxonomy(&self, unit_id: i64) -> Option<(i64, Option<i64>, Option<i64>)> {
+        let conn = self.store.as_ref()?;
+        let row = tfg::store::fleet_unit(conn, &unit_id.to_string()).ok()??;
+        Some((row.class_id, row.type_id, row.category_id))
+    }
+
+    /// Whether a hull belongs to a complement's kind: the kind is a
+    /// level AND an id ("four helicopters" vs "four aircraft of any
+    /// kind" vs "this exact hull").
+    fn tax_matches(
+        unit_id: i64,
+        tax: &(i64, Option<i64>, Option<i64>),
+        level: &str,
+        id_level: i64,
+    ) -> bool {
+        match level {
+            "unit" => unit_id == id_level,
+            "class" => tax.0 == id_level,
+            "type" => tax.1 == Some(id_level),
+            "category" => tax.2 == Some(id_level),
+            _ => false,
+        }
+    }
+
+    /// A drop refused by a full complement: badge the destination and
+    /// name what is full, with the refusal buzz.
+    fn flag_embark_full(&mut self, host: i64, child: i64, reason: String) {
+        self.pending_embark = None;
+        self.embark_reject.insert(host, Instant::now());
+        let child_name = self
+            .placement_seed_for(child)
+            .map(|(name, _, _)| name)
+            .unwrap_or_else(|| format!("unit {child}"));
+        let host_name = self
+            .force
+            .get(host)
+            .map(|h| h.name.clone())
+            .unwrap_or_else(|| format!("unit {host}"));
+        self.note_placement(format!(
+            "{child_name} cannot embark aboard {host_name} — {reason} full"
+        ));
+        tfg::sfx::play(tfg::sfx::Sfx::Buzz);
+        self.dirty = true;
+    }
+
+    /// A rejected drop: badge the destination for a few seconds and say
+    /// why on the placement line. The candidates list is the rule, so
+    /// the line names it.
+    fn flag_embark_reject(&mut self, host: i64, child: i64) {
+        self.pending_embark = None;
+        self.embark_reject.insert(host, Instant::now());
+        let child_name = self
+            .placement_seed_for(child)
+            .map(|(name, _, _)| name)
+            .unwrap_or_else(|| format!("unit {child}"));
+        let host_name = self
+            .force
+            .get(host)
+            .map(|h| h.name.clone())
+            .unwrap_or_else(|| format!("unit {host}"));
+        self.note_placement(format!(
+            "{child_name} cannot embark aboard {host_name} — not an allowed candidate"
+        ));
+        tfg::sfx::play(tfg::sfx::Sfx::Buzz);
+        self.dirty = true;
+    }
+
+    /// The embarked-contents island body for one host: what is
+    /// directly inside it in the exercise's own composition, with the
+    /// host's permission per piece. Complements are authored in the
+    /// register app — this surface shows the result (the contents plus
+    /// any over-capacity warning the last write reported), never an
+    /// editor. Clearing lets a piece act; unembarking takes it out.
+    fn embark_island_body(&mut self, ui: &mut egui::Ui, host: i64) {
         self.ensure_embarked(host);
-        self.ensure_capacities(host);
+        let name = self
+            .force
+            .get(host)
+            .map(|h| h.name.clone())
+            .unwrap_or_else(|| format!("unit {host}"));
+        ui.weak(format!("aboard {name}"));
         let inside = self.embarked.get(&host).cloned().unwrap_or_default();
         let over = self.embark_over.get(&host).cloned().unwrap_or_default();
-        egui::CollapsingHeader::new(format!("Embarked ({})", inside.len()))
-            .id_salt(format!("embarked-{host}"))
-            .show(ui, |ui| {
-                if inside.is_empty() {
-                    ui.weak("nothing embarked");
-                } else {
-                    let mut sel = self.embark_detach_sel.get(&host).cloned().unwrap_or_default();
-                    for u in &inside {
-                        let mut on = sel.contains(&u.id);
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut on, "");
-                            ui.label(format!("{} ({}) · {}", u.name, u.hull_number, u.class_name));
-                        });
-                        if on && !sel.contains(&u.id) {
-                            sel.push(u.id);
-                        } else if !on {
-                            sel.retain(|id| *id != u.id);
-                        }
-                    }
-                    self.embark_detach_sel.insert(host, sel.clone());
-                    if !sel.is_empty() && ui.small_button(format!("detach {} selected", sel.len())).clicked()
-                    {
-                        self.embark_detach(host, sel);
-                    }
-                }
-                for o in &over {
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        format!(
-                            "over capacity: {} {} holds {} (max {})",
-                            o.level, o.id_level, o.would_hold, o.max_aboard
-                        ),
-                    );
-                }
-                let open = self.embark_attach_open.contains(&host);
-                if ui.small_button(if open { "close attach picker" } else { "attach…" }).clicked() {
-                    if open {
-                        self.embark_attach_open.remove(&host);
-                    } else {
-                        self.embark_attach_open.insert(host);
-                    }
-                }
-                if self.embark_attach_open.contains(&host) {
-                    self.ensure_candidates(host);
-                    let cands =
-                        self.embark_candidates.get(&host).cloned().unwrap_or_default();
-                    if cands.is_empty() {
-                        ui.weak("no candidates — this hull declares no complements; set capacities first");
-                    } else {
-                        ui.weak(format!("{} candidate(s), capped at 200", cands.len()));
-                        let mut sel =
-                            self.embark_attach_sel.get(&host).cloned().unwrap_or_default();
-                        for c in &cands {
-                            let mut on = sel.contains(&c.id);
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut on, "");
-                                ui.label(format!(
-                                    "{} ({}) · {}",
-                                    c.name, c.hull_number, c.class_name
-                                ));
-                            });
-                            if on && !sel.contains(&c.id) {
-                                sel.push(c.id);
-                            } else if !on {
-                                sel.retain(|id| *id != c.id);
-                            }
-                        }
-                        self.embark_attach_sel.insert(host, sel.clone());
-                        if !sel.is_empty()
-                            && ui.small_button(format!("attach {} selected", sel.len())).clicked()
-                        {
-                            self.embark_attach(host, sel);
-                        }
-                    }
-                }
-            });
-        let caps = self.unit_capacities.get(&host).cloned().unwrap_or_default();
-        let dirty = self.capacities_dirty.contains(&host);
-        egui::CollapsingHeader::new(format!(
-            "Capacities{}{}",
-            if caps.is_empty() { " — none declared".to_string() } else { format!(" ({})", caps.len()) },
-            if dirty { " · unsaved".to_string() } else { String::new() }
-        ))
-        .id_salt(format!("capacities-{host}"))
-        .show(ui, |ui| {
-            ui.weak("what this hull carries, and how many — per hull, not per class");
-            let mut remove: Option<usize> = None;
-            for (i, c) in caps.iter().enumerate() {
+        if inside.is_empty() {
+            ui.weak("nothing embarked");
+        } else {
+            let mut out: Vec<i64> = Vec::new();
+            let mut clear: Vec<i64> = Vec::new();
+            let mut revoke: Vec<i64> = Vec::new();
+            for u in &inside {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} {} · max {}", c.level, c.id_level, c.max_aboard));
-                    if ui.small_button("remove").clicked() {
-                        remove = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = remove {
-                let mut next = caps.clone();
-                next.remove(i);
-                self.unit_capacities.insert(host, next);
-                self.capacities_dirty.insert(host);
-            }
-            ui.horizontal(|ui| {
-                let mut level =
-                    self.cap_level.get(&host).cloned().unwrap_or_else(|| "class".to_string());
-                egui::ComboBox::from_id_salt(format!("cap-level-{host}"))
-                    .selected_text(level.clone())
-                    .show_ui(ui, |ui| {
-                        for l in ["category", "type", "class", "unit"] {
-                            ui.selectable_value(&mut level, l.to_string(), l);
+                    self.unit_thumbnail_ui(ui, &u.id.to_string(), 28.0);
+                    ui.vertical(|ui| {
+                        ui.label(u.name.clone());
+                        ui.weak(format!("{} · {}", u.hull_number, u.class_name));
+                        // The host's permission, in words: a piece that
+                        // is not cleared takes no orders of its own.
+                        if u.is_cleared {
+                            ui.label(
+                                egui::RichText::new("cleared — may act")
+                                    .small()
+                                    .color(egui::Color32::from_rgb(0x4A, 0xDE, 0x80)),
+                            );
+                        } else {
+                            ui.weak("aboard — takes no orders until cleared");
                         }
                     });
-                self.cap_level.insert(host, level.clone());
-                let mut id = self.cap_id.get(&host).cloned().unwrap_or_default();
-                ui.add(
-                    egui::TextEdit::singleline(&mut id)
-                        .hint_text("level id")
-                        .desired_width(70.0),
-                );
-                self.cap_id.insert(host, id.clone());
-                let mut max = self.cap_max.get(&host).cloned().unwrap_or_default();
-                ui.add(
-                    egui::TextEdit::singleline(&mut max)
-                        .hint_text("max")
-                        .desired_width(50.0),
-                );
-                self.cap_max.insert(host, max.clone());
-                if ui.small_button("add").clicked() {
-                    if let (Ok(id_level), Ok(max_aboard)) =
-                        (id.trim().parse::<i64>(), max.trim().parse::<i64>())
-                    {
-                        if id_level > 0 && max_aboard >= 0 {
-                            let mut next = caps.clone();
-                            next.push(tfg::backend::UnitCapacity {
-                                level,
-                                id_level,
-                                max_aboard,
-                            });
-                            self.unit_capacities.insert(host, next);
-                            self.capacities_dirty.insert(host);
-                            self.cap_id.insert(host, String::new());
-                            self.cap_max.insert(host, String::new());
-                        } else {
-                            self.users_status =
-                                "capacity needs a positive level id and a non-negative max"
-                                    .to_string();
-                        }
-                    } else {
-                        self.users_status =
-                            "capacity needs a numeric level id and max".to_string();
-                    }
-                }
-            });
-            if dirty && ui.small_button("save capacities").clicked() {
-                self.save_capacities(host, caps.clone());
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("unembark").clicked() {
+                                out.push(u.id);
+                            }
+                            // Permission follows the piece, not the
+                            // batch: one press per row, never a guess
+                            // about which rows the operator meant.
+                            if u.is_cleared {
+                                if ui.small_button("revoke").clicked() {
+                                    revoke.push(u.id);
+                                }
+                            } else if ui.small_button("clear").clicked() {
+                                clear.push(u.id);
+                            }
+                        },
+                    );
+                });
             }
-        });
+            if !out.is_empty() {
+                self.unembark(host, out);
+            } else if !clear.is_empty() {
+                self.embark_clear(host, clear);
+            } else if !revoke.is_empty() {
+                self.embark_revoke(host, revoke);
+            }
+        }
+        for o in &over {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                format!(
+                    "over capacity: {} {} holds {} (max {})",
+                    o.level, o.id_level, o.would_hold, o.max_aboard
+                ),
+            );
+        }
     }
 
     /// Direct helm control for a caller-commanded piece in an executing
@@ -10207,6 +10489,7 @@ impl ShipApp {
             let mut commanding: Vec<(i64, i64)> = Vec::new();
             let mut removals: Vec<(i64, String)> = Vec::new();
             let mut lifts: Vec<(i64, String)> = Vec::new();
+            let mut open_embark: Option<i64> = None;
             for hull in self.force.hulls().cloned().collect::<Vec<_>>() {
                 let placed = hull.start.is_some();
                 let unit_id = hull.unit_id.to_string();
@@ -10266,12 +10549,16 @@ impl ShipApp {
                                 }
                             });
                     });
-                    // Register-side complement + contents authoring, per
-                    // hull: "this ship carries N helicopters", and what is
-                    // directly inside it. Nothing an exercise runs reads
-                    // this — a game takes its own copy — so it sits with
-                    // the pieces, not the helm.
-                    self.embark_ui(ui, hull.unit_id);
+                    // What is embarked aboard this hull lives in the
+                    // Embarked island — this row only opens it. Drops
+                    // from the fleet picker embark; complements are
+                    // authored in the register app, never here.
+                    ui.horizontal(|ui| {
+                        ui.weak("Embarked");
+                        if ui.small_button("show…").clicked() {
+                            open_embark = Some(hull.unit_id);
+                        }
+                    });
                     ui.separator();
                 });
             }
@@ -10283,6 +10570,9 @@ impl ShipApp {
             }
             for (unit, name) in lifts {
                 self.lift_placement(unit, &name);
+            }
+            if let Some(host) = open_embark {
+                self.embark_island_host = Some(host);
             }
             let pending = self.force.pending(&self.live_hulls());
             if pending > 0 {
@@ -10701,6 +10991,8 @@ impl ShipApp {
                     if self.users_game.is_some() {
                         ui.separator();
                         self.headcount_ui(ui);
+                        ui.separator();
+                        self.mode_ui(ui);
                     }
                     ui.separator();
                     self.map_controls(ui);
@@ -10883,6 +11175,34 @@ impl ShipApp {
             egui::FontId::monospace(12.0),
             state.ink(),
         );
+    }
+
+    /// The exercise's mode, as the held detail reports it: how
+    /// positions are produced (maneuver, static, scenario). Absent when
+    /// no game is held or the detail never named one — the band shows
+    /// nothing rather than a guessed mode.
+    fn mode_ui(&self, ui: &mut egui::Ui) {
+        let Some(detail) = self.held_detail.as_ref() else {
+            return;
+        };
+        let mode = detail.mode.trim();
+        if mode.is_empty() {
+            return;
+        }
+        let pace = detail
+            .pace
+            .map(|p| format!("{p:?}"))
+            .unwrap_or_else(|| "pace unknown".to_string());
+        ui.label(
+            egui::RichText::new(format!("mode {}", mode.to_uppercase()))
+                .monospace()
+                .small()
+                .weak(),
+        )
+        .on_hover_text(format!(
+            "how positions are produced · {} · {}",
+            detail.state, pace
+        ));
     }
 
     /// How many of the roster are actually in the room.
@@ -11223,9 +11543,10 @@ impl ShipApp {
     //    it. The map is full-bleed under the floating zones, so its rect
     //    contains the panel, and a naive release would drop a hull at
     //    whatever point lies behind the form.
-    // 2. The drag ghost is painted by the map, which is UNDER the backdrop.
-    //    So while a drag is in flight the backdrop clears instead of dimming
-    //    — see `chrome::Backdrop`.
+    // 2. The drag ghost is painted by the map, which the panel covers.
+    //    So the picker is a palette (`as_palette`: no backdrop, the map
+    //    stays live and clickable behind it), and while a drag is in
+    //    flight the panel steps aside entirely — see `chrome::Modal`.
 
     /// The Fleet Picker modal.
     ///
@@ -11264,10 +11585,17 @@ impl ShipApp {
             egui::Id::new("fleet-picker"),
             "Fleet picker",
             fleet_picker_size(ui.ctx().viewport_rect().height()),
-        );
+        )
+        // A palette, not a dialog: its rows promise "click the map to
+        // place", and a backdrop would eat that very click — the whole
+        // view dimmed and dead with no way out but the ✕. The panel
+        // claims only its own rect; the map behind it stays live, and a
+        // release over the panel itself is still refused by
+        // `drop_lands_on_map` via the published rect below.
+        .as_palette();
         // A drag in flight means the pointer is about to be over the map, and the
-        // ghost it is aiming with is painted there — so the whole panel steps
-        // aside, not just the dim. It is the thing covering the target, and a
+        // ghost it is aiming with is painted there — so the panel steps
+        // aside while the gesture lasts. It is the thing covering the target, and a
         // release over it is refused by `drop_lands_on_map`, so leaving it up
         // would take away exactly the ground the gesture is for.
         let dragging = self.unit_drag.is_some();
@@ -12045,6 +12373,15 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         let state = self.game_state();
         let vp = ui.ctx().viewport_rect();
         let w = clamp_zone_width(self.side_zone_w, vp.width());
+        // The participant's door onto the plan polls on a timer: the
+        // Game Master's Play and other people's declarations move it
+        // under us. Seat-holders only — a caller with no place is
+        // refused 403, and a 5s refusal on the status line is spam,
+        // not signal. The repaint keeps the timer alive while idle.
+        if self.users_game.is_some() && self.own_roster_row().is_some() {
+            self.poll_current_step();
+            ui.ctx().request_repaint_after(Duration::from_secs(6));
+        }
 
         // The user island is first in every state, because identity is the
         // one thing that does not change with the exercise.
@@ -12101,6 +12438,17 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 entries.push((
                     Island::new(egui::Id::new("z.fleet"), "Fleet", egui::vec2(w, 320.0))
                         .with_trailing(&format!("{} PIECES", self.force.len())),
+                    true,
+                ));
+                // Task organisation, authored bottom-up: pick units off
+                // the map into a Satuan Tugas, then Satuan Tugas into a
+                // Gugus, and so on up the echelon vocabulary. Local
+                // scratch for this hold — the server tree is a later
+                // slice — but the levels it may use already come from
+                // the server, never from a hardcoded list.
+                entries.push((
+                    Island::new(egui::Id::new("z.groups"), "Groups", egui::vec2(w, 380.0))
+                        .with_trailing(&self.groups_trail()),
                     true,
                 ));
                 entries.push((
@@ -12188,6 +12536,27 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                     Island::new(egui::Id::new("z.log"), "Log", egui::vec2(w, 260.0)),
                     true,
                 ));
+                }
+                // Personnel get the Step banner instead of the console:
+                // their door onto the plan is the polled current-step
+                // (the instruction plus their own declaration), never
+                // the book. The organizer audience keeps the Steps
+                // island above; everyone else reads here.
+                if !self.steps_audience() {
+                    let step_trail = match &self.current_step {
+                        Some(view) => match &view.asking {
+                            Some(ask) if ask.you_ready => "READY".to_string(),
+                            Some(_) => "ASKING".to_string(),
+                            None if view.current.is_some() => "PLAYING".to_string(),
+                            None => "—".to_string(),
+                        },
+                        None => "—".to_string(),
+                    };
+                    entries.push((
+                        Island::new(egui::Id::new("z.mystep"), "Step", egui::vec2(w, 380.0))
+                            .with_trailing(&step_trail),
+                        true,
+                    ));
                 }
             }
             // Closure is read-only, so the column is what you debrief with:
@@ -12372,12 +12741,14 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 x if x == egui::Id::new("z.essentials") => self.zone_essentials_body(ui),
                 x if x == egui::Id::new("z.control") => self.zone_control_body(ui),
                 x if x == egui::Id::new("z.fleet") => self.zone_fleet_body(ui),
+                x if x == egui::Id::new("z.groups") => self.zone_groups_body(ui),
                 x if x == egui::Id::new("z.players") => self.zone_players_body(ui),
                 x if x == egui::Id::new("z.review") => self.zone_review_body(ui),
                 x if x == egui::Id::new("z.ready") => self.zone_ready_body(ui),
                 x if x == egui::Id::new("z.clock") => self.zone_exercise_body(ui),
                 x if x == egui::Id::new("z.orders") => self.zone_orders_body(ui),
                 x if x == egui::Id::new("z.steps") => self.zone_steps_body(ui),
+                x if x == egui::Id::new("z.mystep") => self.zone_mystep_body(ui),
                 x if x == egui::Id::new("z.crew") => self.zone_crew_body(ui),
                 x if x == egui::Id::new("z.log") => self.zone_log_body(ui),
                 x if x == egui::Id::new("z.assessment") => self.zone_assessment_body(ui),
@@ -12749,6 +13120,230 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         self.setup_fleet_ui(ui);
     }
 
+    /// The island-band readout for Groups: pick count while selecting,
+    /// group count otherwise. The band is the select-mode indicator an
+    /// operator reads without opening the island.
+    fn groups_trail(&self) -> String {
+        if self.group_select {
+            format!("SELECT {}", self.group_picked.len())
+        } else {
+            format!("{} GROUPS", self.groups.group_list().len())
+        }
+    }
+
+    /// Toggle one map id (a unit marker or a group flag) in the pick
+    /// set. One set for both: a group id is never a unit id, so the
+    /// form splits them by membership when it musters.
+    fn toggle_group_pick(&mut self, id: String) {
+        if !self.group_picked.remove(&id) {
+            self.group_picked.insert(id);
+        }
+    }
+
+    /// Muster the picked units and groups into a new group of the named
+    /// vocabulary level. Bottom-up like the hierarchy demands: units
+    /// into a Satuan Tugas, Satuan Tugas into a Gugus, and so on up
+    /// the levels the server lists. A level with no local equivalent
+    /// is refused loudly — mustering under a rank this build cannot
+    /// reason about would corrupt authority, scopes and the map zones
+    /// together. The server-side tree (a later slice) carries those
+    /// levels natively.
+    fn form_group_from_picks(&mut self, name: String, level: String) {
+        let Some(kind) = GroupKind::from_echelon(&level) else {
+            self.users_status = format!(
+                "group refused: level `{level}` has no local equivalent yet — server task-organisation sync lands later"
+            );
+            return;
+        };
+        let units: Vec<String> = self
+            .group_picked
+            .iter()
+            .filter(|id| self.groups.group(id).is_none())
+            .cloned()
+            .collect();
+        let children: Vec<String> = self
+            .group_picked
+            .iter()
+            .filter(|id| self.groups.group(id).is_some())
+            .cloned()
+            .collect();
+        if units.is_empty() && children.is_empty() {
+            self.users_status = "group refused: pick units or groups on the map first".to_string();
+            return;
+        }
+        let mut n = self.groups.group_list().len() + 1;
+        let mut id = format!("g{n}");
+        while self.groups.group(&id).is_some() {
+            n += 1;
+            id = format!("g{n}");
+        };
+        let noun = match (units.len(), children.len()) {
+            (u, 0) => format!("{u} unit(s)"),
+            (0, c) => format!("{c} group(s)"),
+            (u, c) => format!("{u} unit(s) + {c} group(s)"),
+        };
+        match self
+            .groups
+            .add_group(id, name.clone(), kind, units, children, None)
+        {
+            Ok(()) => {
+                self.group_picked.clear();
+                self.group_name.clear();
+                tfg::sfx::play(tfg::sfx::Sfx::Ding);
+                self.users_status =
+                    format!("formed {name} ({}) — {noun}", kind.label());
+            }
+            Err(e) => {
+                tfg::sfx::play(tfg::sfx::Sfx::Buzz);
+                self.users_status = format!("group refused: {e}");
+            }
+        }
+    }
+
+    /// Task-organisation authoring for the Planning column: select mode
+    /// plus the pick set plus the form plus the forest. Collect-then-
+    /// apply — the rows borrow to draw and cannot muster through
+    /// `self` mid-pass.
+    fn zone_groups_body(&mut self, ui: &mut egui::Ui) {
+        self.ensure_echelons();
+        // Select mode is the island's whole contract with the map: ON,
+        // and clicks pick instead of selecting; OFF, and the map
+        // behaves as it always has. The toggle carries its state in
+        // words, not only in colour, so the mode survives a glance.
+        ui.horizontal(|ui| {
+            let label = if self.group_select {
+                "● Select mode: ON"
+            } else {
+                "○ Select mode: off"
+            };
+            if ui
+                .button(label)
+                .on_hover_text("when on, map clicks pick units and groups into the set below instead of selecting them")
+                .clicked()
+            {
+                self.group_select = !self.group_select;
+                if !self.group_select {
+                    self.group_picked.clear();
+                }
+            }
+            if !self.group_picked.is_empty() && ui.small_button("clear picks").clicked() {
+                self.group_picked.clear();
+            }
+        });
+        if self.group_select {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} picked — click units and group flags on the map",
+                    self.group_picked.len()
+                ))
+                .strong(),
+            );
+        } else {
+            ui.weak("turn select mode on, then click units and group flags on the map");
+        }
+        ui.separator();
+        // The form: a name plus a level from the echelon vocabulary —
+        // the server's words, never a hardcoded list. While the read
+        // is in flight the seeded four stand in and say so.
+        let levels: Vec<String> = if self.echelons.is_empty() {
+            ["Unsur", "Satuan Tugas", "Gugus", "Operasi Gabungan"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            self.echelons.iter().map(|l| l.name.clone()).collect()
+        };
+        if self.echelons.is_empty() {
+            ui.weak("echelon vocabulary unread — built-in levels stand in");
+        }
+        if self.group_kind_idx >= levels.len() {
+            self.group_kind_idx = 0;
+        }
+        ui.label(egui::RichText::new("name").weak().small());
+        ui.add(
+            egui::TextEdit::singleline(&mut self.group_name)
+                .desired_width(f32::INFINITY)
+                .hint_text("e.g. Satgas A"),
+        );
+        ui.label(egui::RichText::new("level").weak().small());
+        egui::ComboBox::from_id_salt("group-kind")
+            .selected_text(levels.get(self.group_kind_idx).cloned().unwrap_or_default())
+            .show_ui(ui, |menu| {
+                for (i, name) in levels.iter().enumerate() {
+                    menu.selectable_value(&mut self.group_kind_idx, i, name);
+                }
+            });
+        let mut form: Option<(String, String)> = None;
+        if ui
+            .add_enabled(
+                !self.group_name.trim().is_empty() && !self.group_picked.is_empty(),
+                egui::Button::new(format!("Form group from {} picked", self.group_picked.len())),
+            )
+            .on_hover_text("muster the picked units and groups under a new group of this level")
+            .clicked()
+        {
+            form = Some((
+                self.group_name.trim().to_string(),
+                levels.get(self.group_kind_idx).cloned().unwrap_or_default(),
+            ));
+        }
+        ui.separator();
+        // The forest, in creation order: each group with its level, its
+        // members, and pick/delete verbs. A picked row says so — the
+        // set is only real if the operator can see it.
+        let mut toggles: Vec<String> = Vec::new();
+        let mut deletes: Vec<String> = Vec::new();
+        if self.groups.group_list().is_empty() {
+            ui.weak("no groups yet — pick units on the map and form a Satuan Tugas");
+        }
+        for g in self.groups.group_list().iter() {
+            let picked = self.group_picked.contains(&g.id);
+            ui.horizontal(|ui| {
+                let mark = if picked { "✓ " } else { "" };
+                ui.label(format!(
+                    "{mark}{} ({}) · {}",
+                    g.name,
+                    g.kind.label(),
+                    self.groups.group_units(&g.id).len()
+                ));
+                if ui
+                    .small_button(if picked { "unpick" } else { "pick" })
+                    .clicked()
+                {
+                    toggles.push(g.id.clone());
+                }
+                if ui.small_button("delete").clicked() {
+                    deletes.push(g.id.clone());
+                }
+            });
+            let members = self.groups.group_units(&g.id);
+            if !members.is_empty() {
+                let shown: Vec<String> = members
+                    .iter()
+                    .map(|m| {
+                        self.groups
+                            .group(m)
+                            .map(|c| format!("{} ({})", c.name, c.kind.label()))
+                            .unwrap_or_else(|| self.unit_label(m))
+                    })
+                    .collect();
+                ui.weak(format!("  {}", shown.join(", ")));
+            }
+        }
+        status_line(ui, &self.users_status.clone());
+        if let Some((name, level)) = form {
+            self.form_group_from_picks(name, level);
+        }
+        for id in toggles {
+            self.toggle_group_pick(id);
+        }
+        for id in deletes {
+            self.groups.remove_group(&id);
+            self.group_picked.remove(&id);
+            self.users_status = "group removed — its members muster nowhere".to_string();
+        }
+    }
+
     fn zone_players_body(&mut self, ui: &mut egui::Ui) {
         if let Some(reason) = self.setup_step_lock(1) {
             ui.weak(format!("Not yet — {reason}."));
@@ -12862,18 +13457,53 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         status_line(ui, &self.users_status.clone());
     }
 
-    /// Whether the caller sits in the Game Master seat, matched by the
-    /// canonical role name. Best effort, NOT authority: game roles may be
-    /// renamed (one deployment's organizer seat reads `Penyelenggara`),
-    /// while the server arbitrates the real grant by policy — the minos
-    /// transition check replaced its own name comparison for exactly this
-    /// reason. So this only ever hides EXTRA controls (safe direction),
-    /// and anything it gates degrades to read-only plus a loud refusal
-    /// rather than a silent dead end. Never use it for a verb whose
-    /// refusal would strand the exercise: the advance stays ungated.
+    /// Whether the caller sits in the Game Master seat. Best effort,
+    /// NOT authority: the server arbitrates the real grant by policy —
+    /// the minos transition check replaced its own name comparison for
+    /// exactly this reason. So this only ever hides EXTRA controls (safe
+    /// direction), and anything it gates degrades to read-only plus a
+    /// loud refusal rather than a silent dead end. Never use it for a
+    /// verb whose refusal would strand the exercise: the advance stays
+    /// ungated.
+    ///
+    /// The seat is recognised through the server's own vocabulary, never
+    /// a hardcoded deployment string: the canonical name plus the label
+    /// the mirror gives that same role (`Game Master` / `Penyelenggara`
+    /// in the seed). A deployment that relabels the seat keeps working
+    /// as long as the mirror carries the new label. What this cannot
+    /// see is a custom role that shares neither — for that the server
+    /// would need to publish a GM capability, which it currently does
+    /// not (the client never reads the permission matrix).
     fn is_game_master(&self) -> bool {
-        self.own_roster_row()
-            .is_some_and(|p| p.role_name == "Game Master")
+        let Some(own) = self.own_roster_row() else {
+            return false;
+        };
+        // The seed's two constants for the organizer seat, hardcoded
+        // once: they anchor the vocabulary, they are not a deployment
+        // string. Everything else is resolved from the mirror.
+        const GM_NAME: &str = "Game Master";
+        const GM_LABEL: &str = "Penyelenggara";
+        let mut seats = vec![GM_NAME.to_string(), GM_LABEL.to_string()];
+        let roles = self
+            .users_game_roles
+            .iter()
+            .map(|r| (r.name.as_str(), r.id_name.as_str()))
+            .chain(
+                self.users_roles
+                    .iter()
+                    .map(|(_, name, id_name, _)| (name.as_str(), id_name.as_str())),
+            );
+        for (name, id_name) in roles {
+            // The canonical seat under a relabelled name.
+            if name == GM_NAME && !id_name.is_empty() {
+                seats.push(id_name.to_string());
+            }
+            // A custom seat carrying the GM label.
+            if id_name == GM_LABEL && !name.is_empty() {
+                seats.push(name.to_string());
+            }
+        }
+        seats.iter().any(|s| *s == own.role_name)
     }
 
     /// Seated exercise-side players run the exercise from the bottom
@@ -12898,6 +13528,18 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             || self
                 .own_roster_row()
                 .is_some_and(|p| self.users_is_judge(&p))
+    }
+
+    /// Who sees the Inspector: the organizer audience, same rule as the
+    /// Steps console. The role-name match alone would hide the real
+    /// Game Master in deployments where that seat is named something
+    /// else, so the judge flag carries it — which means judge-side
+    /// seats see it too. There is no server capability that tells a
+    /// Game Master apart from a judge, so this is as narrow as the
+    /// client can honestly draw it; the server still arbitrates every
+    /// write the editors below stage.
+    fn inspector_audience(&self) -> bool {
+        self.steps_audience()
     }
 
     /// The dashboard's world, or why there is none: Simulation only,
@@ -13523,6 +14165,65 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         None
     }
 
+    /// Read where the exercise is and what this caller owes it, on a
+    /// timer. The Game Master's Play and other people's declarations
+    /// move it under us, so the banner re-reads rather than showing
+    /// the step it saw once. No held game, no door — and a failing
+    /// read retries on the timer, never per frame.
+    fn poll_current_step(&mut self) {
+        let due = self
+            .current_step_read_at
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
+        if !due || self.setup_op.is_some() {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        let Ok((master, tok)) = self.users_client() else {
+            return;
+        };
+        self.current_step_read_at = Some(Instant::now());
+        self.setup_op = Some(spawn_rest("current-step", move || {
+            master
+                .game_current_step(&tok, gid)
+                .map(SetupDone::CurrentStep)
+                .map_err(|e| e.to_string())
+        }));
+    }
+
+    /// Declare (or withdraw) the caller's own readiness for the step
+    /// the banner names. The declaration route names its step in the
+    /// path, so a stale banner can only be refused loudly — and a
+    /// landed write re-polls immediately, because the counts moved.
+    fn declare_step(&mut self, sid: i64, step: i64, ready: bool) {
+        if self.setup_busy("step") {
+            return;
+        }
+        let Some((gid, _)) = self.users_game.clone() else {
+            return;
+        };
+        let (master, tok) = match self.users_client() {
+            Ok(t) => t,
+            Err(e) => {
+                self.users_status = format!("step declaration failed: {e}");
+                return;
+            }
+        };
+        self.setup_op = Some(spawn_rest("step-declare", move || {
+            let out = if ready {
+                master
+                    .declare_step_readiness(&tok, gid, sid, step)
+                    .map(|()| "ready for the step — the Game Master plays it once everyone is".to_string())
+            } else {
+                master
+                    .withdraw_step_readiness(&tok, gid, sid, step)
+                    .map(|()| "declaration withdrawn — declare again when set".to_string())
+            };
+            out.map(SetupDone::StepDeclared).map_err(|e| e.to_string())
+        }));
+    }
+
     /// Read whether a step may start, and hold the answer against the
     /// step it was asked for. Refuses while the slot is busy rather than
     /// orphaning a read behind the in-flight op.
@@ -13599,6 +14300,97 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     /// this island — the plan is what they are exercised against, so the
     /// book, its gates and these controls are GM-side by backend design
     /// (migration 000062), and their tasking arrives as messages.
+    /// The participant's door onto the plan: the ONE step in play and
+    /// the ONE step asking this caller, from the polled `current-step`
+    /// — never the book around them, which personnel must not see. The
+    /// Game Master and judges get the Steps island instead (controls
+    /// plus gates); this banner is instruction plus declaration.
+    /// Collect-then-apply like every other body: the rows borrow to
+    /// draw and cannot declare through `self` mid-pass.
+    fn zone_mystep_body(&mut self, ui: &mut egui::Ui) {
+        // No seat, no door: the endpoint refuses seatless callers, so
+        // the poll never runs for them — say so instead of "reading…"
+        // forever.
+        if self.own_roster_row().is_none() {
+            ui.weak("hold a seat in this exercise — the banner reads your own door onto the plan");
+            status_line(ui, &self.users_status.clone());
+            return;
+        }
+        let mut declare: Option<(i64, i64, bool)> = None;
+        let Some(view) = self.current_step.clone() else {
+            ui.weak("reading where the exercise is…");
+            status_line(ui, &self.users_status.clone());
+            return;
+        };
+        match &view.current {
+            Some(run) => {
+                ui.label(
+                    egui::RichText::new(format!("NOW: {}", run.scenario.title)).strong(),
+                );
+                if run.step.content.is_empty() {
+                    ui.weak("(playing a step with no written instruction)");
+                } else {
+                    ui.label(run.step.content.clone());
+                }
+            }
+            None => {
+                ui.weak("no step playing — the exercise runs between steps");
+            }
+        }
+        ui.separator();
+        match &view.asking {
+            Some(ask) => {
+                ui.label(
+                    egui::RichText::new(format!("NEXT: {}", ask.scenario.title)).strong(),
+                );
+                if ask.step.content.is_empty() {
+                    ui.weak("(not written yet — the instruction arrives with the Game Master's tasking)");
+                } else {
+                    ui.label(ask.step.content.clone());
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} of {} declared · {} outstanding",
+                        ask.required - ask.outstanding,
+                        ask.required,
+                        ask.outstanding
+                    ))
+                    .small(),
+                );
+                if !ask.you_via_name.is_empty() {
+                    ui.weak(format!("asked via {} {}", ask.you_via_kind, ask.you_via_name));
+                }
+                ui.horizontal(|ui| {
+                    if ask.you_ready {
+                        ui.label(
+                            egui::RichText::new("✓ you declared")
+                                .small()
+                                .color(egui::Color32::from_rgb(0x4A, 0xDE, 0x80)),
+                        );
+                        if ui.small_button("withdraw").clicked() {
+                            declare = Some((ask.scenario.id, ask.step.id, false));
+                        }
+                    } else if ui
+                        .button("Declare ready")
+                        .on_hover_text(
+                            "after setting your helm — the Game Master plays the step once everyone is ready",
+                        )
+                        .clicked()
+                    {
+                        declare = Some((ask.scenario.id, ask.step.id, true));
+                    }
+                });
+            }
+            None => {
+                ui.weak("no step is asking you — the Game Master plays the next step when its people are ready");
+            }
+        }
+        status_line(ui, &self.users_status.clone());
+        if let Some((sid, step, ready)) = declare {
+            self.declare_step(sid, step, ready);
+        }
+    }
+
     fn zone_steps_body(&mut self, ui: &mut egui::Ui) {
         // Controls follow the island's audience, NOT the role name: this
         // deployment's organizer seat reads `Penyelenggara`, and a name
@@ -13949,6 +14741,8 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         self.step_signals_seen.clear();
         self.step_signals_primed = false;
         self.step_gate = None;
+        self.current_step = None;
+        self.current_step_read_at = None;
         self.users_gunits.clear();
         // The caller's pieces belonged to the released hold — the next
         // join re-deals them, with the tree. Gap flags are
@@ -15190,6 +15984,30 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             SetupDone::StepGate(key, gate) => {
                 self.step_gate = Some((key, gate));
             }
+            SetupDone::CurrentStep(view) => {
+                self.current_step = Some(view);
+            }
+            SetupDone::Echelons(levels) => {
+                self.echelons = levels;
+                // The kind picker holds an index into this list — clamp
+                // it, defaulting to Satuan Tugas, the level units are
+                // mustered into first.
+                self.group_kind_idx = self
+                    .echelons
+                    .iter()
+                    .position(|l| {
+                        tfg::groups::GroupKind::from_echelon(&l.name)
+                            == Some(tfg::groups::GroupKind::SatuanTugas)
+                    })
+                    .unwrap_or(0)
+                    .min(self.echelons.len().saturating_sub(1));
+            }
+            SetupDone::StepDeclared(note) => {
+                // The counts moved with the write — re-poll now rather
+                // than letting the banner sit a full interval behind.
+                self.current_step_read_at = None;
+                self.users_status = note;
+            }
             SetupDone::Related((sid, step), view, true) => {
                 // A saved related list replaces what was cached and seeds
                 // the working set for the editor that is still open.
@@ -15325,25 +16143,83 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             SetupDone::EmbarkedLoaded(host, units) => {
                 self.embarked.insert(host, units);
             }
-            SetupDone::EmbarkCandidates(host, units) => {
-                self.embark_candidates.insert(host, units);
-            }
-            SetupDone::CapacitiesLoaded(host, caps) => {
-                // A dirty draft is the operator's unsaved work — a load
-                // landing after an edit must not clobber it.
-                if !self.capacities_dirty.contains(&host) {
-                    self.unit_capacities.insert(host, caps);
+            SetupDone::CapsLoaded(host, caps) => {
+                self.unit_caps.insert(host, caps);
+                // Complements are the last thing a derived picker needs:
+                // derive now, then decide a drop parked for this host.
+                self.ensure_candidates(host);
+                if self.pending_embark.is_some_and(|(h, _)| h == host)
+                    && self.embark_candidates.contains_key(&host)
+                {
+                    let (_, child) = self.pending_embark.take().unwrap_or((host, -1));
+                    if child >= 0 {
+                        self.evaluate_embark(host, child);
+                    }
                 }
             }
             SetupDone::EmbarkChanged(host, result) => {
+                let before: Vec<i64> = self
+                    .embarked
+                    .get(&host)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|u| u.id)
+                    .collect();
                 self.embarked.insert(host, result.units);
                 self.embark_over.insert(host, result.over_capacity);
-                self.embark_attach_sel.remove(&host);
-                self.embark_detach_sel.remove(&host);
-            }
-            SetupDone::CapacitiesSaved(host, caps) => {
-                self.unit_capacities.insert(host, caps);
-                self.capacities_dirty.remove(&host);
+                // The rule that gated this drop is stale now — the host
+                // holds one more or one fewer hull — so the next hover
+                // re-reads it.
+                self.embark_candidates.remove(&host);
+                if self.pending_embark.is_some_and(|(h, _)| h == host) {
+                    // The drop's attach: the embarked child is aboard,
+                    // not a separate piece, so it leaves the map and the
+                    // force draft, and the host's contents island opens
+                    // on what landed.
+                    let (_, child) = self.pending_embark.take().unwrap_or((host, -1));
+                    if child >= 0 {
+                        self.force.remove(child);
+                        self.release_hull(&child.to_string());
+                        self.refresh_unassigned_units();
+                    }
+                    self.embark_island_host = Some(host);
+                    self.embark_flash.insert(host, Instant::now());
+                    tfg::sfx::play(tfg::sfx::Sfx::Ding);
+                    self.note_placement("embarked — contents shown in the Embarked island");
+                } else {
+                    // An unembark: the freed hulls return to the force
+                    // draft unplaced (no map position, no commander —
+                    // the operator places and seats them again), and the
+                    // island already open shows the remaining contents.
+                    let after: Vec<i64> = self
+                        .embarked
+                        .get(&host)
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|u| u.id)
+                        .collect();
+                    let mut back = 0;
+                    for child in before {
+                        if after.contains(&child) {
+                            continue;
+                        }
+                        if let Some((name, hull, Some(class_id))) =
+                            self.placement_seed_for(child)
+                        {
+                            self.force.upsert(tfg::force::DraftHull::new(
+                                child, name, hull, class_id,
+                            ));
+                            back += 1;
+                        }
+                    }
+                    self.refresh_unassigned_units();
+                    tfg::sfx::play(tfg::sfx::Sfx::Ding);
+                    self.note_placement(format!(
+                        "unembarked {back} hull(s) — back in the force, unplaced"
+                    ));
+                }
             }
             SetupDone::Timeline(page, append) => {
                 if append {
@@ -16852,6 +17728,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         if !self.mode.armed.load(Ordering::SeqCst) {
             self.feed("place refused: engine disarmed".to_string());
             self.note_placement("place refused: engine disarmed");
+            tfg::sfx::play(tfg::sfx::Sfx::Buzz);
             return None;
         }
         if self.acting_as.is_some() {
@@ -16859,6 +17736,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         }
         if !self.placement_valid(la, lo) {
             self.note_placement("placement needs water");
+            tfg::sfx::play(tfg::sfx::Sfx::Buzz);
             return None;
         }
         let pid = self.fleet_pick.clone()?;
@@ -16873,6 +17751,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                     let msg = format!("place refused: {name} is not a register hull");
                     self.feed(msg.clone());
                     self.users_status = msg;
+                    tfg::sfx::play(tfg::sfx::Sfx::Buzz);
                     return None;
                 };
                 // Carry a commander the Player picker already named, so
@@ -16903,6 +17782,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 let msg = format!("place refused: no sim stats for {name}");
                 self.feed(msg.clone());
                 self.users_status = msg;
+                tfg::sfx::play(tfg::sfx::Sfx::Buzz);
                 None
             }
         }
@@ -16936,6 +17816,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         self.placed_fleet.insert(pid.to_string());
         self.clear_fleet_pick();
         self.refresh_unassigned_units();
+        tfg::sfx::play(tfg::sfx::Sfx::Ding);
         // The event feed only renders in an execution window;
         // the setup flow owns its own status line too. The spec
         // source rides the message (H10): Minos figures name
@@ -18323,6 +19204,9 @@ impl eframe::App for ShipApp {
         // M7: harvest off-thread REST before rendering, so statuses
         // and lists are a frame fresh at most.
         self.pump_rest_ops();
+        if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary)) {
+            tfg::sfx::play(tfg::sfx::Sfx::Click);
+        }
         self.update_unit_drag(ui);
         // Text scale (field ticket): OS base captured once, pref
         // multiplied on top — idempotent per frame, never compounding.
@@ -18694,13 +19578,24 @@ impl eframe::App for ShipApp {
         // exists iff a selection exists; closing it deselects. Ships get
         // the live readout, groups get members/commander/authority plus
         // command + focus actions.
-        if self.selection.is_some() {
+        //
+        // Organizers only (see `inspector_audience`): commanders steer
+        // from the dashboard, and the symbol/affiliation/heading editors
+        // here are not theirs to touch.
+        //
+        // Docked along the bottom, full width with the dashboard's own
+        // margins — never a floater. The position is recomputed every
+        // frame and never stored, so a drag snaps back: a dock is a
+        // place, not a window that remembers.
+        if self.selection.is_some() && self.inspector_audience() {
+            let vp = ui.ctx().viewport_rect();
+            let size = egui::vec2((vp.width() - 24.0).max(400.0), 240.0);
             let mut open = true;
-            let mut pos = self.inspector_pos;
+            let mut pos = egui::pos2(12.0, (vp.height() - size.y - 12.0).max(0.0));
             let spec = tfg::chrome::Island::new(
                 egui::Id::new("Inspector"),
                 "Inspector",
-                egui::vec2(300.0, 320.0),
+                size,
             );
             tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
             ui.heading("Inspector");
@@ -18727,16 +19622,22 @@ impl eframe::App for ShipApp {
                     } else {
                         ""
                     };
-                    ui.label(format!("ship: {}{sim_badge}{}", self.unit_label(&id), if stale { " (stale)" } else { "" }));
-                    self.map_symbol_editor(ui, &id);
-                    self.affiliation_editor(ui, &id);
+                    let ship_line = format!("ship: {}{sim_badge}{}", self.unit_label(&id), if stale { " (stale)" } else { "" });
                     let reported_heading = self.registry.blend_heading(&id, 1.0);
-                    self.heading_editor(ui, &id, reported_heading);
+                    // Wide dock, three segments side by side: identity
+                    // editors, hull picture, live fix — instead of one
+                    // vertical stack with two thirds of the width empty.
+                    ui.columns(3, |cols| {
+                    cols[0].label(ship_line);
+                    self.map_symbol_editor(&mut cols[0], &id);
+                    self.affiliation_editor(&mut cols[0], &id);
+                    self.heading_editor(&mut cols[0], &id, reported_heading);
                     // Hull picture (images ticket): the decoded
                     // versioned texture when available, otherwise the
                     // temporary source through egui's loader. Both are
                     // memory-only; the presigned URL is never mirrored.
                     if let Ok(uid) = id.parse::<i64>() {
+                        cols[1].label("picture");
                         let picture = self.visuals.get(uid).map(|v| {
                             (
                                 v.image_url.clone(),
@@ -18752,14 +19653,14 @@ impl eframe::App for ShipApp {
                                 let display_size = inspector_image_size(
                                     texture.size,
                                     self.inspector_image_width,
-                                    ui.available_width(),
+                                    cols[1].available_width(),
                                 );
-                                ui.add(
+                                cols[1].add(
                                     egui::Image::from_texture(texture)
                                         .fit_to_exact_size(display_size),
                                 );
                                 let size = texture.size;
-                                ui.weak(format!(
+                                cols[1].weak(format!(
                                     "image decoded · manifest width {} px · texture {:.0}×{:.0} px",
                                     width.unwrap_or(0),
                                     size.x,
@@ -18769,28 +19670,28 @@ impl eframe::App for ShipApp {
                             Some((Some(_), AssetKind::UnitImage, _, None, expires_at, _))
                                 if expires_at.is_some_and(|at| at <= Instant::now()) =>
                             {
-                                ui.weak("refreshing picture source…");
+                                cols[1].weak("refreshing picture source…");
                             }
                             Some((Some(source), AssetKind::UnitImage, width, None, _, _)) => {
                                 let height = self.visuals.get(uid).and_then(|v| v.height_px);
-                                self.show_visual_source(ui, uid, &source, width, height);
+                                self.show_visual_source(&mut cols[1], uid, &source, width, height);
                             }
                             Some((None, AssetKind::UnitImage, _, _, _, Some(retry_at)))
                                 if retry_at > Instant::now() =>
                             {
-                                ui.weak("picture source unavailable — retrying");
+                                cols[1].weak("picture source unavailable — retrying");
                             }
                             Some((None, AssetKind::UnitImage, _, _, _, _)) => {
-                                ui.weak("loading picture…");
+                                cols[1].weak("loading picture…");
                             }
                             None => {
-                                ui.weak("visual: not resolved (manifest or unit not loaded)");
+                                cols[1].weak("visual: not resolved (manifest or unit not loaded)");
                             }
                             Some((_, AssetKind::Unsupported, _, _, _, _)) => {
-                                ui.weak("unsupported asset kind");
+                                cols[1].weak("unsupported asset kind");
                             }
                             Some((_, AssetKind::Unavailable, _, _, _, _)) => {
-                                ui.weak("no picture");
+                                cols[1].weak("no picture");
                             }
                         }
                         if self
@@ -18798,7 +19699,7 @@ impl eframe::App for ShipApp {
                             .get(uid)
                             .is_some_and(|v| v.asset_kind == AssetKind::UnitImage)
                         {
-                            self.inspector_image_size_control(ui);
+                            self.inspector_image_size_control(&mut cols[1]);
                         }
                         if let Some(v) = self.visuals.get(uid) {
                             let content_type = if v.content_type.is_empty() {
@@ -18806,7 +19707,7 @@ impl eframe::App for ShipApp {
                             } else {
                                 v.content_type.clone()
                             };
-                            ui.weak(format!("asset type: {content_type}"));
+                            cols[1].weak(format!("asset type: {content_type}"));
                         }
                         // Physical measurements, when Minos published
                         // them. Unpublished reads as unknown rather
@@ -18814,27 +19715,27 @@ impl eframe::App for ShipApp {
                         if let Some(v) = self.visuals.get(uid) {
                             match (v.loa_m, v.beam_m) {
                                 (Some(loa), Some(beam)) => {
-                                    ui.label(format!("loa {loa:.1} m · beam {beam:.1} m"));
+                                    cols[1].label(format!("loa {loa:.1} m · beam {beam:.1} m"));
                                 }
                                 _ => {
-                                    ui.weak("no published measurements");
+                                    cols[1].weak("no published measurements");
                                 }
                             }
                         }
                     }
-                    ui.label(format!(
+                    cols[2].label(format!(
                         "pos: {:.6} {:.6}",
                         fix.position.latitude, fix.position.longitude
                     ));
-                    ui.label(format!(
+                    cols[2].label(format!(
                         "hdg/spd: {} / {}",
                         fix.heading_deg.map(|h| format!("{h:.0}°")).as_deref().unwrap_or("—"),
                         fix.speed_kn.map(|s| format!("{s:.0} kn")).as_deref().unwrap_or("—")
                     ));
                     let age = self.last_seen.get(&id).map(|t| t.elapsed().as_secs()).unwrap_or(999);
                     let n = self.fix_count.get(&id).copied().unwrap_or(0);
-                    ui.label(format!("last update: {age}s ago · {n} fixes · trail {trail_len}"));
-                    ui.label(format!("wire ts: {}", fix.ts));
+                    cols[2].label(format!("last update: {age}s ago · {n} fixes · trail {trail_len}"));
+                    cols[2].label(format!("wire ts: {}", fix.ts));
                     // Data age at render (backfilled ticket): live fixes
                     // age from receipt, backfills from recorded time.
                     // Badged on wire sources only (sim clocks are game time).
@@ -18842,17 +19743,17 @@ impl eframe::App for ShipApp {
                         let now = Utc::now().timestamp();
                         match fix.data_age_secs(now) {
                             Some(a) if fix.is_old_data(now) => {
-                                ui.label(format!("data age: {}:{:02} · OLD DATA", a / 60, a % 60));
+                                cols[2].label(format!("data age: {}:{:02} · OLD DATA", a / 60, a % 60));
                             }
                             Some(a) => {
-                                ui.label(format!("data age: {a}s"));
+                                cols[2].label(format!("data age: {a}s"));
                             }
                             None => {
-                                ui.weak("data age unknown");
+                                cols[2].weak("data age unknown");
                             }
                         }
                     }
-                    ui.horizontal(|ui| {
+                    cols[2].horizontal(|ui| {
                         if ui.small_button("follow").clicked() {
                             follow_selected = Some((
                                 id.clone(),
@@ -18863,6 +19764,8 @@ impl eframe::App for ShipApp {
                             deselect = true;
                         }
                     });
+                    });
+
                 }
                 None => {
                     ui.label("ship out of view — deselect and pick again");
@@ -18878,8 +19781,11 @@ impl eframe::App for ShipApp {
                             let commander = self.groups.group(&gid).and_then(|g| g.commander.clone());
                             let allowed: Vec<String> = members.iter().filter(|u| self.action_allows(u)).cloned().collect();
                             let auth = self.command_authority(&allowed).map(Self::authority_label).unwrap_or("view only");
-                            ui.label(format!("group: {name} · {} unit(s)", members.len()));
-                            ui.label(format!(
+                            // Same three-segment split as the ship arm:
+                            // identity, members, actions.
+                            ui.columns(3, |cols| {
+                            cols[0].label(format!("group: {name} · {} unit(s)", members.len()));
+                            cols[0].label(format!(
                                 "commander: {} · you hold: {auth}",
                                 commander.as_deref().unwrap_or("—")
                             ));
@@ -18892,7 +19798,7 @@ impl eframe::App for ShipApp {
                                 .unwrap_or_default();
                             if child_ids.is_empty() {
                                 for u in &members {
-                                    ui.horizontal(|ui| {
+                                    cols[1].horizontal(|ui| {
                                         ui.label(self.unit_label(u));
                                         if ui.small_button("inspect").clicked() {
                                             drill_ship = Some(u.clone());
@@ -18902,14 +19808,14 @@ impl eframe::App for ShipApp {
                             } else {
                                 for cid in &child_ids {
                                     if let Some(c) = self.groups.group(cid) {
-                                        ui.horizontal(|ui| {
+                                        cols[1].horizontal(|ui| {
                                             ui.label(format!("{} · {} unit(s)", c.name, self.groups.group_units(&c.id).len()));
                                             if ui.small_button("select").clicked() {
                                                 drill_group = Some(c.id.clone());
                                             }
                                         });
                                         for u in &c.units {
-                                            ui.horizontal(|ui| {
+                                            cols[1].horizontal(|ui| {
                                                 ui.label(format!("  {}", self.unit_label(u)));
                                                 if ui.small_button("inspect").clicked() {
                                                     drill_ship = Some(u.clone());
@@ -18919,7 +19825,7 @@ impl eframe::App for ShipApp {
                                     }
                                 }
                             }
-                            ui.horizontal(|ui| {
+                            cols[2].horizontal(|ui| {
                                 if ui.small_button("command").clicked() {
                                     self.show_orders = true;
                                 }
@@ -18945,6 +19851,8 @@ impl eframe::App for ShipApp {
                                     deselect = true;
                                 }
                             });
+                            });
+
                         }
                         None => {
                             ui.label("group removed.");
@@ -18980,7 +19888,6 @@ impl eframe::App for ShipApp {
             }
             ui.separator();
             });
-            self.inspector_pos = pos;
             if !open {
                 self.deselect();
             }
@@ -19144,6 +20051,34 @@ impl eframe::App for ShipApp {
                 );
             }
         }
+        // The embarked-contents island: what is directly inside the
+        // host, read-only. Opened by a successful embark drop and by
+        // the per-piece "show…" button; closed like any island.
+        if let Some(host) = self.embark_island_host {
+            let size = egui::vec2(320.0, 280.0);
+            let host_label = self
+                .force
+                .get(host)
+                .map(|h| h.name.clone())
+                .unwrap_or_else(|| format!("unit {host}"));
+            let spec =
+                tfg::chrome::Island::new(egui::Id::new("embarked"), "Embarked", size)
+                    .with_trailing(&host_label);
+            let mut pos = self
+                .embark_island_pos
+                .unwrap_or_else(|| egui::pos2(ui.ctx().viewport_rect().width() - 344.0, 360.0));
+            let mut open = true;
+            tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("embarked-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.embark_island_body(ui, host));
+            });
+            self.embark_island_pos = Some(pos);
+            if !open {
+                self.embark_island_host = None;
+            }
+        }
         if let Some((ship, at)) = follow_req {
             self.request_frame(&ship, at);
         }
@@ -19268,13 +20203,36 @@ impl eframe::App for ShipApp {
                             if let Some(pos) = on_map {
                                 let px = (pos.x - rect.min.x) as f64;
                                 let py = (pos.y - rect.min.y) as f64;
-                                let (mw, mh) = self.map_dims();
-                                let (la, lo) = unproject_mercator(
-                                    px, py, self.center, self.zoom, mw, mh,
-                                );
-                                self.arm_fleet_pick(drag.id);
-                                self.try_place_picked(la, lo);
-                                self.mode.tool = SetupTool::Select;
+                                // A drop onto a deployed hull embarks
+                                // instead of placing: the candidates list
+                                // decides, and a refused drop badges the
+                                // destination rather than placing beside
+                                // it. Only a drop that hits no hull falls
+                                // through to a full map placement.
+                                let child = drag.id.parse::<i64>().ok();
+                                let host = child.and_then(|c| {
+                                    self.map_deployed_host_at(
+                                        &markers,
+                                        px,
+                                        py,
+                                        pixels_per_point,
+                                        &drag.id,
+                                    )
+                                    .map(|h| (h, c))
+                                });
+                                if let Some((h, c)) = host {
+                                    self.clear_fleet_pick();
+                                    self.try_embark_drop(h, c);
+                                    self.mode.tool = SetupTool::Select;
+                                } else {
+                                    let (mw, mh) = self.map_dims();
+                                    let (la, lo) = unproject_mercator(
+                                        px, py, self.center, self.zoom, mw, mh,
+                                    );
+                                    self.arm_fleet_pick(drag.id);
+                                    self.try_place_picked(la, lo);
+                                    self.mode.tool = SetupTool::Select;
+                                }
                             } else {
 
                                 self.clear_fleet_pick();
@@ -19305,11 +20263,28 @@ impl eframe::App for ShipApp {
                         }
                     }
                 }
-                if let (Some(drag), Some(pos)) = (
-                    self.unit_drag.as_ref(),
+                // Hovering a deployed hull with a drag warms its
+                // candidates cache, so the drop decides at once instead
+                // of parking. `ensure_*` dedups, so this costs one
+                // request per host, not one per frame.
+                if let (Some(drag_id), Some(pos)) = (
+                    self.unit_drag.as_ref().map(|d| d.id.clone()),
                     ui.input(|input| input.pointer.interact_pos()),
                 ) {
                     if rect.contains(pos) {
+                        let px = (pos.x - rect.min.x) as f64;
+                        let py = (pos.y - rect.min.y) as f64;
+                        let hover_host = self.map_deployed_host_at(
+                            &markers,
+                            px,
+                            py,
+                            pixels_per_point,
+                            &drag_id,
+                        );
+                        if let Some(h) = hover_host {
+                            self.ensure_candidates(h);
+                            self.ensure_unit_caps(h);
+                        }
                         let local = pos - rect.min.to_vec2();
                         let (la, lo) = unproject_mercator(
                             local.x as f64,
@@ -19320,15 +20295,34 @@ impl eframe::App for ShipApp {
                             self.map_dims().1,
                         );
                         let valid = self.placement_valid(la, lo);
-                        let tint = if valid {
-                            egui::Color32::from_rgb(74, 222, 128)
-                        } else {
-                            egui::Color32::from_rgb(246, 197, 107)
-                        };
+                        // Over a deployed hull the ring previews the
+                        // embark answer, not the water: green takes the
+                        // unit, red refuses it, amber means the rule has
+                        // not loaded yet.
+                        let embark_tint = hover_host.and_then(|h| {
+                            drag_id.parse::<i64>().ok().map(|c| (h, c))
+                        }).and_then(|(h, c)| {
+                            self.embark_candidates.get(&h).map(|cands| {
+                                if cands.iter().any(|c2| c2.id == c) {
+                                    egui::Color32::from_rgb(74, 222, 128)
+                                } else {
+                                    egui::Color32::from_rgb(248, 113, 113)
+                                }
+                            })
+                        });
+                        let tint = embark_tint.unwrap_or_else(|| {
+                            if hover_host.is_some() {
+                                egui::Color32::from_rgb(246, 197, 107)
+                            } else if valid {
+                                egui::Color32::from_rgb(74, 222, 128)
+                            } else {
+                                egui::Color32::from_rgb(246, 197, 107)
+                            }
+                        });
                         let ghost_rect =
                             egui::Rect::from_center_size(local, egui::vec2(54.0, 54.0));
                         let painter = ui.painter_at(rect);
-                        if let Ok(uid) = drag.id.parse::<i64>() {
+                        if let Ok(uid) = drag_id.parse::<i64>() {
                             if let Some(texture) = self.visuals.get(uid).and_then(|v| v.texture.clone()) {
                                 painter.image(
                                     texture.id,
@@ -19351,10 +20345,15 @@ impl eframe::App for ShipApp {
                             27.0,
                             egui::Stroke::new(2.0, tint),
                         );
+                        let ghost_name = self
+                            .unit_drag
+                            .as_ref()
+                            .map(|d| d.name.clone())
+                            .unwrap_or_default();
                         painter.text(
                             local + egui::vec2(32.0, 2.0),
                             egui::Align2::LEFT_TOP,
-                            &drag.name,
+                            &ghost_name,
                             egui::FontId::proportional(12.0),
                             egui::Color32::WHITE,
                         );
@@ -19624,15 +20623,32 @@ impl eframe::App for ShipApp {
                                     }
                                 }
                             } else if let Some(id) = hit_unit {
-                                eprintln!("select {id}");
-                                self.select_ship(id);
+                                // Select mode picks instead of selecting:
+                                // the island's set is what the map feeds.
+                                if self.group_select {
+                                    eprintln!("pick {id}");
+                                    self.toggle_group_pick(id);
+                                } else {
+                                    eprintln!("select {id}");
+                                    self.select_ship(id);
+                                }
                             } else if let Some(g) = hit_group_symbol {
-                                eprintln!("select group {}", g.group);
-                                self.select_group(g.group);
+                                if self.group_select {
+                                    eprintln!("pick group {}", g.group);
+                                    self.toggle_group_pick(g.group);
+                                } else {
+                                    eprintln!("select group {}", g.group);
+                                    self.select_group(g.group);
+                                }
                             } else if let Some(z) = hit_zone {
-                                eprintln!("select group {}", z.group);
-                                self.select_group(z.group.clone());
-                            } else if self.fleet_pick.is_none() && !self.placing {
+                                if self.group_select {
+                                    eprintln!("pick group {}", z.group);
+                                    self.toggle_group_pick(z.group.clone());
+                                } else {
+                                    eprintln!("select group {}", z.group);
+                                    self.select_group(z.group.clone());
+                                }
+                            } else if self.fleet_pick.is_none() && !self.placing && !self.group_select {
                                 // Empty water, nothing armed: deselect (the
                                 // Inspector shuts with the selection).
                                 eprintln!("deselect");
@@ -19864,6 +20880,16 @@ impl eframe::App for ShipApp {
                         focused,
                         self.zoom,
                     );
+                    // A picked flag wears the set's white ring, like a
+                    // picked marker does — the set is only real if the
+                    // operator can see it on the map.
+                    if self.group_picked.contains(&symbol.group) {
+                        painter.circle_stroke(
+                            rect.min + egui::vec2(symbol.x, symbol.y),
+                            (SYMBOL_BOX_PX * 0.62) as f32,
+                            egui::Stroke::new(2.0, egui::Color32::WHITE),
+                        );
+                    }
                 }
                 let mut image_quads: Vec<Option<Vec<egui::Pos2>>> =
                     (0..markers.len()).map(|_| None).collect();
@@ -19948,6 +20974,51 @@ impl eframe::App for ShipApp {
                         );
                     }
                 }
+                // Rejected embark drops: a red ✕ beside the
+                // destination marker for a few seconds, then forgotten.
+                // A refusal that leaves no mark reads as a missed drop,
+                // and the operator retries the same refusal.
+                let now = Instant::now();
+                let fresh_rejects: Vec<i64> = self
+                    .embark_reject
+                    .iter()
+                    .filter(|(_, at)| now.duration_since(**at).as_secs() < 4)
+                    .map(|(h, _)| *h)
+                    .collect();
+                if !fresh_rejects.is_empty() {
+                    ui.ctx().request_repaint_after(Duration::from_secs(1));
+                }
+                self.embark_reject
+                    .retain(|_, at| now.duration_since(*at).as_secs() < 4);
+                {
+                    let badge_painter = ui.painter_at(rect);
+                    for host in &fresh_rejects {
+                        if let Some(m) = markers.iter().find(|m| {
+                            m.id.parse::<i64>().ok() == Some(*host)
+                                && !self.hidden.contains(&m.id)
+                        }) {
+                            let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
+                            let badge = c + egui::vec2(22.0, -22.0);
+                            badge_painter.circle_filled(
+                                badge,
+                                11.0,
+                                egui::Color32::from_rgb(127, 29, 29),
+                            );
+                            badge_painter.circle_stroke(
+                                badge,
+                                11.0,
+                                egui::Stroke::new(2.0, egui::Color32::from_rgb(248, 113, 113)),
+                            );
+                            badge_painter.text(
+                                badge,
+                                egui::Align2::CENTER_CENTER,
+                                "✕",
+                                egui::FontId::proportional(13.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    }
+                }
                 // Layer 3 is gone: the white circle outline it drew is
                 // superseded by the affiliation frame painted in layer 2.
                 // A second outline around every symbol muddied the one
@@ -19970,11 +21041,40 @@ impl eframe::App for ShipApp {
                 // the box have grown: a ring stated as a pixel count silently
                 // becomes a ring around the middle of the glyph.
                 let ring = |multiple: f32| multiple * symbol_footprint_radius_px() as f32;
+                // Accepted embark flashes, kept alive by repaint while
+                // fresh. The shader halo carries the flash on machines
+                // that afford one; the expanding epaint ring carries it
+                // everywhere else, so Low tier is the same effect without
+                // the glow, not a missing one.
+                let flash_now = Instant::now();
+                let mut flash_alive = false;
                 for m in &markers {
                     if self.hidden.contains(&m.id) {
                         continue;
                     }
                     let c = rect.min + egui::vec2(m.x as f32, m.y as f32);
+                    if let Some(landed) = m
+                        .id
+                        .parse::<i64>()
+                        .ok()
+                        .and_then(|uid| self.embark_flash.get(&uid))
+                    {
+                        let age = flash_now.duration_since(*landed).as_secs_f32();
+                        if age < 2.5 {
+                            flash_alive = true;
+                            let k = 1.0 - age / 2.5;
+                            halos.push((c, tfg::fx::Halo::Embark, 0.85 * k));
+                            painter.circle_stroke(
+                                c,
+                                ring(2.0) + age * 26.0,
+                                egui::Stroke::new(
+                                    2.0,
+                                    egui::Color32::from_rgb(74, 222, 128)
+                                        .linear_multiply(k),
+                                ),
+                            );
+                        }
+                    }
                     if self.selection == Some(Selection::Ship(m.id.clone())) {
                         painter.circle_stroke(
                             c,
@@ -19982,6 +21082,16 @@ impl eframe::App for ShipApp {
                             egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE),
                         );
                         halos.push((c, tfg::fx::Halo::Signal, 0.55));
+                    }
+                    // The group pick set, in white: select mode's answer
+                    // to the selection ring above. Outer (2.0) so the
+                    // two never share a radius when both are on.
+                    if self.group_picked.contains(&m.id) {
+                        painter.circle_stroke(
+                            c,
+                            ring(2.0),
+                            egui::Stroke::new(2.0, egui::Color32::WHITE),
+                        );
                     }
                     if Some(&m.id) == self.following.as_ref() {
                         painter.circle_stroke(
@@ -20006,6 +21116,19 @@ impl eframe::App for ShipApp {
                         // already shown, not a call to action.
                         halos.push((c, tfg::fx::Halo::Stale, 0.40));
                     }
+                }
+                // Stale flashes are forgotten, not accumulated: the map
+                // holds the effect for one gesture echo, not a history.
+                if self
+                    .embark_flash
+                    .values()
+                    .any(|at| flash_now.duration_since(*at).as_secs_f32() >= 2.5)
+                {
+                    self.embark_flash
+                        .retain(|_, at| flash_now.duration_since(*at).as_secs_f32() < 2.5);
+                }
+                if flash_alive {
+                    ui.ctx().request_repaint_after(Duration::from_millis(80));
                 }
                 self.fx.paint_halos(&painter, &halos);
                 // Selected on-map heading handle: the arrow sits on the
@@ -20185,8 +21308,8 @@ fn apply_ops_theme(ctx: &egui::Context) {
         let v = &mut style.visuals;
         v.window_fill = tokens::CONSOLE_NIGHT;
         v.window_stroke = egui::Stroke::new(1.0, tokens::HAIRLINE_SLATE);
-        // A popup keeps a radius. An island carries a chamfer and paints its
-        // own body, so this radius never reaches one.
+        // A popup keeps a radius. An island paints its own rounded steel
+        // body, so this radius never reaches one.
         v.window_corner_radius = egui::CornerRadius::same(8);
         v.panel_fill = tokens::CONSOLE_NIGHT;
         v.faint_bg_color = tokens::PANEL_SLATE;
@@ -20592,7 +21715,6 @@ fn main() -> Result<(), String> {
                 settings_open: false,
                 reduced_motion: false,
                 motion_secs: 0.2,
-                inspector_pos: egui::pos2(816.0, 440.0),
                 orders_pos: egui::pos2(500.0, 250.0),
                 login_pos: egui::pos2(8.0, 120.0),
                 log_pos: egui::pos2(8.0, 480.0),
@@ -20625,14 +21747,12 @@ fn main() -> Result<(), String> {
                 embarked: HashMap::new(),
                 embark_candidates: HashMap::new(),
                 embark_over: HashMap::new(),
-                unit_capacities: HashMap::new(),
-                capacities_dirty: std::collections::HashSet::new(),
-                embark_attach_open: std::collections::HashSet::new(),
-                embark_attach_sel: HashMap::new(),
-                embark_detach_sel: HashMap::new(),
-                cap_level: HashMap::new(),
-                cap_id: HashMap::new(),
-                cap_max: HashMap::new(),
+                unit_caps: HashMap::new(),
+                embark_island_host: None,
+                embark_island_pos: None,
+                embark_reject: HashMap::new(),
+                embark_flash: HashMap::new(),
+                pending_embark: None,
                 helm_preview_pending: HashSet::new(),
                 controlled: HashSet::new(),
                 pending_waypoint: None,
@@ -20703,6 +21823,8 @@ fn main() -> Result<(), String> {
                 pending_step_release: false,
                 pending_step_unready: false,
                 step_gate_read_at: None,
+                current_step: None,
+                current_step_read_at: None,
                 step_signals_seen: HashSet::new(),
                 step_signals_primed: false,
                 show_comms: false,
@@ -20896,6 +22018,11 @@ fn main() -> Result<(), String> {
                 show_replay: true,
                 log_filter: "all".to_string(),
                 groups: Groups::default(),
+                group_select: false,
+                group_picked: std::collections::HashSet::new(),
+                group_name: String::new(),
+                group_kind_idx: 0,
+                echelons: Vec::new(),
                 acting_as: None,
                 desktop: "all".to_string(),
                 drafts: HashMap::new(),

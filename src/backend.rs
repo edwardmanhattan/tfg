@@ -22,7 +22,7 @@ pub use error::BackendError;
 pub use auth::{AppRole, AuthenticatedUser, MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
 pub use feed::{GameMsg, MinosRest, Snapshot};
 pub use live::{LIVE_BACKOFF_BASE_SECS, LIVE_BACKOFF_CAP_SECS, LiveCmd, LiveEvent, LiveWire};
-pub use master::{AssetGroup, BackendUser, EmbarkationCandidate, EmbarkationResult, EmbarkedUnit, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePace, GameRole, GameScenario, GameScenarioStep, GameStepRun, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameReadinessView, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, OverCapacity, ServiceBranchCount, TimeWindow, UnitCapacity, UnitCommander, UnitSpeedEntry, UnitSpeeds, actual_to_rfc3339, assumed_hhmm_to_rfc3339, date_ok, hhmm_ok, hhmm_window_ok, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, RelatedPerson, RelatedPost, Review, ScenarioRole, StepReadiness, StepReadinessPerson, StepRelated, StepRewind, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
+pub use master::{AssetGroup, BackendUser, CurrentStepAsking, CurrentStepPlaying, CurrentStepScenario, CurrentStepStep, CurrentStepView, EchelonLevel, EmbarkationCandidate, EmbarkationResult, EmbarkedUnit, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePace, GameRole, GameScenario, GameScenarioStep, GameStepRun, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameReadinessView, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, OverCapacity, ServiceBranchCount, TimeWindow, UnitCapacity, UnitCommander, UnitSpeedEntry, UnitSpeeds, actual_to_rfc3339, assumed_hhmm_to_rfc3339, date_ok, hhmm_ok, hhmm_window_ok, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, RelatedPerson, RelatedPost, Review, ScenarioRole, StepReadiness, StepReadinessPerson, StepRelated, StepRewind, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
 pub use replay::{FileReplay, now_ts};
 // Shared with live.rs and the tests below; not public API.
 pub(crate) use feed::FeedEvent;
@@ -984,7 +984,7 @@ mod tests {
             }
         });
         let master = MinosMaster::new("http://127.0.0.1:18090/api/v1").expect("client builds");
-        let fix = master.order_unit("AT", 3, 13, 45.0, 20.0).expect("order");
+        let fix = master.order_unit("AT", 3, 13, 45.0, 20.0, None).expect("order");
         assert_eq!(fix.unit_id, 13);
         assert!(fix.clamped, "20 kn exceeded the hull's published max");
         assert_eq!(fix.requested_speed, Some(20.0), "ask preserved beside the clamp");

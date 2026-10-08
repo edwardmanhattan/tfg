@@ -12,9 +12,9 @@
 //!
 //! Two things this buys that the paint alone could not:
 //!
-//! - **The silhouette is ours.** The body is a [`chamfer_tr`] polygon, so
-//!   the cut edge can be a deliberate 2px line rather than a radius
-//!   compromise.
+//! - **The silhouette is ours.** The body is a rounded rect with a steel
+//!   bevel — a dark bed, a bright wire, a top light — rather than a drawn
+//!   line, and the radius is small enough to stay console, not bubble.
 //! - **The footprint is stable.** A fixed-size island does not grow and
 //!   shrink under the operator's cursor as a `collapsing` section opens,
 //!   which matters when the panel floats over a map they are reading.
@@ -115,27 +115,12 @@ impl Island {
 /// chamfer is cheap and a sheared panel is not (a shear insets the
 /// top-left corner by the lean, so any fixed content inset pokes through
 /// the diagonal unless it accounts for it).
-pub fn chamfer_tr(rect: Rect, cut: f32) -> Vec<Pos2> {
-    let cut = cut.clamp(0.0, (rect.width() * 0.5).min(rect.height()));
-    vec![
-        pos2(rect.left(), rect.top()),
-        pos2(rect.right() - cut, rect.top()),
-        pos2(rect.right(), rect.top() + cut),
-        pos2(rect.right(), rect.bottom()),
-        pos2(rect.left(), rect.bottom()),
-    ]
-}
-
-fn translated(pts: &[Pos2], d: Vec2) -> Vec<Pos2> {
-    pts.iter().map(|p| *p + d).collect()
-}
-
 // ---------------------------------------------------------------------------
 // Paint
 // ---------------------------------------------------------------------------
 
-/// Paint the island body: hard shadow, chamfered panel, title band, and the
-/// 2px rim.
+/// Paint the island body: hard shadow, steel-edged rounded panel, title
+/// band, and the inset rim.
 ///
 /// `owns_input` is the whole of ADR-0016. It is one boolean and it decides
 /// whether the rim is `tokens::RESTING_RIM` or `tokens::ACTIVE_RIM`, and
@@ -143,49 +128,80 @@ fn translated(pts: &[Pos2], d: Vec2) -> Vec<Pos2> {
 /// owns input before painting, because if two islands each test their own
 /// `hovered` then two rims light and the rule means nothing.
 ///
-/// The rim is drawn twice, once for each of its jobs. The inner band is the
-/// attention signal, and it is the reason the register reads as heat rather
-/// than as a highlighted border. The 2px cut edge stays neutral at rest so
-/// the chamfer still reads as a chamfer when no island owns input.
+/// The edge is drawn three times, once for each of its jobs. The dark
+/// casing parts the panel from bright land; the steel bed and the bright
+/// wire centred on it read as a bevel catching light; the top light and
+/// bottom shade sell the direction of it. One of the dark pair always
+/// parts from the ground, so the border reads on any tile.
 pub fn paint_island(painter: &Painter, rect: Rect, owns_input: bool) {
-    let pts = chamfer_tr(rect, tokens::CUT);
+    let rounding = CornerRadius::same(tokens::ISLAND_RADIUS);
+    let r = f32::from(tokens::ISLAND_RADIUS);
 
-    painter.add(Shape::convex_polygon(
-        translated(&pts, tokens::ISLAND_CAST_OFFSET),
+    painter.rect_filled(
+        Rect::from_min_max(
+            rect.min + tokens::ISLAND_CAST_OFFSET,
+            rect.max + tokens::ISLAND_CAST_OFFSET,
+        ),
+        rounding,
         tokens::ISLAND_CAST,
-        Stroke::NONE,
-    ));
-    // Cased contrast edge: a dark casing straddling the silhouette, then a
-    // bright edge centred on it. One of the pair always parts from the
-    // ground — the casing from bright land, the edge from dark water — so
-    // the border reads on any tile. The bright line covers the casing's
-    // inner half, leaving a dark halo outside and the edge itself.
-    painter.add(Shape::closed_line(
-        pts.iter()
-            .copied()
-            .chain(std::iter::once(pts[0]))
-            .collect(),
-        Stroke::new(4.0, tokens::DEEP_WELL),
-    ));
-    painter.add(Shape::convex_polygon(
-        pts.clone(),
-        tokens::CONSOLE_NIGHT,
-        Stroke::NONE,
-    ));
-    painter.add(Shape::closed_line(
-        pts.iter()
-            .copied()
-            .chain(std::iter::once(pts[0]))
-            .collect(),
-        Stroke::new(2.0, tokens::ISLAND_EDGE),
-    ));
+    );
+    // The bevel, OUTSIDE the panel edge, as nested fills rather than
+    // stacked strokes: a stroke keeps one path radius while its outer
+    // edge grows with its width, so three widths on one radius corner
+    // apart — the lumpy corner. Nested fills grow path AND radius
+    // together, so every ring stays concentric. One pixel each, so the
+    // metal reads as a wire rather than a dark mass squaring the bend:
+    // casing 2–3, bed 1–2, wire 0–1, all outside the fill's own rect.
+    painter.rect_filled(
+        rect.expand(3.0),
+        CornerRadius::same(tokens::ISLAND_RADIUS + 3),
+        tokens::DEEP_WELL,
+    );
+    painter.rect_filled(
+        rect.expand(2.0),
+        CornerRadius::same(tokens::ISLAND_RADIUS + 2),
+        tokens::STEEL_LO,
+    );
+    painter.rect_filled(
+        rect.expand(1.0),
+        CornerRadius::same(tokens::ISLAND_RADIUS + 1),
+        tokens::STEEL_HI,
+    );
+    painter.rect_filled(rect, rounding, tokens::CONSOLE_NIGHT);
 
-    // Title band, clipped to the panel so it never crosses the diagonal.
+    // Directional light: a pale line just inside the top edge, a dark one
+    // just inside the bottom. Both stop short of the corners, where the
+    // rounding would carry them outside the panel.
+    painter.line_segment(
+        [
+            pos2(rect.left() + r, rect.top() + 2.0),
+            pos2(rect.right() - r, rect.top() + 2.0),
+        ],
+        Stroke::new(1.0, Color32::from_white_alpha(44)),
+    );
+    painter.line_segment(
+        [
+            pos2(rect.left() + r, rect.bottom() - 2.0),
+            pos2(rect.right() - r, rect.bottom() - 2.0),
+        ],
+        Stroke::new(1.0, Color32::from_black_alpha(90)),
+    );
+
+    // Title band, its top corners rounded with the panel.
     let band = Rect::from_min_max(
         rect.left_top(),
-        pos2(rect.right() - tokens::CUT, rect.top() + tokens::TITLE_H),
+        pos2(rect.right(), rect.top() + tokens::TITLE_H),
     );
-    painter.rect_filled(band, CornerRadius::ZERO, tokens::PANEL_SLATE);
+    painter.rect_filled(
+        band,
+        CornerRadius {
+            nw: tokens::ISLAND_RADIUS,
+            ne: tokens::ISLAND_RADIUS,
+            sw: 0,
+            se: 0,
+        },
+        tokens::PANEL_SLATE,
+    );
     painter.line_segment(
         [
             pos2(band.left(), band.bottom()),
@@ -194,54 +210,21 @@ pub fn paint_island(painter: &Painter, rect: Rect, owns_input: bool) {
         Stroke::new(1.0, tokens::CUT_GREY),
     );
 
-    // The rim: the polygon's own outline, offset inward. Insetting rather
-    // than stroking the silhouette is what makes it a rim, and it is why the
-    // band can trace the chamfer without the chamfer reading as a heavier
-    // edge than the panel.
-    paint_rim(painter, &pts, owns_input);
-
-    // The chamfer's own edge, neutral at rest. Brightened rather than
-    // recoloured on hover, so the One Signal Rule holds while the cut still
-    // reads as deliberate.
-    let cut_edge = Stroke::new(
-        2.0,
-        if owns_input {
-            tokens::CUT_GREY.gamma_multiply(1.6)
-        } else {
-            tokens::CUT_GREY
-        },
-    );
-    painter.line_segment(
-        [
-            pos2(rect.right() - tokens::CUT, rect.top()),
-            pos2(rect.right(), rect.top() + tokens::CUT),
-        ],
-        cut_edge,
-    );
+    // The rim: the silhouette's own outline, offset inward. Insetting
+    // rather than stroking is what makes it a rim rather than a border.
+    paint_rim(painter, rect, owns_input);
 }
 
-/// The 3px band inset from `pts`, in the rim colour for the input state.
-fn paint_rim(painter: &Painter, pts: &[Pos2], owns_input: bool) {
-    let centroid = (pts
-        .iter()
-        .fold(Vec2::ZERO, |acc, p| acc + p.to_vec2())
-        / pts.len() as f32)
-        .to_pos2();
-    let inner: Vec<Pos2> = pts
-        .iter()
-        .map(|p| {
-            let inward = (centroid - *p).normalized();
-            *p + inward * tokens::RIM_INSET
-        })
-        .collect();
-    painter.add(Shape::closed_line(
-        inner
-            .iter()
-            .copied()
-            .chain(std::iter::once(inner[0]))
-            .collect(),
+/// The inset rim in the rim colour for the input state: a smaller rounded
+/// rect riding inside the bevel, its corners tightened by the inset.
+fn paint_rim(painter: &Painter, rect: Rect, owns_input: bool) {
+    let inset = tokens::RIM_INSET;
+    painter.rect_stroke(
+        rect.shrink(inset),
+        CornerRadius::same(tokens::ISLAND_RADIUS.saturating_sub(inset as u8)),
         Stroke::new(tokens::RIM_BAND, tokens::rim(owns_input)),
-    ));
+        StrokeKind::Middle,
+    );
 }
 
 /// The title band's rule texture.
@@ -251,13 +234,16 @@ fn paint_rim(painter: &Painter, pts: &[Pos2], owns_input: bool) {
 /// on the smallest text on the panel. The band holds one short tracked label
 /// and a count, so the texture is free there and nowhere else.
 pub fn paint_band_texture(painter: &Painter, rect: Rect) {
+    let r = f32::from(tokens::ISLAND_RADIUS);
     let mut y = rect.top() + tokens::BAND_SCAN_PITCH;
     let bottom = rect.top() + tokens::BAND_TEXTURE_H;
     while y < bottom {
+        // Inset by the corner radius: a full-width rule would cross the
+        // rounded top corners and paint over the map behind the panel.
         painter.line_segment(
             [
-                pos2(rect.left(), y),
-                pos2(rect.right() - tokens::CUT, y),
+                pos2(rect.left() + r, y),
+                pos2(rect.right() - r, y),
             ],
             Stroke::new(1.0, Color32::from_white_alpha(tokens::BAND_SCAN_ALPHA)),
         );
@@ -321,7 +307,7 @@ fn paint_close(painter: &Painter, rect: Rect, hot: bool) {
 // The island
 // ---------------------------------------------------------------------------
 
-/// Show a floating island: chamfered body, own title bar, drag, close.
+/// Show a floating island: rounded steel-edged body, own title bar, drag, close.
 ///
 /// # The one contract callers must respect
 ///
@@ -439,7 +425,13 @@ pub fn island_owned(
             ui.set_clip_rect(ui.max_rect().intersect(band));
             let rect = ui.min_rect();
 
-            let painter = ui.painter_at(rect.intersect(band));
+            // The clip is wider than the panel on purpose: the steel
+            // bevel and the offset shadow both live OUTSIDE the panel
+            // rect, and a clip cut to the rect guillotines their arcs
+            // along square lines — which reads as sharp nubs at the
+            // corners. The body scope below re-clips to the content
+            // rect, so nothing else escapes through the wider clip.
+            let painter = ui.painter_at(rect.expand(8.0).intersect(band));
 
             // ADR-0016: the rim lights on the island that owns input, and
             // ownership arrives as a parameter rather than being decided
@@ -454,7 +446,7 @@ pub fn island_owned(
             // they overlap. Reverse these and the close button dies.
             let title_band = Rect::from_min_max(
                 rect.left_top(),
-                pos2(rect.right() - tokens::CUT, rect.top() + tokens::TITLE_H),
+                pos2(rect.right(), rect.top() + tokens::TITLE_H),
             );
             let drag = ui.interact(
                 title_band,
@@ -482,10 +474,9 @@ pub fn island_owned(
 
             if !spec.trailing.is_empty() {
                 // Right-aligned, and stopping short of the close button.
-                // The button sits at CLOSE_INSET from the panel edge and the
-                // band's own right edge is CUT from it, so a note placed at
-                // the band's edge lands underneath the button — which is
-                // what the first pass did.
+                // The button sits at CLOSE_INSET from the panel edge, so a
+                // note placed at the band's edge lands underneath the
+                // button — which is what the first pass did.
                 painter.text(
                     pos2(close_rect.left() - tokens::ISLAND_PAD, title_band.center().y + 4.0),
                     egui::Align2::RIGHT_BOTTOM,
@@ -876,6 +867,15 @@ pub struct Modal {
     pub open: bool,
     /// Whether the backdrop paints its dim.
     pub backdrop: Backdrop,
+    /// A palette claims only its own panel rect: no backdrop, so the map
+    /// and the islands stay live behind it. For a form that exists to
+    /// start something that happens on the map — the Fleet picker arms a
+    /// placement the operator finishes with a map click — a backdrop
+    /// would eat the very click the panel promises. Drops over the panel
+    /// itself are still refused, but that is the caller's job to publish
+    /// via the rect it gets back (see `drop_lands_on_map`), not the
+    /// backdrop's. See [`Modal::as_palette`].
+    pub palette: bool,
     /// The panel steps out of the way entirely: no backdrop, no panel, no
     /// input claimed. See [`Modal::step_aside`].
     pub aside: bool,
@@ -906,8 +906,25 @@ impl Modal {
             size,
             open: true,
             backdrop: Backdrop::Dim,
+            palette: false,
             aside: false,
         }
+    }
+
+    /// This modal is a palette, not a dialog: it keeps its panel and its
+    /// close button, but claims nothing outside its own rect. The map
+    /// behind it stays clickable, so a picker row can honestly say
+    /// "click the map to place".
+    pub fn as_palette(mut self) -> Self {
+        self.palette = true;
+        self
+    }
+
+    /// Whether this frame paints and claims the backdrop. A stepped-aside
+    /// panel claims nothing at all; a palette never had a backdrop to
+    /// begin with.
+    pub fn claims_backdrop(&self) -> bool {
+        !self.aside && !self.palette
     }
 
     /// The panel stops existing for this frame: no backdrop, no panel, and
@@ -1008,8 +1025,8 @@ impl Modal {
 /// islands behind still read as clearly recessed. 104 it is.
 pub const MODAL_BACKDROP_ALPHA: u8 = 104;
 
-/// Title row height. Smaller than an island's band because a modal has no
-/// chamfer and no drag region, so the band is carrying only a label and a
+/// Title row height. Smaller than an island's band because a modal is
+/// square with no drag region, so the band is carrying only a label and a
 /// close button.
 pub const MODAL_TITLE_H: f32 = 30.0;
 
@@ -1047,6 +1064,9 @@ pub fn modal(
     }
 
     let mut clicked_close = false;
+    // A palette has no backdrop: the panel is the whole claim, and the map
+    // behind it stays live. See `Modal::as_palette`.
+    if spec.claims_backdrop() {
     // The top band stays OUTSIDE the backdrop.
     //
     // The backdrop claims the whole viewport, which is what makes the map inert
@@ -1104,6 +1124,7 @@ pub fn modal(
                 );
             }
         });
+    }
 
     egui::Area::new(spec.id)
         .fixed_pos(rect.min)
@@ -1509,6 +1530,16 @@ fn the_backdrop_begins_under_the_top_band() {
         assert_eq!(rect.center(), vp.center());
         assert_eq!(rect.width(), 700.0);
         assert_eq!(rect.height(), 500.0);
+    }
+
+    /// A palette claims no backdrop: the map behind it stays live, which
+    /// is what lets a picker row promise "click the map to place". A
+    /// dialog keeps its backdrop and the map behind it stays inert.
+    #[test]
+    fn a_palette_claims_no_backdrop() {
+        assert!(modal(vec2(700.0, 500.0)).claims_backdrop());
+        assert!(!modal(vec2(700.0, 500.0)).as_palette().claims_backdrop());
+        assert!(!modal(vec2(700.0, 500.0)).step_aside().claims_backdrop());
     }
 
     /// A modal taller than the window is clamped, never centred off-screen

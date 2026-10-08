@@ -41,6 +41,27 @@ impl GroupKind {
             GroupKind::OperasiGabungan => "OperasiGabungan",
         }
     }
+
+    /// Resolve a vocabulary level to a local kind, by Indonesian name.
+    /// `None` for a level this build has no equivalent for (a future
+    /// Koarmada between Gugus and Operasi Gabungan, or a renamed
+    /// custom level): the caller refuses loudly rather than mustering
+    /// units under a rank it cannot reason about. The server-side tree
+    /// (a later slice) will carry those levels natively.
+    pub fn from_echelon(name: &str) -> Option<Self> {
+        let squashed: String = name
+            .to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        match squashed.as_str() {
+            "unsur" => Some(GroupKind::Unsur),
+            "satuantugas" | "satgas" => Some(GroupKind::SatuanTugas),
+            "gugus" => Some(GroupKind::Gugus),
+            "operasigabungan" | "opgab" => Some(GroupKind::OperasiGabungan),
+            _ => None,
+        }
+    }
 }
 
 /// One group: shared identity plus unit and child-group members.

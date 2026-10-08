@@ -91,6 +91,10 @@ pub enum Halo {
     Signal,
     /// Old data — backfilled rather than live.
     Stale,
+    /// An embark just landed aboard this hull. A transient flash, not a
+    /// state — the map holds it for a couple of seconds while its alpha
+    /// decays, then forgets it.
+    Embark,
 }
 
 impl Halo {
@@ -99,6 +103,7 @@ impl Halo {
         match self {
             Halo::Signal => [0.133, 0.827, 0.933],
             Halo::Stale => [0.965, 0.773, 0.420],
+            Halo::Embark => [0.290, 0.871, 0.502],
         }
     }
 }

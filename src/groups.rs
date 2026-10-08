@@ -221,6 +221,19 @@ mod tests {
     }
 
     #[test]
+    fn echelon_names_resolve_to_kinds_and_strangers_refuse() {
+        assert_eq!(GroupKind::from_echelon("Unsur"), Some(GroupKind::Unsur));
+        assert_eq!(GroupKind::from_echelon("Satuan Tugas"), Some(GroupKind::SatuanTugas));
+        assert_eq!(GroupKind::from_echelon("Gugus"), Some(GroupKind::Gugus));
+        assert_eq!(GroupKind::from_echelon("Operasi Gabungan"), Some(GroupKind::OperasiGabungan));
+        // Ranks are compared, never these strings — but the strings are
+        // still the lookup, so a future level resolves to nothing
+        // rather than to somebody else's rank.
+        assert_eq!(GroupKind::from_echelon("Koarmada"), None);
+        assert_eq!(GroupKind::from_echelon(""), None);
+    }
+
+    #[test]
     fn remove_group_strips_parent_refs() {
         let (mut g, _) = rig();
         g.remove_group("s1");

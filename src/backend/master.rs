@@ -99,6 +99,30 @@ impl MinosMaster {
         })
     }
 
+    /// Echelon vocabulary, lowest first, as typed levels: the words a
+    /// task organisation is built from. Prefer this over `hierarchy()`
+    /// when the order matters — the lookup-table shape has no room for
+    /// `echelon_rank`, and the alphabet is not the hierarchy.
+    pub fn echelon_levels(&self, token: &str) -> Result<Vec<EchelonLevel>, BackendError> {
+        let data = self.get(token, "/hierarchy")?;
+        let mut levels: Vec<EchelonLevel> = data
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|h| {
+                Some(EchelonLevel {
+                    id: h["id"].as_i64()?,
+                    name: h["name"].as_str().unwrap_or("").to_string(),
+                    id_name: h["id_name"].as_str().unwrap_or("").to_string(),
+                    echelon_rank: h["echelon_rank"].as_i64().unwrap_or(0),
+                })
+            })
+            .collect();
+        levels.sort_by_key(|l| l.echelon_rank);
+        Ok(levels)
+    }
+
     /// Echelon vocabulary, lowest first. Order lives in echelon_rank.
     pub fn hierarchy(&self, token: &str) -> Result<TableData, BackendError> {
         let data = self.get(token, "/hierarchy")?;
@@ -338,6 +362,18 @@ impl MinosMaster {
         )
     }
 
+
+    fn delete(&self, token: &str, path: &str) -> Result<serde_json::Value, BackendError> {
+        unwrap_envelope(
+            self.client
+                .delete(&format!("{}{}", self.base_url, path))
+                .bearer_auth(token)
+                .send()?,
+        )
+    }
+
+    /// Bodiless PUT (readiness declare): no `.json()`, so no
+    /// `Content-Type` and no empty object for the validator to trip on.
     fn put(
         &self,
         token: &str,
@@ -353,17 +389,6 @@ impl MinosMaster {
         )
     }
 
-    fn delete(&self, token: &str, path: &str) -> Result<serde_json::Value, BackendError> {
-        unwrap_envelope(
-            self.client
-                .delete(&format!("{}{}", self.base_url, path))
-                .bearer_auth(token)
-                .send()?,
-        )
-    }
-
-    /// Bodiless PUT (readiness declare): no `.json()`, so no
-    /// `Content-Type` and no empty object for the validator to trip on.
     fn put_empty(&self, token: &str, path: &str) -> Result<serde_json::Value, BackendError> {
         unwrap_envelope(
             self.client
@@ -2085,6 +2110,108 @@ impl MinosMaster {
         }
     }
 
+    /// Declare ready for one step: the participant's own write, and the
+    /// route the step's gate waits for. Pressing it twice is one
+    /// declaration with a later instant, not an error.
+    pub fn declare_step_readiness(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+    ) -> Result<(), BackendError> {
+        self.put_empty(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}/readiness"),
+        )?;
+        Ok(())
+    }
+
+    /// Take the caller's own step declaration back. Idempotent: about a
+    /// step never declared for, the honest answer is "not declared".
+    pub fn withdraw_step_readiness(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+    ) -> Result<(), BackendError> {
+        self.delete(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}/readiness"),
+        )?;
+        Ok(())
+    }
+
+    /// Where the exercise is, and what the caller is being asked to
+    /// declare: the participant's only door onto the plan. `current`
+    /// is the step in play (absent between steps); `asking` is the
+    /// first unreached step that asks THIS caller (absent when none
+    /// does). Counts are numbers, not names — a commander learns
+    /// whether they hold the step up, not the opposing force.
+    pub fn game_current_step(
+        &self,
+        token: &str,
+        game_id: i64,
+    ) -> Result<CurrentStepView, BackendError> {
+        let data = self.get(token, &format!("/games/{game_id}/current-step"))?;
+        Ok(Self::parse_current_step(&data))
+    }
+
+    /// The `current-step` answer, parsed. Absent halves stay absent —
+    /// a missing `asking` means no step asks this caller, never an
+    /// empty step to render.
+    fn parse_current_step(v: &serde_json::Value) -> CurrentStepView {
+        fn parse_half(
+            v: &serde_json::Value,
+        ) -> Option<(CurrentStepScenario, CurrentStepStep)> {
+            let sc = v["scenario"].as_object()?;
+            let st = v["step"].as_object()?;
+            Some((
+                CurrentStepScenario {
+                    id: sc["id"].as_i64()?,
+                    title: sc["title"].as_str().unwrap_or("").to_string(),
+                },
+                CurrentStepStep {
+                    id: st["id"].as_i64()?,
+                    content: st["content"].as_str().unwrap_or("").to_string(),
+                    window_end_at: st["window_end_at"].as_str().map(|s| s.to_string()),
+                },
+            ))
+        }
+        let current = v
+            .get("current")
+            .and_then(|c| {
+                let (scenario, step) = parse_half(c)?;
+                let run = c.get("run")?;
+                Some(CurrentStepPlaying {
+                    scenario,
+                    step,
+                    state: run["state"].as_str().unwrap_or("").to_string(),
+                    assumed_start: run["assumed_start"].as_str().map(|s| s.to_string()),
+                })
+            });
+        let asking = v.get("asking").and_then(|a| {
+            let (scenario, step) = parse_half(a)?;
+            let you = a.get("you")?;
+            Some(CurrentStepAsking {
+                scenario,
+                step,
+                required: a["required"].as_i64().unwrap_or(0),
+                outstanding: a["outstanding"].as_i64().unwrap_or(0),
+                you_ready: you["ready"].as_bool().unwrap_or(false),
+                you_via_kind: you["via"]["kind"].as_str().unwrap_or("").to_string(),
+                you_via_id: you["via"]["id"].as_i64().unwrap_or(0),
+                you_via_name: you["via"]["name"].as_str().unwrap_or("").to_string(),
+            })
+        });
+        CurrentStepView {
+            assumed_time: v["assumed_time"].as_str().map(|s| s.to_string()),
+            current,
+            asking,
+        }
+    }
+
     /// One step run, as the control answers it.
     fn parse_step_run(v: &serde_json::Value) -> Result<GameStepRun, BackendError> {
         let id = v["id"]
@@ -3033,6 +3160,70 @@ pub struct StepRelated {
     pub personnel: Vec<RelatedPerson>,
 }
 
+/// One scenario as the `current-step` answer names it: the title the
+/// banner shows, never the plan around it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentStepScenario {
+    pub id: i64,
+    pub title: String,
+}
+
+/// One step as the `current-step` answer names it: the instruction
+/// text for a non-GM caller, plus the window end as an instant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentStepStep {
+    pub id: i64,
+    pub content: String,
+    pub window_end_at: Option<String>,
+}
+
+/// The step in play, when the exercise is on one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentStepPlaying {
+    pub scenario: CurrentStepScenario,
+    pub step: CurrentStepStep,
+    pub state: String,
+    pub assumed_start: Option<String>,
+}
+
+/// The first unreached step that asks THIS caller to declare, when
+/// one does. `you_ready` is the caller's own declaration; the counts
+/// say whether they hold the step up, never who else is on it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentStepAsking {
+    pub scenario: CurrentStepScenario,
+    pub step: CurrentStepStep,
+    pub required: i64,
+    pub outstanding: i64,
+    pub you_ready: bool,
+    pub you_via_kind: String,
+    pub you_via_id: i64,
+    pub you_via_name: String,
+}
+
+/// Where the exercise is, and what the caller owes it. Either half is
+/// absent on its own terms — between steps for `current`, "no step
+/// asks you" for `asking` — and neither absence is an error.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CurrentStepView {
+    pub assumed_time: Option<String>,
+    pub current: Option<CurrentStepPlaying>,
+    pub asking: Option<CurrentStepAsking>,
+}
+
+/// One level of the echelon vocabulary: the ordered levels a task
+/// organisation is built from (Unsur, Satuan Tugas, Gugus, Operasi
+/// Gabungan in the seed). Global master data, not per game — every
+/// exercise builds its own tree from these words. Ranks may have
+/// gaps; treat `echelon_rank` as an order, never an index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EchelonLevel {
+    pub id: i64,
+    pub name: String,
+    pub id_name: String,
+    pub echelon_rank: i64,
+}
+
 impl GameScenarioStep {
     /// The window, if both ends are present.
     ///
@@ -3287,12 +3478,17 @@ pub struct EmbarkationCandidate {
 }
 
 /// A unit directly inside a host, as the contents list draws it.
+/// `is_cleared` is the host's permission: a piece that is not cleared
+/// takes no orders of its own. (CMS reads carry no clearance — the
+/// field stays false there — because permission is an exercise fact.)
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbarkedUnit {
     pub id: i64,
     pub name: String,
     pub hull_number: String,
     pub class_name: String,
+    pub is_cleared: bool,
+    pub cleared_at: Option<String>,
 }
 
 /// A complement the whole attach or detach batch went past. A warning,
@@ -3553,35 +3749,16 @@ impl MinosMaster {
             .collect()
     }
 
-    /// Set what a unit carries, as a whole. The response is the stored
-    /// list, so the caller can confirm what landed.
-    pub fn set_unit_capacities(
-        &self,
-        token: &str,
-        unit_id: i64,
-        capacities: &[UnitCapacity],
-    ) -> Result<Vec<UnitCapacity>, BackendError> {
-        let body = serde_json::json!({
-            "capacities": capacities
-                .iter()
-                .map(|c| {
-                    serde_json::json!({
-                        "level": c.level,
-                        "id_level": c.id_level,
-                        "max_aboard": c.max_aboard,
-                    })
-                })
-                .collect::<Vec<_>>()
-        });
-        let data = self.put(token, &format!("/units/{unit_id}/capacities"), body)?;
-        Ok(Self::parse_capacities(&data))
-    }
-
     /// What could be put inside a unit: live, not the host, not already
     /// inside something, not an ancestor of the host, and of a kind the
     /// host has declared it carries. Capped at 200. Empty means the
-    /// host declared no complements — capacities are the first thing an
-    /// operator sets.
+    /// host declares no complements — complements are authored in the
+    /// register app, never here.
+    ///
+    /// CMS only: the exercise keeps its own composition (see the `game_*`
+    /// embarkation methods below), and this read answers the register's
+    /// copy of it. The game picker derives its list from the game's own
+    /// pieces instead.
     pub fn embarkation_candidates(
         &self,
         token: &str,
@@ -3591,7 +3768,9 @@ impl MinosMaster {
         Ok(Self::parse_embarkation_units(&data))
     }
 
-    /// What is directly inside a unit.
+    /// What is directly inside a unit, in the register's copy.
+    /// CMS only — the exercise reads its own composition through
+    /// [`Self::game_embarkations`].
     pub fn embarkations(
         &self,
         token: &str,
@@ -3601,18 +3780,24 @@ impl MinosMaster {
         Ok(Self::parse_embarked_units(&data))
     }
 
+    fn parse_embarked_unit(u: &serde_json::Value) -> EmbarkedUnit {
+        EmbarkedUnit {
+            id: u["id"].as_i64().unwrap_or(0),
+            name: u["name"].as_str().unwrap_or("").to_string(),
+            hull_number: u["hull_number"].as_str().unwrap_or("").to_string(),
+            class_name: u["class_name"].as_str().unwrap_or("").to_string(),
+            is_cleared: u["is_cleared"].as_bool().unwrap_or(false),
+            cleared_at: u["cleared_at"].as_str().map(|s| s.to_string()),
+        }
+    }
+
     fn parse_embarked_units(data: &serde_json::Value) -> Vec<EmbarkedUnit> {
         data["units"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .iter()
-            .map(|u| EmbarkedUnit {
-                id: u["id"].as_i64().unwrap_or(0),
-                name: u["name"].as_str().unwrap_or("").to_string(),
-                hull_number: u["hull_number"].as_str().unwrap_or("").to_string(),
-                class_name: u["class_name"].as_str().unwrap_or("").to_string(),
-            })
+            .map(Self::parse_embarked_unit)
             .collect()
     }
 
@@ -3637,6 +3822,9 @@ impl MinosMaster {
     /// over a declared complement is a WARNING, not a refusal — the
     /// answer reports which complement was exceeded. The response is
     /// the host's contents after the attach.
+    ///
+    /// CMS only: the exercise stages its own composition through
+    /// [`Self::game_attach_units`].
     pub fn attach_units(
         &self,
         token: &str,
@@ -3655,6 +3843,9 @@ impl MinosMaster {
     /// Take units out of a hull. A physical delete, all-or-nothing, with
     /// the same refusal shape as the attach. The response is the host's
     /// remaining contents.
+    ///
+    /// CMS only: the exercise detaches through
+    /// [`Self::game_detach_units`].
     pub fn detach_units(
         &self,
         token: &str,
@@ -3670,18 +3861,106 @@ impl MinosMaster {
         Ok(Self::parse_embarkation_result(&data))
     }
 
+    /// What one piece of an exercise carries: the exercise's OWN
+    /// composition, copied from the register when the hull was assigned
+    /// and edited only through the `game_*` methods here. A CMS detach
+    /// under a running game cannot change who a telegram reaches.
+    pub fn game_embarkations(
+        &self,
+        token: &str,
+        game_id: i64,
+        unit_id: i64,
+    ) -> Result<Vec<EmbarkedUnit>, BackendError> {
+        let data = self.get(
+            token,
+            &format!("/games/{game_id}/units/{unit_id}/embarkations"),
+        )?;
+        Ok(Self::parse_embarked_units(&data))
+    }
+
+    /// Put pieces directly inside one of an exercise's pieces. Same
+    /// all-or-nothing refusals as the register attach (ring, already
+    /// inside, unknown or duplicate id, or not a piece of this game);
+    /// a passed complement is a warning in the answer, not a refusal.
+    pub fn game_attach_units(
+        &self,
+        token: &str,
+        game_id: i64,
+        unit_id: i64,
+        unit_ids: &[i64],
+    ) -> Result<EmbarkationResult, BackendError> {
+        let body = serde_json::json!({ "unit_ids": unit_ids });
+        let data = self.post(
+            token,
+            &format!("/games/{game_id}/units/{unit_id}/embarkations"),
+            body,
+        )?;
+        Ok(Self::parse_embarkation_result(&data))
+    }
+
+    /// Take pieces out of one of an exercise's pieces. A piece that
+    /// leaves under way is given a position of its own; the answer is
+    /// the host's remaining contents.
+    pub fn game_detach_units(
+        &self,
+        token: &str,
+        game_id: i64,
+        unit_id: i64,
+        unit_ids: &[i64],
+    ) -> Result<EmbarkationResult, BackendError> {
+        let body = serde_json::json!({ "unit_ids": unit_ids });
+        let data = self.post(
+            token,
+            &format!("/games/{game_id}/units/{unit_id}/embarkations/detach"),
+            body,
+        )?;
+        Ok(Self::parse_embarkation_result(&data))
+    }
+
+    /// Let the pieces inside one piece act: the host's permission for
+    /// embarked units to take orders and hold positions of their own.
+    /// Cleared pieces stay aboard for messages and readiness.
+    pub fn game_clear_aboard(
+        &self,
+        token: &str,
+        game_id: i64,
+        unit_id: i64,
+        unit_ids: &[i64],
+    ) -> Result<EmbarkationResult, BackendError> {
+        let body = serde_json::json!({ "unit_ids": unit_ids });
+        let data = self.post(
+            token,
+            &format!("/games/{game_id}/units/{unit_id}/embarkations/clear"),
+            body,
+        )?;
+        Ok(Self::parse_embarkation_result(&data))
+    }
+
+    /// Take the host's permission back. Legs already sailed stay sailed;
+    /// what is withdrawn is the permission to take further orders.
+    pub fn game_revoke_clearance(
+        &self,
+        token: &str,
+        game_id: i64,
+        unit_id: i64,
+        unit_ids: &[i64],
+    ) -> Result<EmbarkationResult, BackendError> {
+        let body = serde_json::json!({ "unit_ids": unit_ids });
+        let data = self.post(
+            token,
+            &format!("/games/{game_id}/units/{unit_id}/embarkations/revoke"),
+            body,
+        )?;
+        Ok(Self::parse_embarkation_result(&data))
+    }
+
     fn parse_embarkation_result(data: &serde_json::Value) -> EmbarkationResult {
         let units = data["units"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .iter()
-            .map(|u| EmbarkedUnit {
-                id: u["id"].as_i64().unwrap_or(0),
-                name: u["name"].as_str().unwrap_or("").to_string(),
-                hull_number: u["hull_number"].as_str().unwrap_or("").to_string(),
-                class_name: u["class_name"].as_str().unwrap_or("").to_string(),
-            })
+            .map(Self::parse_embarked_unit)
             .collect();
         let over_capacity = data["over_capacity"]
             .as_array()
@@ -4268,6 +4547,62 @@ mod window_authoring_tests {
         assert_eq!(groups[0]["name"], "Sea");
         assert_eq!(groups[0]["id_name"], "Aset Laut");
         assert_eq!(groups[0]["hull_count"], 88);
+    }
+
+    #[test]
+    fn embarked_unit_carries_the_hosts_permission() {
+        let data = serde_json::json!({
+            "units": [
+                { "id": 1503, "name": "Heli", "hull_number": "H-01", "class_name": "AS565", "is_cleared": false, "cleared_at": serde_json::Value::Null },
+                { "id": 6523, "name": "Boat", "hull_number": "B-02", "class_name": "RHIB", "is_cleared": true, "cleared_at": "2016-01-31T13:01:33.786Z" }
+            ],
+            "over_capacity": []
+        });
+        let units = MinosMaster::parse_embarked_units(&data);
+        assert_eq!(units.len(), 2);
+        assert!(!units[0].is_cleared, "aboard means no orders until cleared");
+        assert!(units[1].is_cleared, "a cleared piece may act");
+        assert_eq!(units[1].cleared_at.as_deref(), Some("2016-01-31T13:01:33.786Z"));
+        // A CMS answer carries no clearance — absence reads as aboard,
+        // never as permission.
+        let bare = serde_json::json!({ "units": [{ "id": 7 }] });
+        let parsed = MinosMaster::parse_embarked_units(&bare);
+        assert!(!parsed[0].is_cleared);
+    }
+
+    #[test]
+    fn current_step_names_the_step_in_play_and_the_one_asking() {
+        let data = serde_json::json!({
+            "assumed_time": "1990-06-10T12:25:28.780Z",
+            "current": {
+                "scenario": { "id": 7883, "title": "Plot" },
+                "step": { "id": 5317, "content": "Sail", "window_end_at": serde_json::Value::Null },
+                "run": { "state": "playing", "assumed_start": "1950-03-20T03:05:48.037Z" }
+            },
+            "asking": {
+                "scenario": { "id": 3990, "title": "Next plot" },
+                "step": { "id": 9689, "content": "Hold", "window_end_at": serde_json::Value::Null },
+                "required": 3,
+                "outstanding": 1,
+                "you": { "ready": false, "via": { "kind": "hull", "id": 9683, "name": "KRI A" } }
+            }
+        });
+        let view = MinosMaster::parse_current_step(&data);
+        let current = view.current.expect("the step in play is named");
+        assert_eq!(current.step.content, "Sail");
+        assert_eq!(current.state, "playing");
+        let asking = view.asking.expect("the step asking this caller is named");
+        assert_eq!(asking.step.content, "Hold");
+        assert_eq!(asking.outstanding, 1);
+        assert!(!asking.you_ready);
+        assert_eq!(asking.you_via_name, "KRI A");
+    }
+
+    #[test]
+    fn current_step_absent_halves_are_absences_not_empty_steps() {
+        let view = MinosMaster::parse_current_step(&serde_json::json!({}));
+        assert!(view.current.is_none(), "between steps is a state, not an error");
+        assert!(view.asking.is_none(), "no step asking is the ordinary rest state");
     }
 
 }
