@@ -1802,16 +1802,6 @@ struct DashShip {
     label: String,
 }
 
-/// The callsign a step-started marker message carries. The server
-/// publishes no event when a step starts, so the Game Master's client
-/// broadcasts one: scenario commanders hold their helm orders until a
-/// message with this callsign arrives. A callsign rather than a body
-/// match because both the socket event and the inbox row carry it, and
-/// a convention in free text would be one rename away from silence.
-/// When the backend ships a real step event this constant and its two
-/// readers are the whole of what gets replaced.
-const STEP_START_CALLSIGN: &str = "STEP-START";
-
 /// A GM step control: play, skip, end or rewind one step. No body on the
 /// wire — everything the action needs is in the path, and instants come
 /// from the exercise clock.
@@ -2659,10 +2649,6 @@ enum SetupDone {
     StageFailed(String, String),
     /// A GM step control answered with the run it made or closed.
     StepRun(tfg::backend::GameStepRun),
-    /// The step-started marker landed. Its own variant because a plain
-    /// `MsgSent` clears the compose draft — which may be the very tasking
-    /// the Game Master is still writing for the next step.
-    StepMarkerSent(i64),
     /// A rewind's answer: what the erased attempt cost, table by table.
     StepRewound(tfg::backend::StepRewind),
     /// B4's answer for one step: the gate plus who holds it back. Keyed,
@@ -3097,19 +3083,6 @@ struct ShipApp {
     /// never needs a second call. There is no listing route; a restart
     /// re-derives the current step from the next answer, not from memory.
     step_runs: Vec<tfg::backend::GameStepRun>,
-    /// Helm orders a scenario commander has planned but not sent: ship id
-    /// → (heading, speed). The server applies an accepted order at once
-    /// and queues nothing, so the hold has to live here until the Game
-    /// Master's Play is signalled.
-    staged_helm: HashMap<String, (f32, f32)>,
-    /// A step-started marker arrived: post the staged orders (retried per
-    /// frame while the setup slot is busy, never dropped).
-    pending_step_release: bool,
-    /// …and withdraw this commander's own readiness once released, so the
-    /// next step asks them to declare again. The server holds ONE
-    /// readiness flag and only a rewind resets it, so without this a
-    /// commander would stay "ready" for every later step.
-    pending_step_unready: bool,
     /// When the Steps island last read the gate. The count of who is
     /// ready changes by other people's hands, so the island re-reads on a
     /// short timer rather than showing the number it saw once.
@@ -3122,12 +3095,6 @@ struct ShipApp {
     /// When `current_step` was last read, so the banner re-reads on a
     /// timer and never per frame.
     current_step_read_at: Option<Instant>,
-    /// Marker message ids already acted on, and whether the inbox has been
-    /// read once. The first inbox read only BASELINES old markers —
-    /// otherwise opening the app mid-exercise would replay every earlier
-    /// step's release.
-    step_signals_seen: HashSet<i64>,
-    step_signals_primed: bool,
     /// The comms hub, anchored top-right: step instructions plus the
     /// whole inbox in one place. Replaces the floating Messages island
     /// inside a session, whose default position sat under the side zone.
@@ -3138,8 +3105,8 @@ struct ShipApp {
     /// the size is clamped to the window on read so a resize can never push
     /// the hub off-screen or shrink it past usability.
     comms_size_override: Option<egui::Vec2>,
-    /// When the inbox was last read for the comms hub or the step-signal
-    /// poll, so a failing read is retried on a timer and never per frame.
+    /// When the inbox was last read for the comms hub, so a failing
+    /// read is retried on a timer and never per frame.
     comms_load_at: Option<Instant>,
     /// Which step the Steps island has open, as (scenario, step). The
     /// composer keeps its own selection — this one drives the execution
@@ -3885,11 +3852,6 @@ impl ShipApp {
                     self.feed("live token expired (109): refreshing".to_string());
                     self.refresh_now();
                 }
-                LiveEvent::Message(m) if m.callsign == STEP_START_CALLSIGN => {
-                    // A signal, not mail: it releases planned helm orders
-                    // and never opens or fills the inbox island.
-                    self.step_started(m.id);
-                }
                 LiveEvent::Message(m) => {
                     // H11: broadcast or addressed — drawn, filed, and
                     // the island opens itself once for the new mail.
@@ -4378,12 +4340,7 @@ impl ShipApp {
             self.scenarios.clear();
             self.users_game_roles.clear();
             self.step_runs.clear();
-            self.staged_helm.clear();
-            self.pending_step_release = false;
-            self.pending_step_unready = false;
             self.step_gate_read_at = None;
-            self.step_signals_seen.clear();
-            self.step_signals_primed = false;
             self.step_gate = None;
             self.current_step = None;
             self.current_step_read_at = None;
@@ -4548,12 +4505,7 @@ impl ShipApp {
         self.users_game_roles.clear();
         self.users_roster.clear();
         self.step_runs.clear();
-        self.staged_helm.clear();
-        self.pending_step_release = false;
-        self.pending_step_unready = false;
         self.step_gate_read_at = None;
-        self.step_signals_seen.clear();
-        self.step_signals_primed = false;
         self.step_gate = None;
         self.current_step = None;
         self.current_step_read_at = None;
@@ -5172,12 +5124,7 @@ impl ShipApp {
         self.users_game_roles.clear();
         self.users_roster.clear();
         self.step_runs.clear();
-        self.staged_helm.clear();
-        self.pending_step_release = false;
-        self.pending_step_unready = false;
         self.step_gate_read_at = None;
-        self.step_signals_seen.clear();
-        self.step_signals_primed = false;
         self.step_gate = None;
         self.current_step = None;
         self.current_step_read_at = None;
@@ -5408,12 +5355,7 @@ impl ShipApp {
             self.users_game_roles.clear();
         self.users_roster.clear();
         self.step_runs.clear();
-        self.staged_helm.clear();
-        self.pending_step_release = false;
-        self.pending_step_unready = false;
         self.step_gate_read_at = None;
-        self.step_signals_seen.clear();
-        self.step_signals_primed = false;
         self.step_gate = None;
         self.current_step = None;
         self.current_step_read_at = None;
@@ -8455,43 +8397,35 @@ impl ShipApp {
         {
             self.helm_drafts.remove(id);
         }
-        // In a scenario the fleet waits for the Game Master's Play: the
-        // server would apply an accepted order at once and queue nothing,
-        // so the buttons PLAN here and the order is posted when the step
-        // starts. Everywhere else they send, as before.
-        let hold = self.scenario_hold();
+        // Helm posts at once in every mode: `POST
+        // /games/{id}/units/{unit_id}/order` is accepted in execution
+        // for maneuver and scenario alike (static is the mirror — it
+        // takes hand-set positions and refuses orders). There is no
+        // client-side hold for a step; the server owns timing.
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     !pending,
-                    egui::Button::new(if hold { "Plan helm" } else { "Set helm" }),
+                    egui::Button::new("Set helm"),
                 )
                 .clicked()
             {
                 let medium = self.helm_medium.get(id).cloned().filter(|m| !m.is_empty());
-                if hold {
-                    self.stage_helm(id, heading, speed);
-                } else {
-                    self.order_via_minos(id, heading, speed, medium);
-                }
+                self.order_via_minos(id, heading, speed, medium);
             }
             if ui
                 .add_enabled(
                     !pending,
-                    egui::Button::new(if hold { "Plan hold" } else { "Hold position" }),
+                    egui::Button::new("Hold position"),
                 )
                 .clicked()
             {
-                if hold {
-                    self.stage_helm(id, reported_heading, 0.0);
-                } else {
-                    self.order_via_minos(
-                        id,
-                        reported_heading,
-                        0.0,
-                        self.helm_medium.get(id).cloned().filter(|m| !m.is_empty()),
-                    );
-                }
+                self.order_via_minos(
+                    id,
+                    reported_heading,
+                    0.0,
+                    self.helm_medium.get(id).cloned().filter(|m| !m.is_empty()),
+                );
                 self.helm_drafts.insert(
                     id.to_string(),
                     HelmDraft {
@@ -8501,24 +8435,7 @@ impl ShipApp {
                 );
             }
         });
-        if hold {
-            match self.staged_helm.get(id) {
-                Some((h, sp)) => {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "planned: {h:.0}° · {sp:.0} kn — the ship holds until the Game Master plays the step"
-                        ))
-                        .color(tfg::tokens::ALERT_YELLOW)
-                        .small(),
-                    );
-                }
-                None => {
-                    ui.weak("nothing planned — the ship holds until the Game Master plays the step");
-                }
-            }
-        } else {
-            ui.weak("No waypoint: heading and speed remain in force until replaced.");
-        }
+        ui.weak("No waypoint: heading and speed remain in force until replaced.");
     }
 
     fn helm_heading_input(ui: &mut egui::Ui, heading_deg: &mut f32, enabled: bool) {
@@ -11087,23 +11004,12 @@ impl ShipApp {
             .small()
             .weak(),
         );
-        if self.scenario_hold() {
-            if self.staged_helm.is_empty() {
-                ui.label(
-                    egui::RichText::new("Helm: nothing planned — set it in My command, then press Ready for step.")
-                        .small(),
-                );
-            } else {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Helm: {} order(s) planned — released when the Game Master plays the step.",
-                        self.staged_helm.len()
-                    ))
-                    .small()
-                    .color(tfg::tokens::ALERT_YELLOW),
-                );
-            }
-        }
+        ui.label(
+            egui::RichText::new(
+                "Helm orders post at once with Set helm — set it in My command, then press Ready for step.",
+            )
+            .small(),
+        );
         ui.separator();
         self.messages_island(ui);
     }
@@ -13666,23 +13572,6 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         if !self.dashboard_open {
             return;
         }
-        // The fallback for a step-started marker the socket dropped: while
-        // orders are planned (and until the inbox has been read once, to
-        // baseline old markers) the inbox is re-read on a timer. Without
-        // it a missed signal would hold a commander's helm forever.
-        if self.scenario_hold() {
-            let wanted = !self.step_signals_primed || !self.staged_helm.is_empty();
-            if wanted {
-                let due = self
-                    .comms_load_at
-                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
-                if due && self.setup_op.is_none() {
-                    self.comms_load_at = Some(Instant::now());
-                    self.refresh_inbox();
-                }
-                ui.ctx().request_repaint_after(Duration::from_secs(5));
-            }
-        }
         // Follow a valid hull: the stored pick, else the first held.
         let active = match self.dashboard_ship.clone() {
             Some(id) if data.ships.iter().any(|s| s.id == id) => id,
@@ -13951,169 +13840,32 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             .show(ui, |ui| self.orders_body(ui));
     }
 
-    /// Whether this client holds helm orders for the Game Master's Play.
-    /// Scenario games only, in execution, for seated commanders: the
-    /// server applies an accepted order at once and queues nothing, so in
-    /// a scenario — where the Game Master releases the fleet step by
-    /// step — the hold lives on the commander's side until a step-started
-    /// marker arrives (see `STEP_START_CALLSIGN`).
-    fn scenario_hold(&self) -> bool {
-        self.game_state() == tfg::gamestate::GameState::Execution
-            && self.held_detail.as_ref().is_some_and(|d| d.mode == "scenario")
-            && self.player_station()
-    }
-
-    /// Plan a helm order instead of sending it: held here until the
-    /// step starts. Replacing a plan for the same hull is the point —
-    /// the last thing the commander set before declaring ready is what
-    /// runs.
-    fn stage_helm(&mut self, id: &str, heading: f32, speed: f32) {
-        self.staged_helm.insert(id.to_string(), (heading, speed));
-        self.users_status = format!(
-            "planned {:.0}° at {:.0} kn — released when the Game Master plays the step",
-            heading, speed
-        );
-    }
-
-    /// A step-started marker arrived (socket or inbox). Each marker acts
-    /// once: it releases this commander's planned orders, so the NEXT
-    /// step asks them to set helm and declare again. Step declarations
-    /// need no clearing here — they live per (step, attempt) on the
-    /// server, and a replay erases the abandoned attempt's own.
-    fn step_started(&mut self, msg_id: i64) {
-        if !self.step_signals_seen.insert(msg_id) {
-            return;
-        }
-        if !self.player_station() {
-            return;
-        }
-        if !self.staged_helm.is_empty() {
-            self.pending_step_release = true;
-        }
-        self.dirty = true;
-    }
-
-    /// Post released orders — one slot, so one per frame, and never
-    /// dropped: a busy slot just retries next frame.
-    fn drive_step_release(&mut self) {
-        if !self.pending_step_release && !self.pending_step_unready {
-            return;
-        }
-        if self.setup_op.is_some() {
-            self.dirty = true;
-            return;
-        }
-        if self.pending_step_release {
-            self.pending_step_release = false;
-            let planned: Vec<(String, (f32, f32))> = self.staged_helm.drain().collect();
-            let mut legs: Vec<(i64, String, f64, f32, Option<String>)> = Vec::new();
-            let mut unresolved = 0;
-            for (id, (heading, speed)) in planned {
-                match self.minos_order_target(&id) {
-                    Some(uid) => legs.push((uid, id, f64::from(heading), speed, None)),
-                    None => unresolved += 1,
-                }
-            }
-            if unresolved > 0 {
-                let line = format!(
-                    "{unresolved} planned order(s) could not be sent — the hull is not yours to command now"
-                );
-                self.feed(line.clone());
-                self.users_status = line;
-            }
-            if !legs.is_empty() {
-                self.spawn_order_batch(legs);
-            }
-            self.dirty = true;
-            return;
-        }
-        // Drained: step declarations are per (step, attempt) server-side,
-        // so there is nothing to withdraw when a step starts. The flag
-        // stays only for sessions that staged one before this fix.
-        self.pending_step_unready = false;
-    }
-
-    /// Tell every commander's client a step started. Scenario games
-    /// only; broadcast (no audience), carrying `STEP_START_CALLSIGN`.
-    /// Loud on failure: a commander whose client never hears this holds
-    /// their orders forever.
-    fn send_step_marker(&mut self, run: &tfg::backend::GameStepRun) {
-        if !self.held_detail.as_ref().is_some_and(|d| d.mode == "scenario") {
-            return;
-        }
-        let Some((gid, _)) = self.users_game.clone() else {
-            return;
-        };
-        let Ok((master, tok)) = self.users_client() else {
-            return;
-        };
-        let Some(degree) = self.msg_degree.or(self.msg_degrees.first().map(|d| d.0)) else {
-            let line = "step started, but no message degree is available to announce it — commanders' planned orders will not release"
-                .to_string();
-            self.feed(line.clone());
-            self.users_status = line;
-            return;
-        };
-        let title = self
-            .step_detail(run.scenario_id, run.step_id)
-            .map(|(t, _, p)| format!("{t} — step {}", p + 1))
-            .unwrap_or_else(|| format!("step {}", run.step_id));
-        let draft = tfg::backend::MsgDraft {
-            kind: "telegram".to_string(),
-            classification: "TERBUKA".to_string(),
-            content: format!("Step started: {title}. Planned helm orders are released."),
-            to: Vec::new(),
-            cc: Vec::new(),
-            assumed_role: None,
-            reply_to: None,
-            degree,
-            msg_type: None,
-            callsign: STEP_START_CALLSIGN.to_string(),
-            sending_note: format!("step {}", run.step_id),
-            group_name: String::new(),
-            per: String::new(),
-            registration_number: String::new(),
-        };
-        self.setup_op = Some(spawn_rest("step-marker", move || {
-            master
-                .send_message(&tok, gid, &draft)
-                .map_err(|e| e.to_string())
-                .map(|m| SetupDone::StepMarkerSent(m.id))
-        }));
-    }
-
-    /// Mail that is not the step marker: the marker is a signal, not
-    /// something to read, so it counts and displays as neither.
-    fn is_marker(m: &tfg::backend::InboxMsg) -> bool {
-        m.callsign == STEP_START_CALLSIGN
-    }
-
     /// What the Game Master last told this player to do: the newest mail
-    /// from somebody else that is not the step marker, from the inbox or
-    /// the socket (whichever has seen it). The server has no step-
-    /// instruction feed yet, so tasking arrives as ordinary messages;
-    /// this is the seam a real feed replaces. (sender, content, created).
+    /// from somebody else, from the inbox or the socket (whichever has
+    /// seen it). The server has no step-instruction feed yet, so tasking
+    /// arrives as ordinary messages; this is the seam a real feed
+    /// replaces. (sender, content, created).
     fn current_instruction(&self) -> Option<(String, String, String)> {
         let me = self.own_roster_row().map(|p| p.user_name);
         let from_other = |sender: &str| me.as_deref().is_none_or(|n| sender != n);
         let inbox = self
             .inbox
             .iter()
-            .filter(|m| !Self::is_marker(m) && from_other(&m.sender))
+            .filter(|m| from_other(&m.sender))
             .map(|m| (m.sender.clone(), m.content.clone(), m.created_at.clone()));
         let socket = self
             .game_messages
             .iter()
-            .filter(|m| m.callsign != STEP_START_CALLSIGN && from_other(&m.sender))
+            .filter(|m| from_other(&m.sender))
             .map(|m| (m.sender.clone(), m.content.clone(), m.created_at.clone()));
         inbox.chain(socket).max_by(|a, b| a.2.cmp(&b.2))
     }
 
-    /// Unread mail addressed to this account, markers excluded.
+    /// Unread mail addressed to this account.
     fn unread_mail(&self) -> usize {
         self.inbox
             .iter()
-            .filter(|m| !Self::is_marker(m) && self.msg_is_unread(m))
+            .filter(|m| self.msg_is_unread(m))
             .count()
     }
 
@@ -14320,8 +14072,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         }));
     }
 
-    /// Fire one GM step control. A successful Play in a scenario game
-    /// also broadcasts the step-started marker (see the StepRun arm).
+    /// Fire one GM step control.
     fn step_control(&mut self, sid: i64, step: i64, verb: StepVerb) {
         if self.setup_busy("step") {
             return;
@@ -14804,12 +14555,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         self.users_game_roles.clear();
         self.users_roster.clear();
         self.step_runs.clear();
-        self.staged_helm.clear();
-        self.pending_step_release = false;
-        self.pending_step_unready = false;
         self.step_gate_read_at = None;
-        self.step_signals_seen.clear();
-        self.step_signals_primed = false;
         self.step_gate = None;
         self.current_step = None;
         self.current_step_read_at = None;
@@ -15913,9 +15659,6 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 self.dispatch_queued_refresh();
             }
         }
-        // Planned helm orders released by a step-started marker, then the
-        // readiness withdrawal — one per frame through the shared slot.
-        self.drive_step_release();
         // The WebSocket game-position stream is an accelerator. The
         // documented interim source is the REST plot; if the socket is
         // quiet, recover through REST once per second.
@@ -16133,20 +15876,9 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                     "played" => "step ended".to_string(),
                     other => format!("step {}: {other}", run.step_id),
                 };
-                // The server publishes nothing when a step starts, and
-                // scenario commanders are holding their helm orders for
-                // exactly this moment — so the Game Master's client says
-                // so, as a marker message every commander's client reads.
-                // Only a PLAY starts movement (a skip jumps the clock),
-                // and only a scenario game holds orders at all.
-                if run.state == "playing" {
-                    self.send_step_marker(&run);
-                }
-            }
-            SetupDone::StepMarkerSent(_) => {
-                // Quiet on purpose: no compose-draft clear, no popup. The
-                // inbox re-read keeps the Game Master's own mail honest.
-                self.refresh_inbox();
+                // Commanders release on the polled `current-step` door, not
+                // on mail: no marker goes out here, so Play needs no
+                // message degree and no inbox read either.
             }
             SetupDone::StepRewound(rewind) => {
                 // The erasure took the attempt's runs with it, so the
@@ -16349,23 +16081,6 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 Err(e) => self.users_status = format!("task organisation failed: {e}"),
             },
             SetupDone::MsgPage(page) => {
-                // Markers the socket missed still release planned orders.
-                // The FIRST read only baselines: opening the app mid-
-                // exercise must not replay every earlier step's release.
-                let markers: Vec<i64> = page
-                    .messages
-                    .iter()
-                    .filter(|m| m.callsign == STEP_START_CALLSIGN)
-                    .map(|m| m.id)
-                    .collect();
-                if self.step_signals_primed {
-                    for id in markers {
-                        self.step_started(id);
-                    }
-                } else {
-                    self.step_signals_seen.extend(markers);
-                    self.step_signals_primed = true;
-                }
                 self.inbox = page.messages;
                 self.inbox_total = page.total_records;
                 self.inbox_pages = page.total_pages.max(1);
@@ -20031,10 +19746,11 @@ impl eframe::App for ShipApp {
             self.show_messages = false;
         }
         if self.show_comms {
-            // First open reads the inbox once (and baselines step
-            // markers); a failing read retries on a timer, never per
-            // frame.
-            if !self.step_signals_primed
+            // First open reads the inbox once; while it is still
+            // empty a failing read retries on a timer, never per
+            // frame. (An inbox that is genuinely empty re-reads too —
+            // cheap honesty while the hub is open.)
+            if self.inbox.is_empty()
                 && self.setup_op.is_none()
                 && self
                     .comms_load_at
@@ -21891,14 +21607,9 @@ fn main() -> Result<(), String> {
                 users_roles: Vec::new(),
                 users_game_roles: Vec::new(),
                 step_runs: Vec::new(),
-                staged_helm: HashMap::new(),
-                pending_step_release: false,
-                pending_step_unready: false,
                 step_gate_read_at: None,
                 current_step: None,
                 current_step_read_at: None,
-                step_signals_seen: HashSet::new(),
-                step_signals_primed: false,
                 show_comms: false,
                 comms_pos: None,
                 comms_size_override: None,
