@@ -2524,6 +2524,7 @@ enum WhichModal {
     Composer,
     Fleet,
     Player,
+    Session,
 }
 
 #[derive(Debug, Clone)]
@@ -3174,6 +3175,10 @@ struct ShipApp {
     fleet_picker_open: bool,
     /// Whether the Player Picker modal is showing.
     player_picker_open: bool,
+    /// Whether the New-session modal is showing. A bool rather than
+    /// egui memory because the form owns drafts that must survive a
+    /// close-and-reopen.
+    session_creator_open: bool,
     /// The held session's last detail read, kept whole.
     ///
     /// Cleared whenever the hold changes, because a detail is a fact about ONE
@@ -6446,6 +6451,7 @@ impl ShipApp {
     /// clear the form, move to step 2.
     fn apply_created_game(&mut self, g: tfg::backend::GameRow, note: String) {
         self.users_status = note;
+        self.session_creator_open = false;
         self.users_refresh_games();
         self.set_held_game(Some((g.id, g.name)));
         self.minos_clock = None;
@@ -9601,53 +9607,18 @@ impl ShipApp {
         }
         if can_manage_sessions {
             ui.separator();
-            ui.strong("New session");
+            // The create form lives in the New-session modal now (top-band
+            // toggle): this island works the HELD session, and seven more
+            // rows here read as another of its properties.
             ui.horizontal(|ui| {
-                ui.label("name:");
-                ui.text_edit_singleline(&mut self.setup_name);
-                if ui.small_button("create").clicked() {
-                    self.setup_create_game();
+                if ui
+                    .small_button("＋ New session…")
+                    .on_hover_text("create a session with the full form")
+                    .clicked()
+                {
+                    self.open_only(WhichModal::Session);
                 }
-            });
-            ui.horizontal(|ui| {
-                ui.label("description:");
-                ui.text_edit_singleline(&mut self.setup_description);
-            });
-            ui.horizontal(|ui| {
-                ui.label("purpose:");
-                ui.text_edit_singleline(&mut self.setup_purpose);
-            });
-            ui.horizontal(|ui| {
-                ui.label("target:");
-                ui.text_edit_singleline(&mut self.setup_target);
-            });
-            ui.horizontal(|ui| {
-                ui.label("area:");
-                ui.text_edit_singleline(&mut self.setup_area);
-            });
-            ui.horizontal(|ui| {
-                ui.label("map tag:");
-                ui.text_edit_singleline(&mut self.setup_map_tag);
-            });
-            // Mode is fixed at creation — no operation changes it after —
-            // so this picker is the one place it is ever chosen. Maneuver
-            // integrates helm orders; scenario steers the same way while
-            // the Game Master plots steps around it; static takes hand-set
-            // positions and refuses orders.
-            ui.horizontal(|ui| {
-                ui.label("mode:");
-                egui::ComboBox::from_id_salt("setup-mode")
-                    .selected_text(self.setup_mode.clone())
-                    .show_ui(ui, |ui| {
-                        for m in ["maneuver", "scenario", "static"] {
-                            ui.selectable_value(&mut self.setup_mode, m.to_string(), m);
-                        }
-                    });
-            });
-            ui.weak(match self.setup_mode.as_str() {
-                "scenario" => "scenario: personnel steer like maneuver; the Game Master plays steps around them.",
-                "static" => "static: positions are set by hand — helm orders are refused.",
-                _ => "maneuver: the exercise integrates helm orders.",
+                ui.weak("name, mode, description, purpose, target, area, map tag.");
             });
         // The scenario book's entry point, on the island that already owns
         // the held session's own facts.
@@ -10969,6 +10940,23 @@ impl ShipApp {
                         ui.separator();
                         self.mode_ui(ui);
                     }
+                    // The create toggle lives on the band, never in a side
+                    // island: the islands work the HELD session, and a
+                    // create form there reads as another of its properties.
+                    if self.can_manage_sessions() {
+                        ui.separator();
+                        if ui
+                            .small_button("＋ New session")
+                            .on_hover_text("create a session with the full form")
+                            .clicked()
+                        {
+                            if self.session_creator_open {
+                                self.session_creator_open = false;
+                            } else {
+                                self.open_only(WhichModal::Session);
+                            }
+                        }
+                    }
                     ui.separator();
                     self.map_controls(ui);
                     // "What now", in weak ink. The zone shows what IS; this
@@ -11545,6 +11533,7 @@ impl ShipApp {
         self.composer_visible = which == WhichModal::Composer;
         self.fleet_picker_open = which == WhichModal::Fleet;
         self.player_picker_open = which == WhichModal::Player;
+        self.session_creator_open = which == WhichModal::Session;
         // A drag does not survive the modal that armed it: the release would
         // land on the map with no panel to have started it, which is a command
         // nobody asked for.
@@ -11680,6 +11669,117 @@ impl ShipApp {
             self.composer_draft_error = None;
             self.composer_new_title.clear();
         }
+    }
+
+    /// The New-session modal: the full create form behind one toggle.
+    ///
+    /// The create used to live inline in the side islands — first as a
+    /// name-only shortcut in the no-session island, then as a seven-row
+    /// stack on the Essentials island. Both were the wrong home: the
+    /// islands are a working surface for the HELD session, and a create
+    /// form there reads as another property of it. A dialog owns the
+    /// decision instead, and the top band owns the toggle, so creating
+    /// is reachable from every state without claiming island space.
+    fn session_creator_modal(&mut self, ui: &egui::Ui) {
+        let spec = tfg::chrome::Modal::new(
+            egui::Id::new("session-creator"),
+            "New session",
+            egui::vec2(560.0, 620.0),
+        );
+        let panel = spec.rect_in(ui.ctx().viewport_rect());
+        let kept = tfg::chrome::modal(ui.ctx(), &spec, |ui| {
+            self.session_creator_body(ui);
+        });
+        self.modal_panel_rects.push(panel);
+        if !kept {
+            self.session_creator_open = false;
+        }
+    }
+
+    /// The create form itself: name (required) plus every optional the
+    /// `POST /games` body accepts, so nothing the edit form owns later
+    /// is missing here. One field per row, label above input, web-form
+    /// order — name, mode, then the prose rows in the order the server
+    /// documents them.
+    fn session_creator_body(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "A session is a plan the Game Master authors: a force, a roster and a window.",
+            )
+            .weak()
+            .small(),
+        );
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Name *").strong().small());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.setup_name)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("e.g. Latihan Armada 2026"),
+                );
+                if self.setup_name.trim().is_empty() {
+                    ui.label(
+                        egui::RichText::new("Name is required — the server refuses a nameless session.")
+                            .weak()
+                            .small(),
+                    );
+                }
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Mode").strong().small());
+                ui.horizontal(|ui| {
+                    for m in ["maneuver", "scenario", "static"] {
+                        ui.selectable_value(&mut self.setup_mode, m.to_string(), m);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(match self.setup_mode.as_str() {
+                        "scenario" => "scenario: personnel steer like maneuver; the Game Master plays steps around them.",
+                        "static" => "static: positions are set by hand — helm orders are refused.",
+                        _ => "maneuver: the exercise integrates helm orders.",
+                    })
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(10.0);
+                let mut field = |ui: &mut egui::Ui, label: &str, hint: &str, value: &mut String| {
+                    ui.label(egui::RichText::new(label).strong().small());
+                    ui.add(
+                        egui::TextEdit::singleline(value)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(hint),
+                    );
+                    ui.add_space(8.0);
+                };
+                field(ui, "Description", "what this exercise is about", &mut self.setup_description);
+                field(ui, "Purpose", "what it must achieve", &mut self.setup_purpose);
+                field(ui, "Target", "who or what is exercised", &mut self.setup_target);
+                field(ui, "Area", "where it takes place", &mut self.setup_area);
+                field(ui, "Map tag", "which chart backbone to load", &mut self.setup_map_tag);
+            });
+        ui.add_space(8.0);
+        ui.separator();
+        let busy = self.setup_busy("create");
+        let name_ok = !self.setup_name.trim().is_empty();
+        ui.horizontal(|ui| {
+            if ui.small_button("Cancel").clicked() {
+                self.session_creator_open = false;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let create = ui.add_enabled(
+                    name_ok && !busy,
+                    egui::Button::new(egui::RichText::new("Create session →").strong()),
+                );
+                if create.clicked() {
+                    self.setup_create_game();
+                }
+                if !name_ok {
+                    ui.label(egui::RichText::new("name required").weak().small());
+                }
+            });
+        });
+        status_line(ui, &self.users_status.clone());
     }
 
     /// The task organisation flattened for the relate picker: (node id,
@@ -12986,34 +13086,11 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         ));
     }
 
-    /// The only island that renders when no session is held, so it is also
-    /// the only place a session can be NAMED.
-    ///
-    /// It used to offer a bare "Start a new session" button, which called the
-    /// create verb with nothing filled and answered "name the game first" —
-    /// pointing at a form that was not on screen, because the create form lives
-    /// on the Essentials island and that island only renders once a session is
-    /// HELD. A verb that cannot succeed is worse than no verb: it looks like
-    /// the way in and it is not.
-    ///
-    /// Name only, because name is the one field `POST /games` requires, and
-    /// every other field is optional and reachable from the edit form once the
-    /// game exists. Creating here hands the game over, the zone becomes
-    /// Planning, and the rest of the plan is authored from there.
-    /// The only island that renders when no session is held, so it is also
-    /// the only place a session can be NAMED.
-    ///
-    /// It used to offer a bare "Start a new session" button, which called the
-    /// create verb with nothing filled and answered "name the game first" —
-    /// pointing at a form that was not on screen, because the create form lives
-    /// on the Essentials island and that island only renders once a session is
-    /// HELD. A verb that cannot succeed is worse than no verb: it looks like
-    /// the way in and it is not.
-    ///
-    /// Name only, because name is the one field `POST /games` requires, and
-    /// every other field is optional and reachable from the edit form once the
-    /// game exists. Creating here hands the game over, the zone becomes
-    /// Planning, and the rest of the plan is authored from there.
+    /// The only island that renders when no session is held. It picks,
+    /// joins, or OPENS the create dialog — the form itself lives in the
+    /// New-session modal (see `session_creator_body`), reachable from the
+    /// top band in every state, so this island never owns a second copy
+    /// of it.
     fn zone_start_body(&mut self, ui: &mut egui::Ui) {
         // Personnel front door first: a player with a room key holds no
         // session yet, and this island is the only surface that state
@@ -13036,22 +13113,15 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             return;
         }
         ui.separator();
-        ui.label(egui::RichText::new("name").weak().small());
-        ui.add(
-            egui::TextEdit::singleline(&mut self.setup_name)
-                .desired_width(f32::INFINITY)
-                .min_size(egui::vec2(0.0, 32.0))
-                .hint_text("the exercise's name"),
-        );
         if ui
             .add_sized(
                 egui::vec2(ui.available_width(), 32.0),
-                egui::Button::new("Create session →"),
+                egui::Button::new("＋ New session…"),
             )
-            .on_hover_text("create it and hold it; the rest of the plan is authored in Planning")
+            .on_hover_text("create it with the full form; the rest of the plan is authored in Planning")
             .clicked()
         {
-            self.setup_create_game();
+            self.open_only(WhichModal::Session);
         }
         status_line(ui, &self.users_status.clone());
     }
@@ -13620,19 +13690,28 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         };
         self.dashboard_ship = Some(active.clone());
         // The helm opens with execution, not with readiness: a commander
-        // plans first and declares after, and (in a scenario) the step
-        // start clears the declaration — a form gated on it would vanish
-        // exactly when the next step needs it.
+        // plans first and declares after. Step declarations live in
+        // their own store keyed by (step, attempt) — never in the
+        // game-level readiness flag, which the server only accepts in
+        // preparation (see `zone_mystep_body` for the other door onto
+        // the same gate).
         let armed = data.execution && !data.static_mode;
+        let step_tag = self.current_step.as_ref().and_then(|v| {
+            v.asking.as_ref().map(|a| {
+                if a.you_ready {
+                    "ready for step".to_string()
+                } else {
+                    "set helm, then ready".to_string()
+                }
+            })
+        });
         let trailing = format!(
             "{} · {}",
             data.role_name,
             if data.static_mode {
                 "static"
-            } else if data.execution && data.ready {
-                "ready for step"
             } else if data.execution {
-                "set helm, then ready"
+                step_tag.as_deref().unwrap_or("no step asking you")
             } else if data.ready {
                 "ready to start"
             } else {
@@ -13655,7 +13734,16 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         // to one of my hulls; `select` only opens the Inspector.
         let mut follow: Option<String> = None;
         let mut select: Option<String> = None;
-        let mut declare: Option<bool> = None;
+        let mut declare: Option<(i64, i64, bool)> = None;
+        // The asking step, cloned out before the columns: the rows
+        // borrow to draw and cannot declare through `self` mid-pass.
+        // `None` means no step asks this caller — the button stays off
+        // rather than firing the game-level readiness the server only
+        // accepts in preparation.
+        let asking = self.current_step.as_ref().and_then(|v| {
+            v.asking.as_ref()
+                .map(|a| (a.scenario.id, a.step.id, a.you_ready))
+        });
         tfg::chrome::island(ui.ctx(), &spec, &mut pos, &mut open, |ui| {
             ui.columns(3, |cols| {
                 // -- own ship --
@@ -13733,34 +13821,42 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 // READY FOR THE STEP, in execution only. Not the readiness a
                 // player declares to enter the session (that lives in the
                 // Readiness island, in preparation): this one says "my
-                // helm for this step is set". The server keeps ONE flag per
-                // participant and the step gate counts it, so it is the
-                // same declaration — the client clears it when each step
-                // starts (see `step_started`), which is what makes it a
-                // per-step statement. Before execution the control would
-                // be indistinguishable from the session one, so it is not
-                // offered here at all.
+                // helm for this step is set". It declares on the asking
+                // step's own route
+                // (`PUT .../steps/{step}/readiness`) — never on the
+                // game-level readiness the server only accepts in
+                // preparation. No step asking means no button.
                 if data.execution {
-                    cols[2].horizontal(|row| {
-                        if data.ready {
-                            row.label(
-                                egui::RichText::new("✓ ready for this step")
-                                    .small()
-                                    .color(egui::Color32::from_rgb(0x4A, 0xDE, 0x80)),
-                            );
-                            if row.small_button("not ready").clicked() {
-                                declare = Some(false);
-                            }
-                        } else if row
-                            .button("Ready for step")
-                            .on_hover_text(
-                                "after planning your helm — the Game Master plays the step once everyone is ready",
-                            )
-                            .clicked()
-                        {
-                            declare = Some(true);
+                    match asking {
+                        Some((sid, step, true)) => {
+                            cols[2].horizontal(|row| {
+                                row.label(
+                                    egui::RichText::new("✓ ready for this step")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(0x4A, 0xDE, 0x80)),
+                                );
+                                if row.small_button("not ready").clicked() {
+                                    declare = Some((sid, step, false));
+                                }
+                            });
                         }
-                    });
+                        Some((sid, step, false)) => {
+                            cols[2].horizontal(|row| {
+                                if row
+                                    .button("Ready for step")
+                                    .on_hover_text(
+                                        "after planning your helm — the Game Master plays the step once everyone is ready",
+                                    )
+                                    .clicked()
+                                {
+                                    declare = Some((sid, step, true));
+                                }
+                            });
+                        }
+                        None => {
+                            cols[2].weak("no step is asking you — declare in My step when one does");
+                        }
+                    }
                 } else {
                     cols[2].weak("session readiness is declared in the Readiness island");
                 }
@@ -13807,8 +13903,8 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         if let Some(id) = select {
             self.select_ship(id);
         }
-        if let Some(ready) = declare {
-            self.set_own_readiness(ready);
+        if let Some((sid, step, ready)) = declare {
+            self.declare_step(sid, step, ready);
         }
     }
 
@@ -13880,10 +13976,10 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     }
 
     /// A step-started marker arrived (socket or inbox). Each marker acts
-    /// once: it releases this commander's planned orders and clears their
-    /// readiness, so the NEXT step asks them to set helm and declare
-    /// again. The server holds one flag per participant and resets it
-    /// only on a rewind, which is why the clearing is done here.
+    /// once: it releases this commander's planned orders, so the NEXT
+    /// step asks them to set helm and declare again. Step declarations
+    /// need no clearing here — they live per (step, attempt) on the
+    /// server, and a replay erases the abandoned attempt's own.
     fn step_started(&mut self, msg_id: i64) {
         if !self.step_signals_seen.insert(msg_id) {
             return;
@@ -13894,12 +13990,11 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         if !self.staged_helm.is_empty() {
             self.pending_step_release = true;
         }
-        self.pending_step_unready = true;
         self.dirty = true;
     }
 
-    /// Post released orders, then withdraw readiness — one slot, so one
-    /// per frame, and never dropped: a busy slot just retries next frame.
+    /// Post released orders — one slot, so one per frame, and never
+    /// dropped: a busy slot just retries next frame.
     fn drive_step_release(&mut self) {
         if !self.pending_step_release && !self.pending_step_unready {
             return;
@@ -13932,10 +14027,10 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             self.dirty = true;
             return;
         }
+        // Drained: step declarations are per (step, attempt) server-side,
+        // so there is nothing to withdraw when a step starts. The flag
+        // stays only for sessions that staged one before this fix.
         self.pending_step_unready = false;
-        if self.own_roster_row().is_some_and(|p| p.ready) {
-            self.set_own_readiness(false);
-        }
     }
 
     /// Tell every commander's client a step started. Scenario games
@@ -19409,6 +19504,9 @@ impl eframe::App for ShipApp {
         if self.fleet_picker_open {
             self.fleet_picker_modal(ui);
         }
+        if self.session_creator_open {
+            self.session_creator_modal(ui);
+        }
         if self.player_picker_open {
             self.player_picker_modal(ui);
         }
@@ -21809,6 +21907,7 @@ fn main() -> Result<(), String> {
                 users_roster: Vec::new(),
                 fleet_picker_open: false,
                 player_picker_open: false,
+                session_creator_open: false,
                 held_detail: None,
                 readiness: None,
                 readiness_gap: ReadinessGap::default(),
