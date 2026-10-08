@@ -167,6 +167,10 @@ A full-width unrounded band in Console Night, one row, holding the things an
 operator needs without hunting: connection state, how many are online, the
 clock block, and logout at the right.
 
+Groups are split by separators, not gaps. Actions are all small buttons at
+one height; secondary readouts (headcount, zoom) are small weak mono, so the
+link state and the clock stay the two things the band reads at a glance.
+
 It is the frame, not a card, so it takes no corner radius. It floats over the
 map like everything else; it never pushes the map down.
 

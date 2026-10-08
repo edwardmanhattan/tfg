@@ -10672,8 +10672,17 @@ impl ShipApp {
                 let avail = vp.width();
                 ui.horizontal(|ui| {
                     self.link_ui(ui);
-                    ui.add_space(tfg::tokens::INDENT);
-                    self.headcount_ui(ui);
+                    // Separators, not gaps, between groups: the band is one
+                    // row of mixed readouts and actions, and without edges
+                    // the groups run together. The headcount only exists in
+                    // a session, so its separator is gated with it rather
+                    // than left dangling.
+                    if self.users_game.is_some() {
+                        ui.separator();
+                        self.headcount_ui(ui);
+                    }
+                    ui.separator();
+                    self.map_controls(ui);
                     // "What now", in weak ink. The zone shows what IS; this
                     // is the one thing it cannot, and an operator who has
                     // lost their place is the operator this is for.
@@ -10692,24 +10701,31 @@ impl ShipApp {
                     // whole band needs about 900 points.
                     const HINT_BUDGET: f32 = 900.0;
                     if avail > HINT_BUDGET {
-                        ui.add_space(tfg::tokens::INDENT);
+                        ui.separator();
                         ui.label(
                             egui::RichText::new(self.next_action_hint())
                                 .weak()
                                 .small(),
                         );
                     }
-                    ui.add_space(tfg::tokens::INDENT);
-                    self.map_controls(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Sign out").clicked() {
+                        // Small actions, all one height: full-size buttons
+                        // made the band three different heights at once.
+                        if ui.small_button("Sign out").clicked() {
                             self.sign_out("signed out from the top zone");
                         }
-                        if ui.button("Settings").clicked() {
+                        ui.separator();
+                        if ui.small_button("Settings").clicked() {
                             self.open_only(WhichModal::Settings);
                         }
+                        ui.separator();
                         self.clock_ui(ui);
-                        self.mail_ui(ui);
+                        // The comms door only exists in a session, same rule
+                        // as the headcount: no dangling separator.
+                        if self.users_game.is_some() {
+                            ui.separator();
+                            self.mail_ui(ui);
+                        }
                     });
                 });
                 // Where the band ends, published for the modal backdrop.
@@ -10749,7 +10765,7 @@ impl ShipApp {
             None => "no instructions yet — the Game Master's tasking for a step arrives here".to_string(),
         };
         hover.push_str(" · click to open the comms hub");
-        if ui.button(label).on_hover_text(hover).clicked() {
+        if ui.small_button(label).on_hover_text(hover).clicked() {
             self.show_comms = !self.show_comms;
         }
         // The instruction line is the first thing to go on a narrow
@@ -10864,7 +10880,14 @@ impl ShipApp {
             .iter()
             .filter(|p| p.joined_at.is_some())
             .count();
-        ui.monospace(format!("{in_room}/{seated} in room"));
+        // Secondary readout: small weak mono, so the link state and the
+        // clock stay the two things the band reads at a glance.
+        ui.label(
+            egui::RichText::new(format!("{in_room}/{seated} in room"))
+                .monospace()
+                .small()
+                .weak(),
+        );
     }
 
     /// Zoom, and nothing else.
@@ -10879,8 +10902,13 @@ impl ShipApp {
         if ui.small_button("\u{2212}").on_hover_text("zoom out").clicked() {
             self.zoom_by(-1.0);
         }
-        ui.monospace(format!("z{:.0}", self.zoom))
-            .on_hover_text("zoom level");
+        ui.label(
+            egui::RichText::new(format!("z{:.0}", self.zoom))
+                .monospace()
+                .small()
+                .weak(),
+        )
+        .on_hover_text("zoom level");
         if ui.small_button("+").on_hover_text("zoom in").clicked() {
             self.zoom_by(1.0);
         }
