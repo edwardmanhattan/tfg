@@ -669,6 +669,22 @@ fn comms_default_pos(ctx: &egui::Context) -> egui::Pos2 {
     egui::pos2((vp.width() - size.x - 12.0).max(0.0), 44.0)
 }
 
+/// The hub's live size: the dragged override when set, else the default.
+/// Clamped to the window either way — a resize stretches the island, never
+/// the screen.
+fn comms_live_size(state: Option<egui::Vec2>, ctx: &egui::Context) -> egui::Vec2 {
+    let vp = ctx.viewport_rect();
+    let max = egui::vec2(
+        (vp.width() - 24.0).max(300.0),
+        (vp.height() - 72.0).max(240.0),
+    );
+    let base = state.unwrap_or_else(|| comms_size(ctx));
+    egui::vec2(
+        base.x.clamp(300.0, max.x),
+        base.y.clamp(240.0, max.y),
+    )
+}
+
 /// The commander's dashboard footprint: full width across the bottom
 /// (ship, task group, helm share it), clamped to the viewport so a small
 /// window gets a smaller station rather than one hanging off-screen.
@@ -3098,6 +3114,11 @@ struct ShipApp {
     /// inside a session, whose default position sat under the side zone.
     show_comms: bool,
     comms_pos: Option<egui::Pos2>,
+    /// The hub's dragged size, when the operator has resized it. `None`
+    /// means the default footprint; the south-east grip writes `Some`, and
+    /// the size is clamped to the window on read so a resize can never push
+    /// the hub off-screen or shrink it past usability.
+    comms_size_override: Option<egui::Vec2>,
     /// When the inbox was last read for the comms hub or the step-signal
     /// poll, so a failing read is retried on a timer and never per frame.
     comms_load_at: Option<Instant>,
@@ -17737,8 +17758,9 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     /// this draws what the channels delivered.
     fn messages_island(&mut self, ui: &mut egui::Ui) {
         // #99: inbox first (readable, actionable), socket arrivals
-        // below (as-delivered), compose last.
-        ui.heading("Inbox");
+        // below (as-delivered), compose last. Section labels, not headings:
+        // the island band already says Comms.
+        ui.strong("Inbox");
         ui.horizontal(|ui| {
             if ui.small_button("refresh").clicked() {
                 self.inbox_page_no = 1;
@@ -17847,7 +17869,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
             }
         }
         ui.separator();
-        ui.heading("Live arrivals");
+        ui.strong("Live arrivals");
         if self.game_messages.is_empty() {
             ui.weak("No socket mail yet — broadcasts and addressed pushes land here.");
         } else {
@@ -17884,7 +17906,7 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
     /// extra boxes, reply target. Sends off-thread; the inbox reloads
     /// on success.
     fn compose_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("New message");
+        ui.strong("New message");
         if self.users_game.is_none() {
             ui.weak("Hold a session first — mail belongs to the exercise.");
             return;
@@ -17988,30 +18010,46 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                 self.refresh_roles();
             }
         });
+        // One field per row, label above, full width at 32px: the old
+        // label-beside-field rows squeezed two fields and three labels into
+        // 460 points and every row came out a different height.
+        ui.label("new role:");
         ui.horizontal(|ui| {
-            ui.label("new role:");
-            ui.text_edit_singleline(&mut self.new_role_name);
-            if ui.small_button("create").clicked() {
+            ui.add_sized(
+                egui::vec2(
+                    (ui.available_width() - 78.0).max(80.0),
+                    32.0,
+                ),
+                egui::TextEdit::singleline(&mut self.new_role_name)
+                    .vertical_align(egui::Align::Center),
+            );
+            if ui
+                .add_sized(egui::vec2(70.0, 32.0), egui::Button::new("create"))
+                .clicked()
+            {
                 self.create_role();
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("callsign:");
-            ui.text_edit_singleline(&mut self.msg_callsign);
-        });
-        ui.horizontal(|ui| {
-            ui.label("note:");
-            ui.text_edit_singleline(&mut self.msg_sending_note);
-            ui.label("group:");
-            ui.text_edit_singleline(&mut self.msg_group);
-        });
-        ui.horizontal(|ui| {
-            ui.label("per:");
-            ui.text_edit_singleline(&mut self.msg_per);
-            ui.label("regnum:");
-            ui.text_edit_singleline(&mut self.msg_regnum);
-        });
-        if ui.button("send").clicked() {
+        for (label, value) in [
+            ("callsign:", &mut self.msg_callsign),
+            ("note:", &mut self.msg_sending_note),
+            ("group:", &mut self.msg_group),
+            ("per:", &mut self.msg_per),
+            ("regnum:", &mut self.msg_regnum),
+        ] {
+            ui.label(label);
+            ui.add_sized(
+                egui::vec2(ui.available_width(), 32.0),
+                egui::TextEdit::singleline(value).vertical_align(egui::Align::Center),
+            );
+        }
+        if ui
+            .add_sized(
+                egui::vec2(ui.available_width(), 32.0),
+                egui::Button::new("send"),
+            )
+            .clicked()
+        {
             self.send_composed();
         }
     }
@@ -19010,7 +19048,7 @@ impl eframe::App for ShipApp {
                 self.comms_load_at = Some(Instant::now());
                 self.refresh_inbox();
             }
-            let size = comms_size(ui.ctx());
+            let size = comms_live_size(self.comms_size_override, ui.ctx());
             let unread = self.unread_mail();
             let spec = tfg::chrome::Island::new(egui::Id::new("comms"), "Comms", size)
                 .with_trailing(&if unread > 0 {
@@ -19028,6 +19066,56 @@ impl eframe::App for ShipApp {
             });
             self.comms_pos = Some(pos);
             self.show_comms = open;
+            // Resize grip on the hub's south-east corner: a drag writes the
+            // size override the next frame reads, so the resize is live.
+            // Registered after the island, so the corner wins where the two
+            // overlap.
+            {
+                let g = 18.0;
+                egui::Area::new(egui::Id::new("comms-resize"))
+                    .fixed_pos(egui::pos2(pos.x + size.x - g, pos.y + size.y - g))
+                    .movable(false)
+                    .constrain(false)
+                    .interactable(true)
+                    .order(egui::Order::Middle)
+                    .show(ui.ctx(), |ui| {
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(g, g), egui::Sense::drag());
+                        let painter = ui.painter_at(rect);
+                        let ink = if resp.dragged() {
+                            tfg::tokens::RADAR_CYAN
+                        } else if resp.hovered() {
+                            tfg::tokens::CUT_GREY
+                        } else {
+                            tfg::tokens::CUT_GREY.linear_multiply(0.35)
+                        };
+                        for off in [5.0, 9.0, 13.0] {
+                            painter.line_segment(
+                                [
+                                    egui::pos2(rect.right() - off, rect.bottom() - 3.0),
+                                    egui::pos2(rect.right() - 3.0, rect.bottom() - off),
+                                ],
+                                egui::Stroke::new(2.0, ink),
+                            );
+                        }
+                        if resp.dragged() {
+                            let d = ui.ctx().input(|i| i.pointer.delta());
+                            let cur = self.comms_size_override.unwrap_or(size);
+                            let vp = ui.ctx().viewport_rect();
+                            let max = egui::vec2(
+                                (vp.width() - 24.0).max(300.0),
+                                (vp.height() - 72.0).max(240.0),
+                            );
+                            self.comms_size_override = Some(egui::vec2(
+                                (cur.x + d.x).clamp(300.0, max.x),
+                                (cur.y + d.y).clamp(240.0, max.y),
+                            ));
+                        }
+                        if resp.hovered() || resp.dragged() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                        }
+                    });
+            }
         }
         if let Some((ship, at)) = follow_req {
             self.request_frame(&ship, at);
@@ -20592,6 +20680,7 @@ fn main() -> Result<(), String> {
                 step_signals_primed: false,
                 show_comms: false,
                 comms_pos: None,
+                comms_size_override: None,
                 comms_load_at: None,
                 step_gate: None,
                 users_roster: Vec::new(),

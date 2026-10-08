@@ -46,6 +46,11 @@ pub const HAIRLINE_SLATE: Color32 = Color32::from_rgb(0x33, 0x41, 0x55);
 /// step above the hairline, because at hairline value the chamfer
 /// disappeared into the map and defeated the point of drawing one.
 pub const CUT_GREY: Color32 = Color32::from_rgb(0x8C, 0x9B, 0xAE);
+/// Island edge: the bright half of the cased border. Near-white so it parts
+/// from dark water and night chrome; the dark casing beside it parts from
+/// bright land. Neither alone survives both grounds — the pair is the
+/// border. Never the cyan accent.
+pub const ISLAND_EDGE: Color32 = Color32::from_rgb(0xC9, 0xD2, 0xDE);
 
 /// The only accent. Live chrome state, and the island that owns input.
 /// Its rarity is the whole reason an ON state is readable across a room,
@@ -323,5 +328,25 @@ mod tests {
     #[test]
     fn zone_fits_an_island_plus_its_pad() {
         assert!(ZONE_W > 300.0, "the fleet picker's taxonomy column is 176px and its result rows need the rest");
+    }
+
+    /// The island edge must part from BOTH grounds it can sit on: dark
+    /// water/chrome and bright land. A mid-grey edge vanishes into one of
+    /// them, which is the failure the casing exists to survive — the edge
+    /// carries the dark half, the casing the bright half.
+    #[test]
+    fn island_edge_contrasts_dark_and_bright_grounds() {
+        fn luma(c: Color32) -> f32 {
+            0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
+        }
+        let edge = luma(ISLAND_EDGE);
+        assert!(
+            (edge - luma(CONSOLE_NIGHT)).abs() > 80.0,
+            "the edge melts into the panel fill"
+        );
+        assert!(
+            (edge - luma(DEEP_WELL)).abs() > 80.0,
+            "the edge melts into dark water"
+        );
     }
 }

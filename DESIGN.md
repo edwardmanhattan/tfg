@@ -8,6 +8,7 @@ colors:
   panel-slate: "#1E293B"
   hairline-slate: "#334155"
   cut-grey: "#8C9BAE"
+  island-edge: "#C9D2DE"
   map-ink: "#E2E8F0"
   body-silver: "#8C8C8C"
   button-graphite: "#3C3C3C"
@@ -68,7 +69,8 @@ components:
     activeAlpha: 0.5
     width: "3px"
     inset: "1px"
-    outerBorder: "2px {colors.cut-grey}"
+    edge: "2px {colors.island-edge}"
+    casing: "4px {colors.deep-well}"
   band-scanline:
     pitch: "4px"
     alpha: 0.067
@@ -134,8 +136,8 @@ not perform.
 **Key Characteristics:**
 - One radar-cyan signal, and it means "live or yours". Nothing else is cyan.
 - The heat lives on the island rim and the title band, never across a body.
-- Depth is tonal (chrome → slate → well) plus a bold cut-grey border: a 2px
-  outer edge and a 3px inset rim.
+- Depth is tonal (chrome → slate → well) plus a cased contrast edge: a
+  bright edge with a dark halo, and a 3px inset rim.
 - Ubuntu Light for people, Hack for machines; two type roles, no more.
 - Circles are map objects, rectangles are controls. The chamfer means a
   surface that moves.
@@ -255,7 +257,13 @@ top-right corner, and a lit rim.
 - **Fixed footprint.** An island does not resize to fit its content. The body
   scrolls. A panel that grows under the cursor while someone is reading a map
   is worse than one that scrolls, and a stable silhouette is what makes the
-  chamfer read as a shape.
+  chamfer read as a shape. The operator may still resize explicitly: the side
+  zone drags by its inner edge, Comms by its south-east corner — both write
+  an explicit size rather than tracking content.
+- **Contrast edge.** A cased border, not a single stroke: a 2px near-white
+  edge on the silhouette plus a 4px near-black casing straddling it. The edge
+  parts from dark water, the casing from bright land, so the border reads on
+  any tile. Modals carry the same casing squared.
 - **Title band.** 30px, Panel Slate, carrying one tracked monospace label in
   short caps and, right-aligned, a count or a status. This is the band's
   whole job. It is also where the only permitted texture lives.
@@ -275,9 +283,10 @@ reading "cyan" learned nothing, because cyan was everywhere.
 So the rim has two states, and this is the rule extension ADR-0014
 anticipated and left as a one-line change:
 
-- **At rest**, the rim is Cut Grey at full opacity plus a 2px cut-grey outer
-  border, so stacked islands hold a clear edge over a bright tile map. It
-  separates the panel from the moving map and says nothing else.
+- **At rest**, the rim is Cut Grey at full opacity and the silhouette carries
+  the cased contrast edge (bright edge, dark halo), so stacked islands hold
+  a clear edge on any tile. It separates the panel from the moving map and
+  says nothing else.
 - **Owning input**, the rim is Radar Cyan at 50%. Exactly one island is in
   this state at a time, and it is the one under the pointer.
 
@@ -537,7 +546,7 @@ duration stays at the low end for that reason.
 ### Do:
 - Route every state-bearing message through the status ink function.
 - Keep Radar Cyan to live state and the focused surface.
-- Separate panels with a bold cut-grey border and step a tone for depth.
+- Separate panels with a cased contrast edge and step a tone for depth.
 - Light a rim only on the island that owns input.
 - Keep texture and hardware detail on a title band, never across a body.
 - Put machine output in Hack and give every island a fixed footprint.

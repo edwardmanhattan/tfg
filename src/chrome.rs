@@ -155,10 +155,29 @@ pub fn paint_island(painter: &Painter, rect: Rect, owns_input: bool) {
         tokens::ISLAND_CAST,
         Stroke::NONE,
     ));
+    // Cased contrast edge: a dark casing straddling the silhouette, then a
+    // bright edge centred on it. One of the pair always parts from the
+    // ground — the casing from bright land, the edge from dark water — so
+    // the border reads on any tile. The bright line covers the casing's
+    // inner half, leaving a dark halo outside and the edge itself.
+    painter.add(Shape::closed_line(
+        pts.iter()
+            .copied()
+            .chain(std::iter::once(pts[0]))
+            .collect(),
+        Stroke::new(4.0, tokens::DEEP_WELL),
+    ));
     painter.add(Shape::convex_polygon(
         pts.clone(),
         tokens::CONSOLE_NIGHT,
-        Stroke::new(2.0, tokens::CUT_GREY),
+        Stroke::NONE,
+    ));
+    painter.add(Shape::closed_line(
+        pts.iter()
+            .copied()
+            .chain(std::iter::once(pts[0]))
+            .collect(),
+        Stroke::new(2.0, tokens::ISLAND_EDGE),
     ));
 
     // Title band, clipped to the panel so it never crosses the diagonal.
@@ -172,7 +191,7 @@ pub fn paint_island(painter: &Painter, rect: Rect, owns_input: bool) {
             pos2(band.left(), band.bottom()),
             pos2(band.right(), band.bottom()),
         ],
-        Stroke::new(1.0, tokens::CUT_GREY.linear_multiply(0.6)),
+        Stroke::new(1.0, tokens::CUT_GREY),
     );
 
     // The rim: the polygon's own outline, offset inward. Insetting rather
@@ -201,7 +220,7 @@ pub fn paint_island(painter: &Painter, rect: Rect, owns_input: bool) {
     );
 }
 
-/// The 2px band inset from `pts`, in the rim colour for the input state.
+/// The 3px band inset from `pts`, in the rim colour for the input state.
 fn paint_rim(painter: &Painter, pts: &[Pos2], owns_input: bool) {
     let centroid = (pts
         .iter()
@@ -1099,7 +1118,9 @@ pub fn modal(
             let painter = ui.painter_at(panel);
 
             // Square, not chamfered. The chamfer means "this whole surface
-            // moves" (ADR-0014), and a modal does not move.
+            // moves" (ADR-0014), and a modal does not move. Same cased edge
+            // as islands, squared: a dark halo outside, the bright edge on
+            // the frame, so the panel parts from any tile.
             painter.rect_filled(
                 panel,
                 CornerRadius::ZERO,
@@ -1108,8 +1129,14 @@ pub fn modal(
             painter.rect_stroke(
                 panel,
                 CornerRadius::ZERO,
-                Stroke::new(1.0, tokens::HAIRLINE_SLATE),
-                StrokeKind::Inside,
+                Stroke::new(4.0, tokens::DEEP_WELL),
+                StrokeKind::Outside,
+            );
+            painter.rect_stroke(
+                panel,
+                CornerRadius::ZERO,
+                Stroke::new(2.0, tokens::ISLAND_EDGE),
+                StrokeKind::Outside,
             );
 
             let title_row = Rect::from_min_max(
@@ -1122,7 +1149,7 @@ pub fn modal(
                     pos2(title_row.left(), title_row.bottom()),
                     pos2(title_row.right(), title_row.bottom()),
                 ],
-                Stroke::new(1.0, tokens::HAIRLINE_SLATE),
+                Stroke::new(1.0, tokens::CUT_GREY),
             );
             tracked_caps(
                 ctx,
