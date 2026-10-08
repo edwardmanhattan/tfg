@@ -12391,8 +12391,15 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
         // Resize grip on the zone's inner edge: a 10px draggable strip over
         // the full band height. Dragging writes `side_zone_w`, which the next
         // frame's origins, band and camera offset all read — so the resize is
-        // live and nothing disagrees about the width mid-drag. Registered
-        // after the islands, so the edge wins where the strip overlaps them.
+        // live and nothing disagrees about the width mid-drag.
+        //
+        // A separate Area is a separate layer, and egui moves an Area's layer
+        // above everything in its order on ANY press inside it — so the first
+        // drag on an island buries a plain grip Area for good. The explicit
+        // move_to_top below runs after every island, every frame, so the grip
+        // deterministically ends the frame on top. (The comms grip instead
+        // pins itself as its island's sublayer; the zone spans many islands
+        // and has no single parent to hang under.)
         let grip_w = tfg::tokens::ZONE_GRIP_W;
         let grip_x = match dock {
             tfg::chrome::Dock::Left => band.left() + band.width() - grip_w * 0.5,
@@ -12438,6 +12445,14 @@ if let Some(Selection::Ship(id)) = self.selection.clone() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
             });
+        // After every island and the grip itself: the grip layer ends each
+        // frame on top, so a press on the edge always reaches it no matter
+        // which island was touched last. Stays in Middle, so modals still
+        // cover it.
+        ui.ctx().move_to_top(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("zone-resize"),
+        ));
     }
 
     /// Whether the side zone already carries the surface the free-floating
@@ -19068,10 +19083,18 @@ impl eframe::App for ShipApp {
             self.show_comms = open;
             // Resize grip on the hub's south-east corner: a drag writes the
             // size override the next frame reads, so the resize is live.
-            // Registered after the island, so the corner wins where the two
-            // overlap.
+            //
+            // A separate Area is a separate layer, and egui moves an Area's
+            // layer above everything in its order on ANY press inside it —
+            // so the first title-drag on the hub buries a plain grip Area
+            // for good and the corner scrolls instead of resizing. Pinning
+            // the grip as the hub's sublayer keeps it directly above its own
+            // island no matter how the island layers churn, and never above
+            // modals.
             {
                 let g = 18.0;
+                let grip_layer =
+                    egui::LayerId::new(egui::Order::Middle, egui::Id::new("comms-resize"));
                 egui::Area::new(egui::Id::new("comms-resize"))
                     .fixed_pos(egui::pos2(pos.x + size.x - g, pos.y + size.y - g))
                     .movable(false)
@@ -19115,6 +19138,10 @@ impl eframe::App for ShipApp {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
                         }
                     });
+                ui.ctx().set_sublayer(
+                    egui::LayerId::new(egui::Order::Middle, egui::Id::new("comms")),
+                    grip_layer,
+                );
             }
         }
         if let Some((ship, at)) = follow_req {
