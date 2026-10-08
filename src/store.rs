@@ -506,6 +506,42 @@ pub fn tax_branches_in_asset_group(
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
+/// Categories in an asset group, with server type counts. `None`
+/// is the whole register. A category with no group folds into
+/// Other, the same fold the counts use — so the Other tab lists
+/// exactly the categories it counts. This is the picker's first
+/// Miller column: Asset Group > Category > Type > Class > Hull,
+/// read straight off `unit_categories.id_asset_group`, never
+/// through the operator-authored branch mapping.
+pub fn tax_categories_in_asset_group(
+    conn: &Connection,
+    asset_group_id: Option<i64>,
+) -> Result<Vec<TaxRow>, String> {
+    let Some(group) = asset_group_id else {
+        return tax_rows(
+            conn,
+            "SELECT id, name, id_name, type_count FROM unit_categories ORDER BY name",
+            None,
+        );
+    };
+    let other = asset_group_other_id(conn);
+    let fold_nulls = Some(group) == other;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, id_name, type_count FROM unit_categories
+              WHERE id_asset_group = ?1 OR (?2 = 1 AND id_asset_group IS NULL)
+              ORDER BY name",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![group, if fold_nulls { 1 } else { 0 }],
+            tax_row,
+        )
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
 /// One branch's declared categories, with server type counts.
 /// Unfiltered: every category the branch owns, whatever its group.
 pub fn tax_categories(conn: &Connection, branch_id: i64) -> Result<Vec<TaxRow>, String> {
@@ -1962,6 +1998,35 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].trail(), "Navy / Frigate / FFG");
         assert!(tax_search(&conn, "nope").expect("miss").is_empty());
+    }
+
+    #[test]
+    fn drill_readers_walk_group_to_hull_without_branch_mapping() {
+        // Asset Group > Category > Type > Class > Hull reads straight
+        // off `id_asset_group`: no branch mapping involved, so a hull
+        // whose branch owns nothing still drills down.
+        let conn = open(&std::path::PathBuf::from(":memory:")).expect("open");
+        conn.execute(
+            "INSERT INTO helpers (table_name, id, name, id_name) VALUES
+              ('asset_groups', 2, 'Sea', 'Aset Laut'),
+              ('asset_groups', 4, 'Other', 'Aset Lainnya')",
+            [],
+        )
+        .expect("groups");
+        conn.execute(
+            "INSERT INTO unit_categories (id, name, id_name, type_count, id_asset_group)
+              VALUES (2, 'Frigate', 'Frigat', 1, 2), (9, 'Unmapped', 'X', 0, NULL)",
+            [],
+        )
+        .expect("categories");
+        let sea = tax_categories_in_asset_group(&conn, Some(2)).expect("sea");
+        assert_eq!(sea.len(), 1);
+        assert_eq!(sea[0].id, 2);
+        let all = tax_categories_in_asset_group(&conn, None).expect("all");
+        assert_eq!(all.len(), 2);
+        let other = tax_categories_in_asset_group(&conn, Some(4)).expect("other");
+        assert_eq!(other.len(), 1, "null-group folds into Other");
+        assert_eq!(other[0].id, 9);
     }
 
     #[test]

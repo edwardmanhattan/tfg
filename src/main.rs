@@ -3023,15 +3023,14 @@ struct ShipApp {
     /// from the synced store; each assign seats the picked commander.
     setup_reg_search: String,
     fleet_query: String,
-    /// Top rung of the fleet drill (Domain > Kategori > Tipe > Kelas >
-    /// Aset): the asset group the drill is filtered by. `None` is the
+    /// Top rung of the fleet drill (Asset Group > Category > Type >
+    /// Class > Hull): the asset group the drill is filtered by. `None` is the
     /// whole register. Stored on the category server-side
     /// (`/unit-categories.id_asset_group`), backfilled onto local hulls
     /// at sync — the drill stays on the local store (offline-first),
     /// and the backend's `/units` filters already cover the same drill
     /// should the picker ever move onto live queries.
     drill_asset_group: Option<i64>,
-    drill_branch: Option<i64>,
     drill_category: Option<i64>,
     drill_type: Option<i64>,
     drill_class: Option<i64>,
@@ -9845,7 +9844,7 @@ impl ShipApp {
         }
     }
 
-    /// Fleet picker for the setup step. The operator keeps the five
+    /// Fleet picker for the setup step. The operator keeps the four
     /// Miller columns visible; the result row is the only place a unit
     /// is selected or dragged.
     fn unit_picker_ui(&mut self, ui: &mut egui::Ui) -> Vec<(i64, String)> {
@@ -9859,7 +9858,6 @@ impl ShipApp {
             if ui.small_button("clear").clicked() {
                 self.fleet_query.clear();
                 self.drill_asset_group = None;
-                self.drill_branch = None;
                 self.drill_category = None;
                 self.drill_type = None;
                 self.drill_class = None;
@@ -9967,15 +9965,13 @@ impl ShipApp {
             return out;
         }
 
-        let (branch, category, unit_type) =
-            (self.drill_branch, self.drill_category, self.drill_type);
-        // Top rung: asset-group tabs (Domain > Kategori > Tipe > Kelas >
-        // Aset reads bottom-up here — the group sits above the category).
-        // Counts are the local live-hull counts, which agree with
-        // `GET /units/asset-groups` tab-for-tab after a sync (unclassified
-        // folds into Aset Lainnya on both sides). Tabs rather than a
-        // sixth Miller column: five taxonomy columns plus the leaf
-        // already fill the panel.
+        let (category, unit_type) = (self.drill_category, self.drill_type);
+        // Top rung: asset-group tabs (Asset Group > Category > Type >
+        // Class > Hull). Counts are the local live-hull counts, which
+        // agree with `GET /units/asset-groups` tab-for-tab after a sync
+        // (unclassified folds into Aset Lainnya on both sides). Tabs
+        // rather than a fifth Miller column: three taxonomy columns plus
+        // the leaf already fill the panel.
         let asset_groups = self
             .store
             .as_ref()
@@ -9992,7 +9988,6 @@ impl ShipApp {
                     )
                     .clicked()
                 {
-                    self.drill_branch = None;
                     self.drill_category = None;
                     self.drill_type = None;
                     self.drill_class = None;
@@ -10011,7 +10006,6 @@ impl ShipApp {
                         )
                         .clicked()
                     {
-                        self.drill_branch = None;
                         self.drill_category = None;
                         self.drill_type = None;
                         self.drill_class = None;
@@ -10019,15 +10013,9 @@ impl ShipApp {
                 }
             });
         }
-        let (branches, categories, types, classes) = match self.store.as_ref() {
+        let (categories, types, classes) = match self.store.as_ref() {
             Some(conn) => (
-                tfg::store::tax_branches_in_asset_group(conn, self.drill_asset_group)
-                    .unwrap_or_default(),
-                branch
-                    .map(|id| {
-                        tfg::store::tax_categories_in(conn, id, self.drill_asset_group)
-                            .unwrap_or_default()
-                    })
+                tfg::store::tax_categories_in_asset_group(conn, self.drill_asset_group)
                     .unwrap_or_default(),
                 category
                     .map(|id| tfg::store::tax_types(conn, id).unwrap_or_default())
@@ -10036,7 +10024,7 @@ impl ShipApp {
                     .map(|id| tfg::store::tax_classes(conn, id).unwrap_or_default())
                     .unwrap_or_default(),
             ),
-            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         };
 
         let label = |row: &tfg::store::TaxRow| {
@@ -10052,7 +10040,6 @@ impl ShipApp {
         };
         let crumbs: Vec<String> = [
             crumb(&asset_groups, self.drill_asset_group),
-            crumb(&branches, self.drill_branch),
             crumb(&categories, self.drill_category),
             crumb(&types, self.drill_type),
             crumb(&classes, self.drill_class),
@@ -10063,7 +10050,6 @@ impl ShipApp {
         ui.horizontal_wrapped(|ui| {
             if ui.small_button("Fleet").clicked() {
                 self.drill_asset_group = None;
-                self.drill_branch = None;
                 self.drill_category = None;
                 self.drill_type = None;
                 self.drill_class = None;
@@ -10074,11 +10060,6 @@ impl ShipApp {
             }
         });
 
-        if self.drill_branch != branch {
-            self.drill_category = None;
-            self.drill_type = None;
-            self.drill_class = None;
-        }
         if self.drill_category != category {
             self.drill_type = None;
             self.drill_class = None;
@@ -10092,7 +10073,7 @@ impl ShipApp {
         // It used to be gathered into a `rows` vec AFTER the columns and
         // handed to `picker_tail_ui`, which drew it as a list UNDER the
         // columns. Two things were wrong with that and both are the same
-        // mistake. The drill is five levels deep and `tax_units` is documented
+        // mistake. The drill is four levels deep and `tax_units` is documented
         // as the leaf, so the one level that is actually selectable was not a
         // column — the columns narrowed to a class and stopped, with dead
         // space to the right of the fourth. And the list it went to was
@@ -10148,9 +10129,8 @@ impl ShipApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
-                    let levels: [(&str, &[tfg::store::TaxRow], bool); 4] = [
-                        ("Branch", &branches, true),
-                        ("Category", &categories, self.drill_branch.is_some()),
+                    let levels: [(&str, &[tfg::store::TaxRow], bool); 3] = [
+                        ("Category", &categories, true),
                         ("Type", &types, self.drill_category.is_some()),
                         ("Class", &classes, self.drill_type.is_some()),
                     ];
@@ -10173,16 +10153,11 @@ impl ShipApp {
                                             let text = label(option);
                                             match depth {
                                                 0 => ui.selectable_value(
-                                                    &mut self.drill_branch,
-                                                    Some(option.id),
-                                                    text,
-                                                ),
-                                                1 => ui.selectable_value(
                                                     &mut self.drill_category,
                                                     Some(option.id),
                                                     text,
                                                 ),
-                                                2 => ui.selectable_value(
+                                                1 => ui.selectable_value(
                                                     &mut self.drill_type,
                                                     Some(option.id),
                                                     text,
@@ -10199,7 +10174,7 @@ impl ShipApp {
                         });
                         ui.separator();
                     }
-                    // The leaf column: the fifth level, and the only one whose
+                    // The leaf column: the fourth level, and the only one whose
                     // rows are draggable, so it is the one that gets the width
                     // for a thumbnail, a name and a verb.
                     ui.vertical(|ui| {
@@ -21794,7 +21769,6 @@ fn main() -> Result<(), String> {
                 setup_reg_search: String::new(),
                 fleet_query: String::new(),
                 drill_asset_group: None,
-                drill_branch: None,
                 drill_category: None,
                 drill_type: None,
                 drill_class: None,
@@ -22049,35 +22023,35 @@ mod tests {
 
     // -- the Fleet picker's column set --------------------------------------
     //
-    // Two defects, one cause. The drill is five levels deep and `tax_units` is
-    // the leaf, but only four levels were columns: the fifth was a list drawn
+    // Two defects, one cause. The drill is four levels deep and `tax_units` is
+    // the leaf, but only three levels were columns: the fourth was a list drawn
     // UNDER the columns, in a modal body that is a fixed rect with no scroll,
     // so it was painted past the panel's bottom edge and nothing in the panel
     // could bring it on screen. The leaf was not misplaced, it was
     // unreachable, and no unit could be picked or dragged at all.
     //
     // These are arithmetic, so they are pinned without a renderer. What a
-    // screenshot cannot tell you — that the five columns fit the panel's
+    // screenshot cannot tell you — that the four columns fit the panel's
     // width, and that the tail's reserve survives the strip's height — is
     // exactly what a screenshot showed as "looks fine".
 
-    /// The five columns fit the panel, with the leaf wider than the rest.
+    /// The four columns fit the panel, with the leaf wider than the rest.
     ///
     /// The leaf is wider because its rows carry a thumbnail, a name and a verb
     /// rather than a name alone. The failure this pins is silent and severe:
-    /// the columns are in a horizontal scroll area, so five that do not fit do
+    /// the columns are in a horizontal scroll area, so four that do not fit do
     /// not clip, they push the leaf off the right of the panel behind a
     /// scrollbar nobody is going to find for a list they can see is cut off.
     #[test]
     fn drill_columns_fit_the_picker_width() {
         let body = FLEET_PICKER_SIZE.x - 2.0 * tfg::tokens::PAD;
-        let columns = 4.0 * MILLER_COL_WIDTH + MILLER_LEAF_WIDTH;
-        // Four separators between five columns, plus the frame each column
+        let columns = 3.0 * MILLER_COL_WIDTH + MILLER_LEAF_WIDTH;
+        // Three separators between four columns, plus the frame each column
         // reserves against its own scrollbar.
-        let chrome = 4.0 * (tfg::tokens::ITEM_SPACING.x + 18.0);
+        let chrome = 3.0 * (tfg::tokens::ITEM_SPACING.x + 18.0);
         assert!(
             columns + chrome <= body,
-            "five columns need {:.0}pt of a {:.0}pt body",
+            "four columns need {:.0}pt of a {:.0}pt body",
             columns + chrome,
             body
         );
