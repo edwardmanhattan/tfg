@@ -13,6 +13,8 @@
 //! - [`force`]: the operator's force before Minos hears of it, and the diff a stage advance writes.
 //! - [`backend`]: v0 poll contract: `PollSource`, file replay, HTTP stub.
 //! - [`symbology`]: APP-6C symbol model + generated icon geometry. Leaf: depends on nothing.
+//! - [`shell_threads`]: poll/map spawns shared by both shells. Toolkit-free;
+//!   the map spawn follows in U6 when the frame handoff drops egui.
 //!
 //! Module list is alphabetical after `assets`.
 
@@ -38,6 +40,7 @@ pub mod overlay;
 pub mod paths;
 pub mod roster;
 pub mod sfx;
+pub mod shell_threads;
 pub mod sim;
 pub mod store;
 pub mod symbology;

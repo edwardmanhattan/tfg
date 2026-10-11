@@ -13,9 +13,12 @@ Default five canonical labels, strings equal to role names. See `docs/agents/tri
 Do not compile just to check that a change parses. The user compiles the code
 themselves on their own time. Make the change and report it.
 
-Two exceptions, both of which have been used repeatedly and neither of which is
-optional:
+Exceptions:
 
+- **GPUI migration in progress.** While the migration runs, the agent may
+  compile and test to verify its own slices (`cargo test --lib`,
+  `cargo check`, proto-crate builds). A UI surface still needs a driven
+  binary and a capture before it is reported as working.
 - **Fixing a UI defect.** A defect in this console is invisible to the compiler
   and to the test suite. Drive the real binary and look at it. See
   `docs/ui-verify-handoff.md`, and `bash scripts/ui-shoot/env-up.sh` for the

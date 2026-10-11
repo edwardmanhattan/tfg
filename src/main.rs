@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use chrono::{Datelike, TimeZone, Utc};
-use tfg::backend::{BackendError, FileReplay, GameFix, GameMsg, GamePositionUpdate, LiveCmd, LiveEvent, LiveWire, MinosAuth, MinosMaster, MinosRest, MockPoll, PollSource, TokenPair};
+use tfg::backend::{FileReplay, GameFix, GameMsg, GamePositionUpdate, LiveCmd, LiveEvent, MinosAuth, MinosMaster, TokenPair};
 use tfg::catalog::Catalog;
 use tfg::fleet::Fleet;
 use tfg::gamestate::GameState;
@@ -41,9 +41,9 @@ use tfg::map_render::{
     zone_width_px, zoom_for_group_frame, zoom_for_ground_resolution,
 };
 use tfg::land::Land;
+use tfg::shell_threads::{PollThreadConfig, WireKind, spawn_poll_thread};
 use tfg::sim::{
-    CommandRefusal, MergeSource, OrderRefusal, OrderState, OrderView, SimCommand, SimEvent,
-    SimSource,
+    CommandRefusal, OrderRefusal, OrderState, OrderView, SimCommand, SimEvent,
 };
 
 const MAP_W: f64 = 800.0;
@@ -344,64 +344,6 @@ enum Onboard {
 /// Eksekusi is `Phase::Live`, Evaluasi is `Phase::Closed`. Derived
 /// from `UiMode` every frame, never stored, so the existing state
 /// machine (#26) stays the single writer of the phase.
-/// Runtime wire backends for the poll thread (task #39). Replay stays
-/// boot-only (env).
-enum WireKind {
-    /// Explicit mock source (M10): examples/mock_backend.rs over
-    /// TFG_BACKEND_URL. Never a Minos route — Minos is Live below.
-    Mock(String),
-    /// A built-in scenario embedded in the executable. The value is the
-    /// scenario stem accepted by [`tfg::assets::scenario_json`].
-    EmbeddedReplay(String),
-    Live {
-        ws_url: String,
-        rest_base: String,
-        token: String,
-        cmd_tx: Sender<LiveCmd>,
-        cmd_rx: Receiver<LiveCmd>,
-        event_tx: Sender<LiveEvent>,
-        wake_tx: Sender<()>,
-    },
-    Empty,
-}
-
-/// Wire source that yields nothing: a disconnected presentation, or a
-/// simulation running on sim data alone.
-struct EmptyWire;
-
-impl PollSource for EmptyWire {
-    fn poll(&mut self) -> Result<Vec<Fix>, BackendError> {
-        Ok(Vec::new())
-    }
-}
-
-/// Build a wire source plus its status description. Live failures fall
-/// back to an empty wire with the reason (feed-down reads as stale).
-fn build_wire(kind: WireKind) -> Result<(Box<dyn PollSource>, String), String> {
-    match kind {
-        WireKind::Mock(url) => MockPoll::new(&url)
-            .map(|h| (Box::new(h) as Box<dyn PollSource>, format!("mock {url}")))
-            .map_err(|e| e),
-        WireKind::EmbeddedReplay(name) => {
-            let json = tfg::assets::scenario_json(&name)
-                .ok_or_else(|| format!("unknown built-in scenario {name}"))?;
-            FileReplay::from_json(json)
-                .map(|r| (Box::new(r) as Box<dyn PollSource>, format!("replay {name} (embedded)")))
-                .map_err(|e| format!("embedded scenario {name}: {e}"))
-        }
-        WireKind::Live { ws_url, rest_base, token, cmd_tx, cmd_rx, event_tx, wake_tx } => {
-            let rest = MinosRest::new(&rest_base).map_err(|e| e)?;
-            match LiveWire::connect(&ws_url, &rest, &token, cmd_tx, cmd_rx, event_tx, wake_tx) {
-                Ok(w) => Ok((Box::new(w) as Box<dyn PollSource>, format!("live {ws_url}"))),
-                Err(e) => Ok((
-                    Box::new(EmptyWire) as Box<dyn PollSource>,
-                    format!("live failed ({e}); empty"),
-                )),
-            }
-        }
-        WireKind::Empty => Ok((Box::new(EmptyWire) as Box<dyn PollSource>, "empty".to_string())),
-    }
-}
 /// One parsed history journal, loaded off-thread: entries plus
 /// the units/players seen plus the replay events. The island renders
 /// this, never the disk.
@@ -21267,71 +21209,18 @@ fn main() -> Result<(), String> {
     // wakes early. Receiver lives in the poll thread below.
     let (wire_wake_tx, wire_wake_rx) = mpsc::channel::<()>();
     let ui_wire_wake_tx = wire_wake_tx;
-    let poll_handle = std::thread::spawn(move || {
-        // Boot wire (task #39, M10): TFG_BACKEND_URL points at the
-        // explicit mock (examples/mock_backend.rs) — never at Minos,
-        // which is the Live wire below. Replay data is embedded; an
-        // unknown scenario fails rather than reading a local file.
-        let boot_kind = match std::env::var("TFG_BACKEND_URL") {
-            Ok(url) => WireKind::Mock(url),
-            Err(_) => match std::env::var("TFG_SCENARIO") {
-                Ok(name) => WireKind::EmbeddedReplay(name),
-                Err(_) => WireKind::EmbeddedReplay("empty".to_string()),
-            },
-        };
-        let (wire, desc) = match build_wire(boot_kind) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("backend failed to start: {e}");
-                return;
-            }
-        };
-        eprintln!("backend: {desc}");
-        let mut source = MergeSource::new(
-            wire,
-            SimSource::new_with_journal(
-                sim_cmd_rx,
-                sim_evt_tx,
-                tfg::log::Journal::open(initial_log)
-                    .unwrap_or_else(|e| {
-                        eprintln!("session log disabled: {e}");
-                        tfg::log::Journal::disabled()
-                    }),
-            ),
-        );
-        source.set_armed_flag(poll_armed);
-        loop {
-            // Runtime wire swaps from the Connection island (task #39).
-            while let Ok(kind) = wire_ctl_rx.try_recv() {
-                match build_wire(kind) {
-                    Ok((w, desc)) => {
-                        eprintln!("backend: {desc}");
-                        source.set_wire(w);
-                    }
-                    Err(e) => eprintln!("wire swap failed: {e}"),
-                }
-            }
-            match source.poll() {
-                Ok(fixes) => {
-                    if poll_tx.send(fixes).is_err() {
-                        return; // UI gone
-                    }
-                }
-                Err(e) => eprintln!("poll failed (ships keep misses): {e}"),
-            }
-            for _ in 0..20 {
-                std::thread::sleep(Duration::from_millis(100));
-                if poll_shutdown.load(Ordering::SeqCst) {
-                    return;
-                }
-                // Live-wire fast lane: a queued socket publication cuts the
-                // 2 s sleep short, so the marker moves in ~100 ms. The sim
-                // cadence is untouched — this only skips idle sleeping.
-                if wire_wake_rx.try_iter().count() > 0 {
-                    break;
-                }
-            }
-        }
+    // Poll thread owns the backend source; the UI owns the registry. Spawn
+    // lives in `tfg::shell_threads` so both shells share it (U2); behaviour
+    // is unchanged, see the module docs.
+    let poll_handle = spawn_poll_thread(PollThreadConfig {
+        wire_ctl_rx,
+        wire_wake_rx,
+        sim_cmd_rx,
+        sim_evt_tx,
+        poll_tx,
+        shutdown: poll_shutdown,
+        armed: poll_armed,
+        initial_log,
     });
 
     // Map thread owns the persistent scene; frames come back by channel.

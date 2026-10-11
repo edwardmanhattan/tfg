@@ -1,0 +1,23 @@
+[package]
+name = "gpui-shell"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately not a workspace member. Same pattern as `proto/gpui-island`:
+# its own Cargo.lock and its own target, so the ~500-crate GPUI tree never
+# disturbs the shipped crate's build directory. U8 moves this into the
+# workspace and deletes the egui shell; until then the two shells coexist.
+#
+# U2: shell and window. One Entity, one Render, one label. Threads, theme,
+# fonts and the notify policy wire up in later slices against the seam list
+# in the module docs of `src/main.rs`.
+
+[dependencies]
+gpui = "=0.2.2"
+
+[patch.crates-io]
+xattr = { path = "../gpui-spike/patches/xattr" }
+
+[profile.dev]
+opt-level = 1
