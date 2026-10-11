@@ -149,6 +149,11 @@ the surface may not fill the tiled area (possible transparent
 `WindowBackgroundAppearance` default). U-next: set opaque background and
 re-crop tighter.
 
+**Correction 2026-10-12.** No defect: repaged histogram of the same crop
+is 985,132/1,006,080 fill (0.979) `CONSOLE_NIGHT`. The fringe was a
+misread of the downscaled preview. `Opaque` is already the GPUI default
+(verified in pinned source), and no background change is needed.
+
 **Proto-crate `[patch]` rule.** Cargo ignores `[patch.crates-io]` of a
 path dependency, so `gpui-shell` resolved upstream `tokio-centrifuge`
 (no `with_connect_data`) until the vendor patch was mirrored into
