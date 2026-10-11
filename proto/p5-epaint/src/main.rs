@@ -73,6 +73,7 @@ mod gpuprobe;
 // assumed valid, and the draw is checked for non-zero output.
 #[path = "../../../src/fx/mod.rs"]
 mod fx;
+mod glass;
 
 // The APP-6C symbology core. This is the module the harness exists for as
 // much as the panel is: it has no egui and no sqlite in it, so it compiles
@@ -100,16 +101,29 @@ const WELL: Color32 = Color32::from_rgb(0x02, 0x06, 0x17);
 const INK: Color32 = Color32::from_rgb(0xE2, 0xE8, 0xF0);
 const MUTED: Color32 = Color32::from_rgb(0x8C, 0x8C, 0x8C);
 const LINE: Color32 = Color32::from_rgb(0x33, 0x41, 0x55);
-const SIGNAL: Color32 = Color32::from_rgb(0x22, 0xD3, 0xCE);
+/// The one signal hue, single-sourced.
+///
+/// This was `#22D3CE`, which is `RADAR_CYAN` (`#22D3EE`) with the last byte
+/// mis-copied — a near-miss nobody could tell from a typo by eye. It was the
+/// third accent in one binary, and the whole point of a signal colour is that
+/// it is one thing you can learn.
+const SIGNAL: Color32 = tokens::RADAR_CYAN;
 const STALE: Color32 = Color32::from_rgb(0xF6, 0xC5, 0x6B);
 
-/// Hard offset shadow, not a blur. DESIGN.md:272 makes depth tonal plus a
-/// hairline, and a blur pass is the one item on the fill-rate list that
-/// isn't affordable on the low end.
-const SHADOW: Color32 = Color32::from_black_alpha(120);
+/// Hard offset shadow, not a blur.
+///
+/// The alpha comes from `tokens::ISLAND_CAST`, not from a hand-picked 120.
+/// `DESIGN.md`'s rationale for a hard offset (tonal depth plus a hairline)
+/// still holds; what does not hold is a local number that nobody can trace
+/// back to the rule.
+const SHADOW: Color32 = tokens::ISLAND_CAST;
 
-/// Corner radius today's theme already uses (main.rs:12306).
-const RADIUS: u8 = 8;
+/// Corner radius, from the app's own widget radius.
+///
+/// This was `8`, described in its comment as "radius today's theme already
+/// uses (main.rs:12306)". The theme's radius has a name, so it is cited by
+/// name now. Two files both claiming 8 by coincidence is how six radii happen.
+const RADIUS: u8 = tokens::CONTROL_RADIUS;
 
 /// Maximum shear (Blade) and chamfer (Notch) at full entrance. Named
 /// because the content rect has to clear them: a label placed at a fixed
@@ -1030,6 +1044,28 @@ struct Proto {
     bright: bool,
     island_pos: Pos2,
     island_open: bool,
+    /// Which of the two shadow answers the glass-b pass shows.
+    glass_b: bool,
+    glass_shadow: glass::ShadowMode,
+    /// Live widget state for the component sheet. Real widgets need real
+    /// state to be hovered, focused and clicked against.
+    glass_components: bool,
+    glass_text: String,
+    glass_segment: usize,
+    glass_toggles: [bool; 2],
+    /// One-shot: give the field focus on the next frame, so the focus ring
+    /// can be captured without a keyboard.
+    glass_focus_field: bool,
+    /// Capture the framebuffer and close. Only for unattended runs.
+    glass_shoot: bool,
+    /// Overrides the capture filename. Set by `--name`.
+    glass_name: Option<String>,
+    /// Latch, so the capture is requested exactly once rather than every
+    /// frame. Distinct from `glass_shoot`, which is the user's flag.
+    glass_capture_pending: bool,
+    /// Frames drawn since startup. The capture waits for a handful, so the
+    /// viewport's initial size has been applied by the time it is asked for.
+    frames: u64,
 }
 
 /// A stand-in for the real tile map: pale sea, white land, a grid, and a few
@@ -1103,8 +1139,97 @@ fn paint_bright_ground(ui: &mut egui::Ui, screen: egui::Rect) {
     }
 }
 
+/// Register the mock's own typefaces.
+///
+/// egui ships `Ubuntu-Light` as its proportional default and `Hack` as its
+/// monospace, so the console's labels and its data lines were rendering in
+/// two faces the mock never asked for. This is the fix, and it is two TTF
+/// files plus a family map.
+///
+/// The faces are embedded rather than loaded from the system because egui
+/// cannot reach fontconfig, and because a console that changes face when the
+/// operator's machine changes theme is not a console.
+fn install_console_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // The weights are separate entries because epaint's `FontId` is
+    // `{ size, family }` with a `TODO(emilk): weight` — a weight is a family.
+    for (name, bytes) in [
+        (glass::FONT_INTER_LIGHT, &include_bytes!("../assets/Inter-Light.ttf")[..]),
+        (
+            glass::FONT_INTER_REGULAR,
+            &include_bytes!("../assets/Inter-Regular.ttf")[..],
+        ),
+        (
+            glass::FONT_INTER_MEDIUM,
+            &include_bytes!("../assets/Inter-Medium.ttf")[..],
+        ),
+        (
+            glass::FONT_INTER_SEMIBOLD,
+            &include_bytes!("../assets/Inter-SemiBold.ttf")[..],
+        ),
+        (
+            glass::FONT_MONO_REGULAR,
+            &include_bytes!("../assets/JetBrainsMono-Regular.ttf")[..],
+        ),
+    ] {
+        fonts
+            .font_data
+            .insert(name.to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes.to_owned())));
+    }
+
+    // A `FontFamily::Name` has to be bound to at least one font, or epaint
+    // panics with `is not bound to any fonts` the first time it is asked for.
+    // The shipped app's Hack stays reachable for the arrows Ubuntu-Light
+    // cannot draw (`src/main.rs::add_symbol_fallbacks`).
+    for name in [
+        glass::FONT_INTER_LIGHT,
+        glass::FONT_INTER_REGULAR,
+        glass::FONT_INTER_MEDIUM,
+        glass::FONT_INTER_SEMIBOLD,
+        glass::FONT_MONO_REGULAR,
+    ] {
+        fonts.families.insert(
+            egui::FontFamily::Name(std::sync::Arc::from(name)),
+            vec![name.to_owned()],
+        );
+    }
+
+    // Proportional resolves to Inter at 400 first, then the shipped app's Hack
+    // for the arrows it adds. Monospace resolves to JetBrains Mono.
+    fonts.families.insert(
+        egui::FontFamily::Proportional,
+        vec![glass::FONT_INTER_REGULAR.to_owned(), "Hack".to_owned()],
+    );
+    fonts.families.insert(
+        egui::FontFamily::Monospace,
+        vec![glass::FONT_MONO_REGULAR.to_owned(), "Hack".to_owned()],
+    );
+
+    ctx.set_fonts(fonts);
+}
+
 impl eframe::App for Proto {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.frames += 1;
+        // `with_inner_size` is not reaching the viewport: every capture came
+        // out at whatever size the surface happened to start at, and the
+        // first ones raced the resize and produced four different
+        // dimensions. The size is therefore set at runtime, once, by command
+        // — which is the only path that has proven to stick.
+        if self.frames == 1 {
+            install_console_fonts(ui.ctx());
+            let (w, h) = if self.glass_components {
+                (940.0, 1000.0)
+            } else {
+                // The mock's own viewBox, so every coordinate in the console
+                // port is the mock's coordinate and a capture can be set
+                // beside the reference without resampling.
+                (1440.0, 900.0)
+            };
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+        }
         let ctx = ui.ctx().clone();
         // Pinned so logical == physical and the window lands at a known
         // pixel rect. The screentone DPI path is still live — it just
@@ -1112,6 +1237,279 @@ impl eframe::App for Proto {
         ctx.set_pixels_per_point(1.0);
         let screen = ui.max_rect();
         let ppp = ctx.pixels_per_point();
+
+        // The glass-b pass, whole. Ordered so an early `return` can never
+        // skip the capture reply, which is the bug that cost an hour here:
+        // the reply arrives as an event one frame after the request, and a
+        // branch that returns before draining it hangs forever.
+        if self.glass_b {
+            // 1. Drain the reply first, whatever else this frame does.
+            let shot = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            // 1a. `Context::set_fonts` writes the definitions into memory and
+            // `begin_pass` applies them, so the faces installed on frame 1
+            // are not reachable until frame 2. Painting text in a named
+            // family that is not bound yet panics in epaint
+            // (`FontFamily::Name(..) is not bound to any fonts`), and the
+            // console's every label is a named family because egui has no
+            // weight axis. One blank frame is the cost.
+            if self.frames < 2 {
+                return;
+            }
+            if let Some(image) = shot {
+                // `--name` overrides, so the component pass labels its own
+                // captures instead of overwriting the shadow ones.
+                let tag = self.glass_name.clone().unwrap_or_else(|| {
+                    match self.glass_shadow {
+                        glass::ShadowMode::Epaint => "shadow-epaint",
+                        glass::ShadowMode::Polygon => "shadow-polygon",
+                    }
+                    .to_owned()
+                });
+                let dir = format!("{}/../glass-mock/shots", env!("CARGO_MANIFEST_DIR"));
+                let _ = std::fs::create_dir_all(&dir);
+                let path = format!("{dir}/glass-{tag}.png");
+                let pixels: Vec<u8> = image
+                    .pixels
+                    .iter()
+                    .flat_map(|c| [c.r(), c.g(), c.b(), c.a()])
+                    .collect();
+                if let Some(img) = image::RgbaImage::from_raw(
+                    image.width() as u32,
+                    image.height() as u32,
+                    pixels,
+                ) {
+                    let _ = img.save(&path);
+                    println!("wrote {path}");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                self.glass_capture_pending = false;
+                return;
+            }
+
+            // 2. Ask, once, but only after the window has settled.
+            //
+            // This used to ask on the first frame, and the viewport's
+            // `with_inner_size` had not been applied yet — so every capture
+            // was of the initial window, which is why resizing the window to
+            // the mock's 1440x900 changed nothing about the shots. The
+            // request waits for the entrance frames to land.
+            if self.glass_shoot && !self.glass_capture_pending && self.frames > 20 {
+                self.glass_capture_pending = true;
+                let tag = self.glass_name.clone().unwrap_or_else(|| {
+                    match self.glass_shadow {
+                        glass::ShadowMode::Epaint => "shadow-epaint",
+                        glass::ShadowMode::Polygon => "shadow-polygon",
+                    }
+                    .to_owned()
+                });
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+                    tag,
+                )));
+            }
+
+            // 3. Input.
+            if !ctx.egui_wants_keyboard_input() {
+                if ctx.input(|i| i.key_pressed(egui::Key::S)) {
+                    self.glass_shadow = match self.glass_shadow {
+                        glass::ShadowMode::Epaint => glass::ShadowMode::Polygon,
+                        glass::ShadowMode::Polygon => glass::ShadowMode::Epaint,
+                    };
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::C)) {
+                    self.glass_components = !self.glass_components;
+                }
+            }
+
+            // 4. Paint. The mock's B layout, whole: graticule under the map,
+            //    the top band, the three panels with real content, the north
+            //    arrow, the scale bar, the fix callout and the hulls.
+            //
+            //    The two halves share the window because at the repo's real
+            //    type scale the specimens need the height, and two panels
+            //    plus a sheet is a thumbnail of each.
+            glass::paint_graticule(ui.painter(), screen);
+            glass::paint_map_wash(ui.painter(), screen);
+            glass::paint_top_band(ui.painter(), screen);
+            glass::paint_north(ui.painter(), pos2(screen.right() - 46.0, 108.0));
+            glass::paint_scale_bar(ui.painter(), pos2(screen.right() - 176.0, screen.bottom() - 66.0));
+            glass::paint_callout(ui.painter(), pos2(700.0, 404.0));
+            if self.glass_components {
+                let area = egui::Area::new(egui::Id::new("glass_components"))
+                    .fixed_pos(egui::pos2(40.0, 44.0))
+                    .order(egui::Order::Foreground)
+                    .show(&ctx, |ui| {
+                        // The area has to declare its height. egui sizes an
+                        // area from the previous frame's rect, and the
+                        // ScrollArea inside reads `available_height` from
+                        // that — so with no declared size the sheet started at
+                        // zero, climbed for a few frames, and settled at
+                        // whatever the cards happened to reach. Every card
+                        // below the fold was clipped with no scrollbar to
+                        // reach it, which is not a scroll.
+                        ui.set_min_size(egui::vec2(660.0, 930.0));
+                        // The ground every card steps up from, so `GROUND` is
+                        // one definition rather than a literal in two files.
+                        egui::Frame::new()
+                            .fill(glass::COMP_GROUND)
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                Color32::from_rgb(0x2E, 0x28, 0x20),
+                            ))
+                            .corner_radius(12)
+                            .inner_margin(egui::Margin::same(20))
+                            .show(ui, |ui| {
+                                ui.set_width(620.0);
+                                glass::component_sheet(
+                                    ui,
+                                    &mut self.glass_text,
+                                    &mut self.glass_segment,
+                                    &mut self.glass_toggles,
+                                    &mut self.glass_focus_field,
+                                );
+                            });
+                    });
+                let _ = area;
+                return;
+            }
+
+            let session = glass::panel_rect(24.0, 96.0, 300.0, 208.0);
+            let roster = glass::panel_rect(24.0, 316.0, 300.0, 196.0);
+            let settings = glass::panel_rect(
+                screen.right() - 384.0,
+                96.0,
+                360.0,
+                // 16px taller than the mock's 556. The mock's own Settings
+                // body overflows its panel by this much — its four cards are
+                // taller than its body — and in a browser that spills without
+                // consequence because nothing clips. Here it runs the last
+                // card's border across the panel's bottom edge, so the panel
+                // grows to hold the content the mock asks for.
+                572.0,
+            );
+            // Hulls at the mock's own positions, painted BEFORE the panels so
+            // a hull that drifts behind one is occluded by it rather than
+            // drawn over its rim. They were after, which put KRI LAMPO's ring
+            // and label on top of the Settings panel.
+            let p = ui.painter();
+            glass::paint_unit(p, pos2(640.0, 300.0), true);
+            glass::paint_unit(p, pos2(760.0, 356.0), false);
+            glass::paint_unit(p, pos2(880.0, 250.0), false);
+            glass::paint_unit(p, pos2(520.0, 410.0), false);
+            glass::paint_unit(p, pos2(1010.0, 300.0), false);
+
+            // Then the panels, and their content on top of the bevel.
+            glass::paint_instrument_panel(
+                p,
+                session,
+                "Session",
+                "Planning",
+                false,
+                self.glass_shadow,
+                &ctx,
+                self.show_hitbox,
+            );
+            glass::paint_instrument_panel(
+                p,
+                roster,
+                "Roster",
+                "12 seats",
+                false,
+                self.glass_shadow,
+                &ctx,
+                self.show_hitbox,
+            );
+            glass::paint_instrument_panel(
+                p,
+                settings,
+                "Settings",
+                "",
+                true,
+                self.glass_shadow,
+                &ctx,
+                self.show_hitbox,
+            );
+            glass::paint_session_body(p, session);
+            glass::paint_roster_body(p, roster);
+            glass::paint_settings_body(p, settings);
+            glass::paint_panel_title(p, session, "Session", Some(("Planning", false)));
+            glass::paint_panel_title(p, roster, "Roster", None);
+            glass::paint_panel_title(p, settings, "Settings", None);
+
+            if self.show_hitbox {
+                ui.painter().text(
+                    egui::pos2(60.0, screen.bottom() - 34.0),
+                    egui::Align2::LEFT_TOP,
+                    "S shadow  ·  C components  ·  H hitboxes",
+                    egui::FontId::monospace(13.0),
+                    Color32::from_rgb(0xA7, 0x9D, 0x8E),
+                );
+            }
+            return;
+
+            // The mock's B layout at the mock's own geometry, so the capture
+            // can be put beside the reference without resampling anything.
+            // The notch, the bevel, the scanline band, the lit rim, the
+            // brackets and the hulls are all judgeable at 1:1 rather than
+            // guessed at from a thumbnail.
+            let session = glass::panel_rect(24.0, 96.0, 300.0, 208.0);
+            let roster = glass::panel_rect(24.0, 316.0, 300.0, 196.0);
+            let settings = glass::panel_rect(screen.right() - 384.0, 96.0, 360.0, 556.0);
+            glass::paint_instrument_panel(
+                ui.painter(),
+                session,
+                "Session",
+                "Planning",
+                false,
+                self.glass_shadow,
+                &ctx,
+                self.show_hitbox,
+            );
+            glass::paint_instrument_panel(
+                ui.painter(),
+                roster,
+                "Roster",
+                "12 seats",
+                false,
+                self.glass_shadow,
+                &ctx,
+                self.show_hitbox,
+            );
+            glass::paint_instrument_panel(
+                ui.painter(),
+                settings,
+                "Settings",
+                "",
+                true,
+                self.glass_shadow,
+                &ctx,
+                self.show_hitbox,
+            );
+            // Hulls at the mock's own positions.
+            glass::paint_unit(ui.painter(), pos2(640.0, 300.0), true);
+            glass::paint_unit(ui.painter(), pos2(760.0, 356.0), false);
+            glass::paint_unit(ui.painter(), pos2(880.0, 250.0), false);
+            glass::paint_unit(ui.painter(), pos2(520.0, 410.0), false);
+            glass::paint_unit(ui.painter(), pos2(1010.0, 300.0), false);
+            // Lab instructions for whoever is driving the harness, gated on
+            // the same key. They are not part of the design, and shipping
+            // them by default made the direction's first screenshot read as
+            // an unfinished build.
+            if self.show_hitbox {
+                ui.painter().text(
+                    egui::pos2(60.0, screen.bottom() - 34.0),
+                    egui::Align2::LEFT_TOP,
+                    "S shadow  ·  C components  ·  H hitboxes",
+                    egui::FontId::monospace(13.0),
+                    Color32::from_rgb(0xA7, 0x9D, 0x8E),
+                );
+            }
+            return;
+        }
 
         // Behaviour contract from PICKER.md, unchanged.
         if !ctx.egui_wants_keyboard_input() {
@@ -1533,12 +1931,35 @@ fn main() -> eframe::Result {
     let zone_mode = args.iter().any(|a| a == "--zone");
     let modal_mode = args.iter().any(|a| a == "--modal");
     let zone_right = args.iter().any(|a| a == "--zone-right");
+    let glass_b = args.iter().any(|a| a == "--glass-b");
+    let glass_shoot = args.iter().any(|a| a == "--shoot");
+    let components = args.iter().any(|a| a == "--components");
+    let field_focus = args.iter().any(|a| a == "--field-focus");
+    // `--components` only means anything inside the `--glass-b` pass. It used
+    // to be read only there but resized the window regardless, so running the
+    // harness with `--components` and no `--glass-b` silently answered the
+    // wrong question while still reporting itself as having listened.
+    if components && !glass_b {
+        eprintln!(
+            "--components is only read by the --glass-b pass; ignoring it. \
+             Run: --glass-b --components"
+        );
+    }
+    let glass_name = args
+        .iter()
+        .position(|a| a == "--name")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
 
+    // No `with_inner_size` here: it never reached the viewport under a bare
+    // Xvfb, and every capture came out at whatever the surface started at.
+    // `Proto::ui` sets the size by `ViewportCommand::InnerSize` on the first
+    // frame instead, which does stick.
+    let _ = components;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 720.0])
             .with_position([40.0, 40.0])
-            .with_title("p5-epaint — 1-3 / arrows switch · R replay · H hitbox"),
+            .with_title("tfg prototype — Tern direction"),
         ..Default::default()
     };
     eframe::run_native(
@@ -1562,6 +1983,21 @@ fn main() -> eframe::Result {
             bright,
                 island_pos: pos2(340.0, 90.0),
                 island_open: true,
+                glass_b,
+                glass_shadow: if args.iter().any(|a| a == "--glass-b-shadow") {
+                    glass::ShadowMode::Polygon
+                } else {
+                    glass::ShadowMode::Epaint
+                },
+                glass_components: components,
+                glass_text: String::new(),
+                glass_segment: 1,
+                glass_toggles: [true, false],
+                glass_focus_field: field_focus,
+                glass_shoot,
+                glass_name,
+                glass_capture_pending: false,
+                frames: 0,
             }))
         }),
     )

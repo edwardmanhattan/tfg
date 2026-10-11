@@ -15,4 +15,8 @@ publish = false
 eframe = "0.36"
 egui = "0.36"
 epaint = "0.36"
+# For the glass-b self-capture only: the prototyped frame has to be looked
+# at, and bare Xvfb has no compositor, so the app writes its own PNG. Same
+# major version tfg resolves.
+image = "0.25"
 tokio = { version = "1", features = ["rt"] }

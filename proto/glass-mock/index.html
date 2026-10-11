@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tfg × Tern — three fusion directions</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ground:#100E0C;
+    --glass:#1A1714;
+    --line:#332C25;
+    --ink:#EDE6DA;
+    --ink-mid:#A79D8E;
+    --ink-low:#6B6357;
+    --signal:#5B8DEF;
+    --live:#5FD08A;
+    --steel-lo:#2B333E;
+    --steel-hi:#E6EBF2;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#080706;font-family:Inter,system-ui,sans-serif;color:var(--ink);padding:48px 56px;-webkit-font-smoothing:antialiased}
+  .board{width:1440px;height:900px;position:relative;overflow:hidden;background:var(--ground);border-radius:14px;box-shadow:0 40px 120px rgba(0,0,0,.7)}
+  .board + .board{margin-top:88px}
+  .tag{position:absolute;left:0;top:-32px;font-size:11px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-low)}
+  .tag b{color:var(--ink);font-weight:600}
+  .tag em{font-style:normal;color:var(--ink-mid);font-weight:400;letter-spacing:.02em;text-transform:none;font-size:12px}
+  .map{position:absolute;inset:0}
+  .map svg{width:100%;height:100%;display:block}
+  .label{font-size:11px;font-weight:500;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-low)}
+  .mono{font-family:"JetBrains Mono",monospace;font-size:12px;font-variant-numeric:tabular-nums}
+
+  /* Translucent fill, not a live backdrop blur. Headless Chromium
+     double-composites backdrop-filter, and egui has no blur either:
+     the real app gets frosted ground from a pre-blurred backdrop. */
+  .panel{
+    position:absolute;
+    background:rgba(26,23,20,.90);
+    border:1px solid rgba(237,230,218,.075);
+    border-radius:12px;
+    box-shadow:0 20px 48px rgba(0,0,0,.5),0 2px 6px rgba(0,0,0,.35),inset 0 1px 0 rgba(237,230,218,.05);
+  }
+  .panel-title{height:40px;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:1px solid rgba(237,230,218,.06);position:relative}
+  .panel-title .label{color:var(--ink-mid)}
+  .panel-body{padding:14px}
+  .card{background:rgba(237,230,218,.035);border:1px solid rgba(237,230,218,.05);border-radius:8px;padding:12px 14px}
+  .card + .card{margin-top:8px}
+  .card h4{font-size:12.5px;font-weight:500;margin-bottom:3px}
+  .card p{font-size:12px;line-height:17px;color:var(--ink-mid)}
+  .row{display:flex;align-items:center;gap:10px}
+  .grow{flex:1;min-width:0}
+  .seg{display:flex;background:rgba(0,0,0,.28);border-radius:6px;padding:2px;gap:2px}
+  .seg button{font:inherit;font-size:12px;line-height:1;color:var(--ink-mid);background:none;border:0;border-radius:4px;padding:6px 11px;cursor:pointer}
+  .seg button[aria-pressed="true"]{background:rgba(237,230,218,.10);color:var(--ink);box-shadow:inset 0 1px 0 rgba(237,230,218,.06)}
+  .field{height:32px;display:flex;align-items:center;gap:8px;padding:0 11px;background:rgba(0,0,0,.3);border:1px solid rgba(237,230,218,.07);border-radius:6px}
+  .field:focus-within{border-color:color-mix(in srgb,var(--signal) 55%,transparent)}
+  .field input{flex:1;background:none;border:0;outline:0;color:var(--ink);font:inherit;font-size:12.5px}
+  .field input::placeholder{color:var(--ink-low)}
+  .pill{display:inline-flex;align-items:center;gap:6px;height:20px;padding:0 9px;border-radius:5px;font-size:10.5px;font-weight:500;letter-spacing:.09em;text-transform:uppercase}
+  .pill.live{background:color-mix(in srgb,var(--live) 15%,transparent);color:var(--live)}
+  .pill.plan{background:rgba(237,230,218,.08);color:var(--ink-mid)}
+  .dot{width:6px;height:6px;border-radius:50%;flex:0 0 6px}
+  .vline{width:1px;align-self:stretch;background:rgba(237,230,218,.07)}
+  .seats{display:flex;flex-direction:column}
+  .seat{display:flex;align-items:center;gap:10px;height:34px;font-size:12.5px}
+  .seat + .seat{border-top:1px solid rgba(237,230,218,.045)}
+  .seat .where{color:var(--ink-low);font-size:11.5px}
+  .seat .state{margin-left:auto}
+  .rail{display:flex;flex-direction:column}
+  .step{display:flex;align-items:center;gap:10px;height:30px;font-size:12px;color:var(--ink-low)}
+  .step .n{width:16px;height:16px;border-radius:50%;border:1px solid currentColor;flex:0 0 16px;display:flex;align-items:center;justify-content:center;font-size:9px;font-family:"JetBrains Mono",monospace}
+  .step.done{color:var(--ink-mid)}
+  .step.now{color:var(--ink)}
+  .step.now .n{border-color:var(--signal);color:var(--signal)}
+  .top{position:absolute;left:0;right:0;top:0;height:44px;z-index:5;display:flex;align-items:center;gap:14px;padding:0 16px;background:linear-gradient(to bottom,rgba(16,14,12,.92),rgba(16,14,12,.55) 70%,transparent)}
+  .mark{display:flex;align-items:center;gap:9px}
+  .mark .name{font-size:13px;font-weight:600;letter-spacing:.02em}
+  .crumb{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--ink-mid)}
+  .crumb .sep{color:var(--ink-low)}
+
+  /* Variant B and C: the instrument frame. */
+  .v-instrument .panel, .v-full .panel{border-radius:2px 12px 12px 12px}
+  .v-instrument .panel-title, .v-full .panel-title{
+    background:repeating-linear-gradient(to bottom,rgba(0,0,0,.16) 0 1px,transparent 1px 4px),linear-gradient(to bottom,rgba(237,230,218,.05),transparent);
+  }
+  .v-instrument .panel::after, .v-full .panel::after{
+    content:"";position:absolute;top:-1px;right:-1px;width:22px;height:22px;
+    background:linear-gradient(225deg,var(--ground) 0 49%,transparent 50%);
+    border-left:1px solid rgba(237,230,218,.075);border-bottom:1px solid rgba(237,230,218,.075);
+  }
+  .v-instrument .panel::before, .v-full .panel::before{
+    content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+    box-shadow:inset 0 0 0 1px rgba(43,51,62,.85),inset 0 0 0 2px rgba(230,235,242,.16);
+  }
+  .bracket{position:absolute;width:11px;height:11px;pointer-events:none;opacity:.5;display:none}
+  .v-instrument .bracket, .v-full .bracket{display:block}
+  .bracket.tl{left:7px;top:7px;border-left:1px solid var(--steel-hi);border-top:1px solid var(--steel-hi)}
+  .bracket.tr{right:7px;top:7px;border-right:1px solid var(--steel-hi);border-top:1px solid var(--steel-hi)}
+  .bracket.bl{left:7px;bottom:7px;border-left:1px solid var(--steel-hi);border-bottom:1px solid var(--steel-hi)}
+  .bracket.br{right:7px;bottom:7px;border-right:1px solid var(--steel-hi);border-bottom:1px solid var(--steel-hi)}
+  .panel.own{
+    border-color:color-mix(in srgb,var(--signal) 42%,transparent);
+    box-shadow:0 20px 48px rgba(0,0,0,.5),0 0 0 1px color-mix(in srgb,var(--signal) 22%,transparent),0 0 22px color-mix(in srgb,var(--signal) 12%,transparent),inset 0 1px 0 rgba(237,230,218,.05);
+  }
+  .panel.own .panel-title .label{color:var(--signal)}
+  .graticule{position:absolute;inset:0;pointer-events:none;opacity:0}
+  .v-instrument .graticule,.v-full .graticule{opacity:1}
+  .v-full .card{border-radius:2px 8px 8px 8px;background:repeating-linear-gradient(to bottom,rgba(0,0,0,.10) 0 1px,transparent 1px 5px),rgba(237,230,218,.032);box-shadow:inset 0 0 0 1px rgba(43,51,62,.7)}
+  .v-full .seg{background:rgba(0,0,0,.42);border-radius:2px 6px 6px 6px;box-shadow:inset 0 0 0 1px rgba(43,51,62,.8)}
+  .v-full .seg button[aria-pressed="true"]{background:color-mix(in srgb,var(--signal) 16%,transparent);color:var(--signal)}
+  .v-full .field{border-radius:2px 6px 6px 6px}
+  .v-full .pill.live{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--live) 30%,transparent)}
+
+  .unit{position:absolute;transform:translate(-50%,-50%)}
+  .unit .nm{position:absolute;left:16px;top:-7px;white-space:nowrap;font-family:"JetBrains Mono",monospace;font-size:11px;color:#DCE4DA;opacity:.75}
+  .unit.own .nm{color:var(--signal);opacity:1}
+  .halo{position:absolute;inset:-14px;border-radius:50%;background:radial-gradient(circle,color-mix(in srgb,var(--signal) 26%,transparent),transparent 70%)}
+  .ring{position:absolute;inset:0;border-radius:50%;border:2px solid var(--ink)}
+  .own .ring{border-color:var(--signal)}
+  .north{position:absolute;right:398px;top:20px}
+  .scalebar{position:absolute;left:344px;bottom:24px}
+  .callout{position:absolute;left:352px;top:396px}
+  .switch{position:fixed;left:24px;bottom:24px;z-index:99;display:flex;gap:6px;padding:6px;border-radius:10px;background:rgba(16,14,12,.9);border:1px solid rgba(237,230,218,.09)}
+  .switch button{font:inherit;font-size:11px;font-weight:500;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-mid);background:none;border:0;border-radius:6px;padding:7px 13px;cursor:pointer}
+  .switch button[aria-pressed="true"]{background:rgba(237,230,218,.10);color:var(--ink)}
+</style>
+</head>
+<body>
+<div class="switch">
+  <button data-v="0" aria-pressed="true">A · Glass</button>
+  <button data-v="1" aria-pressed="false">B · Instrument</button>
+  <button data-v="2" aria-pressed="false">C · Full fusion</button>
+</div>
+
+<script>
+  // One map for all three boards, so the variants differ only in the frame.
+  const MAP = `
+  <svg viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice">
+    <rect width="1440" height="900" fill="#111512"/>
+    <path d="M0 620 C160 560 260 590 380 545 C470 512 540 520 610 470 C660 435 700 400 720 300 C742 190 800 120 900 96 C1010 68 1120 110 1200 210 C1290 322 1360 430 1440 500 L1440 900 L0 900 Z" fill="#20291F"/>
+    <path d="M0 620 C160 560 260 590 380 545 C470 512 540 520 610 470 C660 435 700 400 720 300" fill="none" stroke="#6E7A63" stroke-width="1.5" opacity=".5"/>
+    <path d="M120 700 C300 660 430 700 560 660 C700 618 820 660 960 630 C1120 596 1280 640 1440 610" fill="none" stroke="#7C8A70" stroke-width="1" opacity=".26"/>
+    <path d="M180 780 C360 745 500 780 660 750 C840 716 1040 760 1240 730" fill="none" stroke="#7C8A70" stroke-width="1" opacity=".17"/>
+    <g opacity=".5">
+      <ellipse cx="980" cy="250" rx="180" ry="95" fill="none" stroke="#8A9A80" stroke-width="1" opacity=".3"/>
+      <ellipse cx="980" cy="250" rx="120" ry="62" fill="none" stroke="#8A9A80" stroke-width="1" opacity=".22"/>
+      <ellipse cx="980" cy="250" rx="62" ry="32" fill="none" stroke="#8A9A80" stroke-width="1" opacity=".16"/>
+    </g>
+    <g font-family="Inter" font-size="12" fill="#D9E2D2" opacity=".6">
+      <text x="716" y="146" letter-spacing="1.6">SATUAN TUGAS BRAVO</text>
+      <text x="1092" y="474" letter-spacing="1.2" opacity=".7">LAUT JAWA</text>
+      <text x="196" y="862" letter-spacing="1.2" opacity=".45">SELAT SUNDA</text>
+    </g>
+  </svg>`;
+  document.querySelectorAll(".map").forEach((m) => { m.innerHTML = MAP; });
+</script>
+
+<!-- VARIANT A — GLASS -->
+<div class="board v-glass" data-v="0">
+  <div class="tag"><b>A — Glass</b> &nbsp;<em>Tern's register end to end. The game lives in the map only.</em></div>
+  <div class="map"></div>
+  <div class="north">
+    <svg width="26" height="40" viewBox="0 0 26 40">
+      <path d="M13 2 18 24 13 20 8 24Z" fill="none" stroke="#D9E2D2" stroke-width="1.2" opacity=".7"/>
+      <path d="M13 20v14M9 36h8" stroke="#D9E2D2" stroke-width="1" opacity=".45"/>
+      <text x="13" y="12" text-anchor="middle" font-family="JetBrains Mono" font-size="9" fill="#D9E2D2" opacity=".75">N</text>
+    </svg>
+  </div>
+  <div class="scalebar">
+    <div class="bar" style="height:5px;width:132px;border:1px solid rgba(217,226,210,.45);border-top:0;background:linear-gradient(to right,rgba(217,226,210,.55) 0 33.3%,transparent 33.3% 66.6%,rgba(217,226,210,.55) 66.6%)"></div>
+    <div class="cap" style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:rgba(217,226,210,.55);letter-spacing:.06em">0 ——— 10 NM</div>
+  </div>
+  <div class="callout">
+    <svg width="300" height="60" viewBox="0 0 300 60" style="overflow:visible">
+      <path d="M8 30 H150" stroke="#E2685F" stroke-width="1" stroke-dasharray="4 5" opacity=".65"/>
+      <text x="0" y="18" font-family="JetBrains Mono" font-size="11" fill="#E2685F" opacity=".85">KRI RIGEL · 08°12’S 114°26’E</text>
+      <text x="0" y="46" font-family="JetBrains Mono" font-size="10.5" fill="#E2685F" opacity=".5">GAME 14:22:07 · FIX 2s AGO</text>
+    </svg>
+  </div>
+  <div class="unit own" style="left:640px;top:300px">
+    <div class="halo"></div><div class="ring" style="width:22px;height:22px"></div>
+    <span class="nm">KRI RIGEL</span>
+  </div>
+  <div class="unit" style="left:760px;top:356px"><div class="ring" style="width:14px;height:14px;border-color:#9A9488"></div><span class="nm">KRI LAMPO</span></div>
+  <div class="unit" style="left:880px;top:250px"><div class="ring" style="width:14px;height:14px;border-color:#9A9488"></div><span class="nm">KRI SINGA</span></div>
+  <div class="unit" style="left:520px;top:410px"><div class="ring" style="width:14px;height:14px;border-color:#9A9488"></div><span class="nm">KRI KAKAP</span></div>
+  <div class="unit" style="left:1010px;top:300px"><div class="ring" style="width:14px;height:14px;border-color:#9A9488"></div><span class="nm">KRI SURYA</span></div>
+
+  <div class="top">
+    <div class="mark">
+      <svg width="20" height="20" viewBox="0 0 20 20"><path d="M10 1 19 10 10 19 1 10Z" fill="none" stroke="#5B8DEF" stroke-width="1.5"/><circle cx="10" cy="10" r="2.6" fill="#5B8DEF"/></svg>
+      <div class="name">tfg</div>
+    </div>
+    <div class="vline" style="height:18px"></div>
+    <div class="crumb"><span>Operasi Gabungan</span><span class="sep">/</span><span>Satuan Tugas Bravo</span><span class="sep">/</span><span style="color:var(--ink)">KRI Rigel</span></div>
+    <div class="grow"></div>
+    <span class="pill live"><span class="dot" style="background:var(--live)"></span>Wire</span>
+    <span class="mono" style="color:var(--ink-mid)">GAME 14:22:07</span>
+    <div class="vline" style="height:18px"></div>
+    <span class="label" style="color:var(--ink-mid)">Helm · Lt. Kdr. Arif</span>
+  </div>
+
+  <div class="panel" style="left:24px;top:96px;width:300px;height:208px">
+    <div class="panel-title"><span class="label">Session</span><div class="grow"></div><span class="pill plan">Planning</span></div>
+    <div class="panel-body">
+      <div class="rail">
+        <div class="step done"><span class="n">1</span>Setup<span class="grow"></span><span class="mono" style="font-size:11px">08:00</span></div>
+        <div class="step now"><span class="n">2</span>Live<span class="grow"></span><span class="mono" style="font-size:11px">14:22:07</span></div>
+        <div class="step"><span class="n">3</span>Closed<span class="grow"></span><span class="mono" style="font-size:11px">18:00</span></div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <div class="field grow"><span class="mono" style="color:var(--ink-low)">×</span><span class="mono">1.0</span><span class="label">ratio</span></div>
+        <div class="seg"><button aria-pressed="false">Pause</button><button aria-pressed="true">Run</button></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="left:24px;top:316px;width:300px;height:196px">
+    <div class="panel-title"><span class="label">Roster</span><div class="grow"></div><span class="label">12 seats</span></div>
+    <div class="panel-body" style="padding:6px 14px">
+      <div class="seats">
+        <div class="seat"><span class="dot" style="background:var(--live)"></span><span class="who" style="color:var(--ink)">Arif</span><span class="where">KRI Rigel</span><span class="state label">Helm</span></div>
+        <div class="seat"><span class="dot" style="background:var(--live)"></span><span class="who" style="color:var(--ink)">Budi</span><span class="where">KRI Lampo</span><span class="state label">Helm</span></div>
+        <div class="seat"><span class="dot" style="background:var(--signal)"></span><span class="who" style="color:var(--ink)">Citra</span><span class="where">Satgas Bravo</span><span class="state label">Commander</span></div>
+        <div class="seat"><span class="dot" style="background:var(--ink-low)"></span><span class="who" style="color:var(--ink)">Dewi</span><span class="where">Unsur 2</span><span class="state label">Observer</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel own" style="right:24px;top:96px;width:360px;height:556px">
+    <div class="panel-title">
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="var(--ink-mid)" stroke-width="1.3"><path d="M8 1.5 14 5v6l-6 3.5L2 11V5Z"/><circle cx="8" cy="8" r="2"/></svg>
+      <span class="label">Settings</span><div class="grow"></div>
+      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="var(--ink-low)" stroke-width="1.3"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg>
+    </div>
+    <div class="panel-body" style="padding:14px">
+      <div class="field">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="var(--ink-low)" stroke-width="1.4"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></svg>
+        <input placeholder="Search settings">
+      </div>
+      <div class="row" style="margin:14px 0 4px;justify-content:space-between">
+        <span class="label">Appearance</span><span class="label">Model</span><span class="label">Sound</span><span class="label">Layout</span><span class="label">Input</span><span class="label">Motion</span>
+      </div>
+      <div style="height:1px;background:rgba(237,230,218,.07);margin:8px 0 14px"></div>
+      <div class="card">
+        <h4>What the command bar runs</h4>
+        <p>Shell the command bar opens on Ctrl+Shift+A.</p>
+        <div class="field" style="margin-top:9px"><span class="mono" style="color:var(--signal)">omp</span><span style="width:1px;height:14px;background:var(--signal)"></span></div>
+      </div>
+      <div class="card">
+        <h4>A new agent block opens</h4>
+        <p>Replace the tab's only pane when it is idle at a prompt, and split otherwise.</p>
+        <div class="seg" style="margin-top:9px"><button aria-pressed="false">Split</button><button aria-pressed="true">Replace</button><button aria-pressed="false">New tab</button></div>
+      </div>
+      <div class="card">
+        <h4>Text size</h4>
+        <p>Base the console lays out in. Settings multiplies it.</p>
+        <div class="seg" style="margin-top:9px"><button aria-pressed="false">Default</button><button aria-pressed="true">Larger</button></div>
+      </div>
+      <div class="card">
+        <h4>New tabs start in</h4>
+        <p>Always the directory of the block they split from.</p>
+        <div class="seg" style="margin-top:9px"><button aria-pressed="true">Current</button><button aria-pressed="false">Home</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- VARIANT B — INSTRUMENT -->
+<div class="board v-instrument" data-v="1">
+  <div class="tag"><b>B — Instrument</b> &nbsp;<em>The frame is the game. Notch, scan band, bevel, brackets, one lit rim.</em></div>
+  <div class="map">
+    <div class="graticule">
+      <svg viewBox="0 0 1440 900" preserveAspectRatio="none" style="position:absolute;inset:0">
+        <g stroke="#5B8DEF" stroke-width="1" opacity=".07">
+          <path d="M120 0V900M280 0V900M440 0V900M600 0V900M760 0V900M920 0V900M1080 0V900M1240 0V900M1400 0V900"/>
+          <path d="M0 100H1440M0 220H1440M0 340H1440M0 460H1440M0 580H1440M0 700H1440M0 820H1440"/>
+        </g>
+      </svg>
+    </div>
+  </div>
+  <div class="north">
+    <svg width="26" height="40" viewBox="0 0 26 40">
+      <path d="M13 2 18 24 13 20 8 24Z" fill="none" stroke="#D9E2D2" stroke-width="1.2" opacity=".7"/>
+      <path d="M13 20v14M9 36h8" stroke="#D9E2D2" stroke-width="1" opacity=".45"/>
+      <text x="13" y="12" text-anchor="middle" font-family="JetBrains Mono" font-size="9" fill="#D9E2D2" opacity=".75">N</text>
+    </svg>
+  </div>
+  <div class="scalebar">
+    <div class="bar" style="height:5px;width:132px;border:1px solid rgba(217,226,210,.45);border-top:0;background:linear-gradient(to right,rgba(217,226,210,.55) 0 33.3%,transparent 33.3% 66.6%,rgba(217,226,210,.55) 66.6%)"></div>
+    <div class="cap" style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:rgba(217,226,210,.55);letter-spacing:.06em">0 ——— 10 NM</div>
+  </div>
+  <div class="unit own" style="left:640px;top:300px">
+    <svg width="120" height="120" viewBox="0 0 120 120" style="position:absolute;left:-49px;top:-49px;overflow:visible">
+      <circle cx="60" cy="60" r="44" fill="none" stroke="#5B8DEF" stroke-width="1" opacity=".35"/>
+      <g stroke="#5B8DEF" stroke-width="1" opacity=".55">
+        <path d="M60 12v10M60 98v10M12 60h10M98 60h10"/>
+        <path d="M27 27l7 7M93 93l-7-7M93 27l-7 7M27 93l7-7" opacity=".6"/>
+      </g>
+      <circle cx="60" cy="60" r="30" fill="none" stroke="#5B8DEF" stroke-width="1" stroke-dasharray="2 6" opacity=".4"/>
+    </svg>
+    <div class="halo"></div><div class="ring" style="width:22px;height:22px"></div>
+    <span class="nm">KRI RIGEL</span>
+  </div>
+  <div class="callout" style="left:700px;top:404px">
+    <svg width="300" height="46" viewBox="0 0 300 46" style="overflow:visible">
+      <text x="0" y="10" font-family="JetBrains Mono" font-size="11" fill="#5B8DEF" opacity=".8">08°12’S 114°26’E</text>
+      <text x="0" y="34" font-family="JetBrains Mono" font-size="10.5" fill="#A79D8E" opacity=".55">GAME 14:22:07 · FIX 2s AGO</text>
+    </svg>
+  </div>
+  <div class="unit" style="left:760px;top:356px"><div class="ring" style="width:14px;height:14px;border-color:#9A9488"></div><span class="nm">KRI LAMPO</span></div>
+  <div class="unit" style="left:880px;top:250px"><div class="ring" style="width:14px;height:14px;border-color:#9A9488"></div><span class="nm">KRI SINGA</span></div>
+  <div class="unit" style="left:520px;top:410px"><div class="ring" style="width:14px;height:14px;border-color:#9A9488"></div><span class="nm">KRI KAKAP</span></div>
+  <div class="unit" style="left:1010px;top:300px"><div class="ring" style="width:14px;height:14px;border-color:#9A9488"></div><span class="nm">KRI SURYA</span></div>
+
+  <div class="top">
+    <div class="mark">
+      <svg width="20" height="20" viewBox="0 0 20 20"><path d="M10 1 19 10 10 19 1 10Z" fill="none" stroke="#5B8DEF" stroke-width="1.5"/><circle cx="10" cy="10" r="2.6" fill="#5B8DEF"/></svg>
+      <div class="name">tfg</div>
+    </div>
+    <div class="vline" style="height:18px"></div>
+    <div class="crumb"><span>Operasi Gabungan</span><span class="sep">/</span><span>Satuan Tugas Bravo</span><span class="sep">/</span><span style="color:var(--ink)">KRI Rigel</span></div>
+    <div class="grow"></div>
+    <span class="pill live"><span class="dot" style="background:var(--live)"></span>Wire</span>
+    <span class="mono" style="color:var(--ink-mid)">GAME 14:22:07</span>
+    <div class="vline" style="height:18px"></div>
+    <span class="label" style="color:var(--ink-mid)">Helm · Lt. Kdr. Arif</span>
+  </div>
+
+  <div class="panel" style="left:24px;top:96px;width:300px;height:208px">
+    <span class="bracket tl"></span><span class="bracket tr"></span><span class="bracket bl"></span><span class="bracket br"></span>
+    <div class="panel-title"><span class="label">Session</span><div class="grow"></div><span class="pill plan">Planning</span></div>
+    <div class="panel-body">
+      <div class="rail">
+        <div class="step done"><span class="n">1</span>Setup<span class="grow"></span><span class="mono" style="font-size:11px">08:00</span></div>
+        <div class="step now"><span class="n">2</span>Live<span class="grow"></span><span class="mono" style="font-size:11px">14:22:07</span></div>
+        <div class="step"><span class="n">3</span>Closed<span class="grow"></span><span class="mono" style="font-size:11px">18:00</span></div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <div class="field grow"><span class="mono" style="color:var(--ink-low)">×</span><span class="mono">1.0</span><span class="label">ratio</span></div>
+        <div class="seg"><button aria-pressed="false">Pause</button><button aria-pressed="true">Run</button></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="left:24px;top:316px;width:300px;height:196px">
+    <span class="bracket tl"></span><span class="bracket tr"></span><span class="bracket bl"></span><span class="bracket br"></span>
+    <div class="panel-title"><span class="label">Roster</span><div class="grow"></div><span class="label">12 seats</span></div>
+    <div class="panel-body" style="padding:6px 14px">
+      <div class="seats">
+        <div class="seat"><span class="dot" style="background:var(--live)"></span><span class="who" style="color:var(--ink)">Arif</span><span class="where">KRI Rigel</span><span class="state label">Helm</span></div>
+        <div class="seat"><span class="dot" style="background:var(--live)"></span><span class="who" style="color:var(--ink)">Budi</span><span class="where">KRI Lampo</span><span class="state label">Helm</span></div>
+        <div class="seat"><span class="dot" style="background:var(--signal)"></span><span class="who" style="color:var(--ink)">Citra</span><span class="where">Satgas Bravo</span><span class="state label">Commander</span></div>
+        <div class="seat"><span class="dot" style="background:var(--ink-low)"></span><span class="who" style="color:var(--ink)">Dewi</span><span class="where">Unsur 2</span><span class="state label">Observer</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel own" style="right:24px;top:96px;width:360px;height:556px">
+    <span class="bracket tl"></span><span class="bracket tr"></span><span class="bracket bl"></span><span class="bracket br"></span>
+    <div class="panel-title">
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="var(--ink-mid)" stroke-width="1.3"><path d="M8 1.5 14 5v6l-6 3.5L2 11V5Z"/><circle cx="8" cy="8" r="2"/></svg>
+      <span class="label">Settings</span><div class="grow"></div>
+      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="var(--ink-low)" stroke-width="1.3"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg>
+    </div>
+    <div class="panel-body" style="padding:14px">
+      <div class="field">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="var(--ink-low)" stroke-width="1.4"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></svg>
+        <input placeholder="Search settings">
+      </div>
+      <div class="row" style="margin:14px 0 4px;justify-content:space-between">
+        <span class="label">Appearance</span><span class="label">Model</span><span class="label">Sound</span><span class="label">Layout</span><span class="label">Input</span><span class="label">Motion</span>
+      </div>
+      <div style="height:1px;background:rgba(237,230,218,.07);margin:8px 0 14px"></div>
+      <div class="card">
+        <h4>What the command bar runs</h4>
+        <p>Shell the command bar opens on Ctrl+Shift+A.</p>
+        <div class="field" style="margin-top:9px"><span class="mono" style="color:var(--signal)">omp</span><span style="width:1px;height:14px;background:var(--signal)"></span></div>
+      </div>
+      <div class="card">
+        <h4>A new agent block opens</h4>
+        <p>Replace the tab's only pane when it is idle at a prompt, and split otherwise.</p>
+        <div class="seg" style="margin-top:9px"><button aria-pressed="false">Split</button><button aria-pressed="true">Replace</button><button aria-pressed="false">New tab</button></div>
+      </div>
+      <div class="card">
+        <h4>Text size</h4>
+        <p>Base the console lays out in. Settings multiplies it.</p>
+        <div class="seg" style="margin-top:9px"><button aria-pressed="false">Default</button><button aria-pressed="true">Larger</button></div>
+      </div>
+      <div class="card">
+        <h4>New tabs start in</h4>
+        <p>Always the directory of the block they split from.</p>
+        <div class="seg" style="margin-top:9px"><button aria-pressed="true">Current</button><button aria-pressed="false">Home</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+
+
+
+
+<!-- VARIANT C — FULL FUSION -->
+<div class="board v-full" data-v="2">
+  <div class="tag"><b>C — Full fusion</b> &nbsp;<em>Both registers on every surface: glass, notch, scan band, controls in bevel.</em></div>
+  <div class="map">
+    <div class="graticule">
+      <svg viewBox="0 0 1440 900" preserveAspectRatio="none" style="position:absolute;inset:0">
+        <g stroke="#5B8DEF" stroke-width="1" opacity=".08">
+          <path d="M120 0V900M280 0V900M440 0V900M600 0V900M760 0V900M920 0V900M1080 0V900M1240 0V900M1400 0V900"/>
+          <path d="M0 100H1440M0 220H1440M0 340H1440M0 460H1440M0 580H1440M0 700H1440M0 820H1440"/>
+        </g>
+      </svg>
+    </div>
+  </div>
+  <div class="north">
+    <svg width="26" height="40" viewBox="0 0 26 40">
+      <path d="M13 2 18 24 13 20 8 24Z" fill="none" stroke="#D9E2D2" stroke-width="1.2" opacity=".7"/>
+      <path d="M13 20v14M9 36h8" stroke="#D9E2D2" stroke-width="1" opacity=".45"/>
+      <text x="13" y="12" text-anchor="middle" font-family="JetBrains Mono" font-size="9" fill="#D9E2D2" opacity=".75">N</text>
+    </svg>
+  </div>
+  <div class="scalebar">
+    <div class="bar" style="height:5px;width:132px;border:1px solid rgba(217,226,210,.45);border-top:0;background:linear-gradient(to right,rgba(217,226,210,.55) 0 33.3%,transparent 33.3% 66.6%,rgba(217,226,210,.55) 66.6%)"></div>
+    <div class="cap" style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:rgba(217,226,210,.55);letter-spacing:.06em">0 ——— 10 NM</div>
+  </div>
+  <div class="unit own" style="left:640px;top:300px">
+    <svg width="150" height="150" viewBox="0 0 150 150" style="position:absolute;left:-64px;top:-64px;overflow:visible">
+      <circle cx="75" cy="75" r="56" fill="none" stroke="#5B8DEF" stroke-width="1" opacity=".32"/>
+      <g stroke="#5B8DEF" stroke-width="1" opacity=".6">
+        <path d="M75 13v13M75 124v13M13 75h13M124 75h13"/>
+        <path d="M32 32l9 9M118 118l-9-9M118 32l-9 9M32 118l9-9" opacity=".55"/>
+      </g>
+      <circle cx="75" cy="75" r="40" fill="none" stroke="#5B8DEF" stroke-width="1" stroke-dasharray="2 6" opacity=".45"/>
+      <circle cx="75" cy="75" r="22" fill="none" stroke="#5B8DEF" stroke-width="1" opacity=".22"/>
+      <path d="M75 61 A14 14 0 0 1 89 75" fill="none" stroke="#5B8DEF" stroke-width="2" opacity=".85"/>
+    </svg>
+    <div class="halo"></div><div class="ring" style="width:22px;height:22px"></div>
+    <span class="nm">KRI RIGEL</span>
+  </div>
+  <div class="unit" style="left:760px;top:356px"><div class="ring" style="width:14px;height:14px;border-color:#9A9488"></div><span class="nm">KRI LAMPO</span></div>
+  <div class="unit" style="left:880px;top:250px"><div class="ring" style="width:14px;height:14px;border-color:#9A9488"></div><span class="nm">KRI SINGA</span></div>
+  <div class="unit" style="left:520px;top:410px"><div class="ring" style="width:14px;height:14px;border-color:#9A9488"></div><span class="nm">KRI KAKAP</span></div>
+  <div class="unit" style="left:1010px;top:300px"><div class="ring" style="width:14px;height:14px;border-color:#9A9488"></div><span class="nm">KRI SURYA</span></div>
+
+  <div class="top">
+    <div class="mark">
+      <svg width="20" height="20" viewBox="0 0 20 20"><path d="M10 1 19 10 10 19 1 10Z" fill="none" stroke="#5B8DEF" stroke-width="1.5"/><circle cx="10" cy="10" r="2.6" fill="#5B8DEF"/></svg>
+      <div class="name">tfg</div>
+    </div>
+    <div class="vline" style="height:18px"></div>
+    <div class="crumb"><span>Operasi Gabungan</span><span class="sep">/</span><span>Satuan Tugas Bravo</span><span class="sep">/</span><span style="color:var(--ink)">KRI Rigel</span></div>
+    <div class="grow"></div>
+    <span class="pill live"><span class="dot" style="background:var(--live)"></span>Wire</span>
+    <span class="mono" style="color:var(--ink-mid)">GAME 14:22:07</span>
+    <div class="vline" style="height:18px"></div>
+    <span class="label" style="color:var(--ink-mid)">Helm · Lt. Kdr. Arif</span>
+  </div>
+
+  <div class="panel" style="left:24px;top:96px;width:300px;height:208px">
+    <span class="bracket tl"></span><span class="bracket tr"></span><span class="bracket bl"></span><span class="bracket br"></span>
+    <div class="panel-title"><span class="label">Session</span><div class="grow"></div><span class="pill plan">Planning</span></div>
+    <div class="panel-body">
+      <div class="rail">
+        <div class="step done"><span class="n">1</span>Setup<span class="grow"></span><span class="mono" style="font-size:11px">08:00</span></div>
+        <div class="step now"><span class="n">2</span>Live<span class="grow"></span><span class="mono" style="font-size:11px">14:22:07</span></div>
+        <div class="step"><span class="n">3</span>Closed<span class="grow"></span><span class="mono" style="font-size:11px">18:00</span></div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <div class="field grow"><span class="mono" style="color:var(--ink-low)">×</span><span class="mono">1.0</span><span class="label">ratio</span></div>
+        <div class="seg"><button aria-pressed="false">Pause</button><button aria-pressed="true">Run</button></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="left:24px;top:316px;width:300px;height:196px">
+    <span class="bracket tl"></span><span class="bracket tr"></span><span class="bracket bl"></span><span class="bracket br"></span>
+    <div class="panel-title"><span class="label">Roster</span><div class="grow"></div><span class="label">12 seats</span></div>
+    <div class="panel-body" style="padding:6px 14px">
+      <div class="seats">
+        <div class="seat"><span class="dot" style="background:var(--live)"></span><span class="who" style="color:var(--ink)">Arif</span><span class="where">KRI Rigel</span><span class="state label">Helm</span></div>
+        <div class="seat"><span class="dot" style="background:var(--live)"></span><span class="who" style="color:var(--ink)">Budi</span><span class="where">KRI Lampo</span><span class="state label">Helm</span></div>
+        <div class="seat"><span class="dot" style="background:var(--signal)"></span><span class="who" style="color:var(--ink)">Citra</span><span class="where">Satgas Bravo</span><span class="state label">Commander</span></div>
+        <div class="seat"><span class="dot" style="background:var(--ink-low)"></span><span class="who" style="color:var(--ink)">Dewi</span><span class="where">Unsur 2</span><span class="state label">Observer</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel own" style="right:24px;top:96px;width:360px;height:556px">
+    <span class="bracket tl"></span><span class="bracket tr"></span><span class="bracket bl"></span><span class="bracket br"></span>
+    <div class="panel-title">
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="var(--ink-mid)" stroke-width="1.3"><path d="M8 1.5 14 5v6l-6 3.5L2 11V5Z"/><circle cx="8" cy="8" r="2"/></svg>
+      <span class="label">Settings</span><div class="grow"></div>
+      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="var(--ink-low)" stroke-width="1.3"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg>
+    </div>
+    <div class="panel-body" style="padding:14px">
+      <div class="field">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="var(--ink-low)" stroke-width="1.4"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></svg>
+        <input placeholder="Search settings">
+      </div>
+      <div class="row" style="margin:14px 0 4px;justify-content:space-between">
+        <span class="label">Appearance</span><span class="label">Model</span><span class="label">Sound</span><span class="label">Layout</span><span class="label">Input</span><span class="label">Motion</span>
+      </div>
+      <div style="height:1px;background:rgba(237,230,218,.07);margin:8px 0 14px"></div>
+      <div class="card">
+        <h4>What the command bar runs</h4>
+        <p>Shell the command bar opens on Ctrl+Shift+A.</p>
+        <div class="field" style="margin-top:9px"><span class="mono" style="color:var(--signal)">omp</span><span style="width:1px;height:14px;background:var(--signal)"></span></div>
+      </div>
+      <div class="card">
+        <h4>A new agent block opens</h4>
+        <p>Replace the tab's only pane when it is idle at a prompt, and split otherwise.</p>
+        <div class="seg" style="margin-top:9px"><button aria-pressed="false">Split</button><button aria-pressed="true">Replace</button><button aria-pressed="false">New tab</button></div>
+      </div>
+      <div class="card">
+        <h4>Text size</h4>
+        <p>Base the console lays out in. Settings multiplies it.</p>
+        <div class="seg" style="margin-top:9px"><button aria-pressed="false">Default</button><button aria-pressed="true">Larger</button></div>
+      </div>
+      <div class="card">
+        <h4>New tabs start in</h4>
+        <p>Always the directory of the block they split from.</p>
+        <div class="seg" style="margin-top:9px"><button aria-pressed="true">Current</button><button aria-pressed="false">Home</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const q = new URLSearchParams(location.search);
+  const idx = q.has("v") ? Math.max(0, Math.min(2, parseInt(q.get("v"), 10) || 0)) : null;
+  function show(i) {
+    // Select by data-v, never by list index. Removing boards shrinks the
+    // list, so an index-based show() deletes everything on the second call.
+    // Keeping all three in the DOM and hiding is what makes the switcher
+    // reversible.
+    document.querySelectorAll(".board").forEach((b) => {
+      b.style.display = b.dataset.v === String(i) ? "block" : "none";
+    });
+    document.querySelectorAll(".switch button").forEach((b, n) => {
+      b.setAttribute("aria-pressed", String(n === i));
+    });
+  }
+  if (idx !== null) show(idx);
+  // No ?v= means the page was opened directly. Default to the first
+  // variant, or all three boards stay stacked and only the top one is
+  // in view, so every click looks like nothing happened.
+  else show(0);
+  document.body.style.padding = "0";
+  scrollTo(0, 0);
+  document.querySelectorAll(".switch button").forEach((b, n) => {
+    b.addEventListener("click", () => show(n));
+  });
+  addEventListener("keydown", (e) => {
+    if (["1", "2", "3"].includes(e.key)) show(parseInt(e.key, 10) - 1);
+  });
+</script>
+</body>
+</html>
