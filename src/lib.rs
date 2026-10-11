@@ -6,10 +6,15 @@
 //! - [`camera`]: the eased camera move on an operator recentre.
 //! - [`chrome`]: island and zone chrome — the floating-panel shell (see ADR-0014, ADR-0016).
 //! - [`tokens`]: the palette and the measurements. Leaf: egui only (see ADR-0016).
+//! - [`view`]: the palette, metrics and chrome geometry with no toolkit type
+//!   in them. This is the seam the shell migration turns on: egui and GPUI
+//!   both read it, and the chrome geometry is testable with no display.
 //! - [`gamestate`]: the exercise lifecycle as one axis. Leaf: no tfg types.
 //! - [`force`]: the operator's force before Minos hears of it, and the diff a stage advance writes.
 //! - [`backend`]: v0 poll contract: `PollSource`, file replay, HTTP stub.
 //! - [`symbology`]: APP-6C symbol model + generated icon geometry. Leaf: depends on nothing.
+//!
+//! Module list is alphabetical after `assets`.
 
 pub mod assets;
 pub mod backend;
@@ -37,3 +42,4 @@ pub mod sim;
 pub mod store;
 pub mod symbology;
 pub mod tokens;
+pub mod view;

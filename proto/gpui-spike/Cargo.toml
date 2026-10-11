@@ -1,0 +1,29 @@
+[package]
+name = "gpui-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately not a workspace member. Same pattern as `proto/p5-epaint`:
+# its own Cargo.lock and its own target, so a 500-crate dependency tree
+# never disturbs the shipped crate's build directory.
+#
+# This crate answers one question and then dies: does GPUI render a real
+# frame on this machine.
+
+[dependencies]
+gpui = "=0.2.2"
+
+# `xattr 0.2.3` reads `libc::ENOATTR`, which libc 0.2.190 no longer exports
+# (glibc renamed it to ENODATA). Without this patch the build dies in xattr
+# before a single gpui crate is compiled. The copy under `patches/xattr` is
+# upstream 0.2.3 with that one constant rebound. ADR-0018 recorded the blocker
+# and proposed ENOSTR, which is the wrong errno and would misreport a missing
+# attribute as a stream error.
+[patch.crates-io]
+xattr = { path = "patches/xattr" }
+
+[profile.dev]
+# The spike is built once and run. opt-level 2 keeps link time sane while
+# still being debug for the parts we need to read.
+opt-level = 1

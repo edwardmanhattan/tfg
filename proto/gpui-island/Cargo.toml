@@ -1,0 +1,22 @@
+[package]
+name = "gpui-island"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately not a workspace member. Same pattern as `proto/p5-epaint`:
+# its own Cargo.lock and its own target, so a 500-crate dependency tree never
+# disturbs the shipped crate's build directory.
+#
+# This crate paints one ARCONS island in GPUI from `tfg::view`. It is the
+# visual-parity proof for the shell migration: if the console's design
+# language can be drawn by GPUI, the rest of the port is mechanical.
+
+[dependencies]
+gpui = "=0.2.2"
+
+[patch.crates-io]
+xattr = { path = "../gpui-spike/patches/xattr" }
+
+[profile.dev]
+opt-level = 1
