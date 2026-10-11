@@ -132,3 +132,25 @@ Lua: `dispatch hl.dsp.focus({ window = "0x..." })` focuses by address and
 returns `ok`. PID-match the window first (`hyprctl -j clients`), focus,
 `grim`, focus back. Next: set `WindowOptions.app_id` so captures match by
 class instead of PID.
+
+**Recipe correction 2026-10-12.** Address-form focus worked twice, then
+went permanently `window not found` for identical calls. Class-form works:
+`dispatch hl.dsp.focus({ window = "class:foot" })` → `ok`. Prefer class
+(and now `app_id: "gpui-shell"` is set, so `class:gpui-shell`). Always
+verify with `activeworkspace` after focusing — one capture round raced a
+stale buffer and showed terminal text over a `CONSOLE_NIGHT` histogram.
+
+**Slice 3 (`gpui-shell` + shared poll thread), verified 2026-10-12.**
+`TFG_SCENARIO=surge`, crop 960x1048+960+32: fill `(15-18, 23-26, 41-43)`
+(`CONSOLE_NIGHT` ±1), label reads `tfg // gpui shell` / `60 fixes` —
+backend thread → channel → 250 ms drain → `notify()` → re-render,
+end to end. Observation, not a defect yet: foliage at the crop edges —
+the surface may not fill the tiled area (possible transparent
+`WindowBackgroundAppearance` default). U-next: set opaque background and
+re-crop tighter.
+
+**Proto-crate `[patch]` rule.** Cargo ignores `[patch.crates-io]` of a
+path dependency, so `gpui-shell` resolved upstream `tokio-centrifuge`
+(no `with_connect_data`) until the vendor patch was mirrored into
+`proto/gpui-shell/Cargo.toml`. U8 will meet this class of issue in
+reverse when the patches move into the workspace.

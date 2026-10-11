@@ -15,8 +15,14 @@ publish = false
 
 [dependencies]
 gpui = "=0.2.2"
+tfg = { path = "../.." }
 
 [patch.crates-io]
+# Mirrors the workspace root's patch (Cargo ignores `[patch]` of a path
+# dependency): the vendored SDK carries `with_connect_data`, which upstream
+# 0.2.6 cannot set and Minos requires for the token (§2, literal).
+tokio-centrifuge = { path = "../../vendor/tokio-centrifuge" }
+# Same xattr story as the other proto crates (glibc ENOATTR = ENODATA).
 xattr = { path = "../gpui-spike/patches/xattr" }
 
 [profile.dev]
