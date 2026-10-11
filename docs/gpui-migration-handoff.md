@@ -104,3 +104,31 @@ topology, the map texture path, and the scroll measurement.
 
 One correction. ADR-0018's claim that GPUI cannot present at all is true for
 Xvfb and false for the machine's compositor. Both are in the document now.
+
+## U2 verification log
+
+**U2 shell (`proto/gpui-shell`), verified 2026-10-12 by capture.** One
+`Entity`, one label, 1040x640 centred (tiler put it at ws4 right half,
+768x838 logical). Crop 960x1048+960+32, active workspace confirmed 4 at
+capture time.
+
+- Fill `(15-18, 23-26, 41-43)` = `CONSOLE_NIGHT` `#0F172A` ±1, ~800k of 1M
+  px. Same ±1 shift as the island record.
+- Label `tfg // gpui shell`, 516 px with r>150, centred. Cores read dimmer
+  than full `MAP_INK` at 12.5px under software Vulkan (AA fringe, not a
+  token error: same `rgba()` path the island matched with).
+
+**U2 poll-thread slice, verified 2026-10-12.** `src/shell_threads.rs`:
+`WireKind`/`EmptyWire`/`build_wire` moved verbatim, `spawn_poll_thread`
+shared by both shells. `cargo test --lib`: 361 passed, 4 failed, all 4
+reproduce on the clean tree (pre-existing, `book`/`map_render`/`roster`/
+`sim`). `cargo check --bins`: clean, zero warnings in touched regions.
+Map thread stays put: `MapResp` carries `egui::ColorImage`, U6 replaces
+the handoff.
+
+**Capture recipe amendment.** This shell's `hyprctl dispatch` is unusable
+(Lua wrapper rejects all args), but the raw Hyprland socket accepts real
+Lua: `dispatch hl.dsp.focus({ window = "0x..." })` focuses by address and
+returns `ok`. PID-match the window first (`hyprctl -j clients`), focus,
+`grim`, focus back. Next: set `WindowOptions.app_id` so captures match by
+class instead of PID.
