@@ -361,6 +361,20 @@ pub fn owning_island(rects: &[Box], px: Option<(f32, f32)>) -> Option<usize> {
     rects.iter().rposition(|r| box_contains(*r, x, y))
 }
 
+/// Clamp a dragged island's top-left into the viewport.
+///
+/// The drag half of `chrome::island_owned`'s rule: the pointer delta is
+/// added to the column position BEFORE this runs, and ONLY drags come
+/// here. A computed column position legitimately sits below the window
+/// (that is what a scrollable column is), so clamping it would pull the
+/// island to the window's bottom edge and fight the scroll chain. The
+/// scroll itself is a separate view transform, never folded into `pos`.
+pub fn clamp_island_to_viewport(x: f32, y: f32, w: f32, h: f32, viewport: Box) -> (f32, f32) {
+    let cx = x.clamp(viewport.0, (viewport.2 - w).max(viewport.0));
+    let cy = y.clamp(viewport.1, (viewport.3 - h).max(viewport.1));
+    (cx, cy)
+}
+
 /// Zone layout: the column's width, clamped to its rails.
 pub fn clamp_zone_width(w: f32, viewport_w: f32) -> f32 {
     w.clamp(ZONE_MIN_W, ZONE_MAX_W).min(viewport_w * 0.8)
@@ -436,6 +450,34 @@ mod tests {
         // The gap between the two belongs to nobody.
         assert_eq!(owning_island(&[a, b], Some((50.0, 105.0))), None);
         assert_eq!(owning_island(&[a, b], None), None);
+    }
+
+    #[test]
+    fn a_drag_clamps_to_the_viewport() {
+        let vp = (0.0, 0.0, 760.0, 620.0);
+        // Inside stays.
+        assert_eq!(
+            clamp_island_to_viewport(200.0, 150.0, 360.0, 300.0, vp),
+            (200.0, 150.0)
+        );
+        // Past each edge sticks to it.
+        assert_eq!(
+            clamp_island_to_viewport(-50.0, 150.0, 360.0, 300.0, vp),
+            (0.0, 150.0)
+        );
+        assert_eq!(
+            clamp_island_to_viewport(500.0, 150.0, 360.0, 300.0, vp),
+            (400.0, 150.0)
+        );
+        assert_eq!(
+            clamp_island_to_viewport(200.0, 900.0, 360.0, 300.0, vp),
+            (200.0, 320.0)
+        );
+        // An island bigger than the window pins to the origin, never NaN.
+        assert_eq!(
+            clamp_island_to_viewport(99.0, 99.0, 900.0, 800.0, vp),
+            (0.0, 0.0)
+        );
     }
 
     #[test]

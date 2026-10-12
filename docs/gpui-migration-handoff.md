@@ -154,6 +154,39 @@ is 985,132/1,006,080 fill (0.979) `CONSOLE_NIGHT`. The fringe was a
 misread of the downscaled preview. `Opaque` is already the GPUI default
 (verified in pinned source), and no background change is needed.
 
+## U4a verification log — drag handle + close-last (2026-10-12)
+
+**Kernel.** `view::clamp_island_to_viewport` ports the drag half of
+`chrome::island_owned:374-390` (delta added by the caller, clamp here,
+drags only — column positions and scroll stay out). Pinned by
+`a_drag_clamps_to_the_viewport` (10/10 view tests green), including the
+oversize-island pins-to-origin case.
+
+**Island proto.** Band is the drag handle (left press records
+cursor-minus-pos; a full-window transparent overlay rendered topmost
+while held takes moves + release, so fast drags stay attached).
+`pos` readout in the body. Close is an 18px `canvas` cross
+(`BODY_SILVER` resting, `MAP_INK` hot — `paint_close` numbers) at the
+kernel's `island_close_center`, rendered as the LAST child: GPUI hit
+order is tree order, later siblings on top, which is the same rule as
+egui's register-last-wins (`chrome.rs:489`). Moving it above the body
+reproduces the exact shipped bug (lights up, swallows nothing).
+
+**Capture** (island at 200,130, modal shut): dark body, 4 hull rows,
+rim, `pos 200,130`. X center `srgb(139,139,139)` = `BODY_SILVER`
+`(140,140,140)` at kernel coordinates; fill cluster `CONSOLE_NIGHT` ±1.
+
+**Two findings.** (1) The scroll viewport paints its own opaque LIGHT
+default — no ancestor bg shows through. First capture was a white panel
+with invisible rows; explicit `.bg(CONSOLE_NIGHT)` on the scroll div
+fixed it. Every future scroll surface needs an explicit bg. (2) Drag
+motion itself is not live-triggered here (no mouse synthesis on
+Wayland): clamp math is tested, the event wiring is code-reviewed
+against `chrome.rs`. A live drag proof waits on a driver.
+
+**Not done here:** zone band clipping, `BodyFit`/scroll-chain
+measurement, sibling input ownership — the rest of U4.
+
 **Proto-crate `[patch]` rule.** Cargo ignores `[patch.crates-io]` of a
 path dependency, so `gpui-shell` resolved upstream `tokio-centrifuge`
 (no `with_connect_data`) until the vendor patch was mirrored into
