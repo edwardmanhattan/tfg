@@ -21,8 +21,8 @@
 //! against its siblings. Those are `chrome::island_owned`'s job.
 
 use gpui::{
-    App, Application, Bounds, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Render, ScrollHandle,
+    App, Application, Bounds, Context, CursorStyle, FontWeight, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Render, ScrollHandle,
     ScrollWheelEvent, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions,
     canvas, div, point, prelude::*, px, size,
 };
@@ -50,7 +50,7 @@ fn rgba(c: Rgba) -> gpui::Rgba {
 }
 
 struct IslandState {
-    /// Top-left in WINDOW pixels (rendered band-relative; see `BAND_TOP`).
+    /// Top-left in WINDOW pixels (rendered band-relative inside the clip).
     pos: (f32, f32),
     /// Cursor-minus-pos grab offset while a band drag is live.
     dragging: Option<(f32, f32)>,
@@ -78,17 +78,22 @@ struct IslandDemo {
     /// fights the scroll and a stale scroll never strands the column
     /// (re-clamped every frame, because overflow changes with state).
     zone_scroll: f32,
+    /// Live zone width. The grip writes it; origins, band and islands read
+    /// it next frame, so the resize is live mid-drag.
+    zone_w: f32,
+    /// Paint order, back to front. Any band press promotes that island to
+    /// the end — the port of `move_to_top` for the grip's problem (a press
+    /// must reach the edge strip no matter which island was touched last).
+    zorder: Vec<usize>,
+    /// Grip drag: cursor-x grab plus width at grab. `None` is not resizing.
+    grip: Option<(f32, f32)>,
+    grip_hot: bool,
 }
 
-/// The zone band for this demo: full-bleed column below the top strip,
-/// from `ZONE_TOP_GAP` to the edge gap. A zone grows no background of its
-/// own (`chrome.rs`: the map shows through the gaps), so this box is a
-/// clip rect and a cull predicate, never paint.
-const BAND_TOP: f32 = 56.0;
-const BAND_BOTTOM: f32 = 596.0;
 /// Column overflow: three 300px islands and two 2px gaps against the
-/// 540px band. The column clamp rides this number.
-const ZONE_OVERFLOW: f32 = 3.0 * 300.0 + 2.0 * 2.0 - (BAND_BOTTOM - BAND_TOP);
+/// band height below. The column clamp rides this number.
+const ZONE_OVERFLOW: f32 =
+    3.0 * 300.0 + 2.0 * ZONE_ISLAND_GAP - (620.0 - ZONE_TOP_GAP - ZONE_EDGE_GAP);
 
 /// The modal panel's footprint. Fixed by contract, like an island's.
 const MODAL_W: f32 = 480.0;
@@ -169,9 +174,9 @@ impl IslandDemo {
     /// Render island `i`. Positions are window pixels; the caller places
     /// this inside the band clip, so the frame sits band-relative here.
     /// `owned` arrives resolved (ADR-0016: decided once, never per-island).
-    /// `scroll` is the column's view transform, applied at paint, never
-    /// folded into `pos`.
-    fn island(&mut self, cx: &mut Context<Self>, i: usize, owned: bool, scroll: f32) -> impl IntoElement {
+    /// `scroll` is the column's view transform and `band_top` the clip
+    /// origin; both applied at paint, never folded into `pos`.
+    fn island(&mut self, cx: &mut Context<Self>, i: usize, owned: bool, scroll: f32, band_top: f32) -> impl IntoElement {
         // Copied out front so the fit log below can write back through
         // `self` without fighting the borrow it reads from.
         let pos = self.islands[i].pos;
@@ -253,6 +258,13 @@ impl IslandDemo {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
+                    // Promote first: a press must reach the edge strip no
+                    // matter which island was touched last (the grip's
+                    // `move_to_top`, as paint order).
+                    if let Some(p) = view.zorder.iter().position(|&k| k == i) {
+                        view.zorder.remove(p);
+                    }
+                    view.zorder.push(i);
                     let st = &mut view.islands[i];
                     st.dragging = Some((
                         f32::from(ev.position.x) - st.pos.0,
@@ -443,7 +455,7 @@ impl IslandDemo {
         div()
             .absolute()
             .left(px(pos.0))
-            .top(px(pos.1 - BAND_TOP - scroll))
+            .top(px(pos.1 - band_top - scroll))
             .w(panel_w)
             .h(panel_h)
             .child(cast)
@@ -481,9 +493,13 @@ impl Render for IslandDemo {
         // it: open AND on the band. A closed or culled island is gone, not
         // dimmed, and never lights. `owning_island` is kernel-tested; this
         // is its one call site. All reads go through the column scroll.
+        //
+        // The band itself comes from the zone rails (`zone_band`): the
+        // column docks right at the edge gap, and the grip's width writes
+        // flow back into it next frame.
         self.zone_scroll = self.zone_scroll.clamp(0.0, ZONE_OVERFLOW);
         let sc = self.zone_scroll;
-        let band: view::Box = (0.0, BAND_TOP, 760.0, BAND_BOTTOM);
+        let band = zone_band((0.0, 0.0, 760.0, 620.0), self.zone_w);
         let mut live: Vec<(usize, view::Box)> = Vec::new();
         for (idx, st) in self.islands.iter().enumerate() {
             if st.open && island_on_band(st.pos.1, sc, band, 300.0) {
@@ -494,8 +510,9 @@ impl Render for IslandDemo {
         let owned_idx = owning_island(&rects, self.pointer).map(|k| live[k].0);
 
         // The band clips; it paints nothing (a zone grows no background).
-        // Islands sit band-relative inside it. The 3px bevel bleed clips at
-        // the band edge where egui bleeds 8 — same rule, tighter margin.
+        // Islands sit band-relative inside it, painted back-to-front per
+        // `zorder`. The 3px bevel bleed clips at the band edge where egui
+        // bleeds 8 — same rule, tighter margin.
         //
         // The column half of the wheel chain lives here too. Bodies scroll
         // themselves through the built-in handler (which no-ops, clamped,
@@ -504,17 +521,17 @@ impl Render for IslandDemo {
         // `chained_wheel`. One gesture, one surface — never both.
         let mut band_el = div()
             .absolute()
-            .left(px(0.0))
-            .top(px(BAND_TOP))
-            .w(px(760.0))
-            .h(px(BAND_BOTTOM - BAND_TOP))
+            .left(px(band.0))
+            .top(px(band.1))
+            .w(px(box_w(band)))
+            .h(px(box_h(band)))
             .overflow_hidden()
-            .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, window, cx| {
+            .on_scroll_wheel(cx.listener(move |view, ev: &ScrollWheelEvent, window, cx| {
                 let dy = f32::from(ev.delta.pixel_delta(window.line_height()).y);
                 let px = f32::from(ev.position.x);
                 let py = f32::from(ev.position.y);
                 view.pointer = Some((px, py));
-                let band = (0.0, BAND_TOP, 760.0, BAND_BOTTOM);
+                let band = zone_band((0.0, 0.0, 760.0, 620.0), view.zone_w);
                 let sc = view.zone_scroll;
                 let mut fit_opt = None;
                 for st in view.islands.iter() {
@@ -543,10 +560,26 @@ impl Render for IslandDemo {
                     cx.notify();
                 }
             }));
-        for (idx, _) in live.iter() {
-            band_el = band_el.child(self.island(cx, *idx, Some(*idx) == owned_idx, sc));
+        let zorder = self.zorder.clone();
+        for zi in zorder {
+            if live.iter().any(|(idx, _)| *idx == zi) {
+                band_el = band_el.child(self.island(cx, zi, Some(zi) == owned_idx, sc, band.1));
+            }
         }
 
+        // The resize grip: 10px straddling the zone's inner (left) edge,
+        // full band height, above the islands and below the modal — the
+        // port of the grip Area plus its every-frame `move_to_top`.
+        // Ink follows state: cyan while dragged, cut grey on hover, 35%
+        // at rest. Dragging writes `zone_w` through the kernel rule.
+        let grip_box = zone_grip_rect(band, band.0);
+        let grip_ink = if self.grip.is_some() {
+            RADAR_CYAN
+        } else if self.grip_hot {
+            CUT_GREY
+        } else {
+            CUT_GREY.with_alpha(89)
+        };
         let mut root = div()
             .relative()
             .size_full()
@@ -556,7 +589,39 @@ impl Render for IslandDemo {
                 view.pointer = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
                 cx.notify();
             }))
-            .child(band_el);
+            .child(band_el)
+            .child(
+                div()
+                    .absolute()
+                    .left(px(grip_box.0))
+                    .top(px(grip_box.1))
+                    .w(px(ZONE_GRIP_W))
+                    .h(px(box_h(grip_box)))
+                    .id("zone-grip")
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(2.0))
+                            .h_full()
+                            .mt(px(8.0))
+                            .mb(px(8.0))
+                            .bg(rgba(grip_ink)),
+                    )
+                    .on_hover(cx.listener(|view, hot: &bool, _, cx| {
+                        view.grip_hot = *hot;
+                        cx.notify();
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, ev: &MouseDownEvent, _, cx| {
+                            view.grip =
+                                Some((f32::from(ev.position.x), view.zone_w));
+                            cx.notify();
+                        }),
+                    ),
+            );
         // Buttons ride the top strip, above the band — the one place the
         // pointer can sit without being over an island.
         root = root.child(
@@ -602,12 +667,14 @@ impl Render for IslandDemo {
                         .child("OPEN MODAL"),
                 ),
         );
-        // The drag overlay: full-window, transparent, topmost, alive only
-        // while a band press is held. Moves and the release land here even
-        // when the cursor has left the band, which is what keeps a fast
-        // drag attached. Rendered last for the same reason the close button
-        // is: later siblings win hits.
-        if let Some(di) = self.islands.iter().position(|st| st.dragging.is_some()) {
+        // The drag overlay: full-window, transparent, topmost, alive while
+        // an island or the grip is held. Moves and the release land here
+        // even when the cursor has left the handle, which is what keeps a
+        // fast drag attached. Rendered last for the same reason the close
+        // button is: later siblings win hits.
+        let drag_island = self.islands.iter().position(|st| st.dragging.is_some());
+        let grip_drag = self.grip;
+        if drag_island.is_some() || grip_drag.is_some() {
             root = root.child(
                 div()
                     .absolute()
@@ -616,23 +683,39 @@ impl Render for IslandDemo {
                     .right(px(0.0))
                     .bottom(px(0.0))
                     .on_mouse_move(cx.listener(move |view, ev: &MouseMoveEvent, _, cx| {
-                        let st = &mut view.islands[di];
-                        if let Some(grab) = st.dragging {
-                            let (x, y) = clamp_island_to_viewport(
-                                f32::from(ev.position.x) - grab.0,
-                                f32::from(ev.position.y) - grab.1,
-                                360.0,
-                                300.0,
-                                (0.0, 0.0, 760.0, 620.0),
+                        if let Some(di) = drag_island {
+                            let st = &mut view.islands[di];
+                            if let Some(grab) = st.dragging {
+                                let (x, y) = clamp_island_to_viewport(
+                                    f32::from(ev.position.x) - grab.0,
+                                    f32::from(ev.position.y) - grab.1,
+                                    360.0,
+                                    300.0,
+                                    (0.0, 0.0, 760.0, 620.0),
+                                );
+                                st.pos = (x, y);
+                                cx.notify();
+                            }
+                        }
+                        // Right dock grows leftward: the kernel rule takes
+                        // the grab width and the cursor delta.
+                        if let Some((grab_x, start_w)) = grip_drag {
+                            view.zone_w = zone_drag_width(
+                                start_w,
+                                f32::from(ev.position.x) - grab_x,
+                                true,
+                                760.0,
                             );
-                            st.pos = (x, y);
                             cx.notify();
                         }
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |view, _, _, cx| {
-                            view.islands[di].dragging = None;
+                            if let Some(di) = drag_island {
+                                view.islands[di].dragging = None;
+                            }
+                            view.grip = None;
                             cx.notify();
                         }),
                     ),
@@ -722,20 +805,31 @@ fn main() {
             // edge (62px clipped), island 2 wholly below it (culled: never
             // rendered, never owns). Pointer seeded over island 1 so the
             // bare capture shows the one-lit-rim state with no input.
+            // Positions from the zone rails, not literals: right-docked
+            // column at the edge gap, origins stacked with the zone gap.
+            let band0 = zone_band((0.0, 0.0, 760.0, 620.0), 360.0);
+            let hs = [300.0, 300.0, 300.0];
+            let p0 = zone_island_origin(band0, 0, &hs);
+            let p1 = zone_island_origin(band0, 1, &hs);
+            let p2 = zone_island_origin(band0, 2, &hs);
             cx.new(|_| IslandDemo {
                 islands: [
-                    IslandState { pos: (200.0, 56.0), dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
-                    IslandState { pos: (200.0, 358.0), dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
-                    IslandState { pos: (200.0, 660.0), dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
+                    IslandState { pos: p0, dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
+                    IslandState { pos: p1, dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
+                    IslandState { pos: p2, dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
                 ],
                 modal_open: false,
-                pointer: Some((380.0, 508.0)),
+                pointer: Some((p1.0 + 180.0, p1.1 + 30.0)),
                 // Seeded mid-column: island 0 cut at the band top, island 2
                 // risen into view at the bottom — the scrolled state, with
                 // no wheel input. Proves the view transform + clamp + cull
                 // path statically; the wheel handler itself is wired and
                 // kernel-decided, awaiting a live gesture.
                 zone_scroll: 120.0,
+                zone_w: 360.0,
+                zorder: vec![0, 1, 2],
+                grip: None,
+                grip_hot: false,
             })
         })
         .unwrap();

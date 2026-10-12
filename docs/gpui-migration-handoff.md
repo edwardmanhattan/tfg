@@ -274,6 +274,33 @@ killed to hand the screen back. Scrolled-layout capture + live-wheel
 proof wait on a quiet machine. Nothing structural is unverified: the
 decision is kernel-tested, the wiring compiles, the fits log live.
 
+## U4e verification log — zone rails: origins, grip, z-order (2026-10-12)
+
+**Kernel.** `view::zone_grip_rect` (10px strip centred on the inner
+edge) + `view::zone_drag_width` (add on left dock, subtract on right,
+then the rails) + tests both docks, rails, and the narrow-viewport
+rail (`the_grip_straddles_the_inner_edge`,
+`a_grip_drag_writes_the_live_width`, 15/15 view tests). The island
+origins were already kernel (`zone_band`, `zone_island_origin`).
+
+**Demo.** Positions now come from the rails — `zone_band` right-docks
+the column at the edge gap, `zone_island_origin` stacks it — instead of
+literals (identical numbers: 376/56/358/660, now derived). Grip div on
+the inner edge with the 2px line (cyan dragged / grey hover / 35%
+idle), `ResizeLeftRight` cursor, drag writes `zone_w` through the
+kernel rule. Band press promotes the island in `zorder` (the grip's
+`move_to_top` as paint order); islands render back-to-front.
+
+**Cursor API note.** `cursor_*` builders are macro-generated tailwind
+names only (`cursor_pointer`, `cursor_move`…); anything else goes
+through generic `.cursor(CursorStyle::…)`.
+
+**Pixels pending (again).** Browser + live terminal work covered the
+window on every attempt; address-form focus returned `ok` but did not
+raise it. Killed to hand the screen back. Right-dock layout, grip ink
+and z-order await a quiet capture; the math is kernel-tested and the
+wiring compiled (`Compiling` line in evidence).
+
 **Compositor API found while relocating.** The `hl` Lua surface is now
 enumerated via error-message introspection: `hl.dsp.window` =
 close,swap,bring_to_top,pseudo,clear_tags,drag,fullscreen,resize,move,

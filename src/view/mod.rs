@@ -439,6 +439,32 @@ impl BodyFit {
 pub const BODY_SCROLL_SLACK: f32 = 12.0;
 
 // ---------------------------------------------------------------------------
+// Zone chrome
+//
+// The resize grip and the drag-width rule from `side_zone`. The grip is a
+// 10px strip straddling the zone's inner edge over the full band height;
+// dragging it writes the live width, which the next frame's origins, band
+// and camera offset all read — so the resize is live and nothing
+// disagrees mid-drag. `Dock::Right` (this console's dock) grows leftward:
+// a leftward pointer delta widens the zone.
+// ---------------------------------------------------------------------------
+
+/// Grip strip for the zone's inner edge: 10px wide, centred on `edge_x`,
+/// full band height. `edge_x` is the band's left edge on a right dock,
+/// its right edge on a left dock.
+pub fn zone_grip_rect(band: Box, edge_x: f32) -> Box {
+    (edge_x - ZONE_GRIP_W * 0.5, band.1, edge_x + ZONE_GRIP_W * 0.5, band.3)
+}
+
+/// Next live zone width after a grip drag: add the pointer delta on a left
+/// dock, subtract on a right dock, then clamp to the rails. Pure so both
+/// shells (and the test) agree with the running column.
+pub fn zone_drag_width(start_w: f32, dx: f32, right_dock: bool, viewport_w: f32) -> f32 {
+    let dw = if right_dock { -dx } else { dx };
+    clamp_zone_width(start_w + dw, viewport_w)
+}
+
+// ---------------------------------------------------------------------------
 // Wheel chaining
 //
 // One gesture moves ONE thing: a body that can still move in the
@@ -645,6 +671,29 @@ mod tests {
         assert_eq!(chained_wheel(Some(fitting), -24.0, true), WheelOwner::Column);
         // No body under the pointer, inside the band: column.
         assert_eq!(chained_wheel(None, -24.0, true), WheelOwner::Column);
+    }
+
+    #[test]
+    fn the_grip_straddles_the_inner_edge() {
+        let band = (376.0, 56.0, 736.0, 596.0);
+        // Right dock: centred on the band's left edge.
+        assert_eq!(zone_grip_rect(band, band.0), (371.0, 56.0, 381.0, 596.0));
+        // Left dock: centred on the band's right edge.
+        assert_eq!(zone_grip_rect(band, band.2), (731.0, 56.0, 741.0, 596.0));
+    }
+
+    #[test]
+    fn a_grip_drag_writes_the_live_width() {
+        // Right dock grows leftward: negative dx widens.
+        assert_eq!(zone_drag_width(360.0, -40.0, true, 760.0), 400.0);
+        assert_eq!(zone_drag_width(360.0, 40.0, true, 760.0), 320.0);
+        // Left dock grows rightward: positive dx widens.
+        assert_eq!(zone_drag_width(360.0, 40.0, false, 760.0), 400.0);
+        // Rails hold either way.
+        assert_eq!(zone_drag_width(360.0, -400.0, true, 760.0), ZONE_MAX_W);
+        assert_eq!(zone_drag_width(360.0, 400.0, true, 760.0), ZONE_MIN_W);
+        // A narrow window clamps through to the viewport rail.
+        assert_eq!(zone_drag_width(360.0, 0.0, true, 300.0), ZONE_MIN_W);
     }
 
     #[test]
