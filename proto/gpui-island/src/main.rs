@@ -21,15 +21,20 @@
 //! against its siblings. Those are `chrome::island_owned`'s job.
 
 use gpui::{
-    App, Application, Bounds, Context, CursorStyle, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Render, ScrollHandle,
-    ScrollWheelEvent, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions,
-    canvas, div, point, prelude::*, px, size,
+    App, AppContext, Application, AsyncApp, Bounds, Context, CursorStyle, FontWeight,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
+    ParentElement, PathBuilder, Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement,
+    Styled, Window, WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px, size,
 };
 
 #[path = "../../../src/view/mod.rs"]
 mod view;
+/// The map handoff, shared verbatim with `gpui-map` (U6) — one
+/// implementation of hold-until-ready and retirement, not two.
+#[path = "../../gpui-map/src/gate.rs"]
+mod gate;
 
+use gate::{FrameGate, FrameReplay};
 use view::{cast_offset, *};
 
 /// One `view::Rgba` as a GPUI colour. The kernel speaks 0..255 sRGB and a
@@ -88,6 +93,11 @@ struct IslandDemo {
     /// Grip drag: cursor-x grab plus width at grab. `None` is not resizing.
     grip: Option<(f32, f32)>,
     grip_hot: bool,
+    /// The map surface (U6): the real map thread's frames, held until
+    /// decoded, retired to keep the atlas bounded. Painted full-bleed
+    /// under everything, because the band and the rails paint no
+    /// background of their own — the map is what shows through.
+    gate: FrameGate,
 }
 
 /// Column overflow: three 300px islands and two 2px gaps against the
@@ -491,7 +501,11 @@ impl IslandDemo {
 }
 
 impl Render for IslandDemo {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The map surface promotes here, once per frame, before anything
+        // is assembled: hold-until-ready, so the picture never blinks.
+        self.gate.tick(window, cx);
+
         // Ownership, resolved ONCE per frame over the islands that can own
         // it: open AND on the band. A closed or culled island is gone, not
         // dimmed, and never lights. `owning_island` is kernel-tested; this
@@ -592,6 +606,21 @@ impl Render for IslandDemo {
                 view.pointer = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
                 cx.notify();
             }))
+            .child(
+                // The map surface (U6), painted first so it sits behind
+                // every piece of chrome. `Fill` (not `Contain`): this is a
+                // viewport, and a letterboxed map would show the black it
+                // is meant to replace.
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .children(self.gate.image().map(|frame| {
+                        img(frame).w_full().h_full().object_fit(ObjectFit::Fill)
+                    })),
+            )
             .child(band_el)
             .child(
                 div()
@@ -669,6 +698,28 @@ impl Render for IslandDemo {
                         }))
                         .child("OPEN MODAL"),
                 ),
+        );
+        // The map readout: the one line that says the surface under all of
+        // this is the map thread's output and not a static picture — the
+        // frame on screen, the decode lag it cost, and the retirement
+        // counts whose difference is the atlas-bound invariant (retired
+        // tracks promoted minus one, always).
+        let g = self.gate.stats();
+        root = root.child(
+            div()
+                .absolute()
+                .top(px(46.0))
+                .left(px(8.0))
+                .px(px(8.0))
+                .py(px(4.0))
+                .bg(rgba(Rgba::black_alpha(160)))
+                .font_family("monospace")
+                .text_size(px(11.0))
+                .text_color(rgba(BUTTON_LABEL))
+                .child(format!(
+                    "map frame {} lag {:.0}ms up {} ret {}",
+                    g.displayed, g.lag_ms, g.promoted, g.retired
+                )),
         );
         // The drag overlay: full-window, transparent, topmost, alive while
         // an island or the grip is held. Moves and the release land here
@@ -803,7 +854,19 @@ fn main() {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             ..Default::default()
         };
-        cx.open_window(opts, |_window, cx| {
+        // The map feed: real frames from `examples/map_burst` by default,
+        // replayed at the map thread's newest-wins discipline. No frames
+        // on disk means no map, which is the honest failure.
+        let dir = std::env::var("MAP_FRAMES_DIR")
+            .unwrap_or_else(|_| "/tmp/opencode/mapframes".to_string());
+        let burst_ms: u64 = std::env::var("BURST_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(80);
+        let looping = std::env::var("LOOP").as_deref() == Ok("1");
+        let replay = FrameReplay::start(&dir, burst_ms, looping);
+
+        let entity = cx.new(|_| {
             // Island 0 fully on the band, island 1 straddling its bottom
             // edge (62px clipped), island 2 wholly below it (culled: never
             // rendered, never owns). Pointer seeded over island 1 so the
@@ -815,7 +878,7 @@ fn main() {
             let p0 = zone_island_origin(band0, 0, &hs);
             let p1 = zone_island_origin(band0, 1, &hs);
             let p2 = zone_island_origin(band0, 2, &hs);
-            cx.new(|_| IslandDemo {
+            IslandDemo {
                 islands: [
                     IslandState { pos: p0, dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
                     IslandState { pos: p1, dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
@@ -833,9 +896,31 @@ fn main() {
                 zorder: vec![0, 1, 2],
                 grip: None,
                 grip_hot: false,
-            })
+                gate: FrameGate::new(),
+            }
+        });
+        let drain = entity.clone();
+        cx.spawn(async move |cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(20))
+                    .await;
+                if let Some((no, bytes, encode_ms)) = replay.latest() {
+                    let _ = cx.update(|app| {
+                        let stale = drain.update(app, |root: &mut IslandDemo, cx| {
+                            let stale = root.gate.queue(no, bytes, encode_ms);
+                            cx.notify();
+                            stale
+                        });
+                        if let Some(stale) = stale {
+                            stale.remove_asset(app);
+                        }
+                    });
+                }
+            }
         })
-        .unwrap();
+        .detach();
+        cx.open_window(opts, |_window, _cx| entity.clone()).unwrap();
         cx.activate(true);
     });
 }

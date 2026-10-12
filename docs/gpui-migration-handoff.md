@@ -524,3 +524,43 @@ and it is invisible at the map thread's own 368 ms pump cadence.
 dark cast, labels legible), but "looks right" is not a gamut check. If a
 tint shows up over the egui shell side by side, this is the first place
 to look.
+
+### The map surface, in the console (2026-10-12)
+
+U6's second half: the map underneath real chrome rather than full-bleed
+on its own. The gate moved out of `gpui-map`'s `main.rs` into
+`proto/gpui-map/src/gate.rs` — `FrameGate` (queue / hold-until-ready /
+retire, counters and telemetry) plus `FrameReplay` (directory of PNGs →
+the map thread's newest-wins channel). `gpui-island` pulls the same file
+in with the `#[path]` trick it already uses for `src/view/mod.rs`, so
+the two protos drive one implementation. That matters for U8, which
+copies one file, not two divergent ones.
+
+**What the island demo is now.** The right-docked band, its islands,
+grip and rails, painted over a full-bleed map surface (`ObjectFit::Fill`
+— a letterboxed map would show the black it exists to replace). The band
+and the rails paint no background of their own, so the map shows through
+the empty column exactly as it should, and the chrome keeps its own
+fills. The readout line under the buttons is deliberate: `map frame 8
+lag 30ms up 5 ret 4` makes a capture self-describing, and `up`/`ret`
+is the atlas-bound invariant in the open.
+
+**Capture** (floated + focused): JAKARTA BAY, PULAU NYAMUK BESAR, the
+city label and the toll-road shields render under the OPEN ISLANDS /
+OPEN MODAL buttons and the ROSTER column, with the islands' own dark
+fills intact on top. Every earlier island property holds unchanged —
+seeded scroll, one-lit-rim ownership, z-order — because the map is a
+single child added first, not a rework.
+
+**Memory on the composite.** 738 promotions in 80s (9.2 fps, `LOOP=1`)
+with RSS flat at 165-172 MB — the island chrome and the map surface
+together, no trend. The gate's numbers match the standalone proof, so
+the surface adds nothing that leaks.
+
+**Still open from the U6 list** (analysis section 5): the five
+`try_load_texture` sites and `egui_extras`' HTTP image loader — GPUI has
+no HTTP loader, so those become `reqwest` fetches into the same
+`ImageSource::Image` path once something needs them (no current surface
+does); `egui::load::SizedTexture` at `:2111`/`:2438`, which is layout,
+not the map; and the `CentralPanel` itself, which becomes the surface
+above. The colour-space check carried over from the previous section.
