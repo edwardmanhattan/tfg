@@ -217,6 +217,40 @@ non-overlapping columns — which is every layout today — but they
 disagree the day two islands overlap. Needs a decision before any
 overlapping layout exists; the port must not silently pick one.
 
+## U4c verification log — scroll measurement (2026-10-12)
+
+**The unknown is gone, and it dissolved rather than surrendered.** No
+custom element is needed: GPUI 0.2.2 ships `ScrollHandle` (`offset()`,
+`max_offset()`, `bounds()`, per-child bounds), fed during layout via
+`.track_scroll()` on any stateful (`id`'d) scroll div. That is the whole
+of `BodyFit`'s three numbers, fresher than egui's (layout-time, not
+last-frame temp storage). Sign convention differs — GPUI offsets run
+negative-down, the kernel positive-down — and flips at the shell
+boundary, next to `rgba()`. `content_h` is `max_offset + viewport`.
+
+**Kernel.** `view::BodyFit` + `can_scroll_up/down` + `BODY_SCROLL_SLACK`
+mirror `chrome` 1:1, pinned by `a_body_claims_the_wheel_only_past_the_
+slack` (12/12 view tests) including the Operator 98.4-vs-94 trailing-
+nothing case. `chrome`'s `BODY_SCROLL_EPSILON` (0.5) is read by nothing —
+dead on arrival, deliberately not mirrored.
+
+**Demo.** Each island owns a `ScrollHandle` (`track_scroll`, ids salted
+`("roster-body", i)` — one shared id would weld all bodies to one
+offset, same rule as `chrome`'s `id_salt`). Twelve literal hull rows
+overflow the 270px viewport. Change-gated `eprintln` per island is this
+proto's `verify-scroll.sh`.
+
+**Log proof** (stderr, no pixels needed):
+`fit island=0 content=409 viewport=270 offset=-0 down=true up=false`
+(and island 1 identically; island 2 logs nothing — culled, second proof
+of U4b). Settles 0/0 → 409/270 within frames of launch. Viewport 270 =
+300 panel − 30 band, exact.
+
+**Process fix.** Two `cargo check` replays (0.22–0.46s) served stale
+fingerprints after quick-successive edits and nearly cost a debugging
+session (a stale binary's UI misread as a layout bug). Proto crates now
+verify by `touch` + `cargo build` with the `Compiling` line in evidence.
+
 **Proto-crate `[patch]` rule.** Cargo ignores `[patch.crates-io]` of a
 path dependency, so `gpui-shell` resolved upstream `tokio-centrifuge`
 (no `with_connect_data`) until the vendor patch was mirrored into

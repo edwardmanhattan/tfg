@@ -387,6 +387,57 @@ pub fn island_on_band(y: f32, scroll: f32, band: Box, height: f32) -> bool {
     top + height >= band.1 && top <= band.3
 }
 
+// ---------------------------------------------------------------------------
+// Scroll measurement
+//
+// What one island body measured about itself, published so the zone can
+// decide who owns the wheel. Mirrors `chrome::BodyFit` 1:1 — three numbers
+// and no more. `content_h` against `viewport_h` is whether the body has
+// anywhere to scroll at all; `offset` is where in its range it already is.
+//
+// The GPUI shell fills this from a `ScrollHandle` at its own boundary
+// (`offset()` is negative-down there, positive-down here; `content_h` is
+// `max_offset + viewport`). No toolkit type crosses: the handle is read
+// where the shell converts colours, and only f32s arrive here.
+// ---------------------------------------------------------------------------
+
+/// What one island body measured about itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BodyFit {
+    /// The height the content asked for.
+    pub content_h: f32,
+    /// The height it was given.
+    pub viewport_h: f32,
+    /// How far the body is scrolled down. Positive is further down.
+    pub offset: f32,
+}
+
+impl BodyFit {
+    /// Whether the body has more content below the fold than above it.
+    /// False for a body that fits, and for one already at the bottom —
+    /// which is the case that hands the wheel back to the column.
+    pub fn can_scroll_down(&self) -> bool {
+        self.content_h - self.viewport_h - self.offset > BODY_SCROLL_SLACK
+    }
+
+    /// Whether the body has more content above the fold than below it.
+    pub fn can_scroll_up(&self) -> bool {
+        self.offset > BODY_SCROLL_SLACK
+    }
+}
+
+/// Content a body may run past its viewport without claiming the wheel.
+///
+/// One text line. A layout's measured extent runs a few points past the
+/// last control for trailing spacing (the Operator island measures 98.4
+/// against 94 available: 4pt of nothing). Without this, that 4pt is
+/// scrollable, so the body claims the first wheel gesture and moves four
+/// points the operator cannot see while the column stays put.
+///
+/// `chrome` also defines `BODY_SCROLL_EPSILON` (0.5) for float residue,
+/// but nothing reads it — dead on arrival, deliberately not mirrored.
+pub const BODY_SCROLL_SLACK: f32 = 12.0;
+
 /// Zone layout: the column's width, clamped to its rails.
 pub fn clamp_zone_width(w: f32, viewport_w: f32) -> f32 {
     w.clamp(ZONE_MIN_W, ZONE_MAX_W).min(viewport_w * 0.8)
@@ -502,6 +553,31 @@ mod tests {
         assert!(!island_on_band(56.0, 300.0, band, 144.0));
         assert!(island_on_band(600.0, 0.0, band, 320.0));
         assert!(island_on_band(-40.0, 0.0, band, 144.0));
+    }
+
+    #[test]
+    fn a_body_claims_the_wheel_only_past_the_slack() {
+        // The Operator case from the docs: 98.4 measured against 94
+        // available is 4pt of trailing nothing — not a scrollable body.
+        let trailing = BodyFit { content_h: 98.4, viewport_h: 94.0, offset: 0.0 };
+        assert!(!trailing.can_scroll_down());
+        assert!(!trailing.can_scroll_up());
+        // A body that fits exactly claims nothing either way.
+        let fitting = BodyFit { content_h: 200.0, viewport_h: 200.0, offset: 0.0 };
+        assert!(!fitting.can_scroll_down());
+        assert!(!fitting.can_scroll_up());
+        // Real overflow scrolls down but not up from the top.
+        let tall = BodyFit { content_h: 600.0, viewport_h: 248.0, offset: 0.0 };
+        assert!(tall.can_scroll_down());
+        assert!(!tall.can_scroll_up());
+        // At the bottom the wheel goes back to the column.
+        let bottom = BodyFit { content_h: 600.0, viewport_h: 248.0, offset: 352.0 };
+        assert!(!bottom.can_scroll_down());
+        assert!(bottom.can_scroll_up());
+        // Midway both directions are live.
+        let mid = BodyFit { content_h: 600.0, viewport_h: 248.0, offset: 100.0 };
+        assert!(mid.can_scroll_down());
+        assert!(mid.can_scroll_up());
     }
 
     #[test]

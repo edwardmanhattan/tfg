@@ -21,8 +21,8 @@
 //! against its siblings. Those are `chrome::island_owned`'s job.
 
 use gpui::{
-    App, Application, Bounds, Context, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Render,
+    App, Application, Bounds, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Render, ScrollHandle,
     StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions, canvas, div, point,
     prelude::*, px, size,
 };
@@ -56,6 +56,13 @@ struct IslandState {
     dragging: Option<(f32, f32)>,
     open: bool,
     close_hot: bool,
+    /// Last logged measurement (change-gated `eprintln`, zone-debug style).
+    last_fit: Option<BodyFit>,
+    /// The body's scroll measurement. `track_scroll` feeds it during
+    /// layout — offset, viewport and content extent with no custom
+    /// element and no frame of lag. Read at the shell boundary into
+    /// `view::BodyFit` (sign flip included); the kernel never sees it.
+    scroll: ScrollHandle,
 }
 
 struct IslandDemo {
@@ -154,8 +161,12 @@ impl IslandDemo {
     /// Render island `i`. Positions are window pixels; the caller places
     /// this inside the band clip, so the frame sits band-relative here.
     /// `owned` arrives resolved (ADR-0016: decided once, never per-island).
-    fn island(&self, cx: &mut Context<Self>, i: usize, owned: bool) -> impl IntoElement {
-        let st = &self.islands[i];
+    fn island(&mut self, cx: &mut Context<Self>, i: usize, owned: bool) -> impl IntoElement {
+        // Copied out front so the fit log below can write back through
+        // `self` without fighting the borrow it reads from.
+        let pos = self.islands[i].pos;
+        let close_hot = self.islands[i].close_hot;
+        let scroll = self.islands[i].scroll.clone();
         // The island is a FIXED footprint. GPUI needs an explicit outer frame
         // because the bevel and the shadow paint outside the panel box, and
         // an element that overflows needs somewhere to overflow into.
@@ -289,41 +300,68 @@ impl IslandDemo {
         // paints its own opaque default (light), which no ancestor bg
         // shows through. An island body on an uninherited default is a
         // white panel — invisible light-on-light rows.
-        let body = div()
-            .id("roster-body")
+        //
+        // `track_scroll` feeds the island's handle during layout: offset,
+        // viewport and content extent, no custom element, no frame of lag.
+        // Twelve rows on purpose — the "12 of 12 hulls" line below is
+        // literal, and the overflow is what makes the measurement nonzero.
+        let hulls = [
+            "HSL-7  Pandora Sound",
+            "DD-101 Makassar Strait",
+            "FFG-104 Sunda Shelf",
+            "DD-102 Java Sea",
+            "HSL-7  Pandora Sound",
+            "DD-101 Makassar Strait",
+            "FFG-104 Sunda Shelf",
+            "DD-102 Java Sea",
+            "HSL-7  Pandora Sound",
+            "DD-101 Makassar Strait",
+            "FFG-104 Sunda Shelf",
+            "DD-102 Java Sea",
+        ];
+        let mut body = div()
+            // Salted per island: one shared id would weld all three bodies
+            // to one scroll offset (`chrome.rs`: `id_salt`, same rule).
+            .id(("roster-body", i))
             .flex_1()
             .w_full()
             .overflow_y_scroll()
+            .track_scroll(&scroll)
             .bg(rgba(CONSOLE_NIGHT))
             .px(px(ISLAND_PAD))
             .pb(px(ISLAND_PAD))
             .flex()
             .flex_col()
-            .gap(px(6.0))
-            .child(
+            .gap(px(6.0));
+        for hull in hulls {
+            body = body.child(
                 div()
                     .text_size(px(13.0))
                     .text_color(rgba(MAP_INK))
-                    .child("HSL-7  Pandora Sound"),
-            )
-            .child(
-                div()
-                    .text_size(px(13.0))
-                    .text_color(rgba(MAP_INK))
-                    .child("DD-101 Makassar Strait"),
-            )
-            .child(
-                div()
-                    .text_size(px(13.0))
-                    .text_color(rgba(MAP_INK))
-                    .child("FFG-104 Sunda Shelf"),
-            )
-            .child(
-                div()
-                    .text_size(px(13.0))
-                    .text_color(rgba(MAP_INK))
-                    .child("DD-102 Java Sea"),
-            )
+                    .child(hull),
+            );
+        }
+        // The live measurement, read at the shell boundary: GPUI's offset
+        // runs negative-down, the kernel's positive-down, so the sign
+        // flips here and nowhere else. `content` is extent over viewport.
+        let max = scroll.max_offset();
+        let viewport_h = f32::from(scroll.bounds().size.height);
+        let content_h = f32::from(max.height) + viewport_h;
+        let offset = -f32::from(scroll.offset().y);
+        let fit = BodyFit { content_h, viewport_h, offset };
+        // Zone-debug style, machine-readable: log on change only, so the
+        // numbers are grepable without drowning the log at 60fps. This is
+        // the proto's `verify-scroll.sh` — the body's own measurement,
+        // adjacent to nothing, because there is no column here yet.
+        if self.islands[i].last_fit != Some(fit) {
+            self.islands[i].last_fit = Some(fit);
+            eprintln!(
+                "fit island={i} content={content_h:.0} viewport={viewport_h:.0} offset={offset:.0} down={} up={}",
+                fit.can_scroll_down(),
+                fit.can_scroll_up(),
+            );
+        }
+        body = body
             .child(
                 div()
                     .text_size(px(13.0))
@@ -334,7 +372,19 @@ impl IslandDemo {
                 div()
                     .text_size(px(11.0))
                     .text_color(rgba(BODY_SILVER))
-                    .child(format!("pos {:.0},{:.0}", st.pos.0, st.pos.1)),
+                    .child(format!("pos {:.0},{:.0}", pos.0, pos.1)),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(format!(
+                        "fit {:.0}/{:.0}+{:.0} {}",
+                        fit.content_h,
+                        fit.viewport_h,
+                        fit.offset,
+                        if fit.can_scroll_down() { "D" } else { "-" },
+                    )),
             );
 
         // --- the rim -------------------------------------------------------
@@ -378,12 +428,12 @@ impl IslandDemo {
                 view.islands[i].dragging = None;
                 cx.notify();
             }))
-            .child(close_cross(st.close_hot));
+            .child(close_cross(close_hot));
 
         div()
             .absolute()
-            .left(px(st.pos.0))
-            .top(px(st.pos.1 - BAND_TOP))
+            .left(px(pos.0))
+            .top(px(pos.1 - BAND_TOP))
             .w(panel_w)
             .h(panel_h)
             .child(cast)
@@ -622,9 +672,9 @@ fn main() {
             // bare capture shows the one-lit-rim state with no input.
             cx.new(|_| IslandDemo {
                 islands: [
-                    IslandState { pos: (200.0, 56.0), dragging: None, open: true, close_hot: false },
-                    IslandState { pos: (200.0, 358.0), dragging: None, open: true, close_hot: false },
-                    IslandState { pos: (200.0, 660.0), dragging: None, open: true, close_hot: false },
+                    IslandState { pos: (200.0, 56.0), dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
+                    IslandState { pos: (200.0, 358.0), dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
+                    IslandState { pos: (200.0, 660.0), dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
                 ],
                 modal_open: false,
                 pointer: Some((380.0, 508.0)),
