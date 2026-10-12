@@ -1120,3 +1120,54 @@ capture. A single quiet-machine re-capture of the TOOLTIP/DRAG/WINDOW protos
 is queued as one task; nothing structural is unverified (the frame, shadow
 and geometry are the same `BoxShadow`/absolute-placement primitives the
 earlier, successfully-captured slices used).
+
+## U8 — cutover authorized (2026-10-12)
+
+**ADR-0018 is retired; ADR-0020 (cutover to GPUI) is accepted.** The owner
+made the call after U1–U8 measured every blocker 0018 rested on. 0018 is
+marked superseded with its reasoning preserved; ADR-0020 carries the cutover
+decision and its consequences. ADR-0002 (egui) and ADR-0019 (halo = Low tier)
+carry forward unchanged.
+
+**What U8 is, and is not.** It is the cutover the plan priced at 2–3 weeks
+over an 18,717-line stable domain and a 26,153-line egui surface — the
+surface is the work. It is NOT doable in one sitting: `src/main.rs` is 23,188
+lines, `impl ShipApp` is ~290 methods, and 53 tests build on egui (38 touch
+`egui::` directly, the rest are pure geometry). The retained-mode rewrite is
+the cost, not the API surface — a find-and-replace estimate is false (the
+analysis says so and U1–U8 confirmed it).
+
+**The cutover order, one green step at a time** (each keeps the binary
+buildable, exactly as U1–U8 did):
+
+1. **Move the 53 tests off `egui::Context::default()`.** The pure-geometry
+   ones (picker columns, island origins, scroll slack) already mirror into
+   `view` and move verbatim; the ~38 egui-coupled ones (comms/dashboard
+   sizing, layout) need their assertions re-expressed against the kernel.
+   This is first because it is mechanical and because the kernel was made
+   pure precisely so these tests could leave egui. Until they move, egui
+   cannot be removed.
+2. **Add gpui to the workspace** with the `xattr` `[patch.crates-io]` and the
+   vendored-centrifuge patch mirrored (the U4e lesson: cargo ignores a path
+   dependency's `[patch]`, so the workspace root must carry them). ~520
+   crates, ~3.1 GB target, Vulkan mandatory — the standing cost, accepted.
+3. **A GPUI `main` beside the egui one**, reusing `proto/gpui-island`'s shell,
+   `src/view`, `gate.rs` and `halo.rs` verbatim. Keep the threads
+   (`src/shell_threads.rs`), the channels, the store and `map_render.rs`
+   exactly as they are; only the handoff changes (U6).
+4. **Port `impl ShipApp` panel by panel** into the GPUI `Render`, in the U5
+   order already proven, each with a capture and a number. The 15 custom
+   painters are the most mechanical part.
+5. **Delete egui, eframe, egui_extras**; regenerate `about.toml`; keep
+   `tfg --probe-gpu` `continue-on-error` in CI.
+
+**The standing risk, named in ADR-0020:** the verification method. GPUI
+renders no frames under the project's Xvfb, and egui's `--shoot` was the
+unattended path. The replacement is the Wayland `grim` capture (what U1–U8
+used); an unattended headless capture is deferred, not solved. CI keeps the
+`--probe-gpu` `continue-on-error` guard.
+
+**This session's slice:** the ADRs and this plan are the committed artifact.
+The cutover itself is the next sessions' work, starting at step 1 (the test
+migration), because it is the mechanical unblock for removing egui and it
+needs no GPU to verify.

@@ -2,7 +2,13 @@
 
 ## Status
 
-Accepted. Reaffirms ADR-0002 against new evidence. No framework migration.
+**Superseded by ADR-0020 (2026-10-12).** The owner retired this decision
+after U1-U7 measured every blocker it rested on and found them either gone
+or workable: GPUI presents on this machine's Wayland compositor (not just
+Xvfb), the widget sheet ports at measured geometry, and the halo gap is
+settled as ADR-0019's Low tier. The original reasoning and the cost analysis
+are preserved below unchanged — the cost numbers still stand and are why
+ADR-0020 calls the port 6-10 weeks rather than free.
 
 ## 2026-10-11 re-measurement
 
