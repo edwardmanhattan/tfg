@@ -239,6 +239,30 @@ pub const fn cast_offset() -> (f32, f32, f32, f32) {
 pub const TITLE_SIZE: f32 = 12.5;
 pub const TITLE_TRACKING: f32 = 1.8;
 
+// ---------------------------------------------------------------------------
+// Text sizes
+//
+// Mirrored from `tokens.rs` (`TEXT_*_PT`), plain f32s so both shells read
+// the same numbers. The rationale lives there and is not repeated here;
+// the short version: these are the BASE the app lays out in (read across
+// a room, in glare), the Settings scale multiplies on top, and the five
+// move together as one proportion. Body == button on purpose. The island
+// title band is absent on purpose (set against `TITLE_H`, not free text).
+// ---------------------------------------------------------------------------
+
+/// Hints and asides.
+pub const TEXT_SMALL_PT: f32 = 10.5;
+/// What plain body text draws in.
+pub const TEXT_BODY_PT: f32 = 15.0;
+/// Equal to `TEXT_BODY_PT` on purpose: a button is a pressable label.
+pub const TEXT_BUTTON_PT: f32 = 15.0;
+/// Modal and section headings.
+pub const TEXT_HEADING_PT: f32 = 21.0;
+/// Readouts and code, in the monospace family.
+pub const TEXT_MONO_PT: f32 = 15.0;
+/// The Settings row's "Larger" step, which is also what the app boots at.
+pub const TEXT_SCALE_LARGER: f32 = 1.15;
+
 /// Title band scanline texture. Restricted to the band on purpose
 /// (`DESIGN.md`'s "Texture, confined"): rendered across a body the rules cut
 /// through the rows and cost legibility on the smallest text on the panel.
@@ -367,11 +391,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_palette_has_no_toolkit_type() {
-        // The whole point of the kernel, pinned.
+    fn the_palette_has_no_toolkit_type() {        // The whole point of the kernel, pinned.
         let c = CONSOLE_NIGHT;
         assert_eq!((c.r, c.g, c.b, c.a), (0x0F, 0x17, 0x2A, 255));
         assert_eq!(c.as_f32()[0], 0x0F as f32 / 255.0);
+    }
+
+    #[test]
+    fn text_sizes_mirror_the_tokens() {
+        // `view` is the shell-readable copy; `tokens` is the source of
+        // truth. A drift here is a silent two-size UI, so it is pinned.
+        // (Only the f32s are read; no egui type crosses the seam.)
+        assert_eq!(TEXT_SMALL_PT, crate::tokens::TEXT_SMALL_PT);
+        assert_eq!(TEXT_BODY_PT, crate::tokens::TEXT_BODY_PT);
+        assert_eq!(TEXT_BUTTON_PT, crate::tokens::TEXT_BUTTON_PT);
+        assert_eq!(TEXT_HEADING_PT, crate::tokens::TEXT_HEADING_PT);
+        assert_eq!(TEXT_MONO_PT, crate::tokens::TEXT_MONO_PT);
+        assert_eq!(TEXT_SCALE_LARGER, crate::tokens::TEXT_SCALE_LARGER);
     }
 
     #[test]

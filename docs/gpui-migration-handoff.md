@@ -159,3 +159,37 @@ path dependency, so `gpui-shell` resolved upstream `tokio-centrifuge`
 (no `with_connect_data`) until the vendor patch was mirrored into
 `proto/gpui-shell/Cargo.toml`. U8 will meet this class of issue in
 reverse when the patches move into the workspace.
+
+## U3 verification log (2026-10-12)
+
+**Correction to the analysis first:** the shipped app does NOT vendor
+Inter — it draws egui's stock fonts (Ubuntu-Light proportional, epaint
+monospace with built-in Hack). The "four Inter families" line in
+`docs/gpui-migration-analysis.md:4.3` describes an aspiration, not the
+code. The Inter/JetBrains bytes live in `proto/p5-epaint/assets` (glass
+experiment). So U3 is additive, not a port: register real fonts where
+egui never had them.
+
+**What landed.** `view` gains the five `TEXT_*_PT` sizes + `TEXT_SCALE_
+LARGER`, mirrored from `tokens.rs` with rationale-by-reference, pinned by
+`text_sizes_mirror_the_tokens` (9/9 view tests green). `gpui-shell`
+registers Inter Regular/Medium/SemiBold + JetBrains Mono via
+`add_fonts(include_bytes!(...))` (fatal on failure, so no silent system
+fallback), draws the title in Inter SemiBold at body size with a
+`FontFallbacks(["Hack"])` chain, and the count line in monospace with a
+`→` arrow — the exact glyph class egui needed the `Hack` append for.
+
+**Capture** (`TFG_SCENARIO=surge`, crop 960x1048+960+32): fill 0.978
+`CONSOLE_NIGHT`, 1,103 bright px, three lines `tfg // gpui shell` /
+`85 fixes` / `surge → java sea`, arrow present (not `.notdef`).
+Typeface proof without a second capture: `fc-scan` shows the files'
+internal families are `Inter` / `JetBrains Mono`, `fc-list` shows no
+system Inter to shadow them, and registration `expect()`s — the pixels
+can only be our bytes.
+
+**Environment note.** `/tmp/opencode/lvp` (software Vulkan) vanished to
+tmp cleanup mid-session (`NoSupportedDeviceFound` on the Intel iGPU —
+blade rejects it, reason unexamined). Recreated without root by fetching
+`vulkan-swrast` 26.2.2 from the Omarchy mirror and unpacking to the same
+path; the handoff env recipe works unchanged. The durable fix is still
+`yay -S vulkan-swrast`.

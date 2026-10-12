@@ -8,21 +8,30 @@
 //! `notify()`s only when fixes arrive — the first retained-mode proof of
 //! the U2 notify policy (no repaint timer; arrival-driven updates).
 //!
-//! Still out of scope: theme/fonts (`apply_ops_theme`, glyph fallbacks),
-//! the map thread (egui-tainted `ColorImage` handoff, U6), and the timed
-//! `notify_after` sites (step-gate, roster door, halo flash).
+//! U3 theme/fonts: Inter (Regular/Medium/SemiBold) + JetBrains Mono are
+//! registered from `proto/p5-epaint/assets` (bytes vendored by the glass
+//! experiment; U8 moves fonts to a shared assets dir). Text sizes come
+//! from `view` (mirrored from `tokens`, pinned by test). The arrow line
+//! proves the symbol fallback: egui needed a `Hack` append for U+2192 et
+//! al; here the fallback chain is `FontFallbacks::from_fonts(["Hack"])`
+//! against the system font, no vendored bytes.
+//!
+//! Still out of scope: the map thread (egui-tainted `ColorImage` handoff,
+//! U6) and the timed `notify_after` sites (step-gate, roster door, halo).
 //!
 //! Status: written, capture-pending. A window is only "working" after the
 //! real binary is driven and captured (see the handoff's U2 log).
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext, Application, AsyncApp, Bounds, Context, IntoElement, ParentElement, Render,
-    Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, size,
+    App, AppContext, Application, AsyncApp, Bounds, Context, FontFallbacks, FontWeight,
+    IntoElement, ParentElement, Render, Styled, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, div, font, px, size,
 };
 use tfg::geo::track::Fix;
 use tfg::shell_threads::{PollThreadConfig, WireKind, spawn_poll_thread};
@@ -60,10 +69,25 @@ impl Render for Root {
             .items_center()
             .justify_center()
             .gap(px(6.0))
-            .text_size(px(TITLE_SIZE))
+            .font(
+                gpui::Font {
+                    family: "Inter".into(),
+                    weight: FontWeight::SEMIBOLD,
+                    fallbacks: Some(FontFallbacks::from_fonts(vec!["Hack".to_string()])),
+                    ..font("Inter")
+                },
+            )
+            .text_size(px(TEXT_BODY_PT))
             .text_color(rgba(MAP_INK))
             .child("tfg // gpui shell")
             .child(format!("{} fixes", self.fixes))
+            .child(
+                div()
+                    .font_family("monospace")
+                    .text_size(px(TEXT_MONO_PT))
+                    .text_color(rgba(BODY_SILVER))
+                    .child("surge → java sea"),
+            )
     }
 }
 
@@ -74,6 +98,23 @@ impl Render for Root {
 /// alive past this function.
 fn main() {
     Application::new().run(|cx: &mut App| {
+        // U3 fonts: Inter in three weights + JetBrains Mono, bytes shared
+        // with the glass experiment until U8 gives fonts a proper home.
+        // GPUI resolves weight from the font data itself, so unlike egui
+        // (one family name per weight) this stays one family. Failures are
+        // fatal: an unregistered Inter silently becomes the system font and
+        // every later capture lies about the typeface.
+        cx.text_system()
+            .add_fonts(vec![
+                Cow::Borrowed(include_bytes!("../../p5-epaint/assets/Inter-Regular.ttf").as_slice()),
+                Cow::Borrowed(include_bytes!("../../p5-epaint/assets/Inter-Medium.ttf").as_slice()),
+                Cow::Borrowed(include_bytes!("../../p5-epaint/assets/Inter-SemiBold.ttf").as_slice()),
+                Cow::Borrowed(
+                    include_bytes!("../../p5-epaint/assets/JetBrainsMono-Regular.ttf").as_slice(),
+                ),
+            ])
+            .expect("bundled fonts register");
+
         // Channels the poll thread owns one end of; the shell keeps the
         // UI-side ends it needs and drops the rest at quit.
         let shutdown = Arc::new(AtomicBool::new(false));
