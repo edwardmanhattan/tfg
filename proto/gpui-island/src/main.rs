@@ -23,7 +23,8 @@
 use gpui::{
     AnyElement, App, AppContext, Application, AsyncApp, Bounds, Context, CursorStyle, FontWeight,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
-    ParentElement, PathBuilder, Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement,
+    ParentElement, PathBuilder, Render, ScrollHandle, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement,
     Styled, Window, WindowBounds, WindowOptions, canvas, div, fill, img, point, prelude::*, px,
     size,
 };
@@ -708,7 +709,30 @@ impl Render for IslandDemo {
                 .children(self.gate.image().map(|frame| {
                     img(frame).w_full().h_full().object_fit(ObjectFit::Fill)
                 }))
-                .child(roster_sheet(0))
+                .child(if std::env::var("BUTTONS").as_deref() == Ok("1") {
+                    // U5's buttons slice: the theme's button, its states
+                    // and its small variant, over the real map.
+                    buttons_layer().into_any_element()
+                } else if std::env::var("LAYOUT").as_deref() == Ok("1") {
+                    // U5's layout slice: the island body's spacing,
+                    // separator, indent and row/column composition.
+                    layout_layer().into_any_element()
+                } else if std::env::var("CHOICE").as_deref() == Ok("1") {
+                    // U5's choice slice: checkbox, toggle and radio.
+                    choice_layer().into_any_element()
+                } else if std::env::var("INPUT").as_deref() == Ok("1") {
+                    // U5's input slice: the text field, its hint and its
+                    // multiline height.
+                    input_layer().into_any_element()
+                } else if std::env::var("MILLER").as_deref() == Ok("1") {
+                    // U5's lists slice: a Miller-columns picker.
+                    miller_layer().into_any_element()
+                } else if std::env::var("TOOLTIP").as_deref() == Ok("1") {
+                    // U5's tooltip slice: the popup frame, gap and shadow.
+                    tooltip_layer().into_any_element()
+                } else {
+                    roster_sheet(0).into_any_element()
+                })
                 .into_any_element();
         }
 
@@ -1068,6 +1092,639 @@ div()
         }
         root.into_any_element()
     }
+}
+
+/// The console's button, from `apply_ops_theme` (U5's buttons slice).
+///
+/// Every value is the theme's, not a guess: fill `BUTTON_GRAPHITE`, a 1px
+/// border that rests `HAIRLINE_SLATE` and lifts `CUT_GREY` on hover and
+/// `RADAR_CYAN` on press, corner radius `CONTROL_RADIUS` (6), label ink
+/// `BUTTON_LABEL` lifting to `BUTTON_LABEL_HOVER`, at `TEXT_BUTTON_PT` (15)
+/// in the proportional family — the shipped console draws egui's stock
+/// proportional face, so the GPUI port draws the registered Inter rather
+/// than the monospace family. Padding is `BUTTON_PADDING` (12, 8); the
+/// height is content-driven (text line + padding), matching egui.
+///
+/// `small` is `ui.small_button`: the same fill/border/radius and ink at
+/// `TEXT_SMALL_PT` (10.5), which is the whole difference — egui's
+/// small_button is a stock button drawn one size down.
+///
+/// Disabled paints a dimmed face (dimmed fill + dimmed ink + hairline
+/// border) with no hover/active states — `add_enabled(false, …)`. NOTE
+/// (the U5 trap, handoff §5 panel 2): GPUI `Button`-from-divs carries no
+/// inner shadow the way a disabled egui icon button does, so a port that
+/// ships an enabled-looking disabled button is WRONG here; the dim is the
+/// port.
+fn button(label: impl Into<SharedString>, small: bool, disabled: bool, hot: bool) -> impl IntoElement {
+    let size = if small { TEXT_SMALL_PT } else { TEXT_BUTTON_PT };
+    let mut el = div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(BUTTON_PADDING.0))
+        .py(px(BUTTON_PADDING.1))
+        .rounded(px(CONTROL_RADIUS))
+        .border(px(1.0))
+        .font_family("Inter")
+        .text_size(px(size));
+    if disabled {
+        el = el
+            .bg(rgba(BUTTON_GRAPHITE.with_alpha(140)))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .text_color(rgba(BUTTON_LABEL.with_alpha(120)));
+    } else {
+        el = el.bg(rgba(BUTTON_GRAPHITE)).border_color(rgba(HAIRLINE_SLATE));
+        if hot {
+            el = el
+                .bg(rgba(RADAR_CYAN.with_alpha(40)))
+                .border_color(rgba(CUT_GREY));
+        }
+        el = el.text_color(rgba(BUTTON_LABEL));
+    }
+    el.child(label.into())
+}
+
+/// A `ui.separator()`: a hairline rule across the body, egui's default
+/// separator stroke at the theme's `HAIRLINE_SLATE`. In the reference it is
+/// the full inner width, one device px, sitting between the header block and
+/// the body below it.
+fn separator() -> impl IntoElement {
+    div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE))
+}
+
+/// A choice widget (U5's choice slice), from egui's `ui.checkbox` /
+/// `ui.toggle_value` at the app theme. The box is `icon_width` (14) square —
+/// `spacing.icon_width`, `icon_width_inner` (8) for the mark — with the
+/// control's corner radius (6), fill `BUTTON_GRAPHITE` and a 1px
+/// `HAIRLINE_SLATE` border, the label `icon_spacing` (4) to its right at
+/// `TEXT_BODY_PT`. The mark is egui's check path (a down-then-up chevron),
+/// `BUTTON_LABEL` for a plain checkbox and `DEEP_WELL` for a toggle whose
+/// active state fills the box `RADAR_CYAN` with a cyan border.
+///
+/// `toggle` selects `ui.toggle_value` (active = cyan fill + dark mark)
+/// over `ui.checkbox` (mark on graphite). Geometry is identical: egui's
+/// toggle_value IS a checkbox drawn one interaction state differently.
+fn checkbox(checked: bool, toggle: bool, label: impl Into<SharedString>) -> impl IntoElement {
+    let ink = if toggle && checked {
+        DEEP_WELL
+    } else {
+        BUTTON_LABEL
+    };
+    let (fill, border) = if toggle && checked {
+        (RADAR_CYAN, RADAR_CYAN)
+    } else {
+        (BUTTON_GRAPHITE, HAIRLINE_SLATE)
+    };
+    // egui's check path, scaled to the 8px inner box: left-mid down to
+    // bottom-mid, up to right-top. Painted through `canvas` because no box
+    // primitive draws a chevron. The canvas fills the 14px box, so the
+    // path is relative to that box's origin.
+    let mark = canvas(
+        |b, _, _| b,
+        move |b, _, window, _| {
+            let (x0, y0) = (f32::from(b.origin.x), f32::from(b.origin.y));
+            let p = |x: f32, y: f32| point(px(x), px(y));
+            let mut path = PathBuilder::stroke(px(1.6));
+            path.move_to(p(x0 + 3.0, y0 + 7.0));
+            path.line_to(p(x0 + 6.0, y0 + 10.0));
+            path.line_to(p(x0 + 11.0, y0 + 4.0));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgba(ink));
+            }
+        },
+    )
+    .size(px(14.0));
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+        .child(
+            div()
+                .w(px(14.0))
+                .h(px(14.0))
+                .rounded(px(CONTROL_RADIUS))
+                .bg(rgba(fill))
+                .border(px(1.0))
+                .border_color(rgba(border))
+                .flex()
+                .items_center()
+                .justify_center()
+                .children(if checked { Some(mark) } else { None }),
+        )
+        .child(
+            div()
+                .text_size(px(TEXT_BODY_PT))
+                .text_color(rgba(BODY_SILVER))
+                .child(label.into()),
+        )
+}
+
+/// A radio button (U5's choice slice), from egui's `ui.radio_value`. The
+/// circle is the same `icon_width` (14) box, corner radiused to a circle,
+/// fill `BUTTON_GRAPHITE` + 1px `HAIRLINE_SLATE` at rest; selected fills
+/// `selection.bg_fill` (`RADAR_CYAN`) with a `selection.stroke`
+/// (`DEEP_WELL`) ring and a `fg_selected` (white) inner dot at
+/// `icon_width_inner` (8). Same box geometry as the checkbox — the two are
+/// one widget drawn differently, which is why they share `icon_width`.
+fn radio(selected: bool, label: impl Into<SharedString>) -> impl IntoElement {
+    let (fill, border) = if selected {
+        (RADAR_CYAN, DEEP_WELL)
+    } else {
+        (BUTTON_GRAPHITE, HAIRLINE_SLATE)
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+        .child(
+            div()
+                .w(px(14.0))
+                .h(px(14.0))
+                .rounded(px(7.0))
+                .bg(rgba(fill))
+                .border(px(1.0))
+                .border_color(rgba(border))
+                .flex()
+                .items_center()
+                .justify_center()
+                .children(if selected {
+                    Some(
+                        div()
+                            .w(px(4.0))
+                            .h(px(4.0))
+                            .rounded(px(2.0))
+                            .bg(rgba(Rgba::rgb(0xFF, 0xFF, 0xFF))),
+                    )
+                } else {
+                    None
+                }),
+        )
+        .child(
+            div()
+                .text_size(px(TEXT_BODY_PT))
+                .text_color(rgba(BODY_SILVER))
+                .child(label.into()),
+        )
+}
+
+/// The U5 choice slice: the checkbox, the toggle and the radio, each in both
+/// states, over the real map. Static states, seeded like the button slice's
+/// hover/active paints — no synthetic input, the states are booleans.
+/// Reference: `examples/choice_probe` rendered at the app theme (a real
+/// egui `ui.checkbox`/`ui.toggle_value`/`ui.radio_value`), which is the
+/// console's own choice vocabulary.
+fn choice_layer() -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(24.0))
+        .top(px(24.0))
+        .p(px(12.0))
+        .rounded(px(8.0))
+        .bg(rgba(Rgba::black_alpha(150)))
+        .flex()
+        .flex_col()
+        .gap(px(ITEM_SPACING.1))
+        .child(checkbox(true, false, "Geographic grid"))
+        .child(checkbox(false, false, "Reduce motion"))
+        .child(checkbox(true, true, "Side zone (toggle)"))
+        .child(checkbox(false, true, "Reduce motion (toggle)"))
+        .child(radio(true, "option A"))
+        .child(radio(false, "option B"))
+}
+
+/// A text field (U5's input slice), from egui's `TextEdit` at the app
+/// theme. The box is `DEEP_WELL` (`visuals.extreme_bg_color`) with a 1px
+/// `HAIRLINE_SLATE` border and the control's radius (6); the text is
+/// `TEXT_BODY_PT` in `MAP_INK`, vertically centered, with `text_edit`
+/// padding (`ui.spacing().text_edit_width` governs only width, not this
+/// inner pad — measured 4px each side). A `hint` is placeholder ink at
+/// `BODY_SILVER`, shown only while the field is empty. `multiline` makes
+/// the box taller (the reference's 3-row field is ~53px vs the singleline
+/// 19px) and top-aligns the text instead of centering it.
+///
+/// This ports the field's LOOK (fill, border, radius, ink, hint, the
+/// singleline/multiline height), not an editable text buffer — GPUI input
+/// ownership is its own surface and is deliberately out of scope for this
+/// geometry slice. The reference is `examples/input_probe`, a real egui
+/// `TextEdit` at the app theme.
+fn text_field(value: impl Into<SharedString>, hint: impl Into<SharedString>, multiline: bool) -> impl IntoElement {
+    let value: SharedString = value.into();
+    let empty = value.len() == 0;
+    let shown: SharedString = if empty { hint.into() } else { value };
+    let ink = if empty { BODY_SILVER } else { MAP_INK };
+    let mut box_el = div()
+        .w_full()
+        .px(px(4.0))
+        .rounded(px(CONTROL_RADIUS))
+        .bg(rgba(DEEP_WELL))
+        .border(px(1.0))
+        .border_color(rgba(HAIRLINE_SLATE))
+        .font_family("Inter")
+        .text_size(px(TEXT_BODY_PT))
+        .text_color(rgba(ink));
+    box_el = if multiline {
+        // Wrap: without it a long line runs past the panel's right edge
+        // instead of breaking — visible immediately in the capture.
+        box_el
+            .min_h(px(48.0))
+            .py(px(4.0))
+            .items_start()
+            .overflow_hidden()
+            .child(
+                div()
+                    .w_full()
+                    .text_size(px(TEXT_BODY_PT))
+                    .child(shown),
+            )
+    } else {
+        box_el
+            .h(px(19.0))
+            .flex()
+            .items_center()
+            .child(shown)
+    };
+    box_el
+}
+
+/// The U5 input slice: singleline (empty-with-hint, filled, password-style),
+/// and a multiline field, over the real map. The password field is drawn as
+/// its mask (`••••••`) because the field LOOK is identical to singleline —
+/// egui's `.password(true)` changes the text, not the box — so the port
+/// carries the box and shows the masked content. Reference:
+/// `examples/input_probe` at the app theme.
+fn input_layer() -> impl IntoElement {
+    let field_label = |t: &'static str| {
+        div()
+            .text_size(px(TEXT_BODY_PT))
+            .text_color(rgba(MAP_INK))
+            .child(t)
+    };
+    div()
+        .absolute()
+        .left(px(24.0))
+        .top(px(24.0))
+        .w(px(300.0))
+        .p(px(12.0))
+        .rounded(px(8.0))
+        .bg(rgba(Rgba::black_alpha(150)))
+        .flex()
+        .flex_col()
+        .gap(px(ITEM_SPACING.1))
+        .child(field_label("singleline"))
+        .child(text_field("", "search", false))
+        .child(field_label("filled"))
+        .child(text_field("KRI Ahmad Yani", "", false))
+        .child(field_label("password"))
+        .child(text_field("••••••••", "", false))
+        .child(field_label("multiline"))
+        .child(text_field("a session for photographing the console\nverify the three modals", "", true))
+}
+
+/// A Miller-columns list (U5's lists slice): the Fleet picker's taxonomy
+/// column plus its leaf column, drawn from the geometry the reference
+/// (`examples/miller_probe`) measured.
+///
+/// The numbers, all measured against that probe at the app theme:
+/// - the console's `picker_row_height` is **39pt** here (`max(label,
+///   button) + item_spacing.y`; a themed button is 39pt in this egui 0.36
+///   build, not the 22 the handoff's earlier note guessed — that note is
+///   corrected below).
+/// - the LEAF row's actual pitch is **46pt** (name + weak subtitle + a
+///   28px thumbnail + an assign `small_button`), measured assign-top to
+///   assign-top: 111 / 157 / 203.
+/// - a `small_button` (assign) is 19pt; a category `selectable_value` is
+///   the stock 18pt button.
+///
+/// The port draws the taxonomy column (selected = cyan `selection` fill +
+/// deep-well ink, the rest graphite/hairline) and the leaf column (28px
+/// `PANEL_SLATE` thumbnail disc, name at body, weak subtitle at small, an
+/// assign `small_button`, the armed row ringed 1px `RADAR_CYAN` expand-2
+/// r3 — the hand-painted selection `picker_leaf_row_ui` uses). GPUI's
+/// virtual list is the plan's suggestion for the real 290-line drill; this
+/// slice draws the row vocabulary at the measured pitch.
+fn miller_layer() -> impl IntoElement {
+    let cat = |name: String, selected: bool| {
+        let (fill, border, ink) = if selected {
+            (RADAR_CYAN, RADAR_CYAN, DEEP_WELL)
+        } else {
+            (BUTTON_GRAPHITE, HAIRLINE_SLATE, BUTTON_LABEL)
+        };
+        div()
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(px(CONTROL_RADIUS))
+            .bg(rgba(fill))
+            .border(px(1.0))
+            .border_color(rgba(border))
+            .font_family("Inter")
+            .text_size(px(TEXT_BUTTON_PT))
+            .text_color(rgba(ink))
+            .child(SharedString::from(name))
+    };
+    // One leaf row: thumbnail, name+subtitle, assign; armed is ringed.
+    // The row is the reference's 46pt pitch; `top` is where it sits in the
+    // column. Absolute (the roster sheet's technique) because a flex
+    // column's `.h()` does not constrain a row — the first two captures
+    // measured a 60px pitch and an ellipse thumbnail before this.
+    let leaf = |name: String, sub: String, armed: bool, top: f32| {
+        let mut row = div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(top))
+            .w_full()
+            .h(px(46.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .w(px(28.0))
+                    .h(px(28.0))
+                    .flex_shrink_0()
+                    .rounded(px(14.0))
+                    .bg(rgba(PANEL_SLATE)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_shrink_0()
+                    .child(
+                        div()
+                            .text_size(px(TEXT_SMALL_PT))
+                            .text_color(rgba(MAP_INK))
+                            .child(SharedString::from(name)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(TEXT_SMALL_PT))
+                            .text_color(rgba(BODY_SILVER))
+                            .child(SharedString::from(sub)),
+                    ),
+            )
+            .child(button("assign", true, false, false));
+        if armed {
+            row = row.child(
+                div()
+                    .absolute()
+                    .left(px(-2.0))
+                    .top(px(-2.0))
+                    .right(px(-2.0))
+                    .bottom(px(-2.0))
+                    .rounded(px(3.0))
+                    .border(px(1.0))
+                    .border_color(rgba(RADAR_CYAN)),
+            );
+        }
+        row
+    };
+    div()
+        .absolute()
+        .left(px(24.0))
+        .top(px(24.0))
+        .w(px(520.0))
+        .p(px(12.0))
+        .rounded(px(8.0))
+        .bg(rgba(Rgba::black_alpha(150)))
+        .flex()
+        .flex_row()
+        .gap(px(12.0))
+        // taxonomy column
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(TEXT_SMALL_PT))
+                        .text_color(rgba(BODY_SILVER))
+                        .child("Category"),
+                )
+                .child(cat("Perang".to_string(), true))
+                .child(cat("Angkut".to_string(), false))
+                .child(cat("Latih".to_string(), false)),
+        )
+        .child(div().w(px(1.0)).h_full().bg(rgba(HAIRLINE_SLATE)))
+        // leaf column
+        .child(
+            div()
+                .flex_1()
+                .relative()
+                .child(
+                    div()
+                        .text_size(px(TEXT_SMALL_PT))
+                        .text_color(rgba(BODY_SILVER))
+                        .child("Pieces"),
+                )
+                .child(leaf("KRI Ahmad Yani".to_string(), "frigate · 351".to_string(), true, 20.0))
+                .child(leaf("KRI Yos Sudarso".to_string(), "frigate · 353".to_string(), false, 66.0))
+                .child(leaf("KRI Cakra".to_string(), "SSK · 401".to_string(), false, 112.0))
+                .child(leaf("KRI Ardadedali".to_string(), "SSK · 404".to_string(), false, 158.0)),
+        )
+}
+
+/// A tooltip (U5's tooltip slice), from egui's `on_hover_text`. The frame
+/// is egui's `Frame::popup`: `CONSOLE_NIGHT` fill (`window_fill`), 1px
+/// `HAIRLINE_SLATE` border (`window_stroke`), the menu corner radius (6),
+/// `menu_margin` (6) inner pad, and the `popup_shadow` (offset 6,10, blur 8,
+/// black α96) — a dark wash down-right of the box. It sits a 4pt `gap` below
+/// its anchor (the widget it explains), capped at `tooltip_width` (500).
+///
+/// `open` seeds the shown/hidden state (the proto's stand-in for a hover
+/// gesture, which cannot be synthesized here — the reference is a real egui
+/// `Tooltip::always_open` at a known anchor, `examples/tooltip_probe`).
+/// GPUI has no native hover-tooltip layer, so the port anchors the box below
+/// the wrapped content and offsets it by the gap; the shadow is a faked
+/// offset wash, since GPUI box shadows are not per-element either.
+fn tooltip(anchor: impl IntoElement, text: impl Into<SharedString>, open: bool) -> impl IntoElement {
+    div()
+        .relative()
+        .child(anchor)
+        .children(if open {
+            Some(
+                div()
+                    .absolute()
+                    .top(px(22.0))
+                    .left(px(0.0))
+                    .max_w(px(500.0))
+                    .px(px(6.0))
+                    .py(px(6.0))
+                    .rounded(px(6.0))
+                    .bg(rgba(CONSOLE_NIGHT))
+                    .border(px(1.0))
+                    .border_color(rgba(HAIRLINE_SLATE))
+                    .text_size(px(TEXT_SMALL_PT))
+                    .text_color(rgba(BODY_SILVER))
+                    .shadow(vec![gpui::BoxShadow {
+                        color: gpui::hsla(0.0, 0.0, 0.0, 96.0 / 255.0),
+                        offset: point(px(6.0), px(10.0)),
+                        blur_radius: px(8.0),
+                        spread_radius: px(0.0),
+                    }])
+                    .child(text.into()),
+            )
+        } else {
+            None
+        })
+}
+
+/// The U5 tooltip slice: a control with its tooltip shown (seeded open),
+/// over the real map — the frame, the 4pt gap below the anchor and the
+/// popup shadow, all from `Frame::popup`. Reference:
+/// `examples/tooltip_probe` at the app theme.
+fn tooltip_layer() -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(40.0))
+        .top(px(40.0))
+        .flex()
+        .flex_col()
+        .gap(px(24.0))
+        .child(tooltip(
+            button("New session", false, false, false),
+            "create it with the full form; the rest of the plan is authored in Planning",
+            true,
+        ))
+        .child(tooltip(
+            button("refresh", true, false, false),
+            "re-read the session list from Minos",
+            false,
+        ))
+}
+
+/// The U5 buttons slice, drawn against the map: a stock button and a
+/// `small_button` in their three live states (rest / hover / press), plus a
+/// disabled row. Static states, seeded like the one-lit-rim capture — the
+/// hover/active paints are the theme's, driven by a boolean rather than a
+/// synthetic pointer. Reference: the toolbar row and the essentials island
+/// in `.impeccable/critique/capture-shipped-console-populated.png`.
+fn buttons_layer() -> impl IntoElement {
+    let row = |y: f32, label: &'static str| {
+        div()
+            .absolute()
+            .left(px(24.0))
+            .top(px(y))
+            .flex()
+            .flex_row()
+            .gap(px(ITEM_SPACING.0))
+            .child(button(label, false, false, false))
+            .child(button(label, false, false, true))
+            .child(button(label, true, false, false))
+            .child(button(label, true, false, true))
+    };
+    div()
+        .absolute()
+        .top(px(0.0))
+        .left(px(0.0))
+        .child(row(24.0, "comms"))
+        .child(row(72.0, "refresh"))
+        .child(
+            div()
+                .absolute()
+                .left(px(24.0))
+                .top(px(120.0))
+                .flex()
+                .flex_row()
+                .gap(px(ITEM_SPACING.0))
+                .child(button("disabled", false, true, false))
+                .child(button("disabled", true, true, false)),
+        )
+}
+
+/// The U5 layout slice (panel 3), measured off the reference's Essentials
+/// island (`.impeccable/critique/capture-shipped-console-populated.png`).
+/// What it shows is the island body's own layout vocabulary: a vertical
+/// stack whose items are spaced by `ITEM_SPACING.1` (6pt = 7.5px at this
+/// scale), a horizontal row (combobox cell + label + button) sharing the
+/// width, a full-width `separator()` hairline, an indented label/value pair
+/// (`INDENT`), and a weak aside at `TEXT_SMALL_PT`. The reference's
+/// measured vertical rhythm is the bar: title → +9px → session/refresh row
+/// (38px) → +7px gap → Edit button (23px) → +9px → separator, i.e. items
+/// spaced by the 6pt item gap, not a fixed row pitch.
+///
+/// This mirrors the reference's STRUCTURE (spacing, separator, indent, the
+/// row/column composition), not its exact widget sizes — the console's
+/// combobox is an egui `ComboBox` (a later choice slice) and its buttons are
+/// the button slice's. The layout claims are the gaps and the separator.
+fn layout_layer() -> impl IntoElement {
+    // A section heading, as the island body draws one.
+    let heading = |t: &'static str| {
+        div()
+            .text_size(px(TEXT_BODY_PT))
+            .text_color(rgba(MAP_INK))
+            .child(t)
+    };
+    // A weak aside: the console's `ui.weak`, at the small size, dimmed ink.
+    let weak = |t: &'static str| {
+        div()
+            .text_size(px(TEXT_SMALL_PT))
+            .text_color(rgba(BODY_SILVER))
+            .child(t)
+    };
+    // The session/refresh row: a combobox-width cell, a label, a button —
+    // the horizontal composition, spaced by the item gap.
+    let pick_row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(ITEM_SPACING.0))
+        .child(
+            div()
+                .flex_1()
+                .h(px(18.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .rounded(px(CONTROL_RADIUS))
+                .border(px(1.0))
+                .border_color(rgba(HAIRLINE_SLATE))
+                .bg(rgba(BUTTON_GRAPHITE))
+                .text_size(px(TEXT_SMALL_PT))
+                .text_color(rgba(BUTTON_LABEL))
+                .child("SHOOT-01"),
+        )
+        .child(
+            div()
+                .text_size(px(TEXT_SMALL_PT))
+                .text_color(rgba(BODY_SILVER))
+                .child("session"),
+        )
+        .child(button("refresh", true, false, false));
+    // An indented label/value pair: `INDENT` in, one line apart.
+    let indented = div()
+        .pl(px(INDENT))
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(weak("purpose"))
+        .child(
+            div()
+                .text_size(px(TEXT_BODY_PT))
+                .text_color(rgba(MAP_INK))
+                .child("a session for photographing the console"),
+        );
+    // The body: a vertical stack, one item gap between rows, over the map.
+    div()
+        .absolute()
+        .left(px(24.0))
+        .top(px(24.0))
+        .w(px(280.0))
+        .p(px(12.0))
+        .rounded(px(8.0))
+        .bg(rgba(Rgba::black_alpha(150)))
+        .flex()
+        .flex_col()
+        .gap(px(ITEM_SPACING.1))
+        .child(heading("1 · Session"))
+        .child(pick_row)
+        .child(button("Edit session (blank leaves alone)", true, false, false))
+        .child(separator())
+        .child(indented)
+        .child(weak("joining needs a seat first — ask the Game Master."))
 }
 
 /// Build one halo sprite: the raster at 2x for a 1.25-1.5 ppp display, as a

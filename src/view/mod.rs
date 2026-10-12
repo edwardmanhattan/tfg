@@ -263,6 +263,29 @@ pub const TEXT_MONO_PT: f32 = 15.0;
 /// The Settings row's "Larger" step, which is also what the app boots at.
 pub const TEXT_SCALE_LARGER: f32 = 1.15;
 
+// ---------------------------------------------------------------------------
+// Button / control metrics
+//
+// The geometry a button lays out with: corner radius, the padding inside a
+// stock button, and the gap between controls in a row. Mirrored from
+// `tokens.rs` so the GPUI shell reads the same numbers the egui shell's
+// `apply_ops_theme` installs into `style.spacing`/`style.visuals`. Measured
+// against the populated console capture (`.impeccable/critique/capture-
+// shipped-console-populated.png`): a stock button is 22 device px tall at the
+// 1.25 scale, a `small_button` 18.
+// ---------------------------------------------------------------------------
+
+/// Corner radius on every button/field control.
+pub const CONTROL_RADIUS: f32 = 6.0;
+/// Padding inside a stock `ui.button` (x, y).
+pub const BUTTON_PADDING: (f32, f32) = (12.0, 8.0);
+/// Gap between controls laid out in a row (x, y).
+pub const ITEM_SPACING: (f32, f32) = (8.0, 6.0);
+/// `ui.indent` / `ui.horizontal` inner indent, one level.
+pub const INDENT: f32 = 20.0;
+/// Gap between a choice widget's icon and its label (`spacing.icon_spacing`).
+pub const ICON_SPACING: f32 = 4.0;
+
 /// Title band scanline texture. Restricted to the band on purpose
 /// (`DESIGN.md`'s "Texture, confined"): rendered across a body the rules cut
 /// through the rows and cost legibility on the smallest text on the panel.
@@ -558,6 +581,13 @@ mod tests {
         assert_eq!(TEXT_HEADING_PT, crate::tokens::TEXT_HEADING_PT);
         assert_eq!(TEXT_MONO_PT, crate::tokens::TEXT_MONO_PT);
         assert_eq!(TEXT_SCALE_LARGER, crate::tokens::TEXT_SCALE_LARGER);
+        assert_eq!(CONTROL_RADIUS, crate::tokens::CONTROL_RADIUS as f32);
+        assert_eq!(BUTTON_PADDING.0, crate::tokens::BUTTON_PADDING.x);
+        assert_eq!(BUTTON_PADDING.1, crate::tokens::BUTTON_PADDING.y);
+        assert_eq!(ITEM_SPACING.0, crate::tokens::ITEM_SPACING.x);
+        assert_eq!(ITEM_SPACING.1, crate::tokens::ITEM_SPACING.y);
+        assert_eq!(INDENT, crate::tokens::INDENT);
+        assert_eq!(ICON_SPACING, 4.0);
     }
 
     #[test]

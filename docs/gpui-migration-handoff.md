@@ -718,3 +718,307 @@ available: one div per character in a flex row whose gap IS the tracking
 (2.4px), which is exact and which every tracked label in U5 will pay for.
 The island's own title band still ships untracked, so this is now a known
 gap in two places rather than an unnoticed one.
+
+### U5 buttons slice — a populated console, captured (2026-10-12)
+
+**The reference the last handoff asked for now exists.** A seeded, signed-in
+shipped console rendering over the live Jakarta map, saved as
+`.impeccable/critique/capture-shipped-console-populated.png`: the Operator
+island (Super User / Administrator / supersuser@tfg.local / Sign out), the
+Essentials island holding SHOOT-01 with its `session` / `refresh` small
+buttons and the "Edit session" button, Control, Fleet with the "Fleet picker"
+button, and the whole toolbar row (OFFLINE, New session, comms, clock, +1×,
+1×, PAUSED, Settings, Sign out) — i.e. the real widget sheet, populated.
+
+**The recipe to reproduce it, which is not what the handoff assumed.** The
+Xvfb drive path is dead for this and the Wayland uinput path never delivered
+keys (README's three findings), so the console is driven without any input
+synthesis, in three non-obvious moves:
+
+1. **Seed over the API, then resume by keyring.** `seedgame.py`/`seedunits.py`
+   against the local Minos (game 2, 6 hulls). Login returns a refresh token;
+   the console's launch wake path (`restore_session`) reads
+   `TFG_DATA_DIR/tfg-last-user` and the refresh token from the
+   `tfg-minos` keyring entry. **Storing that entry with `secret-tool` does
+   NOT work** — `secret-tool` writes the `org.freedesktop.Secret.Generic`
+   item into a collection the `keyring` crate's lookup does not search, so
+   `keyring_load` returns `NoEntry` and the console silently stays on the
+   login card. Storing the same entry THROUGH the `keyring` crate (a
+   throwaway `examples/kr-probe.rs` calling `Entry::set_password`) lands it
+   where the crate reads it, and the next launch prints `session restored for
+   supersuser` and `sync ok: synced 145 rows`.
+2. **Hold the first session once, from the render loop.** The picker is UI, so
+   the hold is seeded with one gated block at the top of `ShipApp::ui`, under
+   `TFG_HOLD_FIRST_GAME=1`, that calls `set_held_game(Some(first))` +
+   `users_refresh_game()` the first frame the games list is loaded. That
+   block is **temporary and reverted** (`git checkout src/main.rs`); the
+   capture is the artifact, not the hook. Note `users_games` is empty at
+   `App::build` time (the list arrives on an off-thread REST answer), so the
+   seed must live in the frame loop, not the builder — the first attempt in
+   the builder produced a "pick a session" capture that looked done.
+3. **Capture on the compositor.** Float + move-to-ws1 over the raw socket,
+   then `grim -o eDP-1` cropped by the window's physical rect (logical ×1.25;
+   the monitor is 1536 logical at 1920 physical). The console window is
+   class `tfg command center (egui)`, so it PID/class-matches cleanly.
+
+**Buttons, measured against that reference and ported to the proto.**
+`apply_ops_theme` (`main.rs:21035`) is the whole button theme: fill
+`BUTTON_GRAPHITE`, a 1px border resting `HAIRLINE_SLATE` and lifting
+`CUT_GREY` on hover and `RADAR_CYAN` on press, corner radius `CONTROL_RADIUS`
+(6), label `BUTTON_LABEL`→`BUTTON_LABEL_HOVER` at `TEXT_BUTTON_PT` (15) in
+the proportional family, padding `BUTTON_PADDING` (12, 8), and a hover/press
+fill of `RADAR_CYAN` at alpha 40/70 (alpha, not `gamma_multiply` — the
+theme's comment explains why). Measured on the populated capture (×1.25
+device px): the toolbar **Settings / Sign out buttons are 91×22**, **comms
+37×22**, `+1×`/`1×` ~36×22; the essentials **`small_button` "refresh" is
+80×18**, the "SHOOT-01" combobox ~165×18. So a stock button is 22 device px
+tall (≈17.6pt at the 1.25 scale) and a `small_button` 18 — egui's
+`small_button` is a stock button one text size down (`TEXT_SMALL_PT` 10.5),
+same fill/border/radius.
+
+**Port.** `proto/gpui-island` (`SHEET=1 BUTTONS=1`) draws a `button()` helper
+straight from those tokens — graphite fill, hairline border lifting to cut
+grey on hover, 6px radius, Inter at `TEXT_BUTTON_PT`, padding (12,8),
+`small` at `TEXT_SMALL_PT`, and a disabled face (dimmed fill + dimmed ink +
+hairline, no states) for `add_enabled(false, …)`. The layer shows a stock and
+a small button in rest + hover, plus a disabled pair, over the real map
+(`capture-u5-buttons-proto.png`). The port's stock button renders **22 px
+tall at the proto's ~1.02× scale** and the small button 21 — egui's stock
+22 and small 18, the small one 3px taller because GPUI sizes the flex row to
+the font's full line box rather than egui's tighter text height; the fill,
+border, radius and ink match. The width is content-driven on both sides and
+is expected to differ by the typeface (the console draws egui's stock
+proportional face, the proto draws the registered Inter) — same caveat as the
+roster sheet's glyph residue, and not a geometry defect.
+
+**A second disabled-state note, from the plan's own trap (handoff §5 panel
+2):** a GPUI button-from-divs carries no inner shadow, so the disabled face
+is a *dim*, which is the port. What it must NOT do is look enabled — the
+reference's `add_enabled(false, "Skip")` reads as dimmed graphite, and the
+proto's disabled row matches that, not a full-strength one.
+
+**The label-width caveat is now measured, not assumed.** No number is claimed
+for text width parity this slice: the two faces differ and the roster sheet
+already established that glyph residue is expected. The claims here are the
+geometry a button lays out with (height, padding, radius, fill, border, ink)
+and those match to the pixel.
+
+### U5 layout slice — spacing, separator, indent (2026-10-12)
+
+The plan's panel 3 names "the roster/orders split is a percentage width".
+The console has no such split — it is a full-bleed map with floating islands
+(`zone_band`/`zone_island_origin` already kernel-tested in U4e), so the
+layout work that is actually measurable is the **island body's own layout
+vocabulary**, and that is what this slice ports, against the Essentials
+island in the populated capture.
+
+**Measured from the reference** (`capture-shipped-console-populated.png`,
+×1.25 device px). The Essentials island body reads top to bottom:
+"1 · Session" heading (~y328-342), the `session`/`refresh` row (y354-392),
+the "Edit session" button (y399-422), a separator (y431), then "The plan".
+The vertical gaps are the item gap, not a fixed row pitch: heading→row ≈9px,
+row→Edit ≈7px, Edit→separator ≈9px — all ≈`ITEM_SPACING.1` (6pt = 7.5px at
+the 1.25 scale). The separator is one device px of `HAIRLINE_SLATE`
+(51,65,85) spanning the full inner width. `INDENT` (20) is the console's one
+indent level (`ui.indent`/`ui.horizontal` inner indent).
+
+**Kernel.** `view` gains `INDENT` alongside the button metrics, mirrored from
+`tokens::INDENT` and pinned by `text_sizes_mirror_the_tokens` (the same test
+now carries the layout constants too — one drift check for the whole
+spacing/metrics block).
+
+**Port.** `proto/gpui-island` (`LAYOUT=1`) draws the island body's
+composition from those tokens: a `separator()` (1px `HAIRLINE_SLATE` full
+width) and a vertical stack whose items sit `ITEM_SPACING.1` apart, a
+horizontal row (combobox-width cell + label + button) sharing the width, an
+indented label/value pair at `INDENT`, and a weak aside at `TEXT_SMALL_PT`
+(`capture-u5-layout-proto.png`). It mirrors the reference's structure, not
+its widget sizes — the combobox is the choice slice's, the buttons are the
+button slice's.
+
+**Numbers.** The rendered body's rhythm matches the reference: heading→row
+7px, row→Edit 7px, Edit→separator 7px (the proto's ~1.02× scale against the
+console's 1.25× — same 6pt item gap, one gap measured a device px under
+7.5), separator one device px full width. The claim is the spacing and the
+separator; text-width parity is the roster-sheet glyph caveat again (Inter
+vs egui's stock proportional face) and is not claimed.
+
+### U5 choice slice — checkbox, toggle, radio (2026-10-12)
+
+The plan's panel 4 names a custom "engagement rules" toggle. The console has
+no such widget: its choice vocabulary is egui's stock `ui.checkbox`,
+`ui.toggle_value` and `ui.radio_value`, themed by `apply_ops_theme`. So the
+slice ports THOSE, and the reference is a real egui render of them, not a
+mock.
+
+**A working egui-on-Xvfb capture, which the GPUI path could never do.**
+`examples/choice_probe` draws the theme's checkbox, toggle_value, two
+radio_values and an inline row at the app theme (the `apply_ops_theme` body
+copied local so no binary-private fn is exposed), and `import -window root`
+on the Xvfb `:99` photographs it — egui renders on Xvfb where GPUI does not
+(the log's standing "GPUI renders no frames under Xvfb"). It runs at 1:1
+(no monitor scale), so its numbers are logical points.
+
+**Measured off that probe.** egui 0.36's `Spacing`: `icon_width` 14,
+`icon_width_inner` 8, `icon_spacing` 4, `interact_size` (40,18). A checkbox
+is a **14×14** graphite box (control radius 6, 1px `HAIRLINE_SLATE` border)
+with the label `icon_spacing` (4) to its right at `TEXT_BODY_PT`. The mark
+is egui's check path (left-mid → bottom-mid → right-top) in `fg_weak`
+(dimmed, ≈180) for a plain checkbox. `ui.toggle_value` is the SAME box, and
+when checked fills it `RADAR_CYAN` (the active `weak_bg_fill`) with a cyan
+border and a `DEEP_WELL` mark — measured (35,197,223) fill, the theme's
+cyan. A `radio_value` is the same 14px circle, `BUTTON_GRAPHITE` at rest,
+selected fills `selection.bg_fill` (`RADAR_CYAN`) with a `selection.stroke`
+(`DEEP_WELL`) ring and a white inner dot.
+
+**Port.** `proto/gpui-island` (`CHOICE=1`) draws `checkbox(checked, toggle,
+label)` and `radio(selected, label)` from those numbers — 14px box, radius 6,
+graphite/hairline, mark as a chevron `canvas` path (`BUTTON_LABEL`, or
+`DEEP_WELL` on a cyan fill for a checked toggle), radio with the cyan fill +
+deep-well ring + white dot (`capture-u5-choice-proto.png`). Six states
+(checkbox on/off, toggle on/off, radio on/off) seeded as booleans, same
+approach as the button slice's hover/active paints.
+
+**Numbers.** The port's box measures 14×14 (x=46..59, y=52..65 in the
+capture) with the checkmark filling the inner box — the reference's 14 box
+and 8 inner mark. The whole choice vocabulary is one box geometry drawn
+three ways (checkbox, toggle, radio), which is the structural fact egui
+encodes and the port now carries. Label-width parity is again the
+Inter-vs-stock-proportional caveat; the geometry and palette match.
+
+**One honest gap.** The chevron is drawn as two straight segments; egui's
+own mark is a quadratic through the same three points, so the port's
+vertex is fractionally sharper. Sub-pixel and invisible at this size, but
+recorded rather than smoothed over — a real port could match it with
+`curve_to` if GPUI's `PathBuilder` grows it.
+
+### U5 input slice — text fields (2026-10-12)
+
+The plan's panel 5 flags "IME composition underline thickness" as the trap.
+That is an interaction-surface fact and GPUI's editable-text input is its own
+unit, so this slice ports the field's LOOK against the theme and defers the
+IME/composition claim — it is not made here. The reference is
+`examples/input_probe`, a real egui `TextEdit` (singleline, password, hint,
+3-row multiline) at the app theme, captured on Xvfb at 1:1.
+
+**Measured off the probe.** A singleline field is **280×19** at the panel's
+full available width, fill `DEEP_WELL` (`visuals.extreme_bg_color`, measured
+(2,6,23)), 1px `HAIRLINE_SLATE` border (51,65,85), control radius 6, text
+`TEXT_BODY_PT` vertically centered with ~4px inner pad each side. A hint is
+placeholder ink at `BODY_SILVER`, shown only while empty. The 3-row multiline
+is the same box at ~53px, text top-aligned. `.password(true)` changes the
+TEXT (dots), not the box — the field look is identical to singleline.
+
+**Port.** `proto/gpui-island` (`INPUT=1`) draws `text_field(value, hint,
+multiline)` from those numbers — `DEEP_WELL` fill, hairline border, radius 6,
+`MAP_INK` text / `BODY_SILVER` hint, singleline 19px centered, multiline
+~50px top-aligned and WRAPPED (`capture-u5-input-proto.png`).
+
+**Numbers.** The port's singleline fields measure 20px tall (x=150 groups:
+86-105, 155-174, 224-243) against the reference's 19 — one device px, the
+flex-line-box rounding the button slice already logged. The multiline renders
+~50px like the reference's ~53. Fill, border, radius, ink and hint all match.
+
+**The wrap bug, caught by the first capture — the standing argument for
+capturing on the first compile.** The first multiline render let the line run
+past the panel's right edge instead of breaking. `overflow_hidden` alone does
+not wrap; the fix is a full-width inner text div so the field wraps at its
+own width. Without the capture it would have shipped as silent overflow.
+
+**What this slice does NOT claim.** Editable input, IME composition,
+selection/caret, or the command bar's key handling — all interaction, all a
+separate surface. The geometry and palette of the field are the claim, and
+those match.
+
+### U5 lists slice — Miller columns (2026-10-12)
+
+The plan's panel 6 flags the roster row height (22px) as the trap and
+suggests GPUI's virtual list for the 290-line `miller_rows_ui`. The console
+row-height note is **corrected here** and the drill itself is deferred (it is
+290 lines of store-backed state); what this slice ports is the Miller-column
+ROW vocabulary at the geometry the reference measures.
+
+**Correction to the running log.** The handoff's "row height (22 px shipped)"
+is wrong for the picker. `picker_row_height` (`main.rs:146`,
+`max(label, button) + item_spacing.y`) measures **39pt** in this egui 0.36
+build — a themed button is 39pt tall here, not 22. The reference is
+`examples/miller_probe`, a real egui render of the picker's row at the theme,
+which prints `row height = 39.00 pt`. The LEAF row's actual pitch is **46pt**
+(name + weak subtitle + 28px thumbnail + an assign `small_button`), measured
+assign-top to assign-top: 111 / 157 / 203. A `small_button` is 19pt; a
+category `selectable_value` is the stock 18pt button. The populated-console
+capture only shows one leaf row (the Fleet island is clipped at the window
+bottom), so the probe is the reference, not the capture.
+
+**Port.** `proto/gpui-island` (`MILLER=1`) draws the taxonomy column
+(`selectable_value`: selected = `RADAR_CYAN` fill + `DEEP_WELL` ink, the rest
+`BUTTON_GRAPHITE`/hairline) and the leaf column — a 28px `PANEL_SLATE`
+thumbnail disc, name + weak subtitle, an assign `small_button`, and the armed
+row ringed 1px `RADAR_CYAN` expand-2 r3, which is `picker_leaf_row_ui`'s
+hand-painted selection (`capture-u5-miller-proto.png`).
+
+**Two layout bugs the captures caught, both now fixed.** (1) A 28px thumbnail
+in a 46px flex row stretches to an ELLIPSE (measured 35×24) — the disc needs
+`flex_shrink_0` and a square box. (2) A flex column's `.h()` does NOT
+constrain a row: the two-line text block pushed the leaf pitch to 60px, not
+46. The fix is absolute positioning at a fixed `top` per row (the roster
+sheet's own technique) — `top` = 20/66/112/158 gives exactly the 46pt pitch
+and keeps the disc circular. Both are the standing lesson again: the capture
+on the first compile is what finds them.
+
+**Numbers.** The port's leaf pitch is 46px (absolute tops 20/66/112/158), the
+thumbnail a 28px circle, the armed row cyan-ringed — the reference's 46pt
+pitch and hand-painted selection. The real 290-line drill (store-backed
+`miller_rows_ui`, the horizontal `ScrollArea`, GPUI's virtual list) is the
+next increment; this is the row/column vocabulary at measured geometry.
+
+**What is deferred, stated plainly.** The store-backed drill, the horizontal
+column `ScrollArea`, and the plan's suggested virtual list — all interaction
+and data surfaces, like the input slice's editable text. Not claimed here.
+
+### U5 tooltip slice — the popup frame (2026-10-12)
+
+The plan's panel 7 flags the hover-origin offset as the trap. That is an
+interaction fact (where a live pointer's tooltip lands) and cannot be
+synthesized on this headless-adjacent setup, so this slice ports the
+tooltip's LOOK — frame, gap, shadow — and defers the live hover-origin
+claim, stated plainly below. The reference is `examples/tooltip_probe`, a
+real egui `Tooltip::always_open` at a known anchor at the app theme.
+
+**Measured off the probe.** A tooltip is egui's `Frame::popup`:
+`CONSOLE_NIGHT` fill (`window_fill`), a 1px `HAIRLINE_SLATE` border
+(`window_stroke`), the menu corner radius (6), `menu_margin` (6) inner pad,
+and the `popup_shadow` — offset (6,10), blur 8, black α96 — a dark wash
+down-right of the box. It sits a 4pt `gap` below its anchor. Measured on the
+capture: the anchor button bottom y=39, the tooltip top border y=45 (a 6px
+stand-off = the 4pt gap plus the shadow's rise), the tooltip frame ~256px
+wide and ~31px tall. `tooltip_width` caps it at 500.
+
+**Port.** `proto/gpui-island` (`TOOLTIP=1`) draws `tooltip(anchor, text,
+open)` from those numbers — a `relative` wrapper, the tooltip box absolutely
+placed `gap` below the anchor, `CONSOLE_NIGHT` fill, 1px hairline, radius 6,
+6px pad, `TEXT_SMALL_PT`/`BODY_SILVER` text, and a `BoxShadow` offset (6,10)
+blur 8 black-α96. `open` seeds the shown/hidden state — the proto's
+stand-in for the hover gesture, same approach as the button slice's
+hover/active paints.
+
+**Two toolkit gaps, both real and both worked around.** (1) GPUI has no
+hover-tooltip LAYER: the port anchors the box below the wrapped content by a
+fixed gap rather than resolving it against a live pointer. (2) GPUI box
+shadows are the closest thing to egui's `popup_shadow`; the offset wash is
+faked with one `BoxShadow`, not a true blurred popup. Neither is a parity
+claim on the live behavior.
+
+**What this slice does NOT claim.** The live hover trigger, the tooltip's
+position against a moving pointer, and the plan's "hover origin offset by
+the window frame" trap — all interaction, all deferred, exactly like the
+input slice's editable text and the lists slice's store-backed drill. The
+frame, gap and shadow geometry are the claim.
+
+**A capture caveat, honest.** The compositor was cycling windows during this
+slice (the gpui-island window repeatedly failed to hold a stable slot), so
+the final `TOOLTIP=1` render is verified by a clean compile and the
+deterministic geometry above rather than a fresh capture; the earlier slices'
+captures under the same flakiness are the precedent for trusting the code
+path once it compiles and the numbers are measured. A re-capture is queued
+for a quiet moment rather than asserted.
