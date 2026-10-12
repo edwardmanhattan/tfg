@@ -434,3 +434,47 @@ spike (small, no new API): hold-until-ready — keep displaying the stable
 always painting), plus explicit `drop_image` of retired frames for a
 bounded atlas. Custom upload element stays the follow-up ONLY if those
 numbers demand it.
+
+### Hold-until-ready result — the fix works, stock path adopted
+
+Same crate, three changes: (1) drain writes `pending`, never `frame`;
+(2) `render` gates on `pending.use_render_image(...)` returning `Some`,
+promoting only then, so the STABLE frame stays painted through every
+decode; (3) promotion retires the old frame on both leaking axes —
+`cx.drop_image(old_ri, Some(window))` for the atlas tile and
+`remove_asset` for the CPU asset-map entry (`fetch_asset` never evicts);
+superseded *pending* frames get `remove_asset` too. Counters + a
+`retire` log line make the claim falsifiable.
+
+**Evidence, 356-frame run:** `promote 355 / retire 354` — exactly
+off-by-one (the first promotion has nothing to retire), so every
+displayed frame's tile is dropped on replacement; `enc 356 / promote
+355` shows newest-wins discarding superseded pendings while always
+promoting the latest. Capture: `frame 561 ... up 484 ret 483`, gradient
+full-bleed, **no black patches** — the churn black is gone.
+
+**Memory, which is the real proof.** RSS sampled every 10s across 855
+promotions: 144120 / 147976 / 140608 / 144356 / 144832 / 144924 / 144924
+/ 144956 / 144936 / 148612 / 141228 kB — flat, ±7MB allocator wobble, no
+trend. Leaking would have cost ~1.9MB decoded + ~2MB atlas tile per
+frame (≈3.3GB over that run). Flat RSS proves BOTH the CPU asset map and
+the (in-process, Lavapipe) GPU atlas stay bounded. Steady state is ~1-2
+tiles: the displayed frame's, plus the pending's once promoted.
+
+**Encode cost is a setting, not a wall.** The 25ms p50 above is the
+`image` default: `CompressionType::Fast` **plus `FilterType::Adaptive`**
+(5 filter candidates tried per row). Pinning `FilterType::NoFilter`:
+min 3.9 / p50 11.4 / p95 17.7 / max 28.5 ms — 2.2x cheaper, still
+paints (promote 342 / retire 341). Bytes grow, but they only travel
+memory-to-decoder, never a disk or wire. Budget ~12ms per burst frame on
+the map thread, off-UI.
+
+**Adopted for U6.** Hold-until-ready + explicit retire + `NoFilter`
+encode is the map texture path; no custom upload element. Open items for
+the integration slice: (a) the real producer holds `egui::ColorImage`
+(RGBA, premultiplied) and must encode off-thread — same shape as this
+spike's encoder, but the frame no longer needs `MapResp`'s `egui::ColorImage`
+at all; (b) confirm the colour space matches what gpui expects (this
+spike's synthetic frames are sRGB-agnostic, so gamma is unverified);
+(c) `Image::from_bytes` hashes the whole byte buffer for its id — fine at
+burst cadence, worth a glance if frames ever stream continuously.

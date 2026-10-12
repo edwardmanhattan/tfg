@@ -39,18 +39,49 @@ const FRAME_W: u32 = 800;
 const FRAME_H: u32 = 600;
 
 struct MapDemo {
-    /// Latest decoded-ready frame, swapped in by the drain task.
+    /// Displayed frame: swapped ONLY after its successor decodes
+    /// (hold-until-ready). Never black after first paint.
     frame: Option<Arc<Image>>,
     frame_no: u64,
     encode_ms: f64,
+    /// Newest-wins successor; promoted on decode-ready, never displayed
+    /// raw (displaying it raw is the churn-black bug).
+    pending: Option<(u64, Arc<Image>, f64)>,
+    promoted: u64,
+    retired_tiles: u64,
 }
 
 impl Render for MapDemo {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Hold-until-ready gate. `use_` starts the successor's async
+        // decode (if not running) and notifies this view on completion;
+        // until it returns Some the STABLE frame stays up. Promotion then
+        // retires the old frame on both axes the stock path leaks:
+        // GPU atlas tile (`drop_image`) and CPU asset entry
+        // (`remove_asset` — `fetch_asset` never evicts).
+        if let Some((n, arc, ms)) = self.pending.clone() {
+            if arc.clone().use_render_image(window, cx).is_some() {
+                if let Some(old) = self.frame.take() {
+                    if let Some(old_ri) = old.clone().get_render_image(window, cx) {
+                        cx.drop_image(old_ri, Some(window));
+                        self.retired_tiles += 1;
+                        eprintln!("retire frame={} -> tile dropped", self.frame_no);
+                    }
+                    old.remove_asset(cx);
+                }
+                eprintln!("promote frame={n}");
+                self.frame = Some(arc);
+                self.frame_no = n;
+                self.encode_ms = ms;
+                self.pending = None;
+                self.promoted += 1;
+            }
+        }
         let mut root = div().relative().size_full().bg(gpui::black());
         if let Some(frame) = self.frame.clone() {
             root = root.child(div().absolute().size_full().child(img(frame)));
         }
+        let pend = self.pending.as_ref().map(|(n, _, _)| n.to_string()).unwrap_or_else(|| "-".into());
         root.child(
             div()
                 .absolute()
@@ -62,7 +93,10 @@ impl Render for MapDemo {
                 .font_family("monospace")
                 .text_size(px(13.0))
                 .text_color(gpui::white())
-                .child(format!("frame {} enc {:.1}ms", self.frame_no, self.encode_ms)),
+                .child(format!(
+                    "frame {} enc {:.1}ms pend {} up {} ret {}",
+                    self.frame_no, self.encode_ms, pend, self.promoted, self.retired_tiles
+                )),
         )
     }
 }
@@ -106,7 +140,15 @@ fn main() {
             let mut png = Vec::new();
             {
                 use image::ImageEncoder as _;
-                image::codecs::png::PngEncoder::new(Cursor::new(&mut png))
+                // Default encoder = Fast compression + ADAPTIVE filtering
+                // (5 filters tried per row). FASTFILTER=1 pins NoFilter to
+                // show how much of the encode is filter search.
+                if std::env::var("FASTFILTER").as_deref() == Ok("1") {
+                    image::codecs::png::PngEncoder::new_with_quality(
+                        Cursor::new(&mut png),
+                        image::codecs::png::CompressionType::Fast,
+                        image::codecs::png::FilterType::NoFilter,
+                    )
                     .write_image(
                         &rgba,
                         FRAME_W,
@@ -114,6 +156,16 @@ fn main() {
                         image::ExtendedColorType::Rgba8,
                     )
                     .expect("png encode");
+                } else {
+                    image::codecs::png::PngEncoder::new(Cursor::new(&mut png))
+                        .write_image(
+                            &rgba,
+                            FRAME_W,
+                            FRAME_H,
+                            image::ExtendedColorType::Rgba8,
+                        )
+                        .expect("png encode");
+                }
             }
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             // Newest-wins lives on the consumer (drain-all, keep latest);
@@ -139,7 +191,14 @@ fn main() {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             ..Default::default()
         };
-        let entity = cx.new(|_| MapDemo { frame: None, frame_no: 0, encode_ms: 0.0 });
+        let entity = cx.new(|_| MapDemo {
+            frame: None,
+            frame_no: 0,
+            encode_ms: 0.0,
+            pending: None,
+            promoted: 0,
+            retired_tiles: 0,
+        });
         let drain = entity.clone();
         cx.spawn(async move |cx: &mut AsyncApp| {
             let mut prev_no = 0u64;
@@ -157,12 +216,15 @@ fn main() {
                         let queue_ms = t0.elapsed().as_secs_f64() * 1000.0;
                         eprintln!("ui frame={n} queue={queue_ms:.1}ms");
                         let _ = cx.update(|app| {
-                            drain.update(app, |root: &mut MapDemo, cx| {
-                                root.frame = Some(arc);
-                                root.frame_no = n;
-                                root.encode_ms = ms;
+                            let retired = drain.update(app, |root: &mut MapDemo, cx| {
+                                let r = root.pending.take().map(|(_, a, _)| a);
+                                root.pending = Some((n, arc, ms));
                                 cx.notify();
-                            })
+                                r
+                            });
+                            if let Some(a) = retired {
+                                a.remove_asset(app);
+                            }
                         });
                     }
                 }
