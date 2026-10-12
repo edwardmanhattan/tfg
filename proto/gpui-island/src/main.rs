@@ -23,8 +23,8 @@
 use gpui::{
     App, Application, Bounds, Context, FontWeight, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions, canvas, div, point,
-    prelude::*, px, size,
+    ScrollWheelEvent, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions,
+    canvas, div, point, prelude::*, px, size,
 };
 
 #[path = "../../../src/view/mod.rs"]
@@ -73,6 +73,11 @@ struct IslandDemo {
     /// most one rim lights (ADR-0016). Seeded over island 1 so the bare
     /// capture shows the one-lit-rim state with no synthetic input.
     pointer: Option<(f32, f32)>,
+    /// Column scroll, positive-down. A VIEW transform: positions stay
+    /// unscrolled and every read subtracts it, so a drag clamp never
+    /// fights the scroll and a stale scroll never strands the column
+    /// (re-clamped every frame, because overflow changes with state).
+    zone_scroll: f32,
 }
 
 /// The zone band for this demo: full-bleed column below the top strip,
@@ -81,6 +86,9 @@ struct IslandDemo {
 /// clip rect and a cull predicate, never paint.
 const BAND_TOP: f32 = 56.0;
 const BAND_BOTTOM: f32 = 596.0;
+/// Column overflow: three 300px islands and two 2px gaps against the
+/// 540px band. The column clamp rides this number.
+const ZONE_OVERFLOW: f32 = 3.0 * 300.0 + 2.0 * 2.0 - (BAND_BOTTOM - BAND_TOP);
 
 /// The modal panel's footprint. Fixed by contract, like an island's.
 const MODAL_W: f32 = 480.0;
@@ -161,12 +169,14 @@ impl IslandDemo {
     /// Render island `i`. Positions are window pixels; the caller places
     /// this inside the band clip, so the frame sits band-relative here.
     /// `owned` arrives resolved (ADR-0016: decided once, never per-island).
-    fn island(&mut self, cx: &mut Context<Self>, i: usize, owned: bool) -> impl IntoElement {
+    /// `scroll` is the column's view transform, applied at paint, never
+    /// folded into `pos`.
+    fn island(&mut self, cx: &mut Context<Self>, i: usize, owned: bool, scroll: f32) -> impl IntoElement {
         // Copied out front so the fit log below can write back through
         // `self` without fighting the borrow it reads from.
         let pos = self.islands[i].pos;
         let close_hot = self.islands[i].close_hot;
-        let scroll = self.islands[i].scroll.clone();
+        let handle = self.islands[i].scroll.clone();
         // The island is a FIXED footprint. GPUI needs an explicit outer frame
         // because the bevel and the shadow paint outside the panel box, and
         // an element that overflows needs somewhere to overflow into.
@@ -326,7 +336,7 @@ impl IslandDemo {
             .flex_1()
             .w_full()
             .overflow_y_scroll()
-            .track_scroll(&scroll)
+            .track_scroll(&handle)
             .bg(rgba(CONSOLE_NIGHT))
             .px(px(ISLAND_PAD))
             .pb(px(ISLAND_PAD))
@@ -344,10 +354,10 @@ impl IslandDemo {
         // The live measurement, read at the shell boundary: GPUI's offset
         // runs negative-down, the kernel's positive-down, so the sign
         // flips here and nowhere else. `content` is extent over viewport.
-        let max = scroll.max_offset();
-        let viewport_h = f32::from(scroll.bounds().size.height);
+        let max = handle.max_offset();
+        let viewport_h = f32::from(handle.bounds().size.height);
         let content_h = f32::from(max.height) + viewport_h;
-        let offset = -f32::from(scroll.offset().y);
+        let offset = -f32::from(handle.offset().y);
         let fit = BodyFit { content_h, viewport_h, offset };
         // Zone-debug style, machine-readable: log on change only, so the
         // numbers are grepable without drowning the log at 60fps. This is
@@ -433,7 +443,7 @@ impl IslandDemo {
         div()
             .absolute()
             .left(px(pos.0))
-            .top(px(pos.1 - BAND_TOP))
+            .top(px(pos.1 - BAND_TOP - scroll))
             .w(panel_w)
             .h(panel_h)
             .child(cast)
@@ -470,12 +480,14 @@ impl Render for IslandDemo {
         // Ownership, resolved ONCE per frame over the islands that can own
         // it: open AND on the band. A closed or culled island is gone, not
         // dimmed, and never lights. `owning_island` is kernel-tested; this
-        // is its one call site.
+        // is its one call site. All reads go through the column scroll.
+        self.zone_scroll = self.zone_scroll.clamp(0.0, ZONE_OVERFLOW);
+        let sc = self.zone_scroll;
         let band: view::Box = (0.0, BAND_TOP, 760.0, BAND_BOTTOM);
         let mut live: Vec<(usize, view::Box)> = Vec::new();
         for (idx, st) in self.islands.iter().enumerate() {
-            if st.open && island_on_band(st.pos.1, 0.0, band, 300.0) {
-                live.push((idx, box_at(st.pos.0, st.pos.1, 360.0, 300.0)));
+            if st.open && island_on_band(st.pos.1, sc, band, 300.0) {
+                live.push((idx, box_at(st.pos.0, st.pos.1 - sc, 360.0, 300.0)));
             }
         }
         let rects: Vec<view::Box> = live.iter().map(|(_, r)| *r).collect();
@@ -484,15 +496,55 @@ impl Render for IslandDemo {
         // The band clips; it paints nothing (a zone grows no background).
         // Islands sit band-relative inside it. The 3px bevel bleed clips at
         // the band edge where egui bleeds 8 — same rule, tighter margin.
+        //
+        // The column half of the wheel chain lives here too. Bodies scroll
+        // themselves through the built-in handler (which no-ops, clamped,
+        // at its limit), so this handler only ever moves the COLUMN: when
+        // no open on-band body under the pointer has room, per
+        // `chained_wheel`. One gesture, one surface — never both.
         let mut band_el = div()
             .absolute()
             .left(px(0.0))
             .top(px(BAND_TOP))
             .w(px(760.0))
             .h(px(BAND_BOTTOM - BAND_TOP))
-            .overflow_hidden();
+            .overflow_hidden()
+            .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, window, cx| {
+                let dy = f32::from(ev.delta.pixel_delta(window.line_height()).y);
+                let px = f32::from(ev.position.x);
+                let py = f32::from(ev.position.y);
+                view.pointer = Some((px, py));
+                let band = (0.0, BAND_TOP, 760.0, BAND_BOTTOM);
+                let sc = view.zone_scroll;
+                let mut fit_opt = None;
+                for st in view.islands.iter() {
+                    if !st.open || !island_on_band(st.pos.1, sc, band, 300.0) {
+                        continue;
+                    }
+                    let content =
+                        island_content_box(box_at(st.pos.0, st.pos.1 - sc, 360.0, 300.0));
+                    if !box_contains(content, px, py) {
+                        continue;
+                    }
+                    let max = st.scroll.max_offset();
+                    let viewport_h = f32::from(st.scroll.bounds().size.height);
+                    fit_opt = Some(BodyFit {
+                        content_h: f32::from(max.height) + viewport_h,
+                        viewport_h,
+                        offset: -f32::from(st.scroll.offset().y),
+                    });
+                    break;
+                }
+                // Subtract: positive wheel Y is content moving down, the
+                // same direction the egui column subtracts towards.
+                if chained_wheel(fit_opt, dy, box_contains(band, px, py)) == WheelOwner::Column
+                {
+                    view.zone_scroll = (view.zone_scroll - dy).clamp(0.0, ZONE_OVERFLOW);
+                    cx.notify();
+                }
+            }));
         for (idx, _) in live.iter() {
-            band_el = band_el.child(self.island(cx, *idx, Some(*idx) == owned_idx));
+            band_el = band_el.child(self.island(cx, *idx, Some(*idx) == owned_idx, sc));
         }
 
         let mut root = div()
@@ -678,6 +730,12 @@ fn main() {
                 ],
                 modal_open: false,
                 pointer: Some((380.0, 508.0)),
+                // Seeded mid-column: island 0 cut at the band top, island 2
+                // risen into view at the bottom — the scrolled state, with
+                // no wheel input. Proves the view transform + clamp + cull
+                // path statically; the wheel handler itself is wired and
+                // kernel-decided, awaiting a live gesture.
+                zone_scroll: 120.0,
             })
         })
         .unwrap();

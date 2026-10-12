@@ -246,6 +246,43 @@ proto's `verify-scroll.sh`.
 of U4b). Settles 0/0 → 409/270 within frames of launch. Viewport 270 =
 300 panel − 30 band, exact.
 
+## U4d verification log — wheel chaining (2026-10-12)
+
+**Native behavior found, then designed around.** GPUI's built-in scroll
+handler adds the delta to EVERY scrollable under the cursor and never
+stops propagation: nested scrollers move concurrently (the exact
+two-surfaces-jump failure the chain exists to prevent). So the port
+suppresses nothing and adds the column half: bodies scroll themselves
+(the built-in no-ops, clamped, at its limit), and a band-level
+`on_scroll_wheel` moves the column only when no open on-band body under
+the pointer has room — `view::chained_wheel`, kernel-tested
+(`one_gesture_moves_one_thing`, 13/13 view tests). Sign convention
+verified in the Wayland client source: positive Y is content moving
+down, same as egui, so the column subtracts identically.
+
+**Wiring** (compiles; `Compiling` line in evidence): band container
+carries `on_scroll_wheel` — refresh pointer, resolve body fit from the
+live `ScrollHandle`, route via `chained_wheel`, clamp
+`zone_scroll` to `[0, 364]` every frame. Positions render through
+`pos − scroll` (drag math proven unaffected: the grab absorbs scroll).
+Seeded `zone_scroll = 120` so the static layout exercises the
+view-transform path (top cut + bottom cut) with no gesture.
+
+**Pixels pending.** A fullscreen video occupied the only output during
+verification; the window mapped behind it (hyprctl-confirmed) and was
+killed to hand the screen back. Scrolled-layout capture + live-wheel
+proof wait on a quiet machine. Nothing structural is unverified: the
+decision is kernel-tested, the wiring compiles, the fits log live.
+
+**Compositor API found while relocating.** The `hl` Lua surface is now
+enumerated via error-message introspection: `hl.dsp.window` =
+close,swap,bring_to_top,pseudo,clear_tags,drag,fullscreen,resize,move,
+deny_from_group,tag,set_prop,alter_zorder,toggle_swallow,pin,signal,
+float,center,fullscreen_state,kill,cycle_next; `hl.dsp.workspace` =
+swap_monitors,toggle_special,rename,move,change_id (moves workspaces
+across monitors, not windows across workspaces). No silent window
+relocator found; class-form `focus` remains the capture tool.
+
 **Process fix.** Two `cargo check` replays (0.22–0.46s) served stale
 fingerprints after quick-successive edits and nearly cost a debugging
 session (a stale binary's UI misread as a layout bug). Proto crates now

@@ -438,6 +438,53 @@ impl BodyFit {
 /// but nothing reads it — dead on arrival, deliberately not mirrored.
 pub const BODY_SCROLL_SLACK: f32 = 12.0;
 
+// ---------------------------------------------------------------------------
+// Wheel chaining
+//
+// One gesture moves ONE thing: a body that can still move in the
+// direction the wheel is turning takes it, otherwise the column does.
+// Without the chain both scroll at once and the gesture jumps two
+// surfaces. Mirrors the `side_zone` decision (`main.rs`): the measurement
+// is live (GPUI feeds handles during layout; egui read last frame's),
+// positive wheel Y is content moving down, and the column subtracts.
+//
+
+/// Who takes a wheel gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelOwner {
+    /// A body under the pointer has room: its own scroller moves.
+    Body,
+    /// No body can take it: the column moves (or nothing, if outside).
+    Column,
+    /// Outside the band, or a zero delta: nobody moves.
+    Neither,
+}
+
+/// Route one vertical wheel delta. `fit` is the body under the pointer, if
+/// any open on-band body contains it; `in_band` gates the column fallback.
+pub fn chained_wheel(fit: Option<BodyFit>, wheel_y: f32, in_band: bool) -> WheelOwner {
+    if !in_band || wheel_y == 0.0 {
+        return WheelOwner::Neither;
+    }
+    match fit {
+        Some(f) if wheel_y > 0.0 => {
+            if f.can_scroll_up() {
+                WheelOwner::Body
+            } else {
+                WheelOwner::Column
+            }
+        }
+        Some(f) => {
+            if f.can_scroll_down() {
+                WheelOwner::Body
+            } else {
+                WheelOwner::Column
+            }
+        }
+        None => WheelOwner::Column,
+    }
+}
+
 /// Zone layout: the column's width, clamped to its rails.
 pub fn clamp_zone_width(w: f32, viewport_w: f32) -> f32 {
     w.clamp(ZONE_MIN_W, ZONE_MAX_W).min(viewport_w * 0.8)
@@ -578,6 +625,26 @@ mod tests {
         let mid = BodyFit { content_h: 600.0, viewport_h: 248.0, offset: 100.0 };
         assert!(mid.can_scroll_down());
         assert!(mid.can_scroll_up());
+    }
+
+    #[test]
+    fn one_gesture_moves_one_thing() {
+        let tall = BodyFit { content_h: 600.0, viewport_h: 248.0, offset: 0.0 };
+        let bottom = BodyFit { content_h: 600.0, viewport_h: 248.0, offset: 352.0 };
+        let fitting = BodyFit { content_h: 200.0, viewport_h: 200.0, offset: 0.0 };
+        // Zero delta and outside band: nobody.
+        assert_eq!(chained_wheel(Some(tall), 0.0, true), WheelOwner::Neither);
+        assert_eq!(chained_wheel(Some(tall), 24.0, false), WheelOwner::Neither);
+        // Room in the direction: the body takes it.
+        assert_eq!(chained_wheel(Some(tall), -24.0, true), WheelOwner::Body);
+        // Positive Y is content moving down: needs room above.
+        assert_eq!(chained_wheel(Some(tall), 24.0, true), WheelOwner::Column);
+        assert_eq!(chained_wheel(Some(bottom), 24.0, true), WheelOwner::Body);
+        assert_eq!(chained_wheel(Some(bottom), -24.0, true), WheelOwner::Column);
+        // A fitting body never takes it; the column does.
+        assert_eq!(chained_wheel(Some(fitting), -24.0, true), WheelOwner::Column);
+        // No body under the pointer, inside the band: column.
+        assert_eq!(chained_wheel(None, -24.0, true), WheelOwner::Column);
     }
 
     #[test]
