@@ -24,17 +24,22 @@ use gpui::{
     App, AppContext, Application, AsyncApp, Bounds, Context, CursorStyle, FontWeight,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
     ParentElement, PathBuilder, Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement,
-    Styled, Window, WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px, size,
+    Styled, Window, WindowBounds, WindowOptions, canvas, div, fill, img, point, prelude::*, px, size,
 };
 
 #[path = "../../../src/view/mod.rs"]
 mod view;
 /// The map handoff, shared verbatim with `gpui-map` (U6) — one
-/// implementation of hold-until-ready and retirement, not two.
+/// implementation, not two.
 #[path = "../../gpui-map/src/gate.rs"]
 mod gate;
+/// The halo's arithmetic (U7), shared with the shader so the CPU raster and
+/// the WGSL cannot drift. Pure: no wgpu in the file.
+#[path = "../../../src/fx/halo.rs"]
+mod halo;
 
-use gate::{FrameGate, FrameReplay};
+use gate::{FrameSlot, RawReplay};
+use std::sync::Arc;
 use view::{cast_offset, *};
 
 /// One `view::Rgba` as a GPUI colour. The kernel speaks 0..255 sRGB and a
@@ -93,11 +98,24 @@ struct IslandDemo {
     /// Grip drag: cursor-x grab plus width at grab. `None` is not resizing.
     grip: Option<(f32, f32)>,
     grip_hot: bool,
-    /// The map surface (U6): the real map thread's frames, held until
-    /// decoded, retired to keep the atlas bounded. Painted full-bleed
-    /// under everything, because the band and the rails paint no
-    /// background of their own — the map is what shows through.
-    gate: FrameGate,
+    /// The map surface (U6): the real map thread's frames on the RAW path —
+    /// `ImageSource::Render`, no encode and no decode hop, so there is
+    /// nothing to hold and nothing to wait for. Painted full-bleed under
+    /// everything, because the band and the rails paint no background of
+    /// their own — the map is what shows through.
+    gate: FrameSlot,
+    /// The newest raw frame from the replay, handed to the slot in `render`
+    /// (promotion is a `Window` operation, so it cannot happen on the
+    /// producer thread).
+    incoming: Option<(u64, u32, u32, Vec<u8>)>,
+    /// Marker halo sprites, pre-rasterized ONCE: GPUI has no per-element
+    /// blend mode, so a halo here is a source-over sprite, and the ADR-0019
+    /// numbers are what that costs. Two markers carry one, so a capture can
+    /// be checked against the model.
+    sprites: Vec<(halo::Halo, f32, std::sync::Arc<gpui::RenderImage>)>,
+    /// The sprite the compositing probe uses. Built unconditionally so the
+    /// probe does not depend on the marker layer's configuration.
+    probe_sprite: std::sync::Arc<gpui::RenderImage>,
 }
 
 /// Column overflow: three 300px islands and two 2px gaps against the
@@ -500,11 +518,155 @@ impl IslandDemo {
     }
 }
 
+impl IslandDemo {
+    /// The marker layer as GPUI must draw it (U7).
+    ///
+    /// Three states, the same rings the console pairs with halos, at the
+    /// radii the console computes — `symbol_footprint_radius_px()` times
+    /// 1.5 / 1.75 / 2.0, which `examples/halo_seam` prints (11.31px ->
+    /// 16.97 / 19.80 / 22.63) — stroked 2px in the same colours. There is
+    /// NO halo: GPUI 0.2.2 has no per-element blend mode, so the shader's
+    /// `One/One` cannot be expressed, and ADR-0019 records what
+    /// substituting source-over costs.
+    ///
+    /// Two markers still carry a source-over sprite, deliberately: not as
+    /// the adopted look but so the capture can be checked against the
+    /// modelled difference, in the toolkit rather than in a spreadsheet.
+    /// The sprites are painted BEFORE the rings, which is the favourable
+    /// ordering for source-over — on top, as the egui code paints the real
+    /// halo, it would veil the rings as well.
+    fn markers(&mut self) -> impl IntoElement {
+        const FOOTPRINT_R: f32 = 11.31;
+        // window points; all left of the right-docked band
+        const POS: [(f32, f32); 3] = [(120.0, 150.0), (240.0, 260.0), (330.0, 420.0)];
+        let tint = |c: Rgba| rgba(c);
+        let ring_ink = [
+            Rgba::rgb(0xAD, 0xD8, 0xE6), // selected: egui's LIGHT_BLUE
+            Rgba::rgb(0xFF, 0xFF, 0x00), // following: YELLOW
+            Rgba::rgb(0xF5, 0x9E, 0x0B), // old data: the stale amber
+        ];
+        let ring_mult = [1.5, 1.75, 2.0];
+
+        let mut layer = div().absolute().top(px(0.0)).left(px(0.0));
+        // Sprites first (under the rings), one per marker that has one.
+        for (i, (halo_kind, _strength, sprite)) in self.sprites.iter().enumerate() {
+            let (cx, cy) = POS[i.min(POS.len() - 1)];
+            let sprite = sprite.clone();
+            layer = layer.child(
+                img(sprite)
+                    .absolute()
+                    .left(px(cx - halo::HALO_R))
+                    .top(px(cy - halo::HALO_R))
+                    .w(px(halo::HALO_R * 2.0))
+                    .h(px(halo::HALO_R * 2.0)),
+            );
+            let _ = halo_kind;
+        }
+        // Then the rings and their discs, in one paint pass.
+        layer.child(canvas(
+            |bounds, _, _| bounds,
+            move |_bounds, _, window, _| {
+                for (i, (cx, cy)) in POS.iter().enumerate() {
+                    let r = FOOTPRINT_R * ring_mult[i];
+                    let ring = Bounds::new(
+                        point(px(cx - r), px(cy - r)),
+                        size(px(r * 2.0), px(r * 2.0)),
+                    );
+                    window.paint_quad(
+                        fill(ring, gpui::transparent_black())
+                            .corner_radii(px(r))
+                            .border_widths(px(2.0))
+                            .border_color(tint(ring_ink[i])),
+                    );
+                    let disc_r = FOOTPRINT_R;
+                    let disc = Bounds::new(
+                        point(px(cx - disc_r), px(cy - disc_r)),
+                        size(px(disc_r * 2.0), px(disc_r * 2.0)),
+                    );
+                    window.paint_quad(
+                        fill(disc, tint(PANEL_SLATE)).corner_radii(px(disc_r)),
+                    );
+                }
+            },
+        ))
+    }
+}
+
+/// The compositing probe (U7): the SAME map image drawn twice in one frame,
+/// side by side and at identical geometry, the right-hand copy carrying one
+/// Signal sprite. Because both copies are in one window and one compositor
+/// pass, the left copy IS the backdrop under the right copy's sprite — so
+/// the capture can be checked against the model (`tint*a + dst*(1-a)`)
+/// without any cross-run alignment, which the compositor's window stacking
+/// makes unreliable.
+///
+/// Each inset carries a solid cyan tab along its top edge: that is the
+/// presence check, so a capture that photographed the wrong window cannot
+/// be mistaken for a result.
+fn compositing_probe(frame: Option<Arc<gpui::RenderImage>>, sprite: Arc<gpui::RenderImage>) -> impl IntoElement {
+    // 170x140 fits left of the right-docked band (x < 376).
+    const W: f32 = 170.0;
+    const H: f32 = 140.0;
+    const Y: f32 = 440.0;
+    const LX: f32 = 16.0;
+    const RX: f32 = 200.0;
+    let inset = |x: f32, with_sprite: bool| {
+        let mut el = div()
+            .absolute()
+            .left(px(x))
+            .top(px(Y))
+            .w(px(W))
+            .h(px(H))
+            .overflow_hidden();
+        el = el.child(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .w(px(W))
+                .h(px(3.0))
+                .bg(rgba(RADAR_CYAN)),
+        );
+        if let Some(frame) = frame.clone() {
+            el = el.child(
+                div().absolute().top(px(3.0)).left(px(0.0)).w(px(W)).h(px(H - 3.0)).child(
+                    img(frame).w_full().h_full().object_fit(ObjectFit::Fill),
+                ),
+            );
+        }
+        if with_sprite {
+            // Offsets are relative to the inset, not the window: the inset
+            // is itself absolutely placed, so an absolute window coordinate
+            // here would double-count the origin and land outside the clip.
+            let cx = W / 2.0;
+            let cy = H / 2.0;
+            el = el.child(
+                img(sprite.clone())
+                    .absolute()
+                    .left(px(cx - halo::HALO_R))
+                    .top(px(cy - halo::HALO_R))
+                    .w(px(halo::HALO_R * 2.0))
+                    .h(px(halo::HALO_R * 2.0)),
+            );
+        }
+        el
+    };
+    div()
+        .absolute()
+        .top(px(0.0))
+        .left(px(0.0))
+        .child(inset(LX, false))
+        .child(inset(RX, true))
+}
+
 impl Render for IslandDemo {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The map surface promotes here, once per frame, before anything
-        // is assembled: hold-until-ready, so the picture never blinks.
-        self.gate.tick(window, cx);
+        // The raw frame is already paintable — nothing to wait for, so this
+        // is a swap, not a gate. A promotion that needed a decode would not
+        // belong here; see `gate::FrameGate` for that path's numbers.
+        if let Some((no, w, h, bgra)) = self.incoming.take() {
+            self.gate.show(window, cx, no, (w, h), bgra);
+        }
 
         // Ownership, resolved ONCE per frame over the islands that can own
         // it: open AND on the band. A closed or culled island is gone, not
@@ -621,6 +783,21 @@ impl Render for IslandDemo {
                         img(frame).w_full().h_full().object_fit(ObjectFit::Fill)
                     })),
             )
+            // The marker layer, as GPUI has to draw it: the epaint state
+            // rings, and no shader halo. ADR-0019 has the numbers for why
+            // the halo does not come across; the rings are the channel
+            // either way, which is what ADR-0015 already said the Low tier
+            // is. Two markers additionally carry a SOURCE-OVER sprite — not
+            // because it is adopted, but so a capture can be checked against
+            // the modelled difference.
+            .child(if std::env::var("PROBE").as_deref() == Ok("1") {
+                // The one-frame A/B, instead of the marker layer: no
+                // cross-run alignment, no second compositor pass.
+                compositing_probe(self.gate.image(), self.probe_sprite.clone())
+                    .into_any_element()
+            } else {
+                self.markers().into_any_element()
+            })
             .child(band_el)
             .child(
                 div()
@@ -701,10 +878,10 @@ impl Render for IslandDemo {
         );
         // The map readout: the one line that says the surface under all of
         // this is the map thread's output and not a static picture — the
-        // frame on screen, the decode lag it cost, and the retirement
-        // counts whose difference is the atlas-bound invariant (retired
-        // tracks promoted minus one, always).
-        let g = self.gate.stats();
+        // frame on screen, its retire count, and what the marker layer is
+        // (and is not) drawing.
+        let shown = self.gate.shown();
+        let retired = self.gate.retired();
         root = root.child(
             div()
                 .absolute()
@@ -717,8 +894,8 @@ impl Render for IslandDemo {
                 .text_size(px(11.0))
                 .text_color(rgba(BUTTON_LABEL))
                 .child(format!(
-                    "map frame {} lag {:.0}ms up {} ret {}",
-                    g.displayed, g.lag_ms, g.promoted, g.retired
+                    "map raw frame {shown} ret {retired} | rings only: no halo (ADR-0019); \
+                     2 sprites source-over = rejected"
                 )),
         );
         // The drag overlay: full-window, transparent, topmost, alive while
@@ -847,6 +1024,38 @@ impl Render for IslandDemo {
     }
 }
 
+/// Build one halo sprite: the raster at 2x for a 1.25-1.5 ppp display, as a
+/// `RenderImage` — the same raw path the map frames take, so the sprite
+/// demo costs no encode either. Strength is folded in at raster time, so
+/// there is one sprite per (state, strength) and none per frame.
+///
+/// The raster is PREMULTIPLIED (it is the additive contribution: `rgb =
+/// tint * a`), but gpui's images are STRAIGHT alpha — its own decoder only
+/// swaps R for B and never premultiplies (`elements/img.rs`), so the
+/// compositor multiplies the colour by alpha itself. Handing it the
+/// premultiplied raster attenuates twice and paints a dark disc; that is
+/// what the compositing probe caught, and un-premultiplying here is the
+/// fix.
+fn halo_sprite(kind: halo::Halo, strength: f32) -> Arc<gpui::RenderImage> {
+    const SUPERSAMPLE: usize = 2;
+    let side = (halo::HALO_R * 2.0) as usize * SUPERSAMPLE;
+    let premultiplied = halo::rasterize(side, kind.rgb(), strength);
+    let mut straight = Vec::with_capacity(premultiplied.len());
+    for px in premultiplied.chunks_exact(4) {
+        let a = px[3] as f32 / 255.0;
+        if a <= 0.0 {
+            straight.extend_from_slice(&[0, 0, 0, 0]);
+        } else {
+            let un = |c: u8| ((c as f32 / a).clamp(0.0, 255.0) + 0.5) as u8;
+            straight.extend_from_slice(&[un(px[0]), un(px[1]), un(px[2]), px[3]]);
+        }
+    }
+    gate::swizzle_rgba_to_bgra(&mut straight);
+    let buf = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(side as u32, side as u32, straight)
+        .expect("sprite size");
+    Arc::new(gpui::RenderImage::new([image::Frame::new(buf)]))
+}
+
 fn main() {
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(760.0), px(620.0)), cx);
@@ -864,7 +1073,7 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(80);
         let looping = std::env::var("LOOP").as_deref() == Ok("1");
-        let replay = FrameReplay::start(&dir, burst_ms, looping);
+        let replay = RawReplay::start(&dir, burst_ms, looping);
 
         let entity = cx.new(|_| {
             // Island 0 fully on the band, island 1 straddling its bottom
@@ -896,7 +1105,22 @@ fn main() {
                 zorder: vec![0, 1, 2],
                 grip: None,
                 grip_hot: false,
-                gate: FrameGate::new(),
+                gate: FrameSlot::new(),
+                incoming: None,
+                probe_sprite: halo_sprite(halo::Halo::Signal, 0.55),
+                // The console's own pairings: selected carries Signal 0.55,
+                // old data carries Stale 0.40. Following gets none, so the
+                // capture shows a haloed and a bare marker side by side.
+                sprites: if std::env::var("NO_SPRITES").as_deref() == Ok("1") {
+                    // A/B for the model check: same binary, same held frame,
+                    // only the sprite layer differs.
+                    Vec::new()
+                } else {
+                    vec![
+                        (halo::Halo::Signal, 0.55, halo_sprite(halo::Halo::Signal, 0.55)),
+                        (halo::Halo::Stale, 0.40, halo_sprite(halo::Halo::Stale, 0.40)),
+                    ]
+                },
             }
         });
         let drain = entity.clone();
@@ -905,16 +1129,12 @@ fn main() {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(20))
                     .await;
-                if let Some((no, bytes, encode_ms)) = replay.latest() {
+                if let Some((no, w, h, bgra)) = replay.latest() {
                     let _ = cx.update(|app| {
-                        let stale = drain.update(app, |root: &mut IslandDemo, cx| {
-                            let stale = root.gate.queue(no, bytes, encode_ms);
+                        drain.update(app, |root: &mut IslandDemo, cx| {
+                            root.incoming = Some((no, w, h, bgra));
                             cx.notify();
-                            stale
-                        });
-                        if let Some(stale) = stale {
-                            stale.remove_asset(app);
-                        }
+                        })
                     });
                 }
             }

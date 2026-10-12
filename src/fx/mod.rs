@@ -85,33 +85,82 @@ impl Quality {
 
 /// What a halo is saying. Both variants reuse a meaning the epaint rings
 /// already carry.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Halo {
-    /// Selected, or the camera is following this hull.
-    Signal,
-    /// Old data — backfilled rather than live.
-    Stale,
-    /// An embark just landed aboard this hull. A transient flash, not a
-    /// state — the map holds it for a couple of seconds while its alpha
-    /// decays, then forgets it.
-    Embark,
-}
+///
+/// Defined in [`halo`] beside the fade the WGSL implements, so the tint a
+/// CPU rasterizer uses and the tint the shader writes cannot disagree.
+pub use halo::Halo;
 
-impl Halo {
-    /// Radar Cyan and the stale amber from DESIGN.md, as 0..1 floats.
-    fn rgb(self) -> [f32; 3] {
-        match self {
-            Halo::Signal => [0.133, 0.827, 0.933],
-            Halo::Stale => [0.965, 0.773, 0.420],
-            Halo::Embark => [0.290, 0.871, 0.502],
+mod halo;
+pub use halo::HALO_R;
+// Re-exported for the CPU side (examples, protos) rather than used here:
+// the point is that both renderers read the same definitions.
+#[allow(unused_imports)]
+pub use halo::{fade, rasterize};
+
+#[cfg(test)]
+mod halo_tests {
+    use super::*;
+
+    /// The shader's own contract, asserted on the CPU side: the centre is
+    /// exactly full strength, and nothing at or beyond the inscribed circle
+    /// contributes. The GPU selftest (`p5-epaint --fx-selftest`) asserts the
+    /// same two facts plus the peak; this is the other half of the parity
+    /// claim, and it runs without a device.
+    #[test]
+    fn fade_is_one_at_the_centre_and_zero_at_the_rim() {
+        assert_eq!(fade(0.0), 1.0);
+        for d in [1.0, 1.2, 1.414, 3.0] {
+            assert_eq!(fade(d), 0.0, "fade({d}) must be exactly zero");
         }
     }
-}
 
-/// Radius in logical points. Sized to read as a halo rather than a glow
-/// field: it clears the 8px marker and its 2px ring, and stops well before
-/// it starts washing the trails underneath.
-pub const HALO_R: f32 = 22.0;
+    #[test]
+    fn fade_is_flat_inside_the_marker_then_monotonic() {
+        // Flat to 0.35 — that is what makes the centre read as pure tint
+        // rather than a curve, and it is why the peak is the tint sum.
+        assert_eq!(fade(0.34), 1.0);
+        let mut prev = fade(0.35);
+        for i in 36..=100 {
+            let d = i as f32 / 100.0;
+            let a = fade(d);
+            assert!(a <= prev, "fade must not rise: {d} gave {a} after {prev}");
+            prev = a;
+        }
+    }
+
+    /// The number the GPU selftest asserts, reproduced on the CPU: cyan at
+    /// strength 1 has channel sum 483, measured 2026-10-11 on the real
+    /// driver. 0.133+0.827+0.933 = 1.893, x255 = 482.7 -> 483.
+    #[test]
+    fn centre_pixel_matches_the_shader_selftest_peak() {
+        let px = rasterize(44, Halo::Signal.rgb(), 1.0);
+        let c = ((22 * 44) + 22) * 4;
+        let sum = px[c] as u32 + px[c + 1] as u32 + px[c + 2] as u32;
+        assert_eq!(sum, 483, "centre = {:?}", &px[c..c + 4]);
+    }
+
+    /// Outside the inscribed circle the contribution is zero on every
+    /// channel, including alpha — so an input frame is what comes back out.
+    #[test]
+    fn corners_contribute_nothing() {
+        let px = rasterize(44, Halo::Stale.rgb(), 1.0);
+        for (x, y) in [(0usize, 0usize), (43, 0), (0, 43), (43, 43)] {
+            let i = (y * 44 + x) * 4;
+            assert_eq!(px[i..i + 4], [0, 0, 0, 0], "corner {x},{y} must be clear");
+        }
+    }
+
+    /// Alpha carries the same weight as the colour, which is what lets a
+    /// source-over surface composite the same buffer.
+    #[test]
+    fn alpha_tracks_the_additive_weight() {
+        let px = rasterize(44, Halo::Embark.rgb(), 0.5);
+        let c = ((22 * 44) + 22) * 4;
+        // 0.5 strength at full fade -> alpha 128, colour at half tint.
+        assert_eq!(px[c + 3], 128);
+        assert_eq!(px[c + 1], (0.871 * 0.5 * 255.0 + 0.5) as u8);
+    }
+}
 
 /// The one shader in the client.
 ///

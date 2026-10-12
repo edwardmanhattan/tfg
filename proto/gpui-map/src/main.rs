@@ -38,10 +38,59 @@ use gpui::{
 };
 use image::{ImageBuffer, Rgba, RgbaImage};
 
-use gate::{FrameGate, FrameReplay};
+use gate::{FrameGate, FrameReplay, FrameSlot};
 
 const FRAME_W: u32 = 800;
 const FRAME_H: u32 = 600;
+
+/// The rail that makes a channel-order mistake obvious: cyan is emitted, so
+/// a wrong swizzle paints it orange. The PNG path's frames carry the same
+/// bar, so the two captures can be compared directly.
+fn swizzle_rgba_to_bgra(rgba: &mut [u8]) {
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+}
+
+/// `MODE=render`: the raw path. No encode, no decode, nothing held.
+struct RawDemo {
+    slot: FrameSlot,
+    incoming: Option<(u64, (u32, u32), Vec<u8>)>,
+    produced: u64,
+}
+
+impl Render for RawDemo {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Nothing to wait for: `ImageSource::Render` is already resolved, so
+        // the frame that arrived this tick is the frame that paints.
+        if let Some((no, size, bgra)) = self.incoming.take() {
+            self.slot.show(window, cx, no, size, bgra);
+        }
+        let mut root = div().relative().size_full().bg(gpui::black());
+        if let Some(frame) = self.slot.image() {
+            root = root.child(div().absolute().size_full().child(img(frame)));
+        }
+        root.child(
+            div()
+                .absolute()
+                .top(px(8.0))
+                .left(px(8.0))
+                .px(px(10.0))
+                .py(px(4.0))
+                .bg(gpui::black())
+                .font_family("monospace")
+                .text_size(px(13.0))
+                .text_color(gpui::white())
+                .child(format!(
+                    "raw frame {} shown {} ret {} produced {}",
+                    self.slot.shown(),
+                    self.slot.shown(),
+                    self.slot.retired(),
+                    self.produced
+                )),
+        )
+    }
+}
 
 struct MapDemo {
     gate: FrameGate,
@@ -109,6 +158,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(80);
     let looping = std::env::var("LOOP").as_deref() == Ok("1");
+    let raw = std::env::var("MODE").as_deref() == Ok("render");
     let replay = FrameReplay::start(&dir, burst_ms, looping);
     let synthetic = replay.frames() == 0;
     let (syn_tx, syn_rx) = std::sync::mpsc::channel::<(u64, Vec<u8>, f64)>();
@@ -141,6 +191,44 @@ fn main() {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             ..Default::default()
         };
+        if raw {
+            let entity = cx.new(|_| RawDemo {
+                slot: FrameSlot::new(),
+                incoming: None,
+                produced: 0,
+            });
+            let drain = entity.clone();
+            cx.spawn(async move |cx: &mut AsyncApp| {
+                let mut n: u64 = 0;
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(burst_ms))
+                        .await;
+                    n += 1;
+                    let mut rgba = render_frame(n)
+                        .into_raw();
+                    // The map thread's own work: swizzle once, off the UI
+                    // thread, exactly where egui's unmul swap lived.
+                    swizzle_rgba_to_bgra(&mut rgba);
+                    let no = n;
+                    let _ = cx.update(|app| {
+                        drain.update(app, |root: &mut RawDemo, cx| {
+                            root.incoming = Some((no, (FRAME_W, FRAME_H), rgba));
+                            root.produced = no;
+                            cx.notify();
+                        })
+                    });
+                    if n % 25 == 0 {
+                        eprintln!("raw produced={n}");
+                    }
+                }
+            })
+            .detach();
+            cx.open_window(opts, |_window, _cx| entity.clone()).unwrap();
+            cx.activate(true);
+            return;
+        }
+
         let entity = cx.new(|_| MapDemo {
             gate: FrameGate::new(),
         });

@@ -27,7 +27,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use gpui::{App, Image, ImageFormat, Window};
+use gpui::{App, Image, ImageFormat, RenderImage, Window};
+use image::{Frame, ImageBuffer, Rgba};
 
 /// What the HUD and the verification log read.
 #[derive(Clone, Copy, Debug, Default)]
@@ -141,8 +142,71 @@ impl FrameGate {
     }
 }
 
-/// Replays PNG frames from a directory the way the map thread sends them:
-/// in order, newest-wins to the consumer, `burst_ms` apart. Frames come
+/// The raw path, and the correction that came with it.
+///
+/// `ImageSource::Render` was written off in the first U6 survey as
+/// unreachable, on the reading that `RenderImage::new` needs a `Frame` that
+/// is gpui-private. It is not: `Frame` is `image::Frame`, re-exported from
+/// the `image` crate the shader already depends on, and `RenderImage::new`
+/// takes `impl Into<SmallVec<[Frame; 1]>>` — so an array of one frame
+/// converts. An external crate CAN build a `RenderImage` from raw bytes.
+///
+/// That matters because it removes every moving part the PNG path needed:
+/// no encode, no asset-map entry, no async decode, and therefore nothing to
+/// hold — `ImageSource::Render` resolves on the spot, so the frame is
+/// paintable in the frame it arrives. What remains is the atlas tile, which
+/// is still minted per `ImageId` and still has to be retired by hand.
+pub struct FrameSlot {
+    displayed: Option<Arc<RenderImage>>,
+    shown: u64,
+    retired: u64,
+}
+
+impl FrameSlot {
+    pub fn new() -> Self {
+        Self {
+            displayed: None,
+            shown: 0,
+            retired: 0,
+        }
+    }
+
+    /// Hand over one frame of BGRA bytes (the sprite atlas is
+    /// `Bgra8Unorm`; the swizzle belongs on the producer's thread), retiring
+    /// the tile of the frame it replaces.
+    pub fn show(
+        &mut self,
+        window: &mut Window,
+        app: &mut App,
+        no: u64,
+        size: (u32, u32),
+        bgra: Vec<u8>,
+    ) {
+        let Some(buffer) = ImageBuffer::<Rgba<u8>, _>::from_raw(size.0, size.1, bgra) else {
+            return; // wrong byte count; nothing to show
+        };
+        let image = Arc::new(RenderImage::new([Frame::new(buffer)]));
+        if let Some(old) = self.displayed.replace(image) {
+            app.drop_image(old, Some(window));
+            self.retired += 1;
+        }
+        self.shown = no;
+    }
+
+    pub fn image(&self) -> Option<Arc<RenderImage>> {
+        self.displayed.clone()
+    }
+
+    pub fn shown(&self) -> u64 {
+        self.shown
+    }
+
+    pub fn retired(&self) -> u64 {
+        self.retired
+    }
+}
+
+/// Replays PNG frames from a directory the way the map thread sends them:/// in order, newest-wins to the consumer, `burst_ms` apart. Frames come
 /// from `examples/map_burst`, which drives the real map engine — the point
 /// being that the gate is exercised by real pixels at a real cadence, not
 /// by a generator that flatters it.
@@ -203,5 +267,79 @@ impl FrameReplay {
 
     pub fn frames(&self) -> usize {
         self.frames
+    }
+}
+
+/// The same replay for the raw path: PNGs decoded ONCE, up front, into BGRA
+/// buffers — which is what the map thread actually produces (it takes
+/// `LiveMap::frame_rgba` and swizzles). Decoding here rather than in the UI
+/// keeps the comparison honest: the per-frame cost of the raw path is the
+/// swizzle, not a decode.
+pub struct RawReplay {
+    rx: Receiver<(u64, u32, u32, Vec<u8>)>,
+    frames: usize,
+}
+
+impl RawReplay {
+    pub fn start(dir: &str, burst_ms: u64, looping: bool) -> Self {
+        let mut paths: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "png"))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        paths.sort();
+        let mut frames: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+        for path in &paths {
+            if let Ok(img) = image::open(path) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let mut bytes = rgba.into_raw();
+                swizzle_rgba_to_bgra(&mut bytes);
+                frames.push((w, h, bytes));
+            }
+        }
+        let count = frames.len();
+        let (tx, rx) = mpsc::channel();
+        if count > 0 {
+            std::thread::spawn(move || {
+                let mut n: u64 = 0;
+                loop {
+                    let (w, h, bytes) = frames[(n as usize) % count].clone();
+                    n += 1;
+                    if tx.send((n, w, h, bytes)).is_err() {
+                        return;
+                    }
+                    if !looping && n as usize >= count {
+                        std::thread::sleep(Duration::from_secs(3600));
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(burst_ms));
+                }
+            });
+        }
+        eprintln!("raw replay: {count} frames from {dir} (burst {burst_ms}ms, loop {looping})");
+        Self { rx, frames: count }
+    }
+
+    pub fn latest(&self) -> Option<(u64, u32, u32, Vec<u8>)> {
+        let mut latest = None;
+        for frame in self.rx.try_iter() {
+            latest = Some(frame);
+        }
+        latest
+    }
+
+    pub fn frames(&self) -> usize {
+        self.frames
+    }
+}
+
+/// RGBA -> BGRA in place. The sprite atlas is `Bgra8Unorm`; gpui's own
+/// decoder does the same swap, and it belongs on the producer's thread.
+pub fn swizzle_rgba_to_bgra(bytes: &mut [u8]) {
+    for px in bytes.chunks_exact_mut(4) {
+        px.swap(0, 2);
     }
 }

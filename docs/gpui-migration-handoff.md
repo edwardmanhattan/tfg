@@ -437,6 +437,13 @@ numbers demand it.
 
 ### Hold-until-ready result — the fix works, stock path adopted
 
+> **Superseded in part (see the CORRECTION below).** The gate, the retire
+> and the memory numbers all hold and are still the right answer for
+> ENCODED frames. What did not hold is "stock path" as the *only* path:
+> `ImageSource::Render` is reachable, needs no encode and no gate, and is
+> what the console surface drives. This section is kept because it is the
+> measured alternative, runnable today (`MODE=png`).
+
 Same crate, three changes: (1) drain writes `pending`, never `frame`;
 (2) `render` gates on `pending.use_render_image(...)` returning `Some`,
 promoting only then, so the STABLE frame stays painted through every
@@ -564,3 +571,92 @@ no HTTP loader, so those become `reqwest` fetches into the same
 does); `egui::load::SizedTexture` at `:2111`/`:2438`, which is layout,
 not the map; and the `CentralPanel` itself, which becomes the surface
 above. The colour-space check carried over from the previous section.
+
+### CORRECTION (2026-10-12): the raw path was never dead
+
+**The first U6 survey was wrong, and it is worth saying exactly how.** It
+concluded `ImageSource::Render` was unreachable because
+`RenderImage::new` takes a `Frame` and no `Frame` is public in gpui. The
+inference was from absence: `grep "pub struct Frame" gpui/src` found
+nothing, so the conclusion was "crate-private". It never checked the
+import. `Frame` is `image::Frame` — `gpui/src/assets.rs:4` is
+`use image::{Delay, Frame};` — and `RenderImage::new(data: impl
+Into<SmallVec<[Frame; 1]>>)` is `pub`. An array of one frame converts via
+`smallvec`'s `From<[T; N]>`. **An external crate can build a
+`RenderImage`, and the crate needs no dependency beyond `image`.**
+
+What that changes, measured side by side in `proto/gpui-map` (`MODE=render`
+vs the PNG path, same binary, same synthetic frames, 800x600):
+
+| | PNG + hold-until-ready | raw `ImageSource::Render` |
+| --- | --- | --- |
+| encode | 3.1ms/frame (real frames) | none |
+| decode hop | p50 39ms lag | none — resolves on the spot |
+| frames shown / produced | 355 / 356 (superseded pendings) | **91 / 91**, then 975/975 |
+| CPU buffers per frame | PNG 400KB + decoded 1.9MB | BGRA 1.9MB, swizzled on the producer |
+| RSS over ~90s at ~10fps | 139-147MB | **128,864kB, flat to the kB** |
+| atlas retirement | `drop_image` + `remove_asset` | `drop_image` only |
+
+So the hold-until-ready gate, the asset map, the encode and the decode lag
+are all unnecessary: the raw path is strictly better and simpler. Channel
+order was checked on pixels, not assumed — the counter bar emits cyan
+(34,211,238) and lands at (38,210,233), so the BGRA handoff matches the
+atlas.
+
+**What survives from the PNG work.** `gate::FrameGate` stays, runnable via
+`MODE=png`, because it is the only correct way to display *encoded* frames
+(and the five `try_load_texture` sites are files, where the asset path is
+still the natural one) — and because a correction nobody can re-run is a
+claim, not evidence. The retirement half is shared: the atlas mints a tile
+per `ImageId` and never evicts, so **both** paths must `drop_image`, and
+`FrameGate`'s `retired == promoted - 1` invariant has a raw twin
+(`FrameSlot`: `retired == shown - 1`, observed 90/91 and flat RSS).
+
+The console surface in `proto/gpui-island` now drives `FrameSlot` with
+`RawReplay` (PNGs decoded once at startup, swizzled, then replayed), which
+is the shape the map thread will actually have.
+
+### U7 verification log — the shader seam (2026-10-12)
+
+**The seam does not port; the tier is Low.** ADR-0019 has the decision and
+the numbers; the measurements behind it:
+
+- **Reachability, from gpui 0.2.2 source.** No per-element blend mode (the
+  only blend state belongs to the surface, `blade_renderer.rs:158`); no
+  device or queue access (`Window` exposes `gpu_specs()` and nothing else);
+  `surface()` is macOS-only, so there is no zero-copy path on Linux. The
+  additive `One/One` the halo depends on cannot be expressed.
+- **Shape parity: the CPU raster IS the shader.** `p5-epaint
+  --fx-selftest --fx-dump <png>` now writes the WGSL's offscreen target
+  (256x256, the real driver). Diffed against `fx::rasterize` over the 44x44
+  box: **max channel delta 1/255, 16 of 1936 pixels differing** — rounding.
+  `examples/halo_seam` runs the comparison and prints the marker ring radii
+  it uses (footprint 11.31px -> 16.97 / 19.80 / 22.63).
+- **Blend: source-over is not a substitute.** On a real map frame at the
+  console's own strengths, source-over darkens **65.3%** of the halo's
+  footprint by up to **44.5/255** luminance, and diverges from additive by
+  up to 130/255 on a channel. ADR-0015's "cannot darken anything behind it"
+  is precisely what it gives up.
+- **Verified in the toolkit, not just in the model.** `PROBE=1` in the
+  console proto draws the same map twice in ONE frame at identical
+  geometry, the right copy carrying one Signal sprite — because two-run A/B
+  is unreliable here (the compositor put a terminal over the window in one
+  of the two runs, which the probe's cyan presence tab is what catches).
+  Against `tint*a + dst*(1-a)`: **2377 samples, max 13.8/255, mean
+  2.67/255** (the tail is sprite-edge resampling, 88px raster -> 55px on
+  screen, not a compositing difference), and the darkening reproduced at
+  65.3%/44.5 — the CPU model transfers to the compositor.
+- **The probe earned its keep: gpui images are STRAIGHT alpha.** The first
+  run painted a dark disc, not a glow: a premultiplied sprite composites to
+  `a^2` because gpui's decoder only swaps R and B and never premultiplies
+  (`elements/img.rs`). Un-premultiplying in `halo_sprite` fixed it, and any
+  future sprite work must do the same.
+
+**What the console surface captures show.** `map raw frame 8 ret 5 | rings
+only: no halo (ADR-0019); 2 sprites source-over = rejected` over real
+Jakarta, with the three states as rings (LIGHT_BLUE at 1.5x, YELLOW at
+1.75x, amber 0xF59E0B at 2.0x, all 2px) and the two source-over sprites
+visible as cyan veils — the rejected approximation, shown so the rejection
+is inspectable rather than asserted. The markers are rings only because
+that is what GPUI will ship; the symbol glyph layer is U6's overlay work,
+not this unit's.

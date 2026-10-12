@@ -14,6 +14,9 @@ publish = false
 
 [dependencies]
 gpui = "=0.2.2"
+# For `RenderImage` only (its `Frame` is `image::Frame`): the raw map path
+# needs no encoder, but the type comes from this crate.
+image = "0.25"
 
 [patch.crates-io]
 xattr = { path = "../gpui-spike/patches/xattr" }

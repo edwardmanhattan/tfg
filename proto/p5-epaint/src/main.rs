@@ -1882,7 +1882,16 @@ fn main() -> eframe::Result {
     // capability check can be exercised on a real machine rather than only
     // type-checked.
     if args.iter().any(|a| a == "--fx-selftest") {
-        return match fx_selftest() {
+        // `--fx-dump <path>` writes the offscreen target out, so the WGSL's
+        // own output can be compared pixel by pixel against a CPU
+        // rasterizer of the same formula — the GPU selftest's three points
+        // become a whole image.
+        let dump = args
+            .iter()
+            .position(|a| a == "--fx-dump")
+            .and_then(|i| args.get(i + 1))
+            .cloned();
+        return match fx_selftest(dump.as_deref()) {
             Ok(()) => Ok(()),
             Err(e) => {
                 eprintln!("fx selftest FAILED: {e}");
@@ -2045,7 +2054,7 @@ fn symbology_check() -> Result<(), String> {
 /// The uniform is written here from the layout documented in `src/fx`,
 /// independently of the module, so a drift between the two shows up as a
 /// blank target rather than passing silently.
-fn fx_selftest() -> Result<(), String> {
+fn fx_selftest(dump: Option<&str>) -> Result<(), String> {
     use eframe::egui_wgpu::wgpu;
 
     const SIZE: u32 = 256;
@@ -2183,6 +2192,18 @@ fn fx_selftest() -> Result<(), String> {
         }
         let lit = data[centre] as u32 + data[centre + 1] as u32 + data[centre + 2] as u32;
         let outside = data[edge_x] as u32 + data[edge_x + 1] as u32 + data[edge_x + 2] as u32;
+
+        // The whole target, if asked for: this is the reference a CPU
+        // rasterizer of `fx::halo` is diffed against, pixel for pixel.
+        if let Some(path) = dump {
+            match image::RgbaImage::from_raw(SIZE, SIZE, data.to_vec()) {
+                Some(img) => {
+                    img.save(path).map_err(|e| format!("dump {path}: {e}"))?;
+                    println!("fx: wrote {path} ({SIZE}x{SIZE} readback)");
+                }
+                None => return Err("readback did not match the target size".to_string()),
+            }
+        }
         drop(data);
         readback.unmap();
 
