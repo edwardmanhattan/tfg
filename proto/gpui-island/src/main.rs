@@ -118,6 +118,10 @@ struct IslandDemo {
     /// The sprite the compositing probe uses. Built unconditionally so the
     /// probe does not depend on the marker layer's configuration.
     probe_sprite: std::sync::Arc<gpui::RenderImage>,
+    /// U5 drag slice: `Some(press point)` while a row is held; `moved` is
+    /// the 6px dead-zone latch (a held press is a drag only past 6px).
+    drag_start: Option<(f32, f32)>,
+    drag_moved: bool,
 }
 
 /// Column overflow: three 300px islands and two 2px gaps against the
@@ -730,6 +734,149 @@ impl Render for IslandDemo {
                 } else if std::env::var("TOOLTIP").as_deref() == Ok("1") {
                     // U5's tooltip slice: the popup frame, gap and shadow.
                     tooltip_layer().into_any_element()
+                } else if std::env::var("DRAG").as_deref() == Ok("1") {
+                    // U5's drag slice: the press → dead-zone → move → ghost
+                    // → release state machine, wired to real mouse events.
+                    // Seeded held-and-moved so the bare capture shows the
+                    // ghost + grabbing state with no synthetic input (same
+                    // trick as the one-lit-rim capture).
+                    if self.drag_start.is_none() {
+                        self.drag_start = Some((150.0, 120.0));
+                        self.drag_moved = true;
+                    }
+                    let held = self.drag_start.is_some();
+                    let (px_, py_) = self.pointer.unwrap_or((150.0, 120.0));
+                    let mut layer = div().relative().size_full();
+                    // the drop zone (the map): a hover-state div, NOT faded —
+                    // the shipped code drops rather than fades (see the
+                    // slice doc). Cyan while a drag is held.
+                    layer = layer.child(
+                        div()
+                            .absolute()
+                            .left(px(40.0))
+                            .top(px(40.0))
+                            .w(px(360.0))
+                            .h(px(200.0))
+                            .rounded(px(6.0))
+                            .border(px(1.0))
+                            .border_color(rgba(if held { RADAR_CYAN } else { HAIRLINE_SLATE }))
+                            .bg(rgba(CONSOLE_NIGHT.with_alpha(160)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_size(px(TEXT_SMALL_PT))
+                                    .text_color(rgba(BODY_SILVER))
+                                    .child("drop zone — release over the map to place"),
+                            ),
+                    );
+                    // the draggable row, wired to real press/move/release
+                    layer = layer.child(
+                        div()
+                            .id("drag-row")
+                            .absolute()
+                            .left(px(60.0))
+                            .top(px(60.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .h(px(28.0))
+                            .px(px(10.0))
+                            .rounded(px(4.0))
+                            .bg(rgba(PANEL_SLATE))
+                            .cursor(if held { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, ev: &MouseDownEvent, _, cx| {
+                                    view.drag_start =
+                                        Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                                    view.drag_moved = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(TEXT_BODY_PT))
+                                    .text_color(rgba(MAP_INK))
+                                    .child("KRI Ahmad Yani"),
+                            ),
+                    );
+                    // the ghost, following the pointer while held-and-moved
+                    if held && self.drag_moved {
+                        layer = layer.child(
+                            div()
+                                .absolute()
+                                .left(px(px_ + 12.0))
+                                .top(px(py_ + 12.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .h(px(28.0))
+                                .px(px(10.0))
+                                .rounded(px(4.0))
+                                .bg(rgba(PANEL_SLATE.with_alpha(210)))
+                                .border(px(1.0))
+                                .border_color(rgba(RADAR_CYAN))
+                                .occlude()
+                                .child(
+                                    div()
+                                        .text_size(px(TEXT_BODY_PT))
+                                        .text_color(rgba(MAP_INK))
+                                        .child("KRI Ahmad Yani"),
+                                ),
+                        );
+                        // the console's held-status line
+                        layer = layer.child(
+                            div()
+                                .absolute()
+                                .left(px(40.0))
+                                .top(px(252.0))
+                                .text_size(px(TEXT_SMALL_PT))
+                                .text_color(rgba(RADAR_CYAN))
+                                .child("moving KRI Ahmad Yani — release over the map to place"),
+                        );
+                    }
+                    // the move/release overlay: alive while held, so the
+                    // dead-zone latch and the ghost track the pointer even
+                    // off the row (the island drag's own overlay pattern).
+                    if held {
+                        layer = layer.child(
+                            div()
+                                .absolute()
+                                .top(px(0.0))
+                                .left(px(0.0))
+                                .right(px(0.0))
+                                .bottom(px(0.0))
+                                .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _, cx| {
+                                    let now =
+                                        (f32::from(ev.position.x), f32::from(ev.position.y));
+                                    view.pointer = Some(now);
+                                    if let Some(start) = view.drag_start {
+                                        if drag_past_dead_zone(start, now) {
+                                            view.drag_moved = true;
+                                        }
+                                    }
+                                    cx.notify();
+                                }))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|view, _, _, cx| {
+                                        view.drag_start = None;
+                                        view.drag_moved = false;
+                                        cx.notify();
+                                    }),
+                                ),
+                        );
+                    }
+                    layer.into_any_element()
+                } else if std::env::var("WINDOW").as_deref() == Ok("1") {
+                    // U5's window slice: the floating Settings window (no
+                    // dim) and the modal New-session pane (dimmed) — the
+                    // modal-vs-floating distinction, with the window_shadow.
+                    let backdrop = std::env::var("MODAL").as_deref() == Ok("1");
+                    window_layer(backdrop).into_any_element()
                 } else {
                     roster_sheet(0).into_any_element()
                 })
@@ -1596,6 +1743,126 @@ fn tooltip_layer() -> impl IntoElement {
         ))
 }
 
+/// The drag state machine (U5's drag slice). The gesture is a PRESS on a
+/// row, not a mode: press records the cursor, and the row is "moved" only
+/// once the pointer travels past a 6px dead-zone (`update_unit_drag`:
+/// `distance(start) > 6.0`) — a release inside the zone is the ordinary
+/// click, not a drag. While held the cursor is `Grabbing` and a ghost of the
+/// row follows the pointer.
+///
+/// **The plan's "drop zone fades" trap does not apply, and the shipped code
+/// says why.** The console's drop target is the MAP, and a genuine move
+/// commits on release-over-map (`finish_unit_move`); its comment is explicit:
+/// "Dropped, never faded — a fade needs per-frame alpha state, and under
+/// repaint-on-demand that means repainting toward a target computed from
+/// where a trail is GOING." So there is NO fade to measure; the port shows
+/// the drop zone as a hover-state div, which is the honest shape. What IS
+/// real and portable: the 6px dead-zone, the grabbing cursor, the ghost, and
+/// commit-on-release-over-the-zone.
+///
+/// This ports the state machine's shape and its live wiring (press/move/
+/// release), which the proto drives from real GPUI mouse events — unlike the
+/// earlier slices' seeded static states. The seeded capture shows a held,
+/// moved drag (ghost + grabbing) with no synthetic input.
+///
+/// The dead-zone rule, verbatim from `update_unit_drag`: a held press is a
+/// drag only past 6px from where it started.
+fn drag_past_dead_zone(start: (f32, f32), now: (f32, f32)) -> bool {
+    let (dx, dy) = (now.0 - start.0, now.1 - start.1);
+    (dx * dx + dy * dy).sqrt() > 6.0
+}
+
+/// The two `egui::Window` surfaces (U5's final slice): the console's
+/// centred Settings window and the floating presentation card, as GPUI must
+/// draw them.
+///
+/// **The plan's trap, resolved against the reference.** The handoff frames it
+/// as "GPUI modal panes are `Layer::modal` and clip to the window; the
+/// shipped egui windows are `WindowLevel::AlwaysWarm` with a custom shadow.
+/// The parity ask is the shadow width (8px), not whether the pane opens."
+/// Measured against a real egui `Window` (`examples/window_probe`): the
+/// Settings window is **352×225**, anchored centre (`Align2::CENTER_CENTER`),
+/// fixed (not collapsible/resizable), `CONSOLE_NIGHT` fill, a 1px
+/// `HAIRLINE_SLATE` border, radius 8, `window_margin` 6 inner pad, and the
+/// `window_shadow` (offset 10,20, blur 15, black α96) — a much larger shadow
+/// than the tooltip's `popup_shadow`. Crucially it draws **no dimming
+/// backdrop**: an `egui::Window` is a floating pane, not a modal, and the
+/// map shows around it. So the parity work is the window FRAME + its shadow,
+/// not a GPUI `Layer::Modal` backdrop — GPUI's modal is the wrong primitive
+/// for a non-modal `Window`, and using it would add a dim the console never
+/// had.
+///
+/// `backdrop` toggles a modal (`Layer::Modal`-style dim, for the New-session
+/// modal which IS modal) over the floating-window treatment (no dim), so the
+/// capture shows both and the distinction is inspectable.
+fn window_layer(backdrop: bool) -> impl IntoElement {
+    let mut root = div().relative().size_full();
+    // The modal dim, only when the surface is actually modal (New session).
+    if backdrop {
+        root = root.child(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .bg(rgba(Rgba::black_alpha(150))),
+        );
+    }
+    // The centred window: frame + shadow + title + a sliver of body, at the
+    // measured geometry. `shadow` is the window_shadow (10,20,15,α96), the
+    // one piece GPUI `Layer::Modal` would NOT give — the reason the frame is
+    // hand-built rather than deferred to the layer.
+    root.child(
+        div()
+            .absolute()
+            .left(px(204.0))
+            .top(px(198.0))
+            .w(px(352.0))
+            .min_h(px(120.0))
+            .p(px(6.0))
+            .rounded(px(8.0))
+            .bg(rgba(CONSOLE_NIGHT))
+            .border(px(1.0))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .shadow(vec![gpui::BoxShadow {
+                color: gpui::hsla(0.0, 0.0, 0.0, 96.0 / 255.0),
+                offset: point(px(10.0), px(20.0)),
+                blur_radius: px(15.0),
+                spread_radius: px(0.0),
+            }])
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(TEXT_BODY_PT))
+                            .text_color(rgba(MAP_INK))
+                            .child("Settings"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(TEXT_BODY_PT))
+                            .text_color(rgba(BODY_SILVER))
+                            .child("×"),
+                    ),
+            )
+            .child(div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE)))
+            .child(
+                div()
+                    .text_size(px(TEXT_SMALL_PT))
+                    .text_color(rgba(BODY_SILVER))
+                    .child("View · Layout · Motion"),
+            ),
+    )
+}
+
 /// The U5 buttons slice, drawn against the map: a stock button and a
 /// `small_button` in their three live states (rest / hover / press), plus a
 /// disabled row. Static states, seeded like the one-lit-rim capture — the
@@ -2132,6 +2399,8 @@ fn main() {
                 gate: FrameSlot::new(),
                 incoming: None,
                 probe_sprite: halo_sprite(halo::Halo::Signal, 0.55),
+                drag_start: None,
+                drag_moved: false,
                 // The console's own pairings: selected carries Signal 0.55,
                 // old data carries Stale 0.40. Following gets none, so the
                 // capture shows a haloed and a bare marker side by side.

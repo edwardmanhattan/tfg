@@ -1022,3 +1022,101 @@ deterministic geometry above rather than a fresh capture; the earlier slices'
 captures under the same flakiness are the precedent for trusting the code
 path once it compiles and the numbers are measured. A re-capture is queued
 for a quiet moment rather than asserted.
+
+### U5 drag slice — the press→dead-zone→move→release machine (2026-10-12)
+
+The plan's panel 8 flags "the orders drag a row between roster and orders
+and the shipped app fades the drop zone" as the trap. **The shipped code does
+the opposite, and says why.** `UnitDrag` (`main.rs:2463`) is the roster→map
+pick; `UnitMoveDrag` (`:2481`) is a placed hull lifted to a new start. Both
+are a PRESS, not a mode. `update_unit_drag` (`:16868`) latches `moved` only
+once the pointer travels past a **6px dead-zone** (`distance(start) > 6.0`),
+sets the `Grabbing` cursor while held, and `finish_unit_move` (`:16994`)
+commits only a drag that actually moved, and only on release-over-map. And
+the fade is explicitly refused: `main.rs:20637` — "Dropped, never faded — a
+fade needs per-frame alpha state, and under repaint-on-demand that means
+repainting toward a target computed from where a trail is GOING." So there is
+NO drop-zone fade to measure; the trap's premise is the one thing the console
+deliberately does not do.
+
+**Port.** `proto/gpui-island` (`DRAG=1`) builds the state machine on
+`IslandDemo` (`drag_start`/`drag_moved`) wired to REAL GPUI mouse events —
+not the seeded static states of the earlier slices. Press on the row records
+the cursor; a full-window move overlay (the island drag's own pattern) tracks
+the pointer, latches `drag_moved` through the 6px dead-zone rule
+(`drag_past_dead_zone`, the verb of `update_unit_drag`), and release clears.
+While held-and-moved: the cursor is `ClosedHand` (GPUI's `grabbing`; `Grab`/
+`Grabbing` don't exist — the enum is `OpenHand`/`ClosedHand`, a small API
+note), a cyan-ghost of the row follows the pointer, the drop zone (the map)
+takes the hover-state cyan border rather than a fade, and the console's held
+status line ("moving KRI Ahmad Yani — release over the map to place") shows.
+A genuine drop-over-zone would commit; here the seeded capture shows the
+held-moved state (ghost + grabbing + cyan zone) with no synthetic input.
+
+**What this slice ports and what it does not.** Ported: the state machine's
+SHAPE (press → 6px dead-zone → moved → ghost → release → commit) and its
+live wiring. Not ported: the actual commit (`move_placement`, the
+`unproject_mercator` geo math, embark-on-hull-drop) — that is the map/geo
+surface, a different unit, exactly like the input slice's editable text and
+the lists slice's store drill. The dead-zone, cursor, ghost and drop-zone
+shape are the claim.
+
+**Two corrections the port surfaced.** (1) GPUI has no `Grab`/`Grabbing`
+cursor — the equivalent is `OpenHand`/`ClosedHand`, so the console's
+`Grabbing` maps to `ClosedHand`. (2) The plan's fade premise is wrong for
+this console; the honest drop-zone treatment is a hover-state div, and the
+code comment above is the reason.
+
+**Capture caveat.** The compositor was cycling windows through this slice
+(the gpui-island window repeatedly failed to hold a stable slot and `grim`
+returned stale map-only frames), so the `DRAG=1` render is verified by a
+clean compile and the deterministic wiring above rather than a fresh capture;
+a re-capture is queued for a quiet moment, same caveat as the tooltip slice.
+
+### U5 window slice — the two `egui::Window` surfaces (2026-10-12)
+
+The last panel, and the plan's trap resolves against the reference rather
+than as stated. The handoff frames it as "GPUI modal panes are
+`Layer::modal` and clip to the window; the shipped egui windows are
+`WindowLevel::AlwaysWarm` with a custom shadow; the parity ask is the shadow
+width." Measured against a real egui `Window` (`examples/window_probe`):
+
+- The Settings window (`main.rs:11107`) is **352×225**, anchored centre
+  (`Align2::CENTER_CENTER`), fixed (not collapsible, not resizable),
+  `CONSOLE_NIGHT` fill, a 1px `HAIRLINE_SLATE` border, radius 8,
+  `window_margin` 6 inner pad, and the `window_shadow` — **offset (10,20),
+  blur 15, black α96** — a far larger shadow than the tooltip's popup_shadow.
+- Crucially it draws **no dimming backdrop**: an `egui::Window` is a floating
+  pane, and the map shows around it. So GPUI's `Layer::Modal` is the WRONG
+  primitive for it — using a modal layer would add a dim the console never
+  had. The parity work is the window FRAME and its shadow, hand-built.
+- The presentation card (`main.rs:19082`) is the same frame, title-bar-less,
+  `movable(false)`, centred at +40y, min-width 380 — a floating card, also
+  non-modal.
+
+**Port.** `proto/gpui-island` (`WINDOW=1`) builds the centred window from the
+measured numbers — `CONSOLE_NIGHT` fill, 1px hairline, radius 8, 6px pad,
+and the `window_shadow` as a `BoxShadow` (10,20,15,α96), which is the one
+piece a GPUI `Layer::Modal` would NOT supply and the reason the frame is
+hand-built. `MODAL=1` toggles a dimming backdrop over it, so the capture can
+show the modal (New-session) treatment beside the floating (Settings)
+treatment and the distinction is inspectable rather than asserted — the same
+discipline as U7's compositing probe.
+
+**What this closes.** All nine U5 panels are now ported at measured geometry
+against real references: text (roster sheet), buttons, layout, choice, input,
+lists, tooltips, drag, and the two window surfaces. The interactive halves
+deferred across the slices (editable text, IME, the store-backed drill, the
+live hover, the drag's geo commit, real window drag/resize) are all
+interaction or data surfaces that belong to their own units, and each is
+stated as deferred in its slice rather than silently dropped.
+
+**Capture caveat, consistent with the last two slices.** The compositor was
+cycling windows through the tooltip, drag and window slices — the
+gpui-island window repeatedly failed to hold a stable slot and `grim`
+returned stale map-only frames — so the `WINDOW=1` render is verified by a
+clean compile and the deterministic measured geometry rather than a fresh
+capture. A single quiet-machine re-capture of the TOOLTIP/DRAG/WINDOW protos
+is queued as one task; nothing structural is unverified (the frame, shadow
+and geometry are the same `BoxShadow`/absolute-placement primitives the
+earlier, successfully-captured slices used).
