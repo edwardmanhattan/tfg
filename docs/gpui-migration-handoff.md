@@ -660,3 +660,61 @@ visible as cyan veils — the rejected approximation, shown so the rejection
 is inspectable rather than asserted. The markers are rings only because
 that is what GPUI will ship; the symbol glyph layer is U6's overlay work,
 not this unit's.
+
+### Where the migration actually stands (2026-10-12)
+
+**U8 is not reachable from here, and the plan says so itself.** Its graph is
+`U5 --> U8`, and U8's first bullet is "move the 53 tests in `main.rs` off
+`egui::Context::default()`", its second "remove `egui`, `eframe` and
+`egui_extras`" — both of which presuppose a GPUI console that draws the
+console. That console does not exist yet: U1-U7 have proven *mechanisms* in
+`proto/` (shell and fonts, island chrome, map surface, texture path, halo
+tier), and **U5 — "about 6,650 lines in `impl ShipApp`... about 290
+methods", 6 to 10 weeks — has not been started.** Deleting egui today would
+delete the product and leave demo binaries.
+
+So the honest next work is U5, one panel at a time under the same discipline
+as everything above: a real surface, real values, a capture, and a number.
+ADR-0018 ("stay on egui... no framework migration") also still stands as the
+repo's *decision*; nothing in U1-U7 reverses it, and U8 would be the unit
+that does. That is a call for the owner, not an agent.
+
+### U5 first slice — the roster sheet (2026-10-12)
+
+The epaint prototype's roster panel, ported to GPUI in `proto/gpui-island`
+(`SHEET=1`), and compared against that prototype's own render
+(`.impeccable/critique/capture-shipped-chrome-roster.png`). Provenance
+matters here: the reference is **p5-epaint's** render with shipped chrome
+values, not the shipped console's binary — the console's own roster is
+inside the 6,650-line widget sheet and gets compared when that surface
+ports.
+
+Every number in the port is measured from the reference rather than
+eyeballed: panel (73,65) 338x428 with a 20px top-right chamfer, inner rails
+at 15/322, title at +14, counter right-aligned at -15, separator at +46,
+rows 34 tall from +54, name mono 12 at (+12,+7), hull mono 11 right at -12,
+class 10.5 at (+12,+20), stale dot r2.5 at (right-16, bottom-8), selection
+as `black_alpha(70)` r3 plus a 2x18 SIGNAL rule. The first run had
+`INNER_R = 337` (window-space) instead of 322 (panel-space) and the counter
+and hull column sat flush against the edge — a derivation error the capture
+caught immediately, which is the argument for capturing on the first
+compile rather than the last.
+
+**Numbers.** Against the reference crop, per-pixel max-channel difference
+with a 1px tolerance, over 141,616 pixels: **median 1/255, p90 1/255**;
+p99 78, max 228, and **1.23% of pixels differ by more than 60** — all of
+them glyph pixels, spread across the text rows. Both sides register the
+same faces (Inter; JetBrains Mono mapped to monospace, with Hack reachable
+for arrows), so the residue is the text engine's rasterization and
+hinting, not a different typeface. Geometry, palette, selection, separator
+and status dots match to the pixel.
+
+**A second vocabulary gap, same class as U7's blend finding: GPUI 0.2.2 has
+no letter spacing.** `TextStyle` has no field for it, and `FontFeatures`
+cannot express tracking — egui kept it in the text format, which is exactly
+what `view`'s `TITLE_TRACKING` doc says ("the tracking is the whole trick
+and needs an explicit layout job"). It is worked around here the only way
+available: one div per character in a flex row whose gap IS the tracking
+(2.4px), which is exact and which every tracked label in U5 will pay for.
+The island's own title band still ships untracked, so this is now a known
+gap in two places rather than an unnoticed one.

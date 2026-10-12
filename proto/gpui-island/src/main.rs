@@ -9,10 +9,10 @@
 //! What it proves about the architecture:
 //!
 //! - The palette survives the migration. Every colour is a `view::Rgba`, and
-//!   no `egui::Color32` appears anywhere in this file.
+//! no `egui::Color32` appears anywhere in this file.
 //! - The bevel is four nested fills, exactly as it is four nested
-//!   `rect_filled` calls today. That order is why the rings stay concentric,
-//!   and that property is a fact about the paint, not about egui.
+//! `rect_filled` calls today. That order is why the rings stay concentric,
+//! and that property is a fact about the paint, not about egui.
 //! - Font weight is a value, not a family name.
 //!
 //! What it does NOT yet do, which is the real work of the port: it does not
@@ -21,14 +21,13 @@
 //! against its siblings. Those are `chrome::island_owned`'s job.
 
 use gpui::{
-    App, AppContext, Application, AsyncApp, Bounds, Context, CursorStyle, FontWeight,
+    AnyElement, App, AppContext, Application, AsyncApp, Bounds, Context, CursorStyle, FontWeight,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
     ParentElement, PathBuilder, Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement,
-    Styled, Window, WindowBounds, WindowOptions, canvas, div, fill, img, point, prelude::*, px, size,
+    Styled, Window, WindowBounds, WindowOptions, canvas, div, fill, img, point, prelude::*, px,
+    size,
 };
 
-#[path = "../../../src/view/mod.rs"]
-mod view;
 /// The map handoff, shared verbatim with `gpui-map` (U6) — one
 /// implementation, not two.
 #[path = "../../gpui-map/src/gate.rs"]
@@ -37,6 +36,8 @@ mod gate;
 /// the WGSL cannot drift. Pure: no wgpu in the file.
 #[path = "../../../src/fx/halo.rs"]
 mod halo;
+#[path = "../../../src/view/mod.rs"]
+mod view;
 
 use gate::{FrameSlot, RawReplay};
 use std::sync::Arc;
@@ -207,7 +208,14 @@ impl IslandDemo {
     /// `owned` arrives resolved (ADR-0016: decided once, never per-island).
     /// `scroll` is the column's view transform, applied at paint, never
     /// folded into `pos`.
-    fn island(&mut self, cx: &mut Context<Self>, i: usize, owned: bool, scroll: f32, clip: view::Box) -> impl IntoElement {
+    fn island(
+        &mut self,
+        cx: &mut Context<Self>,
+        i: usize,
+        owned: bool,
+        scroll: f32,
+        clip: view::Box,
+    ) -> impl IntoElement {
         // Copied out front so the fit log below can write back through
         // `self` without fighting the borrow it reads from.
         let pos = self.islands[i].pos;
@@ -223,7 +231,10 @@ impl IslandDemo {
         let (ct, cr, cb, cl) = cast_offset();
         let cast = div()
             .absolute()
-            .top(px(-ct)).right(px(-cr)).bottom(px(-cb)).left(px(-cl))
+            .top(px(-ct))
+            .right(px(-cr))
+            .bottom(px(-cb))
+            .left(px(-cl))
             .bg(rgba(ISLAND_CAST))
             .rounded(px(ISLAND_RADIUS));
 
@@ -233,17 +244,26 @@ impl IslandDemo {
         // and radius together, so every ring stays concentric.
         let casing = div()
             .absolute()
-            .top(px(-3.0)).right(px(-3.0)).bottom(px(-3.0)).left(px(-3.0))
+            .top(px(-3.0))
+            .right(px(-3.0))
+            .bottom(px(-3.0))
+            .left(px(-3.0))
             .bg(rgba(DEEP_WELL))
             .rounded(px(ISLAND_RADIUS + 3.0));
         let steel_lo = div()
             .absolute()
-            .top(px(-2.0)).right(px(-2.0)).bottom(px(-2.0)).left(px(-2.0))
+            .top(px(-2.0))
+            .right(px(-2.0))
+            .bottom(px(-2.0))
+            .left(px(-2.0))
             .bg(rgba(STEEL_LO))
             .rounded(px(ISLAND_RADIUS + 2.0));
         let steel_hi = div()
             .absolute()
-            .top(px(-1.0)).right(px(-1.0)).bottom(px(-1.0)).left(px(-1.0))
+            .top(px(-1.0))
+            .right(px(-1.0))
+            .bottom(px(-1.0))
+            .left(px(-1.0))
             .bg(rgba(STEEL_HI))
             .rounded(px(ISLAND_RADIUS + 1.0));
 
@@ -326,7 +346,10 @@ impl IslandDemo {
         let scanlines = {
             let mut rows = div()
                 .absolute()
-                .top(px(0.0)).left(px(0.0)).right(px(0.0)).bottom(px(0.0))
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
                 .flex()
                 .flex_col()
                 .occlude();
@@ -359,15 +382,15 @@ impl IslandDemo {
         // Twelve rows on purpose — the "12 of 12 hulls" line below is
         // literal, and the overflow is what makes the measurement nonzero.
         let hulls = [
-            "HSL-7  Pandora Sound",
+            "HSL-7Pandora Sound",
             "DD-101 Makassar Strait",
             "FFG-104 Sunda Shelf",
             "DD-102 Java Sea",
-            "HSL-7  Pandora Sound",
+            "HSL-7Pandora Sound",
             "DD-101 Makassar Strait",
             "FFG-104 Sunda Shelf",
             "DD-102 Java Sea",
-            "HSL-7  Pandora Sound",
+            "HSL-7Pandora Sound",
             "DD-101 Makassar Strait",
             "FFG-104 Sunda Shelf",
             "DD-102 Java Sea",
@@ -401,7 +424,11 @@ impl IslandDemo {
         let viewport_h = f32::from(handle.bounds().size.height);
         let content_h = f32::from(max.height) + viewport_h;
         let offset = -f32::from(handle.offset().y);
-        let fit = BodyFit { content_h, viewport_h, offset };
+        let fit = BodyFit {
+            content_h,
+            viewport_h,
+            offset,
+        };
         // Zone-debug style, machine-readable: log on change only, so the
         // numbers are grepable without drowning the log at 60fps. This is
         // the proto's `verify-scroll.sh` — the body's own measurement,
@@ -446,7 +473,10 @@ impl IslandDemo {
         // the caller decides which island owns input.
         let rim = div()
             .absolute()
-            .top(px(RIM_INSET)).left(px(RIM_INSET)).right(px(RIM_INSET)).bottom(px(RIM_INSET))
+            .top(px(RIM_INSET))
+            .left(px(RIM_INSET))
+            .right(px(RIM_INSET))
+            .bottom(px(RIM_INSET))
             .border(px(RIM_BAND))
             .border_color(rgba(rim(owned)))
             .rounded(px(ISLAND_RADIUS - RIM_INSET))
@@ -502,13 +532,7 @@ impl IslandDemo {
                     .size_full()
                     .overflow_hidden()
                     .rounded(px(ISLAND_RADIUS))
-                    .child(
-                        div()
-                            .relative()
-                            .h(px(TITLE_H))
-                            .child(band)
-                            .child(scanlines),
-                    )
+                    .child(div().relative().h(px(TITLE_H)).child(band).child(scanlines))
                     .child(body),
             )
             .child(top_light)
@@ -583,9 +607,7 @@ impl IslandDemo {
                         point(px(cx - disc_r), px(cy - disc_r)),
                         size(px(disc_r * 2.0), px(disc_r * 2.0)),
                     );
-                    window.paint_quad(
-                        fill(disc, tint(PANEL_SLATE)).corner_radii(px(disc_r)),
-                    );
+                    window.paint_quad(fill(disc, tint(PANEL_SLATE)).corner_radii(px(disc_r)));
                 }
             },
         ))
@@ -603,7 +625,10 @@ impl IslandDemo {
 /// Each inset carries a solid cyan tab along its top edge: that is the
 /// presence check, so a capture that photographed the wrong window cannot
 /// be mistaken for a result.
-fn compositing_probe(frame: Option<Arc<gpui::RenderImage>>, sprite: Arc<gpui::RenderImage>) -> impl IntoElement {
+fn compositing_probe(
+    frame: Option<Arc<gpui::RenderImage>>,
+    sprite: Arc<gpui::RenderImage>,
+) -> impl IntoElement {
     // 170x140 fits left of the right-docked band (x < 376).
     const W: f32 = 170.0;
     const H: f32 = 140.0;
@@ -629,9 +654,13 @@ fn compositing_probe(frame: Option<Arc<gpui::RenderImage>>, sprite: Arc<gpui::Re
         );
         if let Some(frame) = frame.clone() {
             el = el.child(
-                div().absolute().top(px(3.0)).left(px(0.0)).w(px(W)).h(px(H - 3.0)).child(
-                    img(frame).w_full().h_full().object_fit(ObjectFit::Fill),
-                ),
+                div()
+                    .absolute()
+                    .top(px(3.0))
+                    .left(px(0.0))
+                    .w(px(W))
+                    .h(px(H - 3.0))
+                    .child(img(frame).w_full().h_full().object_fit(ObjectFit::Fill)),
             );
         }
         if with_sprite {
@@ -660,12 +689,27 @@ fn compositing_probe(frame: Option<Arc<gpui::RenderImage>>, sprite: Arc<gpui::Re
 }
 
 impl Render for IslandDemo {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         // The raw frame is already paintable — nothing to wait for, so this
         // is a swap, not a gate. A promotion that needed a decode would not
         // belong here; see `gate::FrameGate` for that path's numbers.
         if let Some((no, w, h, bgra)) = self.incoming.take() {
             self.gate.show(window, cx, no, (w, h), bgra);
+        }
+
+        // SHEET=1: the roster sheet is the subject, so the console chrome
+        // that would overlap its right edge (the reference has none) is left
+        // out. The map stays — the panel is judged over real figure-ground,
+        // which is the prototype's own stated reason for the backdrop.
+        if std::env::var("SHEET").as_deref() == Ok("1") {
+            return div()
+                .relative()
+                .size_full()
+                .children(self.gate.image().map(|frame| {
+                    img(frame).w_full().h_full().object_fit(ObjectFit::Fill)
+                }))
+                .child(roster_sheet(0))
+                .into_any_element();
         }
 
         // Ownership, resolved ONCE per frame over the islands that can own
@@ -717,8 +761,7 @@ impl Render for IslandDemo {
                     if !st.open || !island_on_band(st.pos.1, sc, band, 300.0) {
                         continue;
                     }
-                    let content =
-                        island_content_box(box_at(st.pos.0, st.pos.1 - sc, 360.0, 300.0));
+                    let content = island_content_box(box_at(st.pos.0, st.pos.1 - sc, 360.0, 300.0));
                     if !box_contains(content, px, py) {
                         continue;
                     }
@@ -733,8 +776,7 @@ impl Render for IslandDemo {
                 }
                 // Subtract: positive wheel Y is content moving down, the
                 // same direction the egui column subtracts towards.
-                if chained_wheel(fit_opt, dy, box_contains(band, px, py)) == WheelOwner::Column
-                {
+                if chained_wheel(fit_opt, dy, box_contains(band, px, py)) == WheelOwner::Column {
                     view.zone_scroll = (view.zone_scroll - dy).clamp(0.0, ZONE_OVERFLOW);
                     cx.notify();
                 }
@@ -779,9 +821,11 @@ impl Render for IslandDemo {
                     .left(px(0.0))
                     .right(px(0.0))
                     .bottom(px(0.0))
-                    .children(self.gate.image().map(|frame| {
-                        img(frame).w_full().h_full().object_fit(ObjectFit::Fill)
-                    })),
+                    .children(
+                        self.gate
+                            .image()
+                            .map(|frame| img(frame).w_full().h_full().object_fit(ObjectFit::Fill)),
+                    ),
             )
             // The marker layer, as GPUI has to draw it: the epaint state
             // rings, and no shader halo. ADR-0019 has the numbers for why
@@ -793,8 +837,11 @@ impl Render for IslandDemo {
             .child(if std::env::var("PROBE").as_deref() == Ok("1") {
                 // The one-frame A/B, instead of the marker layer: no
                 // cross-run alignment, no second compositor pass.
-                compositing_probe(self.gate.image(), self.probe_sprite.clone())
-                    .into_any_element()
+                compositing_probe(self.gate.image(), self.probe_sprite.clone()).into_any_element()
+            } else if std::env::var("SHEET").as_deref() == Ok("1") {
+                // U5's first slice: the roster sheet, over the real map so
+                // the figure-ground question is the real one.
+                roster_sheet(0).into_any_element()
             } else {
                 self.markers().into_any_element()
             })
@@ -825,8 +872,7 @@ impl Render for IslandDemo {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|view, ev: &MouseDownEvent, _, cx| {
-                            view.grip =
-                                Some((f32::from(ev.position.x), view.zone_w));
+                            view.grip = Some((f32::from(ev.position.x), view.zone_w));
                             cx.notify();
                         }),
                     ),
@@ -895,7 +941,7 @@ impl Render for IslandDemo {
                 .text_color(rgba(BUTTON_LABEL))
                 .child(format!(
                     "map raw frame {shown} ret {retired} | rings only: no halo (ADR-0019); \
-                     2 sprites source-over = rejected"
+ 2 sprites source-over = rejected"
                 )),
         );
         // The drag overlay: full-window, transparent, topmost, alive while
@@ -954,73 +1000,73 @@ impl Render for IslandDemo {
         }
         if self.modal_open {
             root = root.child(
-                div()
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(rgba(Rgba::black_alpha(150)))
-                    .child(
-                        div()
-                            .relative()
-                            .w(px(MODAL_W))
-                            .h(px(MODAL_H))
-                            .child(modal_silhouette())
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .size_full()
-                                    .overflow_hidden()
-                                    .p(px(PAD))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .justify_between()
-                                            .h(px(TITLE_H))
-                                            // The close button has to clear
-                                            // the chamfer: nothing clickable
-                                            // may sit on the diagonal.
-                                            .pr(px(CUT + 8.0))
-                                            .child(
-                                                div()
-                                                    .font_family("monospace")
-                                                    .text_size(px(TITLE_SIZE))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgba(MAP_INK))
-                                                    .child("M O D A L"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("close-modal")
-                                                    .cursor_pointer()
-                                                    .font_family("monospace")
-                                                    .text_size(px(14.0))
-                                                    .text_color(rgba(BUTTON_LABEL))
-                                                    .on_click(cx.listener(|view, _, _, cx| {
-                                                        view.modal_open = false;
-                                                        cx.notify();
-                                                    }))
-                                                    .child("X"),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(13.0))
-                                            .text_color(rgba(BODY_SILVER))
-                                            .child("Chamfered panel: top-right cut by CUT (20px), 2px CUT_GREY edge."),
-                                    ),
-                            ),
-                    ),
-            );
+div()
+.absolute()
+.top(px(0.0))
+.left(px(0.0))
+.right(px(0.0))
+.bottom(px(0.0))
+.flex()
+.items_center()
+.justify_center()
+.bg(rgba(Rgba::black_alpha(150)))
+.child(
+div()
+.relative()
+.w(px(MODAL_W))
+.h(px(MODAL_H))
+.child(modal_silhouette())
+.child(
+div()
+.flex()
+.flex_col()
+.size_full()
+.overflow_hidden()
+.p(px(PAD))
+.child(
+div()
+.flex()
+.flex_row()
+.items_center()
+.justify_between()
+.h(px(TITLE_H))
+// The close button has to clear
+// the chamfer: nothing clickable
+// may sit on the diagonal.
+.pr(px(CUT + 8.0))
+.child(
+div()
+.font_family("monospace")
+.text_size(px(TITLE_SIZE))
+.font_weight(FontWeight::SEMIBOLD)
+.text_color(rgba(MAP_INK))
+.child("M O D A L"),
+)
+.child(
+div()
+.id("close-modal")
+.cursor_pointer()
+.font_family("monospace")
+.text_size(px(14.0))
+.text_color(rgba(BUTTON_LABEL))
+.on_click(cx.listener(|view, _, _, cx| {
+view.modal_open = false;
+cx.notify();
+}))
+.child("X"),
+),
+)
+.child(
+div()
+.text_size(px(13.0))
+.text_color(rgba(BODY_SILVER))
+.child("Chamfered panel: top-right cut by CUT (20px), 2px CUT_GREY edge."),
+),
+),
+),
+);
         }
-        root
+        root.into_any_element()
     }
 }
 
@@ -1051,9 +1097,289 @@ fn halo_sprite(kind: halo::Halo, strength: f32) -> Arc<gpui::RenderImage> {
         }
     }
     gate::swizzle_rgba_to_bgra(&mut straight);
-    let buf = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(side as u32, side as u32, straight)
-        .expect("sprite size");
+    let buf =
+        image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(side as u32, side as u32, straight)
+            .expect("sprite size");
     Arc::new(gpui::RenderImage::new([image::Frame::new(buf)]))
+}
+
+/// The prototype's STALE (0xF6C56B), which is neither of the kernel's two
+/// ambers: it is the fixture's own design value, and the comparison is
+/// against that fixture.
+const STALE_SAND: Rgba = Rgba::rgb(0xF6, 0xC5, 0x6B);
+
+/// The roster sheet (U5's first slice): the epaint prototype's panel, ported
+/// to GPUI at the geometry measured from its own reference capture
+/// (`.impeccable/critique/capture-shipped-chrome-roster.png`) rather than
+/// eyeballed. Everything below is either from that measurement or from
+/// `proto/p5-epaint`'s own constants:
+///
+/// | part | value |
+/// | --- | --- |
+/// | panel rect | (73,65) 338x428, top-right chamfer 20 |
+/// | fill / edge | PANEL_SLATE / 1px LINE x1.5, shadow +5+6 |
+/// | title | "ROSTER" tracked caps 15 at inner.left, +14 |
+/// | counter | "8 / 125" mono 11, right-aligned -16, +16 |
+/// | separator | 1px LINE at +46, inner.left..inner.right |
+/// | body | rows of 34 from +54 |
+/// | row | name mono 12 (+12,+7); hull mono 11 right -12, +7; class 10.5 (+12,+20); stale dot r2.5 at (right-16, bottom-8) |
+/// | selected | black_alpha(70) r3 over the row, 2x18 SIGNAL rule at its left |
+///
+/// What this proves is the VOCABULARY, not the console's live roster: the
+/// fixture is the prototype's eight rows, because the console's own roster
+/// rows carry force data (hull, class) that `roster::LiveSeat` does not.
+/// Wiring real seats is the next increment.
+fn roster_sheet(selected: usize) -> impl IntoElement {
+    struct Row {
+        name: &'static str,
+        hull: &'static str,
+        class: &'static str,
+        stale: bool,
+    }
+    const ROWS: [Row; 8] = [
+        Row {
+            name: "KRI Ahmad Yani",
+            hull: "351",
+            class: "frigate · ASW",
+            stale: false,
+        },
+        Row {
+            name: "KRI Yos Sudarso",
+            hull: "353",
+            class: "frigate · ASW",
+            stale: false,
+        },
+        Row {
+            name: "KRI Cakra",
+            hull: "401",
+            class: "SSK · 209/1300",
+            stale: false,
+        },
+        Row {
+            name: "KRI Ardadedali",
+            hull: "404",
+            class: "SSK · DSME 209/1400",
+            stale: false,
+        },
+        Row {
+            name: "KRI Alugoro",
+            hull: "405",
+            class: "SSK · DSME 209/1400",
+            stale: true,
+        },
+        Row {
+            name: "KRI Fatahillah",
+            hull: "—",
+            class: "corvette",
+            stale: false,
+        },
+        Row {
+            name: "KRI Sungai Gerong",
+            hull: "—",
+            class: "patrol · 40m",
+            stale: true,
+        },
+        Row {
+            name: "KRI Dewaruci",
+            hull: "—",
+            class: "auxiliary",
+            stale: false,
+        },
+    ];
+    const PANEL_X: f32 = 73.0;
+    const PANEL_Y: f32 = 65.0;
+    const PANEL_W: f32 = 338.0;
+    const PANEL_H: f32 = 428.0;
+    const INNER_L: f32 = 15.0;
+    // Panel-local: measured 88..395 in window space, minus the panel origin
+    // (73). Getting this wrong is visible immediately as a counter and hull
+    // column flush against the right edge.
+    const INNER_R: f32 = 322.0;
+    const ROW_H: f32 = 34.0;
+    const BODY_TOP: f32 = 54.0;
+
+    let mut panel = div()
+        .absolute()
+        .left(px(PANEL_X))
+        .top(px(PANEL_Y))
+        .w(px(PANEL_W))
+        .h(px(PANEL_H));
+
+    // The chamfered silhouette, its shadow and the lit cut: one path pass,
+    // the same technique the modal uses.
+    panel = panel.child(canvas(
+        |bounds, _, _| bounds,
+        |bounds, _, window, _| {
+            let (x0, y0) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+            let (x1, y1) = (x0 + PANEL_W, y0 + PANEL_H);
+            let poly = |dx: f32, dy: f32| {
+                let mut p = PathBuilder::fill();
+                p.move_to(point(px(x0 + dx), px(y0 + dy)));
+                p.line_to(point(px(x1 - CUT + dx), px(y0 + dy)));
+                p.line_to(point(px(x1 + dx), px(y0 + CUT + dy)));
+                p.line_to(point(px(x1 + dx), px(y1 + dy)));
+                p.line_to(point(px(x0 + dx), px(y1 + dy)));
+                p.close();
+                p.build()
+            };
+            if let Ok(shadow) = poly(5.0, 6.0) {
+                window.paint_path(shadow, rgba(ISLAND_CAST));
+            }
+            if let Ok(body) = poly(0.0, 0.0) {
+                window.paint_path(body, rgba(PANEL_SLATE));
+            }
+            // The cut edge reads as a deliberate cut, not a clipping bug.
+            let mut cut = PathBuilder::stroke(px(2.0));
+            cut.move_to(point(px(x1 - CUT), px(y0)));
+            cut.line_to(point(px(x1), px(y0 + CUT)));
+            if let Ok(cut) = cut.build() {
+                window.paint_path(cut, rgba(RADAR_CYAN.with_alpha(140)));
+            }
+            // The panel's own 1px edge, on the silhouette.
+            let mut edge = PathBuilder::stroke(px(1.0));
+            edge.move_to(point(px(x0), px(y0)));
+            edge.line_to(point(px(x1 - CUT), px(y0)));
+            edge.line_to(point(px(x1), px(y0 + CUT)));
+            edge.line_to(point(px(x1), px(y1)));
+            edge.line_to(point(px(x0), px(y1)));
+            edge.close();
+            if let Ok(edge) = edge.build() {
+                window.paint_path(edge, rgba(HAIRLINE_SLATE.with_alpha(191)));
+            }
+            // Separator under the header, and the 1px panel edge.
+            let mut sep = PathBuilder::stroke(px(1.0));
+            sep.move_to(point(px(x0 + INNER_L), px(y0 + 46.0)));
+            sep.line_to(point(px(x0 + INNER_R), px(y0 + 46.0)));
+            if let Ok(sep) = sep.build() {
+                window.paint_path(sep, rgba(HAIRLINE_SLATE));
+            }
+        },
+    ));
+
+    // Header: the title and the counter.
+    //
+    // The title is tracked caps, and GPUI 0.2.2 has NO letter spacing —
+    // `TextStyle` has no field for it and `FontFeatures` cannot express
+    // tracking (egui put it in the text format, which is what `view`'s
+    // `TITLE_TRACKING` doc says). This is that gap, worked around the only
+    // way available: one div per character in a flex row whose gap IS the
+    // tracking. It is exact, and it is a cost every tracked label in U5
+    // will pay until GPUI grows the property.
+    panel = panel.child(
+        div()
+            .absolute()
+            .left(px(INNER_L))
+            .top(px(14.0))
+            .flex()
+            .flex_row()
+            .gap(px(2.4))
+            .font_family("Inter")
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_size(px(15.0))
+            .text_color(rgba(RADAR_CYAN))
+            .children("ROSTER".chars().map(|c| div().child(c.to_string()))),
+    );
+    panel = panel.child(
+        div()
+            .absolute()
+            .left(px(INNER_R - 120.0))
+            .top(px(16.0))
+            .w(px(120.0))
+            .font_family("JetBrains Mono")
+            .text_size(px(11.0))
+            .text_color(rgba(BODY_SILVER))
+            .flex()
+            .justify_end()
+            .child("8 / 125"),
+    );
+
+    // Rows.
+    for (i, row) in ROWS.iter().enumerate() {
+        let top = BODY_TOP + ROW_H * i as f32;
+        let mut el = div()
+            .absolute()
+            .left(px(INNER_L))
+            .top(px(top))
+            .w(px(INNER_R - INNER_L))
+            .h(px(ROW_H));
+        if i == selected {
+            el = el.child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .w(px(INNER_R - INNER_L))
+                    .h(px(ROW_H))
+                    .rounded(px(3.0))
+                    .bg(rgba(view::Rgba::black_alpha(70))),
+            );
+            // Weight on the 2px edge, not on a colour change (DESIGN.md:283).
+            el = el.child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(8.0))
+                    .w(px(2.0))
+                    .h(px(18.0))
+                    .rounded(px(1.0))
+                    .bg(rgba(RADAR_CYAN)),
+            );
+        }
+        let ink = if row.stale { BODY_SILVER } else { MAP_INK };
+        el = el
+            .child(
+                div()
+                    .absolute()
+                    .left(px(12.0))
+                    .top(px(7.0))
+                    .font_family("JetBrains Mono")
+                    .text_size(px(12.0))
+                    .text_color(rgba(ink))
+                    .child(row.name),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(INNER_R - INNER_L - 120.0))
+                    .top(px(7.0))
+                    .w(px(108.0))
+                    .flex()
+                    .justify_end()
+                    .font_family("JetBrains Mono")
+                    .text_size(px(11.0))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(row.hull),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(12.0))
+                    .top(px(20.0))
+                    .font_family("Inter")
+                    .text_size(px(10.5))
+                    .text_color(rgba(BODY_SILVER.with_alpha(204)))
+                    .child(row.class),
+            );
+        if row.stale {
+            el = el.child(canvas(
+                move |bounds, _, _| bounds,
+                move |bounds, _, window, _| {
+                    let cx = f32::from(bounds.origin.x) + INNER_L + (INNER_R - INNER_L) - 16.0;
+                    let cy = f32::from(bounds.origin.y) + top + ROW_H - 8.0;
+                    let r = px(2.5);
+                    window.paint_quad(
+                        fill(
+                            Bounds::new(point(px(cx - 2.5), px(cy - 2.5)), size(r * 2.0, r * 2.0)),
+                            rgba(STALE_SAND),
+                        )
+                        .corner_radii(r),
+                    );
+                },
+            ));
+        }
+        panel = panel.child(el);
+    }
+    panel
 }
 
 fn main() {
@@ -1075,6 +1401,26 @@ fn main() {
         let looping = std::env::var("LOOP").as_deref() == Ok("1");
         let replay = RawReplay::start(&dir, burst_ms, looping);
 
+        // The same bundled faces the shell registers (U3): without them the
+        // system font silently stands in and every comparison lies about the
+        // typeface. Fatal on failure, deliberately.
+        cx.text_system()
+            .add_fonts(vec![
+                std::borrow::Cow::Borrowed(
+                    include_bytes!("../../p5-epaint/assets/Inter-Regular.ttf").as_slice(),
+                ),
+                std::borrow::Cow::Borrowed(
+                    include_bytes!("../../p5-epaint/assets/Inter-Medium.ttf").as_slice(),
+                ),
+                std::borrow::Cow::Borrowed(
+                    include_bytes!("../../p5-epaint/assets/Inter-SemiBold.ttf").as_slice(),
+                ),
+                std::borrow::Cow::Borrowed(
+                    include_bytes!("../../p5-epaint/assets/JetBrainsMono-Regular.ttf").as_slice(),
+                ),
+            ])
+            .expect("bundled fonts register");
+
         let entity = cx.new(|_| {
             // Island 0 fully on the band, island 1 straddling its bottom
             // edge (62px clipped), island 2 wholly below it (culled: never
@@ -1089,9 +1435,30 @@ fn main() {
             let p2 = zone_island_origin(band0, 2, &hs);
             IslandDemo {
                 islands: [
-                    IslandState { pos: p0, dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
-                    IslandState { pos: p1, dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
-                    IslandState { pos: p2, dragging: None, open: true, close_hot: false, scroll: ScrollHandle::new(), last_fit: None },
+                    IslandState {
+                        pos: p0,
+                        dragging: None,
+                        open: true,
+                        close_hot: false,
+                        scroll: ScrollHandle::new(),
+                        last_fit: None,
+                    },
+                    IslandState {
+                        pos: p1,
+                        dragging: None,
+                        open: true,
+                        close_hot: false,
+                        scroll: ScrollHandle::new(),
+                        last_fit: None,
+                    },
+                    IslandState {
+                        pos: p2,
+                        dragging: None,
+                        open: true,
+                        close_hot: false,
+                        scroll: ScrollHandle::new(),
+                        last_fit: None,
+                    },
                 ],
                 modal_open: false,
                 pointer: Some((p1.0 + 180.0, p1.1 + 30.0)),
@@ -1117,8 +1484,16 @@ fn main() {
                     Vec::new()
                 } else {
                     vec![
-                        (halo::Halo::Signal, 0.55, halo_sprite(halo::Halo::Signal, 0.55)),
-                        (halo::Halo::Stale, 0.40, halo_sprite(halo::Halo::Stale, 0.40)),
+                        (
+                            halo::Halo::Signal,
+                            0.55,
+                            halo_sprite(halo::Halo::Signal, 0.55),
+                        ),
+                        (
+                            halo::Halo::Stale,
+                            0.40,
+                            halo_sprite(halo::Halo::Stale, 0.40),
+                        ),
                     ]
                 },
             }
