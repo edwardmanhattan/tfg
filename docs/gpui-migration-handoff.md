@@ -469,12 +469,58 @@ paints (promote 342 / retire 341). Bytes grow, but they only travel
 memory-to-decoder, never a disk or wire. Budget ~12ms per burst frame on
 the map thread, off-UI.
 
-**Adopted for U6.** Hold-until-ready + explicit retire + `NoFilter`
-encode is the map texture path; no custom upload element. Open items for
-the integration slice: (a) the real producer holds `egui::ColorImage`
-(RGBA, premultiplied) and must encode off-thread — same shape as this
-spike's encoder, but the frame no longer needs `MapResp`'s `egui::ColorImage`
-at all; (b) confirm the colour space matches what gpui expects (this
-spike's synthetic frames are sRGB-agnostic, so gamma is unverified);
-(c) `Image::from_bytes` hashes the whole byte buffer for its id — fine at
-burst cadence, worth a glance if frames ever stream continuously.
+**Adopted for U6.** Hold-until-ready + explicit retire is the map texture
+path; no custom upload element. Open items for the integration slice:
+(a) the real producer holds `egui::ColorImage` (RGBA, premultiplied) and
+must encode off-thread — same shape as this spike's encoder, but the
+frame no longer needs `MapResp`'s `egui::ColorImage` at all; (b) confirm
+the colour space matches what gpui expects (this spike's synthetic frames
+are sRGB-agnostic, so gamma is unverified); (c) `Image::from_bytes`
+hashes the whole byte buffer for its id — fine at burst cadence, worth a
+glance if frames ever stream continuously.
+
+### Real frames: the synthetic numbers did not survive (2026-10-12)
+
+The gradient above is near-worst-case entropy, and two of its findings
+were artefacts of that. `examples/map_burst` drives a real camera gesture
+against the seeded cache and writes every frame, so the gate could be
+measured on the thing it will actually carry.
+
+**Real imagery is 5x cheaper to encode, and the filter search is not
+worth skipping.** 8 frames of Jakarta at 800x600, same encoder settings:
+
+| metric | synthetic gradient | real map |
+| --- | --- | --- |
+| encode p50, `image` defaults (Fast + Adaptive) | 25.1 ms | **3.1 ms** |
+| encode p50, `FilterType::NoFilter` | 11.4 ms | 2.5 ms |
+| bytes, defaults / NoFilter | — | 400 KB / 1.8 MB |
+
+Real frames have large flat regions, so deflate is cheap and the filter
+search earns 4.5x compression for 0.6 ms. The NoFilter recommendation
+above is **withdrawn** for the map path: use the default encoder. (It
+stays right for synthetic-looking content, which is why both columns are
+recorded — the lesson is that the entropy of the picture decides, and the
+map's is low.) Render + pump dominates the producer by two orders of
+magnitude: **p50 368.6 ms** per gesture step on a warm cache, so the map
+thread is pump-bound and the encoder was never the bottleneck.
+
+**The gate on real frames, sustained.** 12.5 fps (loop of the 8 real
+frames, `BURST_MS=80`) for 120 s: `promote 1472 / retire 1471` — the same
+strict off-by-one — with RSS flat at 139-147 MB the whole way. Leaking
+would have cost ~4.2 MB/frame here (400 KB PNG + 1.9 MB decoded + 1.9 MB
+atlas tile) — roughly 6 GB. Two real 800x600 windows are on screen in the
+capture (`frame 8 enc 0.0ms lag 39ms pend - up 6 ret 5`): JAKARTA BAY,
+Kota, Penjaringan, the toll-road shields and the coastline all render.
+
+**Latency, measured end to end.** Decode + notify lag on 400 KB real
+PNGs: min 9.4 / **p50 38.6** / p95 46.9 / max 57.2 ms (`promote …
+lag=` log). `Image::from_bytes` on the UI thread: p50 0.10 ms, max
+0.5 ms. So the gate costs about one frame of lag versus egui's
+synchronous `TextureHandle::set` — the analysis predicted exactly that,
+and it is invisible at the map thread's own 368 ms pump cadence.
+
+**Colour space, still open.** The real frames carry MapLibre's
+`PREMULTIPLIED = true` RGBA; the capture looks right (no washed-out or
+dark cast, labels legible), but "looks right" is not a gamut check. If a
+tint shows up over the egui shell side by side, this is the first place
+to look.
