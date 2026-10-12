@@ -375,6 +375,18 @@ pub fn clamp_island_to_viewport(x: f32, y: f32, w: f32, h: f32, viewport: Box) -
     (cx, cy)
 }
 
+/// Whether an island at column height `y` still shows once the column has
+/// been scrolled by `scroll`. Mirrors `chrome::island_on_band`.
+///
+/// Culled rather than drawn off-band: an island outside the band must not
+/// own input either, and ownership is decided from rects the caller builds,
+/// so the caller needs this predicate, not just the drawing. Straddlers
+/// stay — any overlap with the band is enough.
+pub fn island_on_band(y: f32, scroll: f32, band: Box, height: f32) -> bool {
+    let top = y - scroll;
+    top + height >= band.1 && top <= band.3
+}
+
 /// Zone layout: the column's width, clamped to its rails.
 pub fn clamp_zone_width(w: f32, viewport_w: f32) -> f32 {
     w.clamp(ZONE_MIN_W, ZONE_MAX_W).min(viewport_w * 0.8)
@@ -478,6 +490,18 @@ mod tests {
             clamp_island_to_viewport(99.0, 99.0, 900.0, 800.0, vp),
             (0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn an_island_shows_while_it_touches_the_band() {
+        // Mirrors `chrome`'s reachability cases, in kernel tuples.
+        let band = (24.0, 40.0, 344.0, 624.0);
+        assert!(!island_on_band(1362.0, 0.0, band, 320.0));
+        assert!(island_on_band(1362.0, 1058.0, band, 320.0));
+        assert!(island_on_band(56.0, 0.0, band, 144.0));
+        assert!(!island_on_band(56.0, 300.0, band, 144.0));
+        assert!(island_on_band(600.0, 0.0, band, 320.0));
+        assert!(island_on_band(-40.0, 0.0, band, 144.0));
     }
 
     #[test]

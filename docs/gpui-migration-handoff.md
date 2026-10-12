@@ -187,6 +187,36 @@ against `chrome.rs`. A live drag proof waits on a driver.
 **Not done here:** zone band clipping, `BodyFit`/scroll-chain
 measurement, sibling input ownership — the rest of U4.
 
+## U4b verification log — zone band: clip, cull, one lit rim (2026-10-12)
+
+**Kernel.** `view::island_on_band` mirrors `chrome::island_on_band`
+(culled, never drawn off-band, and the caller needs the predicate
+because off-band islands must not own input either). Chrome's six
+reachability cases mirrored 1:1 into `an_island_shows_while_it_touches_
+the_band` (11/11 view tests green).
+
+**Demo.** Three islands in a full-bleed band (56–596): island 0 fully
+on, island 1 straddling the bottom edge, island 2 wholly below (never
+rendered). Ownership resolves ONCE per frame over open + on-band
+islands; hover moves refresh the pointer. Band container clips and
+paints nothing (a zone grows no background).
+
+**Capture.** Hard FILL→DARK cut mid-body at the band edge (column scan:
+fill y0–117, wallpaper-black from y118 — no rim, no AA slope, a
+guillotine exactly where egui's clip goes). X at `BODY_SILVER` at kernel
+coordinates (carried from U4a). Rims: island 1 top region holds 1,003 px
+of α50%-cyan-over-night (the lit blend), island 0 holds 0 lit / 1,455
+resting grey. Exactly one lit rim — ADR-0016's rule, pixel-proven with
+the pointer seeded over island 1 (same precedent as the modal's
+starts-open capture; the hover→resolve→rim path is real code).
+
+**Open discrepancy, not resolved here.** `chrome::owning_island` takes
+the FIRST containing rect (`.position`, "lower index wins") while
+`view::owning_island` takes the LAST (`.rposition`). Identical on
+non-overlapping columns — which is every layout today — but they
+disagree the day two islands overlap. Needs a decision before any
+overlapping layout exists; the port must not silently pick one.
+
 **Proto-crate `[patch]` rule.** Cargo ignores `[patch.crates-io]` of a
 path dependency, so `gpui-shell` resolved upstream `tokio-centrifuge`
 (no `with_connect_data`) until the vendor patch was mirrored into

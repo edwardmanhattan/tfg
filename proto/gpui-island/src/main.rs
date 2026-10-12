@@ -49,22 +49,31 @@ fn rgba(c: Rgba) -> gpui::Rgba {
     }
 }
 
-struct IslandDemo {
-    owned: bool,
-    modal_open: bool,
-    /// The island floats: its top-left in window pixels. Drags add the
-    /// pointer delta and clamp to the window (`clamp_island_to_viewport`);
-    /// computed column positions never pass through here, which is what
-    /// keeps a drag clamp from fighting the scroll chain.
+struct IslandState {
+    /// Top-left in WINDOW pixels (rendered band-relative; see `BAND_TOP`).
     pos: (f32, f32),
-    /// Cursor-minus-pos grab offset while a band drag is live. `None` is
-    /// the whole of "not dragging".
+    /// Cursor-minus-pos grab offset while a band drag is live.
     dragging: Option<(f32, f32)>,
-    /// The island's own open flag. The close button owns the only write.
     open: bool,
-    /// Close-button hover, for the resting→hot ink switch.
     close_hot: bool,
 }
+
+struct IslandDemo {
+    islands: [IslandState; 3],
+    modal_open: bool,
+    /// Last known cursor position in window pixels. Hover moves keep it
+    /// fresh; ownership resolves from it every frame, exactly once, so at
+    /// most one rim lights (ADR-0016). Seeded over island 1 so the bare
+    /// capture shows the one-lit-rim state with no synthetic input.
+    pointer: Option<(f32, f32)>,
+}
+
+/// The zone band for this demo: full-bleed column below the top strip,
+/// from `ZONE_TOP_GAP` to the edge gap. A zone grows no background of its
+/// own (`chrome.rs`: the map shows through the gaps), so this box is a
+/// clip rect and a cull predicate, never paint.
+const BAND_TOP: f32 = 56.0;
+const BAND_BOTTOM: f32 = 596.0;
 
 /// The modal panel's footprint. Fixed by contract, like an island's.
 const MODAL_W: f32 = 480.0;
@@ -142,7 +151,11 @@ fn close_cross(hot: bool) -> impl IntoElement {
 }
 
 impl IslandDemo {
-    fn island(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Render island `i`. Positions are window pixels; the caller places
+    /// this inside the band clip, so the frame sits band-relative here.
+    /// `owned` arrives resolved (ADR-0016: decided once, never per-island).
+    fn island(&self, cx: &mut Context<Self>, i: usize, owned: bool) -> impl IntoElement {
+        let st = &self.islands[i];
         // The island is a FIXED footprint. GPUI needs an explicit outer frame
         // because the bevel and the shadow paint outside the panel box, and
         // an element that overflows needs somewhere to overflow into.
@@ -218,10 +231,11 @@ impl IslandDemo {
             .border_color(rgba(CUT_GREY))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|view, ev: &MouseDownEvent, _, cx| {
-                    view.dragging = Some((
-                        f32::from(ev.position.x) - view.pos.0,
-                        f32::from(ev.position.y) - view.pos.1,
+                cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
+                    let st = &mut view.islands[i];
+                    st.dragging = Some((
+                        f32::from(ev.position.x) - st.pos.0,
+                        f32::from(ev.position.y) - st.pos.1,
                     ));
                     cx.notify();
                 }),
@@ -320,7 +334,7 @@ impl IslandDemo {
                 div()
                     .text_size(px(11.0))
                     .text_color(rgba(BODY_SILVER))
-                    .child(format!("pos {:.0},{:.0}", self.pos.0, self.pos.1)),
+                    .child(format!("pos {:.0},{:.0}", st.pos.0, st.pos.1)),
             );
 
         // --- the rim -------------------------------------------------------
@@ -331,7 +345,7 @@ impl IslandDemo {
             .absolute()
             .top(px(RIM_INSET)).left(px(RIM_INSET)).right(px(RIM_INSET)).bottom(px(RIM_INSET))
             .border(px(RIM_BAND))
-            .border_color(rgba(rim(self.owned)))
+            .border_color(rgba(rim(owned)))
             .rounded(px(ISLAND_RADIUS - RIM_INSET))
             .occlude();
 
@@ -355,21 +369,21 @@ impl IslandDemo {
             .h(px(CLOSE))
             .id("close-island")
             .cursor_pointer()
-            .on_hover(cx.listener(|view, hot: &bool, _, cx| {
-                view.close_hot = *hot;
+            .on_hover(cx.listener(move |view, hot: &bool, _, cx| {
+                view.islands[i].close_hot = *hot;
                 cx.notify();
             }))
-            .on_click(cx.listener(|view, _, _, cx| {
-                view.open = false;
-                view.dragging = None;
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.islands[i].open = false;
+                view.islands[i].dragging = None;
                 cx.notify();
             }))
-            .child(close_cross(self.close_hot));
+            .child(close_cross(st.close_hot));
 
         div()
             .absolute()
-            .left(px(self.pos.0))
-            .top(px(self.pos.1))
+            .left(px(st.pos.0))
+            .top(px(st.pos.1 - BAND_TOP))
             .w(panel_w)
             .h(panel_h)
             .child(cast)
@@ -403,51 +417,95 @@ impl IslandDemo {
 
 impl Render for IslandDemo {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The island floats at `pos`; the buttons stay centred beneath.
-        // One boolean per surface, one click each.
-        let mut root = div().relative().size_full().flex().flex_col().items_center().justify_center().gap(px(12.0));
-        if self.open {
-            root = root.child(self.island(cx));
-        } else {
-            root = root.child(
-                div()
-                    .id("open-island")
-                    .cursor_pointer()
-                    .px(px(14.0))
-                    .py(px(8.0))
-                    .bg(rgba(BUTTON_GRAPHITE))
-                    .font_family("monospace")
-                    .text_size(px(12.0))
-                    .text_color(rgba(BUTTON_LABEL))
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.open = true;
-                        cx.notify();
-                    }))
-                    .child("OPEN ISLAND"),
-            );
+        // Ownership, resolved ONCE per frame over the islands that can own
+        // it: open AND on the band. A closed or culled island is gone, not
+        // dimmed, and never lights. `owning_island` is kernel-tested; this
+        // is its one call site.
+        let band: view::Box = (0.0, BAND_TOP, 760.0, BAND_BOTTOM);
+        let mut live: Vec<(usize, view::Box)> = Vec::new();
+        for (idx, st) in self.islands.iter().enumerate() {
+            if st.open && island_on_band(st.pos.1, 0.0, band, 300.0) {
+                live.push((idx, box_at(st.pos.0, st.pos.1, 360.0, 300.0)));
+            }
         }
+        let rects: Vec<view::Box> = live.iter().map(|(_, r)| *r).collect();
+        let owned_idx = owning_island(&rects, self.pointer).map(|k| live[k].0);
+
+        // The band clips; it paints nothing (a zone grows no background).
+        // Islands sit band-relative inside it. The 3px bevel bleed clips at
+        // the band edge where egui bleeds 8 — same rule, tighter margin.
+        let mut band_el = div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(BAND_TOP))
+            .w(px(760.0))
+            .h(px(BAND_BOTTOM - BAND_TOP))
+            .overflow_hidden();
+        for (idx, _) in live.iter() {
+            band_el = band_el.child(self.island(cx, *idx, Some(*idx) == owned_idx));
+        }
+
+        let mut root = div()
+            .relative()
+            .size_full()
+            // Hover tracking for ownership: every move refreshes the
+            // pointer and the resolve above runs again next frame.
+            .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _, cx| {
+                view.pointer = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                cx.notify();
+            }))
+            .child(band_el);
+        // Buttons ride the top strip, above the band — the one place the
+        // pointer can sit without being over an island.
         root = root.child(
             div()
-                .id("open-modal")
-                .cursor_pointer()
-                .px(px(14.0))
-                .py(px(8.0))
-                .bg(rgba(BUTTON_GRAPHITE))
-                .font_family("monospace")
-                .text_size(px(12.0))
-                .text_color(rgba(BUTTON_LABEL))
-                .on_click(cx.listener(|view, _, _, cx| {
-                    view.modal_open = true;
-                    cx.notify();
-                }))
-                .child("OPEN MODAL"),
+                .absolute()
+                .top(px(8.0))
+                .left(px(8.0))
+                .flex()
+                .flex_row()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .id("open-islands")
+                        .cursor_pointer()
+                        .px(px(14.0))
+                        .py(px(8.0))
+                        .bg(rgba(BUTTON_GRAPHITE))
+                        .font_family("monospace")
+                        .text_size(px(12.0))
+                        .text_color(rgba(BUTTON_LABEL))
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            for st in view.islands.iter_mut() {
+                                st.open = true;
+                            }
+                            cx.notify();
+                        }))
+                        .child("OPEN ISLANDS"),
+                )
+                .child(
+                    div()
+                        .id("open-modal")
+                        .cursor_pointer()
+                        .px(px(14.0))
+                        .py(px(8.0))
+                        .bg(rgba(BUTTON_GRAPHITE))
+                        .font_family("monospace")
+                        .text_size(px(12.0))
+                        .text_color(rgba(BUTTON_LABEL))
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.modal_open = true;
+                            cx.notify();
+                        }))
+                        .child("OPEN MODAL"),
+                ),
         );
         // The drag overlay: full-window, transparent, topmost, alive only
         // while a band press is held. Moves and the release land here even
         // when the cursor has left the band, which is what keeps a fast
         // drag attached. Rendered last for the same reason the close button
         // is: later siblings win hits.
-        if self.dragging.is_some() {
+        if let Some(di) = self.islands.iter().position(|st| st.dragging.is_some()) {
             root = root.child(
                 div()
                     .absolute()
@@ -455,8 +513,9 @@ impl Render for IslandDemo {
                     .left(px(0.0))
                     .right(px(0.0))
                     .bottom(px(0.0))
-                    .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _, cx| {
-                        if let Some(grab) = view.dragging {
+                    .on_mouse_move(cx.listener(move |view, ev: &MouseMoveEvent, _, cx| {
+                        let st = &mut view.islands[di];
+                        if let Some(grab) = st.dragging {
                             let (x, y) = clamp_island_to_viewport(
                                 f32::from(ev.position.x) - grab.0,
                                 f32::from(ev.position.y) - grab.1,
@@ -464,14 +523,14 @@ impl Render for IslandDemo {
                                 300.0,
                                 (0.0, 0.0, 760.0, 620.0),
                             );
-                            view.pos = (x, y);
+                            st.pos = (x, y);
                             cx.notify();
                         }
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|view, _, _, cx| {
-                            view.dragging = None;
+                        cx.listener(move |view, _, _, cx| {
+                            view.islands[di].dragging = None;
                             cx.notify();
                         }),
                     ),
@@ -557,16 +616,18 @@ fn main() {
             ..Default::default()
         };
         cx.open_window(opts, |_window, cx| {
-            // Centred island, modal shut: the bare capture proves the
-            // island (drag handle, close button, readout) with no input.
-            // The chamfer proof stays one click away on OPEN MODAL.
+            // Island 0 fully on the band, island 1 straddling its bottom
+            // edge (62px clipped), island 2 wholly below it (culled: never
+            // rendered, never owns). Pointer seeded over island 1 so the
+            // bare capture shows the one-lit-rim state with no input.
             cx.new(|_| IslandDemo {
-                owned: true,
+                islands: [
+                    IslandState { pos: (200.0, 56.0), dragging: None, open: true, close_hot: false },
+                    IslandState { pos: (200.0, 358.0), dragging: None, open: true, close_hot: false },
+                    IslandState { pos: (200.0, 660.0), dragging: None, open: true, close_hot: false },
+                ],
                 modal_open: false,
-                pos: (200.0, 130.0),
-                dragging: None,
-                open: true,
-                close_hot: false,
+                pointer: Some((380.0, 508.0)),
             })
         })
         .unwrap();
