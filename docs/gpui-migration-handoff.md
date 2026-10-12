@@ -301,6 +301,39 @@ raise it. Killed to hand the screen back. Right-dock layout, grip ink
 and z-order await a quiet capture; the math is kernel-tested and the
 wiring compiled (`Compiling` line in evidence).
 
+## U4e/bisect postscript — the double-offset bug (2026-10-12)
+
+**Root cause found, and it was never overflow, wheel, loop, or paint.**
+`island()` relativized y (`pos − band_top − scroll`) but not x (`pos.0`
+raw) — harmless while the band sat at x0 (U4b), fatal the moment zone
+math docked it at x376 (U4e): every island parked at double offset,
+off-screen. The red-rect test proved the container pixel-perfect while
+exonerating nothing; the tell was island text rendering ~300px right of
+place. Fix: pass the band box, relativize both axes (10 lines).
+
+**Bisect ledger (what each step actually proved):** wheel handler and
+overflow exonerated on verified-fresh binaries; loop condition
+exonerated by `live=3` in the log; bg-over-children exonerated by
+red-removal; the unconditional-twin and root-twin proved `island()`
+paints fine — which is what finally pointed at coordinates, not
+painting.
+
+**Capture (floated + focused window):** all three islands render in the
+clip container — island 0 top-cut mid-row at the band edge (scroll 120
+view transform), island 1 whole, island 2 band + one row then black
+(band-bottom clip). Seeded pointer clobbered again (focus likely
+delivers a cursor event), so rims rest — correct for cursor-elsewhere;
+the lit state stands proven from U4b.
+
+**Process rules hardened.** (1) Proto rebuilds: wipe
+`target/debug/.fingerprint/gpui-island-*` + `touch` + `cargo build`,
+require the `Compiling` line AND binary-newer-than-source, or the run
+is void — cargo replays stale fingerprints across quick-successive
+edits and cost most of this session. (2) Float (`hl.dsp.window.float`)
++ address-focus makes captures deterministic on a crowded compositor.
+(3) Downscaled previews mislead (white panel, foliage, phantom
+buttons); verify by full-res crops and pixel scans.
+
 **Compositor API found while relocating.** The `hl` Lua surface is now
 enumerated via error-message introspection: `hl.dsp.window` =
 close,swap,bring_to_top,pseudo,clear_tags,drag,fullscreen,resize,move,

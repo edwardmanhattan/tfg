@@ -172,11 +172,14 @@ fn close_cross(hot: bool) -> impl IntoElement {
 
 impl IslandDemo {
     /// Render island `i`. Positions are window pixels; the caller places
-    /// this inside the band clip, so the frame sits band-relative here.
+    /// this inside the band clip, so the frame sits band-relative here:
+    /// BOTH axes relativize (`pos - band origin - scroll`). Missing the x
+    /// relativization once parked every island at double offset — visible
+    /// only after the band left x0 for the zone rails.
     /// `owned` arrives resolved (ADR-0016: decided once, never per-island).
-    /// `scroll` is the column's view transform and `band_top` the clip
-    /// origin; both applied at paint, never folded into `pos`.
-    fn island(&mut self, cx: &mut Context<Self>, i: usize, owned: bool, scroll: f32, band_top: f32) -> impl IntoElement {
+    /// `scroll` is the column's view transform, applied at paint, never
+    /// folded into `pos`.
+    fn island(&mut self, cx: &mut Context<Self>, i: usize, owned: bool, scroll: f32, clip: view::Box) -> impl IntoElement {
         // Copied out front so the fit log below can write back through
         // `self` without fighting the borrow it reads from.
         let pos = self.islands[i].pos;
@@ -454,8 +457,8 @@ impl IslandDemo {
 
         div()
             .absolute()
-            .left(px(pos.0))
-            .top(px(pos.1 - band_top - scroll))
+            .left(px(pos.0 - clip.0))
+            .top(px(pos.1 - clip.1 - scroll))
             .w(panel_w)
             .h(panel_h)
             .child(cast)
@@ -563,7 +566,7 @@ impl Render for IslandDemo {
         let zorder = self.zorder.clone();
         for zi in zorder {
             if live.iter().any(|(idx, _)| *idx == zi) {
-                band_el = band_el.child(self.island(cx, zi, Some(zi) == owned_idx, sc, band.1));
+                band_el = band_el.child(self.island(cx, zi, Some(zi) == owned_idx, sc, band));
             }
         }
 
