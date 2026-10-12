@@ -387,3 +387,50 @@ blade rejects it, reason unexamined). Recreated without root by fetching
 `vulkan-swrast` 26.2.2 from the Omarchy mirror and unpacking to the same
 path; the handoff env recipe works unchanged. The durable fix is still
 `yay -S vulkan-swrast`.
+
+## U6 spike — the map texture decision, measured (2026-10-12)
+
+**Question.** How do 800x600 raw RGBA map frames reach a GPUI surface at
+interaction cadence — URI churn or custom element? Surveyed pinned gpui
+0.2.2 source first; two of the four candidate paths are dead on arrival:
+
+- `ImageSource::Render(Arc<RenderImage>)`: `RenderImage::new` needs a
+  `Frame` that is `pub(crate)` — external crates cannot construct one.
+- `surface()`: macOS-only (CoreVideo). Dead on Linux.
+- Zero-copy external texture: absent, as ADR-0002 already observed.
+
+That leaves `ImageSource::Image(Arc<Image>)`: ENCODED bytes (PNG)
+decoded async off-UI. New spike crate `proto/gpui-map` (own lockfile,
+own target, same xattr patch mirroring) times the round trip with
+synthetic frames (gradient + counter bar, 800x600 @10Hz, newest-wins
+drain like the map thread).
+
+**Verdict: stock path paints held frames, goes black under churn.**
+`STATIC=1` (one frame, held): gradient + counter bar render full-bleed,
+HUD `frame 1 enc 28.8ms` — captured floated + focused. At 10Hz
+newest-wins: HUD advances (2,168 `ui frame` lines, queue ≈0.2ms) but the
+surface stays black (full-frame saturation census: 0/22,400). Mechanism:
+`use_asset` decodes async and returns `None` until ready, notifying the
+view on completion — but each new `Arc<Image>` (id = hash of bytes)
+restarts the load, so the notify always arrives after the swap. The
+surface perpetually waits for a frame that is already stale.
+
+**Second finding: atlas tiles leak on this path.** `paint_image` only
+ever `get_or_insert_with`s (keyed by per-frame `ImageId`); removal runs
+solely through explicit `drop_image` or the `image_cache` element —
+neither fires for bare `img(Arc<Image>)`. Every burst frame would mint a
+~1000x750-device-px GPU texture and keep it to window close. Unbounded
+by construction.
+
+**Numbers.** PNG encode 800x600 (gradient, near-worst-case entropy),
+~8,600 samples: min 12.1 / p50 25.1 / p95 33.3 / max 102.6 ms — on the
+producer thread, off-UI, so acceptable for BURSTY map traffic
+(newest-wins drain on camera moves, `JUMP_PUMP` frames per gesture), not
+for a continuous stream the pump never produces.
+
+**Decision.** Stock `Image` path unusable as-is for map bursts. Next
+spike (small, no new API): hold-until-ready — keep displaying the stable
+`Arc` until the successor's `use_data` returns `Some` (~1-frame lag,
+always painting), plus explicit `drop_image` of retired frames for a
+bounded atlas. Custom upload element stays the follow-up ONLY if those
+numbers demand it.

@@ -1,0 +1,19 @@
+[package]
+name = "gpui-map"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately not a workspace member: own lockfile, own target dir.
+# U6 spike: the map texture decision — PNG-encoded frames through
+# `ImageSource::Image`, timed end to end. See src/main.rs.
+
+[dependencies]
+gpui = "=0.2.2"
+image = "0.25"
+
+[patch.crates-io]
+xattr = { path = "../gpui-spike/patches/xattr" }
+
+[profile.dev]
+opt-level = 1
