@@ -37,6 +37,49 @@ pub trait PollSource {
 }
 
 /// Mock HTTP source (M10): `GET {base_url}/v0/positions` returning a
+/// The Centrifugo socket URL for a Minos REST base, both shells' rule.
+///
+/// `https://host/api/v1` connects `wss://host/connection/websocket`;
+/// `http://host:PORT` connects `ws://host:8000/connection/websocket`
+/// (the local Centrifugo port). Pure string work, and the reason it lives
+/// here rather than on either shell: the egui console and the GPUI one
+/// must derive the SAME socket from the SAME base, or a handoff would
+/// silently point one shell at the wrong wire.
+pub fn websocket_url(base_url: &str) -> String {
+    let (scheme, rest) = match base_url.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => ("http", base_url),
+    };
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    let host = hostport.split(':').next().unwrap_or(hostport);
+    if scheme == "https" {
+        format!("wss://{host}/connection/websocket")
+    } else {
+        format!("ws://{host}:8000/connection/websocket")
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::websocket_url;
+
+    #[test]
+    fn https_bases_get_the_secure_socket() {
+        assert_eq!(
+            websocket_url("https://api.tfg.development.crossnet.co.id/api/v1"),
+            "wss://api.tfg.development.crossnet.co.id/connection/websocket"
+        );
+    }
+
+    #[test]
+    fn a_local_http_base_gets_the_dev_centrifugo_port() {
+        assert_eq!(
+            websocket_url("http://127.0.0.1:8080/api/v1"),
+            "ws://127.0.0.1:8000/connection/websocket"
+        );
+    }
+}
+
 /// JSON array of wire fixes, served by `examples/mock_backend.rs`.
 /// Explicit mock/replay compatibility only — this is NOT the Minos
 /// integration (Minos is `GET /api/v1/live-feed/positions` with a

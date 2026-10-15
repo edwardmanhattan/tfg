@@ -30,9 +30,13 @@ const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// headless container should do the latter: software rendering there is
 /// expected, not a regression.
 pub fn probe() -> Result<(), String> {
-    // egui-wgpu re-exports the exact wgpu it renders with, so this cannot
-    // drift from the app's version and costs no dependency.
-    use eframe::egui_wgpu::wgpu;
+    // egui-wgpu re-exported the exact wgpu the egui console renders with,
+    // so this could not drift from the app's version and cost no
+    // dependency. Since the cutover (U8 prep A) it names wgpu directly:
+    // the probe reports MACHINE capability (adapter present, frame within
+    // budget), which is stack-agnostic — but it proves the blade path the
+    // GPUI console renders through only by proxy, and says so.
+    use wgpu;
 
     // `request_device` and `enumerate_adapters` are both async in wgpu 30,
     // and `main` is sync with no runtime up yet.

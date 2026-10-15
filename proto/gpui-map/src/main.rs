@@ -26,7 +26,7 @@
 //! replays it once and holds the last frame. `BURST_MS` sets the cadence.
 //! Verdict + numbers live in `docs/gpui-migration-handoff.md`.
 
-#[path = "gate.rs"]
+#[path = "../../../src/map_gate.rs"]
 mod gate;
 
 use std::io::Cursor;

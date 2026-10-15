@@ -12,10 +12,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # Typed backend errors (already in the tree via the socket SDK).
 thiserror = "2"
-egui = "0.36.2"
-eframe = "0.36.2"
-egui_extras = { version = "0.36.2", features = ["image", "http"] }
 reqwest = { version = "0.13.5", features = ["blocking", "json"] }
+# Machine graphics-capability probe (`tfg::gpuprobe`), shared by both
+# consoles' `--probe-gpu`. Names wgpu directly since U8 prep A (it used to
+# ride eframe's re-export); version pinned to the lockfile's 30.0.1.
+wgpu = "30"
 tiny_http = "0.12.0"
 # Live socket (transport resolution): pinned exact, own thread + own
 # runtime in the actor; the UI thread never touches async.
@@ -37,10 +38,30 @@ base64 = "0.22"
 # device at RUNTIME stays silent, never broken.
 rodio = "0.22"
 
+# The console toolkit (ADR-0020, cut over at U8 step 5) — the dependency
+# and its patches, resolved against the shipped crate rather than against
+# a proto.
+#
+# Pinned EXACT, as every proto pins it: 0.2.x is what U1–U8 measured, and a
+# minor bump is a new blade-graphics with a new shader and surface model.
+#
+# The cost is the standing one ADR-0020 accepted: ~520 more crates in the
+# lockfile and ~3 GB more target, and Vulkan becomes mandatory at runtime
+# through `blade`. The Linux package already carries `libvulkan1`, so
+# packaging costs nothing new.
+gpui = "=0.2.2"
+
 # Vendored socket SDK (see vendor/tokio-centrifuge): upstream 0.2.6 cannot
 # set the connect command's `data`, which is where Minos reads our token
 # (§2, literal), and drops handshake refusal codes (H5: surfaced through
 # on_disconnected by patch). Pinned version must match the dependency below.
+
+[dev-dependencies]
+# GPUI's headless test harness (VisualTestContext, `#[gpui::test]`) lives
+# behind this feature. Enabled for tests only, so the shipped binary does
+# not carry the extra input backends.
+gpui = { version = "=0.2.2", features = ["test-support"] }
+
 [patch.crates-io]
 # 0.9.3 does not export Visual Studio's Release/Debug or vcpkg library
 # directories to rustc; keep the Windows build fix local until upstream ships it.
@@ -62,3 +83,15 @@ rodio = "0.22"
 # Re-apply on the next version bump; no upstream issue filed.
 maplibre_native = { path = "vendor/maplibre_native" }
 tokio-centrifuge = { path = "vendor/tokio-centrifuge" }
+
+# `xattr` 0.2.3, with `ENOATTR` rebound to `ENODATA` (61) rather than the
+# `ENOSTR` (60) it ships. glibc defines `ENOATTR` AS `ENODATA`, so the upstream
+# constant asks for an errno Linux never returns and every extended-attribute
+# read fails as "no such attribute". The protos carry the same patch in their
+# own `[patch.crates-io]`; it has to be here too, and that is the U4e lesson:
+# CARGO IGNORES A PATH DEPENDENCY'S `[patch]`. `gpui-shell` resolved upstream
+# `tokio-centrifuge` — no `with_connect_data`, no handshake refusal codes — for
+# exactly as long as its patch lived only in the proto. U8 meets the same class
+# of issue in reverse, so both patches now live at the root and the protos keep
+# theirs for their own lockfiles.
+xattr = { path = "proto/gpui-spike/patches/xattr" }

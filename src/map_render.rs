@@ -1,4 +1,10 @@
-//! Shared map plumbing for the egui shell.
+//! Shared map plumbing, for BOTH shells (U6).
+//!
+//! It was the egui shell's alone until the cutover: the map thread's frames
+//! came back as an `egui::ColorImage`, which is a toolkit type in the middle
+//! of a channel and the reason the spawn could not leave that binary. The
+//! handoff now carries raw RGBA (`shell_threads::MapResp`) and each shell
+//// converts at its own boundary, so one spawn serves both.
 //!
 //! One persistent [`LiveMap`] (a `Continuous` renderer) per map thread:
 //! the GL context, tile cache, glyph atlas, and shaders stay hot, so a
@@ -221,6 +227,20 @@ impl LiveMap {
         (self.w, self.h)
     }
 }
+
+/// The console's base map geometry, shared by both shells.
+///
+/// One definition rather than two: the GPUI shell and the egui shell must open
+/// on the same place at the same size, or every capture comparison between
+/// them is a comparison of two different maps. The egui shell keeps its own
+/// names as aliases so its call sites are untouched.
+pub const MAP_W: f64 = 800.0;
+pub const MAP_H: f64 = 600.0;
+pub const MAP_CENTER: (f64, f64) = (-6.108, 106.910);
+pub const MAP_ZOOM: f64 = 11.0;
+pub const MAP_STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
+/// Pumps for a jump (a recentre); an ordinary gesture spends fewer.
+pub const JUMP_PUMP: u32 = 6;
 
 /// World-size base in px at zoom 0 for the overlay math. Calibrated
 /// against the renderer (task #42, `examples/calibrate_projection.rs`):
@@ -1050,6 +1070,24 @@ pub fn project_mercator(
     (x - cx + w / 2.0, y - cy + h / 2.0)
 }
 
+/// The centre a pan drag asks for.
+///
+/// A drag points at the map pixel under the cursor and asks for THAT GROUND to
+/// stay there, so the centre becomes that pixel — which is why the sign lives
+/// here and not at the call site: dragging the picture right moves the centre
+/// LEFT, and writing that arithmetic twice is how the two directions come to
+/// disagree.
+pub fn pan_center(
+    center: (f64, f64),
+    zoom: f64,
+    dx: f64,
+    dy: f64,
+    w: f64,
+    h: f64,
+) -> (f64, f64) {
+    unproject_mercator(w / 2.0 - dx, h / 2.0 - dy, center, zoom, w, h)
+}
+
 /// Keep the point under the cursor fixed across a zoom step (task #43):
 /// the new center puts the cursor's geographic point back under it.
 /// Exact inverse of the forward path by construction (see test).
@@ -1106,10 +1144,86 @@ pub fn unproject_mercator(
     (lat, lon)
 }
 
+/// Click a Zone's OUTLINE, or the name written on it — never its
+/// interior. The interior of a Zone is ground: in a client where
+/// clicking the map places a unit and clicking empty water clears the
+/// selection, letting a translucent overlay capture both is a bug
+/// wearing a feature's clothes. Units still beat a Zone's outline.
+///
+/// Moved off the console binary for the cutover (U8 step 1), verbatim —
+/// pure tuple math over [`ZONE_HIT_BAND_PX`], no toolkit in it.
+pub fn zone_outline_hit(
+    px: f64,
+    py: f64,
+    pts: &[(f32, f32)],
+    label_c: (f64, f64),
+    label_half_w: f64,
+) -> bool {
+    // A zero half-width means the group painted no name (the label
+    // policy suppressed it), not that there is a zero-width target
+    // sitting on the centroid catching everything through it.
+    if label_half_w > 0.0
+        && label_c.0 - label_half_w <= px
+        && px <= label_c.0 + label_half_w
+        && label_c.1 - 9.0 <= py
+        && py <= label_c.1 + 9.0
+    {
+        return true;
+    }
+    if pts.len() < 2 {
+        return false;
+    }
+    // Indexed rather than `windows(2)`: a polygon's edges wrap, and a
+    // window pair walk silently leaves the LAST edge unpickable — the
+    // closing edge of a Zone is exactly where an operator clicks when
+    // tracing a formation's boundary.
+    (0..pts.len()).any(|i| {
+        distance_to_segment(px, py, pts[i], pts[(i + 1) % pts.len()]) <= ZONE_HIT_BAND_PX
+    })
+}
+
+fn distance_to_segment(px: f64, py: f64, a: (f32, f32), b: (f32, f32)) -> f64 {
+    let (ax, ay) = (a.0 as f64, a.1 as f64);
+    let (bx, by) = (b.0 as f64, b.1 as f64);
+    let (dx, dy) = (bx - ax, by - ay);
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-9 {
+        return (px - ax).hypot(py - ay);
+    }
+    let t = (((px - ax) * dx + (py - ay) * dy) / len_sq).clamp(0.0, 1.0);
+    (px - (ax + t * dx)).hypot(py - (ay + t * dy))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::MapSymbol;
+
+    /// A pan drag pulls the ground with the cursor: the same ground stays under
+    /// the hand, so the CENTRE moves the other way. Both axes, because the sign
+    /// flip is per-axis and one of them inverted is the classic bug.
+    #[test]
+    fn a_pan_drag_pulls_the_ground_with_the_cursor() {
+        let centre = (-6.108, 106.910);
+        // The mercator round trip is float, not exact: project then unproject
+        // lands within 1e-13 of where it started, and comparing exactly would
+        // make this test fail on arithmetic rather than on the sign.
+        let (lat0, lon0) = pan_center(centre, 11.0, 0.0, 0.0, 800.0, 600.0);
+        assert!(
+            (lat0 - centre.0).abs() < 1e-9 && (lon0 - centre.1).abs() < 1e-9,
+            "a drag of nothing is no move (round trip exact to 1e-9, got {lat0},{lon0})"
+        );
+        let (_, lon_after) = pan_center(centre, 11.0, 40.0, 0.0, 800.0, 600.0);
+        assert!(
+            lon_after < centre.1,
+            "dragging the picture right moves the centre west"
+        );
+        let (lat_after, _) = pan_center(centre, 11.0, 0.0, 40.0, 800.0, 600.0);
+        assert!(
+            lat_after > centre.0,
+            "dragging the picture down (screen y grows south) moves the centre north"
+        );
+    }
 
     /// An extent at an exact pixel radius, so a test can sit ON a
     /// threshold instead of near one.
@@ -2255,5 +2369,25 @@ mod tests {
             "old centre rendered at {px}, wanted {}",
             w / 2.0 - shift
         );
+    }
+
+    /// A Zone is picked by its outline and its name, never by its
+    /// interior: the middle of a translucent ground overlay is still map.
+    /// Moved off the console binary with the function (U8 step 1).
+    #[test]
+    fn a_zone_is_picked_by_its_outline_not_its_inside() {
+        // A 200 x 100 rectangle of screen px.
+        let pts = vec![(0.0, 0.0), (200.0, 0.0), (200.0, 100.0), (0.0, 100.0)];
+        let label_c = (100.0, 50.0);
+        // Deep inside, far from every edge: NOT a hit.
+        assert!(!zone_outline_hit(100.0, 50.0, &pts, label_c, 0.0));
+        // On the outline: a hit, within the band.
+        assert!(zone_outline_hit(0.0, 50.0, &pts, label_c, 0.0));
+        assert!(zone_outline_hit(100.0, 0.0, &pts, label_c, 0.0));
+        // Just outside the band: not a hit.
+        assert!(!zone_outline_hit(-ZONE_HIT_BAND_PX - 1.0, 50.0, &pts, label_c, 0.0));
+        // The name on the Zone is a hit wherever it sits.
+        assert!(zone_outline_hit(100.0, 50.0, &pts, label_c, 40.0));
+        assert!(!zone_outline_hit(100.0, 80.0, &pts, label_c, 20.0));
     }
 }

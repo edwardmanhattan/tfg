@@ -24,6 +24,21 @@ pub struct MinosMaster {
 }
 
 /// One mirrored table: target, columns, and rows.
+/// One hull from the register, with its taxonomy NAMES rather than ids.
+///
+/// See [`MinosMaster::units_named`] for why this exists beside `units`.
+#[derive(Debug, Clone)]
+pub struct UnitNamed {
+    /// The unit id, which is the key the wire reports fixes under: the
+    /// live feed and the register share it as a decimal string, so the
+    /// roster can join a hull to its track without a name lookup.
+    pub id: i64,
+    pub name: String,
+    pub hull_number: String,
+    pub class_name: String,
+    pub category_name: String,
+}
+
 pub struct TableData {
     pub table: &'static str,
     pub columns: &'static str,
@@ -283,6 +298,33 @@ impl MinosMaster {
         })
     }
 
+    /// Hull register WITH the taxonomy names, for a surface that shows a
+    /// class name rather than an id.
+    ///
+    /// [`Self::units`] flattens the taxonomy to ids by design: the console
+    /// resolves them from the catalog after a sync, so a name would be
+    /// carried twice. A shell that has no store yet wants the name directly,
+    /// and asking for the id would mean fetching the catalog as well — so
+    /// this reads the nested names off the same endpoint.
+    ///
+    /// One page: the register is 25 hulls today and the callers that need
+    /// every hull use [`Self::units`], which pages.
+    pub fn units_named(&self, token: &str) -> Result<Vec<UnitNamed>, BackendError> {
+        let data = self.get(token, "/units?page_size=200&page_number=1")?;
+        let list = data.as_array().cloned().unwrap_or_default();
+        Ok(list
+            .iter()
+            .map(|u| UnitNamed {
+                id: Self::int_of(u, "id").unwrap_or(0),
+                name: u["name"].as_str().unwrap_or("").to_string(),
+                hull_number: Self::str_of(u, "hull_number").unwrap_or_else(|| "—".to_string()),
+                class_name: Self::str_of(&u["unit_class"], "name").unwrap_or_else(|| "—".to_string()),
+                category_name: Self::str_of(&u["unit_class"]["category"], "name")
+                    .unwrap_or_else(|| "—".to_string()),
+            })
+            .collect())
+    }
+
     /// Declared branch → category ownership (setup-overhaul picker):
     /// ids only — the rows themselves come from categories(). Empty is
     /// a real answer (a branch owning nothing renders a zero, not an
@@ -442,6 +484,19 @@ impl MinosMaster {
     }
 
     /// Games for the session-users picker (summary shape, newest first).
+    /// The caller's own identity: id and display name.
+    ///
+    /// The one read that says WHOSE seat to look for. `/users/me` is the
+    /// server's own answer to "who am I", so the client never has to decode
+    /// its own token to find out.
+    pub fn me(&self, token: &str) -> Result<(i64, String), BackendError> {
+        let data = self.get(token, "/users/me")?;
+        Ok((
+            data["id"].as_i64().unwrap_or(0),
+            data["name"].as_str().unwrap_or("").to_string(),
+        ))
+    }
+
     pub fn games_list(&self, token: &str) -> Result<Vec<GameRow>, BackendError> {
         Ok(self
             .paged(token, "/games")?
@@ -3244,30 +3299,10 @@ impl GameScenarioStep {
     }
 }
 
-/// Whether `s` is a `HHMM` the backend will accept.
-///
-/// Strict on purpose, because the backend's own parser is: exactly four
-/// characters, digits only, hour at most 23, minute at most 59. So `900`,
-/// `2400`, `10:00` and `1060` are all refused, and a client that accepts any
-/// of them turns an immediate local correction into a 400 from the field.
-///
-/// Checked on the way out so the author sees the problem while typing.
-pub fn hhmm_ok(s: &str) -> bool {
-    if s.len() != 4 || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    let h = s[0..2].parse::<u32>().unwrap_or(99);
-    let m = s[2..4].parse::<u32>().unwrap_or(99);
-    h <= 23 && m <= 59
-}
-
-/// Whether a pair of `HHMM` strings is a window the backend will accept.
-///
-/// Both ends or neither, and the end must be after the start. A window that
-/// crosses midnight is two steps, by the backend's own rule.
-pub fn hhmm_window_ok(start: &str, end: &str) -> bool {
-    hhmm_ok(start) && hhmm_ok(end) && start < end
-}
+/// Whether `s` is a `HHMM` the backend will accept, and whether a pair runs
+/// forwards: `view`'s pure string validation, re-exported here so every
+/// existing `backend::hhmm_*` path resolves unchanged.
+pub use crate::view::{hhmm_ok, hhmm_window_ok};
 
 /// The date the exercise clock is stamped with, and it is NOT a real date.
 ///

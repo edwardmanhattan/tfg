@@ -7,7 +7,8 @@
 desktop
 
 <!-- Note: `desktop` is outside the web/ios/android/adaptive enum by explicit
-     user decision (2026-09-23): the app is a native Rust/egui desktop window,
+     user decision (2026-09-23): the app is a native Rust desktop window
+     (egui at the time of the decision, GPUI since the U8 step-5 cutover),
      and none of the four schema values is truthful for it. -->
 
 ## Users
@@ -66,7 +67,8 @@ detail):
   system libraries; the local store holds state when no backend is reachable.
 - **Backend-optional operation** — live, replay, and mock backends are
   interchangeable sources; local drafts survive disconnection.
-- **egui as the UI shell** (ADR-0002) — all client UI in egui/eframe.
+- **GPUI as the UI shell** (ADR-0020, cut over at U8 step 5) — all client UI
+  in GPUI; egui/eframe before it (ADR-0002).
 - **MapLibre as a pure map engine with game objects as overlays**
   (ADR-0001) — tiles and camera only; markers/trails/zones are client-side
   overlay primitives, never map style layers.

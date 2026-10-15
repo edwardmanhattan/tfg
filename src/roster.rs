@@ -226,6 +226,21 @@ pub fn plan(draft: &RosterDraft, live: &[LiveSeat]) -> Vec<RosterWrite> {
     writes
 }
 
+/// Whether a game role may need a fleet before the exercise can run.
+///
+/// TRUE for everything that is not judge-side, because that is all the
+/// helpers mirror can say. There is no positive "requires a command" flag on
+/// a game role — the schema carries `is_judge_side` and nothing else — so the
+/// honest form of this question is "is this the judge side", and the answer
+/// for the rest is a warning rather than a block.
+///
+/// A free function because the rule is pure and takes only the flag: the note
+/// appears in two places (the seat form and the roster row) and one answer
+/// served from two places is two answers waiting to disagree.
+pub fn role_may_need_command(is_judge_side: bool) -> bool {
+    !is_judge_side
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +353,15 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["seat", "role", "unseat"]);
+    }
+
+    /// The only positive fact the helpers mirror carries about a game role
+    /// is `is_judge_side`, so "may need a command" is exactly its negation.
+    /// A test that says anything more would be asserting a flag the schema
+    /// does not have.
+    #[test]
+    fn only_the_judge_side_is_known_not_to_need_a_command() {
+        assert!(!role_may_need_command(true), "judge side never commands");
+        assert!(role_may_need_command(false), "everything else may");
     }
 }

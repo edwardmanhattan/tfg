@@ -47,9 +47,9 @@ the MapLibre core.
 | The scenario book's client API | `backend::master` `GameScenario`, `GameScenarioStep`, 8 methods | 6 tests: the `HHMM` rules, nested-step parse, no-id refusal |
 | The Scenario Composer modal | `ShipApp::composer_modal`, `composer_body` | `cargo check` clean; **not looked at** (no compositor on this machine) |
 | The composer draft's rules | `ComposerDraft::problem` | 5 tests: half-window, malformed, backwards, no-window, empty content |
-| The Fleet Picker modal | `ShipApp::fleet_picker_modal` | `cargo check` clean; **not looked at** (no compositor) |
+| The Fleet Picker modal | `ShipApp::fleet_picker_modal`, geometry in `tfg::picker` | `cargo check` clean; **not looked at** (no compositor). The geometry (column widths, panel size, strip, drop rule) is kernel-tested with no egui context |
 | A clear backdrop for drag-to-map | `chrome::Backdrop` | 2 tests: it drops the dim and nothing else, and a dim is actually dimmed |
-| A release over a panel is not a drop | `main::drop_lands_on_map` | 3 tests: the panel edge half-open, the empty case, and TWO panels where one would pass both |
+| A release over a panel is not a drop | `picker::drop_lands_on_map` (moved out of `main.rs` for the GPUI cutover, ADR-0020) | 3 tests: the panel edge half-open, the empty case, and TWO panels where one would pass both |
 | The Player Picker modal | `ShipApp::player_picker_modal` | `cargo check` clean; **not looked at** (no compositor) |
 | The seat note's rule | `main::role_may_need_command` | a test that says exactly what the schema can support and no more |
 | Island roster is read-only, editor is in the modal | `users_roster_ui` / `roster_editor_ui` | a source-level check on the Id collision, which no screenshot would reveal |

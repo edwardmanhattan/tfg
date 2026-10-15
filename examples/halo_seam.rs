@@ -4,7 +4,7 @@
 //! Two questions, both answered with numbers rather than argument:
 //!
 //! 1. **Parity.** `p5-epaint --fx-selftest --fx-dump <png>` writes the
-//!    WGSL's offscreen target. [`tfg::fx::rasterize`] evaluates the same
+//!    WGSL's offscreen target. [`tfg::halo::rasterize`] evaluates the same
 //!    formula on the CPU. Diffing the two says whether the CPU path is the
 //!    same effect or merely a similar one.
 //! 2. **Blend.** GPUI 0.2.2 has no per-element blend mode and no device
@@ -20,7 +20,7 @@
 //! `HALO_STRENGTH` (default 0.55, the console's selected-marker value).
 
 use image::{Rgba, RgbaImage};
-use tfg::fx::Halo;
+use tfg::halo::Halo;
 
 /// The GPU selftest draws into a 256x256 target with the quad's half-extent
 /// at HALO_R pixels, so the halo occupies a 2*HALO_R box about the centre.
@@ -37,14 +37,14 @@ fn main() {
         .unwrap_or(0.55);
 
     let tint = Halo::Signal.rgb();
-    let side = (tfg::fx::HALO_R * 2.0) as usize; // 44
+    let side = (tfg::halo::HALO_R * 2.0) as usize; // 44
 
     // ---- 1. Parity: CPU raster vs the WGSL's own readback ----------------
     let dump = image::open(&dump_path)
         .unwrap_or_else(|e| panic!("shader dump {dump_path}: {e}"))
         .to_rgba8();
     assert_eq!(dump.dimensions(), (DUMP_SIZE as u32, DUMP_SIZE as u32));
-    let cpu = tfg::fx::rasterize(side, tint, 1.0);
+    let cpu = tfg::halo::rasterize(side, tint, 1.0);
 
     let origin = DUMP_SIZE / 2 - side / 2; // 106
     let mut max_delta = 0i32;

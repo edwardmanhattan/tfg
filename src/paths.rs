@@ -135,6 +135,48 @@ fn platform_data_dir() -> Result<PathBuf, String> {
     Err("neither XDG_DATA_HOME nor HOME is set".to_string())
 }
 
+/// Load optional `.env` files: working directory first for developer
+/// workflows, then the installed app data directory. Real environment
+/// variables always win — files only fill gaps.
+///
+/// Moved off the egui binary for the cutover (U8 prep A): endpoint
+/// selection lives in env files for both consoles, so the loader is
+/// shared rather than reimplemented per binary.
+pub fn load_dotenv(paths: Option<&AppPaths>) {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::current_dir().ok().map(|dir| dir.join(".env")) {
+        candidates.push(path);
+    }
+    if let Some(paths) = paths {
+        candidates.push(paths.data_dir.join(".env"));
+    }
+    for path in candidates {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let (k, v) = (k.trim(), v.trim());
+            if k.is_empty() || std::env::var(k).is_ok() {
+                continue;
+            }
+            let v = v
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(v);
+            // Tab: set_var is unsafe under edition 2024 (process-wide).
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

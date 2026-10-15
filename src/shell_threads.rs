@@ -18,9 +18,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::assets::scenario_json;
 use crate::backend::{
@@ -172,4 +172,83 @@ pub fn spawn_poll_thread(cfg: PollThreadConfig) -> JoinHandle<()> {
             }
         }
     })
+}
+
+/// A request for one map frame: sequence, centre, zoom, pixel size, and how
+/// many MapLibre pumps to spend on it.
+pub type MapReq = (u64, (f64, f64), f64, (u32, u32), u32);
+
+/// One finished map frame: the request's identity, plus RAW RGBA bytes,
+/// row-major, `w` x `h`, premultiplied exactly as MapLibre produced them
+/// (see [`crate::map_render::LiveMap::is_premultiplied`]).
+///
+/// TOOLKIT-FREE BY DESIGN, and this is the U6 handoff. It used to carry an
+/// `egui::ColorImage`, which is a toolkit type in the middle of the map
+/// thread's message and the reason the spawn could not leave the egui binary.
+/// Each shell now converts at its own boundary: the egui console wraps these
+/// bytes in a `ColorImage` where it consumes them, and the GPUI shell
+/// swizzles them to BGRA for its atlas. Neither toolkit's type appears here,
+/// which is what lets ONE spawn serve both binaries.
+pub type MapResp = (u64, (f64, f64), f64, (u32, u32), Vec<u8>);
+
+/// Everything the map thread needs that is not a request.
+pub struct MapConfig {
+    /// First centre and zoom, used for the initial frame.
+    pub center: (f64, f64),
+    pub zoom: f64,
+    /// Initial pixel size; a request at a different size rebuilds the scene.
+    pub width: u32,
+    pub height: u32,
+    /// MapLibre style URL.
+    pub style: String,
+    /// Prepared runtime cache (see `map_render::prepare_runtime_cache`).
+    pub cache: std::path::PathBuf,
+    /// Pumps for a jump (a recentre); the ordinary gesture spends fewer.
+    pub jump_pump: u32,
+}
+
+/// Spawn the map thread: it owns the persistent MapLibre scene and answers
+/// requests with finished frames, newest-wins.
+///
+/// Moved here from the egui binary's `fn main` for U6, which is what the
+/// module doc above predicted ("the spawn follows then"). The behaviour is
+/// unchanged — same newest-wins drain, same resize rebuild, same off-thread
+/// pixel readback — and the egui console's frames are byte-identical: it
+/// converts the same RGBA it always did, one call site later.
+///
+/// It exits when the UI drops the request sender, dropping the scene on this
+/// thread instead of racing process teardown.
+pub fn spawn_map_thread(config: MapConfig) -> (Sender<MapReq>, Receiver<MapResp>, JoinHandle<()>) {
+    let (req_tx, req_rx) = mpsc::channel::<MapReq>();
+    let (resp_tx, resp_rx) = mpsc::channel::<MapResp>();
+    let handle = std::thread::spawn(move || {
+        use crate::map_render::LiveMap;
+        let mut size = (config.width, config.height);
+        let mut scene = LiveMap::new(config.center, config.zoom, size.0, size.1, &config.style, config.cache.clone());
+        while let Ok(first) = req_rx.recv() {
+            // Newest-wins: a burst of scroll-zoom requests renders once, so
+            // the texture never lags seconds behind.
+            let mut latest = first;
+            for newer in req_rx.try_iter() {
+                latest = newer;
+            }
+            let (seq, at, zoom, px, pump) = latest;
+            if px != size {
+                // Window resize: rebuild the scene once at the new size.
+                scene = LiveMap::new(at, zoom, px.0.max(1), px.1.max(1), &config.style, config.cache.clone());
+                size = px;
+            }
+            scene.set_center(at, zoom);
+            // Smoothness measurement: round-trip cost per frame, so tile lag
+            // can be split into pump-bound vs render/network-bound.
+            let t0 = Instant::now();
+            scene.pump(pump);
+            let rgba = scene.frame_rgba();
+            eprintln!("map frame {seq}: {}ms (pump {pump})", t0.elapsed().as_millis());
+            if resp_tx.send((seq, at, zoom, size, rgba)).is_err() {
+                break; // UI gone
+            }
+        }
+    });
+    (req_tx, resp_rx, handle)
 }

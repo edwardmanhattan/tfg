@@ -1,19 +1,37 @@
 # GPUI migration handoff
 
-**Written 2026-10-11.** Read this first, then the files it names. It exists so
-the next session does not repeat this session's measurements.
+**Written 2026-10-11. Last updated 2026-10-13.** Read this first, then the
+files it names. It exists so the next session does not repeat this session's
+measurements. Everything below the `## State` table is a chronological log,
+newest last, and each entry carries its own verification.
 
-## State
+## State (2026-10-13)
 
-The migration has not started. What exists is proof and a foundation.
+**The cutover is underway, not planned.** The GPUI shell is a working console
+against the dev API: it signs in, reads the game, draws the map and the fleet,
+and shows ten panels. It is NOT the shipped console — egui still is, and
+deleting it is U8 step 5 — but nothing in the shell is scaffolding any more.
 
-| Artifact | State |
+| Piece | State |
 |---|---|
-| `src/view/mod.rs` | Architected seam. Palette, metrics and chrome geometry with no toolkit type. 8 tests pass, no display, no GPU. |
-| `proto/gpui-spike/` | GPUI 0.2.2 renders on this machine. Verified, 847 frames, pixel-exact colour bars. |
-| `proto/gpui-island/` | One ARCONS island in GPUI from `view`. Renders, verified by capture. Palette matches at pixel level. |
-| `docs/gpui-migration-analysis.md` | Cost analysis. 21–34 weeks, 8 units, risk register. |
-| `docs/adr/0018-…md` | Re-measured at the top. Original reasoning preserved below. |
+| `src/view/mod.rs` | The toolkit-free seam: palette, metrics, chrome geometry, marker colours, the camera's zoom bounds. |
+| `src/markers.rs` | The marker model (`ShipMarker`, `MapSymbolShape`) and the symbol/affiliation vocabulary, moved off `main.rs`. |
+| `src/shell_gpui.rs` | The GPUI shell: map + camera (zoom, pan), live markers (taxonomy glyph + affiliation frame), and the panels below. |
+| `src/bin/tfg_gpui.rs` | The binary: map thread, poll thread + live wire, the synced store and its resolvers, the session read, the order path, the sign-in. |
+| `proto/gpui-island` | The parity proto. Still MapLibre-free, and still the reason the shell names no `map_render`. |
+| `docs/adr/0020-…md` | Carries the cutover decision; 0018 is superseded. |
+
+**The panels, every one verified by capture.** Sign-in · top zone (link,
+headcount, game, zoom) · roster sheet (the hull register) · live markers ·
+Settings · People (the session roster) · My command (seat, commanded hulls,
+helm) · Comms · Step · Inspector. Each has a `TFG_*` seed so it can be
+photographed headlessly, and each capture is in the log below with what it
+proved.
+
+**Verification.** `cargo test --lib` **428 pass**, with four PRE-EXISTING
+failures (`book::prune…`, `map_render::quad_bow…`, `roster::seats…`,
+`sim::order_move…`) that no migration work has touched. Both binaries and
+`proto/gpui-island` build.
 
 ## Verified facts, with how to re-verify
 
@@ -49,7 +67,16 @@ conversion the tokens never asked for and shifts every hue.
 panel box. Three of the island's four bevel rings paint outside it and the clip
 guillotines them. Clip the content column instead.
 
-## Capture recipe, which finally worked
+## Capture recipe
+
+**Reach for `scripts/gpui-capture.sh` first.** It encodes the prose below plus
+the four rules this session learned by losing half an hour to a hung `grim`:
+timeout every external call, kill the app from a `trap` rather than the last
+line, PROBE grim before launching, and match the window by **class**
+(`tfg-gpui`) rather than by pid and a rect — Hyprland places this window
+somewhere new each launch, and a stale rect crops someone else's window while
+looking perfectly plausible. The prose stays for the why, and for the cases the
+script does not cover.
 
 Get the window's geometry from `hyprctl -j clients`, unset `WAYLAND_DISPLAY` is
 wrong here, keep it set. Then crop with `magick in.png -crop WxH+X+Y` where the
@@ -70,31 +97,136 @@ export LD_LIBRARY_PATH=/tmp/opencode/lvp/usr/lib
 The user can install it cleanly with `yay -S vulkan-swrast`, which removes the
 env-var layer from every later test.
 
-## Next unit
+### The capture seeds, and which way they run
 
-The modal chamfer, in `proto/gpui-island`. A convex pentagon with the top-right
-cut back by `view::CUT` (20.0), stroked 2px. It is the one silhouette egui
-cannot draw, which makes it the strongest single argument for the migration.
-One boolean and one click. Verify with one capture of the modal open.
+Two polarities share one variable shape, and they run opposite ways. A seed that
+looks like it opens a thing may close it, or do nothing at all.
 
-Two traps to avoid, both from this session. Paint the silhouette outside the
-panel box so the clip belongs on the content column. Convert colour with
-`gpui::rgba`, never through `Hsla`.
+**The four island-open seeds are default OPEN, and `=0` is the only thing that
+changes them** (`src/shell_gpui.rs` ~909):
 
-## What is open after that
+```
+people_open: std::env::var("TFG_PEOPLE").as_deref() != Ok("0"),
+crew_open:   std::env::var("TFG_CREW").as_deref()   != Ok("0"),
+command_open:std::env::var("TFG_COMMAND").as_deref()!= Ok("0"),
+step_open:   std::env::var("TFG_STEP").as_deref()   != Ok("0"),
+```
 
-The island's drag handle, close button and input ownership. In egui the title
-band registers last because that is the entire close-button fix, and a port has
-to preserve the order.
+So `TFG_STEP=1` is a **no-op** — the island was already open — and `TFG_STEP=0`
+is the only spelling that does anything. They default open because the console's
+column is full at rest: a seed that forced something open would be a capture of
+a state nobody is in. `TFG_PEOPLE` used to open a centred modal and now closes
+an island; its comment says so.
 
-`side_zone` and the scroll chain. `BodyFit` has no GPUI equivalent, so it needs
-a custom element that reports its own scroll offset. This is the largest single
-unknown left.
+**A third kind, and neither family: `TFG_ASSESS_TAB=N` picks the Assessment
+island's tab (0 Summary, 1 Timeline, 2 Judgements, 3 Reviews).** It is an index
+rather than a flag because the thing it selects has four states, and a flag
+family cannot express that. It defaults to 0, so an unseeded launch opens the
+Summary the console opens. It exists because the only tab with anything in it on
+this account is Timeline — a photograph of the Summary proves nothing
+about the other three.
 
-The widget sheet. About 6,650 lines of `&mut Ui` methods. Volume rather than
-difficulty.
+**The modal seeds are default CLOSED, and `=1` opens them:**
 
-The unattended capture path on Xvfb. Opens a surface, paints nothing.
+```
+TFG_COMMS  TFG_INSPECT  TFG_SETTINGS  TFG_PLAYER
+TFG_FLEET  TFG_BOOK     TFG_COMPOSE   TFG_RELATE
+```
+
+So `TFG_COMMS=0` is a no-op. They default closed because an open inbox over the
+console on every launch was exactly the capture that kept looking like a stray
+focus click — a flag defaulting the wrong way, not input at all.
+
+Same variable, opposite meaning. `TFG_STEP=1` does nothing and `TFG_COMMS=1`
+opens a modal; there is no spelling that tells you which family a seed belongs
+to except the table above.
+
+**A fourth kind: `TFG_EMBARK=<host id>` opens the Embarked modal on one hull.**
+It takes an id rather than a flag because the modal reads one hull's
+passengers and a flag would not say whose. The read fires from the modal's
+first draw (latched, single-flight), so seeding the host seeds the whole
+open — e.g. `TFG_GAME=5 TFG_EMBARK=8` photographs host 8's passengers with
+no click.
+
+**`TFG_SCROLL` and a wheel delta move the column in OPPOSITE directions for the
+same number.** Islands are placed at `origin.1 - zone_scroll` (render, ~5749),
+so a larger offset moves them **up** and reveals the stack's bottom. The wheel
+handler is `zone_scroll = (zone_scroll - dy).clamp(0.0, ceiling)` (~5803).
+Therefore:
+
+- `TFG_SCROLL=+N` and a wheel with `delta.y = -N` photograph the **same frame**.
+- A **positive** wheel delta moves islands **down** and reveals the top. (The
+  code's own comment reads this as "positive wheel Y is content moving down".)
+- To see the bottom of a stack, set `TFG_SCROLL=462`, or dispatch `dy = -462`.
+
+**The trap that cost a wrong number: `zone_scroll` growing reads as "scrolling
+down" but moves content UP.** The wheel test's own assertion message — "a
+downward wheel moves the column down" — names the *offset*, not the islands.
+Read it as islands and every direction inverts.
+
+**And a seed is not a measurement.** `TFG_SCROLL=474` clamps to the real ceiling,
+so the seed's value says nothing about the ceiling. Quoting 474 as "the ceiling"
+was wrong: the judge execution column's ceiling is **462**, which is
+172+380+420+240 plus four 2-point gaps = 1220 over a 758-point band
+(56 + 24 edge gaps on an 838-tall window). Compute it from
+`view::zone_overflow(view::zone_stack_height(&slots), band)`; never read it off a
+seed that was clamped to it.
+
+## What is blocked, and why (2026-10-13)
+
+Three things this environment will not give us. All measured, none of them code.
+
+**The write half.** Orders, step advance and message send are each
+refused in the states reachable here: an EXECUTING game freezes setup (seating
+and unit assignment answer 409), a PREPARATION game freezes its terms (the
+window cannot be set, so the start check can never pass), and a fresh PLANNING
+game cannot be transitioned at all (403 — and NOT because of the seat: a
+Controller seat answers the same). So the helm, the message composer and the
+step declarations are built and pinned by test, and cannot be proven against
+the server until somebody can start a game.
+
+**Correction (2026-10-13): readiness was never in that list — it was only
+never probed.** Declaring readiness as a player in a preparation game answers
+**200** (proven on game 12: PUT set `is_ready` with a `ready_at` stamp,
+DELETE withdrew it, prior state restored). Planning writes proven since:
+session create (201), scenario add (201, seated), step add (201), step delete
+(200), readiness declare/withdraw (200/200). What remains blocked is exactly:
+execution-gated writes (helm orders, messages, step advance/readiness —
+`declare_step_readiness` is unprobed but lives in execution), transitions,
+and the clock.
+
+**Correction (2026-10-13, evening): the helm is proven — see "Execution
+unblocked" below.** With two accounts (superuser Commando + budi GM),
+game 42 went planning → preparation → execution, and the helm order answered
+**201**. Execution-gated writes are no longer a class; they are per-surface:
+messages need the hull under a task node (game 42's tree is fixed empty —
+next: fresh game, hierarchy in planning), step advance/readiness and the
+comms composer UI are unbuilt, the clock still has no GET.
+
+**The task organisation.** `/games/{id}/hierarchy` returns EMPTY for every dev
+game, and `HierarchyNode` carries no commander, so no task group can be
+derived. Same class of gap.
+
+**The exercise clock.** There is no clock GET — the backend's own comment says
+the pause/resume/factor writes ARE the read — and recomputing `assumed_now`
+client-side is explicitly refused. The Step panel shows the server's
+`assumed_time` from `current-step`; a ticking clock needs the Minos clock
+channel.
+
+## Next
+
+The helm is proven live (game 42 executes — see the log). What is left:
+the comms composer UI (message send wants a hull under a task node — fresh
+game with hierarchy built in planning, node schema + placement route still to
+discover), step advance/readiness (unprobed, live in execution), and the top
+zone's clock (blocked: no clock GET). Then
+U8 step 5: delete egui, eframe and egui_extras, regenerate `about.toml`.
+
+**The honest gap.** The shell READS what the console reads. The write and
+management surfaces — orders, readiness, the composer, session creation — are
+the remaining bulk, and most of them cannot be proven on this environment at
+all. That is the thing to settle with whoever runs Minos before U8 step 5 is
+scheduled.
 
 ## Do not re-measure
 
@@ -1171,3 +1303,3495 @@ used); an unattended headless capture is deferred, not solved. CI keeps the
 The cutover itself is the next sessions' work, starting at step 1 (the test
 migration), because it is the mechanical unblock for removing egui and it
 needs no GPU to verify.
+
+## U8 step 1, first increment — 22 of 53 tests off egui (2026-10-12)
+
+Two clusters moved, both under the U1–U8 discipline: same rules, same names,
+same arithmetic, a kernel module each, `cargo test --lib` green, no GPU.
+
+**`src/picker.rs` — the Fleet picker's geometry (7 tests).** `MILLER_*`,
+`PICKER_*`, `picker_size`, `strip_height` and `drop_lands_on_map` were
+`main.rs`'s, spelled against `egui::Vec2` / `egui::Rect` / `egui::Pos2`. They
+are a leaf module now: a size is `(f32, f32)` and a panel rect is
+`view::Box`, the convention `view` already set. Names unchanged so the prose
+quoting them (`chrome.rs`, `docs/ui-overhaul-status.md`, the tests) does not
+drift. The shell converts at the boundary — a four-line `drop_lands_on_map`
+adapter beside the call sites — because the kernel must not learn egui's name
+and egui must not learn the kernel's.
+
+**One boundary the move exposed, and the old test never probed.** egui's
+`Rect::contains` is HALF-OPEN (`min <= p < max`) and `view::box_contains` is
+closed. The drop rule was written against the half-open form, so a release
+exactly on a modal panel's right or bottom edge lands on the map. Rather than
+quietly inherit whichever predicate was nearest, `view` gained
+`box_holds_interior` beside `box_contains`, with the reason: an island's
+boundary belongs to the island (ownership must leave no seam unclaimed) and a
+modal panel's does not. `a_release_over_a_panel_is_not_a_drop` now asserts
+`(500,250)` and `(250,400)` — the exact edges — which the pre-move test
+probed only 0.5pt either side of. That gap was the half of the rule most
+likely to be lost in a port, and `view`'s own test pins the two predicates
+against each other.
+
+**`src/visuals.rs` — the hull visual cache (15 tests).** `AssetKind`,
+`UnitVisual`, `VisualCache`, `image_source_expires_at` and
+`IMAGE_READ_RETRY_DELAY` moved; the eighteen-tests estimate in the plan was a
+miscount, it is fifteen plus three helpers. The rules are pure — manifest
+versions, presign expiry, settled absence — and were pinned in the binary
+only because the struct was there.
+
+**The one type that changed, and it is U6's seam.** `UnitVisual` used to hold
+`texture: Option<egui::load::SizedTexture>` — a toolkit type inside the model,
+which is exactly what the cutover removes. The kernel now holds
+`visuals::TextureHandle(u64)`: an opaque number the SHELL mints. `ShipApp`
+keeps the other half in `unit_textures: HashMap<u64, SizedTexture>`, written by
+`hold_texture` (which also retires the previous entry, so the table is bounded
+by what the cache points at, not by everything ever decoded) and read back
+through `unit_texture`. GPUI will key whatever its image slot is; neither
+name reaches the kernel. Five call sites changed, and one behaviour note:
+`paint_unit_image`'s `expect("renderable visual has a texture")` became a
+`continue` in its caller, so a missing shell texture now falls through to the
+symbol instead of panicking — unreachable today, because a handle only exists
+once `hold_texture` has inserted the bytes.
+
+**What this increment does NOT claim.** No capture and no run: the texture
+seam is a runtime path (five call sites, five painted surfaces) and it is
+verified here by the compiler and by the fifteen cache tests, not by a pixel.
+The next quiet-compositor moment should drive the console with a pictured
+hull and look at the map thumbnail, the picker row, the drag ghost and the
+Inspector's picture column — those four are the whole of the seam, and a
+regression in any of them shows as a symbol where a photograph belongs.
+
+**Numbers.** `cargo test --lib`: **396 pass** (was 373; +22 moved, +1 new
+`view` test), same 4 pre-existing failures (`book`, `map_render`, `roster`,
+`sim` — all reproduce on the clean tree). `cargo test --bin tfg`: **31 pass**
+(was 53). `cargo check --bins`: zero new warnings — the 3 bin and 5 lib
+warnings are the untouched-code set, verified unchanged.
+
+**What is left of the 53, and why each is still there (31 tests).** Not a
+backlog of equal items:
+
+- **The source-level checks** (`the_editable_roster_is_only_in_the_modal`,
+  `every_create_verb_has_a_name_field_on_screen`, `no_login_path_offers_a_mode_choice`,
+  `a_surface_is_in_the_column_or_floating_never_both`,
+  `settings_offers_a_view_rather_than_a_mode_choice`,
+  `the_console_boots_at_the_larger_text_step`) read `include_str!("main.rs")`.
+  They cannot leave until the surface they inspect does — they move with the
+  GPUI `main`, i.e. at cutover, and they are the tests that will point at the
+  new file.
+- **The paint-level assertions** (`the_theme_installs_larger_text_than_egui_ships`,
+  the glyph-contrast pair, the hit-region and paint-order cluster,
+  `inspector_image_size`) name egui types the GPUI shell replaces one panel at
+  a time. The theme one is the interesting case: GPUI has no global style, so
+  its assertion becomes a token check that `view` already carries — it dies at
+  cutover rather than moving.
+- **The readiness gate and the composer draft** (`ReadinessGap`,
+  `unknown_gate_blockers`, `ComposerDraft`, `role_may_need_command` — 11
+  tests) are already pure and need no toolkit at all. They are the next move
+  and the cheapest one: a new leaf module each, verbatim. Blocked on nothing
+  but a name — `ComposerDraft` is the comms composer, not `book`'s scenario
+  draft, and `ReadinessGap` is the execution gate, so they are two modules or
+  one named for neither's concept.
+- **Two leftovers found in passing:** `Row`, `window_set()` and `no_window()`
+  in `main.rs`'s test module are scaffolding for a table test that no longer
+  exists. Dead, and left dead here rather than deleted in a slice that is
+  about something else.
+
+**Process note, for the next session.** Two of this session's edits were
+line-arithmetic deletions over a 23k-line file and the second mangled it; the
+recovery was `git show HEAD:src/main.rs` plus re-applying both moves as
+unique-text cuts. Marker-based cuts are the only safe form here. Also: this
+repo has a pre-existing `stash@{0}` from 2026-09-25 — do not `git stash push`
+without checking `git stash list` first.
+
+## U8 step 1, second increment — 33 of 53 off egui (2026-10-12)
+
+The cluster the first increment named as next, done. **Eleven more tests**,
+three destinations, and one of them needed no type change at all.
+
+**`src/readiness.rs` (new) — the execution gate's unknown states (5 tests).**
+`ReadinessGap`, `ReadinessGap::of` and `unknown_gate_blockers`. The server's own
+verdict (`GameReadinessView`, `blockers`, `can_execute`) stays in `backend`;
+this module is only the client's answer for when there is no verdict to read,
+which is the branch a deleted rule would quietly come back in.
+
+**`src/book.rs` — the composer's step draft (5 tests).** `ComposerDraft` now
+sits directly above `StagedStep`, whose own doc already said the step form
+validates "the same as the step form" — that reference is now a neighbour
+rather than a pointer across the binary. `problem()` and `window()` needed no
+change beyond `tfg::backend::` → `crate::backend::`.
+
+**`src/roster.rs` — `role_may_need_command` (1 test).** `roster.rs` already
+carries `StagedSeat.judge`, the exact flag the rule reads, and its module doc
+is the same shape ("the rules about what a legal draft is are pure functions
+over plain data"). One answer served from two places is two answers waiting to
+disagree, which is what the rule's own doc says, and now it is one function in
+the module that owns the flag.
+
+**The naming question the last increment raised is settled by the code, not by
+taste.** `ComposerDraft` is `book`'s, not a third draft-shaped module: `book.rs`
+is "the scenario book as the operator has it, before Minos has heard of it",
+which is exactly what a composer draft is. `ReadinessGap` needed a new module
+because nothing in the tree owns "why the last read produced no verdict" —
+`gamestate` is where an exercise IS, not why it could not be judged.
+
+**Verification.** Every moved item was diffed against `HEAD` assertion for
+assertion: **identical modulo `pub` and `tfg::` → `crate::`**. The only
+substantive addition is a doc line on `ReadinessGap::of` recording that the 404
+classification was verified against the deployed dev API — that fact was in the
+test's comment and belonged on the function. `cargo test --lib`: **407 pass**
+(was 396), same 4 pre-existing failures. `cargo test --bin tfg`: **20 pass**
+(was 31). Zero new warnings.
+
+**Dead scaffolding deleted, found by the move.** `window_set()`, `no_window()`
+and `struct Row` in `main.rs`'s test module were the remains of a readiness
+table test that no longer exists — `Row` had nine fields including `want` and
+`why` for exactly the blanker-list assertion the gate tests now carry
+individually. They were dead before this cutover; moving the tests they sat
+beside is what made that checkable.
+
+**Running total: 33 of 53 moved.** What remains in `main.rs` (20 tests) is now
+only two kinds, and both are stated in the module's own header: source-level
+checks that read `include_str!("main.rs")` and move with the GPUI `main` at
+cutover, and paint-level assertions that name egui types the shell replaces one
+panel at a time. Nothing pure is left merely misplaced, which is the point at
+which step 1 stops being a move-and-verify exercise and becomes the cutover
+itself.
+
+## U8 step 2 — gpui in the shipped crate (2026-10-12)
+
+**Done, and it cost less than the plan said.** `gpui = "=0.2.2"` is a
+dependency of the root package now, with both patches where cargo will actually
+read them. Nothing references it yet, so this step is resolution and compilation
+only — the GPUI `main` is step 3.
+
+**The xattr patch had to move to the root, and that is the U4e lesson paying
+off in advance.** Cargo ignores a path dependency's `[patch.crates-io]`, so a
+patch that lives only in a proto never applies to the shipped crate. Both
+patches now sit in the root table: `maplibre_native` and `tokio-centrifuge`
+(vendored) and `xattr` (the `ENOATTR` → `ENODATA` rebind). Verified it is not
+merely RESOLVED but COMPILED from our path — `zed-async-tar`, which is gpui's
+tar, resolves `xattr ^0.2` to `proto/gpui-spike/patches/xattr`, and
+`target/debug/deps/xattr-*.d` names that directory as the source. The
+unrelated `xattr 1.6.1` that `tar 0.4.46` wants is a separate slot and is
+untouched: two versions of one crate is the patch working, not a conflict.
+
+**Numbers, measured rather than repeated.** Lockfile `[[package]]` entries
+**708 → 1003** (+295; the plan's "~520" was the proto's own closure including
+dev-deps). The graph carries `blade-graphics 0.7.1` and `ash 0.38.0+1.3.281` —
+the Vulkan path ADR-0020 made mandatory. New artifacts: **4.5 GB in 1,462
+files**; `target/` is **40 G** in total, almost all of it the pre-existing
+MapLibre C++ checkout, not this step. `cargo check --bins` from cold took
+**2m21s**; `cargo build --bins` is warm at **0.53s**, so step 3 pays no build
+cost. gpui's own rlib is **268 MB**.
+
+**The shipped console is untouched, and the mechanism matters.** No code
+changed, and gpui is unreferenced, so cargo builds its rlib but does not pass
+it to the linker: `ldd target/debug/tfg` has no Vulkan in it and `nm` finds
+zero `gpui::` symbols. That is why the egui binary still runs on a machine
+whose Vulkan story is unresolved — the mandatory-Vulkan consequence of ADR-0020
+bites at step 3, when the GPUI `main` links blade, and not before.
+
+`cargo test --lib`: **407 pass**, same 4 pre-existing failures — feature
+unification across 295 new packages disturbed nothing. Zero new warnings in our
+code (the 3 bin warnings are the pre-existing untouched-code set).
+
+### Correction to the GPU record, which this step surfaced
+
+**The machine has a working discrete GPU, and the log's gap was never closed.**
+The handoff recorded "`NoSupportedDeviceFound` on the Intel iGPU — blade rejects
+it, reason unexamined", and every U1–U8 capture was made under the software
+Vulkan layer at `/tmp/opencode/lvp`. `tfg --probe-gpu` now reports:
+
+```
+adapter: Vulkan / DiscreteGpu — NVIDIA GeForce RTX 2050
+probe: DiscreteGpu — device ready in 201ms, first frame in 648µs (budget 100ms)
+```
+
+Two honest qualifications. It is **wgpu** (via `eframe::egui_wgpu`), not blade,
+so it proves the ICDs and a dGPU are present and working — not that blade's own
+instance and device selection will pick it. And it is **independent of this
+step**: the probe predates gpui and touches none of it. What it changes is the
+verification plan for step 3 onward: try the GPUI main on the dGPU FIRST, and
+keep `/tmp/opencode/lvp` (still unpacked) as the fallback rather than the
+default. If blade does reject the dGPU the way it rejected the iGPU, the reason
+is now worth finding, because it would be blade's selection and not the
+machine's.
+
+## U8 step 3, first increment — a GPUI `main` beside the egui one (2026-10-12)
+
+**There is a second binary now, and it runs on this machine.** `cargo build
+--bins` produces `tfg` (the shipped egui console, untouched) and `tfg_gpui`
+(the cutover's shell). Both read the same kernel and the same threads; only
+the paint layer differs. Nothing in the egui console changed — not one line of
+`main.rs` behaviour.
+
+**What moved, and why it is one file rather than two.** `gate.rs` became
+`src/map_gate.rs`, a lib module, because its own doc said "U8 then copies one
+implementation into the shell, not two". Three consumers now compile that one
+file: the lib, `proto/gpui-map` and `proto/gpui-island`, the latter two through
+`#[path]` exactly as they already did for `view` and `fx::halo`. The island
+shell itself became `src/shell_gpui.rs` with `fn main()` renamed to `pub fn
+run()`, and `src/bin/tfg_gpui.rs` is four lines. `proto/gpui-island/src/main.rs`
+is now a driver plus three shim modules, because the shell addresses its kernel
+by `crate::` path and a proto's crate root is not ours.
+
+Two things that cost time and are worth recording:
+
+- **A `#[path]` inside an INLINE module resolves against the inline module's own
+  directory** — a directory that does not exist. `mod fx { #[path = "../../src/…"]
+  pub mod halo; }` looked right and was wrong; the fix is a top-level
+  `#[path] mod halo_file;` re-exported as `fx::halo`, which is also clearer
+  about what it is.
+- **`cargo build … | head` SIGPIPEs cargo and leaves the old binary in place.**
+  The first capture after the viewport fix showed no change because the build
+  had been killed at 12 lines of warnings and `target/debug/tfg_gpui` still
+  carried its 18:13 timestamp against an 18:20 source. Cargo is not
+  SIGPIPE-safe; pipe to a file and read the file.
+
+### The defect the first capture found, which is the real content of this increment
+
+**The shell hardcoded its own viewport.** Five sites spelled
+`(0.0, 0.0, 760.0, 620.0)` — the size it *asked* the window for — instead of
+asking the window what it is. A tiler put the window in a 768x838 tile, and the
+band kept docking against a viewport that no longer existed, so the chrome
+occupied a floating rectangle and the rest of the surface was transparent
+wallpaper. That is fine for a fixed-size demo and fatal for a console, which is
+resized constantly. The four sites on the render path now read
+`window.viewport_size()` through one `viewport()` helper; the two inside the
+move-listener read the listener's own `&mut Window`, because the outer borrow
+cannot escape into a closure that outlives the method — which is the actual
+reason those two could not simply call the helper.
+
+**Measured, on a window deliberately NOT the size the shell assumed** (floating
+at 778x848 logical, capture cropped at logical ×1.25):
+
+| | before the fix | after |
+| --- | --- | --- |
+| console bbox, logical | y 56..600 of 848 tall | **y 56..823 of 848** |
+| CONSOLE_NIGHT fill | 23.4% of the window | **35.3%** |
+
+823 is `848 − ZONE_EDGE_GAP (24)` — the band's bottom is now the live window's
+bottom, not a remembered one. The right edge lands at 748 of 778, which is the
+band's `778 − 24` less the islands' own 360 width plus the bevel bleed. The
+column still docks right, still clips, still shows the islands' own
+`CONSOLE_NIGHT` bodies, `PANEL_SLATE` rails, `CUT_GREY` resting rims and
+`MAP_INK` ink. `RADAR_CYAN` is zero, which is the expected state: focus
+delivers a cursor event and clobbers the seeded pointer, so no rim is lit —
+the same finding as U4e, and the lit state stands proven from U4b.
+
+**What is still wrong, stated plainly.** The islands' *positions* are still
+seeded in `fn new()` from the old literal viewport (one site, `zone_island_origin`
+over `(0,0,760,620)`), because `fn new()` has no window to ask. So on a resize
+the band follows and the islands do not. For a demo that is invisible; for the
+console it is not, and step 4's port derives every island origin from the
+kernel each frame, as U4e established. The seed stays until then.
+
+### GPU: the dGPU finding holds
+
+The shell ran with **no software Vulkan layer at all** — no
+`VK_ICD_FILENAMES`, no `LD_LIBRARY_PATH` — straight onto the NVIDIA RTX 2050
+that step 2's probe found. `/tmp/opencode/lvp` was not touched. So blade's own
+device selection does pick the dGPU, which was the open half of step 2's
+correction, and the software layer is now a fallback rather than a requirement.
+
+`app_id: Some("tfg-gpui")` is set in `WindowOptions` (U2 queued exactly this),
+and **Hyprland still reports an empty `class` and `initialClass`**, so the
+class-form focus recipe in this document does not apply to this window. The
+cause is unexamined — gpui plumbs `WindowOptions.app_id` into
+`set_app_id` before `map_window`, so either the Wayland path ignores it or
+Hyprland reads the property from somewhere else. Capture by geometry instead,
+which is what the recipe already falls back to. Left open rather than guessed at.
+
+**Verification.** `cargo test --lib` 407 pass (same 4 pre-existing failures);
+`cargo test --bin tfg` 20 pass; `cargo build --bins` clean with the 8
+pre-existing warnings and none new; both protos build against the moved file.
+No capture is claimed for anything but the island chrome: there are **no map
+frames** (`MAP_FRAMES_DIR` defaults to `/tmp/opencode/mapframes`, which does
+not exist, and the shell says so in its own log: `raw replay: 0 frames`), so
+the map layer is absent by design and the console's fill is the islands' own.
+
+## U8 step 3, second increment — the real map handoff (2026-10-12)
+
+**Step 3 is finished. Both shells now drive one map thread, and both show the
+real map.** The GPUI console paints Jakarta Bay under its island chrome from
+the same MapLibre scene the egui console uses — not from PNGs on disk.
+
+**The handoff was smaller than the plan implied, because the thread already
+produced raw bytes.** `LiveMap::frame_rgba()` returns `Vec<u8>` RGBA; the
+`egui::ColorImage` in `MapResp` was only ever a wrapper around those bytes,
+built on the map thread. So U6 is: the channel carries the bytes, and each
+shell wraps or swizzles them at its own boundary.
+
+- `shell_threads::MapResp` is now `(u64, (f64,f64), f64, (u32,u32), Vec<u8>)`
+  — toolkit-free, which is what let the spawn leave the egui binary. The
+  module doc's own prediction ("the spawn follows then") is now done.
+- `shell_threads::spawn_map_thread(MapConfig)` is the one spawn. Behaviour is
+  unchanged: same newest-wins drain, same resize rebuild, same off-thread
+  pixel readback.
+- The egui console converts in `drain_map`, one call site later than before.
+  That is one 1.9 MB memcpy per frame on the UI thread against a map thread
+  whose pump costs ~270-400 ms, which is why moving the conversion off the map
+  thread costs nothing measurable.
+- The GPUI shell swizzles RGBA→BGRA with `map_gate::swizzle_rgba_to_bgra` on
+  its side of the seam.
+
+**The shape that made it clean: the shell takes a FRAME FEED, not a map.**
+`shell_gpui::run(feed)` where `feed` is a `Box<dyn FnMut() -> Option<frame>>`.
+The shipped binary spawns the map thread and hands over a closure that drains
+and swizzles it; `proto/gpui-island` hands over `run_replay`, a directory of
+PNGs. The shell therefore names only `view`, `map_gate` and `fx::halo` — never
+`map_render` or `shell_threads` — which is what keeps the parity proto free of
+MapLibre's 2 GB C++ tree. Preparing the cache is the BINARY's job for the same
+reason. Without that seam the proto would have had to shim `shell_threads`,
+and `shell_threads` reaches `assets`, `backend`, `log`, `sim` and `map_render`.
+
+**One shared home for the map's base geometry.** `MAP_W`/`MAP_H`/
+`MAP_CENTER`/`MAP_ZOOM`/`MAP_STYLE`/`JUMP_PUMP` moved to `map_render` (whose
+doc line "Shared map plumbing for the egui shell" is now false and was
+corrected). The egui shell keeps its old names as aliases, so its call sites
+are untouched: one definition, two shells, and a capture comparison between
+them is a comparison of the same map.
+
+### Verification — both shells, one spawn, real captures
+
+| | egui console (`tfg`) | GPUI console (`tfg_gpui`) |
+| --- | --- | --- |
+| map frames logged | 2 (404 ms, 385 ms pump) | 24 warm-up (263-271 ms each) |
+| sea blue `(152,181,245)`-class | 16.4% of the window | 12.6% |
+| land pale `(238,234,230)`-class | 19.4% | 6.6% + variants |
+| pixels with >25 channel spread | 54.0% | 74.4% |
+| CONSOLE_NIGHT / PANEL_SLATE | 11.8% / 1.9% | 32.4% / 1.9% |
+
+The GPUI shell's console fill is higher because its island column is three
+300 px islands over a 778x848 window, while the egui console's own chrome is
+the real thing at its own geometry — the two are not the same layout yet, and
+that is expected: step 4 ports the console's panels.
+
+**Both binaries log `map frame N: …ms (pump …)` from the same spawn**, which is
+the claim: one implementation, two consumers. No panics in either log.
+
+### The one parity question this surfaced, and it is not answered here
+
+The island rim's EXACT-colour count dropped when the map appeared: `CUT_GREY`
+`(140,155,174)` within ±6 went from **3,668 px (no map) to 460 px (with map)**
+in the same shell at the same geometry. The rim is still there — 8,043 px
+within ±20 — so this is not a missing line.
+
+The likely cause is already in this document: three of the island's four bevel
+rings paint OUTSIDE the panel box (U4a, "the clip guillotines them"). Those
+outer slivers composite against the map, and Jakarta's water is bright
+`(152,181,245)`, so the blended edge moves off the exact token while the inner
+rings stay put. The egui console, whose rims sit over different geometry,
+keeps 5,493 exact matches.
+
+Recorded rather than resolved: it is a rim-parity question between the two
+shells, and the right moment to settle it is when the console's own islands
+port in step 4 — the protos matched the rim at pixel level against a flat
+reference, and a map behind it is the new variable. Anyone comparing the two
+shells before then should compare within ±20, not ±6.
+
+**Verification.** `cargo test --lib` 407 pass (same 4 pre-existing failures);
+`cargo test --bin tfg` 20 pass; `cargo build --bins` clean, back to the 8
+pre-existing warnings; `proto/gpui-island` and `proto/gpui-map` both build,
+the former still without MapLibre. The egui console was run and captured, not
+just compiled: that is the regression this increment could have broken, since
+its frame conversion moved one call site.
+
+## U8 step 4, first panel — the roster sheet over real hulls (2026-10-12)
+
+**The first panel of the port, and its rows are live data.** The roster sheet's
+eight literal rows are gone: they are the hull register from the dev API, 127
+real hulls, and the sheet renders the first eleven with a counter that reads
+`11 / 127`.
+
+The sheet's own doc had already named this increment — "Wiring real seats is
+the next increment" — so this is that, not a new decision.
+
+**The shape, and why it repeats the map's.** The shell takes prepared inputs
+and never names `backend`, `map_render` or `shell_threads`; the binary owns the
+runtime. So `fetch_roster` lives in `src/bin/tfg_gpui.rs`, exactly where the
+map thread and its feed already live, and the proto passes `fixture_roster()`.
+That is what keeps `proto/gpui-island` buildable: `backend` reaches `store`
+(sqlite) and `reqwest`, and shimming it would have cost the proto its
+isolation for no gain.
+
+**A backend method was added, not duplicated.** `MinosMaster::units_named`
+returns the register with the taxonomy NAMES, beside `units`, which flattens
+them to ids by design (the console resolves those from the catalog after a
+sync). The sheet wants a name, and asking for the id would have meant fetching
+the catalog too. One page: the callers that need every hull page through
+`units`.
+
+**Credentials are in the environment, never in the source.** `TFG_API_USER` /
+`TFG_API_PASS`, with the fixture as the fallback when they are unset — so the
+shipped crate carries no secret, and a capture without credentials is still
+comparable to the U5 measurement it was made against. The console's real path
+is the login card plus the OS keyring, and that is where this goes next.
+
+### Verification — read off the capture, not off the log
+
+| claim | how it was checked |
+| --- | --- |
+| the rows are the register | `tesseract` on the captured rows: row 0 `Anka-S (MALE)`, row 1 `KRI Abdul Halim Perdanakusuma`, row 2 `KRI Ahmad Yani` — the API's first three hulls, exactly. Rows 3-10 read as the same names in the same order (Ajak, Alamang, Alugoro, Ardadedali, Arun, Badik, Banda Aceh, Banjarmasin) at 12pt mono over a map, where tesseract's own accuracy falls off |
+| the data drives the render | the counter OCRs clean as **`11 / 127`** — 127 is what `/units?page_size=200` returns, 11 is what the body holds |
+| the geometry did not move | panel at physical (91,81) 422x535 = logical (72.8, 64.8) 337.6x428 against the reference's (73,65) 338x428; row pitch 42 physical = 33.6 logical against 34 |
+| nothing is clipped or missing | all eleven rows sit on a uniform `(30,40,58)` = `PANEL_SLATE` (the standing ±1), and row 0 is darker at `(22,30,42)` — the `black_alpha(70)` selection wash plus the SIGNAL rule, which is correct for `selected = 0` |
+
+**One measurement the increment corrected by accident.** `/units` with no query
+returns 25 rows; `/units?page_size=200&page_number=1` returns 127. The register
+holds 127 hulls and the default page size hides the rest — worth knowing before
+anyone sizes a picker off an unpaged read.
+
+**Verification.** `cargo test --lib` 407 pass (same 4 pre-existing failures);
+`cargo test --bin tfg` 20 pass; `cargo build --bins` clean at the 8
+pre-existing warnings; `proto/gpui-island` still builds without MapLibre.
+
+**What this panel still does not do.** No staleness (there is no wire source for
+it yet — the console derives it from a fix's age, which needs the poll stream),
+no selection interaction, and the class is read off the wire rather than
+resolved through the catalog as the console does. All three are named in the
+code, and the poll stream is the natural next increment: it unlocks staleness,
+selection and the map markers at once.
+
+### U8 step 4 continued — the poll stream, and staleness off the wire (2026-10-13)
+
+The panel's own doc named this increment: "the poll stream is the natural next
+increment: it unlocks staleness, selection and the map markers at once." This is
+the first third of that — **staleness is now real, joined to the register by the
+unit id both sources carry.**
+
+**The kernel move, done for the right reason.** `ShipMarker` and the whole
+marker model (`MapSymbolShape`, `map_symbol_shape/accent/fill`,
+`affiliation_ink/fill`, `plurality_icon`, `paint_order`, the `FRAME_*`
+constants, `offset_run_outward`) left `main.rs` for a new toolkit-free
+`src/markers.rs`. Not to port the markers yet — the GPUI shell does not draw
+them this increment — but because `Registry` (the track engine) and the model
+have to meet somewhere neither toolkit owns, and the egui painters can read a
+kernel type as readily as an `egui` one. The PAINTERS stay in `main.rs` and
+convert at their boundary through one `egui_color`/`egui_points` adapter.
+
+**A silent colour error the move caught.** The egui named greys are not the
+round numbers a reader guesses: `egui::Color32::GRAY` is **(160,160,160)** and
+`LIGHT_GRAY` is **(220,220,220)**. Substituting `0x80`/`0xD3` failed
+`every_glyph_ink_reads_against_every_affiliation_fill` at 2.25:1 against the
+stale fill — the ported constant was 32 units too dark. The contrast test is
+the only thing standing between the model and a wrong ink nobody would see.
+
+**The join, and why it is one line.** `MinosMaster::units_named` now returns
+`UnitNamed.id`, and `RosterRow` carries it as `unit_id`. The live wire keys
+fixes by the unit id as a decimal string (`ship_id: "8"`); the register carries
+the same id. `apply_liveness` finds the row whose `unit_id` equals the feed's
+and sets its `stale`. One key, no name lookup, no taxonomy — the same join the
+egui console's track store uses.
+
+**One spawn, both shells.** `backend::websocket_url` is the pure `https→wss` /
+`http→ws:8000` transform, pulled out of `ShipApp::ws_url_for` so the egui
+console and the GPUI one derive the SAME socket from the SAME base. The binary
+logs in once (the token opens both the register and the wire), spawns
+`spawn_poll_thread`, and swaps the boot wire for the live one over `wire_ctl` —
+the identical `WireKind::Live` the egui console sends. The registry is owned
+beside the poll thread; the shell stays a renderer of `(unit_id, stale)` pairs.
+
+**A render bug the live data exposed.** The staleness pip was a `canvas` that
+added `top` to a `bounds.origin.y` that already carried the row's offset — so
+the pip landed `top` pixels too low, two rows down, the instant staleness went
+live. The fixture's stale rows sat at the bottom where the miss was less
+obvious; unit 8 at row 1 made it unmistakable (dot on KRI Ajak, row 3). Fixed
+by drawing the pip as a `div` positioned in the row's own layout frame
+(`.right(16).bottom(8)`), which cannot double-count. The fixture capture with
+rows 4 and 6 confirmed the position before the real-data capture did.
+
+### Verification — read off the capture, not off the log
+
+| claim | how it was checked |
+| --- | --- |
+| the wire connects and delivers | log: `wire: live wss://…`, `backend: live …` (the boot wire swapped), `[LIVE-dbg] apply: unit=8 snapshot lat=-7.88 lon=112.53` — the dev API's Centrifugo socket, end to end |
+| the join key exists on both sides | `/units?page_size=200` row 1 is `id 8` = "KRI Abdul Halim Perdanakusuma"; the wire reports `ship_id "8"`; they are the same decimal string |
+| liveness reaches the shell | the fix feed reported `batch=[("8", true)]` — unit 8 stale after 3 missed polls (the seed emits once, then silence accrues misses, per `polls_carry_fresh_only_with_one_shot_seed`) |
+| the pip lands on the right row | pixel scan: exactly one `STALE_SAND` pip, on **row 1 (KRI Abdul Halim Perdanakusuma, KRI-355)** — the row the join named, and no other. The capture shows it |
+| the geometry is unchanged | counter still `11 / 127`; panel and rows unmoved from the register-only capture |
+
+**Verification.** `cargo test --lib` 417 pass (the 9 moved marker tests + 2 new
+`websocket_url` tests; same 4 pre-existing failures); `cargo test --bin tfg` 12
+pass; `cargo build --bins` clean at the pre-existing warnings;
+`proto/gpui-island` still builds without MapLibre (it drives `run_replay`,
+whose fix feed is a `|| None` closure).
+
+**What this still does not do.** Selection interaction and the map markers.
+The `ShipMarker` model is now in the kernel and tested, but nothing builds a
+`ShipMarker` from a `Fix` yet — that builder is entangled with `ShipApp`
+(`visuals`, `unit_lods`, `affiliations`, the animation fractions) and porting
+it is its own slice. Selection is the smaller next step: the sheet already
+takes a `selected` index, and the wire now says which hulls exist.
+
+### U8 step 4 continued — selection: the rows answer a click (2026-10-13)
+
+The sheet already took a `selected` index and painted the wash and the SIGNAL
+edge for it; it was hardcoded to `0` with no input. This increment wires the
+other half: **click a row and it becomes selected.** The state, the render and
+the handler, and the proof that a click moves the state.
+
+**The state.** `IslandDemo` gained `selected: usize` (default 0), threaded into
+`roster_sheet` at both call sites. Each row is now an interactive element —
+`.id(("roster-row", i)).cursor_pointer().on_click(cx.listener(...))` — the same
+pattern the island close button and drag grips already use. The handler is
+three lines: set `selected = i`, `cx.notify()`. The console's selection also
+moves the camera and the detail pane; that wiring is a later slice — this is
+the state the sheet owns.
+
+**The verification, and why it is a test and not a capture.** The render path
+is proven by capture: `TFG_SEL=5` (the same seed-the-state precedent as
+`TFG_POINTER` and `TFG_FRAME`) puts the wash and the cyan edge on row 5, KRI
+Alugoro, over the real map, counter still `11 / 127`. The click is proven by a
+`#[gpui::test]`, not a driven click, because **the uinput pointer does not
+register with libinput in this session** — the device creates (the ACL grants
+access) but Hyprland never sees it, so `cursorpos` stays pinned no matter what
+`move_abs` sends. It worked in the prior session (that is how the egui console
+was driven); it is an environment regression, not a code one, and fighting the
+compositor for a synthetic click would prove nothing the test does not.
+
+So `IslandDemo::new(roster, total, selected)` was split out of `run` — a
+testability win on its own — and the test builds the view headlessly (no
+window, no wire, no map thread), simulates a click at row 3's measured window
+position through GPUI's own event path, and asserts `selected == 3`. A second
+test clicks the header band (above the body) and asserts the selection does not
+move. Both pass. The state the test sets is the same state the capture renders.
+
+**A reconstruction, done under duress.** Extracting `new` was done with a
+text transform over the inline `cx.new(|_| { … })` block, and the first attempt
+mangled the braces — it dropped `roster_sheet`'s tail (`panel = panel.child(el)`
+and the return) and `run`'s head (`pub fn run`, the `Application::new` wrapper,
+the font registration and the `WindowOptions`). The lesson is the one the
+23k-line `main.rs` already taught: **marker-based text cuts only.** The whole
+head was rebuilt from `proto/gpui-shell/src/main.rs` (the file `run` was ported
+from) and re-verified against the surviving tail, the binary's `run(...)` call,
+and `RawReplay::start`/`latest`. `run_replay` and the `FrameFeed`/`FixFeed` type
+aliases were rebuilt the same way. A capture after the rebuild is pixel-for-pixel
+the pre-rebuild one. One collision the rebuild caught: `view::Box` (the glob
+import) shadows `std::boxed::Box`, so the feed types are `std::boxed::Box<…>`,
+the same reason the binary spells it out.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| clicking a row selects it | `#[gpui::test] clicking_a_roster_row_selects_it`: `simulate_click` at row 3's window position → `selected == 3` |
+| a click off the rows does nothing | `clicking_the_header_does_not_change_selection`: click at y=30 panel-local → `selected` unchanged |
+| the render follows the selection | capture with `TFG_SEL=5`: wash + cyan edge on row 5 (KRI Alugoro), stale dot still on row 1, counter `11 / 127`, map through the panel |
+| the rebuild did not drift | post-rebuild capture is identical to the pre-rebuild one; window at (768,26) 768×838, panel at (73,65) |
+
+**Verification.** `cargo test --lib` 419 pass (2 new selection tests; same 4
+pre-existing failures); `cargo test --bin tfg` 12 pass; `cargo build --bins`
+clean at the pre-existing warnings; `proto/gpui-island` still builds without
+MapLibre. The `gpui` `test-support` feature is now a dev-dependency (headless
+test harness only, not in the shipped binary).
+
+**What this still does not do.** The selection is sheet-local: it moves the
+wash and the edge, and nothing else reads it yet. The console's selection
+drives the camera and the detail pane, and the map markers key off it — those
+are the next increments, and they are where the extracted `ShipMarker` model
+(from the earlier move) will finally get built from a `Fix`.
+
+### U8 step 4 continued — live markers: the map draws the ships (2026-10-13)
+
+The shell's marker layer was a U7 demo: three hardcoded rings at fixed window
+points, two of them carrying source-over halo sprites so the capture could be
+checked against the shader halo. This increment makes it real. **One ring per
+tracked hull, at its projected fix position.**
+
+**The plumbing, and where the projection lives.** The fix feed carried
+`Vec<(unit_id, stale)>`; it now carries `Vec<LiveMarker>`, and a `LiveMarker`
+is `(id, x, y, stale)` with `x`/`y` **in the map frame's pixel space**. The
+binary does the projection with the kernel's `map_render::project_mercator` —
+it already owns the registry, and the projection is already kernel code — so
+the shell never names the map, its centre, or its zoom. The shell learns the
+frame's dimensions from the frame itself (the promotion in `render` now writes
+`map_dims`), and scales `map → window` by `viewport / map_dims`. That is why
+the shell stays MapLibre-free and the projection has one implementation.
+
+**The inks, from the state vocabulary the sheet already speaks.** The selected
+hull (its unit id is the selected roster row's) is SIGNAL; a stale one is the
+same amber the roster's pip uses (`STALE_SAND`); a fresh one the map ink. The
+first cut had no frame and the amber ring **vanished into the map's tan roads**
+and the light ink into its pale ones — the capture showed a ring you had to
+hunt for. The fix is the console's own: a dark `FRAME_KEYLINE` under the ink,
+which is the contrast every marker on the egui map already carries. The shell
+repeats that one colour as `MARKER_KEYLINE` rather than importing `markers`:
+that module pulls the store and its sqlite, and the parity proto's whole reason
+to exist is a fast loop without them.
+
+**Verified, and one environment fact that shaped the proof.** The layer
+computes `map_dims=(800,600)`, `live=1`, `sx=0.96`, `sy=1.397` (from the
+status line and a temporary debug print). The dev wire carries **exactly one
+live unit — unit 8 at lat −7.88, lon 112.54, near Surabaya — and the map is
+centred on Jakarta (MAP_CENTER), so with the shipped config the one marker is
+~600 km outside the view.** To prove the draw end-to-end, `MAP_CENTER` was
+temporarily moved to bring unit 8 into the visible map area; the keylined amber
+ring then drew exactly at the projected position (near Temas/Beji), and the
+capture is the evidence. `MAP_CENTER` was restored. Two things the experiment
+caught: `WORLD_BASE_PX` is 512, not 256 (the first offset was 2× off and put
+the ship at the map's edge), and the map's centre is the *window's* centre,
+which sits **under** the right-docked chrome — a ship at the map centre is
+half-hidden behind the island panel.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the layer receives projected markers | debug: `map_dims=(800,600) live=1 sx=0.96 sy=1.397`, marker `(200.0, 300.0, stale, "8")` |
+| the projection is the kernel's | the binary calls `map_render::project_mercator`; the shell only scales |
+| the ring draws at the fix | with the centre temporarily over unit 8, the keylined amber ring sits at the projected position (near Temas/Beji) |
+| the shell stays light | `proto/gpui-island` builds with no `markers`/store/sqlite dependency |
+
+**Verification.** `cargo test --lib` 419 pass (same 4 pre-existing failures);
+`cargo build --bins` clean at the pre-existing warnings; `proto/gpui-island`
+builds without MapLibre.
+
+**What this still does not do, and what it exposed.** Three things, in the order
+they now matter. (1) **The selection is not yet joined to the marker**: the ink
+is picked by comparing the selected roster row's unit id, but nothing clicks a
+marker to *make* it selected, and the marker does not move the camera to the
+hull — the console's selection does both. (2) **The map centre is the window's,
+not the visible map's** — with chrome docking on the right, a centred hull hides
+behind it; the console centres on the area the map actually shows. (3) **The
+symbol is a ring, not the taxonomy glyph**: `ShipMarker`'s `map_symbol`,
+`affiliation`, `lod` and `visual` are all resolved in `ShipApp` (visuals,
+affiliations, unit_symbols, labels) and none of that is wired yet — which is
+the next real slice, and the one the extracted `ShipMarker` model is waiting for.
+
+### U8 step 4 continued — the marker draws its glyph (2026-10-13, fast-tracked)
+
+The marker was a ring. It is now the hull's **taxonomy glyph** — a frigate
+draws a diamond, a submarine an ellipse, a landing ship a pentagon — so the
+map carries the vocabulary the console's map carries, not a placeholder.
+
+**The shape vocabulary moved to `view`.** `MapSymbolShape` was in `markers`,
+and `markers` imports `store` (its resolvers name `MapSymbol` and
+`Affiliation`). The shell paints these shapes and must not reach through
+`store` — that would put the bundled sqlite behind the parity proto's fast
+loop, which is the whole reason the proto exists. So the enum and its one
+geometry primitive (`regular_polygon`) moved to `view`, the light vocabulary
+module both the shell and the proto already compile; `markers` re-exports the
+enum, so every existing `markers::MapSymbolShape` path still resolves.
+
+**The symbol source is a bridge, and named as one.** The console resolves a
+symbol from the taxonomy's STABLE IDS (`store::SymbolResolver`: type, then
+category, then domain), which needs the synced mirror *and* the operator's own
+assignments behind it. The register the GPUI binary fetches carries class
+NAMES and no ids. So `markers::symbol_from_class_name` reads the names — in
+the kernel, in one place, tested, with the doc saying exactly what it is and
+what replaces it. The seam is deliberate: when the store is wired into the
+binary, the ID resolver drops in behind the same return type.
+
+**The painter is a mechanical port.** `shell_gpui::paint_glyph` is
+`paint_map_symbol`'s ten shapes at the same authored radii (a radius-8
+reference times `scale`), built from `view::regular_polygon` and GPUI's
+`paint_path` / `paint_quad`. It fills in ONE ink — the state ink the shell
+already had (selected SIGNAL / stale amber / fresh map ink) — because the
+console's per-shape fill needs the same store-resolved assignments. The dark
+keyline ring stays under it, so the glyph reads on the map's tan roads.
+
+**The marker layer stays store-free by carrying the shape.** `LiveMarker`
+gained `symbol: view::MapSymbolShape`; the binary resolves it once (class name
+→ symbol → shape) and hands it over, so the shell never names `store` or
+`markers`.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the bridge reads real class names | `the_class_name_bridge_reads_the_register` maps the register's own strings (Frigate, Submarine, Fast Attack Craft, LPD, Auxiliary, MALE) and falls through to `UnknownShip` |
+| the glyph draws | capture: unit 8 ("…· Frigate") draws a diamond in the stale amber inside the keyline, at its projected position near Temas/Beji |
+| the shell stays light | `proto/gpui-island` builds with no `markers`/`store`/sqlite dependency |
+
+**Verification.** `cargo test --lib` 420 pass (1 new; same 4 pre-existing
+failures); both binaries and `proto/gpui-island` build clean.
+
+**What this still does not do.** The affiliation FRAME (the coloured outline
+that carries friend/hostile/neutral/unknown) is not drawn: alone it is the
+Unknown frame for every hull anyway, because affiliation is store- and
+session-backed and the binary opens neither — so it is the next slice, and it
+is the one that needs the store wired (open, sync, the two resolvers). Same
+for the per-shape fill. And the selection is still one-way: the sheet's
+selected row lights the matching marker, but clicking a marker does not yet
+select the row, and nothing moves the camera.
+
+### U8 step 4 continued — the local store is wired (2026-10-13, fast-tracked)
+
+The GPUI binary now opens the console's own **local store** and uses it. This
+is the enabler the last handoff named: it is what the affiliation frame, the
+per-shape fill and (next) the real panels all sit on.
+
+**What the binary does now.** After the register fetch it opens
+`paths.local_db` and syncs it — `store::sync_from`, the console's own path,
+the same six master tables plus the branch-category map. The log reads
+`store: synced 7 tables`. Then it reads the store ONCE (the taxonomy and the
+assignment tables do not move under it): `SymbolResolver` from the three
+id-keyed assignment tables, and a `unit_id -> (type, category, domain)` map
+from `fleet_units`. Per hull, the symbol resolves from those stable IDs first
+— the console's rule — and falls through to `symbol_from_class_name` only
+when the resolver says `UnknownShip`, which on a first run is every hull,
+because a fresh store has no operator assignments. The bridge written last
+time is now the *fallback*, not the source.
+
+**The glyph takes its taxonomy fill.** `map_symbol_accent` and
+`map_symbol_fill` moved from `markers` to `view` (the shell paints them), and
+the marker layer fills the glyph with `map_symbol_fill(shape, stale)`. The
+selection moved to the RING — SIGNAL when the hull is the selected row —
+which is where the console puts it too: the fill says what kind it is, the
+edge says it is chosen. A stale hull's fill greys, which is the console's
+rule and the reason the capture shows a grey diamond: unit 8 is stale, so its
+Frigate blue is correctly not shown.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the store opens and syncs | log: `store: synced 7 tables` (helpers, hierarchy, categories, types, classes, units, branch_categories) |
+| the resolver is the primary path | `resolve_symbol` asks the id-keyed `SymbolResolver` first, the class-name bridge only on `UnknownShip` |
+| the fill follows the shape and staleness | `the_glyph_fill_is_the_accent_and_grey_when_stale`: stale is exactly `(160,160,160)`, fresh brightens the accent |
+| the glyph still draws | capture: unit 8's diamond, now grey (stale), inside the keyline |
+
+**Verification.** `cargo test --lib` 421 pass (1 new; same 4 pre-existing
+failures); both binaries and `proto/gpui-island` build clean.
+
+**What this still does not do.** The **affiliation frame** — the coloured
+outline that carries friend/hostile/neutral/unknown — is NOT drawn, and
+affiliation is resolved but discarded. In this environment it would be the
+Unknown frame for every hull anyway: affiliation is store- AND session-backed,
+and the binary has no session, so `affiliation_resolver` answers Unknown for
+everything. The frame is the next batch and it needs a larger move than the
+fill did: `frame_for`/`frame_polygon`/`frame_strokes` and `BattleDimension`
+live in `symbology` (light, shimmable), but `affiliation_ink`/`affiliation_fill`
+and the eight `FRAME_*` constants are still in `markers` and have to come to
+`view` first, exactly as the fill did. Then the panels — which is what the
+store was opened for.
+
+### U8 step 4 continued — the affiliation frame (2026-10-13, fast-tracked)
+
+The marker now draws the **affiliation frame**: the coloured, cased outline
+that carries friend / hostile / neutral / unknown. The map now reads the way
+the console's does — a frame for who, a glyph for what kind.
+
+**The vocabulary moved to `view`.** `affiliation_ink`/`affiliation_fill`,
+`darkened_ink`/`MAP_INK_DARK`, `offset_run_outward` and the eight `FRAME_*`
+constants left `markers` for `view`, exactly as the glyph colours did last
+time — the shell paints them and must not reach through `markers` (and so
+`store`). `markers` re-exports them, so its own tests and any `markers::` path
+keep resolving. The frame's geometry itself was already light: `symbology`
+depends on nothing, so `proto/gpui-island` now shims it alongside `view`, and
+`SYMBOL_BOX_PX`'s equal-by-construction twin `symbology::BOX_PX` is what the
+shell uses (it cannot name `map_render`, which carries MapLibre).
+
+**The painter is the console's, ported.** `shell_gpui::paint_frame` is
+`paint_affiliation_frame`: the interior filled in the affiliation's own hue
+mixed toward the map's ink, then every stroked run CASED — a dark pass pushed
+OUTWARD first, the hue on top, because a centred wider stroke eats the glyph's
+pixels (`FRAME_KEYLINE_OUT_PX`'s doc has the measurement). A planned hull's
+runs dash, which GPUI has no primitive for, so `dash_run` walks the polyline
+and measures along it. Selection is a SIGNAL ring OUTSIDE the frame — the
+console's weight-on-the-edge — so the frame keeps saying *which side* while
+the ring says *chosen*.
+
+**The binary carries the affiliation, and the resolver is the rule.** The
+binary builds `affiliation_resolver` for this machine's own scope (`local:0`)
+and resolves each hull's branch. It also CORRECTED something from last time:
+`resolve_symbol` now asks whether the operator has EVER assigned the hull's
+type/category/domain, and only then falls back to the class-name bridge. An
+assignment that says `UnknownShip` wins over a name — the tables are the
+operator's statement, and overriding them from a class name is the guessing
+the console refuses to do. Last time's version overrode an explicit
+`UnknownShip`, which the real data exposed.
+
+**It resolved real data, not Unknown.** The shared `tfg-local.db` already
+carried a prior console session's work: 127 units, **6 type→symbol
+assignments**, and **one claimed branch**. Unit 8's branch is the claimed one,
+so the frame is **Friendly** (the blue rectangle) — not the Unknown quatrefoil
+the plan predicted. Its type is assigned `UnknownShip`, so the glyph is the
+generic dot, correctly.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the frame draws from the store | capture: a blue cased RECTANGLE (Friendly), interior filled, at unit 8's position |
+| the affiliation is real, not defaulted | `our_branches` has one row = branch 1; unit 8's `branch_id` is 1 → Friendly |
+| the operator's assignment wins | unit 8's type 2 is assigned `UnknownShip` in `unit_type_symbols`, so the glyph is a Dot, not the class name's Frigate |
+| the proto stays light | `proto/gpui-island` builds with `view` + `symbology` shims and no `store`/MapLibre |
+
+**Verification.** `cargo test --lib` 421 pass (same 4 pre-existing failures);
+both binaries and `proto/gpui-island` build clean.
+
+**What this still does not do.** The panels — `comms`, `dashboard`, `orders`,
+`settings` — which is what the store was opened for and the real remainder of
+U8 step 4. And three smaller gaps now visible: the map centre is the window's,
+so a hull at the centre hides behind the right-docked chrome; the selection is
+one-way (sheet → marker, no marker → sheet, no camera); and planned/dimension
+come from the session, so every frame is the closed surface frame for now.
+
+### U8 step 4 continued — the Settings panel (2026-10-13, fast-tracked)
+
+The first **panel** off the session: the console's `settings_modal`, ported. It
+earns the name because it is the one panel whose whole state is client-side —
+view mode, layout, motion — so it needs no game, no participants, no orders,
+and it is the last piece before the panels that DO need a session.
+
+**Why this one first.** The remaining panels — `comms`, `dashboard`, `orders`,
+`onboard` — all read the Minos session: `users_game`, participants, groups,
+tasking orders, messages. None of that is in the GPUI binary yet, and wiring a
+session is its own batch. Settings reads `app_mode`, `show_grid`,
+`show_side_zone`, `side_dock`, `side_zone_w`, `text_scale`, `reduced_motion` —
+all local — and the shell already had three of them (`zone_w`, the grip, the
+band).
+
+**It replaced a mock.** The shell's modal was a demo ("M O D A L" on a
+chamfered panel). It is now the real panel: the same chamfered silhouette, and
+inside it View / Layout / Motion reusing the shell's own `checkbox`, `radio`
+and `button`.
+
+**Three of its controls are wired, and two say why they are not.** View mode
+(`Watch only`), the side zone (show/hide, dock left/right, width in 20px steps
+with a reset) and Motion are live. The **geographic grid** and the **text-size
+scale** are absent by name: the grid needs the map-grid slice — its projection
+is `map_render`'s, and the shell cannot name a module that carries MapLibre —
+and the text scale needs a global multiplier the shell's fixed sizes do not
+have. The panel says so in one sentence rather than showing a control that
+does nothing, which is the same rule the ADRs keep about not drawing a state
+you do not have.
+
+**The dock needed the column to follow the band.** Hiding the zone is one gate
+(a cull in `live`, so the islands leave render AND ownership together), but
+docking exposed a real bug: the islands' positions are stored, computed once
+from the initial right-docked band, so moving the band left left them clipped
+off it. They are now dock-bound — `pos.0 = band.0` every frame, with the drag
+owning y — which is the console's arrangement too: islands ride the zone, they
+do not float free. `view::zone_band_at` is the dock-aware band.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the panel is the console's | capture: Settings, View/Layout/Motion, Watch only off, Side zone on, Docked right, Width **360**, Reduce motion off |
+| the width stepper is wired | a click reached the `+` listener and drove `zone_w` to its clamp (360 → 520), which is also how the stray-click showed the control is live |
+| the dock effect works | with the default temporarily docked left, the capture shows the island column at the LEFT edge (and without the `pos.0` fix, the capture showed it clipped away entirely) |
+| the shell stays light | `proto/gpui-island` builds; `view` gained one function, nothing heavy |
+
+**Verification.** `cargo test --lib` 421 pass (same 4 pre-existing failures);
+both binaries and `proto/gpui-island` build clean. `TFG_SETTINGS=1` opens the
+panel for a headless capture, the same seed-the-state precedent as `TFG_SEL`.
+
+**Next.** The session: `users_game`, participants, groups — the plumbing that
+turns `comms`, `dashboard` and `orders` from unportable into portable. That is
+the next batch, and then those panels follow one at a time.
+
+### U8 step 4 continued — the session, and the top zone (2026-10-13, fast-tracked)
+
+The GPUI binary now holds a **session**, and the shell draws the **top zone** —
+the first panel fed by the game rather than the register. This is the
+prerequisite the last handoff named: `comms`, `dashboard` and `orders` all read
+the session, and none could be ported before it existed.
+
+**The read path, and why it stops where it does.** After login the binary calls
+`games_list`, holds the newest game, and reads `game_participants` for its room.
+That is the whole session: a `SessionView` of the game's name and state and the
+room's counts. It deliberately does NOT join. `join_game` needs a **room key**
+and `set_readiness` is a WRITE, and neither is a prototype's business; more to
+the point, a seat is what the *dashboard* needs and the dashboard is not here
+yet. The counts are `game_participants`' own — seat count, how many presented
+the key, how many are ready — which is exactly what the top zone shows.
+
+**The top zone is the console's, cut to what is sourceable.** Link dot and word,
+the headcount, the held game and its state. The console's bar also carries map
+controls, the clock and sign-out; those are their own slices, and the panel's
+doc says so. The link dot is honest about its limits: the shell sees liveness
+only as live markers, so a quiet wire and an empty map look the same — which is
+why the word is `idle`, never `faulted`. The shell has not been told that
+difference, and guessing it is the lie the console's link states exist to
+avoid.
+
+**One API fact the capture exposed.** The room count reads **0 of 2** — and that
+is faithful: `/games/{id}/participants` sends `ready_at`, not `joined_at`, and
+both this parser and the console's read `joined_at`, so neither can see who is
+in the room on this server. The count is shown against the seats (`0/2`) so the
+bar still says something true rather than a bare zero, and the gap is a server
+contract, not a port.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| a real session is held | capture: `Game 15 (4x) 2026-10-08 19:50 · execution` — game 24 from the dev `/games` |
+| the counts are the room's | same capture: `0/2 in the room · 1 ready`, matching the API's two participants and its one `is_ready` |
+| the bar reads the wire | `live` with the live markers present |
+| the session is read, not written | the binary calls only `games_list` + `game_participants`; no join, no readiness write |
+
+**Verification.** `cargo test --lib` 421 pass (same 4 pre-existing failures);
+both binaries and `proto/gpui-island` build clean.
+
+**Next.** The seat: `join_game` (or a read of the caller's own participant row)
+plus `game_units_list`, giving `auth_user_id`, the commanded hulls and the
+groups. That turns `dashboard` — own ship, task group, helm — from unportable
+into portable, and `orders` and `comms` follow it.
+
+### U8 step 4 continued — the seat, and the People panel (2026-10-13, fast-tracked)
+
+The GPUI binary now holds a **seat**, and the shell draws the **session
+roster** — who is in the room, their seat, their readiness, with the caller's
+own row marked. It is the hull register's twin, and the distinction is the
+point: the register is what the fleet HAS, the roster is who is RUNNING it.
+
+**The seat is READ, not joined — and that was the batch's one real decision.**
+The console joins a game (a room key) and reads its seat from the answer.
+That is a WRITE that seats the account in a live exercise, which is not a
+prototype's business and not something to do by accident on a production game.
+So `MinosMaster::me()` reads `/users/me` for the account's id, and the binary
+looks for its own row in each game's roster instead. Same seat, no write. A
+game whose participants are unreadable (403) is skipped — a room this account
+cannot read is not a room it holds.
+
+**The held game changed, and it should have.** Holding "the newest game" named
+game 24, where this account has no seat. Holding "the newest game this account
+is seated in" names game id 19 — which is *named* "Game 14" (`/games` and the
+roster disagree about which number means what, and the roster is right). That
+is the console's arrangement: the operator holds the game they are IN, not the
+newest one on the server.
+
+**Why this panel rather than the dashboard.** The plan was `dashboard`, and the
+data says no: this account is a **Penyelenggara** — a judge seat — and commands
+**zero hulls** in every game it is seated in. `dashboard_data` returns `None`
+without a commanded hull, in the console too, so a dashboard here would be an
+honest empty box. The roster works for every seat, which makes it the right
+next panel; the dashboard waits for an account that commands something.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the seat is read, not written | the binary calls only `/users/me`, `/games` and `/games/{id}/participants`; no join, no readiness write |
+| the held game is the seated one | capture: `Game 14 · 3 seat(s) · 2 ready · you: Penyelenggara` — game id 19, where this account's row exists |
+| the roster is the room's | the panel lists exactly the API's three seats (BUDI/Commando/ready, MARKUS/Commando/ready, SUPERUSER/Penyelenggara/judge) |
+| the caller's row is marked | SUPERUSER's row is the SIGNAL-tinted one, with `you: Penyelenggara` in the header |
+
+**Verification.** `cargo test --lib` 421 pass (same 4 pre-existing failures);
+both binaries and `proto/gpui-island` build clean. `TFG_PEOPLE=1` opens the
+panel for a headless capture.
+
+**Next.** An account that commands something is what `dashboard` needs, and
+`orders` needs one too — both are commander's panels. Two ways forward: seat a
+test account on a hull in a dev game (a data change, not code), or port
+`comms`, which works for any seat and whose gap is now measured (game 19's
+inbox is reachable but empty, and games this account is not seated in answer
+403). `comms` is the one that needs no new data.
+
+### U8 step 4 continued — the commander's seat, and "My command" (2026-10-13, fast-tracked)
+
+The dashboard is portable now, and this is the first batch that began with a
+**data change** rather than code. The console's `dashboard_island` — "My
+command" — is the seat, the hulls it commands, and their live fixes. Two of
+its three columns are here; the third (task group) needs the session
+hierarchy and the helm is a write, and the panel names both.
+
+**The data change, and why it was needed.** This account was a
+**Penyelenggara** — a judge seat — in every game it held, and two independent
+walls said a judge cannot be a commander: `player_station()` requires a
+non-judge seat, and the server refuses an assignment with "a judge-side
+participant does not command units or task groups". So the seat was changed in
+game 12 ("G10", **preparation** — the one state that is both dashboard-eligible
+and writable) to **Commando** (role 109), and a hull assigned. Both are dev
+data, and both are recorded here because they are state, not code.
+
+**Two server constraints the change surfaced.** (1) **One person commands one
+thing**: assigning a second hull answers "That person already commands the
+unit …" — so giving this seat the hull that is actually ON THE WIRE (unit 8)
+meant removing the first assignment, not adding to it. (2) The hold prefers a
+**player** seat: the first version took the newest game this account was seated
+in, which was an *execution* game where it is a judge, so the panel drew "no
+hull" while a commander seat sat one game further down. The scan now prefers a
+non-judge seat, then any seat, then the newest readable game.
+
+**The fix is joined, not fetched separately.** "My command" finds each
+commanded hull's course and speed in the LIVE markers **by unit id** — the same
+string the roster and the wire share — so the panel never reads the registry,
+and `LiveMarker` grew `heading_deg`/`speed_kn` to carry them. A hull with no
+live marker reads `—` in every fix column: absent is not zero, and the panel
+says so rather than showing `live` for a hull that has never reported.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the seat is real | capture: `Commando · not ready to start` — the role written to game 12, and its readiness (cleared by the role change, as the server documents) |
+| the hull is the seat's | same capture: `KRI Abdul Halim Perdanakusuma (KRI-355)` — game 12's unit 8, whose `id_commander` is this account |
+| the fix joins the wire | same capture: `255° · 0.1 kn · stale` — unit 8's own last fix, ambered because it has gone stale |
+| the shell stays light | `LiveMarker` gained two numbers; no new module, no store in the shell |
+
+**Verification.** `cargo test --lib` 421 pass (same 4 pre-existing failures);
+both binaries and `proto/gpui-island` build clean. `TFG_COMMAND=1` opens the
+panel for a headless capture.
+
+**Next.** The task group needs the session hierarchy (`groups` — three columns
+in the console, none read yet), and the helm is the first panel action that
+WRITES (a helm order). After those, `comms` and `orders` — and `orders` is
+mostly helm, so the write path is the next real decision, not the next panel.
+
+### U8 step 4 continued — the helm, the first write (2026-10-13, fast-tracked)
+
+The console's panel actions have all been reads. "My command" now sends a
+**helm order** — course and speed to a commanded hull — which is the first
+thing the shell writes, and the first time the seam runs the other way.
+
+**The seam, reversed.** Every feed so far is the binary handing the shell
+data. The helm is a `Sender<HelmOrder>` the shell writes to and the binary
+drains, with the server's answer coming back on a status feed of the same
+shape as the others. The shell never learns a base URL, and a shell that
+cannot reach the network cannot leak the token either.
+
+**The rule is checked before the write, not after the refusal.** The helm arms
+only in an executing game with a commanded hull — the console's own rule — and
+that check lives in ONE method (`send_helm`) that both the button and the tests
+call. The server enforces the same rule with a 409 ("Orders are given while a
+game is in `execution`"), which is why the check is local: a disabled look that
+still posts is the one thing this must not be.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the order carries the right thing | `the_helm_sends_the_drafted_order`: the sink receives hull `8` with course 90 and speed 12 |
+| it is silent when it must be | `the_helm_is_silent_outside_execution`: preparation puts NOTHING on the sink |
+| the server's rule matches | driving the API: an order to a preparation game answers 409 naming the execution rule; an order to an execution game this account does not command it in answers the same |
+
+**Verification.** `cargo test --lib` 423 pass (2 new; same 4 pre-existing
+failures); both binaries and `proto/gpui-island` build clean.
+
+**The live order is NOT demonstrated, and the reason is the environment, not
+the code.** No dev game can be put in the one state the helm needs — executing,
+with this account commanding a hull:
+- **Execution games freeze setup**: seating and unit assignment answer 409,
+  "a game's set-up may only be changed while it is in `planning` or
+  `preparation`".
+- **Preparation games freeze terms**: the planned window has no ends, and
+  patching it answers 409, "a game's terms may only be changed while it is in
+  `planning`" — so the game can never satisfy the start check, which is what
+  the transition refuses on.
+- **A fresh planning game is transiently the answer**: it was created, seated,
+  given a hull, and its window set — but `POST /games/{id}/transitions` answers
+  **403** for this account from *planning*, so it could not be started either.
+  It was discarded (204) once the attempt was recorded.
+
+So the write path is built and its contract pinned, and the one thing missing
+is an environment where the server would accept it. That is the honest state:
+`orders` and the rest of the helm's UI can be built now, but nothing should be
+reported as *working against the server* until a game can be started.
+
+**One dev-data change is left standing**: game 12 ("G10", preparation) holds
+this account as a **Commando** commanding unit 8, which is what "My command"
+draws and what the helm would order. It is left because removing it would
+un-demonstrate the panel; it is recorded because it is state, not code.
+
+### U8 step 4 continued — the write probe, and Comms (2026-10-13, fast-tracked)
+
+Two things: a time-boxed attempt to unblock the helm's live verification, and
+the next real panel.
+
+**The write probe failed, and the answer is worth having.** The hypothesis was
+that the transition's 403 was a SEAT problem — that a GM seat could start a
+game a player could then be commanded in. It is not: a fresh game was created,
+superuser seated as **Controller** (judge-side), the window set, and the
+transition answered **403** from that seat too, exactly as it had from the
+Commando seat. So the transition permission is not the game role; it is a
+capability this account does not hold at all. Together with the three rules
+already measured — orders need execution, messages need execution, and setup is
+frozen once executing — the matrix closes: **no account available here can put
+a game into the one state the write path needs.** The probe game was discarded
+(204). This is recorded so it is not re-litigated: the helm's live verification
+needs an account with the transition capability, and that is an environment
+question, not a code one.
+
+**Comms is the next panel, and it is a read.** The console's `comms_body` and
+`messages_island` are, at their core, the session inbox; composing is a write
+and IS blocked by the rule above, so the panel carries the read half and names
+the other one in a sentence. `TFG_GAME` was added with it: pinning the held
+game is a capture aid, and it is also the only way to photograph a panel whose
+data lives in a game this account is not seated in — the inbox here is game
+19's, while "My command" holds game 12.
+
+**Two API facts the seeding found.** (1) `kind` has exactly two values —
+`telegram` and `administrative` — and a **telegram from a judge must be sent
+`AS` a scenario role**, so it needs the scenario composer's roles to exist
+first; `administrative` sends without one, which is what the seeded message
+uses. (2) The message's classification is **TERBUKA / TERBATAS / RAHASIA**
+(open/limited/secret) and its degree comes from the mirrored
+`message_degrees` helper — both real vocabularies the panel now displays.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the transition is not seat-gated | a Controller seat answered the same 403 as a Commando seat — recorded, game discarded |
+| the panel reads the real inbox | capture: `Game 14 · 1 message(s)`, sender `Super User`, class `Terbuka`, kind `administrative · broadcast`, the server's timestamp and the message body |
+| the message is real | it was created by driving the API (`POST /games/19/messages`), and the panel shows the server's own fields, not a fixture |
+
+**Verification.** `cargo test --lib` 423 pass (same 4 pre-existing failures);
+both binaries and `proto/gpui-island` build clean. `TFG_COMMS=1` opens the
+panel, `TFG_GAME=<id>` pins the held game, both headless-capture seeds.
+
+**Next.** `orders` (mostly helm, resting on the unproven write — buildable, not
+provable here), the task group (needs the session hierarchy, `groups`), and the
+top zone's clock and map controls. And the standing question the write probe
+leaves open: whether anyone can start a game on this environment at all.
+
+### U8 step 4 continued — the camera, and the map controls (2026-10-13, fast-tracked)
+
+The map has been a picture: every frame the shell drew came from the map
+thread at ONE centre and ONE zoom, and the markers were projected at that same
+constant. The top zone now carries the console's **map controls** (`−  z11  +`)
+and a step actually moves the camera — the first time the picture is the
+operator's rather than the build's.
+
+**One camera, three readers, and that is the point.** A zoom is an `Arc<Mutex>`
+the binary owns: the frame feed asks the map thread to render at it, the fix
+feed projects the markers at it, and the camera thread writes it. Because all
+three read the SAME value, the picture and the markers cannot decouple — a zoom
+that moved only the map would slide every hull off its own position, which is
+the bug this shape exists to prevent.
+
+**The shell asks; it never transforms.** `zoom_by` clamps exactly as the
+console clamps (`view::ZOOM_MIN`/`ZOOM_MAX`, 3..18), updates the readout, and
+sends the value — the shell never scales the picture itself. The round trip is
+the map thread's, and the readout is the number the shell ASKED for, which is
+the console's own arrangement. The sink that carries it is now an enum
+(`ToBinary`: helm or zoom), because there is one seam and one channel, and two
+parallel channels would be two chances to forget one.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| a step asks the binary | `a_zoom_step_asks_the_binary`: `zoom_by(+1)` puts `ToBinary::Zoom(12.0)` on the sink |
+| the shell does not transform | the test asserts the SINK, and `zoom_by` has no other effect than the readout |
+| the camera reaches the map thread | with the opening zoom temporarily 13, the map area differs from the z11 capture by RMSE **0.538** — the map re-rendered, and the readout read `z13` |
+| the map thread honours it | `shell_threads` re-creates the scene and calls `scene.set_center(at, zoom)` on a request |
+| the markers follow | by construction: the fix feed projects at the same `Arc<Mutex>`, so the frame and the hulls share one camera |
+
+**Verification.** `cargo test --lib` 424 pass (1 new; same 4 pre-existing
+failures); both binaries and `proto/gpui-island` build clean.
+
+**What this does not do.** The camera has no PAN, so the centre is still the
+map's constant — and still sits under the right-docked chrome, which is why the
+"centre a hull and it hides behind the panel" note from three batches ago still
+stands. Panning is the obvious next step inside the camera, and it is the shape
+the drag handlers already use.
+
+**Next.** Pan (completes the camera), the task group (needs the session
+hierarchy, `groups`), the clock (needs the Minos clock channel or a projection
+from the game's window and `time_factor`), and `orders` — which stays
+buildable-but-unprovable until somebody can start a game.
+
+### U8 step 4 continued — pan (2026-10-13, fast-tracked)
+
+The camera could zoom but not move, so the centre was the map's constant — and
+still sat under the right-docked chrome, which is the note that has stood since
+the markers went live. It can move now.
+
+**The map surface is the pan handle, and painting first is what makes it the
+right one.** GPUI hits the deepest element first, so a press over an island, a
+panel, the top zone or a modal never reaches the map — panning is exactly the
+gestures on bare map, with no exclusion list to keep in step with the chrome
+as panels are added. The alternative (a guard in the root handler, testing the
+pointer against the band and every island rect) would have to be rewritten
+every time a panel appeared.
+
+**The sign is a kernel function, not arithmetic in a thread.** `pan_center`
+takes the drag in MAP pixels and answers the new centre: a drag points at the
+map pixel under the cursor and asks for THAT GROUND to stay there, so the
+centre becomes that pixel. `a_pan_drag_pulls_the_ground_with_the_cursor`
+pins BOTH axes — dragging right moves the centre west, dragging down moves it
+north — because the sign flip is per-axis and one of them inverted is the
+classic bug. The shell sends MAP-pixel deltas (it is the side that knows both
+the viewport and the frame's size); the sign and the unprojection are the
+binary's, because the shell has no mercator.
+
+**The camera is now (lat, lon, zoom), still shared.** Frame feed, fix feed and
+the camera thread all read the same triple, so the picture and the markers move
+together — the property that made the zoom safe applies unchanged to pan.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| a drag asks for a pan | `a_pan_asks_the_binary`: `pan_by(12, -7)` puts `ToBinary::Pan { dx: 12, dy: -7 }` on the sink, and a zero-delta move asks for NOTHING | 
+| the sign is right on both axes | `a_pan_drag_pulls_the_ground_with_the_cursor`: right→west, down→north, and a no-op drag is no move (to 1e-9; the mercator round trip is float, not exact) |
+| the centre reaches the map | with the camera temporarily pinned over unit 8, the map renders that area AND the marker sits at its projected position — one camera, both readers |
+| panning cannot steal chrome gestures | by construction: the handler is on the element painted first, so deeper elements win the hit |
+
+**Verification.** `cargo test --lib` 426 pass (2 new; same 4 pre-existing
+failures); both binaries and `proto/gpui-island` build clean. `map_render`
+gained `pan_center` and its test; `MAP_CENTER` is untouched.
+
+**Next.** The clock (needs the Minos clock channel, or a projection from the
+game's window and `time_factor`), the task group (needs the session hierarchy,
+`groups`), and `orders` — still buildable-but-unprovable until somebody can
+start a game.
+
+### U8 step 4 continued — the Step panel, and a capture that hung (2026-10-13, fast-tracked)
+
+**The Step panel** is the console's spine made visible: the exercise's running
+step, the readiness gate, and the SERVER's assumed time. It is read-only on
+purpose — declaring ready and advancing are writes, and the server takes both
+only in the states this environment cannot reach — so the panel is what the
+server will tell anyone with read on the game.
+
+**Why the time shown is the server's.** `GET /games/{id}/current-step` answers
+`assumed_time`, and the backend's own doc is unambiguous: "Never recompute
+assumed-now client-side: the integral needs every segment plus the anchor,
+which is three chances to disagree about what time it is in the exercise."
+There is also no clock GET at all — the pause/resume/factor writes ARE the
+clock read. So the panel displays the server's stamp and says whose it is,
+rather than integrating anything locally. `None` is a real state (game 12
+answers 409, "this game's scenario clock has no anchor"), and the panel says
+so instead of drawing an empty step.
+
+### The capture that hung, and what it cost
+
+A capture command launched the binary, slept, and called `grim` — with no
+timeout. **grim blocked at the Wayland screencopy layer** and wrote nothing.
+Every later step therefore never ran, *including the `pkill` that was supposed
+to reap the GUI process*, so the app stayed alive (its log shows 287 wire
+reconnects over that stretch) and the command only ended when the harness
+aborted it. Thirty-odd minutes of wall clock for a twenty-second job.
+
+**Both faults were mine, and they are the same fault twice**: no `timeout` on
+any external call, and cleanup that only runs if everything before it
+succeeds. Every capture this session had that shape; this is the one that
+happened to hang.
+
+**`scripts/gpui-capture.sh` is rewritten around three rules**, each the fix for
+a piece of it:
+
+1. **Every external call has a `timeout`** — a blocked tool is a fast, named
+   error, never an unbounded wait.
+2. **The app is killed by a `trap`**, not by a statement at the end — a failure
+   anywhere still reaps it.
+3. **grim is PROBED before the app starts** — if screencopy is stuck there is
+   nothing to capture, and the honest answer is an eight-second refusal that
+   says so and leaves nothing running.
+
+The probe earned its place immediately: grim was stuck when the new script was
+written and worked again minutes later, so the blockage was transient. The
+capture below was taken with the hardened script, which also proved the trap by
+leaving no process behind.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the panel reads the server's step | capture: `assumed 2000-01-01 19:00:00+07:00` — game 19's `current-step`, with the line saying whose time it is |
+| absent halves stay absent | same capture: `nothing playing`, `no step asks you` — the server sent neither, and the panel does not invent them |
+| a stuck capture now fails fast | the probe refused in 8s while grim was blocked; with grim back, the same script captured in 16s and left no process |
+
+**Verification.** `cargo test --lib` 426 pass (same 4 pre-existing failures);
+both binaries and `proto/gpui-island` build clean. `TFG_STEP=1` opens the
+panel, `TFG_GAME=<id>` pins the game, both headless-capture seeds.
+
+### U8 step 4 continued — the Inspector (2026-10-13, fast-tracked)
+
+The Inspector: the SELECTED hull's detail, docked along the bottom — identity,
+position, course, speed, trail and state, in one row. It is the second half of
+the selection loop the roster opened (the sheet chooses, the dock answers), and
+it is the first panel that needed **no new plumbing at all**.
+
+**A dock, not a window.** The console recomputes the Inspector's place every
+frame so a drag snaps back — a dock is a place, not a window that remembers —
+and the shell does the same. It renders last of the chrome and under the modal
+layer, because a dock is something the panels cover, not the reverse.
+
+**Everything shown was already in the shell.** The roster carries the identity
+(`name`, `hull`, `class`, `unit_id`), the live markers carry the fix. The only
+kernel addition was three fields on `LiveMarker`: `latitude`, `longitude` and
+`trail` (a COUNT — the shell has no use for the points and every reason not to
+copy them per tick). A panel that costs three numbers is what a finished kernel
+is supposed to feel like; the console's own Inspector reads the same two
+sources plus the registry.
+
+**The editors are named, not faked.** The console's three columns carry editors
+for the map symbol, the affiliation and the heading. Those are writes, and the
+same rule blocks them as blocks the helm, so the dock says so in a sentence —
+the rule every panel here has followed rather than showing controls that do
+nothing.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| it reads the selection | capture: `KRI Abdul Halim Perdanakusuma · KRI-355` — roster row 1, chosen by `TFG_SEL=1` |
+| identity comes from the register | same capture: `class Ahmad Yani / Van Speijk · Frigate`, `unit id 8` |
+| the fix comes from the wire | same capture: `position -7.8816, 112.5356 · 255° · 0.1 kn · 1 fix(es) · stale` — unit 8's own fix, ambered stale |
+| no selection is a real state | the dock renders `no selection` rather than an empty row |
+
+**Verification.** `cargo test --lib` 426 pass (same 4 pre-existing failures);
+both binaries and `proto/gpui-island` build clean. `TFG_INSPECT=1` opens the
+dock, `TFG_SEL=<row>` picks the selection, both headless-capture seeds — and
+this capture went through the new `scripts/gpui-capture.sh`, which left no
+process behind.
+
+**Next.** The task group was the intended next column, and the data says no:
+`/games/{id}/hierarchy` returns **empty** for every dev game, and
+`HierarchyNode` carries no commander, so there is nothing to derive a task
+group from. That needs a game with a real task organisation — the same class of
+gap as the write probe. Otherwise: `orders` (unprovable until a game can be
+started), the map's jump-to-unit, and sign-out.
+
+### U8 step 4 continued — the sign-in card (2026-10-13, fast-tracked)
+
+The shell logged in from `TFG_API_USER`/`TFG_API_PASS`. That was fine for
+driving captures and useless for shipping, and it was the biggest single piece
+of the console still missing. There is a **sign-in card** now, and it is the
+first panel that has to exist before any other.
+
+**Hand-rolled text fields, because GPUI has none.** GPUI 0.2.2 ships the input
+PLUMBING — `Keystroke::key_char`, focus handles, `on_key_down` — and no text
+field widget. So a credential field here is a focus handle, a keystroke handler
+and a value: printable characters append, backspace removes, tab moves between
+the fields, Enter submits. Deliberately no caret and no selection; a card is not
+an editor. `key_char` and not `key`, because the key NAME is the legend on the
+keycap and differs by layout while `key_char` is the character actually typed.
+
+**One sign-in, one authenticated read.** The shell sends the credentials on the
+sink the helm and the camera already use; the binary logs in and answers with
+the register AND the session TOGETHER, because they are one authenticated read
+and half a session is a state nothing should have to render. A refusal comes
+back as a sentence the card shows — never a swallowed error — and the password
+is cleared the moment it has been spent.
+
+**Starting signed-out is the shipped state, not a test state.** `SessionView`'s
+`Default` keeps `signed_in: true` for the tests and the parity proto, and only
+the binary ever clears it: it is the one thing that knows whether it failed to
+authenticate. With no credentials the shell now opens on the card rather than
+on a console with an empty register and a fixture roster.
+
+### A debugging pass the capture helper cost, and the rule that fixes it
+
+The card was built, the tests passed, and three captures in a row showed the
+CONSOLE. The shell had `signed_in = false` at construction and the render took
+the CARD branch — confirmed by instrumenting both — so the picture was of a
+DIFFERENT window: Hyprland places this window somewhere new each launch —
+`(768,26)` and `(0,445)` a minute apart — and the helper matched by PID and a
+rect read from a listing. It cropped whatever was there.
+
+Two things came out of it. The window's **class is `tfg-gpui`** (the long-
+standing "app_id mystery" resolved — it reports now), and the helper matches by
+**class first, PID second**, which is immune to both the placement and the pid
+reuse. That is rule 4 in the script's header, with the cost written down beside
+it. The lesson is the ordinary one and it keeps being expensive: a capture that
+shows something plausible is not a capture that shows the thing you changed.
+
+**And the machine was mid-way through an `omarchy-flux` package update** while
+all this ran — a terminal on screen doing an install — which is where the load
+and very likely the grim hang came from. Worth knowing before reading anything
+into a slow frame time from that window.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the card renders when signed out | capture: `ARCONS · Command Center · Sign in`, the identifier field focused (cyan edge) and the password masked |
+| typing is real | `the_sign_in_card_collects_what_is_typed`: type, backspace, retype, tab, Enter → `ToBinary::SignIn { "superr", "pw" }` on the sink |
+| a half credential is refused locally | `the_sign_in_card_refuses_a_half_credential`: a status line and NOTHING on the sink |
+| the signed-out state is reachable | `TFG_SIGNED_OUT=1` (a capture seed); with no credentials the same path is the shipped default |
+| the capture is of the right window | by class now — the three wrong crops are why rule 4 exists |
+
+**Verification.** `cargo test --lib` 428 pass (2 new; same 4 pre-existing
+failures); both binaries and `proto/gpui-island` build clean.
+
+### U8 step 4 continued — jump-to-unit, and sign-out (2026-10-13, fast-tracked)
+
+The camera could zoom and pan but not go anywhere, and the top zone had no way
+out. Both are closed now: the Inspector carries a **Centre** button that frames
+the selected hull, and the top zone carries the console's **Sign out** at its
+right end. Neither needed a new panel, a new feed, or a new seam — one `ToBinary`
+variant each, on the channel that already exists.
+
+**The jump is the console's `request_frame`, without the glide.** The shell names
+the GROUND (lat/lon from the selected hull's own fix) and the chrome's shift in
+px — it is the side that knows the zone's dock and width — and the binary
+unprojects the visible centre, because only it has the mercator. The shift is a
+kernel function, `view::camera_centre_shift`, mirroring
+`chrome::camera_centre_offset_with` (half the zone width, sign by dock, zero
+when hidden), pinned by `a_covered_zone_shifts_the_visible_centre_off_the_
+window_middle`. A selection with no fix sends nothing: a hull that has never
+reported has no ground, and framing `(0, 0)` would be a lie about where it is.
+
+**Sign-out is local first, like the console's.** The shell tells the binary to
+drop its token copy (so nothing else posts on it) and shows the card on the next
+frame; the live markers go with the session. There is deliberately no server
+revocation here: the binary never held the refresh token, and it keeps no
+keyring — the console's `sign_out` revokes and clears both, and this prototype
+has neither to clear.
+
+**The same batch fixed a real token bug the sign-in card left behind.** The
+card's sign-in logged in on the order thread but dropped the fresh token with
+the answer, so the thread kept the STARTUP token — empty whenever the shell had
+opened on the card — and the first helm order after signing in was refused. The
+thread now keeps the fresh token and game on a successful sign-in. Found by
+reading, not by a failure: nothing had signed in through the card and then
+ordered yet.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the jump asks for the hull's ground | `a_jump_asks_for_the_selected_hulls_ground`: Jump carries unit 1's fix lat/lon with shift **−180px** (right-docked 360px zone) |
+| a fixless selection is silent | `a_jump_is_silent_without_a_fix`: no fix → `false`, nothing on the sink |
+| sign-out clears both sides | `signing_out_clears_the_session_and_tells_the_binary`: `SignOut` on the sink, `signed_in` false, zero live markers |
+| the shift mirrors the console | kernel test pins the fraction (0.5), both dock signs, and hidden-is-zero |
+| the jump runs end to end | log: `centering on -7.8816, 112.5356 (shift -180px)` then `map frame 1001 (pump 6)` — unit 8's own fix, through the real click path (below) |
+| the frame painted is the jump's | capture status line: `map raw frame 1001 ret 3 \| 1 live markers` |
+| the buttons render | capture: `Sign out` at the bar's right end; Inspector `Centre` beside the close, enabled with the fix shown (`-7.8816, 112.5356 · 255° · 0.1 kn · stale`) |
+
+**How the live jump was proven with no input synthesis.** The compositor
+delivers the click that focuses the window INTO the client — the cursor sits on
+the Centre button in both captures — so a stray focus click drove
+`jump_to_selection` through GPUI's own event path: shell → sink → binary
+unproject → map re-request → painted frame 1001. That is a genuine end-to-end
+run, not a test double. It is also a capture hazard, twice observed: the same
+mechanism opened the Comms modal unasked in the second capture, so a capture
+can show a panel nobody seeded. Read the status line before reading the chrome.
+
+**Verification.** `cargo test --lib` 432 pass (4 new: 1 kernel + 3 shell; same 4
+pre-existing failures); `cargo test --bin tfg` 12 pass; both binaries and
+`proto/gpui-island` build clean at the 8 pre-existing warnings, none new.
+
+### U8 step 4 continued — the New-session composer (2026-10-13, fast-tracked)
+
+The first panel that WRITES and can be proven here. Session creation is a
+planning-state POST, and planning writes succeed on this environment (the
+write probe proved games create, seat, assign and window — only transitions
+answer 403). So the console's `session_creator_body` is ported whole: the
+form, the validation, the POST, and holding the new game after it.
+
+**The form is the console's, row for row.** Name (required) plus every
+optional the `POST /games` body accepts — mode, description, purpose, target,
+area, map tag — label above input in the console's web-form order, with the
+console's own sentences (`name the session first`, `Name is required — the
+server refuses a nameless session`). The mode rides radios, not a field,
+because it is a choice of three with the console's one-line meanings. The six
+text fields reuse the sign-in card's hand-rolled pattern (focus handle +
+keystroke handler + value, tab walks all six, Enter submits) through indexed
+accessors, so the rows cannot drift apart.
+
+**The write runs the console's rule, twice.** The panel refuses a nameless
+draft locally AND the binary refuses it again at the seam — the seam must not
+trust the renderer. On success the new game is HELD, the way
+`apply_created_game` holds it: `fetch_session` gained a `pinned` id (the
+`TFG_GAME` env seed moved inside as the startup caller), the create arm reads
+the game back pinned to the new id, and the shell replaces its session, clears
+the form and closes. Born in planning by contract, read back rather than
+assumed. A signed-out shell is refused at the seam, like the helm's backstop.
+
+**One deliberate gap, stated on the panel's doc.** The console gates the door
+on an app role (`can_manage_sessions`); the shell carries no roles yet, so the
+door stands open while signed in and the server has the last word. Roles are
+the next datum, not the next panel.
+
+**The card is taller than any readout panel**, so the chamfered silhouette
+grew a sized variant (`modal_silhouette_at`) — the console's own creator is
+560x620, and shrinking this form onto the 480x320 readout card would ship a
+cramped lie about the layout. Existing callers keep `modal_silhouette()`,
+pixel-unchanged.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the form is the console's | capture: `New session`, intro sentence, Name + hint focused (cyan edge), required note, 3 mode radios (maneuver lit), meaning line, 5 prose fields with the console's hints, Cancel + dimmed `Create session →` + `name required` |
+| the `→` renders | visible on the Create button — no tofu, no fallback needed |
+| a nameless draft never POSTs | `the_composer_refuses_a_nameless_session`: status set, sink empty |
+| a named draft sends the whole form | `the_composer_sends_the_whole_draft`: all seven fields verbatim on the sink, busy latches |
+| the answer holds the game | `applying_a_created_session_holds_it`: panel closes, form clears, mode resets, `planning` game held |
+| the server takes the arm's params | drove the API: `POST /games` (name/mode + 5 prose rows) → **201 planning** (game 27), `DELETE` → 204 — created and discarded, no residue |
+| the seed is action-free | `TFG_COMPOSE=1` opens the form with an EMPTY draft — a seeded name would be one stray click from a real game |
+
+**Verification.** `cargo test --lib` 435 pass (3 new; same 4 pre-existing
+failures); `cargo test --bin tfg` 12 pass; both binaries and
+`proto/gpui-island` build clean at the 8 pre-existing warnings, none new.
+
+### U8 step 4 continued — the Book panel (2026-10-13, fast-tracked)
+
+The held game's scenarios with their steps (read), plus the new-scenario
+title row (the one write). The second planning-write proven end to end after
+session creation — and the one that corrected its own premise mid-slice.
+
+**The read is the console's `book_view` without the staging.** Server
+scenarios in book order, steps numbered with their windows, empty content
+weak (`(not written yet)` is an authoring state, not an error). Staged cuts
+hidden and staged adds appended have no meaning here, because this shell
+stages nothing: the console authors through `book_draft` and syncs on
+advance, and there is no advance to sync on — so adds POST at once, and the
+panel states the difference in a sentence. Remove, relate and window editing
+are the staging machinery's and are named there rather than faked. Steps
+arrive ONLY nested in the scenarios (there is no step-list route), so the
+panel reads `session.book` and nothing else, and a step has NO title — the
+content is the label, which is the backend's decision.
+
+**The 403 that shaped the write.** The first contract drive — scenario POST
+into a fresh game this account created but was never seated in — answered
+**403**. Seating the account as Penyelenggara (role 270) and retrying
+answered **201**. So scenario authorship requires a SEAT, not just a token,
+and the arm reports the server's refusal rather than guessing at it. No
+auto-seat: seating chooses a role, and choosing roles by prototype is exactly
+the accident the seat-is-read-not-joined rule exists to prevent.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the book reads the server's | capture (`TFG_BOOK=1 TFG_GAME=19`): `Game 14 · 1 scenario(s)`, `Scenario 1 - 2 step(s)`, `1 Do A then B 1000–1030`, `2 Do B again then C 1030–1100` — the API's own rows |
+| a titleless row never POSTs | `the_book_refuses_a_titleless_scenario`: status set, sink empty |
+| a titled row sends trimmed | `the_book_sends_the_title`: `AddScenario { "River crossing" }`, busy latches |
+| the answer stays open | `applying_a_refreshed_book_holds_it_and_stays_open`: re-read book held, title cleared, panel open (the composer closes; this must not) |
+| the server takes the arm's path | probe game → seat as Penyelenggara → `POST scenarios` → **201** (`River crossing`, id 7) → book lists it → game discarded (204), no residue |
+| authorship needs a seat | unseated creator POST → 403; seated retry → 201 — recorded so it is not re-litigated |
+
+**Verification.** `cargo test --lib` 438 pass (3 new; same 4 pre-existing
+failures); `cargo test --bin tfg` 12 pass; both binaries and
+`proto/gpui-island` build clean at the 8 pre-existing warnings, none new.
+
+### U8 step 4 continued — book steps: add and remove (2026-10-13, fast-tracked)
+
+The book panel grows its working half: the open scenario's steps with
+per-step remove, and the new-step row (content plus window, both ends or
+neither). Steps still post at once — no staging, stated on the panel — and
+the read they return to is the same re-read book.
+
+**The draft is the console's own.** The step row is held as a
+`book::ComposerDraft` — content plus HHMM window with its `problem()` rule —
+not a copy of it, because a duplicated validation is a second answer waiting
+to disagree. Empty content is LEGAL (an unwritten step is an authoring state,
+drawn weak); only the window rule can refuse. The open scenario defaults to
+the book's first, the console's landing rule; tapping a title opens it.
+
+**The move this slice forced.** The shell names `ComposerDraft`, and
+`problem()` names `crate::backend::hhmm_*` — which would drag the HTTP stack
+behind the parity proto's fast loop, the exact thing the proto exists to
+avoid. So `hhmm_ok`/`hhmm_window_ok` moved to `view`, verbatim, with
+`backend` re-exporting both names: every existing path (master's internals,
+its tests, the binary arm's guards) resolves unchanged, and the proto shims
+`book` like `view`. Pure string validation was kernel all along; it just
+lived in the wrong module.
+
+**Three API facts the probe paid for.** (1) Scenario POSTs need a SEAT —
+an unseated creator gets 403, seating as Penyelenggara gets 201 (last
+slice's finding, re-confirmed). (2) Game role ids differ PER GAME
+(Penyelenggara was 270, 288 and 297 on three fresh games), and call signs
+are globally unique across live games (`SUPERUSER` is taken by the live seat
+in game 19) — the 409s they caused are recorded so nobody re-debugs them.
+(3) A content-only step PATCH NULLS the window: absent does not leave alone,
+whatever the client doc says. Window editing therefore resends the window
+explicitly — which is why it is deferred, not built on a guess.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| empty content sends, half window does not | `empty_step_content_is_legal_but_a_half_window_is_not`: empty posts to scenario 4; `1000` + empty end refused, busy never latches |
+| bad windows never reach the wire | `a_bad_window_never_reaches_the_wire`: `10-1030` and `1100-1000` both refused, sink empty |
+| the whole row sends | `the_step_row_sends_content_and_window`: content + `(1000, 1030)`, busy latches |
+| remove names its step | `removing_a_step_asks_the_binary`: `RemoveStep { 4, 7 }` |
+| the step lifecycle works | probe game → seat → scenario → add step **201** (window stored) → PATCH content-only **200** (window nulled — the quirk) → DELETE step **200** → book empty → game discarded (204) |
+| the panel holds the working half | capture (`TFG_BOOK=1 TFG_GAME=19`): open title cyan, 2 steps with remove buttons, content + window row, Add step, title row below — all on one card |
+| the move changed nothing | `hhmm_*` tests green through the re-export; proto builds with the `book` shim |
+
+**A capture correcting the layout.** The first capture put the book on the
+readout card and clipped the title row off its bottom — the form had
+outgrown the card the moment steps arrived. The book now shares the
+authoring card (`FORM_W/H`, renamed from `COMPOSE_*`), and the re-capture
+shows the whole form. Readout cards are for readouts.
+
+**Verification.** `cargo test --lib` 442 pass (4 new; same 4 pre-existing
+failures); `cargo test --bin tfg` 12 pass; both binaries and
+`proto/gpui-island` build clean at the 8 pre-existing warnings, none new.
+
+### U8 step 4 continued — readiness: declare and withdraw (2026-10-13, fast-tracked)
+
+The seat's own readiness gate, in "My command": declare as a player,
+withdraw when ready, nothing for judges (exempt) and the seatless. The panel
+that corrects the handoff's blocked-write section — readiness was listed as
+refused and had simply never been probed as the seat that can declare.
+
+**The probe.** PUT `/games/12/readiness` as the Commando seat in preparation
+answered **200** with `is_ready` and a `ready_at` stamp; DELETE answered 200
+with `False`. Prior state (not ready — the role change cleared it) restored,
+no residue. Planning-state writes now stand at six proven: session create,
+scenario add, step add, step delete, readiness declare, readiness withdraw.
+
+**The row is the console's `readiness_ui`, all four states.** Judge → the
+exempt sentence; ready → name, role and a withdraw button; player → name,
+role and the declare button; no seat → the room-key sentence. The rule lives
+in one method (`set_readiness`) that both buttons and the tests call — no
+seat, judge, asking for the held state, or an in-flight ask sends anything.
+The answer re-reads the session pinned to the held game (the hold follows
+the answer, the console's `apply_join` rule in miniature) and the panel stays
+open. The helm below it stays disarmed: readiness does not wait for
+execution, which is exactly why this row is live while the helm is not.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| a player declares and withdraws | `readiness_declares_and_withdraws`: `SetReadiness { true }` then `{ false }` on the sink, busy latches between |
+| judges and the seatless are silent | `readiness_is_silent_for_judges_and_the_seatless`: both directions, both judge states, plus no seat — sink empty throughout |
+| the held state is a no-op | `readiness_asks_for_nothing_already_held`: declaring while ready sends nothing |
+| the answer is held, panel open | `applying_a_readiness_answer_holds_the_session`: re-read readiness kept, latch cleared |
+| the server takes it | PUT → 200 (`is_ready`, stamped) → DELETE → 200 (`False`) on game 12, state restored |
+| the row renders | capture (`TFG_COMMAND=1`): `Commando · not ready to start`, `Super User · Commando` + `ready to start` button above the hull and the disarmed helm |
+
+**Verification.** `cargo test --lib` 446 pass (4 new; same 4 pre-existing
+failures); `cargo test --bin tfg` 12 pass; both binaries and
+`proto/gpui-island` build clean at the 8 pre-existing warnings, none new.
+
+### U8 step 4 continued — relate: what a step obliges (2026-10-13, fast-tracked)
+
+The book's last working half: per-step relate counts, and the relate editor
+under its step — hull checkboxes over the exercise's pieces, the nodes
+section honestly empty, save posting the working set whole. The slice that
+also closed the book: the two remaining "remainder" items have no console
+surface at all (below).
+
+**The shape.** The server resolves each step's list (posts + obliged
+personnel), so the session read fans out one `step_related` GET per step —
+best-effort per step, one unreadable list never sinks the session — and the
+editor redraws from the read, never from what was sent. The working set seeds
+from the read when the editor opens (there is no staging here, so the working
+set IS the last saved list), flips one ref per tap, and saves whole — empty
+included, which is legal and clears. Counts (`{n} post(s)`) ride every step
+row; absent reads claim no count rather than zero. The pieces are assigned
+units only: the server 400s any other hull, so the whole register would be a
+menu of refusals. Nodes read "no task organisation loaded" — the hierarchy is
+empty in every dev game, the console's own empty-state.
+
+**The probe behind it.** Relate hull 8 (assigned) → **200** with resolved
+names and obliged personnel → read-back identical → clear (empty list) 200 →
+game discarded (204). Relate unassigned → 400 ("has to be one of its
+pieces"); judge-side seat commanding → 400 (command needs a player seat, so
+the probe reseated Commando and assigned + related cleanly). Empty list is
+legal — the console's "gate refuses an empty list" is about the step gate,
+not the PUT.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the editor seeds from the read | `relate_opens_seeded_from_the_read`: open → working is the read's posts; toggle again → closed |
+| one ref flips, rest stay | `relate_working_flips_one_ref`: add 9, drop 8 → only 9 |
+| save posts whole, silence otherwise | `relate_saves_the_working_set_whole`: `SetRelated { 4, 7, [(hull, 8)] }`, busy latches; shut or in-flight saves nothing |
+| the answer reseeds, stays open | `applying_a_relate_answer_reseeds_and_stays_open`: working becomes the resolved list |
+| the panel shows the working half | capture (`TFG_BOOK=1 TFG_GAME=19 TFG_RELATE=1`): `0 post(s)` counts, open editor with `obliges nobody yet`, two piece checkboxes, empty nodes, save/close, step and title rows below |
+| the fan-out reaches the shell | same capture: game 19's two pieces listed — the pieces read works on live data |
+
+**Two non-items, recorded so they are not re-planned.** Window edit and
+reorder were carried as "the book's remainder", and neither has a console
+surface: no caller posts `update_scenario_step` (windows are set at add and
+never edited), and nothing calls `reorder_scenarios` at all. There is nothing
+to port — the book (shelf, scenario add, step add/remove, relate) is done.
+
+**Verification.** `cargo test --lib` 450 pass (4 new; same 4 pre-existing
+failures); `cargo test --bin tfg` 12 pass; both binaries and
+`proto/gpui-island` build clean at the 8 pre-existing warnings, none new.
+
+### Unblocking execution: measured, not built (2026-10-13)
+
+**Transitions need the Penyelenggara seat.** Seating this account as
+Controller, ADMIN TESTING, Deputy and Referee on fresh planning games all
+answered **403**; seating as Penyelenggara answered **200** (`planning →
+preparation`, no preconditions — the spec's table holds). The spec says it
+plainly once you look: transitions are "authorised by being this game's Game
+Master", and the 403 is the not-GM answer. The two earlier 403s (Commando,
+Controller) were seats, not capabilities — the hypothesis is closed.
+
+**One account cannot span the two halves.** A second seat for the same user
+answers 409 ("One person holds one role per exercise"), and reseating clears
+readiness (spec, re-confirmed by the role-change wipe on game 12). So the
+loop is shut for a single account: the GM seat transitions but cannot
+command or declare (judge-side), the player seat commands and declares but
+cannot transition, and switching seats wipes the declaration the execution
+gate needs. Execution takes two hands — or the Minos admin acting directly.
+
+**Game 19 is already execution — and useless for the helm.** `Game 14`
+executes with Budi/Markus Commando and this account judge-side commanding
+nothing. Setup is frozen there (409), so no hull can be handed over. A fresh
+game is the only path, and it needs the two-hand recipe in the next log's
+answer to the owner.
+
+### Execution unblocked, helm proven live (2026-10-13)
+
+The owner supplied two more accounts (budi, markus), and the write half fell
+in one session. The findings that did it, each measured:
+
+- **Transitions need the Penyelenggara seat.** Controller, ADMIN TESTING,
+  Deputy, Referee → 403; Penyelenggara → 200. The spec: transitions are
+  "authorised by being this game's Game Master".
+- **One person holds one role per exercise** (409 on a second seat), and
+  reseating clears readiness — so a single account cannot span GM + player.
+  Two accounts are the whole trick.
+- **Readiness declares in preparation only** (planning PUT → 409 naming it).
+- **Execution needs three things named at once:** the planned window
+  complete (`actual_end` + `assumed_end`, each after its start — PATCHable in
+  planning only, frozen after), every unit placed on the map (PUT placement
+  works in preparation), and the usual units + players + all-ready. The 409
+  names all of them together.
+- **Field names matter:** the order route takes `heading_deg`/`speed_kn`
+  (400 otherwise) — exactly what the binary's `order_unit` sends.
+
+**Game 42 ("GPUI helm proof") executes.** Created planning → both seats →
+unit 8 assigned + placed + window set (all planning) → GM to preparation →
+superuser declares → GM to execution. It stands as the proof environment:
+superuser Commando commanding placed unit 8, ready; budi Penyelenggara GM.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the helm posts live | `POST /games/42/units/8/order` `{heading_deg: 90, speed_kn: 12}` → **201**, fix answer (`90°`, `12 kn`, unclamped, assumed-time stamped) — the binary's exact body |
+| the shell holds the execution game | capture: `GPUI helm proof · execution`, `Commando · executing`, readiness row with withdraw, hull with live fix, helm ARMED (`SET HELM` full-strength, "An order posts at once…") |
+| the contract matches the code | the 201 body is byte-for-byte what `order_unit` sends; the sink test pins the shell half |
+
+**Messages: one level deeper, mapped but not taken.** Administrative is
+judge↔GM traffic (player 403, "send a Telegram instead"); telegram needs
+the hull under a task-organisation node ("no chain from it"), and nodes POST
+only in planning/preparation — game 42's tree is fixed empty. A telegram
+proof wants a fresh game with the hierarchy built before execution (node
+create schema + hull→node placement route still to discover). Next slice's
+problem, with the composer UI it belongs to.
+
+**Standing dev-data, recorded.** Game 41 (preparation, the windowless
+attempt) cannot be discarded — DELETE is planning-only (409) — so it stands
+with our two seats. Game 42 executes and must stand. Both are state, not code.
+
+**Verification.** No code changed this slice (setup only): `cargo test --lib`
+446 pass still holds by inspection — nothing to re-run for a slice with no
+diff. The helm's tests (`the_helm_sends_the_drafted_order`,
+`the_helm_is_silent_outside_execution`) are now live-backed rather than
+contract-hoped.
+
+### Comms composer + telegram proven live (2026-10-13)
+
+The owner supplied the CMS collection (`docs/minos-backend-postman.json`),
+which named the two missing routes outright: `POST /games/:id/hierarchy`
+(`{id_unit_hierarchy, name, ...}`) and `PUT
+/games/:id/units/:unit_id/hierarchy` (`{id_hierarchy_node}`). The echelon
+vocabulary at `GET /hierarchy` is four rows (Unsur, Satuan Tugas, Gugus,
+Operasi Gabungan); a root node takes rank 4 with no parent.
+
+**Game 43 ("GPUI telegram proof") executes with a task organisation.**
+Planning: both seats (superuser Commando, budi Penyelenggara) → node
+"GUGUS PROOF" created (201, id 1) → unit 8 assigned + map-placed + hierarchy-
+placed (200, `id_hierarchy_node: 1`) → full window → GM to preparation →
+superuser declares → GM to execution. It stands beside game 42 as proof
+environment; game 41 (windowless preparation) still stands, undiscardable.
+
+**Telegram contract, measured:** `POST /games/43/messages`
+`{kind: telegram, classification: TERBUKA, id_degree: 1, content, broadcast:
+true}` → **201** with the message answer. Administrative stays judge↔GM-only
+(403); the addressing GET 400s for a commander ("speaks from the post they
+hold") — correctly unused. The binary's `SendTelegram` arm sends byte-for-
+byte this body (telegram/TERBUKA/degree 1, empty to/cc = broadcast).
+
+**Shell:** comms panel gains the composer row — hand-rolled field (index 10,
+tabs to itself, Enter sends), SEND armed only in execution, `send_telegram`
+refusing non-execution and blank rows in the console's sentences, `ToBinary::
+SendTelegram`, binary arm with re-read, `apply_message` staying open. The
+panel states the cut (broadcast/TERBUKA/BIASA; kind, marking, audience,
+grade pickers later; hull must sit under a task node).
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| telegram posts live | curl 201 on game 43 with the binary's exact body |
+| shell holds the thread | capture `/tmp/gpui_comms.png`: `GPUI telegram proof · execution`, live broadcast row (Terbuka, 09:30), `New telegram` field + armed SEND + cut aside |
+| sink contract | `the_composer_sends_a_telegram_broadcast`, `the_composer_is_silent_until_execution_and_content` |
+| no regressions | `cargo test --lib`: 452 pass, same 4 pre-existing failures (`book::prune…`, `map_render::quad_bow…`, `roster::seats…`, `sim::order_move…`); `cargo check --bin tfg_gpui` clean, no new warnings |
+
+### Step declare proven live, GM verbs named-off (2026-10-13)
+
+**Game 44 ("GPUI step proof") executes with a book that asks.** Planning:
+both seats → node "GUGUS STEP" (id 2, global sequence) → unit 8 assigned +
+map-placed + hierarchy-placed → scenario "First move" + step "Take station
+east of the buoy" (1000–1100) → related `[{hull, 8}]` (200) → window → GM to
+preparation → superuser declares → GM to execution. `GET current-step` as
+superuser answers `asking`: scenario 12, step 16, required 1, outstanding 1,
+`you.ready: false` via hull 8.
+
+**Declare contract, measured:** PUT `.../steps/16/readiness` → **200**
+(outstanding 0, `you_ready` true, gate `may_start: true`) → DELETE → **200**
+(restored to outstanding 1, `you_ready` false). Game 44 stands pristine with
+the ask live.
+
+**Scope, decided from facts:** the console aims Play/Skip/Rewind from
+`step_runs` tracked off the socket (`next_step`, `latest_terminal`), and
+there is no runs GET — only `current-step`. So GM verbs are un-aimable in
+this shell and render visible-but-off for every seat, the console's own
+read-only-seat pattern, with the sentence saying why. The participant
+declare — the write OUR seat owns — is fully built: `StepAsk`/`StepLine`
+carry ids, `send_step_declare` refuses no-asking and stale steps,
+`ToBinary::DeclareStep`, binary arm with re-read, `apply_step_declare`
+staying open. GM verbs are the next slice and need socket step-run
+tracking first.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| declare posts live | curl PUT 200 + DELETE 200 on game 44 with counts/gate/flag verified at each step |
+| shell holds the ask | capture `/tmp/gpui_step.png`: `GPUI step proof · execution`, `Take station east of the buoy · First move · 0 of 1 ready`, armed DECLARE READY, off Play/Skip/End/Rewind + rule aside |
+| sink contract | `the_step_row_declares_for_the_asking_step`, `the_step_row_is_silent_without_an_asking_step` (no-asking + stale-step silence) |
+| no regressions | `cargo test --lib`: 454 pass, same 4 pre-existing failures; `cargo check --bin tfg_gpui` clean, no new warnings |
+
+### Player step reminder strip (2026-10-13)
+
+Per the owner's direction: the player UI is a reminder, not a list. A
+one-line strip just under the top bar names the ONE step — the asking step
+with scenario, instruction and counts, else what is playing — with an
+indicator dot in the console's own colors (sand while the step waits on
+this caller, signal green once declared or when only naming play). A click
+opens the existing step modal, where the scenario and the declare row live;
+the strip grows no panel of its own. Off outside execution and when there
+is nothing to remind. The scaffold button row slides down by the strip's
+height while it shows, so the reminder never covers it.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| strip shows the ask | capture `/tmp/gpui_reminder2.png`: amber dot + `NEXT · First move — Take station east of the buoy · 0 of 1 ready` under the top bar on game 44, modal closed, scaffold row slid clear |
+| click opens the modal | first capture's modal was opened by a compositor focus click landing on the strip (modal defaults closed, proven by test + second capture) — the accidental live proof |
+| composition logic | `the_reminder_names_the_asking_step`, `the_reminder_rests_once_declared_then_falls_back` (declared rest, asking-beats-playing, NOW fallback, silence cases), `opening_the_reminder_opens_the_step_modal` |
+| no regressions | `cargo test --lib`: 457 pass, same 4 pre-existing failures; `cargo check --bin tfg_gpui` clean, no new warnings |
+
+### The composed console: layout by state, and a left dock (2026-10-13)
+
+The owner's direction was to stop shipping "buttons and islands floating on
+the screen" and compose the console's real layout. This is that, in two
+parts: the column's membership is now a function of where the exercise is,
+and the zone docks LEFT like the console's.
+
+**The scaffold is gone.** The nine-button strip (`OPEN ISLANDS`, `OPEN MODAL`,
+`PEOPLE`, `MY COMMAND`, `COMMS`, `STEP`, `INSPECT`, `NEW SESSION`, `BOOK`) and
+the three identical 360x300 demo islands with literal hull rows are both
+deleted. Those buttons existed because the surfaces had no place: a demo's
+answer to "where does this panel go" is a button that opens it. Now they have
+places, and the band carries only the doors the console's band carries.
+
+**The column is a stack, and its membership is the state's.** `view` gained
+`IslandKey`, `IslandSlot`, `zone_islands(state, player)`, `zone_stack_height`,
+`zone_slot_origin` and `zone_overflow` — the console's `side_zone` match, cut
+to the surfaces this shell has. Island state is keyed by `IslandKey` rather
+than by index, and the open/closed choice lives in the four `*_open` flags
+with no second copy inside `IslandState`: two places holding "is this panel
+shown" is two answers waiting to disagree, and the one that loses is always
+the one the operator last touched. `column_slots()` is the ONE answer the
+render, the wheel's chain and the reminder's reveal all read.
+
+The islands no longer drag. That is not a simplification, it is the console's
+arrangement: `zone_island_origins_with` gives every island its origin from the
+stack, so the column is dock-bound and a dock change or a resize moves all of
+it at once with no stored position to update. The grip is now the column's
+only gesture on its geometry, and it straddles the zone's INNER edge —
+`band.2` for a left dock, `band.0` for a right one, because putting it on the
+outer edge parks it against the window border where there is nothing to drag
+into.
+
+| state | column |
+| --- | --- |
+| NoSession | Operator, Fleet |
+| Planning | Operator, Fleet, Crew |
+| Preparation | Operator, Command, Crew |
+| Execution (organizer) | Operator, Step, Command, Crew |
+| Execution (player station) | Operator, Step |
+| Closure | Operator, Crew |
+
+`player` is the console's `player_station()` VERBATIM — a seat held by a
+non-judge — and deliberately does NOT also require a commanded hull. That is
+the DASHBOARD's rule (`main.rs:12719`), and conflating them would hide the
+organizer column from a seated player who has no hull yet, which is most of a
+planning room. The shell's first cut required a hull and was wrong.
+
+**Comms left the column.** It is a modal door now, like Settings and the
+composer, opened from the band's comms door — the console's own flow, whose
+inbox is a floating pane this shell has no machinery for. A 560pt slot in
+every state's column would also have made the per-state layout a wall rather
+than a composition. The band's door flips it, which is what a door does.
+
+**One modal at a time.** `open_only(WhichPanel)` is enforced in one place
+rather than trusted to each door, because a rule every caller must remember is
+a rule that gets forgotten the moment a sixth door appears. The column's
+islands are not in the rule and never were.
+
+**The band is the console's row.** Groups separated by 1px rules rather than a
+list of buttons, and a right-to-left group at the end holding comms, Settings
+and sign out. The session readouts yield on a narrow window behind
+`view::BAND_READOUT_BUDGET` (the console's `HINT_BUDGET`, same number, same
+reason): the band is one row of readouts AND actions, and a left group that
+eats the width pushes the right-hand group off the edge — taking sign-out with
+it. The readouts yield; the doors never do. The map readout line moved behind
+`TFG_READOUT=1`: it is genuinely useful for a self-describing capture and it
+is also a developer's line floating over the map, which the console does not
+have.
+
+**The dock default is LEFT** (`main.rs:20669`). Three things followed it: the
+band mirrors with the same gaps, the grip moves to the inner edge, and
+`camera_centre_shift` answers positive for a left dock so a jump frames the
+hull in the area the map actually shows. The jump test now pins BOTH signs,
+because a sign that only worked on one dock is the classic one-axis-inverted
+bug.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the column follows the state | `the_column_follows_the_state_of_the_exercise`: all four states with no seat, then planning and execution with an exercise-side seat |
+| the state table is the console's | `every_state_has_the_column_it_should`, `a_player_station_changes_the_column_only_in_execution`, `the_operator_island_leads_in_every_state`, `the_step_island_only_shows_in_execution` |
+| a closed island stays closed | `a_closed_island_stays_closed_across_a_state_change`: shut Crew in planning, still shut in execution, in a different slot |
+| a hidden zone holds nothing | `a_hidden_side_zone_holds_no_islands` |
+| one modal at a time | `only_one_modal_opens_at_a_time`: each door closes the others |
+| the dock default is left | `a_jump_asks_for_the_selected_hulls_ground` pins +180 left and −180 right |
+| the column docks left and the grip is on its inner edge | capture `/tmp/gpui_clean.png`: OPERATOR and STEP islands at the left edge, the grip strip at their right, the map filling the rest with no inset |
+| the band carries only doors | same capture: `live · + New session · − z11 + · comms · Settings · Sign out`, no scaffold row, no floating readout |
+| the reminder still opens the step | `opening_the_reminder_opens_the_step_modal` now asserts the island opens AND asks to be revealed |
+
+`cargo test --lib`: **472 pass**, same 4 pre-existing failures (`book`,
+`map_render`, `roster`, `sim`). `cargo test --bin tfg` 12 pass. Both binaries
+and `proto/gpui-island` build; the proto gained a `gamestate` shim because
+`view` now names the state axis.
+
+**A bug the capture caught, and it was not a stray click.** Three captures in
+a row showed the comms inbox open over the console. The handoff's own hazard
+note blames the compositor's focus click; this time the flag was simply
+defaulted the wrong way — the island seeds had been inverted to
+`!= "0"` (open by default, correct for a column island) and comms had become
+a MODAL in the same slice, so it inherited the inversion and opened on every
+launch. The rule the fix records: an inversion applied to one kind of flag
+must not be applied to the other.
+
+**A process failure, recorded because it cost real work.** Restoring
+`view/mod.rs` was attempted with a slice-based `str.replace` whose start and
+end indices resolved to an EMPTY match, and `"".replace("", x)` interleaves
+`x` between every character: a 764-line file became 4.1 million. The file was
+rebuilt from `HEAD` and the missing pieces re-derived from their source
+modules — which surfaced that several earlier sessions' moves into `view`
+(`hhmm_ok`, `MapSymbolShape`, `map_symbol_accent/fill`, `affiliation_*`, the
+eight `FRAME_*`, `camera_centre_shift`, `box_holds_interior`, `ZOOM_*`,
+`AUTH_FIELD_H`, `zone_band_at`) were UNCOMMITTED and would have been lost
+with a `git checkout`. They are restored and now carried by the tests that
+pin them. The rule: never compute a replace range from two `index()` calls
+without asserting the slice is non-empty, and never assume a modified tracked
+file's HEAD is a safe base.
+
+**Still open, unchanged.** The map's centre is the window's, so a hull at the
+centre sits behind the column — worse on a left dock, since the visible area
+is now to the RIGHT of the middle. The selection is one-way (sheet → marker,
+no marker → sheet). The affiliation frame, per-shape fill and the store
+resolvers are wired but every hull still reads Unknown without a session.
+
+### The column's wheel was dead code (2026-10-13)
+
+The owner reported that the sidebar could not be scrolled. It could not, and
+the reason is that **the column's wheel listener never ran at all** — not
+"scrolled the wrong thing", never entered. `chained_wheel`, the ceiling, the
+subtraction and the whole body-versus-column chain were unreachable code.
+
+**The cause is one attribute.** GPUI's scroll dispatch gates every listener
+through `HitboxId::should_handle_scroll`, which is
+`window.mouse_hit_test.ids.contains(&self)`. That set is built by
+`Window::hit_test`, which walks hitboxes newest-first and **`break`s on the
+first `HitboxBehavior::BlockMouse`** — so every hitbox painted before it is
+dropped, including the band's. The island's rim and its band texture were
+`.occlude()`d, which is `BlockMouse`, and the rim covers the whole island. So
+over any island the band's hitbox was never in the set, and
+`Interactivity::on_scroll_wheel` (which wraps the listener in exactly that
+check) never called the handler. GPUI's own doc on `occlude` says
+`block_mouse_except_scroll` "should be preferred"; that is what
+`BlockMouseExceptScroll` is for — it records `hover_hitbox_count` so
+clicks and hover still cannot reach the map behind, and does not `break`.
+
+**Why the tests missed it.** `view::tests` pins `chained_wheel` thoroughly, and
+every one of those tests passed for the whole time the column could not
+scroll — because they test the decision function, and the decision function was
+never called. A kernel test cannot see a missing call site. The two new tests
+dispatch a real `ScrollWheelEvent` through the shell, which is the only layer
+that can tell:
+
+- `a_wheel_over_the_column_moves_the_column` — wheel to the ceiling and back.
+- `a_wheel_over_a_scrolling_body_leaves_the_column_alone` — the Fleet body
+  takes it and `zone_scroll` stays 0. One gesture, one surface.
+
+Two facts about driving this in the harness, both of which fail silently:
+`should_handle_scroll` reads the hit test from the window's **mouse position**,
+not from the scroll event's own `position`, so the pointer must be moved there
+first or the listener is gated off; and the harness window is 1920x1080, where
+a three-island column *fits* and the ceiling is 0, so a test must resize to a
+window where it does not.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the wheel reaches the column | `a_wheel_over_the_column_moves_the_column` (would have failed before the fix — the handler did not run) |
+| the body still wins where it has room | `a_wheel_over_a_scrolling_body_leaves_the_column_alone` |
+| the offset MOVES the islands | capture pair `/tmp/gpui_before.png` vs `/tmp/gpui_scrolled.png` (`TFG_SCROLL=20`), cross-correlated: best shift **25 physical px = exactly 20 window-logical px**, error 21678 against 347287 at zero shift |
+| nothing else moved | `cargo test --lib` 474 pass, same 4 pre-existing failures; both binaries and `proto/gpui-island` build |
+
+**The gesture itself is NOT verified on the real binary, and cannot be here.**
+GPUI does not present on Xvfb, and `uimouse.py`'s uinput pointer moves the real
+cursor but its buttons and wheel never reach the window
+(`scripts/ui-shoot/README.md`, "Where the Wayland path stopped" — measured, not
+assumed). So the wheel is covered by the harness test that dispatches the real
+event, and the paint half is covered by a captured `TFG_SCROLL`, which is why
+that seed exists. Saying "verified by capture" about the gesture would be
+false.
+
+**A process bug this turned up, and it invalidated a test.** `SHEET` was read
+with `std::env::var` inside `render` and two tests set it to `1` without ever
+clearing it, so every test that ran after them in the same process rendered the
+roster sheet instead of the console. It masked a second bug:
+`opening_the_reminder_opens_the_step_modal` asserted on `demo.reveal`, a field
+`render` consumes with `reveal.take()` on the very next frame — it only passed
+because the `SHEET` global made `render` return before the column ran. The
+sheet is now a field seeded once in `new()` (where every other `TFG_*` seed
+lives), the dead inner `else if SHEET` branch in the map child is gone, and the
+test asserts the outcome the comment claims: the click opens the island AND the
+column scrolls it onto the band. Rule: a process-global read in `render` is a
+race with every other test in the binary, and a test that asserts on a field
+the frame is designed to consume is asserting on nothing.
+
+### The Planning column, the console's own (2026-10-13)
+
+The owner's three questions. The third was a bug; the first and second were a
+diagnosis that contradicted notes this log had already recorded, so both are
+written down as measurements.
+
+**1. The data was right, but the read was incomplete.** Game 45 ("Game 15",
+planning) genuinely has **0 participants** — `GET /games/45/participants` answers
+`{"participants":[]}`, and `/units` and `/scenarios` are empty too. Nothing was
+misparsed. What was missing is that `fetch_session` never called
+`game_detail`, `game_readiness` or `game_hierarchy`, and the kernel's own
+`zone_islands` doc justified three missing islands with *"no read route exists
+for either here"*. All three routes exist, are implemented in `master.rs`, and
+answer — `/games/45` returns name, mode, pace, prose and `time_factor: 1`;
+`/readiness` 404s until preparation; `/hierarchy` returns `[]`. So the notes
+were wrong and the comment now says which routes answered what.
+
+**2. The comparison.** The console's Planning column is seven islands
+(`main.rs:11625–11665`); the shell had three.
+
+| console | h | shell had | what was wrong |
+| --- | --- | --- | --- |
+| Operator | 172 | OPERATOR | close; trailing differs (below) |
+| Essentials | 380 | — | absent |
+| Control | 182 | — | absent |
+| Fleet | 320 | FLEET | **wrong surface**: the whole 127-hull REGISTER, which is the console's *picker modal* content. The console's Fleet is the DRAFT, plus a door |
+| Players | 280 | **CREW** | **renamed** — and CREW is a real, different console island (`z.crew`, the arrival list), so the old name named something else. This broke the shell's own rule in `IslandKey::title()`'s doc |
+| Review | 380 | — | absent |
+| Groups | 380 | — | omitted, named: the console's own local-scratch authoring, no read route |
+
+Planning now carries all six the data supports, at the console's heights and in
+the console's order: Operator(172), Essentials(380), Control(182), Fleet(320),
+Players(280), Review(380). Stack 1726 against a 758pt band — the planning
+column cannot fit any window this console runs in, which is exactly why the
+scroll fix mattered.
+
+Trailing notes follow the bodies: Fleet now reads `N PIECES` (the draft) and
+not `127 HULLS`, Players reads `N SEATED`, Crew reads `N IN ROOM`, Control
+reads the multiplier, Review reads the server's outstanding count. The three
+new islands read from `GameFacts` and `ReadinessView` on `SessionView`, which is
+`game_detail` plus `game_readiness` flattened to what the column draws — and
+`room_key` comes along free on the same payload, so Review's key needs no
+second read.
+
+**One divergence found and deliberately NOT ported.** In the console, an
+island's close cross and its title-band drag are both vestigial: `open` and
+`pos` are per-frame locals (`side_zone`), discarded on every redraw, so neither
+persists. The shell's closable islands are kept and the divergence is recorded
+here rather than copied.
+
+**Writes.** Control's Apply posts `set_time_factor` and Review's
+"Enter execution →" posts `transition_game` — both through the existing
+`ToBinary` + re-read plumbing, so the readout on the next frame is Minos's and
+never the draft's. Review's advance is ungated by role and by phase, matching
+the console's reasoning: what may advance is the server's policy call, and a
+client that hid the button would be one more copy of a rule it does not own.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the planning column is the console's | `every_state_has_the_column_it_should` — six keys in order; `the_column_follows_the_state_of_the_exercise` — no-seat and player-station planning |
+| the stack arithmetic still holds | `the_stack_height_counts_a_gap_per_island` (1726), `the_column_scrolls_only_by_what_it_overflows` (1186 of overflow in a 540pt band) |
+| the wheel still chains | `a_wheel_over_the_column_moves_the_column`, `a_wheel_over_a_body_with_room_leaves_the_column_alone` |
+| the column scrolls and the bodies are reachable | captures `/tmp/gpui_plan_top.png` and `/tmp/gpui_plan_sc.png` (`TFG_SCROLL=900`): the first island on band moves from OPERATOR (band edge physical y 74) to PLAYERS (y 264) |
+| the new islands draw real server data | same capture: `Game 15 · scenario · planning · standard pace`, `window incomplete` (amber — both ends or neither), `nothing written yet`, `×1× · Pace 1× — read from Minos`, Apply disabled while the draft is clean |
+| no regressions | `cargo test --lib` 474 pass, same 4 pre-existing failures; both binaries and `proto/gpui-island` build |
+
+**Two things in the wheel test, both failures of the test rather than the code,
+recorded because both cost time.** One `simulate_event` is dispatched through
+every listener the rendered frame accumulated, so a `simulate_mouse_move` that
+notifies paints again and both paints' listeners survive into the dispatch —
+one notch therefore moved the column by 80, not 40. The test now pins direction
+and the ceiling, not the increment. And aiming a wheel at an island requires
+its SCREEN position, which is `origin - scroll`: computed from the unscrolled
+origin the gesture lands below the window and moves nothing, which is how the
+column half passed while the body half was never reached.
+
+**Still open.** The two pickers — the Fleet register as a modal with
+`ForceDraft` staging, and the Player picker — are the next slice. `tfg::force`
+and `tfg::roster` are toolkit-free and already carry the console's own
+`plan(draft, live)` write generation, so the staging is portable rather than
+invented; the reason it is not here is that it is a real slice on its own.
+Groups is still omitted. The trailing-glyph notdef is still parked at the
+owner's request.
+
+### The Fleet picker, on the console's own staging (2026-10-13)
+
+The Fleet island's door now opens something that works. It is the console's
+`ForceDraft` and `force::plan`, ported rather than reinvented — `src/force.rs`
+is toolkit-free, so the draft, its rules and its write generation are the same
+code the egui console runs.
+
+**Every edit posts at once.** The console stages and syncs at a stage advance;
+this shell has no advance, and posting at once is its pattern for every other
+authoring surface (the book, relate, readiness all do). The consequence that
+makes it safe: the draft can be re-seeded from any session read, because it
+never holds anything the server has not been told — so a telegram answer's
+re-read cannot discard staged work.
+
+**The plan is one message, not one per edit.** `ToBinary::SyncForce` carries
+every write `plan` owed, in the order the server accepts them, and the first
+refusal stops the plan. Posting a hull and its commander as two messages would
+let a failure between them leave the exercise holding a piece nobody commands —
+the exact state `ForceGap` exists to prevent.
+
+**One rule, one place.** `stage_assign` and `stage_handover` TAKE a commander
+rather than checking it. Whether an account may hold a piece is the picker's
+question (it offers the room's seats and nothing else); whether a hull may be in
+the exercise without one is `force::plan`'s. A first pass put the seat check in
+both, and the test caught it asserting a sentence the kernel never wrote — two
+copies of one rule, where the copy that drifts is the one that writes.
+
+**What the picker does NOT do.** No placement. The console places a hull by
+dropping it on the map; this shell has no map drop, so neither the draft nor its
+`LiveHull` mirror carries a start and `plan` emits no `Place` or `Lift`. A
+`Place` or `Lift` reaching the binary arm is reported loudly rather than
+swallowed, because it would mean the draft grew a coordinate nobody chose.
+Placement is still READ — `PieceView.placed` from `GET /games/{id}/placements` —
+and still shown on both the island and the picker.
+
+**`WhichPanel` gained `None`.** `open_only` takes the whole enum, so a modal
+close is "open nothing" rather than four flags flipped by hand. The picker's ✕
+uses it, and it is the shape every future door should use.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| a pick posts one Assign carrying the commander | `a_picked_hull_with_no_commander_is_refused_and_named` (asserts on the `ToBinary::SyncForce` payload) |
+| the kernel's rule stops the whole plan and names the hull | `an_uncommanded_piece_stops_the_whole_plan_and_is_named` — through `sync_force`, with nothing sent |
+| a remove is one Remove, and a hull never drafted is not a write | `a_removed_piece_is_one_remove` |
+| the write endpoints work for this account and game | **live**: `POST /games/9/units {id_unit:55, id_commander:2}` → **201**; `DELETE /games/9/units/55` → **200**; game 9 back to `[8, 12]`, exactly as found |
+| the picker draws a real seated room | capture `/tmp/gpui_picker9b.png` (`TFG_GAME=9 TFG_FLEET=1`): `IN THE EXERCISE — 2` with commanders, placed state, the room's three seats as handover buttons and remove; the register with `add`, and `assigned` (disabled) on a hull already in the exercise |
+| the gate is honest with nobody seated | capture `/tmp/gpui_picker.png` (game 45): "Nobody is seated, and Minos gives every piece a commander — seat the room on the Players island first." |
+| no regressions | `cargo test --lib` **477 pass**, same 4 pre-existing failures; both binaries and `proto/gpui-island` build |
+
+**Game 9 is the planning room this was measured on** — 3 non-judge seats (Super
+User, Budi Santoso, Markus Wijaya) and two pieces already assigned, which is the
+only dev game in a state where a pick can be made at all. Game 45 is the bare
+planning room: 0 seats, 0 units, no book.
+
+**Still open.** The Player picker — seating, unseating and role changes through
+`tfg::roster`'s `RosterDraft` and its `plan` — is the next slice; the console's
+`z.players` door opens it and the Players island here does not yet have one.
+Groups is still omitted. The trailing-glyph notdef is still parked at the
+owner's request. And island BODY scrolling remains unverified by gesture: GPUI's
+built-in scroller does not fire for a body inside the clipped column in this
+harness, so the column's scroll is proven and a body's is not.
+
+---
+
+## The Player picker, on `tfg::roster`'s own draft
+
+The Players island's door now opens the directory, and seating, unseating and
+role changes all go through the console's own `tfg::roster` — the same module
+the fleet picker runs on, ported whole rather than reimplemented.
+
+**The door is the console's.** `z.players` has one because seating is one
+decision about a person and a 280-point column cannot hold it. The directory
+needs no extra read: `fetch_session` carries it, so opening the panel draws the
+real thing rather than an empty form with no read attempted.
+
+**One plan, one post.** `stage_seat`/`stage_unseat` mutate the draft, then
+`sync_roster` calls `roster::plan(&draft, &live)` and posts the whole result as
+one `ToBinary::SyncRoster`. Same shape and same reason as `SyncForce`: a plan is
+one decision, and posting its writes one message at a time would let a failure
+between them leave a half-seated room. Safe because the draft is a mirror of
+what Minos was last told, so a session read can re-seed it — and both drafts are
+now re-seeded by the ONE call `reseed_drafts`, which replaced `reseed_force`
+because two reseeds would be two chances to do one and forget the other.
+
+**`PersonView` gained `role_id`, and this was not cosmetic.** `roster::plan`
+compares staged seats against the server's BY ID, so a seat re-picked as the
+same role has to converge to nothing. Carrying only the role's name made both
+sides incomparable — `live_seats()` had to fill in `0` — and every restage
+looked like a change, i.e. a guaranteed 409 on any re-pick. The test
+`restaging_a_seated_account_as_the_same_role_writes_nothing` is what caught it:
+it failed first, and the fix was in the model, not the test.
+
+**Two records, both named.** `directory` and `roles` are on `SessionView` and
+read at hold time. The roles are the game's own `/games/{id}/roles`, never a
+hardcoded list — a deployment that relabels a seat keeps working. The directory
+is a question about ACCOUNTS rather than the exercise, which is why the console
+reads it on the way into the picker and why this reads it with the session.
+
+**No invented call sign, and it says so.** Minos requires one on a seat and the
+console's form asks the operator. Here the account's own name is used,
+upper-cased and cut to eight, and the picker names what it used rather than
+presenting the choice — a seat form that silently invented a call sign would be
+a call sign nobody chose.
+
+### A GPUI trap worth its own entry
+
+`overflow_y_scroll` is on `StatefulInteractiveElement`, not `InteractiveElement`.
+A plain `Div` has no such method. It only exists once the element is stateful —
+so `.id(...)` MUST come first in the chain:
+
+```rust
+// works
+div().id("x").flex_1().overflow_y_scroll()
+// does not compile
+div().flex_1().overflow_y_scroll()
+```
+
+The symptom is misleading: the error reads "no method named
+`overflow_y_scroll` found for struct `gpui::Div`", which points at the wrong
+thing entirely.
+
+**And both pickers were clipping their lists with no scroller at all.** The
+Fleet picker only got away with it because game 9's force is two hulls; the
+Player picker's eight accounts and five roles overflowed a 420-point panel on
+first render. Neither modal had a scroller — they ended in `.overflow_hidden()`,
+so content was simply unreachable. Both are now a fixed header over a scrolling
+list (`#player-picker-list`, `#fleet-picker-list`).
+
+**Directory rows are two lines, not one.** One row with the name and five role
+buttons after it loses whichever end it ran out of: the name clipped, or the
+roles slid under the panel's edge. Stacked — name on one line, the role buttons
+wrapping below — both survive a name of any length and a role list of any size.
+The row's detail joins only the parts the mirror actually carries; a blank rank
+joined with a separator reads as a row that lost its middle.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| seating an unseated account is one Seat carrying a call sign | `seating_a_directory_account_is_one_seat` (asserts on the `ToBinary::SyncRoster` payload) |
+| a restaged seat as the same role writes nothing | `restaging_a_seated_account_as_the_same_role_writes_nothing` — the test that caught the missing `role_id` |
+| an unseat is one Unseat | `an_unseat_is_one_write` |
+| the write endpoints work for this account and game | **live**: `POST /games/9/participants {id_user:5, id_game_role:19, call_sign:"TFGADMIN"}` → **201**; `DELETE /games/9/participants/5` → **200**; game 9 back to `[2, 6, 13]`, exactly as found |
+| the picker draws a real seated room and a real directory | capture `/tmp/gpui_player9c.png` (`TFG_GAME=9 TFG_PLAYER=1`): `IN THE ROOM — 3` with each seat's role and steers/directs, `THE DIRECTORY` with rank · unit · appointment and five role buttons per account, `5 of 5 accounts` |
+| the door is on the island | capture `/tmp/gpui_player_door.png` (`TFG_GAME=9 TFG_SCROLL=760`): Players reads `Game 9 · 3 seat(s) · 0 ready · you: Commando`, then `Player picker (3 seated)` |
+| the pickers scroll | captures above: the directory's last row (`System`) sits past the panel's lower edge with the header fixed |
+| no regressions | `cargo test --lib` **480 pass**, same 4 pre-existing failures; both binaries and `proto/gpui-island` build |
+
+**The readiness dash in the Players island is honest.** It shows `—` for all
+three seats because `is_ready` is false for all three; nothing was broken, the
+column is the console's own "ready" badge reading a room that has not declared.
+
+**Still open.** Groups remains omitted — the console's own is local-scratch
+authoring with no read route, so naming the surface would name something empty.
+Island BODY scrolling is still unverified by gesture for the same reason as
+before (GPUI's built-in scroller does not fire inside the clipped column in this
+harness); what is now proven is that the MODAL bodies are scrollers at all and
+that their content is reachable. The trailing-glyph notdef is still parked at
+the owner's request.
+
+## The three columns nobody had looked at (2026-10-13)
+
+The Planning column was built and captured island by island. The other three
+states — the ones `zone_islands` composes for `Preparation`, `Execution` and
+`Closure` — were pinned by kernel tests on their *membership* and had never
+been driven or seen. Every capture since the recomposition was a planning game
+(9, 45); the execution captures in this log (`gpui_comms.png`, `gpui_step.png`,
+the helm shot) all predate the band and the dock.
+
+That mattered more than a missing screenshot, because execution is the state the
+console spends its life in. It is now seen, and the columns hold.
+
+### What each state's column is, and where it was seen
+
+| state | column | seen on |
+| --- | --- | --- |
+| Planning | Operator, Essentials, Control, Fleet, Players, Review | game 9 / 45 (earlier entries) |
+| Execution, player station | Operator, Step | `/tmp/gpui_exec44.png` — game 44 |
+| Execution, judge | Operator, Step, Command, Crew | `/tmp/gpui_exec_gm.png`, scrolled `/tmp/gpui_exec_gm_sc.png` — game 19 |
+| Preparation, judge | Operator, Command, Crew | `/tmp/gpui_prep38.png` — game 38 |
+| Preparation, player station | Operator, Command, Crew | `/tmp/gpui_prep41.png` — game 41 |
+| Closure | Operator, Crew | `/tmp/gpui_closure11.png` — game 11 |
+
+`player` is `own_seat().is_some_and(|p| !p.judge)`, the console's
+`player_station()` verbatim. Game 44 seats this account as `Commando` (call sign
+`SUEX`) and game 19 as `Penyelenggara`, which is what put the two halves of the
+execution column in reach without inventing a credential.
+
+**A player station's execution column is two islands and fits.** Operator 172
+plus Step 380 plus two gaps is 556 against a 758-point band, so it never
+scrolls at all. The judge's is 172+380+420+240 plus four 2-point gaps = 1220 over a 758-point
+band, so its ceiling is 462. `TFG_SCROLL=474` asked for more than the ceiling
+and clamped to it, which lands Crew — whose origin is 978 — 516 points down the
+band with all 240 of its height inside the 758. The ceiling decided the seed;
+a number above it would have been clamped to the same photograph.
+
+### What the islands read, and that it is the server's own answer
+
+**Crew's count is arrivals, not seats, and it is right.** Game 19 seats three
+people and badges two: Budi Santoso and Markus Wijaya both have `joined_at`, the
+judge seat does not, so the island reads `2 IN ROOM` and gives the third row
+`judge` with no arrival badge. Game 11 also seats two with neither arrived and
+reads `0 IN ROOM`. The console's line — "seated is a role; in room is arrival" —
+is doing real work in both captures rather than restating the seat count.
+
+**Command's exemption sentence is the judge's answer, and it is not a bug.**
+Game 19 and game 38 both show `Super User · Penyelenggara — judge side is exempt
+from readiness`, then `No hull assigned to this seat.` Game 41 — same account as
+`Commando`, ready — shows the other branch: `ready to start` with an armed
+`withdraw`, `1 HULL`, and `KRI Abdul Halim Perdanakusuma (KRI-355) 255° 0.1 kn`
+with a `stale` badge. Four states of `readiness_ui`, all four drawn from what the
+server returned.
+
+**The step verbs stay off, and say why.** In game 19 the judge sees
+`no step asks you`; in game 44 the player sees `Asking / Take station east of
+the buoy / First move · 0 of 1 ready` with `DECLARE READY` armed. Play, Skip, End
+and Rewind are disabled in both, with the aside naming the reason — runs are
+tracked by the Game Master and this shell tracks none. A disabled verb with its
+reason attached is not a stub; it is the honest reading of a capability the
+shell does not have.
+
+### One branch with no live route
+
+**`zone_islands(NoSession, _)` cannot be reached by any capture.** It composes
+Operator and Fleet, and a kernel test pins that. But this shell's sign-out takes
+the whole window to the login card — `TFG_SIGNED_OUT=1` is the proof,
+`/tmp/gpui_nosession.png` shows `ARCONS` with a Sign in form and no column at
+all — so a signed-in account holding no game is a state the binary cannot enter:
+`fetch_session` pins a game or takes the first of `games_list()`, and no dev
+account has an empty list. The console reaches that column because its landing
+surface *is* the register; here the column is replaced by a login card.
+
+That is a named divergence, not a defect, and it is recorded rather than
+papered over by a seed. Nothing in the shell can compose it, so nothing can
+verify it beyond the kernel test.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| a player station's execution column is Operator + Step and fits | capture `/tmp/gpui_exec44.png`: two islands, band reads `NEXT · First move — Take station east of the buoy · 0 of 1 ready` |
+| a judge's execution column adds Command and Crew | capture `/tmp/gpui_exec_gm.png` (game 19): COMMAND with the exemption line and the helm, CREW below the fold |
+| the judge column's scroll reaches the last island | capture `/tmp/gpui_exec_gm_sc.png` (`TFG_SCROLL=474`, clamped to the 462-point ceiling): CREW `2 IN ROOM` wholly inside the band |
+| Crew counts arrivals, not seats | game 19: three seats, `joined_at` on two → `2 IN ROOM`; game 11: two seats, neither arrived → `0 IN ROOM` |
+| Command draws all four readiness branches | game 19 / 38 judge-exempt; game 41 `ready to start` + `withdraw` + `1 HULL` + `stale` |
+| the step verbs are off for a stated reason | both execution captures: Play / Skip / End / Rewind disabled with the runs aside |
+| preparation and closure columns draw | `/tmp/gpui_prep38.png` (judge, `0 IN ROOM`), `/tmp/gpui_prep41.png` (player, hull), `/tmp/gpui_closure11.png` (Crew only) |
+| the no-session column has no live route | `/tmp/gpui_nosession.png` (`TFG_SIGNED_OUT=1`): login card, no column |
+| no source changed | this entry added no code; `cargo test --lib` unchanged at **480 pass** with the same 4 pre-existing failures |
+
+**Still open, unchanged.** Groups remains omitted — no read route. Island BODY
+scrolling is still unverified by gesture, and these captures do not touch it: no
+column here needed a body scroller, because every island fits its band once the
+column itself scrolls. The trailing-glyph notdef is still parked.
+
+## The band's three doors, and a capture script that was lying politely (2026-10-13)
+
+The band opens three modals — `+ New session`, `comms` and `Settings` — and none
+had a capture on the current band. Settings had no capture anywhere in this log,
+comms had one that predates the band rewrite, and `+ New session` opens the
+Composer, which had none.
+
+| door | capture | what it reads |
+| --- | --- | --- |
+| `Settings` | `/tmp/gpui_door_settings.png` | VIEW `Watch only`; LAYOUT `Side zone` checked, `Docked left`, `Width − 360 + reset`; MOTION `Reduce motion` |
+| `comms` | `/tmp/gpui_door_comms.png` | `Game 8 · 0 message(s)`, `No messages — and none can arrive until the game is executing.`, `New telegram` field, `SEND`, and the aside `Composing is a write, and the server takes messages only in execution.` |
+| `+ New session` | `/tmp/gpui_door_compose.png` | `Name *` with `e.g. Latihan Armada 2026`, `Mode` (maneuver / scenario / static), Description, Purpose, Target, Area, Map tag, `Cancel` and `Create session →` greyed with `name required` |
+
+**All three are real surfaces, and two of them refuse honestly.** Comms' SEND is
+disabled because game 8 is planning and messages are an execution write; the
+Composer's Create is disabled because the name is empty, and it says `name
+required` rather than sitting inert. A disabled control with its reason attached
+is the reading of a capability the shell does not have, which is not the same as
+a stub.
+
+### The capture script was writing plausible wrong pictures
+
+The first three attempts at these captures returned a fullscreen video — while
+`/tmp/gpui_run.log` showed the app drawing perfectly (`map frame 24: 237ms`,
+`fit island=review`). Nothing was wrong with the shell.
+
+**`grim -o eDP-1` screencopies the composited output, which is the ACTIVE
+workspace only.** The app lands on a different workspace each launch
+(`special:scratchpad`, then `5`, then `1`), and a window on another workspace is
+not mis-cropped — it is absent. Whatever is on top at its coordinates is written
+to the PNG instead, and it looks entirely plausible.
+
+**It cannot be worked around here.** `hyprctl dispatch` is broken in this build:
+it wraps the argument in Lua (`hl.dispatch(focuswindow class:tfg-gpui)`) and
+cannot parse a multi-word one. This is over the CLI *and* the raw IPC socket —
+`printf 'j/dispatch workspace special:scratchpad' | socat - UNIX-CONNECT:$SOCK`
+fails identically. The recipe's note that dispatch "fails in this shell with a
+Lua parenthesisation error" was right, and now it is known to be unfixable from
+this side rather than merely inconvenient. So the workspace cannot be switched
+to, and the capture cannot be forced.
+
+**So the script now REFUSES instead.** Rule 5, and it is the same shape as the
+four the script already carries: read the window's workspace alongside its rect,
+compare it to the active workspace, and exit 5 with a named error naming both
+workspaces and the reason. A named error is recoverable; a wrong PNG is a
+debugging pass spent proving the shell is fine, which is exactly what this
+morning's session was.
+
+```
+window rect (logical): 768 26 768 838  on workspace '5'
+captured /tmp/gpui_door_comms.png  (466714 bytes)
+```
+
+The rect line now names the workspace too, so a capture that succeeded says
+where it came from and one that could not have says why.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the Settings door opens a real modal | `/tmp/gpui_door_settings.png`: VIEW / LAYOUT / MOTION with `Side zone` checked and `Docked left` |
+| the comms door opens a real modal and refuses honestly | `/tmp/gpui_door_comms.png`: `0 message(s)`, the empty state, SEND present, the execution-only aside |
+| `+ New session` opens the Composer | `/tmp/gpui_door_compose.png`: required Name, three modes, five free-text terms, `Create session →` greyed with `name required` |
+| the app was drawing while the wrong pixels were captured | `/tmp/gpui_run.log`: `map frame 24: 237ms (pump 4)`, `fit island=review content=350 viewport=350` |
+| the app's workspace varies per launch | three runs reported `special:scratchpad`, `5`, `1` |
+| workspace switching is unavailable | `hyprctl dispatch` fails over CLI and over `socat` to the raw socket, identically |
+| a wrong capture is now refused, not written | script rule 5, exit 5, naming both workspaces |
+
+**Still open.** `WhichPanel::Book` has no door — reachable only by `TFG_BOOK=1`
+and by two tests. The console's own band has no book door either (it was ported
+verbatim), so this is a question about where the console opens it, not a missing
+button to invent. Groups remains omitted, island BODY scrolling remains
+unverified by gesture, and the trailing-glyph notdef remains parked.
+
+## The scenario composer's door, on the island that owns the plan (2026-10-13)
+
+`WhichPanel::Book` — the whole API-verified scenario and step surface — had no
+way in. It was written by `TFG_BOOK=1`, by `open_only`, and by two tests, and
+by nothing an operator could press. The handoff had recorded that as a question:
+is the console's band missing a door too, or does the console open it from a
+surface not ported?
+
+**It opens from Essentials.** The console's own placement, verbatim in
+`main.rs::setup_session_ui`, with its comment intact:
+
+> The scenario book's entry point, on the island that already owns the held
+> session's own facts.
+
+And its gate, also verbatim: **absent outside planning rather than greyed out**,
+because authoring is a planning-time act and the server refuses it after, so a
+control that would 403 is a lie about what this session can do.
+
+So the missing door was never a band door. It is the third door of the same
+shape as the two already built — Fleet's island doors the Fleet picker, Players'
+island doors the Player picker, and now Essentials doors the composer:
+
+| island | door | what it opens |
+| --- | --- | --- |
+| FLEET | `Pick hulls` | `WhichPanel::Fleet` |
+| PLAYERS | `Player picker (n seated)` | `WhichPanel::Player` |
+| ESSENTIALS | `Scenario composer` | `WhichPanel::Book` |
+
+The island is the summary; the modal is where the decision gets room. That is
+the console's whole arrangement for a panel too large for a 320-point column,
+and three of them now follow it rather than each inventing a shape.
+
+### What was added
+
+One door on `essentials_body`, gated on the state, carrying the console's own
+readout beside it: `N scenario(s), M step(s).` when the book is non-empty. The
+body's `cx` parameter was `_cx` until now — Essentials had no handler, which is
+itself the evidence that the island was a pure read.
+
+The body-level gate is the console's own belt-and-braces, not the load-bearing
+one: `every_state_has_the_column_it_should` already pins Essentials as
+planning-only, and the kernel test fails before the door can be reached from
+another state. It is kept because it states the reason where a reader looks —
+inside the body that would otherwise draw the button.
+
+**No new test.** The two claims are already pinned, and adding a third would
+restate them: the island is planning-only
+(`view::every_state_has_the_column_it_should`), and opening the Book is
+exclusive (`shell_gpui::only_one_modal_opens_at_a_time`, which already asserts
+`(modal_open, book_open, composer_open) == (true, false, false)` after a
+different door closes it). A test that drives a click on an element id cannot be
+written in this harness — the existing tests call the handler directly — so it
+would pin the gate twice and the behaviour not at all.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the door is on Essentials, in planning, after THE PLAN | `/tmp/gpui_book_door.png`: `Scenario composer` under `THE PLAN / nothing written yet`, beside the island's `PLANNING` tag |
+| the door is absent outside planning | capture on game 19 (execution) showed Command and Crew and no Essentials island at all — the kernel's column decides, not the body |
+| no scenario count line when the book is empty | same capture: game 9's book is empty and the line is not drawn |
+| the console really places the door on Essentials | `main.rs::setup_session_ui`, `open_composer(None)` under the comment quoted above |
+| the console has no band door for the book | `enum WhichModal` is Settings, Composer, Fleet, Player, Session — the band's three doors are Session, Settings and `mail_ui` |
+| the count line's subject exists on some game | `GET /games/44/scenarios` → 1 scenario, 1 step (`First move` / `Take station east of the buoy`) |
+| the capture refused rather than writing a wrong PNG | rule 5 fired twice in a row, naming workspaces `1` and `5`, before attempt 3 landed on the active one |
+
+**The one line not seen.** `N scenario(s), M step(s).` has no subject on this
+account: all seven planning games have an empty book, and the one game that
+carries scenarios (44) is in execution, where the island is not in the column.
+Making a subject would mean writing a scenario to a live dev game, which is a
+mutating GM verb and needs the owner's word — the same rule that kept the shell
+from composing a telegram. The line is a format string over `session.book` and
+`steps.len()`, and the door around it is verified.
+
+## What the console lists and this shell does not (2026-10-13)
+
+Asked whether the migration is finished, the answer was checked rather than
+assumed, and the console's own column specs settled it: `main.rs::side_zone`
+pushes **15** island bodies across six states, and `zone_islands` names **9**.
+The recomposition is done and verified; the port is not.
+
+This is the table. It is the one place to look, and the kernel's arms now point
+here rather than each repeating part of it.
+
+### The console's columns, verbatim from `side_zone`
+
+| state | the console's islands, in order |
+| --- | --- |
+| NoSession | `z.start` |
+| Planning | `z.essentials`, `z.control`, `z.fleet`, `z.groups`, `z.players`, `z.review` |
+| Preparation | `z.ready`, `z.essentials` |
+| Execution (organizer) | `z.clock`, `z.orders`, `z.steps`, `z.crew`, `z.log` |
+| Execution (player) | `z.mystep` |
+| Closure | `z.assessment`, `z.log` |
+
+`z.user` ("Operator", 172) is pushed before the match, so it leads every state —
+which is why `IslandKey::Operator` is first in every one of mine, at the
+console's own 172.
+
+### What was missing, and whether it was already named
+
+**Log and Assessment are PORTED now — see "Log and Assessment, and a cross
+that was lying".** The table below is the state as it was found; `Groups` is the
+only row still standing.
+
+| console island | height | states | named? |
+| --- | --- | --- | --- |
+| `z.groups` "Groups" | 380 | Planning | **yes** — `zone_islands`' Planning arm, "no read route at all" |
+| `z.log` "Log" | 260 | Execution, Closure | **was** Closure yes, Execution no — the Execution arm named the Exercise merge and never mentioned Log. Now ported, the feed half. |
+| `z.assessment` "Assessment" | 420 | Closure | **yes** — `zone_islands`' Closure arm. Now ported, four of five tabs. |
+| `z.clock` "Exercise" | 200 | Execution | **yes** — merged into Step, `zone_islands`' Execution arm |
+
+So the port was more honest than first believed: three of the four gaps were
+named where they were made. **The gap was that none of them reached the
+handoff**, so a reader of the log had no way to know a fifth of the console's
+islands were absent. `z.log` in Execution was the one genuinely unnamed case.
+
+### Two columns carry an island the console's does not
+
+Not every difference is an omission, and this table would be a lie if it only
+listed what is missing.
+
+- **Preparation** — mine is `Command, Crew`; the console's is `Readiness,
+  Essentials`. Crew is a *substitution* for the terms surface the shell has no
+  island for, not a port of anything. **The kernel's comment said "Players
+  rides along" while the code pushed `Crew`** — a stale description of a column
+  that was never built, fixed here, with the divergence now stated in the arm.
+- **Closure** — mine is `Crew`; the console's is `Assessment, Log`. Crew is
+  kept because a debrief is about who was in the room, and that much was named.
+
+### What is blocked, and what is merely not done
+
+The distinction matters because it decides whether this is a decision or a task:
+
+- **Groups — blocked.** `zone_groups_body` is 139 lines of local scratch
+  authoring with no read route at all. Nothing to port to.
+- **Exercise clock — blocked.** Needs the Minos clock channel, and its
+  `End session →` is a transition write that needs the owner's word.
+- **Log and Assessment — NOT blocked.** `zone_log_body` is six lines around
+  `log_island`; `zone_assessment_body` is three lines delegating to
+  `assessment_body`. Both were simply never ported, and both are now the
+  obvious next slice.
+
+### Correction to the last entry
+
+The entry before this one claimed Closure's Assessment and Log were "never
+named". That was wrong — `zone_islands`' Closure arm names both, in the
+console's own words. What was true, and is what this section fixes, is that
+none of the four gaps reached the handoff.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the console has 15 zone bodies | the `match id` in `zone_side_bodies`, `z.user` through `z.assessment` |
+| `z.user` leads every state | `side_zone` pushes it at line 11601, before the per-state match |
+| Log belongs to Execution too | `side_zone`'s Execution arm pushes `z.log` (260) beside Steps and Crew |
+| Assessment is Closure-only | `side_zone`'s Closure arm; the only `z.assessment` push |
+| the console's Preparation has no Crew | its arm pushes `z.ready` and `z.essentials` and nothing else |
+| Log and Assessment are small | `zone_log_body` 6 lines, `zone_assessment_body` 3 lines |
+| Groups is genuinely unportable | `zone_groups_body` 139 lines, and no read route exists |
+
+## Log and Assessment, and a cross that was lying (2026-10-14)
+
+The next slice, closing Execution and Closure to parity. `z.log` and
+`z.assessment` were the two islands the previous entry found missing, and the
+reason Log was worth doing first is that it is not a read at all.
+
+### LOG — a feed, not a read
+
+The console's `z.log` is two surfaces sharing an island:
+
+- **An event feed**, `event_feed: VecDeque<String>` capped at 30 by `feed()`
+  (`main.rs:17029`), which also echoes to stderr.
+- **The session's journals**, below a rule, with a replay slider that drives
+  map ghosts.
+
+The feed is carried and the journals are not, because the journals are files on
+disk and the ghosts are a replay of them — the same class of gap as Groups, and
+worth saying in the island rather than leaving a 260pt panel that reads as
+unfinished.
+
+**The important part: there is no events GET.** Every line in the console's own
+feed is a line that client produced — `feed()` is called from the write paths,
+never from a read. So the shell's `log_feed` is the same: pushed by
+`set_readiness`, `set_time_factor`, `sync_force`, `sync_roster` and
+`declare_step`, each with a line naming what was asked. Nothing seeds it on
+launch, because a feed invented at startup would be a log of things that did
+not happen here.
+
+That makes the feed unverifiable by capture — the only way to get a line into
+it is a real write, which needs the owner's word — so it is verified by test
+instead, and the tests are written to catch the failure a capture would miss:
+a feed that logs without sending, or sends without logging, both look fine on
+screen.
+
+### ASSESSMENT — one tab of five
+
+`z.assessment` is five tabs: Summary, Timeline, Judgements, Reviews,
+Transcript. **Only Summary is carried**, and the other four are named in the
+island rather than drawn as empty tabs — a tab strip over one live tab is
+scaffolding.
+
+This is a smaller omission than it looks, and the reason is worth recording:
+**Timeline, Judgements and Reviews all already have backend reads in this
+crate** — `timeline_page` (paged, 50 at a time), `judgements_list`,
+`reviews_list`. What is missing is that the shell's own `fetch_session` does not
+call them. So the four tabs are absent because the shell does not fetch them,
+not because Minos cannot serve them, and the island says so in those words.
+Transcript is the genuinely unportable one: `self.transcript` is a local trace,
+"the session left no local trace", and there is no route.
+
+The Summary is a read-back of the game's own shape once it is over — session,
+exercise state, seats, pieces, clock factor — which is all data the shell
+already holds.
+
+### Two defects found on the way, both fixed
+
+Neither was introduced by this slice; both were pre-existing and one was made
+worse by it.
+
+**The close cross was drawn on every island and only four responded.**
+`set_island_open` ignores Operator, Fleet, Essentials, Control and Review, but
+the band built its cross unconditionally — so nine islands carried a control
+that read as clickable and did nothing. That is worse than no control, because
+the operator cannot tell "it did not work" from "it is not there". Fixed with
+`island_closeable`, and the cross is now the last child only where it does
+something.
+
+This is a deliberate divergence from the console, not a port: `chrome::
+island_owned` sets `*open = false` and the spec persists it, so the console
+closes ANY island. The seven that stay open here are the ones whose absence
+would leave the column unable to answer the question its state exists to
+answer — close Essentials and planning cannot say what is being planned.
+
+**The cross was painted over the trailing note.** The note is a plain child
+pushed right by `justify_between`; the cross is absolute at
+`island_close_center`. A capture showed `3 SEATED` with the cross over its last
+two glyphs — a count nobody can read. The pad is the kernel's now
+(`island_band_pad_right`), asymmetric on purpose, and the reason it went
+unnoticed is instructive: **the defect is invisible when the note happens to be
+short.** `LOG`'s note is `—`, so the one island that showed it cleanly was the
+one island with nothing to collide with.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| Closure is the console's own column now | `/tmp/gpui_closure11b.png`: OPERATOR, ASSESSMENT, LOG — the Summary read-back (`Game 9`, `CLOSURE`, `SEATS: 2`, `PIECES: 1`, `CLOCK FACTOR: 1×`) and the feed's empty state |
+| Execution judge carries the feed | `/tmp/gpui_log19.png`: the LOG island below CREW, empty, with its journals aside |
+| a write appends one line and still sends | `a_write_appends_one_line_to_the_log`: one line, it says "readiness", and `ToBinary::SetReadiness` reached the sink |
+| the cap holds | `the_log_feed_keeps_thirty_lines`: 40 pushes, 30 lines, `line 10` first and `line 39` last |
+| the cross is gone where it does nothing | `/tmp/gpui_nocross.png`: OPERATOR, ESSENTIALS and CONTROL bands carry their note and no cross |
+| the cross is still there where it works | `/tmp/players_band2.png`: `3 SEATED` reads whole, cross clear to its right |
+| the pad clears the button | `the_bands_right_pad_clears_the_close_button`, kernel |
+| the three assessment reads exist | `timeline_page` (1409), `reviews_list` (1470), `judgements_list` (1676) in `backend/master.rs` |
+| the console closes any island | `chrome::island_owned` sets `*open = false` (564) and the spec persists it (907) |
+
+**Still open.** Groups (no read route), the Exercise clock (needs the Minos
+channel; `End session →` is a transition write), island BODY scrolling by
+gesture, and the trailing-glyph notdef. The three assessment tabs whose reads
+exist but are unfetched are now the obvious next slice, and they need no owner's
+word because they are reads.
+
+## The Assessment island's other three tabs (2026-10-14)
+
+The previous entry left Assessment carrying the Summary tab alone and named the
+other four as absent. Three of them turned out to be **reads that already exist
+in this crate** — `timeline_page` (paged, 50 at a time), `judgements_list`,
+`reviews_list` — so the omission was that `fetch_session` did not call them, not
+that Minos could not serve them. All three are now called and all three tabs are
+carried.
+
+### What is carried, and what is not
+
+| tab | console's surface | carried |
+| --- | --- | --- |
+| Summary | the game's shape read back | yes, unchanged |
+| **Timeline** | filters + `apply`/`reload` + event list + `load more` | **the list, read-only** |
+| **Judgements** | subject picker + score + `record judgement` + the marks list | **the marks list, read-only** |
+| **Reviews** | author + body + `file review` + `mine only` + the documents list | **the documents list, read-only** |
+| Transcript | `self.transcript`, a local trace | no — no route, and its button is not drawn |
+
+A tab strip over four live tabs is the console's own shape, so it stays. What is
+dropped from each pane is the **write half**, and both writes are named at the
+foot of the island rather than drawn disabled — a control that would be refused
+is a lie about what this session can do. The console gates `record judgement` on
+a judge-side seat and `file review` on authorship; neither gate can be honoured
+here without the write, so neither control is offered.
+
+### Three decisions worth recording
+
+**The three reads are fetched only for a CLOSED game.** Assessment is a
+Closure-only island, so asking Minos for a debrief of a game still being planned
+is a read that state does not need — and on the evidence of the routes, one it
+may refuse. Gating on the state rather than fetching always and hiding is the
+honest version: the data is absent because it was not asked for, which is a
+different sentence from "Minos has none", and the island already has a place to
+say which.
+
+**The events are `tfg::backend` types, not flattened copies.** `GameFacts` is
+flattened because `GameDetail` nests a window struct this shell reads four
+fields out of. `TimelineEvent`, `Judgement` and `Review` are flat already, and a
+second struct holding the same fields is the "one answer served from two places"
+this repo forbids. The shell's own comment at the flattening site says as much.
+
+**`timeline_line` is ported verbatim, offset and all.** It reads Minos' `data`
+blob by key, so its failures are a renamed field and a wrong shape — both of
+which print something plausible rather than nothing. Every closure game on this
+account returns `assumed_at` with a `+07:00` offset rather than a `Z`, and the
+formatter's `strip_suffix('Z')` therefore keeps the whole tail, so a row reads
+`11:58:42.414179+07:00 preparation → execution (by 2)`. That is the console's
+own rendering and it was NOT tidied: a formatter the operator knows under one
+output must not be renamed by a port, and "the console prints it ugly too" is
+the answer to why this one is ugly.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| Timeline carries real events | `GET /games/4/timeline` returns `transition`, `clock` and `order` events; `/tmp/gpui_assess4.png` renders all three as lines |
+| Judgements and Reviews are genuinely empty here | both answer `data: []` with `total_records: 0` for every closure game (4, 7, 8, 10, 11) |
+| the tab strip shows which tab is on | `/tmp/tabs2.png`: `Timeline` in the bright ink on a tint, the other three dim |
+| an empty pane says so rather than drawing nothing | `/tmp/tabs3.png`: `Judgements` picked, `No marks yet.`, then the writes aside |
+| the formatter reads each event shape | `the_timeline_reads_each_event_shape`: transition, clock (with a zero `changed_by` printing no `(by 0)`), a clamped order, an unknown type, and a known type with a missing key |
+| the writes are named, not drawn | both captures: `Recording judgements and filing reviews are writes — not carried here.` |
+
+**Still open.** Groups (no read route), the Exercise clock (needs the Minos
+channel; `End session →` is a transition write), island BODY scrolling by
+gesture, and the trailing-glyph notdef. The two assessment WRITES now want the
+owner's word, and the timeline's filters and `load more` are unbuilt — both are
+interaction, not data.
+
+## The parity proto compiles again (2026-10-14)
+
+The Fleet picker, the Player picker and the Assessment island each added a
+`crate::` path the proto does not shim — `force`, `roster` and `backend` — and
+every one of those entries closed with "both binaries and `proto/gpui-island`
+build". That claim was copy-pasted forward: the shell moved into
+`src/shell_gpui.rs` at U8 step 3 with three shims, then grew three surfaces
+that reached three more modules, and nobody re-ran the proto's build. It has
+not compiled since. A parity proof that does not build is not a proof, and a
+log that says it builds is the exact failure this document's own discipline
+("a correction nobody can re-run is a claim, not evidence") exists to catch.
+
+This is the prerequisite for the timeline's `load more` too: the page cursor
+comes back as a `backend::TimelinePage`, and the shell cannot name it until
+`crate::backend` resolves somewhere the proto can compile.
+
+**The fix, and why each shim is the shape it is.** `force` and `roster` are the
+console's own staging and toolkit-free, so they compile as `#[path]` to the
+real files — the same one-implementation rule `view`/`book` already use.
+`force` reaches `geo::coordinates` for `GeoPosition`, and the proto shims only
+that leaf through a top-level `#[path]` re-exported as `geo::coordinates`,
+never `geo/track.rs` (chrono + serde + a track registry the shell does not
+draw). The re-export rather than an inline `mod geo { #[path] … }` is the trap
+U8 step 3 already recorded — a `#[path]` inside an inline module resolves
+against the inline module's own nonexistent directory — hit again and fixed
+the documented way.
+
+**`backend` is the one shim that is not a `#[path]`.** `master.rs` cannot
+compile without reqwest, which is the whole thing the proto exists to stay
+clear of, so the proto carries the three plain-data read types the shell names
+(`TimelineEvent`, `Judgement`, `Review`) as shapes and nothing else. This is a
+deliberate, bounded duplication: the shapes mirror `backend/master.rs`, and if
+the shell ever reads a field the shim lacks the proto fails to compile — which
+is the guard that keeps the two from drifting silently. It is a data shape, not
+a rule, so it does not run afoul of the "one answer served from two places"
+rule the repo enforces on logic. `serde_json` joins the proto's deps because a
+timeline event's `data` payload is a `Value` the shell reads by key; it is pure
+JSON with no transport, so it does not pull the HTTP stack back in.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the proto builds | `cargo build` in `proto/gpui-island` → `Finished` (was 23 errors) |
+| the shims are the real files, not copies | `force`/`roster`/`geo::coordinates` are `#[path]` to `src/` |
+| the shipped crate is untouched | the only diffs are `proto/gpui-island/{src/main.rs,Cargo.toml,Cargo.lock}`; `cargo test --lib` 498 pass holds by inspection |
+
+**One honest note, not fixed here.** The proto now compiles the whole 11k-line
+shell but only calls `run_replay`, so it surfaces ~186 dead-code warnings for
+the panels the replay path never draws. They are growth (the shell doubled
+since the proto last built), not a regression from this change, and silencing
+them with a crate-root `#[allow(dead_code)]` would hide real ones too. The
+build succeeds; the noise is the cost of a parity artifact that compiles a file
+most of which it does not exercise.
+
+## The timeline's interaction half, and a binary that did not build (2026-10-14)
+
+The previous entry's table was honest: Timeline carried "the list, read-only",
+and the filters and `load more` were "unbuilt — interaction, not data". What
+was not known is that the read half was broken too. `ToBinary::Timeline`
+existed as a message — `send_timeline` posted it, with the cursor rules, the
+busy latch and the console's own refusal sentences — but **no arm in
+`tfg_gpui` handled it, no feed drained the answer, and no `apply` existed**.
+`cargo test --lib` stayed green because it never builds the bins, and
+`cargo check --bins` failed with `E0004: ToBinary::Timeline { .. } not
+covered`. The same copy-pasted "both binaries build" the last entry caught in
+the proto, one layer up. The Timeline tab drew the seed page and nothing the
+operator asked for ever left the window.
+
+### What was built, end to end
+
+**The answer path.** `apply_timeline` is the console's `SetupDone::Timeline`
+arm as a method: a reload REPLACES the list, `load more` EXTENDS it, either
+way the cursor block is the page's and the latch clears, and a refusal lands
+on the status line with the held events untouched. The status sentence is the
+console's — `timeline: N event(s)`, plus `· more below` while a next page
+exists.
+
+**The wire.** `TimelineFeed` (the `(page, append)` pair, echoed back like the
+console's own) is now a `run()` parameter drained in the tick loop, and the
+binary answers it with `master.timeline_page` at the console's limit of 50 —
+signed-out refused as a sentence, like every other arm. `run_replay` passes
+`|| None`: a PNG replay has no Minos behind it.
+
+**The tab.** The Timeline pane now draws the console's `timeline_ui` cut to
+this shell's grammar: the source row (All plus the console's five streams —
+changing it reloads from the first page, because a cursor never crosses a
+filter change), personnel/unit and from/to fields (the hand-rolled grammar
+the composer established), the console's BOTH verbs (`apply + reload` and
+`reload` share the handler there too, so they share it here), the hint line,
+the console's own empty sentence (`No events yet — reload to read the
+exercise`, which replaced the shell's `the exercise left no timeline` — data
+absent because it was not asked for is a different sentence from "Minos has
+none"), the read's status line, and `load more →` only while a next page
+exists.
+
+**The cursor block moved to the session.** The seed fetch took page one and
+kept `page.events`, dropping `next_cursor`/`has_more` — so on a closure
+launch the tab showed fifty rows and could never offer more. The fix is where
+the data lives rather than a second copy: `SessionView` carries
+`timeline_cursor`/`timeline_has_more` beside `timeline` (one read, not two
+answers), the shell's copies are deleted, and a session installed whole
+carries its own block with it. `fetch_session` seeds all three from the page.
+
+**The proto shim grew a fourth shape.** `TimelinePage` joins the three
+plain-data shapes, and this is the guard working as designed: the shell named
+a type the shim lacked, and the proto failed to compile until it was mirrored.
+
+**Stale docs, corrected.** `zone_islands`' header still said personnel get
+"the step and nothing else", that Assessment carries "the Summary tab and not
+its Timeline, Judgements, Reviews", and that Execution's `z.log` "is ABSENT,
+not merged" — all three contradicted the built column. The column test's doc
+("shows only identity and the step") and the ASSESSMENT header ("the only tab
+carried here") said the same old thing. They now describe the built surface.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the bins build | `cargo check --bins` clean (was `E0004`) |
+| the lib holds | `cargo test --lib`: 502 pass, same 4 pre-existing failures |
+| reload replaces, `load more` extends | `timeline_reload_replaces_and_load_more_extends` (cursor block, latch, both status sentences) |
+| a refusal keeps the held page | `timeline_failure_keeps_the_held_events` |
+| a bad id refuses before any request | `send_timeline_refuses_a_bad_id_and_a_busy_tab` (personnel, unit, busy latch, nothing on the sink) |
+| the cursor crosses only to `load more` | `send_timeline_carries_the_cursor_only_to_load_more` |
+| the proto builds | `cargo build --manifest-path proto/gpui-island/Cargo.toml` (new shape mirrored) |
+| the tab draws its filters and its events | `/tmp/gpui_timeline2.png` (game 4, `TFG_ASSESS_TAB=1`): source row, four fields, both pills, hint, four real event rows |
+| the first capture lied | `/tmp/gpui_timeline.png` was taken against a stale `./target/debug/tfg_gpui` — the script runs the binary without building it. Rebuilt, re-shot. |
+
+**Two things to carry forward.** The capture script never builds: every
+`gpui-capture.sh` run needs a `cargo build --bin tfg_gpui` first, or the PNG
+is evidence about the previous build. And the personnel field renders its
+focused border on launch (`timeline_focus` defaults to 0) — the composer's
+fields predate this slice and may share the habit; worth one look if the
+column's focus grammar is ever reworked.
+
+**Still open.** Groups (no read route), the Exercise clock (needs the Minos
+channel), island BODY scrolling by gesture, and the trailing-glyph notdef. The
+two assessment WRITES still want the owner's word. A click on `apply`,
+`reload`, a source, or `load more` has kernel tests behind it but no driven
+capture — gesture input does not reach the window on this machine, so the
+binary arm's live round-trip is code-reviewed against the console's
+`load_timeline`, not photographed.
+
+## The debrief's reload verbs, and embarkations re-checked (2026-10-14)
+
+With the Timeline interaction half done, the Assessment surface split cleanly:
+everything left on it is either a WRITE (owner-gated) or a READ nobody had
+asked for twice. The console's Judgements pane has exactly one read verb —
+`reload`, always unfiltered — and its Reviews pane has two: `reload` and the
+`mine only` narrow, which applies server-side on the reload like the inbox
+filter. Both are now carried, and the survey that found them is worth keeping:
+every other control on both panes is compose state for the two gated writes
+(subject pickers, score field, body field, `file review` / `save revision` /
+per-row `edit`), so drawing any of it would be a control that would be
+refused — the lie the foot-of-island aside exists to avoid.
+
+### What was built
+
+**Two reloads, mirroring the timeline slice.** `ToBinary::ReloadJudgements`
+and `ToBinary::ReloadReviews { author }`, each with its own feed
+(`JudgementsFeed`, `ReviewsFeed`), its own latch and status line (the console
+runs them as separate tickets), its own `apply_*` (REPLACE the held list —
+both re-read whole, neither pages), and its own binary arm with the
+signed-out sentence. The status sentences are the console's verbatim:
+`judgements: N mark(s)`, `reviews: N document(s)`.
+
+**The narrow resolves shell-side.** `author` rides the message as this seat
+or `None`, because the binary holds the token but never the seating — and
+`None` without a seat, the console's own flattening of a seatless
+`auth_user_id` (`session.me` is 0 seatless, so the same match applies).
+Flipping `mine only` reloads at once, the console's `.changed()` rule, which
+is also why a narrowed reload REPLACES with the narrowed list rather than
+filtering what is held.
+
+**The panes.** Judgements draws `reload` over the marks list and its status.
+Reviews draws `reload` beside a `mine only` checkbox (the shell's own U5
+choice grammar, plain box like the console's `ui.checkbox`), then its status,
+then the documents. The writes aside still closes both panes.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the bins build | `cargo check --bins` clean |
+| the lib holds | `cargo test --lib`: 504 pass, same 4 pre-existing failures |
+| a reload replaces the marks | `judgements_reload_replaces_the_marks` (replace-not-extend, latch, busy gate, refusal keeps the held list) |
+| the narrow resolves to the seat | `reviews_reload_narrows_to_mine_only` (Some(7) checked, None unchecked, None seatless, replace + status) |
+| the proto builds | untouched by this slice — no new backend type named — `cargo build` clean |
+| both panes draw | `/tmp/gpui_judge.png` (`TFG_ASSESS_TAB=2`): RELOAD, `No marks yet.`, writes aside. `/tmp/gpui_reviews.png` (`TFG_ASSESS_TAB=3`): RELOAD, unchecked `mine only`, `No documents yet.`, writes aside. Closure games hold no marks or documents on this account, so both panes are verbs over empty lists — the lists themselves were proven by the seed fetch, not invented here. |
+
+### Embarked, re-checked with evidence
+
+The "no embarkations exist to read" claim was a session old, so it was
+re-probed rather than repeated: `GET /games/{id}/units/{unit}/embarkations`
+for every unit of games 5, 6, 16, 17, 19, 42, 43, 44, 41 and 12 — 14 hosts —
+and every answer is `{"units": []}`. The client's `parse_embarked_units`
+reads the `units` key, so the shape parses to empty rather than erroring.
+Embarked stays named, not ported — now on today's evidence, not inherited
+lore.
+
+**Still open.** Groups (no read route), the Exercise clock (its only control
+is the owner-gated `End session →`; its readouts are the sim's tick, which
+this shell has none of), island BODY scrolling by gesture, and the
+trailing-glyph notdef. The two assessment WRITES still want the owner's word,
+as do `zone_islands(NoSession,_)`'s fate and the player's helm click-proof.
+The debrief's read half is now complete: every pane the console reads without
+a write is drawn, and every verb on them asks Minos again.
+
+## The debrief's writes, and the exercise's end (2026-10-14)
+
+The owner said go — on the writes, on `End session`, and on the column
+carrying them. A prior slice had surveyed both panes control by control, so
+no new investigation was needed: the read verbs were taken, and what was left
+was exactly the compose halves plus the clock island's one control.
+
+### Record judgement
+
+The console's compose in order: the seat banner, the subject pills, the
+score, the verb. Subjects are pills over the held room minus the caller
+(self-judging fails loudly server-side and the picker refuses it first),
+sorted by name like the console's ComboBox options, with the stored pick kept
+while it is still seated and the first option otherwise. The record verb uses
+the console's `add_enabled` rule as a build rule: without a judge seat there
+is no click target at all, not a pill that answers with a refusal — but the
+send refuses anyway with the banner sentence, because the seam must not trust
+the renderer. The guards run in the console's order with its sentences
+(`pick a subject first`, `cannot judge yourself`, `write the score first`).
+An empty room refuses with the subject sentence: the shell's subjects ride
+the held session, so there is no numeric fallback to offer, and the cut is
+stated where the pills would be (`No subjects seated.`).
+
+The answer names the filed mark and re-reads through the reload — the
+console's `JudgementSent` rule (`recorded #id · reloading judgements`), which
+is why the write and the read hold separate latches on separate feeds.
+
+### File and revise review
+
+Filing picks any seat including this one (authorship is the caller, never the
+subject); revising fixes the subject to the row's and offers save and cancel
+instead, with the row's id in the header. The body is one line, not the
+console's four rows: GPUI ships no multiline field, and the cut is stated on
+the pane rather than hidden. Per-row `edit` renders on the author's own rows
+only, queuing the row into the compose above. Filing clears the body and the
+subject, saving clears the edit and the body — the console's two landings,
+whose statuses this keeps verbatim (`filed #id`, `revised #id`, each
+`· reloading reviews`). Anyone-but-author fails with the server's explicit
+403, carried on the line rather than pre-hidden on stale data.
+
+One shared helper serves both compose fields (`WriteField::Score |
+::Body`) — the fourth copy of the hand-rolled single-line grammar, factored
+because the two fields share everything but the slot and the Enter target.
+The foot-of-island aside is gone: it said the writes were not carried, which
+is now false.
+
+### End session
+
+The console's `z.clock` reduced to its one control, placed where the merge
+already lives: a new EXERCISE section at the Step island's tail, below the
+disabled run-level verbs and visually separate from them — `End session →`
+ends the exercise, not a run, and a live `END SESSION` beside a disabled
+`END` would be one label for two verdicts. The island's readouts are the
+sim's tick and its pause flag, which this shell has none of, so the merge
+carries the verb and names the missing tick rather than faking it. Player
+stations never see the section: the console pushes `z.clock` for organizers
+only, and the gate reads the same `player_station()` the column does —
+extracted to one helper so the two cannot disagree. The binary transitions to
+closure and echoes the held game back; the drain holds it through `apply_end`
+(a method so a test holds exactly what the drain holds), and the column
+recomposes to the debrief around it.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the bins build | `cargo check --bins` clean |
+| the lib holds | `cargo test --lib`: 507 pass, same 4 pre-existing failures |
+| the record guards run in order | `record_judgement_guards_run_in_order` (seat, subject, score, trimmed post, write latch) |
+| file and revise guard their drafts | `file_and_revise_guard_their_drafts` (empty room, empty body, trimmed post, nothing-queued, empty revision, write latch) |
+| the end posts once and refuses players | `end_session_posts_once_and_holds_closure` (single post, busy latch, closure held, player refusal) |
+| the proto builds | untouched — no new backend type named — clean |
+| RECORD draws | `/tmp/gpui_record.png` (game 4, judge seat): subject pill minus self, score hint, free-text note, live RECORD JUDGEMENT, MARKS + append-only, RELOAD, `No marks yet.` |
+| FILE draws | `/tmp/gpui_file.png` (game 4): FILE, both subject pills incl. self, body hint, FILE REVIEW, DOCUMENTS + author-owned, RELOAD + mine only, `No documents yet.` |
+| EXERCISE draws | `/tmp/gpui_end2.png` (game 5, `TFG_SCROLL=250`): below the disabled GAME MASTER verbs, the tick note and a live END SESSION → (`TFG_SCROLL=500` overshoots to COMMAND — recorded so the next shot starts closer) |
+
+**Still open.** Groups (no read route), the exercise tick (no clock GET
+exists — the verb is carried, the readout is not), island BODY scrolling by
+gesture, and the trailing-glyph notdef. `zone_islands(NoSession,_)` still
+wants the three-way pick: leave named, drop, or make reachable. Click-proofs
+for record, file, revise and end (kernel-tested, code-reviewed, unphotographed
+— gestures still do not reach the window) join the helm and the reloads in
+that queue. Embark a unit on any dev game and the Embarked read half becomes
+the next slice.
+
+## The scenario clock's hold, and NoSession closed (2026-10-14)
+
+Two authorizations, two very different sizes. NoSession closed with a comment
+(see below); the hold is the slice.
+
+### NoSession: leave named, with the reason
+
+The question was what "dead" means and what reachability would cost. The
+kernel handles the state and the arm is tested — it is dead only in render,
+where a signed-out shell draws the login card instead of the column. The
+deciding fact is that **the Fleet register needs a token**: a reachable
+NoSession would be an empty register beside the card, strictly worse than
+the card alone. So the arm stays, and its doc now says reachability waits on
+an unauthenticated register read — Minos's question, not this column's. No
+code changed, no test touched.
+
+### The hold
+
+The clock survey had shown the shell carrying only the factor write, but
+pause and resume are plain POSTs needing no clock channel — the backend's
+own contract says the writes ARE the read. Only the tick readout stays out.
+
+**What the shell holds.** The last answer's `running` and nothing else — no
+clock GET exists, so there is no fuller read to hold, and the factor readout
+stays on the re-read `facts.time_factor`. `None` until the first answer;
+unknown attempts pause, the console's rule. A new hold (sign-in, created
+game) resets both the clock and the grant: an answer proved the OLD game's.
+
+**The grant latch.** A 403 answers `Denied` distinctly from `Failed` (new
+`ClockError`), latches `clock_denied`, and speaks the console's landing
+sentence verbatim — shared as `CLOCK_GRANT` so the binary's factor arm names
+the same gate. While latched the verb refuses locally instead of spending a
+doomed POST. Factor posts stay unlatched by design: they are deliberate
+drafts, and a second 403 reports loudly rather than wedging. An answer
+clears the denial — it belonged to an older hold or a changed matrix.
+
+**The verbs.** One message, `SetPaused { paused }`, decided shell-side from
+the held answer like the console's `pause_or_resume_minos` (held → resume,
+else pause). Control draws SCENARIO CLOCK, the RUNNING/HELD readout when
+known, and a pill that always asks the other one. The landing keeps the
+console's status sentence verbatim (`Scenario clock {verb}: assumed … ·
+running|held · accepting orders|orders closed · {factor}x`) and feeds it to
+the Log like the console does. The binary maps pause/resume to the two
+endpoints, eprintlns the outcome, and refuses signed-out like every arm.
+
+**The box.** The hold joined Control at 182pt and the pill painted half
+below the island's own box — the silent-clip defect, caught on capture, not
+by any test. Fixed the box (182 → 210, with the doctrine comment), updated
+the two pinned stack asserts, and re-shot: the pill fits with room to spare.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the bins build | `cargo check --bins` clean |
+| the lib holds | `cargo test --lib`: 508 pass, same 4 pre-existing failures |
+| the toggle follows the last answer | `pause_follows_the_last_answer` (unknown pauses, held resumes, busy latch, denial latches + refuses locally, failure keeps held state, verbatim status) |
+| the proto builds | `GameClock` + `GameClockSegment` mirrored in the shim (fifth and sixth shapes — the drift guard firing twice in two slices) |
+| Control draws the hold | `/tmp/gpui_clock3.png` (planning hold): multiplier, Apply, SCENARIO CLOCK, full PAUSE pill inside the box. `/tmp/gpui_clock2.png` is the same shot at 182pt with the pill clipped — kept as the defect's photograph. |
+
+**Still open.** Groups (no read route), the tick readout (no clock GET),
+island BODY scrolling by gesture, and the trailing-glyph notdef. The grant
+sentence is now shared by three paths (pause verb, factor refusal, denial
+latch) — if Minos rewords the 403, `CLOCK_GRANT` is the one place. Click-proof
+for pause joins the queue behind record, file, revise, end and the helm:
+kernel-tested, code-reviewed, unphotographed.
+
+## The Embarked read half, on real data (2026-10-15)
+
+The owner asked for the 404 first, and the 404 gave up everything else with
+it. The routes are unchanged (same paths, verbs and `unit_ids` body as the
+console sends), the middleware denies with 403 rather than 404, and the 404
+`Resource not found` comes from exactly two server lines: no game row, or no
+`game_units` row for the host — i.e. the drop named a hull outside the held
+game. Reproduced both shapes against the live API (bogus host → 404,
+stranger child → 400 with the per-row refusal), then proved the path with a
+round trip: embarked KRI Ahmad Yani aboard KRI Abdul Halim in game 5 (201),
+watched the ring rule refuse the reverse (400), detached, verified empty —
+and re-attached cleared, which is the state the island now reads. The wip
+backend changed nothing under this surface.
+
+Two things learned on the way down deserve keeping. First, the server allows
+embarking in execution — composition edits are not phase edits, and the 201
+landed on G3 mid-execution. What the owner hit is the CLIENT: the drop starts
+in the Fleet picker, a planning/preparation surface, so execution offers no
+drag source and no mouse path. Second, the register's candidate list was
+empty for the host while the game-side attach succeeded — no contradiction:
+the console derives its gate from the game's own pieces and complements, not
+from the register list.
+
+### What was built (read half only)
+
+**One hull's passengers, lazily, in the modal zone.** `embark_host` draws
+the modal (`open_embarked` is the only way in, mirroring the console's
+`open_embark`; any other modal clears the host so nothing stale lingers
+underneath). The cache is the console's `embarked` map: kept answers are
+kept, most hosts carry nothing, and nothing is prefetched. The first draw
+issues the read — latched single-flight, so seeding the host seeds the whole
+open — and a refusal stops the retry loop on the status line with a Reload
+pill the console does without (a failed first load needs a retry path, and
+the island it ports has none to copy). Answers file under their own host:
+overtaking opens cannot misfile one hull's passengers under another's.
+
+**The rows are the console's verbatim**: name, `hull · class`, and the
+clearance in its own words (`cleared — may act`, green the way the pip is
+green; `aboard — takes no orders until cleared`). Empty reads `nothing
+embarked`. Unembark, clear and revoke stay named, not drawn. The painted
+cross closes it — never the glyph, per the parked notdef the bands work
+around the same way.
+
+**The doors are the console's per-piece row**: `Embarked … show…` on every
+Fleet piece row, naming the count once the cache knows it (`N aboard ·
+show…`).
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the bins build | `cargo check --bins` clean |
+| the lib holds | `cargo test --lib`: 509 pass, same 4 pre-existing failures |
+| open asks once, answers file by host | `embark_opens_once_and_files_under_its_host` (modal-zone exclusivity, busy latch, per-host reads, empty caches as empty, refusal keeps cache, no stale host) |
+| the proto builds | `EmbarkedUnit` mirrored in the shim (seventh shape) |
+| the modal reads the live passenger | `/tmp/gpui_embark.png` (game 5, `TFG_EMBARK=8`): EMBARKED aboard KRI Abdul Halim, KRI Ahmad Yani + class + `cleared — may act`, writes aside |
+| the doors draw | `/tmp/gpui_embark3.png` (planning hold, 2 pieces): `placed show…` on both rows |
+
+Game 5 now carries one cleared embarkation as a standing fixture — placed
+and cleared deliberately (an uncleared passenger takes no orders, which
+would be a landmine for anyone driving G3), revertible with one detach.
+If it ever needs to move, the island reads whichever host holds whom; it
+names no game.
+
+**Still open.** Groups (no read route), the tick readout (no clock GET),
+island BODY scrolling by gesture, and the trailing-glyph notdef. The
+embark WRITES (unembark, clear, revoke) want the owner's word before any
+verb is drawn — the aside holds their place. Click-proof for the `show…`
+doors joins the queue: kernel-tested, unphotographed.
+
+## The embark writes, and a stray click (2026-10-15)
+
+Authorized as the read half was. Three row verbs, one press per row, in
+the console's guards and sentences.
+
+### What was built
+
+**Per-row pills**: `Unembark` always, `Revoke` when cleared else `Clear` —
+the console's right-aligned row buttons, where each click pushes one id.
+The messages carry the row's own pair (`UnembarkUnit` / `ClearAboard` /
+`RevokeClearance { host, unit }`); the shared latch refuses a second verb
+while one flies, in the console's `{verb} refused: …` sentences. The
+answer replaces the host's contents and stores the capacity warnings
+(`embark_over`, new map beside the cache), filed under the answer's own
+host like the read. The rows going empty IS the success feedback, so the
+line clears; refusals land on it and keep the cache. No force-draft fixup
+on unembark, unlike the console: a freed hull was a piece before she
+embarked and still is one, so the next session read picks her up with no
+local staging. The writes aside is gone — it said they were not carried,
+which is now false — and the modal draws the in-flight line plus the
+yellow over-capacity lines in the console's sentence.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the bins build | `cargo check --bins` clean |
+| the lib holds | `cargo test --lib`: 516 pass, same 4 pre-existing failures |
+| one piece per press, filed by host | `embark_writes_carry_one_piece_each` (wire shapes, shared latch + both refusal sentences, replace + warnings, refusal keeps cache) |
+| the proto builds | `OverCapacity` + `EmbarkationResult` mirrored (eighth and ninth shapes) |
+| the pills draw | `/tmp/gpui_embark_writes3.png` (game 5, host 8, cleared row): UNEMBARK + REVOKE beside `cleared — may act` |
+
+### The stray click — read this before trusting a capture
+
+The first two captures of this slice showed NO modal, and the second run's
+log ended with `unembarked 5 from 8` — a live write posted with no
+operator and no test running. Every `send_unembark` call site is a pill
+`on_click` or a test-local channel (verified by grep); the tick loop only
+drains; nothing auto-sends. The only consistent story is stray input events
+reaching the live window: the cursor visibly moves between captures, and
+this machine carries real input hardware (`mouse0-2`, twenty event nodes)
+whose clicks no harness here synthesizes — the documented "uinput never
+reaches the window" is about OUR device, not every device. Across the two
+runs the strays closed the modal twice and posted one unembark, which
+emptied the fixture; it was re-attached and re-cleared, verified
+`[(5, True)]`, and the third capture is clean.
+
+Two standing consequences. First, **the run log is part of every capture
+now**: a PNG proves the pixels, the log proves nothing else fired — this
+is exactly what caught it. Second, the exposure is every live verb in the
+shell, not these pills: helm, record, end session and pause are all one
+stray click from posting. The click-proof queue was already blocked on
+gestures; it is now also the place where a confirmation policy would be
+decided, if one ever is — the console has none, and this slice adds none.
+
+Follow-up diagnosis (2026-10-15): the box carries a Logitech wireless
+mouse plus a Synaptics touchpad, no VNC/RDP listeners, no remote input
+processes — and this account cannot read `/dev/input` (not in the `input`
+group), so the event stream itself is unwatched. Ruled out: our synthetic
+device (never registers), remote sessions, in-app auto-send (every send
+site is a pill `on_click` or a test-local channel, verified by grep; the
+tick loop only drains). Not ruled out: a worn mouse switch bouncing a
+full press-release pair, or physical touchpad contact (tap-to-click reads
+commented-out in the Hyprland config, i.e. libinput defaults). The
+decisive test needs hands: unplug the wireless receiver, rerun any
+capture, watch the log — strays gone means replace the mouse.
+
+## Code review follow-ups (2026-10-15)
+
+Ran the two-axis review (standards + spec) over the recent slices and fixed
+the three concrete findings; the rest was clean (0 hard breaches, all
+claimed plumbing present).
+
+- **Duplicated resolvers → one helper.** `judge_options`/`review_options`
+  and `judge_subject_resolved`/`review_subject_resolved` are now
+  `subject_options(exclude_self)` + `resolve_subject(stored, options)`.
+- **Invented end-session sentence → removed.** The console's `close_game`
+  has no player gate — organizer-only by column placement, server
+  arbitrates — so the send carries no seat check either, like
+  `advance_execution`. The test now asserts a player station posts and the
+  server refuses loudly, instead of asserting a sentence the console never
+  says.
+- **`TFG_EMBARK` documented** alongside the other seed families in the
+  handoff's seed table.
+
+Left standing: the three judgement-call smells (AppMode/Mode name drift,
+`Option<bool>` clock, both pre-existing or documented) and the reviewer's
+NoSession note, which misreads render-gating for reachability.
+
+## U8 step 1, third increment — 6 more tests off egui (2026-10-15)
+
+Twelve tests stood in `main.rs`; eight stand now. The inventory held up
+almost exactly as written: the five source-checks stay (they read
+`include_str!("main.rs")`), the theme/boot halves stay (they paint an egui
+`Context`), and the marker hit test stays deliberately — it pins that the
+egui PAINTER passes the geometry the kernel produces, which is a claim
+about this file's painter, not the geometry.
+
+### Moved, verbatim, with their rules
+
+- **`tfg::phase` (new):** `Phase`, `AppMode`, and both predicates. The enums
+  are used 70-odd times across the app's mode machinery, so they travel as
+  one import — use sites untouched, the way the markers move worked.
+- **`tfg::map_render`:** `zone_outline_hit` + `distance_to_segment`, pure
+  tuples all along.
+- **`tfg::view`:** the inspector image fit as `(f32, f32)` tuples, with its
+  three bounds consts; the three egui call sites convert at the boundary.
+- **`tfg::tokens`:** the sizes-over-stock asserts and the scale-over-one
+  assert, split off from the theme/boot tests whose other halves paint.
+
+### Deleted
+
+`contrast_ratio` in `main.rs` (egui `Color32`): its test moved to
+`tfg::markers` long ago and no caller remained — the Rgba twin there
+carries the rule. Found by grep, not by suspicion.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 515 pass (509 + 6 moved), same 4 pre-existing failures |
+| the bins hold | `cargo test --bins`: 8 pass — exactly the expected remainder (5 source checks, theme, boot, marker hit) |
+| nothing outside moved | repo-wide grep: no caller of any moved item outside `main.rs` before the move |
+
+**Still open.** The 8 that remain cannot leave until their surfaces do —
+each is now named in the module comment with its reason. U8 step 5 (delete
+egui et al) still waits on those surfaces plus the packaging/CI cutover;
+this increment moves the count, not the date.
+
+## U8 prep A — the safe half of the cutover (2026-10-15)
+
+Authorized as "no product consequences": move everything deletable
+without deleting anything shippable, so step 5 lands as `main.rs` +
+friends + deps + CI switch rather than as archaeology.
+
+### Halo out of `fx`
+
+`halo.rs` (92 lines, zero imports) is now `tfg::halo`; the shell reads
+`crate::halo` and the five halo tests travel in the file. `fx` keeps a
+re-export door (`pub use crate::halo::{…}`) so the console, the examples
+and the `halo_seam` probe hold their paths. Both protos updated:
+`gpui-island` points at the new file, `p5-epaint` gains the root alias its
+`fx` include resolves through. Nothing renders differently — same file,
+new address.
+
+### The other console answers in `tfg-gpui`
+
+`--version`, `--check-runtime` and `--probe-gpu`, mirroring the egui
+binary's contract line for line. Two supporting moves, both shared rather
+than duplicated: `runtime_self_check` (+ its 3-line `validate_map_seed`)
+is now `tfg::selfcheck`, parameterized by binary name; the `.env` loader
+is now `tfg::paths::load_dotenv`, called in the same two places. The probe
+itself names `wgpu` directly (new dep, pinned to the lockfile's 30.0.1)
+instead of riding eframe's re-export — with the honesty note attached:
+it reports machine capability, and proves the blade path only by proxy.
+
+### Triage, not deletion
+
+- **Examples:** the five U5 probes (`choice/input/miller/tooltip/window`)
+  stay. They measure the egui reference the log's numbers came from; they
+  die with it at step 5, which is the right time — deleting evidence
+  early buys nothing.
+- **Mirror test:** `view`'s size mirror now pins literals instead of
+  `tokens`, with the old values kept in-test so drift still fails loudly.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 516 pass (halo's 5 in their new home), same 4 pre-existing failures |
+| the bins hold | `cargo test --bins`: 8 pass; `cargo check --bins` clean |
+| the protos hold | `gpui-island` and `p5-epaint` build (p5 needed the wgpu edge for the shared probe) |
+| the examples hold | `cargo build --examples` clean |
+| the flags answer | `tfg-gpui --version` → `tfg-gpui 0.1.0`; `--check-runtime` → runtime ok (41 classes, 125 units); `--probe-gpu` → DiscreteGpu ready, first frame 694µs, exit 0 |
+
+**Still open.** The egui surface itself: `main.rs`, `chrome.rs`,
+`camera.rs`, `picker.rs`, `tokens.rs`, the five probes — all main-only,
+all dying together at step 5 with the deps, the lockfile, `about.toml`
+and the CI/packaging switch. Nothing in this increment changes what ships;
+everything in it shrinks what step 5 has to touch.
+
+## U8 step 5 — egui deleted, `tfg` is GPUI (2026-10-15)
+
+Authorized as the cutover's last step. The product terms (Vulkan
+mandatory, halo Low tier, no Xvfb capture) were accepted with ADR-0020;
+this entry is the mechanics and the proof.
+
+### Deleted
+
+`src/main.rs` (21k lines, the console), `chrome.rs`, `camera.rs`,
+`picker.rs`, `tokens.rs`, `src/fx/` (painters; `halo.rs` already lives at
+the root), the five U5 egui probes, and `proto/p5-epaint` (an eframe app
+whose includes died with the modules — its U5/U7 evidence stays in this
+log). `gpuprobe.rs` survives: it names `wgpu` directly since prep A.
+
+### The 49-test accounting
+
+Lib count falls 516 → 467, all four pre-existing failures unchanged. Every
+lost test is classified, none merely missing:
+
+- `tokens` (6), `chrome` (~27), `camera` (~7): egui-type geometry and
+  paint assertions. The portable halves left earlier (`phase`,
+  zone-pick, image fit, text sizes); what remains tests the OLD
+  toolkit's layout, which the shell's own 500+ tests replace rather
+  than repeat. Porting them would re-implement egui layout in tuples —
+  a port of a dead renderer.
+- `picker.rs` (untracked, ~9): never committed, egui-coupled by
+  construction, unrecoverable and by the same rule.
+- The 8 `main.rs` bin tests die with the binary they tested, per the
+  step-1 analysis that named each unmovable.
+
+### The binary kept its name
+
+`src/bin/tfg_gpui.rs` moved to `src/main.rs`: one package, one binary,
+still called `tfg`. This is why the CI needs ZERO edits — matrix,
+`--check-runtime`, `--version`, `--probe-gpu`, deb and app-bundle paths
+all name `tfg` already, and the flags were ported in prep A. `about.toml`
+needs nothing: it is an allowlist, still valid. `scripts/ui-shoot` is
+retired in place (it drives `./target/debug/tfg` on Xvfb, where GPUI
+never presents); `gpui-capture.sh` is the path. PRODUCT.md's two
+egui-as-shell statements updated; ADRs and old log entries stand as
+history.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 467 pass, same 4 pre-existing failures |
+| the bins hold | `cargo test --bins`: 0 tests (nothing left to test at that level) |
+| the tree builds | `cargo check --bins`, `cargo build --examples`, `gpui-island` all clean |
+| no egui remains | `egui`/`eframe`/`egui_extras` gone from `Cargo.toml`; lockfile carries no `egui`/`eframe`/`epaint` package |
+| the shipped binary presents | `/tmp/gpui_cutover.png`: `tfg` on game 5, Operator + Step + Command, live map, `--version` → `tfg 0.1.0`, `--check-runtime` ok |
+
+**Still open — and none of it is egui.** Groups (no route), tick readout
+(no endpoint), Transcript (local trace, by design), island body gesture
+scroll, the notdef (parked), the 9 click-proofs, attach flow (needs a
+drag source). The cutover is done; what remains is product work.
+
+## Transcript surveyed, exclusion stands (2026-10-15)
+
+Asked whether the last Assessment tab is portable after all. It is not:
+the console's Transcript is the frozen tail (last 200 lines) of the sim
+thread's local JSONL journal, read once on Close — and the shell has no
+sim thread, no journal files, and no map-ghost replay. Porting the tab
+would mean building a journal subsystem, not porting a surface. The
+shell's `log_feed` covers the live-line class already (6 call sites
+against the console's 36 — the sim/live/order-result lines have no
+shell-side source). Exclusion stands, now on inspected evidence rather
+than inherited lore.

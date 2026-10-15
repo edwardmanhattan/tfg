@@ -17,6 +17,11 @@ gpui = "=0.2.2"
 # For `RenderImage` only (its `Frame` is `image::Frame`): the raw map path
 # needs no encoder, but the type comes from this crate.
 image = "0.25"
+# The Assessment island's timeline events carry the source payload as a
+# `serde_json::Value` (the shell reads it by key), so the `backend` shim's
+# shape needs it. Pure JSON, no transport — it does not pull the HTTP stack
+# the proto exists to stay clear of.
+serde_json = "1.0.151"
 
 [patch.crates-io]
 xattr = { path = "../gpui-spike/patches/xattr" }

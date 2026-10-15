@@ -13,36 +13,58 @@
 //! - [`force`]: the operator's force before Minos hears of it, and the diff a stage advance writes.
 //! - [`backend`]: v0 poll contract: `PollSource`, file replay, HTTP stub.
 //! - [`symbology`]: APP-6C symbol model + generated icon geometry. Leaf: depends on nothing.
+//! - [`shell_gpui`]: the GPUI shell — the island chrome and the U5 parity
+//!   layers, painted from `view`. The cutover's second binary
+//!   (`src/bin/tfg_gpui.rs`) and `proto/gpui-island` both drive this one file.
+//! - [`markers`]: the map's marker model — one hull on the map, its
+//!   affiliation vocabulary and the pick order. Toolkit-free; the painters
+//!   stay per-shell (U8 step 4).
+//! - [`map_gate`]: the map frame handoff — newest-wins queue, hold-until-ready
+//!   promotion, and the retirement that keeps the atlas bounded. GPUI-typed by
+//!   design (U6); this is the file U8 moved out of `proto/gpui-map` so the
+//!   shell and the spike drive one implementation.
 //! - [`shell_threads`]: poll/map spawns shared by both shells. Toolkit-free;
 //!   the map spawn follows in U6 when the frame handoff drops egui.
+//! - [`picker`]: the Fleet picker's geometry — panel sizing, the column
+//!   widths and the drop rule. Toolkit-free; the first test cluster U8 moved
+//!   off `egui::Context::default()`.
+//! - [`readiness`]: the execution gate's unknown states — why the last read
+//!   produced no verdict, and what to say while it has not. Toolkit-free.
+//! - [`visuals`]: every hull's picture state — the versioned visual cache and
+//!   what still has to be fetched. The decoded texture is a shell-minted
+//!   handle here, not a toolkit type.
 //!
 //! Module list is alphabetical after `assets`.
 
 pub mod assets;
 pub mod backend;
 pub mod book;
-pub mod camera;
 pub mod catalog;
-pub mod chrome;
 pub mod clock;
 pub mod command;
 pub mod fleet;
 pub mod force;
-pub mod fx;
 pub mod gamestate;
 pub mod gpuprobe;
 pub mod groups;
+pub mod halo;
 pub mod geo;
 pub mod land;
 pub mod log;
+pub mod map_gate;
 pub mod map_render;
+pub mod markers;
 pub mod overlay;
 pub mod paths;
+pub mod phase;
+pub mod readiness;
 pub mod roster;
 pub mod sfx;
+pub mod selfcheck;
+pub mod shell_gpui;
 pub mod shell_threads;
 pub mod sim;
 pub mod store;
 pub mod symbology;
-pub mod tokens;
 pub mod view;
+pub mod visuals;
