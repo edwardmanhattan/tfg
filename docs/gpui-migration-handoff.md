@@ -5198,3 +5198,39 @@ player roles (many pills stacked) is untested beyond the sweep. The
 `proto/gpui-shell` proto fails to build in this checkout: its
 `include_bytes!` references `p5-epaint/assets/`, which is absent —
 pre-existing, unrelated to this slice.
+
+## Row thumbnails go full-width: the photo banner (2026-10-16)
+
+The fleet picker's rows carried the hull photo as a 56×38 stamp beside
+the name. The user asked for the thumbnail's full width — the photos are
+the picker's reason to fetch at all, and a stamp threw the ship away.
+
+The row now stacks: the photograph as a **full-width banner** (236×96, a
+2.5:1 strip) across the top, then the identity line (name over sub), then
+the verbs right-aligned. The drag ghost keeps its small 56×38 stamp — a
+cursor companion is not a banner. `thumb_face` became `thumb_box`
+(fixed width, height, glyph scale) with two wrappers: `thumb_face` for
+the ghost, `thumb_banner` for the row.
+
+**The GPUI 0.2.2 lesson, paid for once:** the banner was first written
+`w_full()` (percentage width on a flex item) and it painted NOTHING —
+neither the photo nor the glyph fallback — and the row's verbs vanished
+with it (the card's layout broke and they fell below the scroll fold).
+A fixed width (`LEAF_CONTENT_W` = 236, the leaf column 244 minus the
+card's padding, all derived from the fixed 700×580 modal) paints
+everything. Percentage widths on flex items resolve their children's own
+percentages against nothing in this toolkit; fixed widths do not. The
+constant's comment records the arithmetic and the trap.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 490 pass, same 4 pre-existing failures |
+| it draws | `/tmp/gpui_banner2.png` (clean run, log checked): full-width photo banners, name + sub under each, ASSIGNED/PLACE/ADD right-aligned |
+| the `w_full` trap is real | `/tmp/gpui_banner.png` (broken): empty banners, missing verbs — bisected by the stash-capture-compare pass |
+
+**Still open.** The banner height (96) is a chosen proportion, not a
+measured one — if the archive's photos run taller than 2.5:1, the cover
+crop keeps the hull but loses more sky; revisit if the photos look
+wrong. The flat (fixture/offline) register rows stay text-only.

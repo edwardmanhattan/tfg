@@ -571,6 +571,15 @@ const FORM_H: f32 = 580.0;
 const FLEET_W: f32 = 700.0;
 const FLEET_H: f32 = 580.0;
 
+/// The leaf column's content width — what a row's banner spans. The
+/// modal (700) minus the picker's padding (12 + 28) and the three fixed
+/// columns with their gaps (3×128 + 4×8) leaves 244 for the leaf, and
+/// the row card's own padding (2×4) leaves 236. Fixed, not a
+/// percentage: a `w_full` banner resolves its children's own percentages
+/// against nothing and they paint nothing — neither photo nor glyph
+/// (proved on capture).
+const LEAF_CONTENT_W: f32 = 236.0;
+
 /// The modal silhouette: a convex pentagon, the panel rect with its
 /// top-right corner cut back by `view::CUT` (20.0), stroked 2px in
 /// `CUT_GREY`. Painted with `window.paint_path` through a `canvas` element
@@ -3216,11 +3225,33 @@ impl IslandDemo {
     fn thumb_face(thumb: Option<Arc<gpui::RenderImage>>, symbol: MapSymbolShape) -> AnyElement {
         // 56×38 at ~3:2, the shape of the archive's own photos; fetched
         // at 192px so the shrink stays ahead of the paint.
-        const W: f32 = 56.0;
-        const H: f32 = 38.0;
+        Self::thumb_box(thumb, symbol, 56.0, 38.0, 1.0)
+    }
+
+    /// The row's thumbnail as a full-width banner: the photograph covering
+    /// the row's whole content width — the picker's reason to fetch photos
+    /// at all. The small box showed a stamp; the banner shows the ship.
+    fn thumb_banner(thumb: Option<Arc<gpui::RenderImage>>, symbol: MapSymbolShape) -> AnyElement {
+        // 96 tall at 236 wide: a 2.5:1 strip, a little wider than the
+        // archive's 3:2 so the cover keeps the hull, not the sky. The
+        // glyph fallback scales up to read as a placeholder, not a
+        // stamp floating in a band.
+        Self::thumb_box(thumb, symbol, LEAF_CONTENT_W, 96.0, 2.0)
+    }
+
+    /// The shared face: a rounded, covered photograph when the fetcher has
+    /// landed one, the glyph centered on a slate band otherwise. The width
+    /// is always fixed — never a percentage (see `LEAF_CONTENT_W`).
+    fn thumb_box(
+        thumb: Option<Arc<gpui::RenderImage>>,
+        symbol: MapSymbolShape,
+        w: f32,
+        h: f32,
+        glyph: f32,
+    ) -> AnyElement {
         let mut face = div()
-            .w(px(W))
-            .h(px(H))
+            .w(px(w))
+            .h(px(h))
             .flex_shrink_0()
             .rounded(px(6.0))
             .overflow_hidden()
@@ -3232,9 +3263,9 @@ impl IslandDemo {
                 canvas(
                     |b, _, _| b,
                     move |b, _, window, _| {
-                        let cx = f32::from(b.origin.x) + W / 2.0;
-                        let cy = f32::from(b.origin.y) + H / 2.0;
-                        paint_glyph(window, (cx, cy), symbol, MAP_INK, 1.0);
+                        let cx = f32::from(b.origin.x) + f32::from(b.size.width) / 2.0;
+                        let cy = f32::from(b.origin.y) + h / 2.0;
+                        paint_glyph(window, (cx, cy), symbol, MAP_INK, glyph);
                     },
                 )
                 .size_full(),
@@ -3244,11 +3275,11 @@ impl IslandDemo {
     }
 
     /// A leaf's thumbnail: its photograph when the fetcher has landed one,
-    /// the glyph disc otherwise. The photo covers the 28px disc (clipped
-    /// by the rounded parent) — a hull portrait, not a stamp.
+    /// the glyph band otherwise — a full-width banner across the top of the
+    /// row, above the name and the verbs.
     fn leaf_thumb(&self, leaf: &FleetTaxLeaf) -> AnyElement {
         let id = leaf.id.parse::<i64>().unwrap_or(-1);
-        Self::thumb_face(self.thumbs.get(&id).cloned(), leaf.symbol)
+        Self::thumb_banner(self.thumbs.get(&id).cloned(), leaf.symbol)
     }
 
     /// The picker's verdict line, shared by the flat list and the drill —
@@ -3567,10 +3598,11 @@ impl IslandDemo {
                 } else {
                     format!("{} \u{00b7} {}", u.hull, u.class_name)
                 };
-                // The row stacks: identity line, then verbs. A single line
-                // cannot hold a 30-character name plus two pills in a 252pt
-                // leaf — the text's minimum shoves the verbs off the modal,
-                // and no truncate/w_full/flex_1 combination in this toolkit
+                // The row stacks: the photo banner, then the identity
+                // line, then verbs. A single line cannot hold a
+                // 30-character name plus two pills in a 252pt leaf — the
+                // text's minimum shoves the verbs off the modal, and no
+                // truncate/w_full/flex_1 combination in this toolkit
                 // shrinks it (three captures proved it). Stacked, the text
                 // ellipsizes against the full column width and the verbs
                 // always fit. Taller than the console's 46pt pitch, which
@@ -3635,13 +3667,18 @@ impl IslandDemo {
                                 thumb: ghost_thumb.clone(),
                             })
                         })
+                        // The banner first: the photograph spans the row's
+                        // full width, and the identity sits under it — the
+                        // ship is the row's first word, not a stamp
+                        // beside the name.
+                        .child(self.leaf_thumb(&u))
                         .child(
                             div()
                                 .flex()
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.0))
-                                .child(self.leaf_thumb(&u))
+                                .pt(px(8.0))
                                 .child(
                                     div()
                                         .flex()
