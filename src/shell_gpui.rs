@@ -3224,30 +3224,36 @@ impl IslandDemo {
     /// small.
     fn thumb_face(thumb: Option<Arc<gpui::RenderImage>>, symbol: MapSymbolShape) -> AnyElement {
         // 56×38 at ~3:2, the shape of the archive's own photos; fetched
-        // at 192px so the shrink stays ahead of the paint.
-        Self::thumb_box(thumb, symbol, 56.0, 38.0, 1.0)
+        // at 192px so the shrink stays ahead of the paint. Cover, not
+        // contain: the ghost is a cursor stamp, and a slice of the photo
+        // reads better at 56pt than a letterboxed sliver.
+        Self::thumb_box(thumb, symbol, 56.0, 38.0, 1.0, ObjectFit::Cover)
     }
 
-    /// The row's thumbnail as a full-width banner: the photograph covering
-    /// the row's whole content width — the picker's reason to fetch photos
-    /// at all. The small box showed a stamp; the banner shows the ship.
+    /// The row's thumbnail as a full-width banner: the whole photograph,
+    /// never a cropped slice — the archive's photos are wide whole-body
+    /// panoramas (5.9:1 to 9.4:1), and a cover-cropped strip showed a
+    /// zoomed-in slice of the hull instead of the ship. `Contain` fits the
+    /// entire image; the banner's modest height hugs it (a wide photo's
+    /// height is its width over its aspect, whatever the box).
     fn thumb_banner(thumb: Option<Arc<gpui::RenderImage>>, symbol: MapSymbolShape) -> AnyElement {
-        // 96 tall at 236 wide: a 2.5:1 strip, a little wider than the
-        // archive's 3:2 so the cover keeps the hull, not the sky. The
-        // glyph fallback scales up to read as a placeholder, not a
-        // stamp floating in a band.
-        Self::thumb_box(thumb, symbol, LEAF_CONTENT_W, 96.0, 2.0)
+        // 48 tall at 236 wide: a 4.9:1 strip that the common 5.9:1–9.4:1
+        // panoramas nearly fill (the rest is a thin slate matte). The
+        // glyph fallback scales to read as a placeholder, not a stamp
+        // floating in a band.
+        Self::thumb_box(thumb, symbol, LEAF_CONTENT_W, 48.0, 1.5, ObjectFit::Contain)
     }
 
-    /// The shared face: a rounded, covered photograph when the fetcher has
-    /// landed one, the glyph centered on a slate band otherwise. The width
-    /// is always fixed — never a percentage (see `LEAF_CONTENT_W`).
+    /// The shared face: a rounded photograph when the fetcher has
+    /// landed one, the glyph centered on a slate band otherwise. The
+    /// width is always fixed — never a percentage (see `LEAF_CONTENT_W`).
     fn thumb_box(
         thumb: Option<Arc<gpui::RenderImage>>,
         symbol: MapSymbolShape,
         w: f32,
         h: f32,
         glyph: f32,
+        fit: ObjectFit,
     ) -> AnyElement {
         let mut face = div()
             .w(px(w))
@@ -3257,7 +3263,7 @@ impl IslandDemo {
             .overflow_hidden()
             .bg(rgba(PANEL_SLATE));
         if let Some(photo) = thumb {
-            face = face.child(img(photo).w_full().h_full().object_fit(ObjectFit::Cover));
+            face = face.child(img(photo).w_full().h_full().object_fit(fit));
         } else {
             face = face.child(
                 canvas(

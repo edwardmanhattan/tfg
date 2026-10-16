@@ -5230,7 +5230,24 @@ constant's comment records the arithmetic and the trap.
 | it draws | `/tmp/gpui_banner2.png` (clean run, log checked): full-width photo banners, name + sub under each, ASSIGNED/PLACE/ADD right-aligned |
 | the `w_full` trap is real | `/tmp/gpui_banner.png` (broken): empty banners, missing verbs — bisected by the stash-capture-compare pass |
 
-**Still open.** The banner height (96) is a chosen proportion, not a
-measured one — if the archive's photos run taller than 2.5:1, the cover
-crop keeps the hull but loses more sky; revisit if the photos look
-wrong. The flat (fixture/offline) register rows stay text-only.
+**Still open.** The banner height (48) suits the archive's wide
+panoramas (measured: 5.9:1–9.4:1, mode 9.4:1) — a fixed box can't match
+every aspect, so `Contain` letterboxes the outliers (a tank, a
+helicopter, a drone — 3 of 62) rather than cropping them; revisit if
+those read too small. The flat (fixture/offline) register rows stay
+text-only.
+
+### Follow-up: whole body, not a zoomed slice (same day)
+
+The first banner used `ObjectFit::Cover`, and the user's screenshot
+showed the defect immediately: the archive's photos are wide whole-body
+panoramas (measured off the manifest — 5.9:1 to 9.4:1, e.g. the LPDs
+at 1346×227), and the 2.46:1 cover-cropped strip showed a zoomed-in
+slice of the hull, not the ship.
+
+`Contain` fits the entire image. A wide photo's contained height is
+its width over its aspect — independent of the box — so the banner
+also slimmed from 96 to 48 (a 4.9:1 strip the common panoramas
+nearly fill) instead of sitting 65% matte. The drag ghost keeps its
+56×38 `Cover` stamp: a cursor stamp wants a slice, not a letterboxed
+sliver.
