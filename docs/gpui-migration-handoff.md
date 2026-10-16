@@ -148,6 +148,13 @@ first draw (latched, single-flight), so seeding the host seeds the whole
 open — e.g. `TFG_GAME=5 TFG_EMBARK=8` photographs host 8's passengers with
 no click.
 
+**A fifth kind: `TFG_SESSIONS=1` opens the session picker unheld.** The
+startup holds nothing, so the column lands on NoSession with three fixture
+rows across the states (real names, states and seats) to pick. The roster
+stays real; only the hold is staged. Without it an authenticated startup
+holds first-player-game as before — the seed photographs the choice, not
+the default.
+
 **`TFG_SCROLL` and a wheel delta move the column in OPPOSITE directions for the
 same number.** Islands are placed at `origin.1 - zone_scroll` (render, ~5749),
 so a larger offset moves them **up** and reveals the stack's bottom. The wheel
@@ -4613,6 +4620,11 @@ commented-out in the Hyprland config, i.e. libinput defaults). The
 decisive test needs hands: unplug the wireless receiver, rerun any
 capture, watch the log — strays gone means replace the mouse.
 
+Confirmed live the next day: across four picker captures, strays opened
+the fleet picker unprompted and posted a real `HoldSession` (read-only,
+fixture-safe — and incidentally proving the hold flow end to end). Every
+capture with visible verbs is now retried until its run log is clean.
+
 ## Code review follow-ups (2026-10-15)
 
 Ran the two-axis review (standards + spec) over the recent slices and fixed
@@ -4634,6 +4646,38 @@ claimed plumbing present).
 Left standing: the three judgement-call smells (AppMode/Mode name drift,
 `Option<bool>` clock, both pre-existing or documented) and the reviewer's
 NoSession note, which misreads render-gating for reachability.
+
+## Map drag lag: pump sleeps, not GPUI (2026-10-15)
+
+Reported as laggy pan/zoom with the question whether GPUI is the cause.
+It is not: every frame cost 240–400ms warm tiles included, and the split
+now logs the parts — `pump 4: 225 + 17 render`. Of ~245ms, ~225 is four
+`render_once` + 50ms sleeps "so async work (tiles) can land", ~35 is real
+render + readback. Cold frame 252ms vs warm 237ms had already said tiles
+cost ~15ms; the split buries the tile hypothesis the rest of the way.
+
+The second find is the actual defect: every gesture sent `JUMP_PUMP` (6)
+— Zoom, Pan and Jump alike — although the const's own doc promises the
+ordinary gesture spends fewer. A drag step paid six sleeps (~350ms a
+frame, ~3fps) for a promise nobody cashed.
+
+The fix is the promise: new `GESTURE_PUMP = 1` for the Pan and Zoom arms
+(one render + one 50ms grace — network tiles out-take any sleep budget on
+fresh ground, and the cache answers warm ground inside the render), full
+budget kept for Jump, warm-up and the config default. Predicted gesture
+frame ~70–90ms (~11–14fps) by the same arithmetic the split measured;
+gesture frames themselves cannot be produced headlessly here, so that
+prediction is code-reviewed, not photographed. No correct seam exists for
+a regression test — the pump mapping lives in the binary's arms, where no
+unit test has ever run — which is noted, not worked around.
+
+Also fixed while measuring: the capture script still launched
+`./target/debug/tfg_gpui`, a pre-cutover fossil, after step 5 moved the
+binary. The first perf capture ran the fossil (same sleeps, so its numbers
+stand, but it was not the tree). The script now launches
+`./target/debug/tfg`, `pkill`s the right process name, and the fossil is
+deleted so it cannot recur. Any post-step-5 capture taken before this fix
+is suspect and was re-taken where it mattered.
 
 ## U8 step 1, third increment — 6 more tests off egui (2026-10-15)
 
@@ -4777,7 +4821,7 @@ history.
 | the bins hold | `cargo test --bins`: 0 tests (nothing left to test at that level) |
 | the tree builds | `cargo check --bins`, `cargo build --examples`, `gpui-island` all clean |
 | no egui remains | `egui`/`eframe`/`egui_extras` gone from `Cargo.toml`; lockfile carries no `egui`/`eframe`/`epaint` package |
-| the shipped binary presents | `/tmp/gpui_cutover.png`: `tfg` on game 5, Operator + Step + Command, live map, `--version` → `tfg 0.1.0`, `--check-runtime` ok |
+| the shipped binary presents | `/tmp/gpui_cutover2.png`: `tfg` on game 5, Operator + Step + Command, live map, `--version` → `tfg 0.1.0`, `--check-runtime` ok (the earlier `cutover.png` ran the fossil — retaken) |
 
 **Still open — and none of it is egui.** Groups (no route), tick readout
 (no endpoint), Transcript (local trace, by design), island body gesture
@@ -4795,3 +4839,362 @@ shell's `log_feed` covers the live-line class already (6 call sites
 against the console's 36 — the sim/live/order-result lines have no
 shell-side source). Exclusion stands, now on inspected evidence rather
 than inherited lore.
+
+## The session picker: login lands on choice, not mid-execution (2026-10-15)
+
+Reported as "first login shows an execution view already". The data was
+all correct — SUEX is Super User's call-sign in game 44, the 2000 stamp
+is the server's own step time, the seat and hull are really held — but
+the HOLD was list-order luck: five Commando games, no choice offered, the
+first player game in server order wins. The console never does this;
+login lands on `z.start` and the operator picks.
+
+### What was built
+
+**`z.start`, ported as a column island.** `SessionRow` (id, name, state,
+seat role, judge side — a display projection like `MyShip`, in server
+order) rides the sign-in answer beside the roster; the NoSession column
+is now Operator + Sessions + Fleet. Rows show name bright with state and
+seat dimmed (`Commando`, `Penyelenggara · judge`, `not seated`); the row
+IS the verb. Holding replaces the session whole through the existing
+`create` feed (`HoldSession` → pinned `fetch_session` → `apply_hold`),
+so the column recomposes around the held game — proven in-harness from
+picker (`operator/sessions/fleet`) to planning column.
+
+**Card sign-in stops auto-holding.** The sign-in answer carries roster,
+games and an unheld session; token kept, game id zero. Env-auth startup
+is untouched (pin or preference holds as before) — only the card path
+changes, which is the reported one.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the bins build | `cargo check --bins` clean |
+| the lib holds | `cargo test --lib`: 468 pass, same 4 pre-existing failures |
+| the kernel holds | NoSession arm `[Operator, Sessions, Fleet]`, key names itself, heights/duplicates loop-clean |
+| hold names the pick | `hold_names_the_picked_game` (picker column unheld → `HoldSession{9}` → busy latch → `apply_hold` installs + list survives → planning column) |
+| the picker draws | `/tmp/gpui_picker2.png` (`TFG_SESSIONS=1`): NO SESSION operator, 3 SESSIONS rows with real names/states/seats, register below |
+| fixture honesty | seed rows use real game names, states and seats (44/38/9 read live); only the hold is staged |
+
+## Seat-me pill, photos on sign-in, rectangular thumbs (2026-10-16)
+
+### Why creating a game seats nobody
+
+The server does not seat the creator — a fresh game's participants list
+is empty, and neither client ever seated on create (the console's
+`apply_created_game` just holds). So the seat has to be taken, and the
+picker refused drops with no way forward. Now the force section offers
+it in one click when the room holds no seat for the operator and the
+game defines an organizer role ("Game Master"/"Penyelenggara", the
+console's constants, matched case-insensitively): "seat me as …"
+stages exactly what the Players island would — same `stage_seat`, same
+name-derived call sign — and the seatless drop refusal points at it.
+Auto-seating on create was considered and refused: joining a room is
+visible to everyone in it, and a client that joins you silently is the
+consent the pill keeps. No organizer role, no pill — seating stays the
+Players island's job, never a guessed role.
+
+### Photos also fetch after a card sign-in
+
+The glyph fallback in the report was a startup-only fetcher: a launch
+without credentials fetched nothing, and the later card sign-in never
+started one. The fetch is now a function of (host, token, channel),
+run at startup when a token exists AND after every sign-in on the new
+token. The shell keys by unit id and skips what it holds, so a second
+pass re-fetches but never repaints.
+
+### Thumbnails leave the circle
+
+56×38 rounded rects at the photos' own aspect, covered never
+letterboxed, fetched at 192px so the shrink stays ahead of the paint —
+one shared face helper for the row and the ghost, so the hand never
+swaps pictures. The glyph fallback lives in the same rect. The disc
+helper is deleted, not deprecated.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 489 pass, same 4 pre-existing failures; `--bins` 2 pass; bin, examples clean |
+| organizer resolves, or doesn't | `organizer_role_{matches_the_deployments_words,absent_without_the_words}` |
+| the pill seats | `seat_me_stages_the_organizer_seat` (one Seat write, own seat, name-derived sign) and `seat_pill_seats_from_the_picker` (swept click posts the roster plan) |
+| it draws | `/tmp/gpui_fleet10.png` (clean run, log checked): five rectangular photo thumbs on the Sea drill, verbs intact, fetch pass done for all 62 pictured hulls |
+
+## Placing IS assigning (2026-10-16)
+
+The 404 in the screenshot was the server being literal: placement is a
+per-piece row, and a register hull dragged straight to the map was never
+added to the exercise — no piece, no row, 404. The first fix (refuse
+locally with "add it first") was wrong too: it defended the two-step
+model the operator never asked for. Dropping a hull on the map assigns
+it — one gesture, `DeployAssign` carrying the operator's own seat (the
+add button's default; seatless refuses locally, same sentence), with the
+binary sequencing `assign_unit` before `set_placement` and answering the
+usual re-read session. The host-side twin, `EmbarkAssign`, chains the
+attach the same way. Either step names its own failure, and an
+assigned-but-unplaced hull is a good state: the next drop places it
+outright. Click-to-place stays strict (its arm was struck on a drafted
+row; a hull that left since is refused, not silently re-added).
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 485 pass, same 4 pre-existing failures; `--bins` 2 pass; protos, bins, examples clean |
+| drop assigns then deploys | `dragging_a_leaf_row_to_the_map_deploys_it` (now seated, unassigned): `DeployAssign{13, commander:7}` with the drop's fractions |
+| seatless drops post nothing | `dropping_without_a_seat_posts_nothing`: empty sink, "no seat" on the line |
+| chains, both sides | `dropping_a_register_hull_{assigns_and_deploys, on_a_host_assigns_and_embarks}` direct on `drop_unit` |
+| taken paths unchanged | `place_button_arms_and_map_click_deploys`, `dropping_a_leaf_row_on_a_host_embarks_it` still green |
+
+**Still open.** A watched live drop (assign-and-place against the server),
+the disk photo cache, hover-truncation on the other modal cards.
+
+## Fleet picker follow-ups: photos, no-drag-map, hide-while-dragging (2026-10-16)
+
+Three complaints, three slices.
+
+### Photos, not glyphs
+
+The glyph was never the design — the console's `unit_thumbnail_ui`
+prefers the hull photograph and falls back to the symbol, and the/Minos
+side already serves it (`unit_image_manifest` + presigned `hull_image_url`,
+with `visuals.rs` holding the rules). The GPUI shell just never fetched.
+Now a background thread at startup reads the manifest (62 pictured on
+dev), resolves one presigned URL per pictured hull, decodes and downscales
+to 96px, and trickles `ThumbRaw` bytes over a channel; the tick mints one
+`RenderImage` per arrival through the same raw path the map frames take,
+and the rows fill in progressively while the glyphs hold. Photo wins,
+glyph stays the fallback, a hull with no picture costs no request. Memory
+only — no disk cache yet, so every launch re-fetches; the manifest
+version is the obvious cache key when that gets built.
+
+### Dragging dragged the map too
+
+Real defect, harness-pinned: GPUI delivers a press to EVERY hovered
+hitbox down the chain, and the full-window map surface is always in it —
+the picker card had no hitbox of its own, so pressing a leaf row ALSO
+started a map pan, and every drag move panned with the ghost. The card
+now truncates hover (`block_mouse_except_scroll`, the island edge's own
+rule, so the columns keep scrolling). `pressing_the_picker_card_does_not_
+pan_the_map` failed before, passes after. Same bug class lives on every
+other modal card — said plainly so it gets fixed deliberately, not
+discovered again.
+
+### The picker hides mid-drag
+
+The tick polls `has_active_drag` once per frame into a `dragging` flag
+(the drop and ghost live in GPUI's own drag state, which no element
+callback can read into the view), and the fleet branch renders only when
+not dragging. Press, lift, and the modal is gone — the whole map is the
+drop zone; release or cancel and it returns, still drilled where it was.
+`dragging_hides_the_picker` pins the flag; the hide itself is three lines
+of wiring, reviewed, for the user's live pointer to confirm.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 482 pass, same 4 pre-existing failures; `--bins` 2 pass; protos, bins, examples clean |
+| bytes mint and refuse | `thumb_image_{mints_from_bytes,refuses_torn_bytes}` |
+| card eats its own presses | `pressing_the_picker_card_does_not_pan_the_map` (red before the block, green after; drag/drop/place proofs still green) |
+| drag hides, drop returns | `dragging_hides_the_picker` |
+| it draws | `/tmp/gpui_fleet9.png` (clean run, log checked): five photo thumbnails on the Sea drill, verbs intact; `/tmp/gpui_fleet8.png`: paint unchanged by the hit-test-only card block |
+
+**Still open.** Disk photo cache (manifest version as key), the same
+hover-truncation on the other modal cards, and a live watched drop —
+`set_placement`/`attach_units` remain harness-proven to the sink only.
+
+## Fleet picker: drag to deploy, drop to embark (2026-10-16)
+
+Leaf rows drag. A press that moves arms a `UnitDragPayload` (numeric id,
+name, glyph) with a thumbnail-and-name ghost; a release over bare map
+deploys there (`DeployUnit` with view fractions, unprojected at the
+binary's camera through `set_placement`), and a release within 20 map px
+of a placed piece's marker embarks aboard it (`EmbarkDrop` through
+`game_attach_units`). Both answers re-read like every other write — the
+deploy on the shared feed under its own `deploy_busy` latch, the embark
+on the embark feed like the unembark/clear/revoke verbs. Click-to-place
+covers the pointer-impaired path: a taken row's PLACE button arms the
+hull, the map shows a crosshair, and a click that stays put deploys (a
+press that moves past 6px pans like any other).
+
+Three things the build taught:
+
+1. **Hover is not topmost.** The drop fires wherever the map is *hovered*,
+   and hover truncates only at `BlockMouseExceptScroll` — so a release
+   over the picker still drops on the map underneath. The harness sweep
+   proved it by accident: a probe's release over the leaf rows posted a
+   deploy. Harmless here (a drop is a drop wherever the map shows
+   through), but a drop that must NOT fire under chrome would need its
+   own truncating hitbox.
+2. **A probe release is a drop.** The sweep that finds the drag source
+   fires a real drop on the way, and that deploy re-renders the picker's
+   status line, shifting every row below the press that found it. The
+   drag proof runs sweep-and-drop in ONE pass — the press that starts a
+   drag keeps going to the drop — because a second press would land on
+   moved rows. Same class as the island-edge defect: geometry read before
+   a write is stale after it.
+3. **Sweep clicks have side effects.** The place-button sweep clicked the
+   exercise's REMOVE and un-drafted the hull sought, then walked past a
+   button narrowed to ~24pt. The sweep seeds a fixed status (geometry
+   holds still), starts below the exercise section, and steps 6pt across
+   the button's end. All of which the test's comments own, because the
+   next person to touch those rows will otherwise re-learn it.
+
+Layout: the leaf row stacks (identity line, verbs line). A single line
+cannot hold a 30-character name plus two pills in a 252pt leaf, and no
+truncate/w_full/flex combination in this toolkit shrinks the text past
+its minimum — three captures watched ASSIGNED slide off the modal while
+the name stayed whole. Taller rows, verbs always aboard; the console's
+46pt pitch had 232pt of leaf to spend and this modal does not.
+
+Not ported: the `All(N)` tab, whole-tree search, photo thumbnails (glyph
+discs hold), and the embark capacity pre-checks (the server evaluates;
+the answer carries what it said). Deploy/embark against the live server
+are harness-proven to the sink only — no capture drives a real
+`set_placement` or `attach_units`, by the standing rule against write
+verbs on live games. The first real drop wants watched hands, and the
+picker's verdict lines are where its refusal will read.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 478 pass, same 4 pre-existing failures; `--bins` 2 pass; protos, bins, examples clean |
+| the tree builds | bin-side `builder_{walks_group_to_hull,empty_store}` on an in-memory mirror (moved out of the shell — the parity proto stays sqlite-free) |
+| the drill walks and clears | `drill_{defaults_to_first_tab,walks_to_the_hulls,parent_change_clears_below}` |
+| drag deploys | `dragging_a_leaf_row_to_the_map_deploys_it`: sweep finds the source, one pass to bare map, `DeployUnit{13}` with the drop's fractions |
+| click places | `place_button_arms_and_map_click_deploys`: sweep arms `pending_place`, map click posts `DeployUnit{13}` |
+| drop embarks | `dropping_a_leaf_row_on_a_host_embarks_it`: marker under the drop, `EmbarkDrop{host:8, child:13}`; plus `drop_{names_the_nearest_placed_host,ignores_unplaced_and_mapless}` |
+| it draws | `/tmp/gpui_fleet7.png` (clean run, log checked): Sea drill to 5 hulls, glyph thumbnails, ASSIGNED + PLACE on the taken row, ADD elsewhere |
+
+## Fleet picker: miller columns, thumbnails (2026-10-16)
+
+The flat register list is now the fallback, not the picker. With a synced
+mirror the picker drills Asset Group > Category > Type > Class > hull off
+the same `store::tax_*` readers the egui console used, with the readers'
+own live-hull counts on every tab and row — a tab's number and the rows
+behind it agree, because they are the same query. Each leaf row carries a
+28px disc with the taxonomy glyph the map would draw (`MAP_INK` on
+`PANEL_SLATE`, painted through `canvas`), the port of the console's
+`unit_thumbnail_ui` fallback rung. Photo textures stay out: there is no
+image pipeline in this shell, and a glyph thumbnail is the honest one.
+
+Plumbing: the binary builds the tree once at startup
+(`fleet_taxonomy_from_store`, best-effort per rung — a bad row empties its
+rung, never the picker) with each leaf's symbol resolved through the same
+resolver the markers use, and hands it to `run()` beside the roster. Drill
+state is four `Option<i64>` with first-tab default; a parent change clears
+below, the console's rule, through `select_*` helpers. The modal widens to
+700 (3 × 128 + flex leaf) — four columns never fit the 520 form, the same
+reason the egui picker ran 980.
+
+Deliberately not ported: the `All(N)` tab (tabs are the groups; a union
+tab is a merge the drill does not need) and whole-tree search (no query
+field in this shell yet). Both noted, neither owed by this request.
+
+Drag is still out — the doc on the picker says so, pointing at the drop
+slice next. A row that looks draggable with no map drop is still a control
+that does nothing.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 474 pass, same 4 pre-existing failures |
+| the tree builds | `fleet_taxonomy_{walks_group_to_hull,empty_store}` on an in-memory mirror |
+| the drill walks and clears | `drill_{defaults_to_first_tab,walks_to_the_hulls,parent_change_clears_below}` |
+| it draws | `/tmp/gpui_fleet2.png` (clean run, log checked): Air/Land/Other/Sea(124) tabs, breadcrumb to Anka-S, four washed columns, glyph thumbnail + ADD on the leaf |
+
+**Still open.** Refreshing the list after a create (a composed game
+appears only on next sign-in — noted, not built), and the remembered-game
+default from the proposal (deferred: the picker solves the complaint,
+persistence is a convenience). The click-proof queue and the mouse
+question are unchanged.
+
+## Row clicks were dead everywhere: the island edge (2026-10-15)
+
+Reported as "can't click any session". Reproduced in-harness on the first
+try: a computed row-centre click lands and nothing reaches the sink — and
+a 16-click sweep of the whole island height lands nothing either. Not
+geometry. Then the sweep's negative generalized: no column-island click
+has EVER been proven, in-harness or live. The three `simulate_click`
+tests in the tree all target the roster SHEET; every island-body verb
+(tabs, pills, fields, step declare, helm steppers, these rows) was
+sink-tested only. The modals worked because they have no island edge.
+
+Root cause, read off GPUI 0.2.2's own `window.rs`: every mouse listener
+requires its hitbox to be hovered, and hover truncates at the topmost
+`BlockMouseExceptScroll` hitbox. The island edge — full-panel, painted
+LAST, topmost — truncated hover at itself, so no body control under it
+could ever fire. The code comment claimed the opposite, porting egui
+reasoning where paint-only rims don't hit-test. In egui the rim is
+invisible to clicks; in GPUI it was a full-panel click black hole.
+
+The fix is tree order: the edge paints FIRST (under the content), the
+close stays last. The 1px border sits at the panel bounds where content
+never paints, so the reorder is invisible — verified on capture — and
+the edge still shields the map in the gaps, which is its whole job. Both
+comments rewritten to state the rule instead of the wish.
+
+`clicking_a_session_row_holds_it` now clicks a real row and asserts the
+hold — the first harness-proven island click in the tree, and the
+regression pin for the whole class. The click-proof queue just got
+shorter the honest way: every island verb is now *capable* of being
+driven; proving each one still wants a working pointer.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 469 pass, same 4 pre-existing failures |
+| row clicks fire | `clicking_a_session_row_holds_it` (failed before the reorder with an empty sink, passes after) |
+| the border survives | `/tmp/gpui_picker6.png` (clean run, log checked): picker rows, island edges intact, no paint change |
+
+## The seat-me pill seated judge-side; drops now refuse locally (2026-10-16)
+
+Reported with a screenshot: after the seat-me pill shipped, clicking ADD
+on a register hull answered `HTTP 400: id_commander: a judge-side
+participant does not command units or task groups`. The user did nothing
+wrong — the pill offered the organizer role ("Penyelenggara"), which is
+judge-side, and the server refuses judge-side commanders outright. The UI
+seated them into a seat that cannot command: a local rule mismatch, fixed
+at the seat selection, not at the error message.
+
+The fix, in three parts. (1) `organizer_role()` became two readers:
+`player_roles()` (the non-judge roles — what the pills may offer) and
+`own_steers()` (`None` unseated, `Some(steers)` from the held role's judge
+flag). (2) The picker's force section renders one pill per PLAYER-side
+role — the organizer pill is gone entirely; seating as organizer remains
+possible on the Players island. (3) `drop_unit` refuses a judge-side drop
+locally, after the seatless gate and before the round trip: "your seat is
+judge-side — it directs, it does not command; take a player seat on the
+Players island". The seatless sentence now points at the player pills when
+the game defines any ("take a player seat above").
+
+The ADD button path hits the same server rule — the pill is the fix, not
+the workflow: proper testing is to seat as a PLAYER-side role (the pill
+now offers exactly those), then drag a hull to the map, and to confirm a
+judge-side seat refuses locally with guidance instead of a 400.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 490 pass, same 4 pre-existing failures |
+| the pills exclude the judge side | `player_roles_{exclude_the_judge_side,empty_when_every_seat_judges}` |
+| the pill stages a player seat | `seat_me_stages_a_player_seat`: one write, role_id 1 (was 9), name-derived call sign |
+| the pill seats from the picker | `seat_pill_seats_from_the_picker`: click sweep, first roster plan is the pill's |
+| judge-side drops refuse locally | `dropping_from_a_judge_side_seat_posts_nothing`: empty sink, the refusal sentence on the line |
+| it draws, empty room | `/tmp/gpui_pill.png` (`TFG_GAME=45 TFG_FLEET=1`, clean run, log checked): one pill — "SEAT ME AS COMMANDO" — no organizer pill |
+| it draws, seated room | `/tmp/gpui_seat.png` (`TFG_FLEET=1`, clean run, log checked): no pills (the room has seats), operator seated Commando — player-side |
+
+**Still open.** The judge-side refusal on the TAKEN path (re-deploying a
+hull already in the exercise) is unguarded — a piece cannot reach a
+judge commander through the assign path the server refuses, but a role
+change after assignment would. The pill visual in a room with several
+player roles (many pills stacked) is untested beyond the sweep. The
+`proto/gpui-shell` proto fails to build in this checkout: its
+`include_bytes!` references `p5-epaint/assets/`, which is absent —
+pre-existing, unrelated to this slice.

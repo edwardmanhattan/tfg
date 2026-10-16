@@ -241,6 +241,14 @@ pub const MAP_ZOOM: f64 = 11.0;
 pub const MAP_STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
 /// Pumps for a jump (a recentre); an ordinary gesture spends fewer.
 pub const JUMP_PUMP: u32 = 6;
+/// Pumps for a pan or zoom step mid-gesture: one render plus one 50ms
+/// grace for tiles. Network tiles take longer than any sleep budget when
+/// the ground is new, and the cache answers warm ground inside the
+/// render — so further sleeps buy almost nothing on fresh ground while
+/// each one costs the drag ~60ms of staleness. Jumps and warm-ups keep
+/// the full budget: a recentre should land complete, and startup is not
+/// latency-sensitive the way a held drag is.
+pub const GESTURE_PUMP: u32 = 1;
 
 /// World-size base in px at zoom 0 for the overlay math. Calibrated
 /// against the renderer (task #42, `examples/calibrate_projection.rs`):

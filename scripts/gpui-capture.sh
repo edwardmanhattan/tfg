@@ -33,7 +33,7 @@
 #      cannot be switched to. REFUSE instead: a named error is recoverable, a
 #      wrong PNG is not.
 #
-# Usage: gpui-capture.sh [RUN_SECS] [OUT] [extra tfg_gpui env, e.g. "TFG_COMMS=1"]
+# Usage: gpui-capture.sh [RUN_SECS] [OUT] [extra tfg env, e.g. "TFG_COMMS=1"]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -54,7 +54,7 @@ if ! timeout "$T" grim -o eDP-1 /tmp/gpui_preflight.png 2>/dev/null; then
 fi
 rm -f /tmp/gpui_preflight.png
 
-pkill -x tfg_gpui 2>/dev/null || true
+pkill -x tfg 2>/dev/null || true
 sleep 0.5
 
 # 2. The trap: however this script ends, the app does too.
@@ -69,7 +69,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # shellcheck disable=SC2086
-env $EXTRA_ENV ./target/debug/tfg_gpui > /tmp/gpui_run.log 2>&1 &
+env $EXTRA_ENV ./target/debug/tfg > /tmp/gpui_run.log 2>&1 &
 PID=$!
 echo "launched pid $PID  (env: ${EXTRA_ENV:-none})"
 

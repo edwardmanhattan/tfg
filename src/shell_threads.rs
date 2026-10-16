@@ -239,12 +239,14 @@ pub fn spawn_map_thread(config: MapConfig) -> (Sender<MapReq>, Receiver<MapResp>
                 size = px;
             }
             scene.set_center(at, zoom);
-            // Smoothness measurement: round-trip cost per frame, so tile lag
-            // can be split into pump-bound vs render/network-bound.
+            // Smoothness measurement: round-trip cost per frame, split so
+            // tile lag can be told apart from pump sleeps and readback.
             let t0 = Instant::now();
             scene.pump(pump);
+            let pump_ms = t0.elapsed().as_millis();
             let rgba = scene.frame_rgba();
-            eprintln!("map frame {seq}: {}ms (pump {pump})", t0.elapsed().as_millis());
+            let render_ms = t0.elapsed().as_millis().saturating_sub(pump_ms);
+            eprintln!("map frame {seq}: {}ms (pump {pump}: {pump_ms} + {render_ms} render)", pump_ms + render_ms);
             if resp_tx.send((seq, at, zoom, size, rgba)).is_err() {
                 break; // UI gone
             }

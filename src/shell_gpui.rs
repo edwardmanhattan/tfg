@@ -34,7 +34,7 @@
 use gpui::{
     AnyElement, App, AppContext, Application, AsyncApp, Bounds, Context, CursorStyle, FontWeight,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ObjectFit,
+    MouseUpEvent, ObjectFit,
     ParentElement, PathBuilder, Render, ScrollHandle, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement,
     Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, fill, img,
@@ -292,6 +292,15 @@ struct IslandDemo {
     roster: Vec<RosterRow>,
     /// How many hulls the register holds, for the sheet's counter.
     roster_total: usize,
+    /// The games this account can see, for the session picker: read at
+    /// sign-in beside the roster, in the server's own order. Holding one
+    /// replaces the session below but never this list — going back to
+    /// pick again must not cost a re-read. Empty until authenticated,
+    /// like the roster.
+    sessions: Vec<SessionRow>,
+    /// The hold latch and its verdict line, for the picker's verb.
+    hold_busy: bool,
+    hold_status: String,
     /// The session the top zone reads: the held game and its room's
     /// headcount. `SessionView::default()` when no session is held.
     session: SessionView,
@@ -432,6 +441,25 @@ struct IslandDemo {
     /// The Fleet picker: the register, opened from the Fleet island's door.
     /// The console's `WhichModal::Fleet`, seeded from the band's door.
     fleet_open: bool,
+    /// A drag is in flight (polled per tick — GPUI owns the state). The
+    /// fleet picker hides for exactly the drag's lifetime, so the drop can
+    /// land anywhere on the map instead of on the modal's own card.
+    dragging: bool,
+    /// The picker's drill tree: Asset Group > Category > Type > Class >
+    /// hull, built once by the binary off the synced mirror. Empty on
+    /// fixture runs — the picker falls back to its flat register list.
+    pub fleet_tax: FleetTaxonomy,
+    /// Hull photographs, minted on first paint as the fetcher lands them.
+    /// The glyph draws until the photo arrives — progressive fill, and a
+    /// hull with no picture keeps its glyph, which is the honest fallback.
+    thumbs: HashMap<i64, Arc<gpui::RenderImage>>,
+    /// The drill position, one rung each. A parent change clears everything
+    /// below it (the console's `drill_*` rule); `None` group means the first
+    /// tab, so an unseeded open still shows a full column set.
+    drill_group: Option<i64>,
+    drill_category: Option<i64>,
+    drill_type: Option<i64>,
+    drill_class: Option<i64>,
     /// The Player picker: the directory, opened from the Players island's
     /// door. The console's `WhichModal::Player`.
     player_open: bool,
@@ -461,6 +489,18 @@ struct IslandDemo {
     roster_status: String,
     force_busy: bool,
     force_status: String,
+    /// A deploy in flight, latched apart from the force writes: the answer
+    /// carries the same re-read session, but the verdict shares the picker's
+    /// line — one panel, one sentence about its last edit.
+    deploy_busy: bool,
+    /// Click-to-place, the drag's fallback: the armed hull id. Set by the
+    /// leaf row's place button; the next map click that is NOT a pan deploys
+    /// it there. A drag never arms this (its release lands on the drop, not
+    /// the row), and arming never pans (the press anchors instead).
+    pending_place: Option<i64>,
+    /// The press anchor while armed: a press that moves past 6px becomes a
+    /// pan like any other, and only a press that stays put places.
+    place_down: Option<(f32, f32)>,
     /// The relate editor: which step it obliges and its working set of
     /// (kind, id) refs. Seeded from the server's read when opened — there is
     /// no staging here, so the working set IS the last saved list until the
@@ -524,6 +564,12 @@ const MODAL_H: f32 = 320.0;
 /// capture proved it, with the title row clipped off the card's bottom.
 const FORM_W: f32 = 520.0;
 const FORM_H: f32 = 580.0;
+
+/// The fleet picker's card: wider than the authoring forms, because four
+/// miller columns (3 × 128 + a flex leaf) do not fit 520 — the egui picker
+/// ran 980 wide for the same reason, and this window is 760.
+const FLEET_W: f32 = 700.0;
+const FLEET_H: f32 = 580.0;
 
 /// The modal silhouette: a convex pentagon, the panel rect with its
 /// top-right corner cut back by `view::CUT` (20.0), stroked 2px in
@@ -1054,11 +1100,12 @@ impl IslandDemo {
         // Inset 0 and width 1 — the edge IS the border, where the old rim was
         // a second line riding 3px inside a bevelled casing. It keeps the
         // rim's `block_mouse_except_scroll()` hitbox, which is what stops the
-        // map behind the panel taking the pointer. That call is safe here:
-        // gpui's `hit_test` walks hitboxes in reverse and only `BlockMouse`
-        // breaks the loop, so this truncates hover without swallowing the
-        // body's own controls — which is why the console's buttons worked
-        // with the rim painted last, and still do with the edge there.
+        // map behind the panel taking the pointer. That call truncates
+        // HOVER at the edge — every mouse listener requires its hitbox to
+        // be hovered — so the edge must sit UNDER the body in tree order:
+        // controls above it stay hoverable, gaps still shield the map.
+        // An edge painted last is a full-panel click black hole, and no
+        // comment claiming otherwise survives contact with `hit_test`.
         let edge = div()
             .absolute()
             .top(px(0.0))
@@ -1109,6 +1156,25 @@ impl IslandDemo {
             .h(panel_h)
             .rounded(px(view::PANEL_RADIUS))
             .bg(rgba(CONSOLE_NIGHT))
+            // Painted FIRST, so the edge is the bottommost thing on the
+            // panel: GPUI resolves hits and paint in tree order, later
+            // siblings on top, and every mouse listener requires its
+            // hitbox to be hovered — hover the edge truncates at itself.
+            // An edge painted last is a full-panel click black hole: no
+            // body control under it can ever fire, which is exactly the
+            // defect this ordering fixes (row clicks landed and died).
+            // The border is at the panel's outer bounds where content
+            // never paints, so painting it under the content is
+            // invisible — and it still shields the map behind the panel
+            // in the gaps, which is the hitbox's whole job.
+            //
+            // The border lives here and ONLY here. Putting it on the panel
+            // as well draws a second line one pixel inside the first, and
+            // a 1px edge that measures 2px is a specification the build
+            // does not meet. The first capture of this slice showed exactly
+            // that: the lit perimeter ran 3,207 pixels against a computed
+            // 1,844, which is the tell.
+            .child(edge)
             .child(
                 div()
                     .flex()
@@ -1117,19 +1183,7 @@ impl IslandDemo {
                     .overflow_hidden()
                     .child(div().relative().h(px(TITLE_H)).child(band))
                     .child(scroller),
-            )
-            // Painted LAST, so the edge is the topmost thing on the panel:
-            // the same rule the close button already obeys, and for the same
-            // reason — GPUI resolves hits and paint in tree order, later
-            // siblings on top.
-            //
-            // The border is here and ONLY here. Putting it on the panel as
-            // well draws a second line one pixel inside the first, and a
-            // 1px edge that measures 2px is a specification the build does not
-            // meet. The first capture of this slice showed exactly that: the
-            // lit perimeter ran 3,207 pixels against a computed 1,844, which
-            // is the tell.
-            .child(edge);
+            );
         // LAST, and only where it does something: see `island_closeable`.
         if Self::island_closeable(key) {
             panel = panel.child(close);
@@ -1330,6 +1384,38 @@ impl IslandDemo {
             map_render_zoom: 0.0,
             roster,
             roster_total,
+            // Seeded open for a headless capture (`TFG_SESSIONS=1`): three
+            // fixture games across the states, unheld — the picker with
+            // something to pick, proving the surface rather than the seed.
+            sessions: if std::env::var("TFG_SESSIONS").as_deref() == Ok("1") {
+                vec![
+                    SessionRow {
+                        id: 44,
+                        name: "GPUI step proof".to_string(),
+                        state: "execution".to_string(),
+                        my_role: "Commando".to_string(),
+                        judge: false,
+                    },
+                    SessionRow {
+                        id: 38,
+                        name: "probe-gm-roule".to_string(),
+                        state: "preparation".to_string(),
+                        my_role: "Penyelenggara".to_string(),
+                        judge: true,
+                    },
+                    SessionRow {
+                        id: 9,
+                        name: "Game 8".to_string(),
+                        state: "planning".to_string(),
+                        my_role: "Commando".to_string(),
+                        judge: false,
+                    },
+                ]
+            } else {
+                Vec::new()
+            },
+            hold_busy: false,
+            hold_status: String::new(),
             session,
             helm_heading: None,
             helm_speed: None,
@@ -1385,6 +1471,24 @@ impl IslandDemo {
             end_busy: false,
             end_status: String::new(),
             fleet_open: std::env::var("TFG_FLEET").as_deref() == Ok("1"),
+            dragging: false,
+            thumbs: HashMap::new(),
+            fleet_tax: FleetTaxonomy::default(),
+            // Seeded drill for a headless capture: the leaf column (and its
+            // thumbnails) is four clicks deep, and a capture cannot click.
+            // Same precedent as `TFG_SEL` — pin the state, never the gesture.
+            drill_group: std::env::var("TFG_DRILL_GROUP")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            drill_category: std::env::var("TFG_DRILL_CATEGORY")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            drill_type: std::env::var("TFG_DRILL_TYPE")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            drill_class: std::env::var("TFG_DRILL_CLASS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
             player_open: std::env::var("TFG_PLAYER").as_deref() == Ok("1"),
             // Seeded open for a headless capture: the host whose
             // passengers the modal reads. The read itself fires from the
@@ -1402,6 +1506,9 @@ impl IslandDemo {
             roster_draft: crate::roster::RosterDraft::new(),
             force_busy: false,
             force_status: String::new(),
+            deploy_busy: false,
+            pending_place: None,
+            place_down: None,
             // `TFG_RELATE` is seeded above, with the working set the open
             // would have built — the literal only takes the values.
             relate_open,
@@ -2056,10 +2163,12 @@ impl IslandDemo {
             view::IslandKey::Crew => self.crew_open,
             view::IslandKey::Command => self.command_open,
             view::IslandKey::Step => self.step_open,
-            // Identity and the register are the column's floor, present in
-            // every state: a way to close them would be a way to be left
-            // with an empty console and no sign-out.
-            view::IslandKey::Fleet | view::IslandKey::Operator => true,
+            // Identity, the register and the picker are the column's floor,
+            // present in every state they appear in: a way to close them
+            // would be a way to be left with an empty console and no
+            // sign-out — and closing the picker would strand the one verb
+            // that holds a game at all.
+            view::IslandKey::Fleet | view::IslandKey::Operator | view::IslandKey::Sessions => true,
             // The plan's own terms, its clock and its gate. Closing them
             // would leave the column unable to say what is being planned or
             // whether it may start — the two questions planning exists to
@@ -2083,6 +2192,7 @@ impl IslandDemo {
             view::IslandKey::Step => self.step_open = open,
             view::IslandKey::Fleet
             | view::IslandKey::Operator
+            | view::IslandKey::Sessions
             | view::IslandKey::Essentials
             | view::IslandKey::Control
             | view::IslandKey::Review
@@ -2110,6 +2220,7 @@ impl IslandDemo {
             view::IslandKey::Step => self.step_body(cx),
             view::IslandKey::Log => self.log_body(cx),
             view::IslandKey::Assessment => self.assessment_body(cx),
+            view::IslandKey::Sessions => self.sessions_body(cx),
         }
     }
 
@@ -2168,6 +2279,9 @@ impl IslandDemo {
                 Some(_) => "PLAYING".to_string(),
                 None => "\u{2014}".to_string(),
             },
+            // The picker counts what it shows, like the register counts
+            // its draft: the games this account can see.
+            view::IslandKey::Sessions => format!("{} SESSIONS", self.sessions.len()),
             // Neither island carries a count in the console either —
             // `side_zone` builds both without a `with_trailing` — and a
             // band note that the surface it belongs to never had is an
@@ -2730,13 +2844,94 @@ impl IslandDemo {
     /// The Fleet picker: the register it is chosen from, and the force being
     /// chosen.
     ///
+    /// The drill's effective rungs: the selection, or the first tab/row when
+    /// untouched, so an unseeded open still shows a full column set. The
+    /// lookups are id-keyed, never positional — a re-sync that reorders rows
+    /// must not move the operator's drill.
+    fn drill_group_id(&self) -> Option<i64> {
+        self.drill_group
+            .or_else(|| self.fleet_tax.groups.first().map(|g| g.id))
+    }
+
+    fn drill_cats(&self) -> &[FleetTaxCat] {
+        let Some(id) = self.drill_group_id() else {
+            return &[];
+        };
+        self.fleet_tax
+            .groups
+            .iter()
+            .find(|g| g.id == id)
+            .map(|g| g.cats.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn drill_types(&self) -> &[FleetTaxType] {
+        let Some(id) = self.drill_category else {
+            return &[];
+        };
+        self.drill_cats()
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.types.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn drill_classes(&self) -> &[FleetTaxClass] {
+        let Some(id) = self.drill_type else {
+            return &[];
+        };
+        self.drill_types()
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.classes.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn drill_units(&self) -> &[FleetTaxLeaf] {
+        let Some(id) = self.drill_class else {
+            return &[];
+        };
+        self.drill_classes()
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.units.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Drill moves, one rung each. A parent change clears everything below
+    /// it — the console's `drill_*` rule: a category from another group with
+    /// a stale class under it would show rows the columns disown.
+    fn select_group(&mut self, id: i64) {
+        self.drill_group = Some(id);
+        self.drill_category = None;
+        self.drill_type = None;
+        self.drill_class = None;
+    }
+
+    fn select_category(&mut self, id: i64) {
+        self.drill_category = Some(id);
+        self.drill_type = None;
+        self.drill_class = None;
+    }
+
+    fn select_type(&mut self, id: i64) {
+        self.drill_type = Some(id);
+        self.drill_class = None;
+    }
+
+    fn select_class(&mut self, id: i64) {
+        self.drill_class = Some(id);
+    }
+
     /// The console's `fleet_picker_modal` — Miller columns over the register,
-    /// one branch at a time, with a drag onto the map to place. This is the
-    /// read-and-stage half: the register's rows and the draft's rows, with the
-    /// commander each hull is handed to, because that is the one thing Minos
-    /// requires of a piece and the one thing the operator has to say. There is
-    /// no drag, because there is no map drop in this shell, and a row that
-    /// looked draggable would be a control that does nothing.
+    /// Asset Group > Category > Type > Class > hull, with the glyph thumbnail
+    /// on every leaf. This is the read-and-stage half: the register's rows
+    /// and the draft's rows, with the commander each hull is handed to,
+    /// because that is the one thing Minos requires of a piece and the one
+    /// thing the operator has to say. Dragging a leaf lifts the hull: a
+    /// release over bare map deploys it there, a release on a placed host's
+    /// marker embarks it aboard — through `DeployUnit` and `EmbarkDrop`,
+    /// the same verbs click-to-place and the embark buttons use.
     ///
     /// Every edit posts at once — `stage_assign` plans the whole draft against
     /// the server and sends it — so what the picker shows is never ahead of
@@ -2787,31 +2982,59 @@ impl IslandDemo {
                 ),
         );
         col = col.child(separator());
-        // Fixed header, scrolling list — the cut the Player picker uses. A
-        // force of any size now fits the same panel.
-        let mut list = div()
-            .id("fleet-picker-list")
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .flex_1()
-            .overflow_y_scroll();
         // The force first: it is what the operator came to change, and the
-        // register is the means.
-        list = list.child(small(format!(
+        // register is the means. Content height, not a scroll: in drill mode
+        // the miller columns below own the scroll; in flat mode this whole
+        // block rides at the top of the scrolling list.
+        let mut force = div().flex().flex_col().gap(px(4.0));
+        force = force.child(small(format!(
             "IN THE EXERCISE \u{2014} {}",
             self.session.pieces.len()
         )));
         let crew = self.crew_choices();
         if crew.is_empty() {
-            list = list.child(small(
+            force = force.child(small(
                 "Nobody is seated, and Minos gives every piece a commander \u{2014} \
                  seat the room on the Players island first."
                     .to_string(),
             ));
+            // The one-click way in: the operator's own seat, as a
+            // player-side role. A fresh game seats nobody — not even its
+            // creator, the server's rule, not ours — and a drop refused for
+            // no seat with no way forward is a wall. These pills stage
+            // exactly what the Players island would (same `stage_seat`, same
+            // call-sign rule), for the one choice nobody has to make: which
+            // seat is theirs. Player-side roles only — the server refuses a
+            // judge-side commander outright, so an organizer pill would seat
+            // you beautifully and leave every drop refused.
+            if self.session.me != 0 {
+                for role in self.player_roles() {
+                    let me = self.session.me;
+                    let name = self.own_name();
+                    let role_name = role.name.clone();
+                    let label = format!("seat me as {role_name}");
+                    force = force.child(
+                        div()
+                            .id(("seat-me", role.id as usize))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                match view.stage_seat(me, &name, &role) {
+                                    Ok(()) => {
+                                        view.force_status = format!(
+                                            "seated as {role_name} \u{2014} drag away"
+                                        )
+                                    }
+                                    Err(why) => view.force_status = why,
+                                }
+                                cx.notify();
+                            }))
+                            .child(button(label, true, false, false)),
+                    );
+                }
+            }
         }
         if self.session.pieces.is_empty() {
-            list = list.child(small("No pieces yet.".to_string()));
+            force = force.child(small("No pieces yet.".to_string()));
         }
         for p in self.session.pieces.clone() {
             let p_label = p.label.clone();
@@ -2885,18 +3108,30 @@ impl IslandDemo {
                     }))
                     .child(button("remove", true, false, false)),
             );
-            list = list.child(row);
+            force = force.child(row);
         }
-        list = list.child(separator());
-        list = list.child(small("THE REGISTER".to_string()));
-        if !self.force_status.is_empty() {
-            list = list.child(
-                div()
-                    .text_size(px(10.5))
-                    .text_color(rgba(if self.force_busy { BODY_SILVER } else { ALERT_YELLOW }))
-                    .child(self.force_status.clone()),
-            );
-        }
+        if self.fleet_tax.groups.is_empty() {
+            // No taxonomy (fixture runs, offline machines): the flat
+            // register list, capped — the picker's old shape, kept as the
+            // fallback rather than showing an empty drill.
+            let mut list = div()
+                .id("fleet-picker-list")
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .flex_1()
+                .overflow_y_scroll();
+            list = list.child(force);
+            list = list.child(separator());
+            list = list.child(small("THE REGISTER".to_string()));
+            if !self.force_status.is_empty() {
+                list = list.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgba(if self.force_busy { BODY_SILVER } else { ALERT_YELLOW }))
+                        .child(self.force_status.clone()),
+                );
+            }
         // One register row per hull, capped: the picker is a card, and the
         // island's own count says how many exist beyond it.
         let in_draft: Vec<i64> = self.session.pieces.iter().map(|p| p.id).collect();
@@ -2955,7 +3190,497 @@ impl IslandDemo {
             self.roster.len().min(24),
             self.roster_total
         )));
-        col.child(list).into_any_element()
+            col.child(list).into_any_element()
+        } else {
+            // The drill: asset-group tabs, a breadcrumb, and four columns —
+            // Category | Type | Class | Hull — the egui picker's shape. The
+            // columns row owns the scroll (each column scrolls alone), so the
+            // force above stays pinned while the register drills.
+            col.child(force)
+                .child(separator())
+                .child(small("THE REGISTER".to_string()))
+                .child(self.drill_status_line())
+                .child(self.drill_tabs(cx))
+                .child(self.drill_crumbs(cx))
+                .child(self.drill_columns(cx))
+                .into_any_element()
+        }
+    }
+
+    /// A hull's face: its photograph when the fetcher has landed one, the
+    /// glyph otherwise — the same face on the row and the ghost, so the
+    /// hand never swaps pictures. A rounded rect at the photo's own aspect
+    /// (covered, never letterboxed), never a cropped circle: ship photos
+    /// are wide, and a disc throws half the hull away before it even gets
+    /// small.
+    fn thumb_face(thumb: Option<Arc<gpui::RenderImage>>, symbol: MapSymbolShape) -> AnyElement {
+        // 56×38 at ~3:2, the shape of the archive's own photos; fetched
+        // at 192px so the shrink stays ahead of the paint.
+        const W: f32 = 56.0;
+        const H: f32 = 38.0;
+        let mut face = div()
+            .w(px(W))
+            .h(px(H))
+            .flex_shrink_0()
+            .rounded(px(6.0))
+            .overflow_hidden()
+            .bg(rgba(PANEL_SLATE));
+        if let Some(photo) = thumb {
+            face = face.child(img(photo).w_full().h_full().object_fit(ObjectFit::Cover));
+        } else {
+            face = face.child(
+                canvas(
+                    |b, _, _| b,
+                    move |b, _, window, _| {
+                        let cx = f32::from(b.origin.x) + W / 2.0;
+                        let cy = f32::from(b.origin.y) + H / 2.0;
+                        paint_glyph(window, (cx, cy), symbol, MAP_INK, 1.0);
+                    },
+                )
+                .size_full(),
+            );
+        }
+        face.into_any_element()
+    }
+
+    /// A leaf's thumbnail: its photograph when the fetcher has landed one,
+    /// the glyph disc otherwise. The photo covers the 28px disc (clipped
+    /// by the rounded parent) — a hull portrait, not a stamp.
+    fn leaf_thumb(&self, leaf: &FleetTaxLeaf) -> AnyElement {
+        let id = leaf.id.parse::<i64>().unwrap_or(-1);
+        Self::thumb_face(self.thumbs.get(&id).cloned(), leaf.symbol)
+    }
+
+    /// The picker's verdict line, shared by the flat list and the drill —
+    /// a refusal from `force::plan` lands here either way.
+    fn drill_status_line(&self) -> AnyElement {
+        if self.force_status.is_empty() {
+            return div().into_any_element();
+        }
+        div()
+            .text_size(px(10.5))
+            .text_color(rgba(if self.force_busy { BODY_SILVER } else { ALERT_YELLOW }))
+            .child(self.force_status.clone())
+            .into_any_element()
+    }
+
+    /// Asset-group tabs: one pill per group with its live-hull count. A tab
+    /// change clears the whole drill below it — the console's rule, through
+    /// `select_group`.
+    fn drill_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.drill_group_id();
+        let mut row = div().flex().flex_row().flex_wrap().gap(px(6.0));
+        for g in self.fleet_tax.groups.clone() {
+            let on = Some(g.id) == active;
+            let (fill, border, ink) = if on {
+                (RADAR_CYAN, RADAR_CYAN, DEEP_WELL)
+            } else {
+                (BUTTON_GRAPHITE, HAIRLINE_SLATE, BUTTON_LABEL)
+            };
+            let id = g.id;
+            row = row.child(
+                div()
+                    .id(("drill-tab", id as usize))
+                    .cursor_pointer()
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .rounded(px(CONTROL_RADIUS))
+                    .bg(rgba(fill))
+                    .border(px(1.0))
+                    .border_color(rgba(border))
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(TEXT_BUTTON_PT))
+                    .text_color(rgba(ink))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.select_group(id);
+                        cx.notify();
+                    }))
+                    .child(format!("{} ({})", g.name, g.count)),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// Where the drill stands, rung by rung. Each crumb jumps back — the
+    /// rung stays, everything below it clears, through the same `select_*`
+    /// the columns use.
+    fn drill_crumbs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap(px(4.0))
+            .font_family(view::FACE_HUMAN)
+            .text_size(px(10.5));
+        let crumb = |label: String| {
+            div()
+                .text_color(rgba(MAP_INK))
+                .child(label)
+        };
+        let sep = || {
+            div()
+                .text_color(rgba(BODY_SILVER))
+                .child("/".to_string())
+        };
+        row = row.child(
+            crumb("Fleet".to_string())
+                .id("drill-crumb-root")
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _, _, cx| {
+                view.drill_category = None;
+                view.drill_type = None;
+                view.drill_class = None;
+                cx.notify();
+            })),
+        );
+        let group_name = self
+            .fleet_tax
+            .groups
+            .iter()
+            .find(|g| Some(g.id) == self.drill_group_id())
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        if !group_name.is_empty() {
+            row = row.child(sep());
+            row = row.child(crumb(group_name));
+        }
+        let mut named: Vec<(String, i64, u8)> = Vec::new();
+        for c in self.drill_cats() {
+            if Some(c.id) == self.drill_category {
+                named.push((c.name.clone(), c.id, 0));
+            }
+        }
+        for t in self.drill_types() {
+            if Some(t.id) == self.drill_type {
+                named.push((t.name.clone(), t.id, 1));
+            }
+        }
+        for c in self.drill_classes() {
+            if Some(c.id) == self.drill_class {
+                named.push((c.name.clone(), c.id, 2));
+            }
+        }
+        for (label, id, rung) in named {
+            row = row.child(sep());
+            row = row.child(
+                crumb(label)
+                    .id(("drill-crumb", rung as usize * 1_000_000 + id as usize))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        match rung {
+                            0 => view.select_category(id),
+                            1 => view.select_type(id),
+                            _ => view.select_class(id),
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// The four miller columns. Each column is a title plus its own scroll,
+    /// at egui's widths scaled to this modal (3 × 128 + a flex leaf). An
+    /// undrilled column names what it waits on rather than showing rows
+    /// from a rung the operator has not picked — the console's
+    /// `Pick ← first` prompts, in words.
+    fn drill_columns(&self, cx: &mut Context<Self>) -> AnyElement {
+        let cats = self.drill_cats().to_vec();
+        let types = self.drill_types().to_vec();
+        let classes = self.drill_classes().to_vec();
+        let units = self.drill_units().to_vec();
+        let sel_cat = self.drill_category;
+        let sel_type = self.drill_type;
+        let sel_class = self.drill_class;
+        let in_draft: Vec<i64> = self.session.pieces.iter().map(|p| p.id).collect();
+        let title = |t: String| {
+            div()
+                .font_family(view::FACE_HUMAN)
+                .text_size(px(10.5))
+                .text_color(rgba(BODY_SILVER))
+                .child(t)
+        };
+        let prompt = |t: &str| {
+            div()
+                .px(px(4.0))
+                .py(px(6.0))
+                .text_size(px(10.5))
+                .text_color(rgba(BODY_SILVER))
+                .child(t.to_string())
+        };
+        // One taxonomy row: the name, its live-hull count, and the wash when
+        // it owns the drill below it.
+        let tax_row = |label: String, count: i64, on: bool| {
+            let mut el = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(6.0))
+                .px(px(6.0))
+                .py(px(4.0))
+                .rounded(px(3.0))
+                .cursor_pointer()
+                .font_family(view::FACE_HUMAN)
+                .text_size(px(11.0))
+                .text_color(rgba(if on { MAP_INK } else { BODY_SILVER }));
+            if on {
+                el = el.bg(rgba(BUTTON_GRAPHITE));
+            }
+            el.child(div().flex_1().child(label))
+                .child(div().text_size(px(10.0)).child(format!("{count}")))
+        };
+        let mut cat_col = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .w(px(128.0))
+            .flex_shrink_0()
+            .child(title(format!("CATEGORY ({})", cats.len())));
+        let mut cat_list = div()
+            .id("drill-col-cat")
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .flex_1()
+            .overflow_y_scroll();
+        for c in cats {
+            let id = c.id;
+            let on = sel_cat == Some(id);
+            cat_list = cat_list.child(
+                div()
+                    .id(("drill-cat", id as usize))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.select_category(id);
+                        cx.notify();
+                    }))
+                    .child(tax_row(c.name.clone(), c.count, on)),
+            );
+        }
+        cat_col = cat_col.child(cat_list);
+        let mut type_col = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .w(px(128.0))
+            .flex_shrink_0()
+            .child(title(format!("TYPE ({})", types.len())));
+        if sel_cat.is_none() {
+            type_col = type_col.child(prompt("Pick a category first"));
+        } else {
+            let mut l = div()
+                .id("drill-col-type")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .flex_1()
+                .overflow_y_scroll();
+            if types.is_empty() {
+                l = l.child(prompt("No types yet"));
+            }
+            for t in types {
+                let id = t.id;
+                let on = sel_type == Some(id);
+                l = l.child(
+                    div()
+                        .id(("drill-type", id as usize))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.select_type(id);
+                            cx.notify();
+                        }))
+                        .child(tax_row(t.name.clone(), t.count, on)),
+                );
+            }
+            type_col = type_col.child(l);
+        }
+        let mut class_col = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .w(px(128.0))
+            .flex_shrink_0()
+            .child(title(format!("CLASS ({})", classes.len())));
+        if sel_type.is_none() {
+            class_col = class_col.child(prompt("Pick a type first"));
+        } else {
+            let mut l = div()
+                .id("drill-col-class")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .flex_1()
+                .overflow_y_scroll();
+            if classes.is_empty() {
+                l = l.child(prompt("No classes yet"));
+            }
+            for c in classes {
+                let id = c.id;
+                let on = sel_class == Some(id);
+                l = l.child(
+                    div()
+                        .id(("drill-class", id as usize))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.select_class(id);
+                            cx.notify();
+                        }))
+                        .child(tax_row(c.name.clone(), c.count, on)),
+                );
+            }
+            class_col = class_col.child(l);
+        }
+        let mut leaf_col = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .flex_1()
+            .child(title(format!("HULL ({})", units.len())));
+        if sel_class.is_none() {
+            leaf_col = leaf_col.child(prompt("Pick a class \u{2014} the hulls list here"));
+        } else {
+            let mut l = div()
+                .id("drill-col-leaf")
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .flex_1()
+                .overflow_y_scroll();
+            if units.is_empty() {
+                l = l.child(prompt("No hulls in this class"));
+            }
+            for u in units {
+                let unit_id = u.id.parse::<i64>().unwrap_or(-1);
+                let taken = in_draft.contains(&unit_id);
+                let name = u.name.clone();
+                // The drag source: the whole row arms the hull, and the ghost
+                // carries its thumbnail and name. The map surface drops it:
+                // bare map deploys, a placed host's marker embarks.
+                let payload = UnitDragPayload::for_leaf(
+                    &u,
+                    self.thumbs.get(&unit_id).cloned(),
+                );
+                let ghost_name = u.name.clone();
+                let ghost_symbol = u.symbol;
+                let ghost_thumb = self.thumbs.get(&unit_id).cloned();
+                let sub = if u.hull.is_empty() {
+                    u.class_name.clone()
+                } else {
+                    format!("{} \u{00b7} {}", u.hull, u.class_name)
+                };
+                // The row stacks: identity line, then verbs. A single line
+                // cannot hold a 30-character name plus two pills in a 252pt
+                // leaf — the text's minimum shoves the verbs off the modal,
+                // and no truncate/w_full/flex_1 combination in this toolkit
+                // shrinks it (three captures proved it). Stacked, the text
+                // ellipsizes against the full column width and the verbs
+                // always fit. Taller than the console's 46pt pitch, which
+                // had 232pt of leaf to spend and this modal does not.
+                let mut verbs = div().flex().flex_row().justify_end().gap(px(6.0));
+                verbs = verbs.child(
+                    div()
+                        .id(("drill-add", unit_id as usize))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            let who = view.session.me;
+                            if view.crew_choices().iter().all(|(id, _)| *id != who) {
+                                view.force_status =
+                                    "your account holds no seat in this room".to_string();
+                                cx.notify();
+                                return;
+                            }
+                            match view.stage_assign(unit_id, &name, who) {
+                                Ok(()) => {
+                                    view.force_status = "piece assigned".to_string()
+                                }
+                                Err(why) => view.force_status = why,
+                            }
+                            cx.notify();
+                        }))
+                        .child(button(
+                            if taken { "assigned" } else { "add" },
+                            true,
+                            taken,
+                            false,
+                        )),
+                );
+                // Click-to-place, the drag's fallback: only a drafted hull
+                // can hold a starting position, so only a taken row arms.
+                // The button says what the next map click will do.
+                if taken {
+                    let place_name = u.name.clone();
+                    verbs = verbs.child(
+                        div()
+                            .id(("drill-place", unit_id as usize))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.arm_place(unit_id, &place_name, cx);
+                            }))
+                            .child(button("place", true, false, false)),
+                    );
+                }
+                l = l.child(
+                    div()
+                        .id(("drill-drag", unit_id as usize))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .px(px(4.0))
+                        .py(px(4.0))
+                        .rounded(px(3.0))
+                        .w_full()
+                        .on_drag(payload, move |_, _, _, cx| {
+                            cx.new(|_| DragGhost {
+                                name: ghost_name.clone(),
+                                symbol: ghost_symbol,
+                                thumb: ghost_thumb.clone(),
+                            })
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(self.leaf_thumb(&u))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .text_size(px(11.0))
+                                                .text_color(rgba(MAP_INK))
+                                                .truncate()
+                                                .child(u.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.0))
+                                                .text_color(rgba(BODY_SILVER))
+                                                .truncate()
+                                                .child(sub),
+                                        ),
+                                ),
+                        )
+                        .child(verbs),
+                );
+            }
+            leaf_col = leaf_col.child(l);
+        }
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(8.0))
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(cat_col)
+            .child(type_col)
+            .child(class_col)
+            .child(leaf_col)
+            .into_any_element()
     }
 
     fn fleet_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -3234,6 +3959,88 @@ impl IslandDemo {
                     col = col.child(small(self.embark_status.clone()));
                 }
             }
+        }
+        col.into_any_element()
+    }
+
+    /// SESSIONS — the games to hold, and the verb that holds one.
+    ///
+    /// The console's `z.start` minus its create button, which lives on the
+    /// band here. One row per game the sign-in read, in the server's own
+    /// order: the name bright, the state and this seat dimmed beside it
+    /// (or "not seated", for a game this account only watches). The row IS
+    /// the verb — a picker with a separate hold button would be two steps
+    /// for one decision — and holding replaces the session whole, so the
+    /// column recomposes around the held game on the next frame.
+    fn sessions_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let small = |t: String| {
+            div()
+                .font_family(view::FACE_HUMAN)
+                .text_size(px(11.0))
+                .text_color(rgba(BODY_SILVER))
+                .child(t)
+        };
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .p(px(PAD))
+            .pr(px(CUT + 8.0));
+        if self.sessions.is_empty() {
+            return col
+                .child(small("No sessions listed \u{2014} sign out and back in to read them.".into()))
+                .into_any_element();
+        }
+        for s in &self.sessions {
+            let id = s.id;
+            let seat = if s.my_role.is_empty() {
+                "not seated".to_string()
+            } else if s.judge {
+                format!("{} \u{00b7} judge", s.my_role)
+            } else {
+                s.my_role.clone()
+            };
+            col = col.child(
+                div()
+                    .id(("session-hold", id as usize))
+                    .cursor_pointer()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(6.0))
+                    .py(px(4.0))
+                    .rounded(px(CONTROL_RADIUS))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.send_hold(id, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(11.0))
+                            .text_color(rgba(MAP_INK))
+                            .child(s.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family(view::FACE_MACHINE)
+                            .text_size(px(10.5))
+                            .text_color(rgba(BODY_SILVER))
+                            .child(s.state.to_uppercase()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(10.5))
+                            .text_color(rgba(BODY_SILVER))
+                            .child(seat),
+                    ),
+            );
+        }
+        // The hold's own verdict line: refusals land here, never silently.
+        if !self.hold_status.is_empty() {
+            col = col.child(small(self.hold_status.clone()));
         }
         col.into_any_element()
     }
@@ -3950,6 +4757,166 @@ impl IslandDemo {
         self.sync_force()
     }
 
+    /// Deploy a hull at map-view fractions: latch the flight, say so on the
+    /// picker's line, and post. The answer is a re-read session on the shared
+    /// feed, applied under `deploy_busy` — the same shape as `sync_force`,
+    /// a separate latch so the two flights never share a verdict.
+    fn send_deploy(&mut self, unit_id: i64, fx: f64, fy: f64, cx: &mut Context<Self>) {
+        self.deploy_busy = true;
+        self.pending_place = None;
+        self.place_down = None;
+        self.force_status = "placing\u{2026}".to_string();
+        let _ = self
+            .order_tx
+            .send(ToBinary::DeployUnit { unit_id, fx, fy });
+        cx.notify();
+    }
+
+    /// A register hull dropped on the map: placing IS assigning. A hull
+    /// already in the exercise deploys (or embarks, on a host) exactly as
+    /// before; a hull outside it is assigned first — to the operator's own
+    /// seat, the same default the add button uses — and the binary chains
+    /// the placement behind the assignment in one verb, so the two can
+    /// never half-commit. Without a seat there is nothing to hand it to,
+    /// and the refusal says so instead of spending the round trip.
+    fn drop_unit(
+        &mut self,
+        unit_id: i64,
+        name: &str,
+        fx: f64,
+        fy: f64,
+        host: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        let taken = self.session.pieces.iter().any(|p| p.id == unit_id);
+        if taken {
+            if let Some(host) = host {
+                self.send_embark(host, unit_id, name, cx);
+            } else {
+                self.send_deploy(unit_id, fx, fy, cx);
+            }
+            return;
+        }
+        let who = self.session.me;
+        if self.crew_choices().iter().all(|(id, _)| *id != who) {
+            // Point at the pills when there are any: a refusal with no way
+            // forward is the wall the seat-me pills exist to remove.
+            self.force_status = if who != 0 && !self.player_roles().is_empty() {
+                "you hold no seat \u{2014} take a player seat above, then drop again"
+                    .to_string()
+            } else {
+                "your account holds no seat in this room".to_string()
+            };
+            cx.notify();
+            return;
+        }
+        // A judge-side seat may not command: the server refuses the write
+        // outright ("a judge-side participant does not command units"), so
+        // refuse here with the way forward rather than spending the round
+        // trip to hear it.
+        if self.own_steers() == Some(false) {
+            self.force_status = "your seat is judge-side \u{2014} it directs, it does not command; take a player seat on the Players island".to_string();
+            cx.notify();
+            return;
+        }
+        if let Some(host) = host {
+            self.embark_busy = true;
+            self.embark_status = format!("assigning {name} and embarking aboard {host}\u{2026}");
+            self.force_status = format!("assigning {name} and embarking aboard {host}\u{2026}");
+            let _ = self.order_tx.send(ToBinary::EmbarkAssign {
+                host,
+                child: unit_id,
+                commander_id: who,
+            });
+        } else {
+            self.deploy_busy = true;
+            self.pending_place = None;
+            self.place_down = None;
+            self.force_status = format!("assigning {name} and placing\u{2026}");
+            let _ = self.order_tx.send(ToBinary::DeployAssign {
+                unit_id,
+                commander_id: who,
+                fx,
+                fy,
+            });
+        }
+        cx.notify();
+    }
+
+    /// Embark a dragged hull aboard a placed host: latch the flight on the
+    /// embark side (the answer lands on its feed, like every embark write)
+    /// and say so on the picker's line too, because the drop started there.
+    ///
+    /// Same local refusal as the deploy: embarkation is per-piece, and a
+    /// hull outside the exercise has no embarkation row for the server to
+    /// find.
+    fn send_embark(&mut self, host: i64, child: i64, name: &str, cx: &mut Context<Self>) {
+        if !self.session.pieces.iter().any(|p| p.id == child) {
+            self.force_status =
+                format!("{name} isn't in the exercise yet \u{2014} add it first, then embark it");
+            cx.notify();
+            return;
+        }
+        self.embark_busy = true;
+        self.embark_status = format!("embarking {name} aboard {host}\u{2026}");
+        self.force_status = format!("embarking {name} aboard {host}\u{2026}");
+        let _ = self.order_tx.send(ToBinary::EmbarkDrop { host, child });
+        cx.notify();
+    }
+
+    /// A drag started or ended elsewhere (GPUI owns the state; the tick
+    /// polls it). The fleet picker hides for the drag's lifetime so the
+    /// drop can land anywhere on the map — a modal over the middle of the
+    /// ocean is a wall between the hull and its water.
+    fn set_dragging(&mut self, dragging: bool, cx: &mut Context<Self>) {
+        if self.dragging != dragging {
+            self.dragging = dragging;
+            cx.notify();
+        }
+    }
+
+    /// Arm click-to-place for a drafted hull: the next map click that stays
+    /// put deploys it there. The drag needs no arming — its release IS the
+    /// click — so this is purely the pointer-impaired and harness path.
+    fn arm_place(&mut self, unit_id: i64, name: &str, cx: &mut Context<Self>) {
+        self.pending_place = Some(unit_id);
+        self.place_down = None;
+        self.force_status = format!("click the map to place {name} \u{2014} or drag the row");
+        cx.notify();
+    }
+
+    /// The host a drop lands on, if it lands on one: the nearest PLACED
+    /// piece's live marker within 20 map px of the drop fractions. Markers
+    /// arrive in the frame's pixel space (`map_dims`), and fractions scale
+    /// back into it — the same fraction round-trip the deploy side uses, in
+    /// reverse. Unplaced pieces are not hosts: there is no marker for a
+    /// hull with no position, and a drop near one's roster row is a deploy.
+    fn drop_host_at(&self, fx: f64, fy: f64) -> Option<i64> {
+        let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
+        if mw <= 0.0 || mh <= 0.0 {
+            return None;
+        }
+        let (px, py) = (fx * mw, fy * mh);
+        let placed: Vec<i64> = self
+            .session
+            .pieces
+            .iter()
+            .filter(|p| p.placed)
+            .map(|p| p.id)
+            .collect();
+        self.live
+            .iter()
+            .filter(|m| m.id.parse::<i64>().is_ok_and(|id| placed.contains(&id)))
+            .map(|m| {
+                let id = m.id.parse::<i64>().unwrap_or(-1);
+                let d = (m.x - px).hypot(m.y - py);
+                (d, id)
+            })
+            .filter(|(d, _)| *d <= 20.0)
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(_, id)| id)
+    }
+
     /// Plan the draft against the server and post the whole plan.
     ///
     /// `Err` carries `ForceGap`'s own sentence and sends nothing — including
@@ -3982,6 +4949,43 @@ impl IslandDemo {
                 role_id: p.role_id,
             })
             .collect()
+    }
+
+    /// The player-side seats: roles that may command hulls. The server
+    /// refuses a judge-side commander outright ("a judge-side participant
+    /// does not command units"), so the seat-me pills offer exactly these —
+    /// an organizer pill would seat you beautifully and leave every drop
+    /// refused. Empty when the game defines no player role, and then
+    /// seating stays the Players island's job.
+    fn player_roles(&self) -> Vec<RoleRow> {
+        self.session
+            .roles
+            .iter()
+            .filter(|r| !r.judge)
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the operator's own seat steers: `None` unseated, `Some`
+    /// whether the held role is judge-side. The drop needs a steering
+    /// seat — organizers direct, they do not command.
+    fn own_steers(&self) -> Option<bool> {
+        let held = self.session.people.iter().find(|p| p.id == self.session.me)?;
+        let role = self.session.roles.iter().find(|r| r.id == held.role_id)?;
+        Some(!role.judge)
+    }
+
+    /// The operator's own display name: the directory's row for this seat,
+    /// or the sign-in identifier when the room holds no row for them — and
+    /// an unseated operator is exactly who needs this. Feeds `stage_seat`,
+    /// whose call-sign rule derives from the name.
+    fn own_name(&self) -> String {
+        self.session
+            .directory
+            .iter()
+            .find(|d| d.id == self.session.me)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| self.login_identifier.clone())
     }
 
     /// Seat an account as a role, and post the plan.
@@ -4338,6 +5342,33 @@ impl IslandDemo {
     fn apply_end(&mut self, session: SessionView) {
         self.end_busy = false;
         self.end_status.clear();
+        self.session = session;
+    }
+
+    /// Hold the picked game — the picker's verb, as a message. The binary
+    /// owns the re-read; the shell only names the id the row drew, never a
+    /// cached guess.
+    ///
+    /// Returns whether a request went out, so a test exercises exactly
+    /// what the click does.
+    fn send_hold(&mut self, game_id: i64, cx: &mut Context<Self>) -> bool {
+        if self.hold_busy {
+            return false;
+        }
+        self.hold_busy = true;
+        self.hold_status = "holding the session\u{2026}".to_string();
+        let _ = self.order_tx.send(ToBinary::HoldSession { game_id });
+        cx.notify();
+        true
+    }
+
+    /// Hold the re-read session a hold answer returned: the picked game
+    /// arrives read back rather than assumed, and the column recomposes
+    /// around it. A method rather than inline handling so a test holds
+    /// exactly what the drain holds.
+    fn apply_hold(&mut self, session: SessionView) {
+        self.hold_busy = false;
+        self.hold_status.clear();
         self.session = session;
     }
 
@@ -8174,14 +9205,38 @@ impl Render for IslandDemo {
                     // exactly the gestures on bare map, with no exclusion list
                     // to keep in step with the chrome.
                     .id("map-surface")
+                    // Armed, the surface shows it: a crosshair where a pan
+                    // would be, because the next click that stays put places
+                    // instead of panning.
+                    .cursor(if self.pending_place.is_some() {
+                        CursorStyle::Crosshair
+                    } else {
+                        CursorStyle::Arrow
+                    })
                     .on_mouse_down(MouseButton::Left, cx.listener(|view, ev: &MouseDownEvent, _, _| {
-                        view.pan = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
+                        let at = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        // Armed, the press anchors instead of panning: only a
+                        // press that stays put places, and a press that moves
+                        // past 6px becomes a pan like any other.
+                        if view.pending_place.is_some() {
+                            view.place_down = Some(at);
+                        } else {
+                            view.pan = Some(at);
+                        }
                     }))
                     .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, window, cx| {
+                        let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        if let Some((ax, ay)) = view.place_down {
+                            if (x - ax).hypot(y - ay) > 6.0 {
+                                view.pan = Some((x, y));
+                                view.place_down = None;
+                            } else {
+                                return;
+                            }
+                        }
                         let Some((lx, ly)) = view.pan else {
                             return;
                         };
-                        let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
                         let (mw, mh) = view.map_dims;
                         let vp = viewport(window);
                         view.pan = Some((x, y));
@@ -8193,11 +9248,70 @@ impl Render for IslandDemo {
                             );
                         }
                     }))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, cx| {
+                    .on_mouse_up(MouseButton::Left, cx.listener(|view, ev: &MouseUpEvent, window, cx| {
+                        // The armed click: a press that never became a pan
+                        // deploys the armed hull at the release fractions.
+                        // Strict, unlike the drop: the arm was struck on a
+                        // drafted row, and a hull that left the exercise
+                        // since is refused rather than silently re-added by
+                        // a click.
+                        if view.place_down.take().is_some() {
+                            let vp = viewport(window);
+                            if vp.2 > 0.0 && vp.3 > 0.0 {
+                                let fx = f64::from(f32::from(ev.position.x) / vp.2)
+                                    .clamp(0.0, 1.0);
+                                let fy = f64::from(f32::from(ev.position.y) / vp.3)
+                                    .clamp(0.0, 1.0);
+                                if let Some(unit_id) = view.pending_place {
+                                    if view.session.pieces.iter().any(|p| p.id == unit_id) {
+                                        view.send_deploy(unit_id, fx, fy, cx);
+                                        return;
+                                    }
+                                    view.force_status =
+                                        "that hull left the exercise \u{2014} add it again first"
+                                            .to_string();
+                                }
+                            }
+                            view.pending_place = None;
+                            cx.notify();
+                            return;
+                        }
                         if view.pan.take().is_some() {
                             cx.notify();
                         }
                     }))
+                    // The drop side of the picker's drag: a hull released
+                    // over bare map deploys there. The predicate names the
+                    // payload type, so stray drags (there are no others yet,
+                    // but the zone grip will grow one) never land here. The
+                    // handler runs without the view, so it re-enters through
+                    // the entity — the same re-entry every drain uses.
+                    .can_drop(|v, _, _| v.is::<UnitDragPayload>())
+                    .on_drop({
+                        let demo = cx.entity();
+                        move |payload: &UnitDragPayload, window: &mut Window, app: &mut App| {
+                            let size = window.viewport_size();
+                            let (w, h) = (f32::from(size.width), f32::from(size.height));
+                            if w <= 0.0 || h <= 0.0 {
+                                return;
+                            }
+                            let at = window.mouse_position();
+                            let fx = f64::from((f32::from(at.x) / w).clamp(0.0, 1.0));
+                            let fy = f64::from((f32::from(at.y) / h).clamp(0.0, 1.0));
+                            let unit_id = payload.unit_id;
+                            let unit_name = payload.name.clone();
+                            let _ = demo.update(app, |view, cx| {
+                                // A drop on a host embarks; anywhere else
+                                // deploys — and a hull outside the exercise
+                                // is assigned on the way in, because placing
+                                // IS assigning. The host is the nearest
+                                // placed piece's marker, so a drop between
+                                // hulls still names water, not a neighbour.
+                                let host = view.drop_host_at(fx, fy);
+                                view.drop_unit(unit_id, &unit_name, fx, fy, host, cx);
+                            });
+                        }
+                    })
                     .children(
                         self.gate
                             .image()
@@ -8449,7 +9563,7 @@ impl Render for IslandDemo {
                     )
                     .into_any_element(),
             )
-        } else if self.fleet_open {
+        } else if self.fleet_open && !self.dragging {
             Some(
                 div()
                     .absolute()
@@ -8464,9 +9578,18 @@ impl Render for IslandDemo {
                     .child(
                         div()
                             .relative()
-                            .w(px(FORM_W))
-                            .h(px(FORM_H))
-                            .child(modal_silhouette_at(FORM_W, FORM_H))
+                            .w(px(FLEET_W))
+                            .h(px(FLEET_H))
+                            // The card truncates hover: without this, a press
+                            // anywhere on the picker ALSO lands on the
+                            // full-window map surface underneath (GPUI
+                            // delivers to every hovered hitbox down the
+                            // chain), so every picker drag pans the map along
+                            // with the gesture. `except_scroll` keeps the
+                            // columns' own scrolling, the way the island edge
+                            // keeps its body's.
+                            .block_mouse_except_scroll()
+                            .child(modal_silhouette_at(FLEET_W, FLEET_H))
                             .child(self.fleet_picker_body(cx)),
                     )
                     .into_any_element(),
@@ -9777,6 +10900,30 @@ pub enum ToBinary {
     /// knows the zone's dock and width — and the binary unprojects the
     /// visible centre, because the shell has no mercator.
     Jump { lat: f64, lon: f64, shift_px: f32 },
+    /// Deploy a hull where the pointer says: the unit plus the drop point as
+    /// fractions of the map view. The shell names fractions, never pixels or
+    /// ground — it knows the viewport, and the frame fills it
+    /// (`ObjectFit::Fill`), so fractions survive any window size. The binary
+    /// unprojects to lat/lon at its own camera and calls `set_placement`,
+    /// because the shell has no mercator. The answer is a re-read session on
+    /// `create_feed`, like every other write here.
+    DeployUnit { unit_id: i64, fx: f64, fy: f64 },
+    /// Assign a register hull and deploy it, in one gesture: the drop of a
+    /// hull the exercise does not hold yet. The commander is the
+    /// operator's own seat (the shell refuses seatless first); the binary
+    /// sequences `assign_unit` before `set_placement`, and the answer is
+    /// the same re-read session a plain deploy returns.
+    DeployAssign { unit_id: i64, commander_id: i64, fx: f64, fy: f64 },
+    /// Embark a dragged hull aboard a placed host: the host the drop's
+    /// fractions landed nearest, plus the dragged hull. The binary owns the
+    /// POST (`game_attach_units`); the answer is the host's contents on the
+    /// embark feed, like every other embark write.
+    EmbarkDrop { host: i64, child: i64 },
+    /// Assign a register hull and embark it, in one gesture: the drop of a
+    /// hull the exercise does not hold yet onto a placed host. Same chain
+    /// as `DeployAssign`, ending in `game_attach_units`, answered on the
+    /// embark feed like every other embark write.
+    EmbarkAssign { host: i64, child: i64, commander_id: i64 },
     /// Sign out. The shell clears its own session and shows the card; the
     /// binary drops its token copy so nothing else posts on it. The binary
     /// never held the refresh token, so there is no server revocation here —
@@ -9867,6 +11014,10 @@ pub enum ToBinary {
     /// Take the host's permission back — the console's `embark_revoke`,
     /// as a message. Legs already sailed stay sailed.
     RevokeClearance { host: i64, unit: i64 },
+    /// Hold one game from the session picker. The binary owns the re-read
+    /// (`fetch_session` pinned, the same read startup holds); the shell
+    /// only names the id the row drew.
+    HoldSession { game_id: i64 },
     /// A step's whole related list, from the relate editor's working set:
     /// hulls of the exercise (nodes ride the same list when the task
     /// organisation exists — it does not in any dev game). Posted at once,
@@ -9934,6 +11085,7 @@ pub enum ToBinary {
 pub struct SignedIn {
     pub roster: Vec<RosterRow>,
     pub roster_total: usize,
+    pub sessions: Vec<SessionRow>,
     pub session: SessionView,
 }
 
@@ -10089,6 +11241,20 @@ pub struct MyShip {
     pub label: String,
 }
 
+/// One game on the session picker, as the start island lists it: the
+/// server's identity and state, plus this account's seat in it (role name
+/// and judge side, empty/false when unseated). A display projection like
+/// `MyShip`, not a second `GameRow` — the picker reads these four things
+/// and nothing else, in the server's own list order.
+#[derive(Clone, Debug)]
+pub struct SessionRow {
+    pub id: i64,
+    pub name: String,
+    pub state: String,
+    pub my_role: String,
+    pub judge: bool,
+}
+
 /// One piece of the exercise: a hull assigned to the held game. The server's
 /// own word — a related hull has to be one of its pieces — and the relate
 /// editor's checkbox list. Assigned units only, never the whole register:
@@ -10229,6 +11395,370 @@ pub fn fixture_roster() -> Vec<RosterRow> {
         stale,
     })
     .collect()
+}
+
+/// One decoded hull photograph from the background fetch: the unit plus
+/// straight-alpha RGBA bytes at thumbnail size. Decoded off-thread (the
+/// shell only ever sees bytes); the `RenderImage` is minted on first
+/// paint, the same raw path the map frames take.
+pub struct ThumbRaw {
+    pub unit_id: i64,
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// The photo trickle, drained like every other feed. `None` most ticks;
+/// one hull's bytes when the fetcher lands one — photographs pop in
+/// progressively, never all-or-nothing.
+pub type ThumbFeed =
+    std::boxed::Box<dyn FnMut() -> Option<Vec<ThumbRaw>> + Send + 'static>;
+
+/// Mint a paintable thumbnail from decoded bytes. `None` on a byte-count
+/// mismatch — a corrupt fetch paints nothing, never a torn image.
+pub fn thumb_image(raw: ThumbRaw) -> Option<Arc<gpui::RenderImage>> {
+    let mut bytes = raw.rgba;
+    gate::swizzle_rgba_to_bgra(&mut bytes);
+    let buf = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(raw.w, raw.h, bytes)?;
+    Some(Arc::new(gpui::RenderImage::new([image::Frame::new(buf)])))
+}
+
+/// One hull at the bottom of the drill, with the glyph the map would draw.
+///
+/// The symbol is resolved ONCE by the binary (same resolver the markers
+/// use) and carried here, because the shell draws this and must not reach
+/// through the store. The photograph, when the fetcher has landed one,
+/// wins — the glyph is the fallback, never the portrait.
+#[derive(Clone, Debug)]
+pub struct FleetTaxLeaf {
+    pub id: String,
+    pub name: String,
+    pub hull: String,
+    pub class_name: String,
+    pub symbol: MapSymbolShape,
+}
+
+/// What a fleet-picker leaf row carries when dragged: the hull's id, its
+/// name for the ghost, and its glyph. `Clone` because the drop side reads
+/// the same value the source armed — one value, two readers, no re-lookup.
+#[derive(Clone, Debug)]
+pub struct UnitDragPayload {
+    pub unit_id: i64,
+    pub name: String,
+    pub symbol: MapSymbolShape,
+    /// The hull's photograph, when the fetcher has landed one — the ghost
+    /// shows the same face the row does. An `Arc`, so the drag shares the
+    /// shell's copy rather than the bytes.
+    pub thumb: Option<Arc<gpui::RenderImage>>,
+}
+
+impl UnitDragPayload {
+    /// The payload a leaf row arms: the id Minos files placements and
+    /// embarkations under, with the row's own display values along for the
+    /// ghost. Pure, so the harness pins it without a pointer.
+    fn for_leaf(leaf: &FleetTaxLeaf, thumb: Option<Arc<gpui::RenderImage>>) -> Self {
+        UnitDragPayload {
+            unit_id: leaf.id.parse::<i64>().unwrap_or(-1),
+            name: leaf.name.clone(),
+            symbol: leaf.symbol,
+            thumb,
+        }
+    }
+}
+
+/// The ghost that follows the pointer while a hull is dragged: its
+/// thumbnail and its name, the console's drag cell in another toolkit.
+struct DragGhost {
+    name: String,
+    symbol: MapSymbolShape,
+    thumb: Option<Arc<gpui::RenderImage>>,
+}
+
+impl Render for DragGhost {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let symbol = self.symbol;
+        // The photograph when there is one, the glyph otherwise — the
+        // same face the row shows, so the hand never swaps pictures.
+        let face = IslandDemo::thumb_face(self.thumb.clone(), symbol);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded(px(4.0))
+            .bg(rgba(PANEL_SLATE))
+            .border(px(1.0))
+            .border_color(rgba(RADAR_CYAN))
+            .child(face)
+            .child(
+                div()
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(11.0))
+                    .text_color(rgba(MAP_INK))
+                    .child(SharedString::from(self.name.clone())),
+            )
+    }
+}
+
+/// One hull-class rung of the drill: id, display name, live-hull count, and
+/// the hulls in it. The nesting IS the hierarchy — Asset Group > Category >
+/// Type > Class > hull — the same walk the egui picker's `drill_*` state
+/// did, read off the same `store::tax_*` readers.
+#[derive(Clone, Debug, Default)]
+pub struct FleetTaxClass {
+    pub id: i64,
+    pub name: String,
+    pub count: i64,
+    pub units: Vec<FleetTaxLeaf>,
+}
+
+/// One type rung of the drill: id, display name, live-hull count, and the
+/// classes under it (see `FleetTaxClass` for the rung contract).
+#[derive(Clone, Debug, Default)]
+pub struct FleetTaxType {
+    pub id: i64,
+    pub name: String,
+    pub count: i64,
+    pub classes: Vec<FleetTaxClass>,
+}
+
+/// One category rung of the drill: id, display name, live-hull count, and
+/// the types under it (see `FleetTaxClass` for the rung contract).
+#[derive(Clone, Debug, Default)]
+pub struct FleetTaxCat {
+    pub id: i64,
+    pub name: String,
+    pub count: i64,
+    pub types: Vec<FleetTaxType>,
+}
+
+/// One asset-group tab of the drill: id, display name, live-hull count, and
+/// the categories under it (see `FleetTaxClass` for the rung contract).
+#[derive(Clone, Debug, Default)]
+pub struct FleetTaxGroup {
+    pub id: i64,
+    pub name: String,
+    pub count: i64,
+    pub cats: Vec<FleetTaxCat>,
+}
+
+/// The whole drill tree, built once at startup. Empty when the store has no
+/// taxonomy (fixture runs, offline machines) — the picker falls back to its
+/// flat register list rather than showing an empty drill.
+///
+/// Built by the binary (`build_fleet_taxonomy` in `main.rs`), not here: the
+/// tree reads off the sqlite mirror, and this module is also compiled into
+/// the sqlite-free parity proto — which is exactly what keeps the drill
+/// honest about its seams.
+#[derive(Clone, Debug, Default)]
+pub struct FleetTaxonomy {
+    pub groups: Vec<FleetTaxGroup>,
+}
+
+#[cfg(test)]
+mod fleet_taxonomy_tests {
+    use super::*;
+
+    pub fn fixture_taxonomy() -> FleetTaxonomy {
+        FleetTaxonomy {
+            groups: vec![
+                FleetTaxGroup {
+                    id: 2,
+                    name: "Sea".to_string(),
+                    count: 2,
+                    cats: vec![FleetTaxCat {
+                        id: 2,
+                        name: "Frigate".to_string(),
+                        count: 2,
+                        types: vec![FleetTaxType {
+                            id: 3,
+                            name: "FFG".to_string(),
+                            count: 2,
+                            classes: vec![FleetTaxClass {
+                                id: 5,
+                                name: "Sigma".to_string(),
+                                count: 2,
+                                units: vec![
+                                    FleetTaxLeaf {
+                                        id: "13".to_string(),
+                                        name: "KRI Ahmad Yani".to_string(),
+                                        hull: "351".to_string(),
+                                        class_name: "Sigma".to_string(),
+                                        symbol: MapSymbolShape::Frigate,
+                                    },
+                                    FleetTaxLeaf {
+                                        id: "14".to_string(),
+                                        name: "KRI Yos Sudarso".to_string(),
+                                        hull: "353".to_string(),
+                                        class_name: "Sigma".to_string(),
+                                        symbol: MapSymbolShape::Frigate,
+                                    },
+                                ],
+                            }],
+                        }],
+                    }],
+                },
+                FleetTaxGroup {
+                    id: 4,
+                    name: "Other".to_string(),
+                    count: 0,
+                    cats: Vec::new(),
+                },
+            ],
+        }
+    }
+
+    fn drill_demo() -> IslandDemo {
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            SessionView::default(),
+            std::sync::mpsc::channel().0,
+        );
+        demo.fleet_tax = fixture_taxonomy();
+        demo
+    }
+
+    #[test]
+    fn drill_defaults_to_first_tab() {
+        let demo = drill_demo();
+        assert_eq!(demo.drill_group_id(), Some(2), "unseeded open shows Sea");
+        assert_eq!(demo.drill_cats().len(), 1);
+        assert!(demo.drill_types().is_empty(), "no category picked yet");
+        assert!(demo.drill_units().is_empty(), "no class picked yet");
+    }
+
+    #[test]
+    fn drill_walks_to_the_hulls() {
+        let mut demo = drill_demo();
+        demo.select_category(2);
+        assert_eq!(demo.drill_types().len(), 1);
+        demo.select_type(3);
+        assert_eq!(demo.drill_classes().len(), 1);
+        demo.select_class(5);
+        assert_eq!(demo.drill_units().len(), 2, "both Sigma hulls list");
+    }
+
+    #[test]
+    fn drill_parent_change_clears_below() {
+        let mut demo = drill_demo();
+        demo.select_category(2);
+        demo.select_type(3);
+        demo.select_class(5);
+        demo.select_category(2);
+        assert!(demo.drill_units().is_empty(), "stale class must not survive");
+        demo.select_type(3);
+        demo.select_class(5);
+        demo.select_group(4);
+        assert!(demo.drill_cats().is_empty(), "Other holds no categories");
+        assert!(demo.drill_units().is_empty(), "stale hulls must not survive");
+        demo.select_group(2);
+        assert!(demo.drill_units().is_empty(), "returning clears too");
+    }
+
+    #[test]
+    fn payload_carries_the_hulls_identity() {
+        let mut demo = drill_demo();
+        demo.select_category(2);
+        demo.select_type(3);
+        demo.select_class(5);
+        let leaf = demo.drill_units().first().cloned().expect("a hull to drag");
+        let payload = UnitDragPayload::for_leaf(&leaf, None);
+        assert_eq!(payload.unit_id, 13, "Minos files under the numeric id");
+        assert_eq!(payload.name, "KRI Ahmad Yani");
+        assert_eq!(payload.symbol, MapSymbolShape::Frigate);
+        assert!(payload.thumb.is_none(), "no photo fetched in-harness");
+    }
+
+    #[test]
+    fn thumb_image_mints_from_bytes() {
+        // 2×2 straight red: the fetcher's contract in miniature.
+        let raw = ThumbRaw {
+            unit_id: 13,
+            w: 2,
+            h: 2,
+            rgba: vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ],
+        };
+        assert!(thumb_image(raw).is_some(), "well-formed bytes paint");
+    }
+
+    #[test]
+    fn thumb_image_refuses_torn_bytes() {
+        let raw = ThumbRaw {
+            unit_id: 13,
+            w: 2,
+            h: 2,
+            rgba: vec![255, 0, 0],
+        };
+        assert!(thumb_image(raw).is_none(), "short bytes paint nothing");
+    }
+
+    fn host_demo() -> IslandDemo {
+        let mut session = SessionView::default();
+        session.pieces = vec![PieceView {
+            id: 8,
+            label: "host".to_string(),
+            commander_id: None,
+            placed: true,
+        }];
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        demo.map_dims = (1000.0, 1000.0);
+        demo.live = vec![LiveMarker {
+            id: "8".to_string(),
+            x: 500.0,
+            y: 500.0,
+            stale: false,
+            symbol: MapSymbolShape::Frigate,
+            affiliation: symbology::Affiliation::Unknown,
+            heading_deg: None,
+            speed_kn: None,
+            latitude: 0.0,
+            longitude: 0.0,
+            trail: 0,
+        }];
+        demo
+    }
+
+    #[test]
+    fn drop_names_the_nearest_placed_host() {
+        let demo = host_demo();
+        assert_eq!(demo.drop_host_at(0.5, 0.5), Some(8), "dead on the marker");
+        assert_eq!(
+            demo.drop_host_at(0.51, 0.5),
+            Some(8),
+            "10px off still boards"
+        );
+        assert_eq!(demo.drop_host_at(0.1, 0.1), None, "far water is a deploy");
+    }
+
+    #[test]
+    fn drop_ignores_unplaced_and_mapless() {
+        let mut demo = host_demo();
+        demo.session.pieces[0].placed = false;
+        assert_eq!(
+            demo.drop_host_at(0.5, 0.5),
+            None,
+            "an unplaced piece hosts nothing"
+        );
+        let mut demo = host_demo();
+        demo.map_dims = (0.0, 0.0);
+        assert_eq!(demo.drop_host_at(0.5, 0.5), None, "no frame, no host");
+    }
 }
 
 fn roster_sheet(
@@ -10539,10 +12069,12 @@ pub fn run_replay(dir: String, burst_ms: u64, looping: bool) {
         std::boxed::Box::new(|| None),
         std::boxed::Box::new(|| None),
         std::boxed::Box::new(|| None),
+        std::boxed::Box::new(|| None),
         std::sync::mpsc::channel().0,
         fixture_roster(),
         125,
         SessionView::default(),
+        FleetTaxonomy::default(),
     );
 }
 
@@ -10564,10 +12096,12 @@ pub fn run(
     mut clock_feed: ClockFeed,
     mut embarked_feed: EmbarkedFeed,
     mut embark_write_feed: EmbarkWriteFeed,
+    mut thumb_feed: ThumbFeed,
     order_tx: OrderSink,
     roster: Vec<RosterRow>,
     roster_total: usize,
     session: SessionView,
+    fleet_tax: FleetTaxonomy,
 ) {
     Application::new().run(move |cx: &mut App| {
         // The instrument type scale's faces: Saira Condensed in four weights
@@ -10624,7 +12158,11 @@ pub fn run(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let entity = cx.new(|_| IslandDemo::new(roster, roster_total, selected, session, order_tx));
+        let entity = cx.new(|_| {
+            let mut demo = IslandDemo::new(roster, roster_total, selected, session, order_tx);
+            demo.fleet_tax = fleet_tax;
+            demo
+        });
         let drain = entity.clone();
         let fix_drain = entity.clone();
         let status_drain = entity.clone();
@@ -10638,11 +12176,43 @@ pub fn run(
         let clock_drain = entity.clone();
         let embarked_drain = entity.clone();
         let embark_write_drain = entity.clone();
+        let thumb_drain = entity.clone();
+        let drag_drain = entity.clone();
         cx.spawn(async move |cx: &mut AsyncApp| {
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(20))
                     .await;
+                // The drag flag, polled not pushed: the drop and the ghost
+                // live in GPUI's own drag state, which no element callback
+                // can read into the view — so the tick asks once per frame
+                // and the picker hides for exactly the drag's lifetime.
+                let _ = cx.update(|app| {
+                    let dragging = app.has_active_drag();
+                    drag_drain.update(app, |root: &mut IslandDemo, cx| {
+                        root.set_dragging(dragging, cx);
+                    })
+                });
+                // Hull photographs, minted as they land: the fetcher decodes
+                // off-thread and the shell only ever sees bytes, so each
+                // arrival mints one `RenderImage` and notifies once — the
+                // rows fill in progressively while the drill stays put.
+                if let Some(batch) = thumb_feed() {
+                    let _ = cx.update(|app| {
+                        thumb_drain.update(app, |root: &mut IslandDemo, cx| {
+                            for raw in batch {
+                                let id = raw.unit_id;
+                                if root.thumbs.contains_key(&id) {
+                                    continue;
+                                }
+                                if let Some(image) = thumb_image(raw) {
+                                    root.thumbs.insert(id, image);
+                                }
+                            }
+                            cx.notify();
+                        })
+                    });
+                }
                 if let Some((no, w, h, bgra, at, zoom)) = feed() {
                     let _ = cx.update(|app| {
                         drain.update(app, |root: &mut IslandDemo, cx| {
@@ -10681,6 +12251,14 @@ pub fn run(
                                 Ok(signed) => {
                                     root.roster = signed.roster;
                                     root.roster_total = signed.roster_total;
+                                    // The games list arrives with the roster,
+                                    // and no game is held: holding is the
+                                    // picker's verb from here, not the
+                                    // sign-in's. The column lands on the
+                                    // NoSession picker, not mid-execution.
+                                    root.sessions = signed.sessions;
+                                    root.hold_busy = false;
+                                    root.hold_status.clear();
                                     root.session = signed.session;
                                     root.selected = 0;
                                     root.login_status.clear();
@@ -10735,6 +12313,11 @@ pub fn run(
                                         root.force_status.clear();
                                         root.reseed_drafts();
                                         root.session = created.session;
+                                    } else if root.deploy_busy {
+                                        root.deploy_busy = false;
+                                        root.force_status.clear();
+                                        root.reseed_drafts();
+                                        root.session = created.session;
                                     } else if root.factor_busy {
                                         root.apply_factor(created.session);
                                     } else if root.advance_busy {
@@ -10743,6 +12326,8 @@ pub fn run(
                                         root.session = created.session;
                                     } else if root.end_busy {
                                         root.apply_end(created.session);
+                                    } else if root.hold_busy {
+                                        root.apply_hold(created.session);
                                     } else {
                                         root.apply_created(created.session);
                                     }
@@ -10770,6 +12355,9 @@ pub fn run(
                                     } else if root.force_busy {
                                         root.force_busy = false;
                                         root.force_status = why;
+                                    } else if root.deploy_busy {
+                                        root.deploy_busy = false;
+                                        root.force_status = why;
                                     } else if root.factor_busy {
                                         root.factor_busy = false;
                                         root.factor_status = why;
@@ -10779,6 +12367,9 @@ pub fn run(
                                     } else if root.end_busy {
                                         root.end_busy = false;
                                         root.end_status = why;
+                                    } else if root.hold_busy {
+                                        root.hold_busy = false;
+                                        root.hold_status = why;
                                     } else {
                                         root.compose_busy = false;
                                         root.compose_status = why;
@@ -12838,6 +14429,794 @@ mod tests {
         match rx.try_recv().expect("the transition reached the sink") {
             ToBinary::EndSession => {}
             other => panic!("expected an end-session, got {other:?}"),
+        }
+    }
+
+    /// Holding a game names the picked id and installs the re-read whole:
+    /// the row drew the id, the answer arrives read back, and the column
+    /// recomposes around it. A hold in flight sends nothing more.
+    #[gpui::test]
+    fn hold_names_the_picked_game(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(
+                fixture_roster(),
+                8,
+                0,
+                SessionView::default(),
+                tx,
+            );
+            demo.sessions = vec![
+                SessionRow {
+                    id: 44,
+                    name: "GPUI step proof".to_string(),
+                    state: "execution".to_string(),
+                    my_role: "Commando".to_string(),
+                    judge: false,
+                },
+                SessionRow {
+                    id: 9,
+                    name: "Game 8".to_string(),
+                    state: "planning".to_string(),
+                    my_role: String::new(),
+                    judge: false,
+                },
+            ];
+            demo
+        });
+        // Unheld: the column is the picker, not mid-execution.
+        let keys = cx.read(|app| {
+            view.read(app)
+                .column_slots()
+                .iter()
+                .map(|s| s.key.id().to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(keys, vec!["operator", "sessions", "fleet"]);
+        assert!(
+            cx.update(|_window, app| view.update(app, |demo, cx| demo.send_hold(9, cx))),
+            "the pick sends"
+        );
+        match rx.try_recv().expect("the hold reached the sink") {
+            ToBinary::HoldSession { game_id } => assert_eq!(game_id, 9, "the row's id"),
+            other => panic!("expected a hold, got {other:?}"),
+        }
+        assert!(
+            !cx.update(|_window, app| view.update(app, |demo, cx| demo.send_hold(44, cx))),
+            "a hold in flight sends nothing"
+        );
+        assert!(rx.try_recv().is_err(), "nothing reached the sink");
+        // The answer installs the held game whole: the latch clears and
+        // the list survives for the next pick.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                let mut held = SessionView::default();
+                held.game_id = 9;
+                held.game = "Game 8".to_string();
+                held.state = "planning".to_string();
+                demo.apply_hold(held);
+                assert!(!demo.hold_busy, "the answer clears the latch");
+                assert!(demo.hold_status.is_empty());
+                assert_eq!(demo.session.game_id, 9);
+                assert_eq!(demo.sessions.len(), 2, "the list survives the hold");
+            })
+        });
+        let keys = cx.read(|app| {
+            view.read(app)
+                .column_slots()
+                .iter()
+                .map(|s| s.key.id().to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            keys,
+            vec!["operator", "essentials", "control", "fleet", "players", "review"],
+            "the column recomposes around the held game"
+        );
+    }
+
+    /// Clicking a session row holds it — the compositor's live click,
+    /// verified deterministically like the roster rows. Row 1's centre is
+    /// computed from the island's own origin (band TITLE_H, body PAD, half
+    /// a row), never hardcoded to a window.
+    #[gpui::test]
+    fn clicking_a_session_row_holds_it(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(
+                fixture_roster(),
+                8,
+                0,
+                SessionView::default(),
+                tx,
+            );
+            demo.sessions = vec![
+                SessionRow {
+                    id: 44,
+                    name: "GPUI step proof".to_string(),
+                    state: "execution".to_string(),
+                    my_role: "Commando".to_string(),
+                    judge: false,
+                },
+                SessionRow {
+                    id: 9,
+                    name: "Game 8".to_string(),
+                    state: "planning".to_string(),
+                    my_role: String::new(),
+                    judge: false,
+                },
+            ];
+            demo
+        });
+        cx.simulate_resize(gpui::size(gpui::px(768.0), gpui::px(838.0)));
+        let (ix, top) = cx.update(|window, app| {
+            let d = view.read(app);
+            let band = zone_band_at(viewport(window), d.zone_w, d.side_dock_left);
+            let slots = d.column_slots();
+            let i = slots
+                .iter()
+                .position(|s| s.key == view::IslandKey::Sessions)
+                .expect("sessions listed while unheld");
+            view::zone_slot_origin(band, &slots, i)
+        });
+        // First row centre: band TITLE_H, body PAD, half a row. The island
+        // edge sits UNDER the body in tree order, so body controls are
+        // hoverable — an edge painted last would swallow this click (the
+        // defect this test pins).
+        cx.simulate_click(
+            gpui::point(gpui::px(ix + 60.0), gpui::px(top + view::TITLE_H + view::PAD + 11.0)),
+            gpui::Modifiers::default(),
+        );
+        match rx.try_recv().expect("the pick reached the sink") {
+            ToBinary::HoldSession { game_id } => assert_eq!(game_id, 44, "row 1 holds game 44"),
+            other => panic!("expected a hold, got {other:?}"),
+        }
+    }
+
+    /// Dragging a leaf row onto the map deploys it there — source payload,
+    /// ghost, map drop and fractions, proven in-harness end to end. The
+    /// source is found by sweep, never by hardcoded pixels: the press walks
+    /// down the leaf column until GPUI reports an active drag. The hull is
+    /// NOT in the exercise, so the drop assigns first — placing IS
+    /// assigning — and the verb carries the operator's own seat.
+    #[gpui::test]
+    fn dragging_a_leaf_row_to_the_map_deploys_it(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut session = SessionView::default();
+            session.me = 7;
+            session.people = vec![PersonView {
+                id: 7,
+                name: "SU".to_string(),
+                call_sign: "SUEX".to_string(),
+                role: "Commando".to_string(),
+                role_id: 1,
+                judge: false,
+                ready: false,
+                present: true,
+            }];
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.fleet_tax = super::fleet_taxonomy_tests::fixture_taxonomy();
+            demo.select_category(2);
+            demo.select_type(3);
+            demo.select_class(5);
+            demo.fleet_open = true;
+            demo
+        });
+        cx.simulate_resize(gpui::size(gpui::px(768.0), gpui::px(838.0)));
+        // The live viewport, never assumed: a resize that lags a frame
+        // would put hardcoded points outside the window, and a drop outside
+        // the window is a silence, not a failure.
+        let (w, h) = cx.update(|window, _| {
+            let s = window.viewport_size();
+            (f32::from(s.width), f32::from(s.height))
+        });
+        // The leaf column sits ~486pt inside the centred 700-wide modal.
+        let lx = (w - 700.0) / 2.0 + 486.0;
+        // Bare map below the centred modal and clear of the left column.
+        let (dx, dy) = (w - 68.0, h - 58.0);
+        // The sweep-and-drop in one pass: press-and-nudge down the leaf
+        // column, and the press that starts a drag KEEPS going — straight
+        // to bare map below the modal, where it releases. One pass because
+        // a probe release fires the drop too (the map underlies everything
+        // hoverable), and that deploy re-renders the picker's status line,
+        // shifting every row below the press that found it. Probes that
+        // find nothing release harmlessly; clicks that land on add post
+        // force plans, skipped at the sink below.
+        let mut found = false;
+        let mut y = 150.0;
+        while y < h - 100.0 && !found {
+            cx.simulate_mouse_down(
+                gpui::point(gpui::px(lx), gpui::px(y)),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_move(
+                gpui::point(gpui::px(lx), gpui::px(y + 20.0)),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            if cx.update(|_, app| app.has_active_drag()) {
+                found = true;
+                for (x, yy) in
+                    [(lx + 40.0, y + 60.0), (w - 148.0, 500.0), (w - 108.0, 640.0), (dx, dy)]
+                {
+                    cx.simulate_mouse_move(
+                        gpui::point(gpui::px(x), gpui::px(yy)),
+                        gpui::MouseButton::Left,
+                        gpui::Modifiers::default(),
+                    );
+                }
+            }
+            cx.simulate_mouse_up(
+                gpui::point(gpui::px(if found { dx } else { lx }), gpui::px(if found { dy } else { y + 20.0 })),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            y += 8.0;
+        }
+        assert!(found, "some leaf row must start a drag");
+        // The drop is last: anything the sweep posted before it (force
+        // plans from add clicks) is skipped, the assign-and-deploy is
+        // verified.
+        let mut deploy = None;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, ToBinary::DeployAssign { .. }) {
+                deploy = Some(msg);
+            }
+        }
+        match deploy.expect("the drop reached the sink") {
+            ToBinary::DeployAssign { unit_id, commander_id, fx, fy } => {
+                assert_eq!(unit_id, 13, "the first leaf row drags Yani");
+                assert_eq!(commander_id, 7, "placing assigns to the operator's seat");
+                assert!(
+                    ((fx - f64::from(dx / w)) as f32).abs() < 0.03,
+                    "fx names the drop, got {fx}"
+                );
+                assert!(
+                    ((fy - f64::from(dy / h)) as f32).abs() < 0.03,
+                    "fy names the drop, got {fy}"
+                );
+            }
+            other => panic!("expected an assign-and-deploy, got {other:?}"),
+        }
+        let _ = view;
+    }
+
+    /// Dropping a leaf row on a placed host's marker embarks it aboard —
+    /// the same sweep-and-hold path as the deploy proof, with a live marker
+    /// under the drop. The marker is the test's own (map space 1:1 with the
+    /// window here), the host is a placed piece, and the child rides along.
+    #[gpui::test]
+    fn dropping_a_leaf_row_on_a_host_embarks_it(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut session = SessionView::default();
+            session.pieces = vec![
+                PieceView {
+                    id: 8,
+                    label: "KRI Ahmad Yani".to_string(),
+                    commander_id: None,
+                    placed: true,
+                },
+                PieceView {
+                    id: 13,
+                    label: "KRI Yos Sudarso".to_string(),
+                    commander_id: None,
+                    placed: false,
+                },
+            ];
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.fleet_tax = super::fleet_taxonomy_tests::fixture_taxonomy();
+            demo.select_category(2);
+            demo.select_type(3);
+            demo.select_class(5);
+            demo.fleet_open = true;
+            // Map space 1:1 with the window, so marker pixels ARE window
+            // pixels and the drop below names the marker exactly.
+            demo.map_dims = (768.0, 838.0);
+            demo.live = vec![LiveMarker {
+                id: "8".to_string(),
+                x: 600.0,
+                y: 750.0,
+                stale: false,
+                symbol: MapSymbolShape::Frigate,
+                affiliation: symbology::Affiliation::Unknown,
+                heading_deg: None,
+                speed_kn: None,
+                latitude: 0.0,
+                longitude: 0.0,
+                trail: 0,
+            }];
+            demo
+        });
+        cx.simulate_resize(gpui::size(gpui::px(768.0), gpui::px(838.0)));
+        let (w, h) = cx.update(|window, _| {
+            let s = window.viewport_size();
+            (f32::from(s.width), f32::from(s.height))
+        });
+        let lx = (w - 700.0) / 2.0 + 486.0;
+        // Onto the host's marker: below the centred modal, clear of the
+        // left column — bare map with a hull on it.
+        let (dx, dy) = (600.0, 750.0);
+        let mut found = false;
+        let mut y = 150.0;
+        while y < h - 100.0 && !found {
+            cx.simulate_mouse_down(
+                gpui::point(gpui::px(lx), gpui::px(y)),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_move(
+                gpui::point(gpui::px(lx), gpui::px(y + 20.0)),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            if cx.update(|_, app| app.has_active_drag()) {
+                found = true;
+                for (x, yy) in [(lx + 40.0, y + 60.0), (620.0, 700.0), (dx, dy)] {
+                    cx.simulate_mouse_move(
+                        gpui::point(gpui::px(x), gpui::px(yy)),
+                        gpui::MouseButton::Left,
+                        gpui::Modifiers::default(),
+                    );
+                }
+            }
+            cx.simulate_mouse_up(
+                gpui::point(
+                    gpui::px(if found { dx } else { lx }),
+                    gpui::px(if found { dy } else { y + 20.0 }),
+                ),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            y += 8.0;
+        }
+        assert!(found, "some leaf row must start a drag");
+        let mut embark = None;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, ToBinary::EmbarkDrop { .. }) {
+                embark = Some(msg);
+            }
+        }
+        match embark.expect("the drop reached the sink") {
+            ToBinary::EmbarkDrop { host, child } => {
+                assert_eq!(host, 8, "the drop named the host marker");
+                assert_eq!(child, 13, "the first leaf row rides along");
+            }
+            other => panic!("expected an embark, got {other:?}"),
+        }
+        let _ = view;
+    }
+
+    /// The picker hides while a drag is in flight and returns when it
+    /// ends — the flag the tick polls, pinned here without a pointer.
+    #[gpui::test]
+    fn dragging_hides_the_picker(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(
+                fixture_roster(),
+                8,
+                0,
+                SessionView::default(),
+                std::sync::mpsc::channel().0,
+            );
+            demo.fleet_open = true;
+            demo
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| demo.set_dragging(true, cx));
+        });
+        let hiding = cx.update(|_, app| view.read(app).dragging);
+        assert!(hiding, "a live drag hides the picker");
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| demo.set_dragging(false, cx));
+        });
+        let back = cx.update(|_, app| {
+            let d = view.read(app);
+            !d.dragging && d.fleet_open
+        });
+        assert!(back, "the drop's end returns the picker, still open");
+    }
+
+    /// Pressing the fleet picker's card never pans the map — the press
+    /// belongs to the picker, and the map handle underneath must not see
+    /// it. GPUI delivers a press to EVERY hovered hitbox down the chain,
+    /// and the full-window map surface is always in it — so without the
+    /// card truncating hover, every picker drag (and every press-and-move
+    /// on the card) drags the map along with the gesture.
+    #[gpui::test]
+    fn pressing_the_picker_card_does_not_pan_the_map(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (_view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(
+                fixture_roster(),
+                8,
+                0,
+                SessionView::default(),
+                tx,
+            );
+            demo.fleet_tax = super::fleet_taxonomy_tests::fixture_taxonomy();
+            demo.select_category(2);
+            demo.select_type(3);
+            demo.select_class(5);
+            demo.fleet_open = true;
+            // A framed map, or panning computes nothing: the pan scales by
+            // the frame's dimensions, and a (0, 0) frame refuses every move.
+            demo.map_dims = (768.0, 838.0);
+            demo
+        });
+        cx.simulate_resize(gpui::size(gpui::px(768.0), gpui::px(838.0)));
+        // The card's right padding: dead card background, no control. A
+        // press-drag here must reach nothing but the card.
+        let at = gpui::point(gpui::px(720.0), gpui::px(400.0));
+        cx.simulate_mouse_down(at, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            gpui::point(gpui::px(740.0), gpui::px(440.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            gpui::point(gpui::px(740.0), gpui::px(440.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        let mut panned = false;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, ToBinary::Pan { .. }) {
+                panned = true;
+            }
+        }
+        assert!(!panned, "a press on the picker card must not pan the map");
+    }
+
+    /// The seat-me pills offer the player-side roles — never the judge
+    /// side, which the server refuses as a commander — and nothing at all
+    /// when every role judges, in which case seating stays the Players
+    /// island's job.
+    #[test]
+    fn player_roles_exclude_the_judge_side() {
+        let mut session = SessionView::default();
+        session.roles = vec![
+            RoleRow { id: 1, name: "Commando".to_string(), judge: false },
+            RoleRow { id: 9, name: "Penyelenggara".to_string(), judge: true },
+        ];
+        let demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        let pills = demo.player_roles();
+        assert_eq!(pills.len(), 1, "one player role, one pill");
+        assert_eq!(pills[0].id, 1);
+    }
+
+    #[test]
+    fn player_roles_empty_when_every_seat_judges() {
+        let mut session = SessionView::default();
+        session.roles = vec![
+            RoleRow { id: 9, name: "Penyelenggara".to_string(), judge: true },
+        ];
+        let demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        assert!(demo.player_roles().is_empty(), "no player role, no pill");
+    }
+
+    /// The seat-me pill stages exactly one write: this account, a
+    /// player-side role, the name-derived call sign — the same seat the
+    /// Players island would stage, without the trip there.
+    #[gpui::test]
+    fn seat_me_stages_a_player_seat(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut session = SessionView::default();
+            session.me = 7;
+            session.roles = vec![
+                RoleRow { id: 1, name: "Commando".to_string(), judge: false },
+                RoleRow { id: 9, name: "Penyelenggara".to_string(), judge: true },
+            ];
+            session.directory = vec![DirectoryRow {
+                id: 7,
+                name: "Super User".to_string(),
+                unit: String::new(),
+                rank: String::new(),
+                appointment: String::new(),
+            }];
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let role = cx.update(|_, app| {
+            let mut pills = view.read(app).player_roles();
+            assert_eq!(pills.len(), 1, "one player role in the fixture");
+            pills.remove(0)
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                demo.stage_seat(7, "Super User", &role)
+                    .expect("a fresh room seats");
+            })
+        });
+        match rx.try_recv().expect("the seat posted") {
+            ToBinary::SyncRoster { writes } => {
+                assert_eq!(writes.len(), 1, "one seat, nothing else");
+                match &writes[0] {
+                    crate::roster::RosterWrite::Seat { user_id, role_id, call_sign, .. } => {
+                        assert_eq!(*user_id, 7);
+                        assert_eq!(*role_id, 1, "a player-side role, never the judge side");
+                        assert_eq!(call_sign, "SUPER US", "the name-derived sign");
+                    }
+                    other => panic!("expected a seat, got {other:?}"),
+                }
+            }
+            other => panic!("expected a roster plan, got {other:?}"),
+        }
+    }
+
+    /// The pill in the picker's force section seats without the trip to
+    /// the Players island: swept like the place button, because the pill's
+    /// seat moves with the verdict line. The first roster plan posted is
+    /// the pill's — add clicks refuse seatless without posting.
+    #[gpui::test]
+    fn seat_pill_seats_from_the_picker(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut session = SessionView::default();
+            session.me = 7;
+            session.roles = vec![
+                RoleRow { id: 1, name: "Commando".to_string(), judge: false },
+                RoleRow { id: 9, name: "Penyelenggara".to_string(), judge: true },
+            ];
+            session.directory = vec![DirectoryRow {
+                id: 7,
+                name: "Super User".to_string(),
+                unit: String::new(),
+                rank: String::new(),
+                appointment: String::new(),
+            }];
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.fleet_open = true;
+            demo.force_status = "sweep".to_string();
+            demo
+        });
+        cx.simulate_resize(gpui::size(gpui::px(768.0), gpui::px(838.0)));
+        let mut seated = false;
+        let mut y = 180.0;
+        while y < 300.0 && !seated {
+            let mut x = 46.0;
+            while x < 260.0 && !seated {
+                cx.simulate_click(
+                    gpui::point(gpui::px(x), gpui::px(y)),
+                    gpui::Modifiers::default(),
+                );
+                while let Ok(msg) = rx.try_recv() {
+                    if matches!(msg, ToBinary::SyncRoster { .. }) {
+                        seated = true;
+                    }
+                }
+                x += 12.0;
+            }
+            y += 8.0;
+        }
+        assert!(seated, "some click took a player seat");
+        let _ = view;
+    }
+
+    /// A seatless drop posts nothing: without a seat there is nobody to
+    /// hand the hull to, and the refusal says so on the picker's line.
+    #[gpui::test]
+    fn dropping_without_a_seat_posts_nothing(cx: &mut gpui::TestAppContext) {        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(
+                fixture_roster(),
+                8,
+                0,
+                SessionView::default(),
+                tx,
+            )
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(13, "KRI Ahmad Yani", 0.5, 0.5, None, cx);
+            })
+        });
+        assert!(rx.try_recv().is_err(), "no seat, no post");
+        let status = cx.update(|_, app| view.read(app).force_status.clone());
+        assert_eq!(status, "your account holds no seat in this room");
+    }
+
+    /// A judge-side seat may not command: the drop refuses locally — the
+    /// server's rule, heard here first — with the way forward, and posts
+    /// nothing.
+    #[gpui::test]
+    fn dropping_from_a_judge_side_seat_posts_nothing(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut session = SessionView::default();
+            session.me = 7;
+            session.roles = vec![
+                RoleRow { id: 1, name: "Commando".to_string(), judge: false },
+                RoleRow { id: 9, name: "Penyelenggara".to_string(), judge: true },
+            ];
+            session.people = vec![PersonView {
+                id: 7,
+                name: "SU".to_string(),
+                call_sign: "SUEX".to_string(),
+                role: "Penyelenggara".to_string(),
+                role_id: 9,
+                judge: true,
+                ready: false,
+                present: true,
+            }];
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(13, "KRI Ahmad Yani", 0.5, 0.5, None, cx);
+            })
+        });
+        assert!(rx.try_recv().is_err(), "a judge-side seat posts nothing");
+        let status = cx.update(|_, app| view.read(app).force_status.clone());
+        assert_eq!(
+            status,
+            "your seat is judge-side \u{2014} it directs, it does not command; take a player seat on the Players island"
+        );
+    }
+
+    /// A seated drop of a register hull assigns and deploys in one verb —
+    /// placing IS assigning — carrying the operator's own seat.
+    #[gpui::test]
+    fn dropping_a_register_hull_assigns_and_deploys(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut session = SessionView::default();
+            session.me = 7;
+            session.people = vec![PersonView {
+                id: 7,
+                name: "SU".to_string(),
+                call_sign: "SUEX".to_string(),
+                role: "Commando".to_string(),
+                role_id: 1,
+                judge: false,
+                ready: false,
+                present: true,
+            }];
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(13, "KRI Ahmad Yani", 0.5, 0.5, None, cx);
+            })
+        });
+        match rx.try_recv().expect("the drop posted") {
+            ToBinary::DeployAssign { unit_id, commander_id, fx, fy } => {
+                assert_eq!(unit_id, 13);
+                assert_eq!(commander_id, 7, "the operator's own seat");
+                assert_eq!((fx, fy), (0.5, 0.5));
+            }
+            other => panic!("expected an assign-and-deploy, got {other:?}"),
+        }
+    }
+
+    /// The host-side twin: a seated drop onto a host assigns and embarks.
+    #[gpui::test]
+    fn dropping_a_register_hull_on_a_host_assigns_and_embarks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut session = SessionView::default();
+            session.me = 7;
+            session.people = vec![PersonView {
+                id: 7,
+                name: "SU".to_string(),
+                call_sign: "SUEX".to_string(),
+                role: "Commando".to_string(),
+                role_id: 1,
+                judge: false,
+                ready: false,
+                present: true,
+            }];
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(13, "KRI Ahmad Yani", 0.5, 0.5, Some(8), cx);
+            })
+        });
+        match rx.try_recv().expect("the drop posted") {
+            ToBinary::EmbarkAssign { host, child, commander_id } => {
+                assert_eq!(host, 8);
+                assert_eq!(child, 13);
+                assert_eq!(commander_id, 7, "the operator's own seat");
+            }
+            other => panic!("expected an assign-and-embark, got {other:?}"),
+        }
+    }
+
+    /// Click-to-place, the drag's fallback: the place button arms the
+    /// drafted hull, and a map click that stays put deploys it there. The
+    /// place button sits at the row's right end, so the sweep clicks across
+    /// it until the arm latches.
+    #[gpui::test]
+    fn place_button_arms_and_map_click_deploys(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut session = SessionView::default();
+            session.pieces = vec![PieceView {
+                id: 13,
+                label: "KRI Ahmad Yani".to_string(),
+                commander_id: None,
+                placed: false,
+            }];
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.fleet_tax = super::fleet_taxonomy_tests::fixture_taxonomy();
+            demo.select_category(2);
+            demo.select_type(3);
+            demo.select_class(5);
+            demo.fleet_open = true;
+            // A seeded status line: sweep clicks rewrite the picker's
+            // verdict line, and a verdict that appears mid-sweep shifts
+            // every row below the clicks still to come. One line in, one
+            // line out — the geometry holds still for the whole sweep.
+            demo.force_status = "sweep".to_string();
+            demo
+        });
+        cx.simulate_resize(gpui::size(gpui::px(768.0), gpui::px(838.0)));
+        let (w, h) = cx.update(|window, _| {
+            let s = window.viewport_size();
+            (f32::from(s.width), f32::from(s.height))
+        });
+        let lx = (w - 700.0) / 2.0 + 486.0;
+        let (dx, dy) = (w - 68.0, h - 58.0);
+        // Sweep the row's right end for the place button: the first click
+        // that arms names the button's seat. Clicks elsewhere do nothing
+        // (the row itself has no click), and clicks on add post force
+        // plans — drained, because only the arm matters here. The sweep
+        // stays inside the modal: clicks below it would land on the map
+        // and deploy the armed hull, disarming the very latch sought. The
+        // sweep runs to the content's right edge — the place button is the
+        // row's last child, and a sweep that stops short of it (as the
+        // first version did at 680) clicks everything but the verb.
+        let modal_bottom = (h + 580.0) / 2.0;
+        let mut armed = false;
+        // Below the exercise section: its remove buttons share the sweep's
+        // x band, and a click there would un-draft the very hull sought.
+        // The drill columns start lower, and the seeded status above keeps
+        // them put while the sweep walks.
+        let mut y = 300.0;
+        while y < modal_bottom - 20.0 && !armed {
+            // The button's end of the row, in full: the place pill is the
+            // row's last child and narrow, and a coarse step walks straight
+            // past it — the first version proved exactly that at step 20.
+            let mut x = 630.0;
+            while x < 712.0 && !armed {
+                cx.simulate_click(
+                    gpui::point(gpui::px(x), gpui::px(y)),
+                    gpui::Modifiers::default(),
+                );
+                while rx.try_recv().is_ok() {}
+                armed = cx.update(|_, app| view.read(app).pending_place == Some(13));
+                x += 6.0;
+            }
+            y += 6.0;
+        }
+        assert!(armed, "some click armed Yani for placing");
+        while rx.try_recv().is_ok() {}
+        cx.simulate_click(
+            gpui::point(gpui::px(dx), gpui::px(dy)),
+            gpui::Modifiers::default(),
+        );
+        match rx.try_recv().expect("the click reached the sink") {
+            ToBinary::DeployUnit { unit_id, .. } => {
+                assert_eq!(unit_id, 13, "the armed hull deploys");
+            }
+            other => panic!("expected a deploy, got {other:?}"),
         }
     }
 

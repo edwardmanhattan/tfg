@@ -879,8 +879,8 @@ pub enum IslandKey {
     /// the exercise (`main.rs::side_zone`'s own comment).
     Operator,
     /// The hull register: what the fleet HAS. Not a session surface — the
-    /// register answers before any game is held, which is why it is the one
-    /// island present in `NoSession`.
+    /// register answers before any game is held, which is why it rides
+    /// along in `NoSession`.
     Fleet,
     /// The game's own terms: name, mode, pace, the planned window, the
     /// Game Master's prose. The console's `z.essentials`, which is where a
@@ -925,12 +925,15 @@ pub enum IslandKey {
     /// console's `z.assessment`, which is five tabs — Summary, Timeline,
     /// Judgements, Reviews, Transcript.
     ///
-    /// This shell carries the Summary alone. The other four have backend
-    /// reads in this crate (`timeline_page`, `judgements_list`,
-    /// `reviews_list`) that the shell's own fetch does not make, and
-    /// Transcript is a local trace with no route. They are named rather than
-    /// drawn empty.
+    /// This shell carries four of the five; only Transcript is named
+    /// rather than drawn, a local trace with no route.
     Assessment,
+    /// The games to hold: every exercise this account can see, with this
+    /// seat in each. The console's `z.start`, which is a session picker
+    /// plus a create button — the create half is the band's door here, so
+    /// the island carries the picker. Last of the keys on purpose: the
+    /// key feeds stateful ids, and appending renumbers nothing.
+    Sessions,
 }
 
 impl IslandKey {
@@ -951,6 +954,7 @@ impl IslandKey {
             IslandKey::Step => "STEP",
             IslandKey::Log => "LOG",
             IslandKey::Assessment => "ASSESSMENT",
+            IslandKey::Sessions => "SESSIONS",
         }
     }
 
@@ -972,6 +976,7 @@ impl IslandKey {
             IslandKey::Step => "step",
             IslandKey::Log => "log",
             IslandKey::Assessment => "assessment",
+            IslandKey::Sessions => "sessions",
         }
     }
 }
@@ -982,7 +987,7 @@ impl IslandKey {
 /// it changes with the exercise's state. What this list fixes is the identity
 /// the operator's open/closed choice hangs off, and it is declared once so no
 /// code path can hold a subset and quietly drop one.
-pub const COLUMN_ISLANDS: [IslandKey; 11] = [
+pub const COLUMN_ISLANDS: [IslandKey; 12] = [
     IslandKey::Operator,
     IslandKey::Essentials,
     IslandKey::Control,
@@ -994,6 +999,7 @@ pub const COLUMN_ISLANDS: [IslandKey; 11] = [
     IslandKey::Step,
     IslandKey::Log,
     IslandKey::Assessment,
+    IslandKey::Sessions,
 ];
 
 /// One slot in the column: which island, and how tall its footprint is.
@@ -1017,16 +1023,12 @@ pub struct IslandSlot {
 ///
 /// The omissions are named rather than hidden:
 ///
-/// - `z.start` (NoSession) is a session PICKER plus a create button. This
-///   shell holds the one game it can read and has no picker, so the create
-///   half is the band's door and the column carries the register instead.
-///   The arm stays although the signed-out path never draws it: a signed-out
-///   shell shows the login card, not the column, and the register needs a
-///   token to read — so a reachable NoSession would be an empty register
-///   beside the card, strictly worse. (A failed hold still lands here with
-///   whatever the register fetched, which is the arm's one honest reader.)
-///   Reachability waits on an unauthenticated register read, which is
-///   Minos's question, not this column's.
+/// - `z.start` (NoSession) is a session PICKER plus a create button. The
+///   create half is the band's door here, and the column carries the
+///   picker as its own island beside the register — which answers even
+///   here, because what the fleet HAS is not a session fact. The picker
+///   lists what the sign-in read; holding one replaces the session whole.
+///   A signed-out shell still shows the login card, not the column.
 /// - `z.essentials` and `z.control` (Planning) are the game's own terms and
 ///   pace. No read route exists for either here.
 /// - `z.groups` is the task organisation, and `/hierarchy` is empty for every
@@ -1049,9 +1051,14 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
     let slot = |key: IslandKey, height: f32| IslandSlot { key, height };
     let mut out = vec![slot(IslandKey::Operator, 172.0)];
     match state {
-        // What the fleet HAS is not a session fact, so the register answers
-        // even here.
-        crate::gamestate::GameState::NoSession => out.push(slot(IslandKey::Fleet, 320.0)),
+        // No held game: identity, the games to hold, and what the fleet
+        // HAS — which is not a session fact, so the register answers even
+        // here. The picker rides second because it is the state's verb:
+        // a signed-in shell with no game is here to choose one.
+        crate::gamestate::GameState::NoSession => {
+            out.push(slot(IslandKey::Sessions, 320.0));
+            out.push(slot(IslandKey::Fleet, 320.0));
+        }
         // PLANNING is the console's column, island for island and height for
         // height (`main.rs::side_zone`): read the plan back (Essentials),
         // set the clock's pace (Control), choose what fights (Fleet), seat
@@ -1717,9 +1724,12 @@ mod tests {
         let keys = |state: GameState, player: bool| -> Vec<IslandKey> {
             zone_islands(state, player).into_iter().map(|s| s.key).collect()
         };
-        // No session: identity, and the register — which answers before any
-        // game is held.
-        assert_eq!(keys(GameState::NoSession, false), [Operator_key(), Fleet_key()]);
+        // No session: identity, the games to hold, and the register —
+        // which answers before any game is held.
+        assert_eq!(
+            keys(GameState::NoSession, false),
+            [Operator_key(), Sessions_key(), Fleet_key()]
+        );
         // Planning is the console's column, island for island: read the plan
         // back, set the clock, choose what fights, seat the room, watch the
         // gate. One omission, named in `zone_islands`: `z.groups`.
@@ -1789,6 +1799,10 @@ mod tests {
     }
     fn Step_key() -> IslandKey {
         IslandKey::Step
+    }
+
+    fn Sessions_key() -> IslandKey {
+        IslandKey::Sessions
     }
 
     /// A player station changes the column in execution and ONLY there. In

@@ -112,6 +112,11 @@ fn main() {
             .and_then(|v| v.parse::<i64>().ok());
         let mut s = if token.is_empty() {
             tfg::shell_gpui::SessionView::default()
+        } else if std::env::var("TFG_SESSIONS").as_deref() == Ok("1") {
+            // Seeded open of the session picker: hold nothing, so the
+            // column lands on NoSession with the shell's fixture rows to
+            // pick. The roster stays real; only the hold is staged.
+            tfg::shell_gpui::SessionView::default()
         } else {
             fetch_session(&host, &token, pinned).unwrap_or_default()
         };
@@ -251,10 +256,18 @@ fn main() {
         tfg::map_render::MAP_CENTER.1,
         tfg::map_render::MAP_ZOOM,
     )));
+    // Hull photographs ride their own channel: the send end is cloned
+    // into the order loop (every card sign-in fetches on the new token)
+    // and the receive end feeds the shell below.
+    let (thumb_tx, thumb_rx) = mpsc::channel::<Vec<tfg::shell_gpui::ThumbRaw>>();
     {
         let (host2, token2, game_id) = (host.clone(), token.clone(), session.game_id);
         let camera2 = camera.clone();
         let req_tx2 = req_tx.clone();
+        // The photo channel's send end rides into the order loop: every
+        // card sign-in fetches again on the new token — a launch without
+        // credentials must not glyph-hold the rows forever.
+        let thumb_fetch_tx = thumb_tx.clone();
         std::thread::spawn(move || {
             // Mutated by the sign-in/sign-out answers below: a card sign-in
             // replaces the startup token (empty when the shell opened on the
@@ -327,7 +340,11 @@ fn main() {
                                 tfg::map_render::MAP_W as u32,
                                 tfg::map_render::MAP_H as u32,
                             ),
-                            tfg::map_render::JUMP_PUMP,
+                            // A zoom step is an ordinary gesture: spend
+                            // GESTURE_PUMP, not the jump budget. The view
+                            // updates at motion speed and the tiles catch
+                            // up on the following frames.
+                            tfg::map_render::GESTURE_PUMP,
                         ));
                     }
                     tfg::shell_gpui::ToBinary::Jump { lat, lon, shift_px } => {
@@ -385,44 +402,169 @@ fn main() {
                             (lat, lon),
                             zoom,
                             (mw as u32, mh as u32),
-                            tfg::map_render::JUMP_PUMP,
+                            // A drag step is an ordinary gesture: spend
+                            // GESTURE_PUMP, not the jump budget, for the
+                            // same motion-speed reason as the zoom step.
+                            tfg::map_render::GESTURE_PUMP,
                         ));
                     }
+                    tfg::shell_gpui::ToBinary::DeployUnit { unit_id, fx, fy } => {
+                        // The picker's drop (or its click-to-place fallback):
+                        // fractions of the map view, unprojected at this
+                        // side's camera — the shell has no mercator — then
+                        // `set_placement`, then the session re-read, like
+                        // every force write. Planning|preparation only: past
+                        // play the first fix leg is frozen and Minos refuses,
+                        // and the refusal is the picker's sentence.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to deploy".to_string())
+                        } else if game_id == 0 {
+                            Err("hold a session before deploying".to_string())
+                        } else if !fx.is_finite() || !fy.is_finite() {
+                            Err("that drop point is nowhere".to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            let (mw, mh) = (tfg::map_render::MAP_W, tfg::map_render::MAP_H);
+                            let (clat, clon, zoom) = camera2
+                                .lock()
+                                .map(|c| (c.0, c.1, c.2))
+                                .unwrap_or((
+                                    tfg::map_render::MAP_CENTER.0,
+                                    tfg::map_render::MAP_CENTER.1,
+                                    tfg::map_render::MAP_ZOOM,
+                                ));
+                            let (lat, lon) = tfg::map_render::unproject_mercator(
+                                fx.clamp(0.0, 1.0) * mw,
+                                fy.clamp(0.0, 1.0) * mh,
+                                (clat, clon),
+                                zoom,
+                                mw,
+                                mh,
+                            );
+                            match master.set_placement(&token2, game_id, unit_id, lat, lon) {
+                                Ok(_) => {
+                                    eprintln!("placed {unit_id} at {lat:.4}, {lon:.4}");
+                                    match fetch_session(&host2, &token2, Some(game_id)) {
+                                        Some(s) => {
+                                            Ok(tfg::shell_gpui::CreatedSession { session: s })
+                                        }
+                                        None => Err(
+                                            "the hull was placed, but the session could not be read"
+                                                .to_string(),
+                                        ),
+                                    }
+                                }
+                                Err(e) => Err(format!("not placed: {e}")),
+                            }
+                        };
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
+                    tfg::shell_gpui::ToBinary::DeployAssign {
+                        unit_id,
+                        commander_id,
+                        fx,
+                        fy,
+                    } => {
+                        // Placing IS assigning: the drop of a hull the
+                        // exercise does not hold yet. `assign_unit` first —
+                        // a hull with no seat is refused before anything is
+                        // written — then the same unproject-and-place the
+                        // plain deploy does. Either step names its own
+                        // failure, and a hull assigned-but-unplaced is a
+                        // good state: the next drop places it outright.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to deploy".to_string())
+                        } else if game_id == 0 {
+                            Err("hold a session before deploying".to_string())
+                        } else if !fx.is_finite() || !fy.is_finite() {
+                            Err("that drop point is nowhere".to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            match master.assign_unit(&token2, game_id, unit_id, commander_id) {
+                                Err(e) => Err(format!("not assigned: {e}")),
+                                Ok(_) => {
+                                    let (mw, mh) = (tfg::map_render::MAP_W, tfg::map_render::MAP_H);
+                                    let (clat, clon, zoom) = camera2
+                                        .lock()
+                                        .map(|c| (c.0, c.1, c.2))
+                                        .unwrap_or((
+                                            tfg::map_render::MAP_CENTER.0,
+                                            tfg::map_render::MAP_CENTER.1,
+                                            tfg::map_render::MAP_ZOOM,
+                                        ));
+                                    let (lat, lon) = tfg::map_render::unproject_mercator(
+                                        fx.clamp(0.0, 1.0) * mw,
+                                        fy.clamp(0.0, 1.0) * mh,
+                                        (clat, clon),
+                                        zoom,
+                                        mw,
+                                        mh,
+                                    );
+                                    match master.set_placement(
+                                        &token2, game_id, unit_id, lat, lon,
+                                    ) {
+                                        Ok(_) => {
+                                            eprintln!(
+                                                "assigned and placed {unit_id} at {lat:.4}, {lon:.4}"
+                                            );
+                                            match fetch_session(&host2, &token2, Some(game_id)) {
+                                                Some(s) => Ok(
+                                                    tfg::shell_gpui::CreatedSession { session: s },
+                                                ),
+                                                None => Err(
+                                                    "the hull was placed, but the session could not be read"
+                                                        .to_string(),
+                                                ),
+                                            }
+                                        }
+                                        Err(e) => Err(format!(
+                                            "assigned, but not placed: {e}"
+                                        )),
+                                    }
+                                }
+                            }
+                        };
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
                     tfg::shell_gpui::ToBinary::SignIn { identifier, password } => {
-                        // The whole authenticated read, TOGETHER: the register
-                        // and the session come from one sign-in, so the shell
-                        // never sees half a session. The refusal is a sentence
-                        // the card can show — never a swallowed error.
+                        // Sign in, then STOP: the roster and the games list
+                        // arrive together, but no game is held — holding is
+                        // the picker's verb, and an auto-hold here is what
+                        // dropped fresh logins mid-execution with no say.
+                        // The refusal is a sentence the card can show —
+                        // never a swallowed error.
                         let outcome = match fetch_roster(&host2, &identifier, &password) {
                             Some((rows, token)) => {
                                 let total = rows.len();
-                                let pinned = std::env::var("TFG_GAME")
-                                    .ok()
-                                    .and_then(|v| v.parse::<i64>().ok());
-                                match fetch_session(&host2, &token, pinned) {
-                                    Some(mut s) => {
-                                        s.signed_in = true;
-                                        s.zoom = tfg::map_render::MAP_ZOOM;
-                                        // The shell gets the session; THIS
-                                        // side keeps the token and the game,
-                                        // so a helm order after a card
-                                        // sign-in posts as the new session.
-                                        // Before this, the startup token
-                                        // (empty when the shell opened on the
-                                        // card) stayed, and the first order
-                                        // after signing in was refused.
-                                        token2 = token;
-                                        game_id = s.game_id;
-                                        Ok(tfg::shell_gpui::SignedIn {
-                                            roster: rows,
-                                            roster_total: total,
-                                            session: s,
-                                        })
-                                    }
-                                    None => Err(
-                                        "signed in, but the session could not be read".to_string(),
-                                    ),
-                                }
+                                let sessions =
+                                    fetch_session_rows(&host2, &token).unwrap_or_default();
+                                // The shell gets the roster and the games;
+                                // THIS side keeps the token with no game
+                                // yet, so the first hold posts as the
+                                // picked session. Photos fetch on the new
+                                // token too — a launch without credentials
+                                // must not glyph-hold the rows forever.
+                                token2 = token.clone();
+                                spawn_thumb_fetch(
+                                    host2.clone(),
+                                    token,
+                                    thumb_fetch_tx.clone(),
+                                );
+                                game_id = 0;
+                                Ok(tfg::shell_gpui::SignedIn {
+                                    roster: rows,
+                                    roster_total: total,
+                                    sessions,
+                                    session: tfg::shell_gpui::SessionView::default(),
+                                })
                             }
                             None => Err(
                                 "sign-in refused \u{2014} check the identifier and password"
@@ -440,6 +582,29 @@ fn main() {
                         // live wire keeps its socket, honestly idle.
                         token2.clear();
                         eprintln!("signed out — token cleared");
+                    }
+                    tfg::shell_gpui::ToBinary::HoldSession { game_id: hold } => {
+                        // The picker's verb: hold the named game, read back
+                        // rather than assumed — `fetch_session` pinned, the
+                        // same read startup holds. An unknown id refuses
+                        // with the row's own name for it, never silence.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to hold a session".to_string())
+                        } else {
+                            match fetch_session(&host2, &token2, Some(hold)) {
+                                Some(mut s) => {
+                                    s.signed_in = true;
+                                    s.zoom = tfg::map_render::MAP_ZOOM;
+                                    game_id = s.game_id;
+                                    eprintln!("holding {} ({})", s.game, s.state);
+                                    Ok(tfg::shell_gpui::CreatedSession { session: s })
+                                }
+                                None => Err("could not hold that session".to_string()),
+                            }
+                        };
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
                     }
                     tfg::shell_gpui::ToBinary::CreateSession { draft } => {
                         // The console's `setup_create_game`, as a message: a
@@ -948,6 +1113,64 @@ fn main() {
                             return;
                         }
                     }
+                    tfg::shell_gpui::ToBinary::EmbarkDrop { host, child } => {
+                        // The picker's drop onto a placed host: one hull
+                        // aboard another, through `game_attach_units`. The
+                        // console's `try_embark_drop`, as a message, without
+                        // its capacity pre-checks — the server evaluates and
+                        // the answer carries what it said.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to embark".to_string())
+                        } else if game_id == 0 {
+                            Err("hold a session before embarking".to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            match master.game_attach_units(&token2, game_id, host, &[child]) {
+                                Ok(result) => {
+                                    eprintln!("embarked {child} aboard {host}");
+                                    Ok((host, result))
+                                }
+                                Err(e) => Err(format!("not embarked: {e}")),
+                            }
+                        };
+                        if embark_write_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
+                    tfg::shell_gpui::ToBinary::EmbarkAssign { host, child, commander_id } => {
+                        // Embarking IS assigning, the host-side twin of the
+                        // drop above: `assign_unit` first, then the attach.
+                        // Answered on the embark feed like every embark
+                        // write — the host's contents after the act.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to embark".to_string())
+                        } else if game_id == 0 {
+                            Err("hold a session before embarking".to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            match master.assign_unit(&token2, game_id, child, commander_id) {
+                                Err(e) => Err(format!("not assigned: {e}")),
+                                Ok(_) => {
+                                    match master.game_attach_units(&token2, game_id, host, &[child]) {
+                                        Ok(result) => {
+                                            eprintln!("assigned and embarked {child} aboard {host}");
+                                            Ok((host, result))
+                                        }
+                                        Err(e) => Err(format!(
+                                            "assigned, but not embarked: {e}"
+                                        )),
+                                    }
+                                }
+                            }
+                        };
+                        if embark_write_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
                     tfg::shell_gpui::ToBinary::ClearAboard { host, unit } => {
                         // The console's `embark_clear`, as a message:
                         // permission to act, not release. Answered back the
@@ -1322,6 +1545,24 @@ fn main() {
     let camera_frame = camera.clone();
     let camera_fix = camera.clone();
 
+    // The picker's drill tree, read once off the synced mirror like the
+    // symbol resolver above it: the taxonomy does not move under us, and a
+    // picker that re-read sqlite per frame would be a fan-out for nothing.
+    // Empty when the store never synced — the picker falls back to flat.
+    let fleet_tax = store.as_ref().map(|conn| {
+        build_fleet_taxonomy(conn, |id| resolve_symbol(id, &store_ctx, &classes))
+    }).unwrap_or_default();
+
+
+    // The photo channel lives as long as the shell: startup fetches when
+    // it can, and every sign-in fetches again — a launch without
+    // credentials must not glyph-hold the rows forever.
+    if !token.is_empty() {
+        spawn_thumb_fetch(host.clone(), token.clone(), thumb_tx.clone());
+    }
+    let thumb_feed: tfg::shell_gpui::ThumbFeed =
+        std::boxed::Box::new(move || thumb_rx.try_recv().ok());
+
     tfg::shell_gpui::run(
         Box::new(move || {
             // Newest-wins, the discipline the map thread answers with: a
@@ -1412,11 +1653,143 @@ fn main() {
         clock_feed,
         embarked_feed,
         embark_write_feed,
+        thumb_feed,
         order_tx,
         roster,
         roster_total,
         session,
+        fleet_tax,
     );
+}
+
+/// Hull photographs, fetched off-thread: the manifest says which hulls
+/// have pictures, one presigned URL per hull resolves the bytes, and each
+/// decoded thumbnail rides the channel the moment it lands — the picker
+/// fills in progressively while the glyphs hold the rows. Memory only (no
+/// disk cache yet); a hull with no picture costs no request.
+///
+/// Runs at startup AND after every sign-in: a launch without credentials
+/// fetches nothing, and a card sign-in later must not leave the rows
+/// glyph-held forever. The shell keys by unit id and skips what it holds,
+/// so a second pass re-fetches but never repaints.
+fn spawn_thumb_fetch(
+    host: String,
+    token: String,
+    thumb_tx: mpsc::Sender<Vec<tfg::shell_gpui::ThumbRaw>>,
+) {
+    std::thread::spawn(move || {
+        let Ok(master) = tfg::backend::MinosMaster::new(&host) else {
+            return;
+        };
+        let Ok(manifest) = master.unit_image_manifest(&token) else {
+            eprintln!("thumbs: no manifest, glyphs hold every row");
+            return;
+        };
+        eprintln!(
+            "thumbs: manifest {} ({} pictured)",
+            manifest.version,
+            manifest.entries.len()
+        );
+        let dl = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build();
+        let Ok(dl) = dl else { return };
+        for e in manifest
+            .entries
+            .iter()
+            .filter(|e| e.asset_kind == "unit_image")
+        {
+            let Ok(Some(url)) = master.hull_image_url(&token, e.unit_id) else {
+                continue;
+            };
+            let bytes = dl.get(&url).send().and_then(|r| r.bytes());
+            let Ok(bytes) = bytes else { continue };
+            let Ok(img) = image::load_from_memory(&bytes) else {
+                continue;
+            };
+            let small = img.thumbnail(192, 192).to_rgba8();
+            let (w, h) = (small.width(), small.height());
+            if thumb_tx
+                .send(vec![tfg::shell_gpui::ThumbRaw {
+                    unit_id: e.unit_id,
+                    w,
+                    h,
+                    rgba: small.into_raw(),
+                }])
+                .is_err()
+            {
+                return;
+            }
+        }
+        eprintln!("thumbs: fetch pass done");
+    });
+}
+
+/// The fleet picker's drill tree, built once off the synced mirror.
+///
+/// Lives here and not in the shell: the tree reads sqlite, and the shell
+/// module is also compiled into the sqlite-free parity proto. Best-effort
+/// per rung — a rung that fails to read comes back empty rather than
+/// failing the whole tree, because a picker with three groups is honest
+/// and a picker that refused to open over one bad row is not. Counts are
+/// the readers' own live-hull counts, so a tab's number and the rows
+/// behind it agree.
+fn build_fleet_taxonomy(
+    conn: &rusqlite::Connection,
+    mut symbol_of: impl FnMut(&str) -> tfg::view::MapSymbolShape,
+) -> tfg::shell_gpui::FleetTaxonomy {
+    use tfg::shell_gpui::{FleetTaxCat, FleetTaxClass, FleetTaxGroup, FleetTaxLeaf, FleetTaxType};
+    use tfg::store::{
+        asset_groups, tax_categories_in_asset_group, tax_classes, tax_types, tax_units,
+    };
+    let mut groups = Vec::new();
+    for g in asset_groups(conn).unwrap_or_default() {
+        let mut cats = Vec::new();
+        for c in tax_categories_in_asset_group(conn, Some(g.id)).unwrap_or_default() {
+            let mut types = Vec::new();
+            for t in tax_types(conn, c.id).unwrap_or_default() {
+                let mut classes = Vec::new();
+                for cl in tax_classes(conn, t.id).unwrap_or_default() {
+                    let units = tax_units(conn, cl.id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|u| FleetTaxLeaf {
+                            symbol: symbol_of(&u.id),
+                            id: u.id,
+                            name: u.name,
+                            hull: u.hull,
+                            class_name: u.class_name,
+                        })
+                        .collect();
+                    classes.push(FleetTaxClass {
+                        id: cl.id,
+                        name: cl.name,
+                        count: cl.count,
+                        units,
+                    });
+                }
+                types.push(FleetTaxType {
+                    id: t.id,
+                    name: t.name,
+                    count: t.count,
+                    classes,
+                });
+            }
+            cats.push(FleetTaxCat {
+                id: c.id,
+                name: c.name,
+                count: c.count,
+                types,
+            });
+        }
+        groups.push(FleetTaxGroup {
+            id: g.id,
+            name: g.name,
+            count: g.count,
+            cats,
+        });
+    }
+    tfg::shell_gpui::FleetTaxonomy { groups }
 }
 
 /// The hull register over the dev API, as the console's own client reads it.
@@ -1514,6 +1887,35 @@ fn resolve_affiliation(id: &str, ctx: &Option<StoreCtx>) -> tfg::symbology::Affi
 /// row in each game's roster instead — no write, and the same seat. A game
 /// whose participants are unreadable (403) is skipped, because a room this
 /// account cannot read is not a room it holds.
+/// The games one account can see, for the session picker: every game in
+/// the server's own order, each with this seat in it (role name and judge
+/// side, empty/false when watching). One participants read per game — the
+/// same fan-out `fetch_session` already pays to choose the hold — so the
+/// picker and the hold never disagree about where this account sits.
+fn fetch_session_rows(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::SessionRow>> {
+    let master = tfg::backend::MinosMaster::new(host).ok()?;
+    let (me, _name) = master.me(token).ok()?;
+    let games = master.games_list(token).ok()?;
+    let mut rows = Vec::new();
+    for g in &games {
+        let Ok(parts) = master.game_participants(token, g.id) else {
+            continue;
+        };
+        let (role, judge) = match parts.iter().find(|p| p.user_id == me) {
+            Some(p) => (p.role_name.clone(), p.judge),
+            None => (String::new(), false),
+        };
+        rows.push(tfg::shell_gpui::SessionRow {
+            id: g.id,
+            name: g.name.clone(),
+            state: g.state.clone(),
+            my_role: role,
+            judge,
+        });
+    }
+    Some(rows)
+}
+
 fn fetch_session(
     host: &str,
     token: &str,
@@ -1831,3 +2233,73 @@ fn fetch_session(
 /// How many extra frames to ask for after the first, so MapLibre's tiles have
 /// time to arrive before a capture. A stand-in for the camera.
 const WARMUP_FRAMES: u64 = 24;
+
+#[cfg(test)]
+mod fleet_taxonomy_tests {
+    use super::*;
+
+    fn seed_tree(conn: &rusqlite::Connection) {
+        conn.execute(
+            "INSERT INTO helpers (table_name, id, name, id_name) VALUES
+              ('asset_groups', 2, 'Sea', 'Aset Laut'),
+              ('asset_groups', 4, 'Other', 'Aset Lainnya')",
+            [],
+        )
+        .expect("groups");
+        conn.execute(
+            "INSERT INTO unit_categories (id, name, id_name, type_count, id_asset_group)
+              VALUES (2, 'Frigate', 'Frigat', 1, 2)",
+            [],
+        )
+        .expect("category");
+        conn.execute(
+            "INSERT INTO unit_types (id, name, id_name, category_id, class_count)
+              VALUES (3, 'FFG', 'Frigat', 2, 1)",
+            [],
+        )
+        .expect("type");
+        conn.execute(
+            "INSERT INTO unit_classes (id, name, id_name, type_id, hull_count)
+              VALUES (5, 'Sigma', 'Sigma', 3, 2)",
+            [],
+        )
+        .expect("class");
+        conn.execute(
+            "INSERT INTO units (id, name, hull_number, class_id, branch_id)
+              VALUES (13, 'KRI Ahmad Yani', '351', 5, 1),
+                     (14, 'KRI Yos Sudarso', '353', 5, 1)",
+            [],
+        )
+        .expect("hulls");
+    }
+
+    #[test]
+    fn builder_walks_group_to_hull() {
+        let conn =
+            tfg::store::open(&std::path::PathBuf::from(":memory:")).expect("open");
+        seed_tree(&conn);
+        let tax =
+            build_fleet_taxonomy(&conn, |_| tfg::view::MapSymbolShape::Frigate);
+        assert_eq!(tax.groups.len(), 2, "both groups list, even empty ones");
+        let sea = tax.groups.iter().find(|g| g.id == 2).expect("sea tab");
+        assert_eq!(sea.cats.len(), 1);
+        assert_eq!(sea.cats[0].types.len(), 1);
+        assert_eq!(sea.cats[0].types[0].classes.len(), 1);
+        assert_eq!(sea.cats[0].types[0].classes[0].units.len(), 2);
+        let leaf = &sea.cats[0].types[0].classes[0].units[0];
+        assert_eq!(leaf.name, "KRI Ahmad Yani");
+        assert_eq!(leaf.hull, "351");
+        assert_eq!(leaf.symbol, tfg::view::MapSymbolShape::Frigate);
+        let other = tax.groups.iter().find(|g| g.id == 4).expect("other tab");
+        assert!(other.cats.is_empty(), "nothing filed under Other");
+    }
+
+    #[test]
+    fn builder_empty_store_is_empty_tree() {
+        let conn =
+            tfg::store::open(&std::path::PathBuf::from(":memory:")).expect("open");
+        let tax =
+            build_fleet_taxonomy(&conn, |_| tfg::view::MapSymbolShape::Dot);
+        assert!(tax.groups.is_empty(), "the picker falls back to flat");
+    }
+}
