@@ -580,6 +580,13 @@ const FLEET_H: f32 = 580.0;
 /// (proved on capture).
 const LEAF_CONTENT_W: f32 = 236.0;
 
+/// The banner's tallest. A photo's natural banner height is its width
+/// over its aspect; the archive's few non-panorama outliers (a tank at
+/// 2.67:1, a helicopter at 1.51:1, a drone at 0.49:1) would reach 88 to
+/// 481 and blow the row up, so past this they letterbox inside it
+/// instead — the whole body still shows, the row stays sane.
+const BANNER_MAX_H: f32 = 96.0;
+
 /// The modal silhouette: a convex pentagon, the panel rect with its
 /// top-right corner cut back by `view::CUT` (20.0), stroked 2px in
 /// `CUT_GREY`. Painted with `window.paint_path` through a `canvas` element
@@ -3233,15 +3240,20 @@ impl IslandDemo {
     /// The row's thumbnail as a full-width banner: the whole photograph,
     /// never a cropped slice — the archive's photos are wide whole-body
     /// panoramas (5.9:1 to 9.4:1), and a cover-cropped strip showed a
-    /// zoomed-in slice of the hull instead of the ship. `Contain` fits the
-    /// entire image; the banner's modest height hugs it (a wide photo's
-    /// height is its width over its aspect, whatever the box).
+    /// zoomed-in slice of the hull instead of the ship. The height
+    /// follows the photo (width over aspect), capped at `BANNER_MAX_H`.
     fn thumb_banner(thumb: Option<Arc<gpui::RenderImage>>, symbol: MapSymbolShape) -> AnyElement {
-        // 48 tall at 236 wide: a 4.9:1 strip that the common 5.9:1–9.4:1
-        // panoramas nearly fill (the rest is a thin slate matte). The
-        // glyph fallback scales to read as a placeholder, not a stamp
-        // floating in a band.
-        Self::thumb_box(thumb, symbol, LEAF_CONTENT_W, 48.0, 1.5, ObjectFit::Contain)
+        let h = match &thumb {
+            Some(photo) => {
+                let size = photo.size(0);
+                let aspect = size.width.0 as f32 / size.height.0 as f32;
+                (LEAF_CONTENT_W / aspect).min(BANNER_MAX_H)
+            }
+            // The placeholder waits at the first banner's height: the
+            // common panoramas land near it and barely reflow.
+            None => 48.0,
+        };
+        Self::thumb_box(thumb, symbol, LEAF_CONTENT_W, h, 1.0, ObjectFit::Contain)
     }
 
     /// The shared face: a rounded photograph when the fetcher has
