@@ -264,10 +264,11 @@ pub enum ForceWrite {
     /// Put a hull aboard another. Names both ends: the endpoint addresses
     /// the host, and the child is the hull that moves.
     Embark { host: i64, child: i64, name: String },
-    /// Take a hull off whatever carries it. Names only the child: the host
-    /// it leaves is whatever the server last said, and the endpoint takes
-    /// the child's id.
-    Disembark { child: i64, name: String },
+    /// Take a hull off whatever carries it. The host is named because the
+    /// detach endpoint addresses the HOST and lists the children leaving it
+    /// — and the host it leaves is whatever the server last said, not
+    /// whatever the draft now wants.
+    Disembark { host: i64, child: i64, name: String },
     /// Take a hull out of the exercise entirely.
     Remove { unit_id: i64, name: String },
 }
@@ -521,16 +522,24 @@ pub fn plan(draft: &ForceDraft, live: &[LiveHull]) -> Result<Vec<ForceWrite>, Fo
         if hull.host == live_host {
             continue;
         }
-        match hull.host {
-            Some(host) => writes.push(ForceWrite::Embark {
+        // A hull already inside something must come OUT before it can go into
+        // something else: the attach endpoint refuses a unit that is "already
+        // inside something", so a re-host is two writes rather than one. The
+        // detach addresses the host the server last named — the only place the
+        // hull can currently be.
+        if let Some(old) = live_host {
+            writes.push(ForceWrite::Disembark {
+                host: old,
+                child: hull.unit_id,
+                name: hull.name.clone(),
+            });
+        }
+        if let Some(host) = hull.host {
+            writes.push(ForceWrite::Embark {
                 host,
                 child: hull.unit_id,
                 name: hull.name.clone(),
-            }),
-            None => writes.push(ForceWrite::Disembark {
-                child: hull.unit_id,
-                name: hull.name.clone(),
-            }),
+            });
         }
     }
     // PASS 3 — removals last: a hull taken back out of the exercise is
@@ -835,8 +844,8 @@ mod tests {
         );
     }
 
-    /// The endpoint takes the child's id, not the host's: whatever carries
-    /// it is what the server last said, and the child is what moves.
+    /// The detach addresses the host the server last named, and lists the
+    /// child leaving it: the child is what moves, the host is where from.
     #[test]
     fn a_disembark_is_one_write() {
         let mut draft = ForceDraft::new();
@@ -854,9 +863,44 @@ mod tests {
         assert_eq!(
             plan(&draft, &server),
             Ok(vec![ForceWrite::Disembark {
+                host: 5,
                 child: 7,
                 name: "KRI Nanggala".into(),
             }])
+        );
+    }
+
+    /// A hull already aboard one host and re-dropped on another comes out
+    /// first: the attach endpoint refuses a unit that is already inside
+    /// something, so the plan spends the detach before the attach.
+    #[test]
+    fn a_re_host_detaches_before_it_attaches() {
+        let mut draft = ForceDraft::new();
+        for (id, name) in [(5, "KRI Ahmad Yani"), (7, "KRI Nanggala"), (9, "KRI Sultan")] {
+            let mut h = hull(id, name, None);
+            h.commander_id = Some(3);
+            draft.upsert(h);
+        }
+        assert!(draft.set_host(7, Some(9)), "re-dropped on a new host");
+        let server = vec![
+            aboard(live(7, "KRI Nanggala", Some(3), None), 5),
+            live(5, "KRI Ahmad Yani", Some(3), None),
+            live(9, "KRI Sultan", Some(3), None),
+        ];
+        assert_eq!(
+            plan(&draft, &server),
+            Ok(vec![
+                ForceWrite::Disembark {
+                    host: 5,
+                    child: 7,
+                    name: "KRI Nanggala".into(),
+                },
+                ForceWrite::Embark {
+                    host: 9,
+                    child: 7,
+                    name: "KRI Nanggala".into(),
+                },
+            ])
         );
     }
 
