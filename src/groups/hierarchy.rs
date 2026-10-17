@@ -7,7 +7,9 @@
 
 use std::collections::HashSet;
 
-use super::model::{Group, GroupKind};
+use super::model::{
+    duplicate_unit_refusal, rank_refusal, repeated_unit_refusal, Group, GroupKind,
+};
 use super::Groups;
 
 impl Groups {
@@ -35,10 +37,10 @@ impl Groups {
         let mut seen: HashSet<&str> = HashSet::new();
         for u in &units {
             if !seen.insert(u.as_str()) {
-                return Err(format!("unit `{u}` listed twice"));
+                return Err(repeated_unit_refusal(u));
             }
             if let Some(owner) = self.groups.iter().find(|g| g.units.iter().any(|m| m == u)) {
-                return Err(format!("unit `{u}` already in group `{}`", owner.name));
+                return Err(duplicate_unit_refusal(u, &owner.name));
             }
         }
         for c in &children {
@@ -49,14 +51,7 @@ impl Groups {
                 return Err(format!("unknown group `{c}`"));
             };
             if child.kind.rank() >= kind.rank() {
-                return Err(format!(
-                    "rank violation: child `{}` ({}:{}) not below {}:{}",
-                    child.name,
-                    child.kind.label(),
-                    child.kind.rank(),
-                    kind.label(),
-                    kind.rank()
-                ));
+                return Err(rank_refusal(&child.name, child.kind, kind));
             }
         }
         self.groups.push(Group { id, name, kind, units, children, commander });
