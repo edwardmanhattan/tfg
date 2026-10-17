@@ -5251,3 +5251,43 @@ also slimmed from 96 to 48 (a 4.9:1 strip the common panoramas
 nearly fill) instead of sitting 65% matte. The drag ghost keeps its
 56×38 `Cover` stamp: a cursor stamp wants a slice, not a letterboxed
 sliver.
+
+## The keyring: a returning launch skips the card (2026-10-17)
+
+The operator logged in by hand on every `cargo run`. The egui console
+stored a refresh token in the OS keyring; the GPUI cutover kept the
+backend functions (`keyring_save/load/clear`, `last_user_*` in
+`src/backend/auth.rs`, service `tfg-minos`) but never wired them — the
+startup read only `TFG_API_USER`/`TFG_API_PASS`, and the card was the
+only interactive path.
+
+The wiring, all in the binary (it owns the token, the paths, and the
+backend — the shell just sends SignIn/SignOut and receives the roster):
+
+- **Startup** tries the environment first (a capture's explicit
+  superuser), then the keyring: `last_user_load` → `keyring_load` →
+  `MinosAuth::refresh` → roster. A stored refresh token rotates into a
+  live session before the shell opens. `TFG_SIGNED_OUT` still forces
+  the card (it wins over every source).
+- **SignIn** saves the refresh token (`keyring_save`) and the last
+  user (`last_user_save`) after a successful login.
+- **SignOut** clears both (`keyring_clear`, `last_user_clear`) — a
+  signed-out operator stays signed out.
+
+The rotation mints a new refresh token; storing it back keeps the next
+launch on the keyring. Every failure (no secret service, expired token,
+refused rotation) degrades to the card, never a crash.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 492 pass (the 2 new keyring round-trips), same 4 pre-existing failures |
+| the keyring round-trips | `keyring_round_trip_save_load_clear`, `last_user_round_trip_save_load_clear` (skips where no secret service) |
+| a returning launch skips the card | stored a real refresh token in the keyring, ran the binary with no env credentials: log `roster: keyring session for superuser`, and the capture shows the console (LIVE, SIGN OUT, STEP panel) — no card |
+
+**Still open.** The sign-out's keyring clear is sink-tested (the
+round-trip) but not gesture-driven — proving it needs a driven pointer
+to click SIGN OUT. The env-before-keyring order means a box with
+`TFG_API_USER` set always uses the environment; the keyring is the
+no-env interactive path.

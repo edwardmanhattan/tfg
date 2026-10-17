@@ -14,6 +14,7 @@
 //! `shell_threads` or `backend` — which is what keeps the parity proto free
 //! of MapLibre's 2 GB C++ tree and of the HTTP stack.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
@@ -63,39 +64,49 @@ fn main() {
 
     // U8 step 4's first panel: the roster sheet's rows are the real hull
     // register. Credentials from the environment, never from the source —
-    // the shipped crate carries no secret, and the console's real path is
-    // the login card plus the OS keyring, which is where this goes next.
+    // the shipped crate carries no secret. The console's real path is the
+    // login card plus the OS keyring: a card sign-in leaves a refresh
+    // token in the keyring, and the next launch rotates it into a session
+    // before the shell opens (see `try_keyring_login`).
     let host = std::env::var("TFG_MINOS_HOST")
         .unwrap_or_else(|_| "https://api.tfg.development.crossnet.co.id/api/v1".to_string());
-    let (roster, roster_total, token) = match (
-        std::env::var("TFG_API_USER"),
-        std::env::var("TFG_API_PASS"),
-    ) {
-        (Ok(user), Ok(pass)) => match fetch_roster(&host, &user, &pass) {
-            Some((rows, token)) => {
-                let total = rows.len();
-                eprintln!("roster: {total} hulls from {host}");
-                (rows, total, token)
-            }
-            None => {
-                eprintln!("roster: fetch failed, falling back to the fixture");
-                (tfg::shell_gpui::fixture_roster(), 125, String::new())
-            }
-        },
-        _ => {
-            eprintln!("roster: no credentials (TFG_API_USER/TFG_API_PASS), fixture rows");
-            (tfg::shell_gpui::fixture_roster(), 125, String::new())
-        }
-    };
-
-    // `TFG_SIGNED_OUT` forces the sign-in card for a headless capture. The
-    // shipped build starts here anyway — the card is otherwise only reachable
-    // by having no credentials at all — and this is the seed that makes the
-    // first panel photographable without unsetting the environment.
-    let (roster, roster_total, token) = if std::env::var("TFG_SIGNED_OUT").as_deref() == Ok("1") {
-        (tfg::shell_gpui::fixture_roster(), 125, String::new())
+    // Credentials, in order: the environment (a capture's explicit
+    // superuser), then the keyring's stored refresh token (a returning
+    // launch skips the card), then the card. `TFG_SIGNED_OUT` wins over
+    // all of them — it forces the card for a headless capture.
+    let (roster, roster_total, token, user) = if std::env::var("TFG_SIGNED_OUT").as_deref()
+        == Ok("1")
+    {
+        eprintln!("roster: TFG_SIGNED_OUT, the card is forced");
+        (tfg::shell_gpui::fixture_roster(), 125, String::new(), String::new())
     } else {
-        (roster, roster_total, token)
+        match (
+            std::env::var("TFG_API_USER"),
+            std::env::var("TFG_API_PASS"),
+        ) {
+            (Ok(user), Ok(pass)) => match fetch_roster(&host, &user, &pass) {
+                Some((rows, token, _)) => {
+                    let total = rows.len();
+                    eprintln!("roster: {total} hulls from {host}");
+                    (rows, total, token, user)
+                }
+                None => {
+                    eprintln!("roster: fetch failed, falling back to the fixture");
+                    (tfg::shell_gpui::fixture_roster(), 125, String::new(), user)
+                }
+            },
+            _ => match try_keyring_login(&host, &paths.last_user) {
+                Some((rows, token, user)) => {
+                    let total = rows.len();
+                    eprintln!("roster: keyring session for {user} from {host}");
+                    (rows, total, token, user)
+                }
+                None => {
+                    eprintln!("roster: no credentials and no keyring session, the card");
+                    (tfg::shell_gpui::fixture_roster(), 125, String::new(), String::new())
+                }
+            },
+        }
     };
 
     // The session's READ path: the newest game and its room. Read-only on
@@ -261,7 +272,8 @@ fn main() {
     // and the receive end feeds the shell below.
     let (thumb_tx, thumb_rx) = mpsc::channel::<Vec<tfg::shell_gpui::ThumbRaw>>();
     {
-        let (host2, token2, game_id) = (host.clone(), token.clone(), session.game_id);
+        let (host2, token2, game_id, user2) =
+            (host.clone(), token.clone(), session.game_id, user.clone());
         let camera2 = camera.clone();
         let req_tx2 = req_tx.clone();
         // The photo channel's send end rides into the order loop: every
@@ -274,6 +286,7 @@ fn main() {
             // card), and a sign-out clears it so nothing else posts on it.
             let mut token2 = token2;
             let mut game_id = game_id;
+            let mut user2 = user2;
             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                 return;
             };
@@ -542,7 +555,7 @@ fn main() {
                         // The refusal is a sentence the card can show —
                         // never a swallowed error.
                         let outcome = match fetch_roster(&host2, &identifier, &password) {
-                            Some((rows, token)) => {
+                            Some((rows, token, refresh_token)) => {
                                 let total = rows.len();
                                 let sessions =
                                     fetch_session_rows(&host2, &token).unwrap_or_default();
@@ -553,6 +566,18 @@ fn main() {
                                 // token too — a launch without credentials
                                 // must not glyph-hold the rows forever.
                                 token2 = token.clone();
+                                // The refresh token outlives the access
+                                // one: the keyring stores it so the next
+                                // launch skips the card, and the last
+                                // user is remembered to key it by.
+                                user2 = identifier.clone();
+                                if let Some(rt) = refresh_token.as_deref() {
+                                    let _ = tfg::backend::keyring_save(&identifier, rt);
+                                    tfg::backend::last_user_save(
+                                        &paths.last_user,
+                                        &identifier,
+                                    );
+                                }
                                 spawn_thumb_fetch(
                                     host2.clone(),
                                     token,
@@ -578,10 +603,15 @@ fn main() {
                     tfg::shell_gpui::ToBinary::SignOut => {
                         // Local, like the shell's half: drop the token so
                         // nothing else posts on it. No server revocation —
-                        // this side never held the refresh token — and the
-                        // live wire keeps its socket, honestly idle.
+                        // the refresh token lives in the OS keyring, not
+                        // here — and the live wire keeps its socket,
+                        // honestly idle. The keyring entry goes with it:
+                        // a signed-out operator stays signed out.
+                        let _ = tfg::backend::keyring_clear(&user2);
+                        tfg::backend::last_user_clear(&paths.last_user);
                         token2.clear();
-                        eprintln!("signed out — token cleared");
+                        user2.clear();
+                        eprintln!("signed out — token and keyring cleared");
                     }
                     tfg::shell_gpui::ToBinary::HoldSession { game_id: hold } => {
                         // The picker's verb: hold the named game, read back
@@ -1800,22 +1830,58 @@ fn build_fleet_taxonomy(
 /// `MinosMaster::units_named` rather than `units`: the sheet wants a class
 /// NAME, and `units` flattens the taxonomy to ids by design (the console
 /// resolves them from the catalog after a sync).
-fn fetch_roster(host: &str, user: &str, pass: &str) -> Option<(Vec<tfg::shell_gpui::RosterRow>, String)> {
+/// The register behind an access token — the one read both the
+/// password login and the keyring refresh go through, so the rows are
+/// built once.
+fn roster_with_token(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::RosterRow>> {
+    let master = tfg::backend::MinosMaster::new(host).ok()?;
+    let units = master.units_named(token).ok()?;
+    Some(
+        units
+            .into_iter()
+            .map(|u| tfg::shell_gpui::RosterRow {
+                unit_id: u.id.to_string(),
+                name: u.name,
+                hull: u.hull_number,
+                class: format!("{} · {}", u.class_name, u.category_name),
+                stale: false,
+            })
+            .collect(),
+    )
+}
+
+fn fetch_roster(
+    host: &str,
+    user: &str,
+    pass: &str,
+) -> Option<(Vec<tfg::shell_gpui::RosterRow>, String, Option<String>)> {
     let auth = tfg::backend::MinosAuth::new(host).ok()?;
     let pair = auth.login(user, pass).ok()?;
-    let master = tfg::backend::MinosMaster::new(host).ok()?;
-    let units = master.units_named(&pair.access_token).ok()?;
-    let rows = units
-        .into_iter()
-        .map(|u| tfg::shell_gpui::RosterRow {
-            unit_id: u.id.to_string(),
-            name: u.name,
-            hull: u.hull_number,
-            class: format!("{} · {}", u.class_name, u.category_name),
-            stale: false,
-        })
-        .collect();
-    Some((rows, pair.access_token))
+    let rows = roster_with_token(host, &pair.access_token)?;
+    Some((rows, pair.access_token, pair.refresh_token))
+}
+
+/// The keyring's stored refresh token for the last user, rotated into a
+/// live session so a returning launch skips the card. `None` when
+/// nothing is stored, the store is unreadable, or the rotation is
+/// refused — each a fresh card, never a crash. The rotation mints a new
+/// refresh token; storing it back keeps the next launch on the keyring.
+fn try_keyring_login(
+    host: &str,
+    last_user_path: &Path,
+) -> Option<(Vec<tfg::shell_gpui::RosterRow>, String, String)> {
+    let user = tfg::backend::last_user_load(last_user_path)?;
+    let stored = match tfg::backend::keyring_load(&user) {
+        Ok(Some(rt)) => rt,
+        _ => return None,
+    };
+    let auth = tfg::backend::MinosAuth::new(host).ok()?;
+    let pair = auth.refresh(&stored).ok()?;
+    if let Some(rt) = &pair.refresh_token {
+        let _ = tfg::backend::keyring_save(&user, rt);
+    }
+    let rows = roster_with_token(host, &pair.access_token)?;
+    Some((rows, pair.access_token, user))
 }
 
 /// The store's resolved picture, read once: the id-keyed symbol resolver, the

@@ -377,3 +377,35 @@ pub fn last_user_load(path: &Path) -> Option<String> {
 pub fn last_user_clear(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
+
+#[cfg(test)]
+mod keyring_tests {
+    use super::*;
+
+    /// The keyring round-trip: save, load, clear. Skipped where the box
+    /// has no secret service (a headless CI) — the store is then
+    /// unavailable, which the callers already treat as "no session".
+    #[test]
+    fn keyring_round_trip_save_load_clear() {
+        let user = "tfg-keyring-test";
+        let token = "a-refresh-token";
+        if keyring_save(user, token).is_err() {
+            eprintln!("no secret service on this box; skipping");
+            return;
+        }
+        assert_eq!(keyring_load(user).ok().flatten(), Some(token.to_string()));
+        keyring_clear(user).expect("clear");
+        assert_eq!(keyring_load(user).ok().flatten(), None);
+    }
+
+    /// The last-user record: save, load, clear through the data-dir path.
+    #[test]
+    fn last_user_round_trip_save_load_clear() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("tfg-last-user-test");
+        last_user_save(&path, "  superuser  ");
+        assert_eq!(last_user_load(&path), Some("superuser".to_string()));
+        last_user_clear(&path);
+        assert_eq!(last_user_load(&path), None);
+    }
+}
