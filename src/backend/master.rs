@@ -414,8 +414,9 @@ impl MinosMaster {
         )
     }
 
-    /// Bodiless PUT (readiness declare): no `.json()`, so no
-    /// `Content-Type` and no empty object for the validator to trip on.
+    /// PUT with a JSON body (placements, re-parenting, appointments):
+    /// every route that keeps its argument in the body rather than in the
+    /// path. Bodiless PUTs exist too — [`Self::put_empty`].
     fn put(
         &self,
         token: &str,
@@ -431,6 +432,8 @@ impl MinosMaster {
         )
     }
 
+    /// Bodiless PUT (readiness declare): no `.json()`, so no
+    /// `Content-Type` and no empty object for the validator to trip on.
     fn put_empty(&self, token: &str, path: &str) -> Result<serde_json::Value, BackendError> {
         unwrap_envelope(
             self.client
@@ -979,6 +982,189 @@ impl MinosMaster {
     ) -> Result<PlacementList, BackendError> {
         let data = self.delete(token, &format!("/games/{game_id}/units/{unit_id}/placement"))?;
         Ok(Self::parse_placements(&data))
+    }
+
+    /// Add a node to a game's task organisation (planning|preparation
+    /// only — the organisation is the plan, and the plan closes when play
+    /// begins). `echelon_id` names the LEVEL, an id read from
+    /// [`Self::echelon_levels`] rather than a spelled name, because the
+    /// vocabulary is master data an operator may rename. `parent_id`
+    /// absent means a root: a game may hold several trees, so no parent is
+    /// a complete statement rather than a missing one. A blank icon or
+    /// note is omitted, as the create form omits its blank optionals.
+    ///
+    /// THE ANSWER IS THE WHOLE FOREST, not the node just made: the server
+    /// re-reads the tree and sends it, so the created node is the one
+    /// carrying the echelon, name and parent this call named, and its id
+    /// comes out of that forest rather than from the write.
+    pub fn hierarchy_create_node(
+        &self,
+        token: &str,
+        game_id: i64,
+        echelon_id: i64,
+        name: &str,
+        parent_id: Option<i64>,
+        icon: &str,
+        note: &str,
+    ) -> Result<Vec<HierarchyNode>, BackendError> {
+        let mut body = serde_json::json!({
+            "id_unit_hierarchy": echelon_id,
+            "name": name,
+        });
+        if let Some(p) = parent_id {
+            body["parent_id"] = serde_json::Value::from(p);
+        }
+        if !icon.trim().is_empty() {
+            body["icon"] = serde_json::Value::String(icon.to_string());
+        }
+        if !note.trim().is_empty() {
+            body["note"] = serde_json::Value::String(note.to_string());
+        }
+        let data = self.post(token, &format!("/games/{game_id}/hierarchy"), body)?;
+        Ok(Self::parse_hierarchy_forest(&data))
+    }
+
+    /// Rename a node (planning|preparation only). Every field the update
+    /// request can carry is optional and an absent key leaves the node
+    /// alone, so this sends only a name when one is given; a request that
+    /// names nothing changes nothing, which is a legitimate no-op rather
+    /// than an error.
+    pub fn hierarchy_update_node(
+        &self,
+        token: &str,
+        game_id: i64,
+        node_id: i64,
+        name: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let mut body = serde_json::Map::new();
+        if let Some(n) = name {
+            body.insert("name".to_string(), serde_json::Value::String(n.to_string()));
+        }
+        self.patch(
+            token,
+            &format!("/games/{game_id}/hierarchy/{node_id}"),
+            serde_json::Value::Object(body),
+        )?;
+        Ok(())
+    }
+
+    /// Remove a node from a game's task organisation (planning|preparation
+    /// only). The server refuses while the node still has children, and
+    /// hulls placed at it stay in the exercise — merely out of the tree —
+    /// so re-organising the force never withdraws it. Both loud, neither
+    /// cascaded.
+    pub fn hierarchy_delete_node(
+        &self,
+        token: &str,
+        game_id: i64,
+        node_id: i64,
+    ) -> Result<(), BackendError> {
+        self.delete(token, &format!("/games/{game_id}/hierarchy/{node_id}"))?;
+        Ok(())
+    }
+
+    /// Re-parent a node (planning|preparation only). Its own route rather
+    /// than a field on the rename, because a nil parent there would make
+    /// "make this a root" and "leave the parent alone" the same request —
+    /// becoming a root is [`Self::hierarchy_detach_node`]. The server
+    /// refuses a parent ranking below the node and a move into the node's
+    /// own descendants, both loudly.
+    pub fn hierarchy_move_node(
+        &self,
+        token: &str,
+        game_id: i64,
+        node_id: i64,
+        parent_id: i64,
+    ) -> Result<(), BackendError> {
+        self.put(
+            token,
+            &format!("/games/{game_id}/hierarchy/{node_id}/parent"),
+            serde_json::json!({ "parent_id": parent_id }),
+        )?;
+        Ok(())
+    }
+
+    /// Lift a node to the top level (planning|preparation only) — a game
+    /// may hold several trees, so becoming a root is an ordinary act and
+    /// not a way of clearing a mistake. The DELETE to the move's PUT, and
+    /// the pair is what keeps a nil parent from standing for both.
+    pub fn hierarchy_detach_node(
+        &self,
+        token: &str,
+        game_id: i64,
+        node_id: i64,
+    ) -> Result<(), BackendError> {
+        self.delete(token, &format!("/games/{game_id}/hierarchy/{node_id}/parent"))?;
+        Ok(())
+    }
+
+    /// Appoint the participant who commands a node (planning|preparation
+    /// only, like every other tree write: the organisation is the plan and
+    /// the plan is fixed when play begins). The person must be a
+    /// participant of this game and never judge-side, and must command
+    /// nothing else — a hull OR a node, never both — refused loudly
+    /// otherwise.
+    pub fn hierarchy_set_commander(
+        &self,
+        token: &str,
+        game_id: i64,
+        node_id: i64,
+        user_id: i64,
+    ) -> Result<(), BackendError> {
+        self.put(
+            token,
+            &format!("/games/{game_id}/hierarchy/{node_id}/commander"),
+            serde_json::json!({ "id_commander": user_id }),
+        )?;
+        Ok(())
+    }
+
+    /// Leave a node uncommanded (planning|preparation only). Idempotent
+    /// while nobody commands it, and refused loudly (409) while units or
+    /// task groups still sit under it — that would leave a force nobody
+    /// can order, and the operator's way out is to appoint somebody else,
+    /// which is one request rather than two.
+    pub fn hierarchy_clear_commander(
+        &self,
+        token: &str,
+        game_id: i64,
+        node_id: i64,
+    ) -> Result<(), BackendError> {
+        self.delete(token, &format!("/games/{game_id}/hierarchy/{node_id}/commander"))?;
+        Ok(())
+    }
+
+    /// Put a hull at a node of the task organisation
+    /// (planning|preparation only). Placement is not assignment: the hull
+    /// is already a piece of this exercise, and this says only where it
+    /// sits in the plan, so a piece may be in the game and unplaced —
+    /// neither act implies the other.
+    pub fn game_unit_place(
+        &self,
+        token: &str,
+        game_id: i64,
+        unit_id: i64,
+        node_id: i64,
+    ) -> Result<(), BackendError> {
+        self.put(
+            token,
+            &format!("/games/{game_id}/units/{unit_id}/hierarchy"),
+            serde_json::json!({ "id_hierarchy_node": node_id }),
+        )?;
+        Ok(())
+    }
+
+    /// Take a hull out of the tree without taking it out of the game
+    /// (planning|preparation only). Idempotent — an already unplaced hull
+    /// stays unplaced, which is the caller's intent either way.
+    pub fn game_unit_unplace(
+        &self,
+        token: &str,
+        game_id: i64,
+        unit_id: i64,
+    ) -> Result<(), BackendError> {
+        self.delete(token, &format!("/games/{game_id}/units/{unit_id}/hierarchy"))?;
+        Ok(())
     }
 
     /// Enter a game room with its key (C2). The key is the only input —
@@ -1631,21 +1817,28 @@ impl MinosMaster {
     /// The game's task organisation (hierarchy ticket): a forest,
     /// highest echelon first, children nested. Staff-gated like the
     /// roster and pieces; the read stays open after execution for
-    /// review. Writes (nodes, moves, piece assignment) are a later
-    /// slice — this call draws the tree.
+    /// review, while the writes that build it close at `execution`
+    /// with the rest of the setup window.
     pub fn game_hierarchy(
         &self,
         token: &str,
         game_id: i64,
     ) -> Result<Vec<HierarchyNode>, BackendError> {
         let data = self.get(token, &format!("/games/{game_id}/hierarchy"))?;
-        Ok(data
-            .as_array()
+        Ok(Self::parse_hierarchy_forest(&data))
+    }
+
+    /// A whole task organisation. The read and every hierarchy write
+    /// answer with this shape — the server re-reads the tree and sends it
+    /// rather than echoing the one node that changed, so one parser serves
+    /// the read and all the writes.
+    fn parse_hierarchy_forest(v: &serde_json::Value) -> Vec<HierarchyNode> {
+        v.as_array()
             .cloned()
             .unwrap_or_default()
             .iter()
             .filter_map(Self::parse_hierarchy_node)
-            .collect())
+            .collect()
     }
 
     /// One forest node, children recursive. A missing id drops the
@@ -1654,6 +1847,7 @@ impl MinosMaster {
     fn parse_hierarchy_node(v: &serde_json::Value) -> Option<HierarchyNode> {
         Some(HierarchyNode {
             id: v["id"].as_i64()?,
+            unit_hierarchy_id: v["id_unit_hierarchy"].as_i64(),
             echelon_name: v["echelon_name"].as_str().unwrap_or("").to_string(),
             echelon_rank: v["echelon_rank"].as_i64().unwrap_or(0),
             parent_id: v["parent_id"].as_i64(),
@@ -2807,6 +3001,12 @@ pub struct ImageManifest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HierarchyNode {
     pub id: i64,
+    /// The ECHELON this node sits at: an id into the vocabulary
+    /// [`MinosMaster::echelon_levels`] reads, which is what a create
+    /// names. Kept apart from `echelon_name`, which an operator may
+    /// rename, so a node can be re-created at its level without
+    /// matching on a spelling.
+    pub unit_hierarchy_id: Option<i64>,
     pub echelon_name: String,
     pub echelon_rank: i64,
     pub parent_id: Option<i64>,
@@ -4640,4 +4840,127 @@ mod window_authoring_tests {
         assert!(view.asking.is_none(), "no step asking is the ordinary rest state");
     }
 
+}
+
+#[cfg(test)]
+mod hierarchy_write_tests {
+    use super::{HierarchyNode, MinosMaster};
+
+    /// A created node reads back out of the forest the server answers
+    /// with. The write and the read share one parser, and the echelon id
+    /// the create named is the field a caller keeps: without it a node
+    /// cannot be compared at its level or re-created against a renamed
+    /// vocabulary.
+    #[test]
+    fn a_created_node_reads_back_with_its_echelon() {
+        let forest = serde_json::json!([
+            {
+                "id": 41,
+                "id_unit_hierarchy": 7,
+                "echelon_name": "Gugus",
+                "echelon_rank": 3,
+                "name": "Gugus Tempur",
+                "icon": "anchor",
+                "note": "",
+                "children": [
+                    {
+                        "id": 42,
+                        "id_unit_hierarchy": 5,
+                        "echelon_name": "Satuan Tugas",
+                        "echelon_rank": 2,
+                        "parent_id": 41,
+                        "name": "Satgas A",
+                        "icon": "",
+                        "note": "",
+                        "children": []
+                    }
+                ]
+            }
+        ]);
+        let nodes: Vec<HierarchyNode> = MinosMaster::parse_hierarchy_forest(&forest);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, 41);
+        assert_eq!(
+            nodes[0].unit_hierarchy_id,
+            Some(7),
+            "the echelon the create named rides the node back"
+        );
+        assert_eq!(nodes[0].parent_id, None, "a root omits its parent");
+        assert_eq!(nodes[0].children.len(), 1);
+        assert_eq!(nodes[0].children[0].unit_hierarchy_id, Some(5));
+        assert_eq!(nodes[0].children[0].parent_id, Some(41));
+    }
+
+    /// A node the server sent without an echelon id still draws — the id
+    /// is for the next write, not for rendering — so absence stays `None`
+    /// rather than dropping the node out of the tree.
+    #[test]
+    fn a_node_without_an_echelon_id_is_kept() {
+        let node = MinosMaster::parse_hierarchy_node(&serde_json::json!({
+            "id": 9,
+            "name": "Unlevelled"
+        }))
+        .expect("an id is enough to draw a node");
+        assert_eq!(node.unit_hierarchy_id, None);
+        assert!(
+            node.children.is_empty(),
+            "a node with no children key is a leaf, not an absent subtree"
+        );
+    }
+
+    /// The structural writes carry the bodies the DTO spells out. A wrong
+    /// key here is a 400 from the field, so the stub asserts the shape
+    /// rather than only that something was sent — and the create asserts
+    /// the two omissions, a root's absent parent and a blank icon, which
+    /// are the ambiguous cases the body has to get right.
+    ///
+    /// The clear routes carry no body at all: everything rides the path,
+    /// which is why they go through the plain `delete` helper.
+    #[test]
+    fn the_structural_writes_send_the_dtos_bodies() {
+        let server = tiny_http::Server::http("127.0.0.1:18110").expect("bind test port");
+        std::thread::spawn(move || {
+            for mut rq in server.incoming_requests().take(4) {
+                use std::io::Read as _;
+                let (method, url) = (rq.method().as_str().to_string(), rq.url().to_string());
+                let mut text = String::new();
+                rq.as_reader().read_to_string(&mut text).unwrap_or(0);
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                let body = if method == "POST" && url.ends_with("/games/3/hierarchy") {
+                    assert_eq!(v["id_unit_hierarchy"].as_i64(), Some(7), "create names its level");
+                    assert_eq!(v["name"].as_str(), Some("Gugus Tempur"));
+                    assert!(
+                        v.get("parent_id").is_none(),
+                        "a root omits the parent rather than sending null"
+                    );
+                    assert!(
+                        v.get("icon").is_none(),
+                        "a blank icon is omitted, not sent empty"
+                    );
+                    r#"{"status_code":201,"message":"Created","data":[{"id":41,"id_unit_hierarchy":7,"echelon_name":"Gugus","echelon_rank":3,"name":"Gugus Tempur","icon":"","note":"","children":[]}]}"#
+                } else if method == "PUT" && url.ends_with("/games/3/hierarchy/41/parent") {
+                    assert_eq!(v["parent_id"].as_i64(), Some(19), "the move names its new parent");
+                    r#"{"status_code":200,"message":"Successfull","data":[]}"#
+                } else if method == "PUT" && url.ends_with("/games/3/hierarchy/41/commander") {
+                    assert_eq!(v["id_commander"].as_i64(), Some(6), "the appointment names the person");
+                    r#"{"status_code":200,"message":"Successfull","data":[]}"#
+                } else if method == "PUT" && url.ends_with("/games/3/units/13/hierarchy") {
+                    assert_eq!(v["id_hierarchy_node"].as_i64(), Some(41), "placement names the node");
+                    r#"{"status_code":200,"message":"Successfull","data":[]}"#
+                } else {
+                    panic!("unexpected request: {method} {url}");
+                };
+                let _ = rq.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18110/api/v1").expect("client builds");
+        let created = master
+            .hierarchy_create_node("AT", 3, 7, "Gugus Tempur", None, "", "")
+            .expect("create answers the forest");
+        assert_eq!(created.len(), 1, "the create answer is the tree, not the node");
+        assert_eq!(created[0].unit_hierarchy_id, Some(7));
+        master.hierarchy_move_node("AT", 3, 41, 19).expect("move");
+        master.hierarchy_set_commander("AT", 3, 41, 6).expect("appoint");
+        master.game_unit_place("AT", 3, 13, 41).expect("place");
+    }
 }
