@@ -388,25 +388,27 @@ struct IslandDemo {
     /// The console's `self.force`, and the console's own module — `tfg::force`
     /// is toolkit-free, so the draft, its rules and its `plan()` write
     /// generation are ported rather than reinvented. Seeded from the session's
-    /// pieces and re-seeded whenever a session read replaces them, which is
-    /// safe precisely because every edit posts at once: the draft never holds
-    /// anything the server has not been told.
+    /// pieces and re-seeded whenever a session read replaces them. WHILE
+    /// PLANNING the draft IS the record: every edit here mutates it and posts
+    /// nothing, and only the Session island's advance writes it through. In
+    /// every later state each edit plans and posts at once, because there is
+    /// no stage left to wait for — and there a re-read cannot discard work,
+    /// because none is held.
     ///
-    /// What the draft does NOT carry is a starting position. The console's
-    /// hulls get one by dropping them on the map, and this shell has no
-    /// drag-to-map — so neither the draft nor its `LiveHull` mirror holds a
-    /// start, and `plan()` emits no Place or Lift. Placement is still READ and
-    /// still shown on the Fleet island; it is simply not authored here, and the
-    /// panel says so rather than offering a control that cannot place.
+    /// A hull dropped on the map carries a starting position here — the drop
+    /// unprojects its fractions to lat/lon locally (see `frame_unproject`) and
+    /// `plan()` emits the `Place` that records it. An embarked hull carries a
+    /// `host` instead, and no start: a hull aboard another has no position of
+    /// its own.
     force: crate::force::ForceDraft,
     /// The operator's roster: who is seated, as THEY have said it.
     ///
     /// The console's `roster_draft`, and the console's own module — `tfg::roster`
     /// is toolkit-free, so the draft, its rules and its `plan()` write
     /// generation are ported. Seeded from the session's seats and re-seeded on
-    /// every session read, which is safe for the same reason the force's is:
-    /// each edit posts at once, so the draft never holds anything Minos has
-    /// not been told.
+    /// every session read. While planning it holds staged seats and removals
+    /// that nothing has posted; each edit still plans and posts at once AFTER
+    /// planning, for the same reason the force's does.
     roster_draft: crate::roster::RosterDraft,
     /// Control's draft: the game-time multiplier being adjusted, and the
     /// latch on the write. `None` means "not touched yet", which is how the
@@ -493,6 +495,11 @@ struct IslandDemo {
     /// carries the same re-read session, but the verdict shares the picker's
     /// line — one panel, one sentence about its last edit.
     deploy_busy: bool,
+    /// The advance out of planning: the latch on the staged flush, and the
+    /// line the Session island says about it. The answer rides the shared
+    /// create feed, like every other session-replacing write here.
+    prepare_busy: bool,
+    prepare_status: String,
     /// Click-to-place, the drag's fallback: the armed hull id. Set by the
     /// leaf row's place button; the next map click that is NOT a pan deploys
     /// it there. A drag never arms this (its release lands on the drop, not
@@ -1282,7 +1289,7 @@ impl IslandDemo {
             })
             .map(|r| r.posts.clone())
             .unwrap_or_default();
-        IslandDemo {
+        let mut demo = IslandDemo {
             islands: view::COLUMN_ISLANDS
                 .iter()
                 .map(|k| IslandState::new(*k))
@@ -1523,6 +1530,8 @@ impl IslandDemo {
             force_busy: false,
             force_status: String::new(),
             deploy_busy: false,
+            prepare_busy: false,
+            prepare_status: String::new(),
             pending_place: None,
             place_down: None,
             // `TFG_RELATE` is seeded above, with the working set the open
@@ -1559,7 +1568,14 @@ impl IslandDemo {
             live: Vec::new(),
             map_dims: (0.0, 0.0),
             reveal: None,
-        }
+        };
+        // Seed the drafts from the held session. The startup hold CAN be a
+        // planning game with pieces on it, and a draft that started empty
+        // would read every one of those pieces as a removal the first time a
+        // plan was made. Nothing is staged at construction, so this discards
+        // nothing — see `reseed_drafts`.
+        demo.reseed_drafts();
+        demo
     }
 
     /// The Settings panel — the console's `settings_modal` ported, and the one
@@ -2503,6 +2519,41 @@ impl IslandDemo {
                 col = col.child(small(format!(
                     "{scenarios} scenario(s), {steps} step(s)."
                 )));
+            }
+            // LEAVE PLANNING. The staged force and roster are written through
+            // whole here and the game moves to preparation — the one control
+            // that turns a planning draft into a record. It rides the Session
+            // island because the island is the held session itself, and the
+            // move is the session's, not the fleet's or the room's.
+            //
+            // ABSENT outside planning, like the door above: past planning the
+            // edits already posted and there is nothing staged to write, so a
+            // control here would either do nothing or repeat a transition the
+            // server refuses.
+            col = col.child(separator());
+            let pending = self.force.pending(&self.live_hulls())
+                + self.roster_draft.pending(&self.live_seats());
+            col = col.child(
+                div()
+                    .id("advance-preparation")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.prepare_advance(cx);
+                    }))
+                    .child(button(
+                        "Move to preparation".to_string(),
+                        false,
+                        self.prepare_busy,
+                        false,
+                    )),
+            );
+            col = col.child(small(if pending == 0 {
+                "nothing staged \u{2014} this just moves the session on".to_string()
+            } else {
+                format!("{pending} staged write(s) will be sent")
+            }));
+            if !self.prepare_status.is_empty() {
+                col = col.child(small(self.prepare_status.clone()));
             }
         }
         col.into_any_element()
@@ -4707,18 +4758,31 @@ impl IslandDemo {
         self.session.people.iter().find(|p| p.id == self.session.me)
     }
 
-    /// Declare or withdraw this seat's readiness — the console's
-    /// `set_own_readiness`, as a message.
-    ///
-    /// Returns false (and sends nothing) for the three non-sends: no seat, a
-    /// judge seat (exempt — the server 409s judges loudly), and asking for
-    /// the state already held. The same rule the row's buttons enforce, kept
-    /// in one place so a test exercises exactly what the click does.
     /// Minos's own force, as the draft's `LiveHull` mirror.
     ///
     /// Derived from the session's pieces rather than stored, so there is one
-    /// source for what the server holds. Neither side carries a start (see the
-    /// `force` field's note), so `plan()` emits no placement writes.
+    /// source for what the server holds.
+    ///
+    /// The session read carries NO starting position — `GameUnit` has no
+    /// placement field, which is why the shell projects the placements read
+    /// separately — so `start` is `None` here. The consequence is deliberate
+    /// and narrow: `plan()` compares the draft's starts against nothing, so a
+    /// draft hull with a live counterpart ALWAYS reads as a placement move and
+    /// emits a `Place`. Re-writing a start the server already has is
+    /// idempotent at the endpoint, so the redundancy is the honest side of the
+    /// trade — a placement the operator can see is worth one repeated PUT.
+    ///
+    /// `host` is `None` for the same reason: the read does not say what
+    /// carries a piece, so the mirror cannot tell a hull already aboard from
+    /// one on the water. Two consequences follow, and both are the shell's
+    /// limit rather than the server's. A seeded hull's draft `host` is `None`
+    /// too, so pass 2 sees `None == None` and writes no embarkation — an
+    /// embarkation the operator did not touch is left standing rather than
+    /// re-stated. But an operator who DROPS a hull onto a host emits one
+    /// `Embark`, and if the server already carries that hull aboard, the
+    /// attach endpoint refuses it ("already inside something") and the whole
+    /// advance stops with that sentence. A hull's host belongs in the session
+    /// read; until it is there, this mirror is one field short and says so.
     fn live_hulls(&self) -> Vec<crate::force::LiveHull> {
         self.session
             .pieces
@@ -4728,23 +4792,30 @@ impl IslandDemo {
                 name: p.label.clone(),
                 commander_id: p.commander_id,
                 start: None,
+                host: None,
             })
             .collect()
     }
 
-    /// Re-seed the draft from what the session holds.
-    ///
-    /// Called whenever a session read replaces the pieces, which is safe
-    /// because every edit posts at once — the draft never holds anything the
-    /// server has not been told, so a re-read cannot discard work.
     /// Re-seed BOTH drafts from what the session holds.
     ///
     /// One call, because they are re-seeded for one reason: a session read
     /// replaced the pieces and the seats, and both drafts are mirrors of what
     /// Minos was last told. Two calls would be two chances to re-seed one and
     /// forget the other.
+    ///
+    /// SAFE ONLY WHERE NOTHING IS STAGED. Before this slice every edit posted
+    /// at once, so a re-read could not discard work. While PLANNING the draft
+    /// IS the record — a re-seed would drop edits the server has not been told
+    /// — and the guard is twofold. The callers that could fire with staged
+    /// work are the Session island's advance, which seeds AFTER the read that
+    /// proves the draft was written through, and the three posting write
+    /// latches (`roster_busy`, `force_busy`, `deploy_busy`), whose flags only
+    /// an edit that POSTED sets — and no planning edit posts. The callers that
+    /// seed a planning room seed it BEFORE there is any work to lose:
+    /// construction, a hold and a created session all install a fresh draft
+    /// whose reference is the game just read.
     fn reseed_drafts(&mut self) {
-        let mut draft = crate::force::ForceDraft::new();
         let mut draft = crate::force::ForceDraft::new();
         for p in &self.session.pieces {
             draft.upsert(crate::force::DraftHull {
@@ -4754,6 +4825,7 @@ impl IslandDemo {
                 class_id: String::new(),
                 start: None,
                 commander_id: p.commander_id,
+                host: None,
             });
         }
         self.force = draft;
@@ -4784,7 +4856,7 @@ impl IslandDemo {
             .collect()
     }
 
-    /// Put a register hull in the draft and post the plan.
+    /// Put a register hull in the draft, and write it through.
     ///
     /// The commander is TAKEN, not checked: whether a given account may hold a
     /// piece is the picker's question (it offers the room's seats and nothing
@@ -4792,6 +4864,12 @@ impl IslandDemo {
     /// `force::plan`'s. Validating the seat here would be a second copy of a
     /// rule the kernel already owns, and the copy that drifts is the one that
     /// writes.
+    ///
+    /// WHILE PLANNING this stages and returns: the hull joins the draft and
+    /// nothing is posted, because the Session island's advance is the moment
+    /// the whole draft is written through. In every later state it posts the
+    /// plan at once, because no advance is left to wait for and the write IS
+    /// the edit.
     fn stage_assign(&mut self, unit_id: i64, name: &str, commander_id: i64) -> Result<(), String> {
         let mut draft = self.force.clone();
         draft.upsert(crate::force::DraftHull {
@@ -4801,32 +4879,47 @@ impl IslandDemo {
             class_id: String::new(),
             start: None,
             commander_id: Some(commander_id),
+            host: None,
         });
         self.force = draft;
+        if self.staging() {
+            return Ok(());
+        }
         self.sync_force()
     }
 
-    /// Hand a drafted hull to somebody else, and post.
+    /// Hand a drafted hull to somebody else, and write it through.
     fn stage_handover(&mut self, unit_id: i64, commander_id: i64) -> Result<(), String> {
         if !self.force.set_commander(unit_id, Some(commander_id)) {
             return Err("that piece is not in the draft".to_string());
         }
-        self.sync_force()
-    }
-
-    /// Take a drafted hull out of the exercise, and post.
-    fn stage_remove(&mut self, unit_id: i64) -> Result<(), String> {
-        if self.force.remove(unit_id).is_none() {
-            return Err("that piece is not in the draft".to_string());
+        if self.staging() {
+            return Ok(());
         }
         self.sync_force()
     }
 
-    /// Deploy a hull at map-view fractions: latch the flight, say so on the
-    /// picker's line, and post. The answer is a re-read session on the shared
-    /// feed, applied under `deploy_busy` — the same shape as `sync_force`,
-    /// a separate latch so the two flights never share a verdict.
-    fn send_deploy(&mut self, unit_id: i64, fx: f64, fy: f64, cx: &mut Context<Self>) {
+    /// Take a drafted hull out of the exercise, and write it through.
+    fn stage_remove(&mut self, unit_id: i64) -> Result<(), String> {
+        if self.force.remove(unit_id).is_none() {
+            return Err("that piece is not in the draft".to_string());
+        }
+        if self.staging() {
+            return Ok(());
+        }
+        self.sync_force()
+    }
+
+    /// Deploy a hull at map-view fractions. While PLANNING this places it in
+    /// the DRAFT and posts nothing; otherwise it latches the flight, says so
+    /// on the picker's line, and posts. The answer is a re-read session on the
+    /// shared feed, applied under `deploy_busy` — the same shape as
+    /// `sync_force`, a separate latch so the two flights never share a verdict.
+    fn send_deploy(&mut self, unit_id: i64, name: &str, fx: f64, fy: f64, cx: &mut Context<Self>) {
+        if self.staging() {
+            self.stage_place_local(unit_id, name, fx, fy, cx);
+            return;
+        }
         self.deploy_busy = true;
         self.pending_place = None;
         self.place_down = None;
@@ -4854,36 +4947,33 @@ impl IslandDemo {
         cx: &mut Context<Self>,
     ) {
         let taken = self.session.pieces.iter().any(|p| p.id == unit_id);
+        // WHILE PLANNING the drop is a LOCAL act: the hull joins the draft
+        // (assigned on the way in, if the exercise does not hold it) and
+        // nothing posts. The advance writes the whole draft through.
+        if self.staging() {
+            if let Some(host) = host {
+                self.stage_embark_local(host, unit_id, name, cx);
+            } else {
+                self.stage_place_local(unit_id, name, fx, fy, cx);
+            }
+            return;
+        }
         if taken {
             if let Some(host) = host {
                 self.send_embark(host, unit_id, name, cx);
             } else {
-                self.send_deploy(unit_id, fx, fy, cx);
+                self.send_deploy(unit_id, name, fx, fy, cx);
             }
             return;
         }
-        let who = self.session.me;
-        if self.crew_choices().iter().all(|(id, _)| *id != who) {
-            // Point at the pills when there are any: a refusal with no way
-            // forward is the wall the seat-me pills exist to remove.
-            self.force_status = if who != 0 && !self.player_roles().is_empty() {
-                "you hold no seat \u{2014} take a player seat above, then drop again"
-                    .to_string()
-            } else {
-                "your account holds no seat in this room".to_string()
-            };
-            cx.notify();
-            return;
-        }
-        // A judge-side seat may not command: the server refuses the write
-        // outright ("a judge-side participant does not command units"), so
-        // refuse here with the way forward rather than spending the round
-        // trip to hear it.
-        if self.own_steers() == Some(false) {
-            self.force_status = "your seat is judge-side \u{2014} it directs, it does not command; take a player seat on the Players island".to_string();
-            cx.notify();
-            return;
-        }
+        let who = match self.own_commander() {
+            Ok(who) => who,
+            Err(why) => {
+                self.force_status = why;
+                cx.notify();
+                return;
+            }
+        };
         if let Some(host) = host {
             self.embark_busy = true;
             self.embark_status = format!("assigning {name} and embarking aboard {host}\u{2026}");
@@ -4908,14 +4998,111 @@ impl IslandDemo {
         cx.notify();
     }
 
+    /// A drop on bare water, WHILE PLANNING: put the hull in the draft at the
+    /// drop point and post nothing.
+    ///
+    /// The drop fractions are unprojected HERE, locally, because the draft
+    /// carries GROUND (a `Start`) and the shell is the side that holds the
+    /// frame's camera and dimensions (see `frame_unproject`). A hull the
+    /// exercise does not hold is added first, commanded by the operator's own
+    /// seat — placing IS assigning, the same chain the binary's `DeployAssign`
+    /// runs, cut to a local edit. Clearing `host` is the other half of the
+    /// statement a bare-water drop makes: the hull is on the water, not aboard.
+    fn stage_place_local(
+        &mut self,
+        unit_id: i64,
+        name: &str,
+        fx: f64,
+        fy: f64,
+        cx: &mut Context<Self>,
+    ) {
+        let who = match self.own_commander() {
+            Ok(who) => who,
+            Err(why) => {
+                self.force_status = why;
+                cx.notify();
+                return;
+            }
+        };
+        if !self.force.contains(unit_id) {
+            let mut draft = self.force.clone();
+            draft.upsert(crate::force::DraftHull {
+                unit_id,
+                name: name.to_string(),
+                hull_number: String::new(),
+                class_id: String::new(),
+                start: None,
+                commander_id: Some(who),
+                host: None,
+            });
+            self.force = draft;
+        }
+        // The commander is SET, not merely taken for a new hull: a drafted
+        // piece with nobody to steer it is the state `force::plan` refuses
+        // whole, and the drop is the operator saying "this one, under me".
+        self.force.set_commander(unit_id, Some(who));
+        let (lat, lon) = self.frame_unproject(fx, fy);
+        self.force.set_start(unit_id, Some(crate::force::Start { lat, lon }));
+        self.force.set_host(unit_id, None);
+        self.pending_place = None;
+        self.place_down = None;
+        self.force_status =
+            format!("{name} staged locally \u{2014} move to preparation writes it");
+        cx.notify();
+    }
+
+    /// A drop onto a host, WHILE PLANNING: put the hull aboard it in the
+    /// draft and post nothing.
+    ///
+    /// A hull the exercise does not hold is added first, commanded by the
+    /// operator's own seat, exactly as the bare-water drop does. The hull's
+    /// own start is CLEARED: a hull aboard another has no position of its own,
+    /// and a `Place` beside the `Embark` would be a claim the server refuses.
+    fn stage_embark_local(&mut self, host: i64, child: i64, name: &str, cx: &mut Context<Self>) {
+        let who = match self.own_commander() {
+            Ok(who) => who,
+            Err(why) => {
+                self.force_status = why;
+                cx.notify();
+                return;
+            }
+        };
+        if !self.force.contains(child) {
+            let mut draft = self.force.clone();
+            draft.upsert(crate::force::DraftHull {
+                unit_id: child,
+                name: name.to_string(),
+                hull_number: String::new(),
+                class_id: String::new(),
+                start: None,
+                commander_id: Some(who),
+                host: None,
+            });
+            self.force = draft;
+        }
+        // Same as the bare-water drop: the commander is SET so a piece that
+        // entered the exercise uncommanded is writable when the advance comes.
+        self.force.set_commander(child, Some(who));
+        self.force.set_host(child, Some(host));
+        self.force.set_start(child, None);
+        self.force_status =
+            format!("{name} staged aboard {host} locally \u{2014} move to preparation writes it");
+        cx.notify();
+    }
+
     /// Embark a dragged hull aboard a placed host: latch the flight on the
     /// embark side (the answer lands on its feed, like every embark write)
     /// and say so on the picker's line too, because the drop started there.
+    /// While PLANNING this stages the embark locally and posts nothing.
     ///
-    /// Same local refusal as the deploy: embarkation is per-piece, and a
-    /// hull outside the exercise has no embarkation row for the server to
-    /// find.
+    /// Otherwise same local refusal as the deploy: embarkation is per-piece,
+    /// and a hull outside the exercise has no embarkation row for the server
+    /// to find.
     fn send_embark(&mut self, host: i64, child: i64, name: &str, cx: &mut Context<Self>) {
+        if self.staging() {
+            self.stage_embark_local(host, child, name, cx);
+            return;
+        }
         if !self.session.pieces.iter().any(|p| p.id == child) {
             self.force_status =
                 format!("{name} isn't in the exercise yet \u{2014} add it first, then embark it");
@@ -4927,6 +5114,131 @@ impl IslandDemo {
         self.force_status = format!("embarking {name} aboard {host}\u{2026}");
         let _ = self.order_tx.send(ToBinary::EmbarkDrop { host, child });
         cx.notify();
+    }
+
+    /// Whether the held game is still being PLANNED — the one state where an
+    /// edit stages locally and the Session island's advance writes the draft
+    /// through.
+    ///
+    /// The state is the SERVER's word (the session read's `state`), never a
+    /// local flag: a game another client has moved on is not planning here
+    /// either, and a staged draft against it would never be written.
+    fn staging(&self) -> bool {
+        crate::gamestate::GameState::from_wire(&self.session.state)
+            == crate::gamestate::GameState::Planning
+    }
+
+    /// The commander a drop hands a hull to: the operator's own seat.
+    ///
+    /// The two refusals are the console's own sentences, kept in one place so
+    /// the local drop and the posting drop name the same way forward. The
+    /// seat must exist (a hull with nobody to steer it is not a state Minos
+    /// can hold) and it must STEER (a judge-side seat directs, it does not
+    /// command — the server refuses the write outright).
+    fn own_commander(&self) -> Result<i64, String> {
+        let who = self.session.me;
+        if self.crew_choices().iter().all(|(id, _)| *id != who) {
+            // Point at the pills when there are any: a refusal with no way
+            // forward is the wall the seat-me pills exist to remove.
+            return Err(if who != 0 && !self.player_roles().is_empty() {
+                "you hold no seat \u{2014} take a player seat above, then drop again".to_string()
+            } else {
+                "your account holds no seat in this room".to_string()
+            });
+        }
+        if self.own_steers() == Some(false) {
+            return Err("your seat is judge-side \u{2014} it directs, it does not command; take a player seat on the Players island".to_string());
+        }
+        Ok(who)
+    }
+
+    /// The map-frame pixel a ground position projects to, at the camera the
+    /// last frame was rendered from. A staged hull has no fix for the binary
+    /// to project, so the shell projects it here from its draft `Start`.
+    fn frame_project(&self, lat: f64, lon: f64) -> (f64, f64) {
+        project_frame_px(
+            lat,
+            lon,
+            self.map_center,
+            self.map_render_zoom,
+            f64::from(self.map_dims.0),
+            f64::from(self.map_dims.1),
+        )
+    }
+
+    /// The ground a drop's view fractions point at: the inverse of
+    /// [`Self::frame_project`], and the shell-side half of what the binary
+    /// does for a non-staged deploy. The fractions are of the map VIEW, and
+    /// the frame fills it (`ObjectFit::Fill`), so the frame's own dimensions
+    /// are the scale.
+    fn frame_unproject(&self, fx: f64, fy: f64) -> (f64, f64) {
+        let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
+        unproject_frame_px(
+            fx.clamp(0.0, 1.0) * mw,
+            fy.clamp(0.0, 1.0) * mh,
+            self.map_center,
+            self.map_render_zoom,
+            mw,
+            mh,
+        )
+    }
+
+    /// The glyph a hull draws as, resolved from the taxonomy the binary built
+    /// — the same symbol its live marker carries. A hull the tree does not
+    /// name falls back to the Dot, the unknown-ship shape `map_symbol_shape`
+    /// itself uses.
+    fn fleet_symbol(&self, unit_id: i64) -> MapSymbolShape {
+        fn walk(groups: &[FleetTaxGroup], id: &str) -> Option<MapSymbolShape> {
+            for g in groups {
+                for c in &g.cats {
+                    for t in &c.types {
+                        for cl in &t.classes {
+                            for l in &cl.units {
+                                if l.id == id {
+                                    return Some(l.symbol);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        walk(&self.fleet_tax.groups, &unit_id.to_string()).unwrap_or(MapSymbolShape::Dot)
+    }
+
+    /// The STAGED hulls that sit at a starting position and have no marker on
+    /// the wire yet: the map draws one planned marker per hull, dashed and
+    /// dimmed, so a position the operator set while planning is visible
+    /// before the advance writes it.
+    ///
+    /// A hull whose fix is already on the wire is SKIPPED: the live marker is
+    /// the truth about where it is, and two frames over one hull would be two
+    /// answers. Projected from the draft's own lat/lon at the frame's camera,
+    /// because a staged hull has no fix for the binary to project.
+    fn planned_marks(&self) -> Vec<(f64, f64, MapSymbolShape)> {
+        let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
+        if mw <= 0.0 || mh <= 0.0 {
+            return Vec::new();
+        }
+        self.force
+            .hulls()
+            .filter_map(|h| {
+                let start = h.start?;
+                if self.live.iter().any(|m| m.id == h.unit_id.to_string()) {
+                    return None;
+                }
+                let (x, y) = project_frame_px(
+                    start.lat,
+                    start.lon,
+                    self.map_center,
+                    self.map_render_zoom,
+                    mw,
+                    mh,
+                );
+                Some((x, y, self.fleet_symbol(h.unit_id)))
+            })
+            .collect()
     }
 
     /// A drag started or ended elsewhere (GPUI owns the state; the tick
@@ -4951,11 +5263,18 @@ impl IslandDemo {
     }
 
     /// The host a drop lands on, if it lands on one: the nearest PLACED
-    /// piece's live marker within 20 map px of the drop fractions. Markers
-    /// arrive in the frame's pixel space (`map_dims`), and fractions scale
-    /// back into it — the same fraction round-trip the deploy side uses, in
-    /// reverse. Unplaced pieces are not hosts: there is no marker for a
-    /// hull with no position, and a drop near one's roster row is a deploy.
+    /// piece's marker within 20 map px of the drop fractions — the live
+    /// marker when there is one, and otherwise a STAGED hull's projected
+    /// position. Markers arrive in the frame's pixel space (`map_dims`), and
+    /// fractions scale back into it — the same fraction round-trip the deploy
+    /// side uses, in reverse. Unplaced pieces are not hosts: there is no
+    /// marker for a hull with no position, and a drop near one's roster row
+    /// is a deploy.
+    ///
+    /// A staged hull must be considered or a drop onto a hull the operator
+    /// just placed would fall in the water beside it: while planning that hull
+    /// has a draft `Start` and no fix, so nothing but this projection can say
+    /// where it is.
     fn drop_host_at(&self, fx: f64, fy: f64) -> Option<i64> {
         let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
         if mw <= 0.0 || mh <= 0.0 {
@@ -4969,17 +5288,29 @@ impl IslandDemo {
             .filter(|p| p.placed)
             .map(|p| p.id)
             .collect();
-        self.live
-            .iter()
-            .filter(|m| m.id.parse::<i64>().is_ok_and(|id| placed.contains(&id)))
-            .map(|m| {
-                let id = m.id.parse::<i64>().unwrap_or(-1);
-                let d = (m.x - px).hypot(m.y - py);
-                (d, id)
-            })
-            .filter(|(d, _)| *d <= 20.0)
-            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(_, id)| id)
+        let mut best: Option<(f64, i64)> = None;
+        let mut consider = |d: f64, id: i64| {
+            let closer = match best {
+                None => true,
+                Some((bd, _)) => d < bd,
+            };
+            if d <= 20.0 && closer {
+                best = Some((d, id));
+            }
+        };
+        for m in &self.live {
+            if let Ok(id) = m.id.parse::<i64>() {
+                if placed.contains(&id) {
+                    consider((m.x - px).hypot(m.y - py), id);
+                }
+            }
+        }
+        for h in self.force.hulls() {
+            let Some(start) = h.start else { continue };
+            let (x, y) = self.frame_project(start.lat, start.lon);
+            consider((x - px).hypot(y - py), h.unit_id);
+        }
+        best.map(|(_, id)| id)
     }
 
     /// Plan the draft against the server and post the whole plan.
@@ -5053,12 +5384,16 @@ impl IslandDemo {
             .unwrap_or_else(|| self.login_identifier.clone())
     }
 
-    /// Seat an account as a role, and post the plan.
+    /// Seat an account as a role, and write it through.
     ///
     /// The role is TAKEN, not checked, for the same reason the force's
     /// commander is: what a role MEANS is the server's business, and whether a
     /// staged seat is a seat, a role change or a no-op is `roster::plan`'s.
     /// A second copy of that rule here would be the copy that drifts.
+    ///
+    /// WHILE PLANNING this stages and returns; the Session island's advance
+    /// writes it through. Otherwise it posts at once, because no advance is
+    /// left to wait for.
     fn stage_seat(&mut self, user_id: i64, name: &str, role: &RoleRow) -> Result<(), String> {
         self.roster_draft.stage(crate::roster::StagedSeat {
             user_id,
@@ -5072,13 +5407,19 @@ impl IslandDemo {
             call_sign: name.chars().take(8).collect::<String>().to_uppercase(),
             judge: role.judge,
         });
+        if self.staging() {
+            return Ok(());
+        }
         self.sync_roster()
     }
 
-    /// Take a seated person off the roster, and post.
+    /// Take a seated person off the roster, and write it through.
     fn stage_unseat(&mut self, user_id: i64) -> Result<(), String> {
         let on_server = self.session.people.iter().any(|p| p.id == user_id);
         self.roster_draft.remove(user_id, on_server);
+        if self.staging() {
+            return Ok(());
+        }
         self.sync_roster()
     }
 
@@ -5380,6 +5721,37 @@ impl IslandDemo {
         true
     }
 
+    /// LEAVE PLANNING: write the whole staged draft through and move the game
+    /// to preparation.
+    ///
+    /// The drafts and the live mirrors they are diffed against cross on the
+    /// wire, because the binary holds the token but never the shell's session
+    /// — the answer is a re-read session on the shared create feed, under
+    /// `prepare_busy`, like every other session-replacing write here.
+    ///
+    /// Returns whether a request went out, so a test exercises exactly what
+    /// the click does.
+    fn prepare_advance(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.prepare_busy {
+            return false;
+        }
+        if self.session.game_id == 0 {
+            return false;
+        }
+        self.prepare_busy = true;
+        self.prepare_status = "moving the plan to preparation\u{2026}".to_string();
+        let live_hulls = self.live_hulls();
+        let live_seats = self.live_seats();
+        let _ = self.order_tx.send(ToBinary::AdvancePreparation {
+            force: self.force.clone(),
+            live_hulls,
+            roster: self.roster_draft.clone(),
+            live_seats,
+        });
+        cx.notify();
+        true
+    }
+
     /// Leave execution. Organizer-gated by placement, not by this send:
     /// the console pushes `z.clock` for organizers only and never checks
     /// the seat in `close_game` — a player station that ended the exercise
@@ -5435,8 +5807,21 @@ impl IslandDemo {
         self.hold_busy = false;
         self.hold_status.clear();
         self.session = session;
+        // A new hold REPLACES the drafts' reference: seed them from the game
+        // just held, so every later edit and the advance diff against what
+        // Minos actually holds rather than against an empty draft that would
+        // read every existing piece as a removal. Nothing is staged at a hold,
+        // so there is no work to discard.
+        self.reseed_drafts();
     }
 
+    /// Declare or withdraw this seat's readiness — the console's
+    /// `set_own_readiness`, as a message.
+    ///
+    /// Returns false (and sends nothing) for the three non-sends: no seat, a
+    /// judge seat (exempt — the server 409s judges loudly), and asking for
+    /// the state already held. The same rule the row's buttons enforce, kept
+    /// in one place so a test exercises exactly what the click does.
     fn set_readiness(&mut self, ready: bool, cx: &mut Context<Self>) -> bool {
         let ok = self.own_seat().is_some_and(|p| !p.judge && p.ready != ready);
         if !ok || self.readiness_busy {
@@ -8016,6 +8401,11 @@ impl IslandDemo {
         self.clock_denied = false;
         self.pause_busy = false;
         self.pause_status.clear();
+        // A created session replaces the held one, so the drafts' reference
+        // moves with it — see `apply_hold`. A brand-new game holds nothing,
+        // so this seeds empty drafts; it is here so the two "a new held game"
+        // paths cannot disagree about seeding.
+        self.reseed_drafts();
     }
 
     /// Submit the book's title row. The binary owns the POST, like every
@@ -8506,6 +8896,10 @@ impl IslandDemo {
         // borrow of the live list across the paint pass would fight the
         // element build.
         let live = self.live.clone();
+        // The staged hulls that sit at a start and are not yet on the wire:
+        // drawn as planned markers, dashed and dimmed. Cloned for the same
+        // reason `live` is — the paint closure is `move`.
+        let planned = self.planned_marks();
         div().absolute().top(px(0.0)).left(px(0.0)).child(canvas(
             |bounds, _, _| bounds,
             move |_bounds, _, window, _| {
@@ -8528,8 +8922,9 @@ impl IslandDemo {
                         paint_reticle(window, (cx, cy), SELECT_R, RADAR_CYAN);
                     }
                     // The affiliation frame (interior + cased outline), then
-                    // the taxonomy glyph inside it. No planned dash yet: the
-                    // binary cannot resolve "unassigned" without a session.
+                    // the taxonomy glyph inside it. `planned` is false for a
+                    // live hull: it is in the exercise and on the wire, and
+                    // the dashed treatment is for the STAGED marks below.
                     paint_frame(window, (cx, cy), m.affiliation, false, m.stale, BOX_PX);
                     paint_glyph(
                         window,
@@ -8539,9 +8934,95 @@ impl IslandDemo {
                         GLYPH_SCALE,
                     );
                 }
+                // PLANNED hulls: a position the operator set while planning,
+                // drawn before the advance writes it. Dashed and dimmed, and
+                // their affiliation is Unknown — the shell has no session
+                // affiliation source (the binary resolves the LIVE markers'
+                // from the store), so a planned hull says "nobody has said"
+                // rather than borrowing a side it cannot prove.
+                for (px, py, shape) in &planned {
+                    let cx = (*px as f32) * sx;
+                    let cy = (*py as f32) * sy;
+                    paint_frame(
+                        window,
+                        (cx, cy),
+                        symbology::Affiliation::Unknown,
+                        true,
+                        true,
+                        BOX_PX,
+                    );
+                    paint_glyph(
+                        window,
+                        (cx, cy),
+                        *shape,
+                        map_symbol_fill(*shape, true),
+                        GLYPH_SCALE,
+                    );
+                }
             },
         ))
     }
+}
+
+/// The Web Mercator world at zoom 0, in pixels. Mirrors `map_render`'s
+/// `WORLD_BASE_PX`: the shell cannot name `map_render` (the parity proto
+/// carries no shim for it, deliberately — see `proto/gpui-island`), so the
+/// two projections it needs are repeated here, the same precedent as the
+/// shell's own `short_timestamp`. The mirror is a copy of the arithmetic,
+/// never a second convention: a planned marker drawn from a start and a live
+/// marker projected by the binary from a fix must share one pixel space.
+const WORLD_BASE_PX: f64 = 512.0;
+
+/// The map-frame pixel a ground position projects to, for a `w` x `h` frame
+/// centred on `center` at `zoom`. The exact twin of
+/// `map_render::project_mercator`, repeated for the reason in
+/// [`WORLD_BASE_PX`].
+fn project_frame_px(
+    lat: f64,
+    lon: f64,
+    center: (f64, f64),
+    zoom: f64,
+    w: f64,
+    h: f64,
+) -> (f64, f64) {
+    fn world(lat: f64, lon: f64, zoom: f64) -> (f64, f64) {
+        let scale = WORLD_BASE_PX * 2f64.powf(zoom);
+        let x = (lon + 180.0) / 360.0 * scale;
+        let s = (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln();
+        let y = (1.0 - s / std::f64::consts::PI) / 2.0 * scale;
+        (x, y)
+    }
+    let (x, y) = world(lat, lon, zoom);
+    let (cx, cy) = world(center.0, center.1, zoom);
+    (x - cx + w / 2.0, y - cy + h / 2.0)
+}
+
+/// The ground a frame pixel points at — the inverse of [`project_frame_px`],
+/// mirroring `map_render::unproject_mercator`. Used where a drop must carry a
+/// ground `Start` even though the shell has no mercator module.
+fn unproject_frame_px(
+    px: f64,
+    py: f64,
+    center: (f64, f64),
+    zoom: f64,
+    w: f64,
+    h: f64,
+) -> (f64, f64) {
+    fn world(lat: f64, lon: f64, zoom: f64) -> (f64, f64) {
+        let scale = WORLD_BASE_PX * 2f64.powf(zoom);
+        let x = (lon + 180.0) / 360.0 * scale;
+        let s = (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln();
+        let y = (1.0 - s / std::f64::consts::PI) / 2.0 * scale;
+        (x, y)
+    }
+    let scale = WORLD_BASE_PX * 2f64.powf(zoom);
+    let (cx, cy) = world(center.0, center.1, zoom);
+    let x = px - w / 2.0 + cx;
+    let y = py - h / 2.0 + cy;
+    let lon = x / scale * 360.0 - 180.0;
+    let s = (1.0 - 2.0 * y / scale) * std::f64::consts::PI;
+    let lat = s.sinh().atan().to_degrees();
+    (lat, lon)
 }
 
 /// The acquisition reticle: four corner brackets, one stroke weight.
@@ -8688,9 +9169,9 @@ fn paint_glyph(
 /// pass pushed OUTWARD first, the hue on top. The casing goes outside, never
 /// as a wider centred stroke, because a centred stroke eats the glyph's
 /// pixels — the doc on `FRAME_KEYLINE_OUT_PX` has the measurement. A planned
-/// hull's runs are dashed (the same frame saying "in the task organisation,
-/// not in the exercise"), which is why `planned` is a parameter even though
-/// nothing sets it yet.
+/// hull's runs are dashed (the same frame saying "staged, not yet in the
+/// exercise"), which is why `planned` is a parameter: `markers` sets it for
+/// the draft's placed hulls and leaves it false for the live ones.
 fn paint_frame(
     window: &mut Window,
     center: (f32, f32),
@@ -9329,7 +9810,18 @@ impl Render for IslandDemo {
                                     .clamp(0.0, 1.0);
                                 if let Some(unit_id) = view.pending_place {
                                     if view.session.pieces.iter().any(|p| p.id == unit_id) {
-                                        view.send_deploy(unit_id, fx, fy, cx);
+                                        // The staged line names the hull, so
+                                        // the armed click carries the label the
+                                        // session read holds — the same value
+                                        // `live_hulls` mirrors.
+                                        let name = view
+                                            .session
+                                            .pieces
+                                            .iter()
+                                            .find(|p| p.id == unit_id)
+                                            .map(|p| p.label.clone())
+                                            .unwrap_or_default();
+                                        view.send_deploy(unit_id, &name, fx, fy, cx);
                                         return;
                                     }
                                     view.force_status =
@@ -11031,10 +11523,9 @@ pub enum ToBinary {
     /// The whole plan rather than one edit per message, because a plan is one
     /// decision. Posting a hull and its commander as two messages would let a
     /// failure between them leave the exercise holding a piece nobody commands
-    /// — the exact state `ForceGap` exists to prevent. The console posts its
-    /// force the same way, at a stage advance; here each edit plans and posts
-    /// immediately, which is this shell's pattern for every other authoring
-    /// surface.
+    /// — the exact state `ForceGap` exists to prevent. Outside planning each
+    /// edit plans and posts immediately; while planning the draft is written
+    /// through whole by `AdvancePreparation` instead.
     SyncForce { writes: Vec<crate::force::ForceWrite> },
     /// The roster, whole: every write `roster::plan` owed Minos.
     ///
@@ -11045,6 +11536,27 @@ pub enum ToBinary {
     /// already holds converges to a role change or to nothing rather than to a
     /// 409 in the middle of authoring.
     SyncRoster { writes: Vec<crate::roster::RosterWrite> },
+    /// LEAVE PLANNING: write the whole staged draft through, then move the
+    /// game to preparation.
+    ///
+    /// This is the one message that carries the drafts rather than writes
+    /// derived from them, because the shell cannot compute the writes: it
+    /// holds no session in the binary, and the binary cannot reach the
+    /// shell's drafts. The drafts and the live mirrors they diff against
+    /// travel together so the plan is computed against the SAME read the
+    /// shell diffed against, at the moment of the advance.
+    ///
+    /// The binary plans the force first; a `ForceGap` refuses the move WHOLE
+    /// and posts nothing. Otherwise it posts the force, then the roster, then
+    /// the task organisation — each whole, the first refusal stopping the
+    /// rest — and only then transitions the game, answering with the re-read
+    /// session.
+    AdvancePreparation {
+        force: crate::force::ForceDraft,
+        live_hulls: Vec<crate::force::LiveHull>,
+        roster: crate::roster::RosterDraft,
+        live_seats: Vec<crate::roster::LiveSeat>,
+    },
     /// The game clock's multiplier, from Control's Apply. One field, one
     /// endpoint (`PATCH /games/{id}/time-factor`), and the answer is a re-read
     /// like every other write here — the readout on the next frame is Minos's,
@@ -12383,6 +12895,18 @@ pub fn run(
                                         root.force_status.clear();
                                         root.reseed_drafts();
                                         root.session = created.session;
+                                    } else if root.prepare_busy {
+                                        // The advance wrote the staged draft
+                                        // through and moved the game on. The
+                                        // re-read session REPLACES the held
+                                        // one first: `reseed_drafts` reads it,
+                                        // and the drafts it seeds are now the
+                                        // record the server just took, so the
+                                        // staging latches clear with them.
+                                        root.prepare_busy = false;
+                                        root.prepare_status.clear();
+                                        root.session = created.session;
+                                        root.reseed_drafts();
                                     } else if root.factor_busy {
                                         root.apply_factor(created.session);
                                     } else if root.advance_busy {
@@ -12423,6 +12947,9 @@ pub fn run(
                                     } else if root.deploy_busy {
                                         root.deploy_busy = false;
                                         root.force_status = why;
+                                    } else if root.prepare_busy {
+                                        root.prepare_busy = false;
+                                        root.prepare_status = why;
                                     } else if root.factor_busy {
                                         root.factor_busy = false;
                                         root.factor_status = why;
@@ -12756,9 +13283,12 @@ mod tests {
     #[gpui::test]
     fn a_picked_hull_with_no_commander_is_refused_and_named(cx: &mut gpui::TestAppContext) {
         let (tx, rx) = std::sync::mpsc::channel();
-        // A room with one seat, and a hull on the register to pick.
+        // A room with one seat, and a hull on the register to pick. The state
+        // is PREPARATION, not planning: this test pins the immediate-post path,
+        // where a picked hull plans and posts at once. While planning the same
+        // pick stages locally and posts nothing — see the staging tests below.
         let session = SessionView {
-            state: "planning".to_string(),
+            state: "preparation".to_string(),
             game: "Game 15".to_string(),
             game_id: 45,
             me: 2,
@@ -12831,6 +13361,7 @@ mod tests {
                     class_id: String::new(),
                     start: None,
                     commander_id: None,
+                    host: None,
                 });
                 demo.sync_force()
                     .expect_err("an uncommanded piece is not writable")
@@ -12851,8 +13382,10 @@ mod tests {
     #[gpui::test]
     fn a_removed_piece_is_one_remove(cx: &mut gpui::TestAppContext) {
         let (tx, rx) = std::sync::mpsc::channel();
+        // PREPARATION, so the removal posts at once: the staging path is
+        // proved separately.
         let session = SessionView {
-            state: "planning".to_string(),
+            state: "preparation".to_string(),
             game: "Game 15".to_string(),
             game_id: 45,
             me: 2,
@@ -12908,8 +13441,9 @@ mod tests {
     #[gpui::test]
     fn seating_a_directory_account_is_one_seat(cx: &mut gpui::TestAppContext) {
         let (tx, rx) = std::sync::mpsc::channel();
+        // PREPARATION, so the seat posts at once — the planning path stages.
         let session = SessionView {
-            state: "planning".to_string(),
+            state: "preparation".to_string(),
             game: "Game 15".to_string(),
             game_id: 45,
             me: 2,
@@ -12953,8 +13487,10 @@ mod tests {
     #[gpui::test]
     fn restaging_a_seated_account_as_the_same_role_writes_nothing(cx: &mut gpui::TestAppContext) {
         let (tx, rx) = std::sync::mpsc::channel();
+        // PREPARATION: the convergence this test pins is `roster::plan`'s, and
+        // it must actually run for the claim to mean anything.
         let session = SessionView {
-            state: "planning".to_string(),
+            state: "preparation".to_string(),
             game: "Game 15".to_string(),
             game_id: 45,
             me: 2,
@@ -12991,8 +13527,9 @@ mod tests {
     #[gpui::test]
     fn an_unseat_is_one_write(cx: &mut gpui::TestAppContext) {
         let (tx, rx) = std::sync::mpsc::channel();
+        // PREPARATION, so the unseat posts at once.
         let session = SessionView {
-            state: "planning".to_string(),
+            state: "preparation".to_string(),
             game: "Game 15".to_string(),
             game_id: 45,
             me: 2,
@@ -13027,6 +13564,326 @@ mod tests {
             matches!(&writes[0], crate::roster::RosterWrite::Unseat { user_id: 6, .. }),
             "got {:?}",
             writes[0]
+        );
+    }
+
+    /// While planning, an edit STAGES: it joins the draft, returns `Ok` and
+    /// posts NOTHING. The Session island's advance is the one moment the draft
+    /// is written through, which is the whole of this slice's rule.
+    #[gpui::test]
+    fn a_planning_pick_stages_locally_and_posts_nothing(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            people: vec![PersonView {
+                id: 2,
+                name: "Super User".to_string(),
+                call_sign: "SUPERUSER".to_string(),
+                role: "Commando".to_string(),
+                role_id: 19,
+                judge: false,
+                ready: false,
+                present: true,
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.stage_assign(1, "KRI Ahmad Yani", 2)
+                    .expect("a seated pick is assignable");
+                assert!(demo.force.contains(1), "the hull joined the draft");
+                assert_eq!(demo.force.get(1).and_then(|h| h.commander_id), Some(2));
+            })
+        });
+        assert!(
+            rx.try_recv().is_err(),
+            "planning stages: nothing is posted until the advance"
+        );
+    }
+
+    /// The advance crosses the wire carrying the STAGED draft and the live
+    /// mirrors it was diffed against — the shell cannot compute the writes
+    /// (the token is the binary's) and the binary cannot see the drafts.
+    #[gpui::test]
+    fn the_advance_carries_the_staged_draft_and_the_live_mirrors(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            people: vec![PersonView {
+                id: 2,
+                name: "Super User".to_string(),
+                call_sign: "SUPERUSER".to_string(),
+                role: "Commando".to_string(),
+                role_id: 19,
+                judge: false,
+                ready: false,
+                present: true,
+            }],
+            pieces: vec![PieceView {
+                id: 8,
+                label: "KRI Already Here (KRI-1)".to_string(),
+                commander_id: Some(2),
+                placed: true,
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        let sent = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.stage_assign(1, "KRI Ahmad Yani", 2).expect("assignable");
+                demo.prepare_advance(cx)
+            })
+        });
+        assert!(sent, "an advance from a held game sends");
+        match rx.try_recv().expect("the advance reached the sink") {
+            ToBinary::AdvancePreparation {
+                force,
+                live_hulls,
+                roster: _,
+                live_seats,
+            } => {
+                assert!(force.contains(1), "the staged hull crossed");
+                assert!(
+                    force.contains(8),
+                    "install seeded the server's piece, so it is not read as a removal"
+                );
+                assert!(
+                    live_hulls.iter().any(|h| h.unit_id == 8),
+                    "the live mirror names the piece the draft was diffed against"
+                );
+                assert!(live_seats.iter().any(|s| s.user_id == 2));
+            }
+            other => panic!("expected an advance, got {other:?}"),
+        }
+        assert!(
+            !cx.update(|_window, app| view.update(app, |demo, cx| demo.prepare_advance(cx))),
+            "an advance in flight sends nothing more"
+        );
+    }
+
+    /// A drop on bare water while planning unprojects the drop point LOCALLY
+    /// and stages it: the draft carries a ground `Start`, the hull is assigned
+    /// on the way in, and nothing is posted.
+    #[gpui::test]
+    fn a_planning_drop_stages_a_start_and_posts_nothing(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            people: vec![PersonView {
+                id: 2,
+                name: "Super User".to_string(),
+                call_sign: "SUPERUSER".to_string(),
+                role: "Commando".to_string(),
+                role_id: 19,
+                judge: false,
+                ready: false,
+                present: true,
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 2, 0, session, tx);
+            demo.map_dims = (1000.0, 1000.0);
+            demo.map_center = (0.0, 0.0);
+            demo.map_render_zoom = 4.0;
+            demo
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(1, "KRI Ahmad Yani", 0.5, 0.5, None, cx)
+            })
+        });
+        assert!(rx.try_recv().is_err(), "a planning drop posts nothing");
+        cx.update(|_window, app| {
+            let hull = view.read(app).force.get(1).cloned().expect("the hull joined");
+            let start = hull.start.expect("the drop staged a ground start");
+            assert_eq!(hull.commander_id, Some(2), "assigned to the operator's seat");
+            assert_eq!(hull.host, None, "a bare-water drop clears any host");
+            assert!(
+                start.lat.abs() < 1e-9 && start.lon.abs() < 1e-9,
+                "the frame's centre unprojects to the map centre: {start:?}"
+            );
+        });
+    }
+
+    /// A drop on a host while planning stages an embarkation: the child's
+    /// `host` is set and its own `start` cleared — a hull aboard another has
+    /// no position of its own — and nothing posts.
+    #[gpui::test]
+    fn a_planning_embark_drop_stages_a_host(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            people: vec![PersonView {
+                id: 2,
+                name: "Super User".to_string(),
+                call_sign: "SUPERUSER".to_string(),
+                role: "Commando".to_string(),
+                role_id: 19,
+                judge: false,
+                ready: false,
+                present: true,
+            }],
+            pieces: vec![PieceView {
+                id: 8,
+                label: "KRI Host (KRI-1)".to_string(),
+                commander_id: Some(2),
+                placed: true,
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 2, 0, session, tx);
+            demo.map_dims = (1000.0, 1000.0);
+            demo
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(1, "KRI Ahmad Yani", 0.5, 0.5, Some(8), cx)
+            })
+        });
+        assert!(rx.try_recv().is_err(), "a planning embark posts nothing");
+        cx.update(|_window, app| {
+            let hull = view.read(app).force.get(1).cloned().expect("the child joined");
+            assert_eq!(hull.host, Some(8), "staged aboard the host");
+            assert_eq!(hull.start, None, "a hull aboard another has no start of its own");
+            assert_eq!(hull.commander_id, Some(2));
+        });
+    }
+
+    /// A planning drop with no seat is refused in the tightest loop: the
+    /// refusal is the console's own sentence, the hull never joins the draft,
+    /// and nothing is posted — no round trip is spent on a write that cannot
+    /// name a commander.
+    #[gpui::test]
+    fn a_planning_drop_without_a_seat_is_refused_locally(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            people: Vec::new(),
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 2, 0, session, tx);
+            demo.map_dims = (1000.0, 1000.0);
+            demo
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(1, "KRI Ahmad Yani", 0.5, 0.5, None, cx)
+            })
+        });
+        assert!(rx.try_recv().is_err(), "nothing posts without a seat");
+        cx.update(|_window, app| {
+            let demo = view.read(app);
+            assert!(
+                demo.force_status.contains("holds no seat"),
+                "the console's own refusal: {}",
+                demo.force_status
+            );
+            assert!(!demo.force.contains(1), "and the hull never joined the draft");
+        });
+    }
+
+    /// A staged start becomes a planned marker: projected from the draft's own
+    /// lat/lon at the frame's camera, and SKIPPED once the hull is on the wire
+    /// — two frames over one hull would be two answers.
+    #[test]
+    fn planned_marks_project_a_staged_start_and_skip_the_wire() {
+        let mut session = SessionView::default();
+        session.state = "planning".to_string();
+        session.game_id = 45;
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        demo.map_dims = (1000.0, 1000.0);
+        demo.map_center = (0.0, 0.0);
+        demo.map_render_zoom = 4.0;
+        demo.force.upsert(crate::force::DraftHull {
+            unit_id: 1,
+            name: "staged".to_string(),
+            hull_number: String::new(),
+            class_id: String::new(),
+            start: Some(crate::force::Start { lat: 0.0, lon: 0.0 }),
+            commander_id: Some(2),
+            host: None,
+        });
+        let marks = demo.planned_marks();
+        assert_eq!(marks.len(), 1, "one staged hull with a fix is one planned mark");
+        assert_eq!(
+            (marks[0].0, marks[0].1),
+            project_frame_px(0.0, 0.0, (0.0, 0.0), 4.0, 1000.0, 1000.0),
+            "projected from the draft start at the frame camera"
+        );
+        assert_eq!(
+            marks[0].2,
+            MapSymbolShape::Dot,
+            "no taxonomy names it, so the unknown-ship fallback"
+        );
+        // On the wire, the live marker is the truth about where it is.
+        demo.live = vec![LiveMarker {
+            id: "1".to_string(),
+            x: 500.0,
+            y: 500.0,
+            stale: false,
+            symbol: MapSymbolShape::Dot,
+            affiliation: symbology::Affiliation::Unknown,
+            heading_deg: None,
+            speed_kn: None,
+            latitude: 0.0,
+            longitude: 0.0,
+            trail: 0,
+        }];
+        assert!(
+            demo.planned_marks().is_empty(),
+            "a hull on the wire draws its live marker, not a planned one"
+        );
+    }
+
+    /// The shell's mirrored projection is the same arithmetic as
+    /// `map_render`'s: the centre is the frame's centre, and the inverse
+    /// round-trips, so a planned marker and a live one share one pixel space.
+    #[test]
+    fn the_frame_projection_round_trips() {
+        let (w, h) = (1280.0, 720.0);
+        let center = (1.0, 104.0);
+        let zoom = 6.0;
+        assert_eq!(
+            project_frame_px(center.0, center.1, center, zoom, w, h),
+            (w / 2.0, h / 2.0),
+            "the centre projects to the frame's centre"
+        );
+        let (lat, lon) = unproject_frame_px(300.0, 250.0, center, zoom, w, h);
+        let (bx, by) = project_frame_px(lat, lon, center, zoom, w, h);
+        assert!(
+            (bx - 300.0).abs() < 1e-6 && (by - 250.0).abs() < 1e-6,
+            "projection and its inverse agree: ({bx}, {by})"
         );
     }
 

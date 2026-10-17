@@ -847,36 +847,9 @@ fn main() {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
-                            let mut refusal: Option<String> = None;
-                            for w in &writes {
-                                let step = match w {
-                                    tfg::roster::RosterWrite::Seat {
-                                        user_id, role_id, call_sign, ..
-                                    } => master
-                                        .add_participant(
-                                            &token2,
-                                            game_id,
-                                            *user_id,
-                                            *role_id,
-                                            call_sign,
-                                        )
-                                        .map(|_| ()),
-                                    tfg::roster::RosterWrite::Role { user_id, role_id, .. } => {
-                                        master
-                                            .set_participant_role(&token2, game_id, *user_id, *role_id)
-                                            .map(|_| ())
-                                    }
-                                    tfg::roster::RosterWrite::Unseat { user_id, .. } => master
-                                        .remove_participant(&token2, game_id, *user_id)
-                                        .map(|_| ()),
-                                };
-                                if let Err(e) = step {
-                                    refusal = Some(format!("{} refused: {e}", w.label()));
-                                    break;
-                                }
-                            }
-                            match refusal {
-                                None => {
+                            match flush_roster(&master, &token2, game_id, &writes) {
+                                Err(why) => Err(why),
+                                Ok(()) => {
                                     eprintln!("roster synced: {} write(s)", writes.len());
                                     match fetch_session(&host2, &token2, Some(game_id)) {
                                         Some(s) => Ok(tfg::shell_gpui::CreatedSession { session: s }),
@@ -886,7 +859,6 @@ fn main() {
                                         ),
                                     }
                                 }
-                                Some(why) => Err(why),
                             }
                         };
                         if create_tx.send(outcome).is_err() {
@@ -901,49 +873,20 @@ fn main() {
                         // operator cannot see, which is the failure
                         // `ForceGap` exists to prevent.
                         //
-                        // A `Place` or `Lift` here is a bug, not a refusal —
-                        // neither side of this shell's draft carries a starting
-                        // position (there is no map drop), so `plan` cannot
-                        // emit one. It is reported loudly rather than swallowed,
-                        // because a draft that grew a start without the panel
-                        // that sets it would otherwise write a coordinate
-                        // nobody chose.
+                        // This path is reached only OUTSIDE planning — while
+                        // planning each edit stages and posts nothing — so the
+                        // writes here are one decision's worth and a `Place`
+                        // or `Lift` is an ordinary position write rather than a
+                        // bug.
                         let outcome = if token2.is_empty() {
                             Err("signed out \u{2014} sign in to pick the fleet".to_string())
                         } else {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
-                            let mut refusal: Option<String> = None;
-                            for w in &writes {
-                                let step = match w {
-                                    tfg::force::ForceWrite::Assign {
-                                        unit_id, commander_id, ..
-                                    } => master
-                                        .assign_unit(&token2, game_id, *unit_id, *commander_id)
-                                        .map(|_| ()),
-                                    tfg::force::ForceWrite::HandOver {
-                                        unit_id, commander_id, ..
-                                    } => master
-                                        .set_unit_commander(&token2, game_id, *unit_id, *commander_id)
-                                        .map(|_| ()),
-                                    tfg::force::ForceWrite::Remove { unit_id, .. } => {
-                                        master.remove_unit(&token2, game_id, *unit_id).map(|_| ())
-                                    }
-                                    tfg::force::ForceWrite::Place { name, .. }
-                                    | tfg::force::ForceWrite::Lift { name, .. } => Err(
-                                        tfg::backend::BackendError::Other(format!(
-                                            "{name} has a position this shell cannot write"
-                                        )),
-                                    ),
-                                };
-                                if let Err(e) = step {
-                                    refusal = Some(format!("{} refused: {e}", w.name()));
-                                    break;
-                                }
-                            }
-                            match refusal {
-                                None => {
+                            match flush_force(&master, &token2, game_id, &writes) {
+                                Err(why) => Err(why),
+                                Ok(()) => {
                                     eprintln!("force synced: {} write(s)", writes.len());
                                     match fetch_session(&host2, &token2, Some(game_id)) {
                                         Some(s) => Ok(tfg::shell_gpui::CreatedSession { session: s }),
@@ -953,7 +896,108 @@ fn main() {
                                         ),
                                     }
                                 }
-                                Some(why) => Err(why),
+                            }
+                        };
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
+                    tfg::shell_gpui::ToBinary::AdvancePreparation {
+                        force,
+                        live_hulls,
+                        roster,
+                        live_seats,
+                    } => {
+                        // LEAVE PLANNING. The drafts cross whole because the
+                        // token lives HERE and the drafts live THERE: the
+                        // shell cannot compute the writes and this side cannot
+                        // see the drafts. The force is planned FIRST, and a
+                        // `ForceGap` refuses the move WHOLE — nothing is
+                        // posted, because issuing the rest would half-commit
+                        // the very draft the advance exists to record.
+                        // Otherwise the force, the roster and the task
+                        // organisation are written through in the order the
+                        // server accepts them, the first refusal stopping the
+                        // rest, and only a clean flush transitions the game to
+                        // preparation. The answer is the re-read session.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to move the plan to preparation"
+                                .to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            match tfg::force::plan(&force, &live_hulls) {
+                                Err(gap) => Err(gap.to_string()),
+                                Ok(force_writes) => {
+                                    let roster_writes = tfg::roster::plan(&roster, &live_seats);
+                                    // The shell holds no task-organisation
+                                    // draft yet, so the tree flush is planned
+                                    // from an empty draft and an empty live
+                                    // frame: it emits nothing and posts
+                                    // nothing. The call is here so the ORDER
+                                    // is stated in one place.
+                                    let groups_writes =
+                                        tfg::groups::plan(&tfg::groups::GroupsDraft::new(), &[]);
+                                    let flush =
+                                        flush_force(&master, &token2, game_id, &force_writes)
+                                            .and_then(|()| {
+                                                flush_roster(
+                                                    &master,
+                                                    &token2,
+                                                    game_id,
+                                                    &roster_writes,
+                                                )
+                                            })
+                                            .and_then(|()| {
+                                                flush_groups(
+                                                    &master,
+                                                    &token2,
+                                                    game_id,
+                                                    &groups_writes,
+                                                )
+                                            });
+                                    match flush {
+                                        Err(why) => Err(why),
+                                        Ok(()) => {
+                                            match master.transition_game(
+                                                &token2,
+                                                game_id,
+                                                "preparation",
+                                            ) {
+                                                Ok(g) => {
+                                                    eprintln!(
+                                                        "{} moved to preparation \
+                                                         ({} force, {} roster, {} group write(s))",
+                                                        g.name,
+                                                        force_writes.len(),
+                                                        roster_writes.len(),
+                                                        groups_writes.len()
+                                                    );
+                                                    match fetch_session(
+                                                        &host2,
+                                                        &token2,
+                                                        Some(game_id),
+                                                    ) {
+                                                        Some(s) => Ok(
+                                                            tfg::shell_gpui::CreatedSession {
+                                                                session: s,
+                                                            },
+                                                        ),
+                                                        None => Err(
+                                                            "moved to preparation, but the session \
+                                                             could not be read"
+                                                                .to_string(),
+                                                        ),
+                                                    }
+                                                }
+                                                Err(e) => Err(format!(
+                                                    "move to preparation refused: {e}"
+                                                )),
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         };
                         if create_tx.send(outcome).is_err() {
@@ -2294,6 +2338,162 @@ fn fetch_session(
         directory,
         roles,
     })
+}
+
+/// Write a force plan through, one write per endpoint, in `force::plan`'s
+/// order.
+///
+/// `Err` carries the whole refusal sentence — the hull's name and the
+/// server's own words — and means the plan STOPPED there: the caller decides
+/// whether to post the rest, and here it never does, because posting the
+/// remainder would half-commit a force the operator cannot see.
+///
+/// Shared by the planning advance and the ordinary per-edit sync: outside
+/// planning each edit plans and posts at once, and the same order the server
+/// accepts the writes in is the same order the plan emits them in.
+fn flush_force(
+    master: &tfg::backend::MinosMaster,
+    token: &str,
+    game_id: i64,
+    writes: &[tfg::force::ForceWrite],
+) -> Result<(), String> {
+    for w in writes {
+        let step = match w {
+            tfg::force::ForceWrite::Assign {
+                unit_id, commander_id, ..
+            } => master
+                .assign_unit(token, game_id, *unit_id, *commander_id)
+                .map(|_| ()),
+            tfg::force::ForceWrite::HandOver {
+                unit_id, commander_id, ..
+            } => master
+                .set_unit_commander(token, game_id, *unit_id, *commander_id)
+                .map(|_| ()),
+            tfg::force::ForceWrite::Remove { unit_id, .. } => {
+                master.remove_unit(token, game_id, *unit_id).map(|_| ())
+            }
+            tfg::force::ForceWrite::Place {
+                unit_id, lat, lon, ..
+            } => master
+                .set_placement(token, game_id, *unit_id, *lat, *lon)
+                .map(|_| ()),
+            tfg::force::ForceWrite::Lift { unit_id, .. } => {
+                master.clear_placement(token, game_id, *unit_id).map(|_| ())
+            }
+            tfg::force::ForceWrite::Embark { host, child, .. } => master
+                .game_attach_units(token, game_id, *host, &[*child])
+                .map(|_| ()),
+            tfg::force::ForceWrite::Disembark { host, child, .. } => master
+                .game_detach_units(token, game_id, *host, &[*child])
+                .map(|_| ()),
+        };
+        if let Err(e) = step {
+            return Err(format!("{} refused: {e}", w.name()));
+        }
+    }
+    Ok(())
+}
+
+/// Write a roster plan through, one write per endpoint, in `roster::plan`'s
+/// order.
+///
+/// Same shape and same stopping rule as [`flush_force`].
+fn flush_roster(
+    master: &tfg::backend::MinosMaster,
+    token: &str,
+    game_id: i64,
+    writes: &[tfg::roster::RosterWrite],
+) -> Result<(), String> {
+    for w in writes {
+        let step = match w {
+            tfg::roster::RosterWrite::Seat {
+                user_id,
+                role_id,
+                call_sign,
+                ..
+            } => master
+                .add_participant(token, game_id, *user_id, *role_id, call_sign)
+                .map(|_| ()),
+            tfg::roster::RosterWrite::Role {
+                user_id, role_id, ..
+            } => master
+                .set_participant_role(token, game_id, *user_id, *role_id)
+                .map(|_| ()),
+            tfg::roster::RosterWrite::Unseat { user_id, .. } => master
+                .remove_participant(token, game_id, *user_id)
+                .map(|_| ()),
+        };
+        if let Err(e) = step {
+            return Err(format!("{} refused: {e}", w.label()));
+        }
+    }
+    Ok(())
+}
+
+/// Write a task-organisation plan through, one write per endpoint, in
+/// `groups::plan`'s order.
+///
+/// A write that names a node created in the SAME flush (`GroupRef::New`) is
+/// refused rather than guessed at: resolving a staged id to the server id a
+/// create answers with is work this advance does not do. The draft the
+/// advance flushes is always empty, so the case cannot arise — refusing
+/// loudly keeps it from arising silently if that ever changes.
+fn flush_groups(
+    master: &tfg::backend::MinosMaster,
+    token: &str,
+    game_id: i64,
+    writes: &[tfg::groups::GroupWrite],
+) -> Result<(), String> {
+    let resolve = |group: &tfg::groups::GroupRef| -> Result<i64, String> {
+        match group {
+            tfg::groups::GroupRef::Live(id) => Ok(*id),
+            tfg::groups::GroupRef::New(id) => Err(format!(
+                "node staged as {id} names a node this same flush creates, \
+                 which the advance cannot resolve"
+            )),
+        }
+    };
+    for w in writes {
+        let step: Result<(), tfg::backend::BackendError> = match w {
+            // The advance never flushes a draft that creates nodes: the shell
+            // holds no task-organisation draft, and the empty one it sends
+            // plans nothing. Refused rather than half-built if that changes.
+            tfg::groups::GroupWrite::CreateNode { .. } => Err(tfg::backend::BackendError::Other(
+                "this advance does not create task-organisation nodes".to_string(),
+            )),
+            tfg::groups::GroupWrite::Rename { group_id, name } => {
+                master.hierarchy_update_node(token, game_id, *group_id, Some(name.as_str()))
+            }
+            tfg::groups::GroupWrite::DeleteNode { group_id } => {
+                master.hierarchy_delete_node(token, game_id, *group_id)
+            }
+            tfg::groups::GroupWrite::MoveNode { group_id, parent } => {
+                let parent = resolve(parent)?;
+                master.hierarchy_move_node(token, game_id, *group_id, parent)
+            }
+            tfg::groups::GroupWrite::ClearParent { group_id } => {
+                master.hierarchy_detach_node(token, game_id, *group_id)
+            }
+            tfg::groups::GroupWrite::SetCommander { group, user_id } => {
+                let group = resolve(group)?;
+                master.hierarchy_set_commander(token, game_id, group, *user_id)
+            }
+            tfg::groups::GroupWrite::ClearCommander { group_id } => {
+                master.hierarchy_clear_commander(token, game_id, *group_id)
+            }
+            tfg::groups::GroupWrite::PlaceUnit { group, unit_id } => {
+                let group = resolve(group)?;
+                master.game_unit_place(token, game_id, *unit_id, group)
+            }
+            tfg::groups::GroupWrite::UnplaceUnit { unit_id } => {
+                master.game_unit_unplace(token, game_id, *unit_id)
+            }
+        };
+        if let Err(e) = step {
+            return Err(format!("{} refused: {e}", w.label()));
+        }
+    }
+    Ok(())
 }
 
 /// How many extra frames to ask for after the first, so MapLibre's tiles have
