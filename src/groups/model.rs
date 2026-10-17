@@ -77,3 +77,35 @@ pub struct Group {
     pub children: Vec<String>,
     pub commander: Option<String>,
 }
+
+/// The rank rule, in the one place it is worded: a child sits strictly
+/// below its parent. Both the in-memory forest (`hierarchy`) and the local
+/// draft (`plan`) refuse through here, so a rank violation reads the same
+/// wherever it is raised.
+pub(super) fn rank_refusal(child_name: &str, child: GroupKind, parent: GroupKind) -> String {
+    format!(
+        "rank violation: child `{child_name}` ({}:{}) not below {}:{}",
+        child.label(),
+        child.rank(),
+        parent.label(),
+        parent.rank(),
+    )
+}
+
+/// A group may not become its own ancestor. The in-memory forest makes
+/// that impossible by construction (a child is always strictly lower), so
+/// only the draft, where a re-parent is an edit, can meet it.
+pub(super) fn cycle_refusal(group_name: &str) -> String {
+    format!("group `{group_name}` cannot be its own ancestor")
+}
+
+/// A unit belongs to at most one group: two owners make jurisdiction
+/// ambiguous. One wording for the in-memory forest and the draft.
+pub(super) fn duplicate_unit_refusal(unit: &str, owner_name: &str) -> String {
+    format!("unit `{unit}` already in group `{owner_name}`")
+}
+
+/// The same unit named twice in one group's own list.
+pub(super) fn repeated_unit_refusal(unit: &str) -> String {
+    format!("unit `{unit}` listed twice")
+}

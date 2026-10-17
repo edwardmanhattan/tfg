@@ -10,13 +10,16 @@
 //! - [`hierarchy`]: build/remove/query the forest, fail-loud validation.
 //! - [`authority`]: rank-derived jurisdiction and authority.
 //! - [`scopes`]: desktop [`Scope`]s with `kind:id` ids.
+//! - [`plan`]: the local [`GroupsDraft`] and the ordered [`plan`] flush.
 
 mod authority;
 mod hierarchy;
 mod model;
+mod plan;
 mod scopes;
 
 pub use model::{Group, GroupKind};
+pub use plan::{plan, GroupRef, GroupWrite, GroupsDraft, LiveGroup, StagedGroup};
 pub use scopes::Scope;
 
 /// The session's group forest.
