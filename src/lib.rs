@@ -11,6 +11,8 @@
 //!   both read it, and the chrome geometry is testable with no display.
 //! - [`gamestate`]: the exercise lifecycle as one axis. Leaf: no tfg types.
 //! - [`force`]: the operator's force before Minos hears of it, and the diff a stage advance writes.
+//! - [`dnd`]: entity-to-entity drag and drop — what a drop on a hull, a person
+//!   or a group means. Leaf: no GPUI, no draft, no network.
 //! - [`backend`]: v0 poll contract: `PollSource`, file replay, HTTP stub.
 //! - [`symbology`]: APP-6C symbol model + generated icon geometry. Leaf: depends on nothing.
 //! - [`shell_gpui`]: the GPUI shell — the island chrome and the U5 parity
@@ -42,6 +44,7 @@ pub mod book;
 pub mod catalog;
 pub mod clock;
 pub mod command;
+pub mod dnd;
 pub mod fleet;
 pub mod force;
 pub mod gamestate;
