@@ -3008,11 +3008,21 @@ impl IslandDemo {
             self.session.pieces.len()
         )));
         let crew = self.crew_choices();
-        if crew.is_empty() {
+        // The pills show when the operator holds no PLAYER-side seat: the
+        // room is empty, or the operator's own seat is judge-side — which
+        // cannot command, so every drop would be refused. Both are a
+        // one-click fix here, in the picker the drop started from.
+        let needs_player_seat = crew.is_empty() || self.own_steers() == Some(false);
+        if needs_player_seat {
             force = force.child(small(
-                "Nobody is seated, and Minos gives every piece a commander \u{2014} \
-                 seat the room on the Players island first."
-                    .to_string(),
+                if crew.is_empty() {
+                    "Nobody is seated, and Minos gives every piece a commander \u{2014} \
+                     seat the room on the Players island first."
+                } else {
+                    "Your seat is judge-side \u{2014} it directs, it does not \
+                     command. Take a player seat to deploy."
+                }
+                .to_string(),
             ));
             // The one-click way in: the operator's own seat, as a
             // player-side role. A fresh game seats nobody — not even its
@@ -15121,6 +15131,57 @@ mod tests {
             status,
             "your seat is judge-side \u{2014} it directs, it does not command; take a player seat on the Players island"
         );
+    }
+
+    /// `own_steers` reads the operator's own seat: `None` unseated, `Some`
+    /// whether the held role is player-side. The seat-me pills and the
+    /// judge-side drop gate both read it — the pills show when it is
+    /// `None` or `Some(false)`, the drop refuses when it is `Some(false)`.
+    #[test]
+    fn own_steers_reads_the_operators_seat() {
+        let session_with = |role_id: i64, judge: bool| {
+            let mut session = SessionView::default();
+            session.me = 7;
+            session.roles = vec![
+                RoleRow { id: 1, name: "Commando".to_string(), judge: false },
+                RoleRow { id: 9, name: "Penyelenggara".to_string(), judge: true },
+            ];
+            session.people = vec![PersonView {
+                id: 7,
+                name: "SU".to_string(),
+                call_sign: "SUEX".to_string(),
+                role: if judge { "Penyelenggara" } else { "Commando" }.to_string(),
+                role_id,
+                judge,
+                ready: false,
+                present: true,
+            }];
+            session
+        };
+        let demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            SessionView::default(),
+            std::sync::mpsc::channel().0,
+        );
+        assert_eq!(demo.own_steers(), None, "no seat, no steering");
+        let demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session_with(1, false),
+            std::sync::mpsc::channel().0,
+        );
+        assert_eq!(demo.own_steers(), Some(true), "a player seat steers");
+        let demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session_with(9, true),
+            std::sync::mpsc::channel().0,
+        );
+        assert_eq!(demo.own_steers(), Some(false), "a judge seat directs");
     }
 
     /// A seated drop of a register hull assigns and deploys in one verb —

@@ -5291,3 +5291,25 @@ round-trip) but not gesture-driven — proving it needs a driven pointer
 to click SIGN OUT. The env-before-keyring order means a box with
 `TFG_API_USER` set always uses the environment; the keyring is the
 no-env interactive path.
+
+### Follow-up: the seat-me pill also catches a judge-side seat (2026-10-17)
+
+The drop gate refused a judge-side deploy correctly, but the operator
+was then stuck: the seat-me pill showed only when the room was EMPTY,
+and a judge-side operator has a seat — so the one-click way out never
+appeared, and the fix was a trip to the Players island.
+
+The pills now show whenever the operator holds no PLAYER-side seat:
+`crew.is_empty() || own_steers() == Some(false)`. An empty room gets
+the old "seat the room" hint; a judge-side seat gets "Your seat is
+judge-side — it directs, it does not command. Take a player seat to
+deploy." Clicking the pill re-seats the operator into the player role
+(a roster role change), and the drop works.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 493 pass, same 4 pre-existing failures |
+| `own_steers` reads the seat | `own_steers_reads_the_operators_seat`: None unseated, Some(true) player, Some(false) judge |
+| it draws | `/tmp/gpui_judge_pill.png` (`TFG_GAME=18 TFG_FLEET=1`, clean run, log checked): the Penyelenggara operator gets the "SEAT ME AS COMMANDO" pill and the judge-side hint |
