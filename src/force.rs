@@ -18,10 +18,13 @@
 //!
 //! THE ORDER OF [`plan`] IS NOT ARBITRARY. A piece is assigned before it is
 //! given a position, because the position endpoint 404s on a hull the server
-//! has never heard of. A hull the operator has taken back out of the exercise
-//! is dropped last, so nothing is ever briefly absent while it moves.
+//! has never heard of. Putting one hull aboard another comes after that, for
+//! the same reason and one more: the embarkation endpoint 404s on a hull — or
+//! a host — the server has never heard of. A hull the operator has taken back
+//! out of the exercise is dropped last, so nothing is ever briefly absent
+//! while it moves.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::geo::coordinates::GeoPosition;
 
@@ -78,6 +81,13 @@ pub struct DraftHull {
     /// state a lift leaves behind, and the state an assign leaves behind.
     pub start: Option<Start>,
     pub commander_id: Option<i64>,
+    /// The hull this piece is aboard, or `None` for a piece on the water.
+    ///
+    /// This is the operator's whole statement about embarkation: a drop on a
+    /// host sets it, a drop on bare water clears it. The chain it starts is
+    /// checked for rings in [`plan`], because Minos refuses one and the
+    /// operator can build one by dragging.
+    pub host: Option<i64>,
 }
 
 impl DraftHull {
@@ -94,6 +104,7 @@ impl DraftHull {
             class_id,
             start: None,
             commander_id: None,
+            host: None,
         }
     }
 }
@@ -110,6 +121,9 @@ pub struct LiveHull {
     pub name: String,
     pub commander_id: Option<i64>,
     pub start: Option<Start>,
+    /// What the server last said carries this piece, or `None` for one on
+    /// the water. The whole of what a diff needs to plan an embarkation.
+    pub host: Option<i64>,
 }
 
 /// The operator's force, keyed by unit id so every read is a lookup and the
@@ -188,6 +202,19 @@ impl ForceDraft {
         }
     }
 
+    /// Put a hull aboard another, or take it off whatever carries it. `None`
+    /// puts it back on the water; the host is named, not the piece, because
+    /// that is the thing the operator dragged it onto.
+    pub fn set_host(&mut self, unit_id: i64, host: Option<i64>) -> bool {
+        match self.hulls.get_mut(&unit_id) {
+            Some(hull) => {
+                hull.host = host;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Hulls nobody commands yet, in unit-id order. The refusal names these and
     /// the bulk fill walks these.
     pub fn uncommanded(&self) -> Vec<&DraftHull> {
@@ -234,6 +261,13 @@ pub enum ForceWrite {
     },
     /// Take a hull off the map. The hull stays in the exercise.
     Lift { unit_id: i64, name: String },
+    /// Put a hull aboard another. Names both ends: the endpoint addresses
+    /// the host, and the child is the hull that moves.
+    Embark { host: i64, child: i64, name: String },
+    /// Take a hull off whatever carries it. Names only the child: the host
+    /// it leaves is whatever the server last said, and the endpoint takes
+    /// the child's id.
+    Disembark { child: i64, name: String },
     /// Take a hull out of the exercise entirely.
     Remove { unit_id: i64, name: String },
 }
@@ -246,6 +280,10 @@ impl ForceWrite {
             | Self::Place { unit_id, .. }
             | Self::Lift { unit_id, .. }
             | Self::Remove { unit_id, .. } => *unit_id,
+            // The child is the hull this write is about: the host is what
+            // it moves to, and a line that has to say which hull went wrong
+            // means the one that moved.
+            Self::Embark { child, .. } | Self::Disembark { child, .. } => *child,
         }
     }
 
@@ -257,52 +295,162 @@ impl ForceWrite {
             | Self::Place { name, .. }
             | Self::Lift { name, .. }
             | Self::Remove { name, .. } => name,
+            Self::Embark { name, .. } | Self::Disembark { name, .. } => name,
         }
     }
 }
 
 /// Why a draft cannot be written through yet.
 ///
-/// A hull in the exercise with nobody to steer it is the whole of it, and the
-/// rule is Minos's rather than this module's: `game_units.id_commander` is NOT
-/// NULL and the assignment endpoint says so in as many words. The draft
-/// tolerates the state so the operator can work; the sync refuses it and names
-/// the hulls, because handing a piece to whoever happened to be seated first
-/// is the one answer nobody can undo by looking at the map.
+/// A stage advance is the moment the draft is written through, and a draft
+/// that cannot be written refuses WHOLE and names the hulls: issuing the rest
+/// would half-commit a force the operator cannot see.
+///
+/// Three states refuse, and all three are Minos's rules rather than this
+/// module's. A hull in the exercise with nobody to steer it is the first:
+/// `game_units.id_commander` is NOT NULL and the assignment endpoint says so
+/// in as many words. The draft tolerates the state so the operator can work;
+/// the sync refuses it, because handing a piece to whoever happened to be
+/// seated first is the one answer nobody can undo by looking at the map. A
+/// hull told to ride itself, and a ring of hulls that carry each other, are
+/// the next two: the attach endpoint refuses both outright ("putting the
+/// group inside the carrier is a ring"), and they are the states a drag can
+/// build, so catching them here is the point of this module rather than a
+/// courtesy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForceGap {
+    pub reason: GapReason,
+    /// The hulls the sentence names, in unit-id order.
     pub hulls: Vec<String>,
+}
+
+/// Which rule refused the draft. The reason is what keeps [`ForceGap`]'s
+/// sentence truthful: a ring is not a missing commander, and telling the
+/// operator it is would send them to the Player picker to fix a drag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GapReason {
+    /// A hull the server does not hold has nobody to command it.
+    Uncommanded,
+    /// A hull is its own host.
+    SelfHost,
+    /// Hulls that carry each other, transitively.
+    Ring,
 }
 
 impl std::fmt::Display for ForceGap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} — Minos gives every piece a commander, so name one on the Player picker first",
-            self.hulls.join(", ")
-        )
+        let hulls = self.hulls.join(", ");
+        match self.reason {
+            GapReason::Uncommanded => write!(
+                f,
+                "{hulls} — Minos gives every piece a commander, so name one on the Player picker first"
+            ),
+            GapReason::SelfHost => write!(
+                f,
+                "{hulls} — a hull cannot ride itself, so drop it on open water or on another hull"
+            ),
+            GapReason::Ring => write!(
+                f,
+                "{hulls} — these hulls carry each other in a ring, so move one back to open water"
+            ),
+        }
     }
+}
+
+/// The first rule the draft breaks, or `None` when it is writable.
+///
+/// The checks run in the order the operator is likely to meet them, and the
+/// first one to fire refuses the whole draft: a plan that writes the commander
+/// of a hull it cannot embark would half-commit.
+fn gap(draft: &ForceDraft, live: &[LiveHull]) -> Option<ForceGap> {
+    let uncommanded: Vec<String> = draft
+        .hulls()
+        .filter(|hull| hull.commander_id.is_none() && !live_holds(live, hull.unit_id))
+        .map(|hull| hull.name.clone())
+        .collect();
+    if !uncommanded.is_empty() {
+        return Some(ForceGap {
+            reason: GapReason::Uncommanded,
+            hulls: uncommanded,
+        });
+    }
+
+    let self_hosted: Vec<String> = draft
+        .hulls()
+        .filter(|hull| hull.host == Some(hull.unit_id))
+        .map(|hull| hull.name.clone())
+        .collect();
+    if !self_hosted.is_empty() {
+        return Some(ForceGap {
+            reason: GapReason::SelfHost,
+            hulls: self_hosted,
+        });
+    }
+
+    let ring = ring_hulls(draft);
+    if !ring.is_empty() {
+        return Some(ForceGap {
+            reason: GapReason::Ring,
+            hulls: ring,
+        });
+    }
+
+    None
+}
+
+/// Every hull that lies on a ring of `host` links, in unit-id order.
+///
+/// A walk follows one hull's host chain until it either leaves the draft —
+/// the host is not a drafted hull, so the chain ends there — or revisits a
+/// hull, at which point everything from the first sighting of that hull
+/// onward is the ring. The walk is finite because there are finitely many
+/// hulls and it stops on the first repeat.
+fn ring_hulls(draft: &ForceDraft) -> Vec<String> {
+    let mut on_ring: BTreeSet<i64> = BTreeSet::new();
+    for start in draft.hulls().map(|hull| hull.unit_id) {
+        let mut path: Vec<i64> = Vec::new();
+        let mut cursor = Some(start);
+        while let Some(id) = cursor {
+            if let Some(at) = path.iter().position(|seen| *seen == id) {
+                on_ring.extend(path[at..].iter().copied());
+                break;
+            }
+            path.push(id);
+            cursor = draft.get(id).and_then(|hull| hull.host);
+        }
+    }
+    on_ring
+        .iter()
+        .filter_map(|id| draft.get(*id).map(|hull| hull.name.clone()))
+        .collect()
 }
 
 /// The writes that carry `draft` onto a server holding `live`, in the order
 /// the server accepts them.
 ///
+/// The writes go in three passes, and the order BETWEEN them is load-bearing
+/// rather than tidy: presence and command first, with a new hull's placement
+/// riding directly behind its assignment; embarkation second, because the
+/// embarkation endpoint 404s on a hull — or a host — the server has never
+/// heard of, exactly as the position endpoint does; removals last, once
+/// nothing else in the plan refers to the hull.
+///
 /// `Err` means nothing is writable: a hull the server has never heard of has
-/// nobody commanding it, and issuing the rest of the plan would half-commit a
-/// force the operator cannot see. The refusal is at the advance rather than at
-/// the drop because that is where the consequence is: the operator can place
-/// freely right up until the moment the record matters.
+/// nobody commanding it, or the embarkation chain is one Minos refuses, and
+/// issuing the rest of the plan would half-commit a force the operator cannot
+/// see. The refusal is at the advance rather than at the drop because that is
+/// where the consequence is: the operator can place freely right up until the
+/// moment the record matters.
 pub fn plan(draft: &ForceDraft, live: &[LiveHull]) -> Result<Vec<ForceWrite>, ForceGap> {
-    let gap: Vec<String> = draft
-        .hulls()
-        .filter(|hull| hull.commander_id.is_none() && !live_holds(live, hull.unit_id))
-        .map(|hull| hull.name.clone())
-        .collect();
-    if !gap.is_empty() {
-        return Err(ForceGap { hulls: gap });
+    if let Some(gap) = gap(draft, live) {
+        return Err(gap);
     }
 
     let mut writes = Vec::new();
+    // PASS 1 — presence, command and position, one hull at a time in unit-id
+    // order. A hull the server does not hold is assigned first, and its
+    // placement rides directly behind the assignment, because the position
+    // endpoint 404s on a hull the server has never heard of.
     for hull in draft.hulls() {
         let Some(here) = live.iter().find(|l| l.unit_id == hull.unit_id) else {
             writes.push(ForceWrite::Assign {
@@ -359,6 +507,34 @@ pub fn plan(draft: &ForceDraft, live: &[LiveHull]) -> Result<Vec<ForceWrite>, Fo
             }
         }
     }
+    // PASS 2 — embarkation, per hull in child unit-id order. AFTER pass 1,
+    // because the embarkation endpoint 404s on a hull — or a host — the
+    // server has never heard of, the same reason `Assign` precedes `Place`:
+    // every hull this pass names has to have been assigned by the pass above.
+    // A hull the server does not hold reads as hostless, which is exactly
+    // right — it arrives on the water and is put aboard in the same advance.
+    for hull in draft.hulls() {
+        let live_host = live
+            .iter()
+            .find(|l| l.unit_id == hull.unit_id)
+            .and_then(|l| l.host);
+        if hull.host == live_host {
+            continue;
+        }
+        match hull.host {
+            Some(host) => writes.push(ForceWrite::Embark {
+                host,
+                child: hull.unit_id,
+                name: hull.name.clone(),
+            }),
+            None => writes.push(ForceWrite::Disembark {
+                child: hull.unit_id,
+                name: hull.name.clone(),
+            }),
+        }
+    }
+    // PASS 3 — removals last: a hull taken back out of the exercise is
+    // dropped once nothing else in the plan refers to it.
     for here in live {
         if !draft.contains(here.unit_id) {
             writes.push(ForceWrite::Remove {
@@ -390,7 +566,14 @@ mod tests {
             name: name.into(),
             commander_id,
             start: start.map(|(lat, lon)| Start { lat, lon }),
+            host: None,
         }
+    }
+
+    /// The same live hull, but the server says it is aboard `host`.
+    fn aboard(mut hull: LiveHull, host: i64) -> LiveHull {
+        hull.host = Some(host);
+        hull
     }
 
     #[test]
@@ -426,6 +609,7 @@ mod tests {
         assert_eq!(
             plan(&draft, &[]),
             Err(ForceGap {
+                reason: GapReason::Uncommanded,
                 hulls: vec!["KRI Nanggala".into(), "KRI Rangsat".into()]
             })
         );
@@ -616,5 +800,168 @@ mod tests {
         // test is the reason it is written down.
         let carried = draft.get(7).expect("still in the draft").commander_id;
         assert_eq!(carried, Some(9));
+    }
+
+    // -- embarkation ------------------------------------------------------
+    //
+    // One hull aboard another is one `host` link in the draft and one
+    // endpoint at the advance. The link is the whole diff, so it is the
+    // whole rule: a change is one write, a synced link is none, and a ring
+    // is the shape Minos refuses.
+
+    /// A hull already in the exercise on both sides has nothing to assign,
+    /// so putting it aboard names no assignment: the link is the whole edit.
+    #[test]
+    fn a_fresh_embark_is_one_write() {
+        let mut draft = ForceDraft::new();
+        let mut host = hull(5, "KRI Ahmad Yani", None);
+        host.commander_id = Some(3);
+        draft.upsert(host);
+        let mut child = hull(7, "KRI Nanggala", None);
+        child.commander_id = Some(3);
+        draft.upsert(child);
+        assert!(draft.set_host(7, Some(5)), "the child is in the draft");
+        let server = vec![
+            live(5, "KRI Ahmad Yani", Some(3), None),
+            live(7, "KRI Nanggala", Some(3), None),
+        ];
+        assert_eq!(
+            plan(&draft, &server),
+            Ok(vec![ForceWrite::Embark {
+                host: 5,
+                child: 7,
+                name: "KRI Nanggala".into(),
+            }])
+        );
+    }
+
+    /// The endpoint takes the child's id, not the host's: whatever carries
+    /// it is what the server last said, and the child is what moves.
+    #[test]
+    fn a_disembark_is_one_write() {
+        let mut draft = ForceDraft::new();
+        let mut host = hull(5, "KRI Ahmad Yani", None);
+        host.commander_id = Some(3);
+        draft.upsert(host);
+        let mut child = hull(7, "KRI Nanggala", None);
+        child.commander_id = Some(3);
+        draft.upsert(child);
+        assert!(draft.set_host(7, None), "clearing the link disembarks");
+        let server = vec![
+            live(5, "KRI Ahmad Yani", Some(3), None),
+            aboard(live(7, "KRI Nanggala", Some(3), None), 5),
+        ];
+        assert_eq!(
+            plan(&draft, &server),
+            Ok(vec![ForceWrite::Disembark {
+                child: 7,
+                name: "KRI Nanggala".into(),
+            }])
+        );
+    }
+
+    /// The embarkation endpoint 404s on a hull — or a host — the server has
+    /// never heard of, so a new host and a new child are both assigned
+    /// before the link that names them is posted.
+    #[test]
+    fn an_embark_is_ordered_after_both_hulls_assignments() {
+        let mut draft = ForceDraft::new();
+        let mut host = hull(5, "KRI Ahmad Yani", None);
+        host.commander_id = Some(3);
+        draft.upsert(host);
+        let mut child = hull(7, "KRI Nanggala", None);
+        child.commander_id = Some(3);
+        draft.upsert(child);
+        assert!(draft.set_host(7, Some(5)));
+        assert_eq!(
+            plan(&draft, &[]),
+            Ok(vec![
+                ForceWrite::Assign { unit_id: 5, name: "KRI Ahmad Yani".into(), commander_id: 3 },
+                ForceWrite::Assign { unit_id: 7, name: "KRI Nanggala".into(), commander_id: 3 },
+                ForceWrite::Embark { host: 5, child: 7, name: "KRI Nanggala".into() },
+            ])
+        );
+    }
+
+    /// The server already holds the link, so the draft and the record agree
+    /// and the sync must write nothing — the same rule as a position that
+    /// round-tripped through JSON.
+    #[test]
+    fn a_synced_embarkation_plans_nothing() {
+        let mut draft = ForceDraft::new();
+        let mut host = hull(5, "KRI Ahmad Yani", None);
+        host.commander_id = Some(3);
+        draft.upsert(host);
+        let mut child = hull(7, "KRI Nanggala", None);
+        child.commander_id = Some(3);
+        child.host = Some(5);
+        draft.upsert(child);
+        let server = vec![
+            live(5, "KRI Ahmad Yani", Some(3), None),
+            aboard(live(7, "KRI Nanggala", Some(3), None), 5),
+        ];
+        assert_eq!(plan(&draft, &server), Ok(Vec::new()));
+    }
+
+    /// Minos refuses a self-attach as a ring of one. Catching it here is
+    /// what stops the operator spending a stage advance to hear it, and the
+    /// hull is named so the sentence points at the piece to drop elsewhere.
+    #[test]
+    fn a_self_embark_is_refused_and_the_hull_named() {
+        let mut draft = ForceDraft::new();
+        let mut h = hull(7, "KRI Nanggala", None);
+        h.commander_id = Some(3);
+        h.host = Some(7);
+        draft.upsert(h);
+        assert_eq!(
+            plan(&draft, &[]),
+            Err(ForceGap {
+                reason: GapReason::SelfHost,
+                hulls: vec!["KRI Nanggala".into()],
+            })
+        );
+    }
+
+    /// Two hulls that carry each other are the ring Minos refuses. The
+    /// refusal names both, because it takes breaking one link to fix it and
+    /// the operator should not have to guess which hulls are involved.
+    #[test]
+    fn an_embarkation_ring_is_refused_and_every_hull_named() {
+        let mut draft = ForceDraft::new();
+        let mut a = hull(7, "KRI Nanggala", None);
+        a.commander_id = Some(3);
+        a.host = Some(8);
+        draft.upsert(a);
+        let mut b = hull(8, "KRI Rangsat", None);
+        b.commander_id = Some(3);
+        b.host = Some(7);
+        draft.upsert(b);
+        assert_eq!(
+            plan(&draft, &[]),
+            Err(ForceGap {
+                reason: GapReason::Ring,
+                hulls: vec!["KRI Nanggala".into(), "KRI Rangsat".into()],
+            })
+        );
+    }
+
+    /// An embark is a write like any other, so the picker's count includes
+    /// it — otherwise a draft whose only edit is a drop on a host would look
+    /// synced while the advance still owed the link.
+    #[test]
+    fn pending_counts_an_embark() {
+        let mut draft = ForceDraft::new();
+        let mut host = hull(5, "KRI Ahmad Yani", None);
+        host.commander_id = Some(3);
+        draft.upsert(host);
+        let mut child = hull(7, "KRI Nanggala", None);
+        child.commander_id = Some(3);
+        draft.upsert(child);
+        assert!(draft.set_host(7, Some(5)));
+        let server = vec![
+            live(5, "KRI Ahmad Yani", Some(3), None),
+            live(7, "KRI Nanggala", Some(3), None),
+        ];
+        assert_eq!(draft.pending(&server), 1);
     }
 }
