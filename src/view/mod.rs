@@ -911,11 +911,6 @@ pub enum IslandKey {
     /// The caller's own command: seat, commanded hulls, their live fixes,
     /// the readiness gate and the helm.
     Command,
-    /// The exercise's running step: what it asks and whether this seat has
-    /// declared. The console's `z.steps` for the organizer audience and
-    /// `z.mystep` for personnel, and its Exercise island's clock readout too
-    /// — one surface here, because one shell has one name per thing.
-    Step,
     /// What happened, as the operator was told it. The console's `z.log`,
     /// which is two surfaces in one island: an event feed capped at 30 lines
     /// that orders and arrivals land in, and below a rule the session's
@@ -956,7 +951,6 @@ impl IslandKey {
             IslandKey::Review => "REVIEW",
             IslandKey::Groups => "GROUPS",
             IslandKey::Command => "COMMAND",
-            IslandKey::Step => "STEP",
             IslandKey::Log => "LOG",
             IslandKey::Assessment => "ASSESSMENT",
             IslandKey::Sessions => "SESSIONS",
@@ -979,7 +973,6 @@ impl IslandKey {
             IslandKey::Review => "review",
             IslandKey::Groups => "groups",
             IslandKey::Command => "command",
-            IslandKey::Step => "step",
             IslandKey::Log => "log",
             IslandKey::Assessment => "assessment",
             IslandKey::Sessions => "sessions",
@@ -993,7 +986,7 @@ impl IslandKey {
 /// it changes with the exercise's state. What this list fixes is the identity
 /// the operator's open/closed choice hangs off, and it is declared once so no
 /// code path can hold a subset and quietly drop one.
-pub const COLUMN_ISLANDS: [IslandKey; 13] = [
+pub const COLUMN_ISLANDS: [IslandKey; 12] = [
     IslandKey::Operator,
     IslandKey::Essentials,
     IslandKey::Control,
@@ -1002,7 +995,6 @@ pub const COLUMN_ISLANDS: [IslandKey; 13] = [
     IslandKey::Crew,
     IslandKey::Review,
     IslandKey::Command,
-    IslandKey::Step,
     IslandKey::Log,
     IslandKey::Assessment,
     IslandKey::Sessions,
@@ -1107,44 +1099,20 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
             out.push(slot(IslandKey::Crew, 280.0));
         }
         // Execution is the state the console spends its life in, so the
-        // column is a working surface rather than a summary: where you are,
-        // what you can order, who is here, and the feed of what happened.
-        // The console's Exercise island (the clock) and its Steps island are
-        // ONE surface here, because the shell has one clock readout and it
-        // is the server's `assumed_time` on the step. That is the only
-        // merge: `z.log`, the event feed, rides the organizer's column as
-        // its own island, the way the console's own Execution column
-        // carries it.
+        // column is a working surface rather than a summary: what you can
+        // order, who is here, and the feed of what happened.
+        //
+        // THE STEP ISLAND IS GONE, and it is the operator's direction rather
+        // than a preference: a step is not one small panel's worth of
+        // information. It is the whole book, which of its steps have been
+        // played, which one the exercise is on, the hulls each step obliges
+        // and whether the gate is clear — plus, for the Game Master, the
+        // verbs that move it. A 300pt column carries four of those and hides
+        // the rest, so the surface moved to the MIDDLE of the frame
+        // (`shell_gpui::IslandDemo::board_body`), where a scenario has room
+        // to be as big as it is. The column keeps what belongs in a column:
+        // the helm, the room and the feed.
         crate::gamestate::GameState::Execution => {
-            // 500, not the 380 the console used. Measured, not guessed: the
-            // instrument body grammar costs room a paragraph stack did not —
-            // a 30pt leading figure, a key/value row's own padding and rule,
-            // and ruled section breaks between groups. The Step body measures
-            // 486pt of content, so at 380 the viewport was 350 and the
-            // DECLARE READY verb — the panel's whole reason to exist — sat
-            // 136pt below the fold.
-            //
-            // 460 was not enough and the reason is worth recording: it gave a
-            // 430pt viewport against 438pt of content, and 8pt of overflow sits
-            // INSIDE `BODY_SCROLL_SLACK`, so `can_scroll_down` reports false.
-            // The body's last line — the note explaining why the Game Master's
-            // verbs are off — was clipped and unreachable, which is the exact
-            // silent-clip defect `docs/ui-overhaul-status.md` records: a clip
-            // is evidence a box is too small, and a box that also reports no
-            // scroll is a box nobody can act on.
-            //
-            // The fix is the box, not the content. The body's 6pt gap is the
-            // console's own spacing rhythm (`DESIGN.md`'s 8 x 6), so trimming
-            // it to buy 22pt would trade a rhythm for a fit. 480 gives a 450pt
-            // viewport against 438 of content, which fits with room to spare
-            // and reports no scroll honestly.
-            //
-            // The cost is the column's ceiling: Execution goes from 1040 to
-            // 1120 over a 758pt band, so Command and Crew sit further down.
-            // They were already below the fold at 1040 — the column scrolls —
-            // so this makes nothing newly unreachable, it re-orders what is
-            // off-screen first.
-            out.push(slot(IslandKey::Step, 500.0));
             // The helm, for EVERYONE who commands a hull \u{2014} and a player
             // station is exactly that.
             //
@@ -1654,54 +1622,33 @@ mod tests {
         }
     }
 
-    /// The step is the one island every state past planning is working
-    /// toward, and execution is where it belongs. Offered outside execution
-    /// it would be a panel of a step nobody is playing.
-    #[test]
-    fn the_step_island_only_shows_in_execution() {
-        for state in [
-            GameState::NoSession,
-            GameState::Planning,
-            GameState::Preparation,
-            GameState::Closure,
-        ] {
-            assert!(
-                !zone_islands(state, false)
-                    .iter()
-                    .any(|s| s.key == IslandKey::Step),
-                "{state:?} claimed a step"
-            );
-        }
-        assert!(
-            zone_islands(GameState::Execution, false)
-                .iter()
-                .any(|s| s.key == IslandKey::Step)
-        );
-    }
-
-    /// A player station sees only identity and the step. A judge commanding
-    /// hulls is still a judge — the console's rule reads the seat, not the
-    /// hulls, and the hulls are the DASHBOARD's question.
+    /// A player station sees identity and its own helm, and nothing else. A
+    /// judge commanding hulls is still a judge — the console's rule reads the
+    /// seat, not the hulls, and the hulls are the DASHBOARD's question.
+    ///
+    /// The helm is the part this got wrong first: the console's player column
+    /// is Step-only because it serves their helm from the floating dashboard,
+    /// and a column-only port read that as "personnel get no command surface"
+    /// -- which left a player station unable to order its own hull, the one
+    /// thing the station exists to do. The step half left the column for the
+    /// middle of the frame, so what a player station keeps here is the helm.
     #[test]
     fn a_player_station_keeps_its_own_helm() {
         let keys: Vec<IslandKey> = zone_islands(GameState::Execution, true)
             .iter()
             .map(|s| s.key)
             .collect();
-        // Identity, the step they are answering, and the HELM.
-        //
-        // The helm is the part this got wrong first: the console's player
-        // column is Step-only because it serves their helm from the floating
-        // dashboard, and a column-only port read that as "personnel get no
-        // command surface" -- which left a player station unable to order
-        // its own hull, the one thing the station exists to do.
-        assert_eq!(keys, vec![IslandKey::Operator, IslandKey::Step, IslandKey::Command]);
+        assert_eq!(keys, vec![IslandKey::Operator, IslandKey::Command]);
     }
 
     /// An organizer's execution column is a working surface, and it is
-    /// ordered: the step (where you are), then what you can order, then who
-    /// is here. Reordering it would put the verb above the question it
-    /// answers.
+    /// ordered: what you can order, then who is here, then what happened.
+    ///
+    /// There is no step here any more. The whole scenario — the book, the
+    /// pointer, the hulls each step obliges, the gate and the Game Master's
+    /// verbs — takes the middle of the frame, because that is how big a
+    /// scenario is. Pinned so a later "it fits in the column after all" does
+    /// not quietly shrink it back.
     #[test]
     fn an_organizers_execution_column_is_ordered() {
         let keys: Vec<IslandKey> = zone_islands(GameState::Execution, false)
@@ -1712,7 +1659,6 @@ mod tests {
             keys,
             vec![
                 IslandKey::Operator,
-                IslandKey::Step,
                 IslandKey::Command,
                 IslandKey::Crew,
                 IslandKey::Log,
@@ -1759,16 +1705,11 @@ mod tests {
             keys(GameState::Preparation, false),
             [Operator_key(), Command_key(), Crew_key()]
         );
-        // Execution is the working surface, for an organizer.
+        // Execution is the working surface, for an organizer. The step is
+        // not here: the scenario board takes the middle of the frame.
         assert_eq!(
             keys(GameState::Execution, false),
-            [
-                Operator_key(),
-                Step_key(),
-                Command_key(),
-                Crew_key(),
-                IslandKey::Log,
-            ]
+            [Operator_key(), Command_key(), Crew_key(), IslandKey::Log]
         );
         // Closure is the debrief, and carries no command: nothing is ordered
         // after the fact.
@@ -1810,10 +1751,6 @@ mod tests {
     fn Command_key() -> IslandKey {
         IslandKey::Command
     }
-    fn Step_key() -> IslandKey {
-        IslandKey::Step
-    }
-
     fn Sessions_key() -> IslandKey {
         IslandKey::Sessions
     }

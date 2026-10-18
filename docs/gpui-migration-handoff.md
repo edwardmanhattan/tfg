@@ -3146,6 +3146,16 @@ carry ids, `send_step_declare` refuses no-asking and stale steps,
 staying open. GM verbs are the next slice and need socket step-run
 tracking first.
 
+> **CORRECTED (later pass).** The GM verbs ARE aimable without runs, and they
+> shipped: `current-step` names the step in play, the book gives that step a
+> position, and every verb is a path segment naming a step the operator
+> pressed — `POST .../steps/{id}/play|skip|end|rewind` all answer 200/201 live
+> on game 2. What the runs read would add is HISTORY, not aim: "played" is
+> "before the pointer", which needs no runs, and a step `end` took the pointer
+> away from is remembered by this console's own ledger. The STEP island the
+> paragraph above is about is gone; the scenario is the middle of the frame
+> now. See `docs/ui-overhaul-status.md`, "the Scenario board".
+
 ### Verification
 
 | claim | how it was checked |

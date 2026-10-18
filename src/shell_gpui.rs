@@ -97,6 +97,10 @@ enum WhichPanel {
     Settings,
     Composer,
     Book,
+    /// The Scenario board: the exercise's plan, its pointer and its verbs, in
+    /// the middle of the frame. Visibility is `board_open`, which the reminder
+    /// strip and the band's door both write.
+    Board,
     Comms,
     /// One hull's passengers, opened from the Fleet island's piece rows.
     /// The console's floating "Embarked" island, which this shell has no
@@ -175,11 +179,41 @@ struct IslandDemo {
     /// thing that makes it unreadable. So the door moved to the band and the
     /// pane stays undimmed.
     comms_open: bool,
-    /// The Step island: the exercise's current step and its readiness gate.
-    /// The console's `z.steps` for the organizer audience and `z.mystep` for
-    /// personnel — one surface here, because one shell has one name per
-    /// thing.
-    step_open: bool,
+    /// The Scenario board: the exercise's whole plan, where it is in it, the
+    /// hulls each step obliges, the readiness gate, and the Game Master's
+    /// verbs — in the MIDDLE of the frame rather than down the side.
+    ///
+    /// It replaced a column island (`STEP`) on the owner's direction, and the
+    /// reason is arithmetic: a scenario is the book, the pointer, the hulls
+    /// per step, the gate and four verbs, and a 300pt column carries four of
+    /// those and hides the rest. The column keeps what belongs in a column.
+    board_open: bool,
+    /// The step-verb latch and its status line, on the shared answer feed —
+    /// the same shape as the declare's, because both answer with a re-read
+    /// session and neither may eat the other's answer.
+    step_verb_busy: bool,
+    step_verb_status: String,
+    /// A pin being placed: while true the map takes one click, turns it into
+    /// coordinates and puts them in the step composer's text. The Book hides
+    /// while it is armed, because the operator cannot click a map they cannot
+    /// see.
+    pin_arm: bool,
+    /// What this console has WATCHED the exercise play, since it held the
+    /// game: `(scenario, step)` for every step `current-step` has named as the
+    /// one in play, in the order first seen.
+    ///
+    /// This is NOT the server's run history, and it is not treated as one.
+    /// Minos publishes no runs read — `current-step` is the only one — and the
+    /// shipped console learns them off the socket instead. It exists for one
+    /// honest sentence: `end` takes the pointer away, and without this a board
+    /// could not tell a step that has just been played from one that has not
+    /// started, which is exactly the difference its REPLAY verb acts on. A
+    /// step this client never saw in play stays "later" rather than being
+    /// assumed done.
+    step_seen: Vec<(i64, i64)>,
+    /// The game `step_seen` belongs to. A new hold is a new exercise, and one
+    /// exercise's runs are not evidence about another's.
+    step_seen_game: i64,
     /// The Log island's feed: what the operator was told happened, newest
     /// last, capped. The console's `event_feed`, a `VecDeque<String>` capped
     /// at 30 by `feed()` (`main.rs:17029`), which also echoes to stderr.
@@ -604,6 +638,16 @@ const FORM_H: f32 = 580.0;
 /// ran 980 wide for the same reason, and this window is 760.
 const FLEET_W: f32 = 700.0;
 const FLEET_H: f32 = 580.0;
+/// The Scenario board's card.
+///
+/// Wider than the authoring form and taller than the readout card, because it
+/// is neither: it holds the whole book (a row per step, each with its hulls
+/// and its verbs) over a footer of verbs that are not steps. Sized so a
+/// 760x620 window still shows it whole — the board is the surface an operator
+/// opens INSTEAD of the column, and a card that overflows a small window is a
+/// card whose last rows nobody can reach.
+const BOARD_W: f32 = 700.0;
+const BOARD_H: f32 = 560.0;
 
 /// The leaf column's content width — what a row's banner spans. The
 /// modal (700) minus the picker's padding (12 + 28) and the three fixed
@@ -1394,7 +1438,14 @@ impl IslandDemo {
             people_open: std::env::var("TFG_PEOPLE").as_deref() != Ok("0"),
             crew_open: std::env::var("TFG_CREW").as_deref() != Ok("0"),
             command_open: std::env::var("TFG_COMMAND").as_deref() != Ok("0"),
-            step_open: std::env::var("TFG_STEP").as_deref() != Ok("0"),
+            // `TFG_BOARD=1` opens the scenario board for a headless capture,
+            // the same seed-the-state precedent as `TFG_SETTINGS`.
+            board_open: std::env::var("TFG_BOARD").as_deref() == Ok("1"),
+            step_verb_busy: false,
+            step_verb_status: String::new(),
+            pin_arm: false,
+            step_seen: Vec::new(),
+            step_seen_game: 0,
             // The feed starts empty and is only ever appended to: there is no
             // events GET to seed it from, and inventing history on launch
             // would be a log of things that did not happen here.
@@ -2070,11 +2121,36 @@ impl IslandDemo {
         } else {
             format!("comms ({})", self.session.messages.len())
         };
-        let right = div()
+        let mut right = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.0))
+            .gap(px(10.0));
+        // The scenario's door, in the console's own left-to-right order: the
+        // plan first, then the mail, then the settings, then the way out.
+        //
+        // Present only while the exercise RUNS. The book is where a plan is
+        // written and it has its own door on the held session; this is where
+        // one is played, and offering it in planning would be a board of a
+        // pointer that does not exist yet.
+        if self.session.execution {
+            right = right
+                .child(
+                    div()
+                        .id("board-door")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            // A door, not a switch: the board's own close is a
+                            // cross, and a band button that toggled it would
+                            // make the strip the only way in.
+                            view.open_only(WhichPanel::Board);
+                            cx.notify();
+                        }))
+                        .child(button("Scenario", true, false, false)),
+                )
+                .child(sep());
+        }
+        right = right
             .child(
                 div()
                     .id("comms-door")
@@ -2155,6 +2231,13 @@ impl IslandDemo {
         self.modal_open = which == WhichPanel::Settings;
         self.composer_open = which == WhichPanel::Composer;
         self.book_open = which == WhichPanel::Book;
+        self.board_open = which == WhichPanel::Board;
+        // Any door but the Book's cancels a pin: a mode that survived the
+        // operator walking off to another surface would make the next map
+        // click somewhere else quote a coordinate nobody asked for.
+        if which != WhichPanel::Book {
+            self.pin_arm = false;
+        }
         self.comms_open = which == WhichPanel::Comms;
         // The embark modal's visibility IS its host: opening anything else
         // clears the host, and opening Embarked keeps the host the opener
@@ -2288,10 +2371,7 @@ impl IslandDemo {
     fn island_closeable(key: view::IslandKey) -> bool {
         matches!(
             key,
-            view::IslandKey::Players
-                | view::IslandKey::Crew
-                | view::IslandKey::Command
-                | view::IslandKey::Step
+            view::IslandKey::Players | view::IslandKey::Crew | view::IslandKey::Command
         )
     }
 
@@ -2307,7 +2387,6 @@ impl IslandDemo {
             view::IslandKey::Players => self.people_open,
             view::IslandKey::Crew => self.crew_open,
             view::IslandKey::Command => self.command_open,
-            view::IslandKey::Step => self.step_open,
             // Identity, the register and the picker are the column's floor,
             // present in every state they appear in: a way to close them
             // would be a way to be left with an empty console and no
@@ -2335,7 +2414,6 @@ impl IslandDemo {
             view::IslandKey::Players => self.people_open = open,
             view::IslandKey::Crew => self.crew_open = open,
             view::IslandKey::Command => self.command_open = open,
-            view::IslandKey::Step => self.step_open = open,
             view::IslandKey::Fleet
             | view::IslandKey::Operator
             | view::IslandKey::Sessions
@@ -2365,7 +2443,6 @@ impl IslandDemo {
             view::IslandKey::Crew => self.crew_body(cx),
             view::IslandKey::Review => self.review_body(cx),
             view::IslandKey::Command => self.command_body(cx),
-            view::IslandKey::Step => self.step_body(cx),
             view::IslandKey::Log => self.log_body(cx),
             view::IslandKey::Assessment => self.assessment_body(cx),
             view::IslandKey::Sessions => self.sessions_body(cx),
@@ -2428,11 +2505,6 @@ impl IslandDemo {
                 None => "\u{2014}".to_string(),
                 Some(r) if r.blockers.is_empty() => "0 OUTSTANDING".to_string(),
                 Some(r) => format!("{} OUTSTANDING", r.blockers.len()),
-            },
-            view::IslandKey::Step => match self.step_reminder() {
-                Some(rem) if rem.needs_you => "ASKING".to_string(),
-                Some(_) => "PLAYING".to_string(),
-                None => "\u{2014}".to_string(),
             },
             // The picker counts what it shows, like the register counts
             // its draft: the games this account can see.
@@ -7792,22 +7864,71 @@ impl IslandDemo {
         None
     }
 
-    /// Open the step modal from the reminder strip: the scenario, the step
-    /// and the declare row live there, so the strip never grows its own.
-    /// Split out of the click listener so a test drives exactly what the
-    /// click does.
-    fn open_step_detail(&mut self, cx: &mut Context<Self>) {
-        self.step_open = true;
-        // And bring it onto the band. The strip's whole job is to be the one
-        // line that says what you owe; a click that opened an island below
-        // the fold would be a click that appears to do nothing.
-        // The scroll itself is `render`'s to make: the column's band comes
-        // from the window, and a click handler has no honest way to ask for
-        // it. So the click records the wish and the next frame honours it —
-        // which also means the reveal uses the same band the island was just
-        // placed in, rather than one computed a frame ago.
-        self.reveal = Some(view::IslandKey::Step);
+    /// Open the Scenario board from the reminder strip: the plan, the step
+    /// this seat owes and the declare row live there, so the strip never grows
+    /// its own.
+    ///
+    /// Split out of the click listener so a test drives exactly what the click
+    /// does. It no longer scrolls a column — the surface is the middle of the
+    /// frame now, which is the whole point of the move: the reminder used to
+    /// reach for an island that could sit below the fold, and a board that is
+    /// already in front of the operator cannot.
+    fn open_board(&mut self, cx: &mut Context<Self>) {
+        self.open_only(WhichPanel::Board);
         cx.notify();
+    }
+
+    /// Arm the pin: the NEXT click on the map becomes coordinates in the step
+    /// composer's text.
+    ///
+    /// The Book shuts while it is armed, and that is not a trick — a modal
+    /// covers the map, so an author who keeps the form open has nothing to
+    /// click. The re-open on the way back is the same argument in reverse.
+    fn arm_pin(&mut self, cx: &mut Context<Self>) {
+        self.pin_arm = true;
+        self.book_open = false;
+        cx.notify();
+    }
+
+    /// Put a clicked pin into the step composer's text.
+    ///
+    /// The pin is TEXT and nothing else: the operator asked for a way to quote
+    /// a place into a sentence, so it lands after the words already there and
+    /// the map forgets it. A pinned SHAPE on the map — a point a step then
+    /// refers to — would be a different feature with a different storage
+    /// question, and this one needs none: the step's content is the record.
+    ///
+    /// Returns whether a pin landed, so a test drives exactly what the click
+    /// does. False for a call while nothing is armed, which is every ordinary
+    /// click on the map.
+    fn place_pin(&mut self, fx: f64, fy: f64, cx: &mut Context<Self>) -> bool {
+        if !self.pin_arm {
+            return false;
+        }
+        // The click is only a PLACE once a frame has told the shell how big the
+        // map is and where its camera sits; before that, unprojecting would
+        // write the coordinate of nothing into the step. The arm survives, so
+        // the operator's next click — a moment later — lands.
+        if self.map_dims.0 <= 0.0 || self.map_dims.1 <= 0.0 {
+            self.feed("the map has not drawn yet \u{2014} click again in a moment".to_string());
+            cx.notify();
+            return false;
+        }
+        let (lat, lon) = self.frame_unproject(fx, fy);
+        let text = pin_text(lat, lon);
+        let content = &mut self.step_draft.content;
+        if !content.is_empty() {
+            content.push(' ');
+        }
+        content.push_str(&text);
+        self.pin_arm = false;
+        // The composer comes back: a pin exists so the author can keep writing
+        // around it, and a modal that stayed shut would make them reopen it to
+        // see what they pinned.
+        self.open_only(WhichPanel::Book);
+        self.feed(format!("pinned {text}"));
+        cx.notify();
+        true
     }
 
     /// Apply the re-read session a declaration answer returned: the counts
@@ -8103,273 +8224,805 @@ impl IslandDemo {
         col.into_any_element()
     }
 
-    /// The Step panel: the exercise's running step, the readiness gate, and
-    /// the SERVER's assumed time.
+    /// Who is reading the exercise, as the Scenario board reads it.
     ///
-    /// This is the console's spine — a step is played, a step is declared.
-    /// The asking row DECLARES: the participant's own write, proven live.
-    /// The Game Master's verbs (play, skip, end, rewind) are visible-but-off:
-    /// they aim from socket-tracked runs, and this shell tracks none yet —
-    /// the panel states the rule rather than aiming Play at a guess. What is
-    /// here besides the declare is what the server tells anyone with read on
-    /// the game.
-    fn step_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        // Content-sized, not `size_full`: this column is an ISLAND body now,
-        // and the island's own scroll viewport does the measuring. A
-        // `size_full` child inside a scroll viewport sizes to the viewport
-        // and then clips its own overflow, which is a body that silently
-        // loses its tail instead of scrolling to it.
-        //
-        // The body's grammar is three units and nothing else: a `section`
-        // ruled break, a `kv` key/value row, and a `note` line of prose. The
-        // panel this replaces was eleven `text_size(px(11.0))` divs in a
-        // column with 4px gaps, which is a stack of paragraphs rather than an
-        // instrument reading — nothing lined up, so the eye re-read every
-        // row. `kv` puts the values in a column the eye can track.
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .p(px(view::PANEL_PAD));
-
-        if self.session.game_id == 0 {
-            return col.child(note("No session held.")).into_any_element();
+    /// Three audiences, and they come from the SEAT this machine holds rather
+    /// than from what the operator asked to see — the same rule
+    /// `player_station` follows, extended because the Game Master is a
+    /// participant seat in Minos (`is_judge_side: false`, "Runs the
+    /// exercise") and would otherwise be read as a commander.
+    ///
+    /// A machine with NO seat reads as the Master, which is the console's own
+    /// `player_station` rule: no seat is the organizer's column, and an
+    /// operator who is signed in but unseated is the person setting the
+    /// exercise up.
+    fn scenario_audience(&self) -> ScenarioAudience {
+        let Some(seat) = self.own_seat() else {
+            return ScenarioAudience::Master;
+        };
+        // The roles Minos documents as running the exercise: the Game Master
+        // ("Runs the exercise; also called Director"), the Controller
+        // ("Controls the exercise") and the Deputy ("Assists the Game
+        // Master"). Named rather than inferred, because the role matrix says
+        // nothing machine-readable about who may drive a step — and matching
+        // on the canonical English `name` (never `id_name`, which is the
+        // Indonesian label) is what every other role decision in this shell
+        // does.
+        match seat.role.as_str() {
+            "Game Master" | "Controller" | "Deputy" => ScenarioAudience::Master,
+            // Everyone else on the judge side watches: the Observer
+            // ("Watches without assessing"), and the scorers, who read the
+            // same plan to mark against it.
+            _ if seat.judge => ScenarioAudience::Observer,
+            // A seat that takes part commands hulls. The board tells them the
+            // ONE thing their station owes — what the step asks, and whether
+            // they have declared.
+            _ => ScenarioAudience::Commander,
         }
-        // The assumed stamp, trimmed the way the console's `short_timestamp`
-        // rule trims it: date and time, no fractional seconds and no offset.
-        // The offset is dropped rather than converted — the exercise's own
-        // zone is what the server stamped, and re-basing it here would be the
-        // client second-guessing the anchor.
-        let assumed = self.session.step.as_ref().map(|st| {
+    }
+
+    /// Note the step the server names on this frame as one this console has
+    /// watched play.
+    ///
+    /// Called every frame from `render`, which is the only place that cannot
+    /// miss it: the session is installed by a dozen drains, and a ledger
+    /// written from each of them is a ledger with a dozen chances to miss one.
+    /// A frame that draws the exercise sees the same pointer the operator
+    /// does.
+    ///
+    /// Only a step IN PLAY is noted. The reading of a gate (`asking`) is not a
+    /// run: a step that asks has not started, and recording it would let the
+    /// board call a step played that never ran.
+    fn note_step_pointer(&mut self) {
+        if self.step_seen_game != self.session.game_id {
+            self.step_seen_game = self.session.game_id;
+            self.step_seen.clear();
+        }
+        // Keys, not references: the ledger is written below, and a borrow of
+        // the session cannot outlive a write to it.
+        let playing = self
+            .session
+            .step
+            .as_ref()
+            .and_then(|s| s.playing.as_ref())
+            .map(|p| (p.scenario_id, p.step_id));
+        let asking = self
+            .session
+            .step
+            .as_ref()
+            .and_then(|s| s.asking.as_ref())
+            .map(|a| (a.scenario_id, a.step_id));
+        if let Some(key) = playing {
+            // A step IN PLAY is not behind the exercise, whatever this ledger
+            // used to say: a rewind re-arms the step it replays.
+            self.forget_step_onwards(key);
+            if !self.step_seen.contains(&key) {
+                self.step_seen.push(key);
+            }
+        }
+        // And a step the GATE waits on is not behind it either — which is how
+        // this ledger learns that an attempt was erased. `rewind` puts a step
+        // back to un-reached, the server says so by asking its seats again,
+        // and forgetting from there keeps the board true. That covers another
+        // client's rewind too, which is the half a local record of writes
+        // could never see.
+        if let Some(key) = asking {
+            if playing != Some(key) {
+                self.forget_step_onwards(key);
+            }
+        }
+    }
+
+    /// Drop this console's record at and after `key`, in the book's order: the
+    /// step is no longer behind the exercise.
+    ///
+    /// No book, no order: an unreadable book leaves the ledger alone rather
+    /// than erasing what the console watched, because "I cannot see the order"
+    /// is not "nothing has been played".
+    fn forget_step_onwards(&mut self, key: (i64, i64)) {
+        let mut order: std::collections::HashMap<(i64, i64), usize> =
+            std::collections::HashMap::new();
+        let mut n = 0usize;
+        for sc in &self.session.book {
+            for st in &sc.steps {
+                order.insert((sc.id, st.id), n);
+                n += 1;
+            }
+        }
+        let Some(&at) = order.get(&key) else {
+            return;
+        };
+        self.step_seen
+            .retain(|k| order.get(k).is_some_and(|&i| i < at));
+    }
+
+    /// The server's assumed stamp, trimmed the way the console's
+    /// `short_timestamp` rule trims it: date and time, no fractional seconds
+    /// and no offset. The offset is dropped rather than converted — the
+    /// exercise's own zone is what the server stamped, and re-basing it here
+    /// would be the client second-guessing the anchor.
+    fn assumed_stamp(&self) -> Option<String> {
+        self.session.step.as_ref().map(|st| {
             let t = st.assumed_time.replace('T', " ");
             let t = t.split(['+']).next().unwrap_or(&t).to_string();
             let t = t.split('.').next().unwrap_or(&t).to_string();
             t.trim().to_string()
-        });
-        match self.session.step.as_ref() {
-            // A server that never published the step is not an error state:
-            // the console says what it can see and stops, rather than
-            // inventing a placeholder step to fill the panel.
-            None => {
-                col = col.child(note(
-                    "No step to read — the game's scenario clock has no anchor, \
-                     or this hold has no step.",
-                ));
-            }
-            Some(step) => {
-                // `ASSUMED` rather than `TIME`, and the word carries the
-                // whole fact: it is the server's stamp, not this client's
-                // integral. That distinction used to need a sentence under
-                // the row explaining it; the key says it in one tracked word,
-                // and a body that spends a line on an implementation note is
-                // a body with less room for the operator's verb.
-                col = col.child(kv(
-                    "ASSUMED",
-                    assumed.clone().unwrap_or_else(|| "\u{2014}".to_string()),
-                    MAP_INK,
-                ));
+        })
+    }
 
-                // --- playing -------------------------------------------------
-                // The one thing on screen that is prose rather than data, so
-                // it is the one thing set in the human face at body size.
-                col = col.child(section("PLAYING"));
-                col = col.child(match step.playing.as_ref() {
-                    None => note("nothing playing").into_any_element(),
-                    Some(p) => div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .child(
-                            div()
-                                .font_family(view::FACE_HUMAN)
-                                .text_size(px(view::BODY_PT))
-                                .text_color(rgba(MAP_INK))
-                                .child(p.content.clone()),
-                        )
-                        .child(kv("SCENARIO", p.scenario.clone(), BODY_SILVER))
-                        .child(kv("STATE", p.state.clone(), BODY_SILVER))
-                        .into_any_element(),
-                });
+    /// The scenario, as the board reads it: the whole book flattened into the
+    /// order the exercise plays it, where the pointer is, the hulls each step
+    /// obliges, and what THIS audience may press on each row.
+    ///
+    /// Derived, never stored. The book is the order (`position` is the
+    /// server's, and the read arrives sorted); the pointer is the server's
+    /// `current-step`; and "played" is simply "before the pointer" — which is
+    /// what the exercise moving on means, and needs no local history to
+    /// claim. There is deliberately no ledger here: a client-side record of
+    /// runs would disagree with the server's the moment another operator
+    /// rewound a step, and the whole point of the board is that it says where
+    /// the exercise IS.
+    ///
+    /// The one thing a reader must not mistake: a step before the pointer
+    /// whose run this console never saw still reads PLAYED. That is honest —
+    /// the exercise is past it — and it is why the row says nothing about
+    /// how it ended.
+    fn scenario_board(&self) -> ScenarioBoard {
+        let audience = self.scenario_audience();
+        let playing = self.session.step.as_ref().and_then(|s| s.playing.as_ref());
+        let asking = self.session.step.as_ref().and_then(|s| s.asking.as_ref());
+        // The pointer: the step in play, else the one the gate waits on —
+        // between steps the asking step is where the exercise stands.
+        let pointer = playing
+            .map(|p| (p.scenario_id, p.step_id))
+            .or_else(|| asking.map(|a| (a.scenario_id, a.step_id)));
 
-                // --- asking: the panel's leading figure ----------------------
-                // The readiness count is the one quantity in this panel that
-                // leads, so it is the one thing drawn at `READOUT_LG_PT` with
-                // `tnum`. Tabular because it changes: a count that reflows
-                // the label beside it as it ticks is the defect the whole
-                // figure component exists to prevent.
-                //
-                // Its ink is its state, routed through the status palette
-                // rather than left grey — the Never-Gray-On-Gray rule, which
-                // applies to a figure exactly as it applies to a status line.
-                col = col.child(section("ASKING"));
-                col = col.child(match step.asking.as_ref() {
-                    None => note("no step asks you").into_any_element(),
-                    Some(a) => {
-                        // The declare row draws what it sends: the asking
-                        // step's own ids ride the button, so a test exercises
-                        // exactly what the click does.
-                        let (sid, step_id, you_ready) =
-                            (a.scenario_id, a.step_id, a.you_ready);
-                        let declare_status = self.step_declare_status.clone();
-                        let outstanding = a.outstanding.max(0);
-                        let ready = (a.required - a.outstanding).max(0);
-                        // The state ink, and where it does NOT go.
-                        //
-                        // It is on the label and the OUTSTANDING row, not on
-                        // the figure. A status colour at 30pt is the exact
-                        // failure this project already recorded: the old
-                        // system lit every island's rim in Radar Cyan, it
-                        // looked good rendered alone, and as a console it
-                        // taught the operator nothing because cyan was
-                        // everywhere. Here the readiness count is outstanding
-                        // on essentially every frame of a real exercise, so a
-                        // yellow figure would be the default face of the
-                        // panel — and a default-state accent is an accent
-                        // spent on nothing.
-                        //
-                        // So size carries the authority and colour carries
-                        // the state: the figure is Map Ink, the word beside
-                        // it and the row under it say which way it is. Neither
-                        // dominates, and neither is on by default.
-                        let ink = if outstanding == 0 {
-                            SIGNAL_GREEN
-                        } else {
-                            WARNING_SAND
-                        };
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_baseline()
-                                    .gap(px(8.0))
-                                    .child(figure(
-                                        &format!("{ready} of {}", a.required),
-                                        true,
-                                        MAP_INK,
-                                    ))
-                                    .child(tracked("ready", view::LABEL_PT, ink)),
-                            )
-                            .child(
-                                div()
-                                    .font_family(view::FACE_HUMAN)
-                                    .text_size(px(view::BODY_PT))
-                                    .text_color(rgba(MAP_INK))
-                                    .child(a.content.clone()),
-                            )
-                            .child(kv("SCENARIO", a.scenario.clone(), BODY_SILVER))
-                            .child(kv("OUTSTANDING", outstanding.to_string(), ink))
-                            .child(kv(
-                                "YOU",
-                                if you_ready { "ready" } else { "\u{2014}" },
-                                if you_ready { SIGNAL_GREEN } else { BODY_SILVER },
-                            ))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .id("step-declare")
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(move |view, _, _, cx| {
-                                                view.send_step_declare(
-                                                    sid, step_id, !you_ready, cx,
-                                                );
-                                            }))
-                                            .child(button(
-                                                if you_ready {
-                                                    "WITHDRAW"
-                                                } else {
-                                                    "DECLARE READY"
-                                                },
-                                                false,
-                                                false,
-                                                false,
-                                            )),
-                                    )
-                                    .child(note(declare_status)),
-                            )
-                            .into_any_element()
+        // The pointer's POSITION first, in one pass over the book. The read
+        // below needs it before it can say which side of the pointer a row is
+        // on, and finding it inline meant the rows BEFORE the pointer were
+        // built before it was known — every one of them read "later", which
+        // is the one answer that is never true of a step already played.
+        let at: Option<usize> = pointer.and_then(|p| {
+            let mut n = 0usize;
+            for sc in &self.session.book {
+                for st in &sc.steps {
+                    n += 1;
+                    if sc.id == p.0 && st.id == p.1 {
+                        return Some(n);
                     }
-                });
+                }
+            }
+            None
+        });
 
-                // The Game Master's verbs: played, skipped, ended and rewound
-                // from tracked runs. This shell tracks no runs — the console
-                // learns them off the socket, and there is no runs GET — so
-                // the verbs stay visible-but-off for every seat rather than
-                // aiming Play at a guess. The server arbitrates the seat on
-                // top of that.
-                col = col.child(section("GAME MASTER"));
-                col = col.child(
+        let steps_gate: std::collections::HashMap<(i64, i64), StepGateView> = self
+            .session
+            .gates
+            .iter()
+            .map(|g| ((g.scenario_id, g.step_id), g.clone()))
+            .collect();
+
+        // --- pass one: the rows, and where each one stands --------------------
+        let mut steps: Vec<BoardStep> = Vec::new();
+        let mut number = 0usize;
+        for sc in &self.session.book {
+            for st in &sc.steps {
+                number += 1;
+                let playing_here =
+                    playing.is_some_and(|p| p.scenario_id == sc.id && p.step_id == st.id);
+                let asking_here =
+                    asking.is_some_and(|a| a.scenario_id == sc.id && a.step_id == st.id);
+                // The pointer first, then the gate, then which side of the
+                // pointer the row is on. A step can be BOTH in play and
+                // waiting on its gate — the ordinary state at the end of one
+                // — so the readiness gate rides beside the read rather than
+                // inside it.
+                //
+                // BEHIND THE POINTER is the server's answer. BEHIND A STEP THE
+                // POINTER NO LONGER NAMES is this console's: Minos publishes no
+                // runs read, so `end` takes the pointer away and leaves a book
+                // that looks untouched. What the console has actually WATCHED
+                // (`step_seen`) is the only evidence that step is behind, and
+                // it is labelled as such — a step this client never saw in play
+                // stays "later" rather than being assumed done.
+                let read = if playing_here {
+                    StepRead::Playing
+                } else if asking_here && at.is_none_or(|at| number >= at) {
+                    StepRead::Asking
+                } else if at.is_some_and(|at| number < at)
+                    || self.step_seen.contains(&(sc.id, st.id))
+                {
+                    StepRead::Played
+                } else {
+                    StepRead::Later
+                };
+                steps.push(BoardStep {
+                    scenario_id: sc.id,
+                    scenario: sc.title.clone(),
+                    step_id: st.id,
+                    number,
+                    content: st.content.clone(),
+                    window: st.window.clone(),
+                    read,
+                    gate: None,
+                    units: self
+                        .related_for(sc.id, st.id)
+                        .map(|r| r.names.clone())
+                        .unwrap_or_default(),
+                    verbs: Vec::new(),
+                });
+            }
+        }
+
+        // --- the head: the ONE row the exercise can move from ----------------
+        //
+        // The step in play, else the one the gate waits on, else the first step
+        // not behind the exercise. That last case is what makes the board
+        // usable at all: on a fresh execution nothing plays and no step asks
+        // the Game Master, and a board with no verb there is a board from which
+        // an exercise could never start.
+        //
+        // ONE row is armed with Play/Skip, never a queue of them. A pointer
+        // that exists is the head, and playing the step after it would let one
+        // stray press jump the plan.
+        let head: Option<usize> = if playing.is_some() {
+            None
+        } else {
+            steps
+                .iter()
+                .position(|r| matches!(r.read, StepRead::Asking))
+                .or_else(|| steps.iter().position(|r| matches!(r.read, StepRead::Later)))
+        };
+
+        // --- pass two: the gate and the verbs, from where each row stands ----
+        for i in 0..steps.len() {
+            let read = steps[i].read;
+            let key = (steps[i].scenario_id, steps[i].step_id);
+            let is_head = Some(i) == head;
+            let verbs = match audience {
+                ScenarioAudience::Master => match read {
+                    // The step in play: END closes it, REPLAY re-activates it
+                    // from its own start (the server erases the abandoned
+                    // attempt and says what it cost).
+                    StepRead::Playing => vec![StepVerb::End, StepVerb::Replay],
+                    // The step the gate waits on: PLAY starts it against the
+                    // gate (the server records the override), SKIP moves past
+                    // it without playing.
+                    StepRead::Asking => vec![StepVerb::Play, StepVerb::Skip],
+                    // A step the exercise is past: REPLAY is the operator's
+                    // "re-activate the steps before".
+                    StepRead::Played => vec![StepVerb::Replay],
+                    // The next one to start: the same pair the asking row
+                    // carries, because it is the same decision.
+                    StepRead::Later if is_head => vec![StepVerb::Play, StepVerb::Skip],
+                    StepRead::Later => Vec::new(),
+                },
+                // An observer reads and does not drive: the same rows, the same
+                // pointer, no verbs. A commander is told the one thing their
+                // station owes and nothing about the rest of the plan.
+                ScenarioAudience::Observer | ScenarioAudience::Commander => Vec::new(),
+            };
+            // The gate rides the step the exercise stands on and nowhere else:
+            // it is the one count that changes while the board is open, and a
+            // gate on a step two plays away is noise. Absent is a real answer —
+            // the fan-out is best-effort, and a step whose gate could not be
+            // read claims no count rather than zero.
+            let wanted = matches!(read, StepRead::Playing | StepRead::Asking) || is_head;
+            steps[i].gate = steps_gate.get(&key).filter(|_| wanted).cloned();
+            steps[i].verbs = verbs;
+        }
+
+        // A commander's board is the current step alone. Every other row is
+        // another unit's business, and a plan a player can read whole is a plan
+        // they will steer against.
+        if audience == ScenarioAudience::Commander {
+            steps.retain(|s| matches!(s.read, StepRead::Playing | StepRead::Asking));
+        }
+        ScenarioBoard {
+            audience,
+            game: self.session.game.clone(),
+            assumed: self.assumed_stamp(),
+            at,
+            total: number,
+            steps,
+        }
+    }
+
+    /// Send one Game Master verb at one step — the console's `play_step`,
+    /// `skip_step`, `end_step` and `rewind_step`, as one message.
+    ///
+    /// Returns false (and sends nothing) for the three non-sends: no held
+    /// game, a verb already in flight, or a seat the board did not draw the
+    /// verb for. The last one is the same rule the row enforces, kept here so
+    /// a test exercises exactly what the click does — and the server
+    /// arbitrates the seat on top, loudly.
+    ///
+    /// Only an audience the board arms may send: a Commander is never offered
+    /// a verb, and an Observer is offered none by the same row rule. That is
+    /// a CLIENT-side guard, not a security one — the server refuses a seat it
+    /// does not recognise — but a client that offered the button anyway would
+    /// be lying about the console's own vocabulary.
+    fn send_step_verb(
+        &mut self,
+        scenario_id: i64,
+        step_id: i64,
+        verb: StepVerb,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.step_verb_busy || self.session.game_id == 0 {
+            return false;
+        }
+        if self.scenario_audience() != ScenarioAudience::Master {
+            return false;
+        }
+        self.step_verb_busy = true;
+        self.step_verb_status = format!("{} \u{2026}", verb.label().to_lowercase());
+        self.feed(format!("step {step_id} \u{00b7} {}", verb.id()));
+        let _ = self.order_tx.send(ToBinary::StepVerb {
+            scenario_id,
+            step_id,
+            verb,
+        });
+        cx.notify();
+        true
+    }
+
+    /// Apply the re-read session a step verb returned. The pointer moves to
+    /// whatever the server says it is — the board's readout is Minos's, never
+    /// the click's assumption — and a rewind's cost sentence rides the answer
+    /// so the operator learns what the replay erased.
+    fn apply_step_verb(&mut self, session: SessionView, note: String) {
+        self.step_verb_busy = false;
+        self.session = session;
+        self.step_verb_status = if note.is_empty() {
+            String::new()
+        } else {
+            self.feed(note.clone());
+            note
+        };
+    }
+
+    /// The Scenario board: the exercise's plan, its pointer and its verbs, in
+    /// the MIDDLE of the frame.
+    ///
+    /// This replaced the column's STEP island, and the move is the owner's
+    /// direction: a scenario is too big for a 300pt column. It carries the
+    /// whole book, which steps have been played, the one the exercise is on,
+    /// the hulls each step obliges, the readiness gate, and — for the Game
+    /// Master — the verbs that move it. Four of those in a column is a panel
+    /// that says the plan is smaller than it is.
+    ///
+    /// The audiences are drawn from ONE model (`scenario_board`), so a row the
+    /// Game Master sees and a row an observer sees cannot disagree about the
+    /// exercise; what differs is the verbs, and for a commander the rows
+    /// themselves.
+    fn board_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let board = self.scenario_board();
+        let master = board.audience == ScenarioAudience::Master;
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .size_full()
+            .overflow_hidden()
+            .p(px(PAD))
+            .pr(px(CUT + 8.0));
+
+        // --- the head -------------------------------------------------------
+        let head = |right: AnyElement| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .h(px(TITLE_H))
+                .child(
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(8.0))
-                        .flex_wrap()
-                        .child(div().id("step-play").child(button("Play", false, true, false)))
-                        .child(div().id("step-skip").child(button("Skip", false, true, false)))
-                        .child(div().id("step-end").child(button("End", false, true, false)))
+                        .gap(px(10.0))
                         .child(
                             div()
-                                .id("step-rewind")
-                                .child(button("Rewind", false, true, false)),
-                        ),
-                );
-                // No note under these verbs. There was one — "the Game Master
-                // drives these from tracked runs" — and it was trimmed, then
-                // removed, for a measured reason: this body's content measures
-                // ~511pt against a 450pt viewport, and the last line was
-                // painting below the panel's own box. That is the defect
-                // `docs/ui-overhaul-status.md` records as "a `max_rect` tells
-                // the layout where to stop; it does not stop the painter", and
-                // a clipped last line with no scroll available is a clip
-                // nobody can act on.
-                //
-                // The GAME MASTER label and four disabled verbs already say
-                // what the note said. A body that spends its last line on a
-                // sentence the chrome has already conveyed is a body with less
-                // room for the operator's verb, so the note goes and the verbs
-                // are the tail.
-                //
-                // EXERCISE follows the runs, and it is NOT one of them:
-                // `End session →` ends the exercise, not a run, and it is
-                // the console's `z.clock` island reduced to its one control.
-                // The island's readouts are the sim's tick (G+MM:SS) and its
-                // pause flag, and this shell runs no sim — the server's
-                // assumed time already reads on the step above — so the
-                // merge carries the verb and names the missing tick rather
-                // than faking it. Player stations never see it: the console
-                // pushes `z.clock` for organizers only.
-                if !self.player_station() {
-                    col = col.child(section("EXERCISE"));
-                    col = col.child(note(
-                        "Elapsed needs the exercise tick \u{2014} no clock GET exists, so this carries the verb and not the readout.",
-                    ));
-                    col = col.child(
+                                .font_family(view::FACE_HUMAN)
+                                .text_size(px(TITLE_SIZE))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgba(MAP_INK))
+                                .child("Scenario"),
+                        )
+                        .child(tracked(
+                            match board.audience {
+                                ScenarioAudience::Master => "game master",
+                                ScenarioAudience::Observer => "observer",
+                                ScenarioAudience::Commander => "commander",
+                            },
+                            view::LABEL_PT,
+                            match board.audience {
+                                ScenarioAudience::Master => RADAR_CYAN,
+                                _ => CUT_GREY,
+                            },
+                        )),
+                )
+                .child(right)
+        };
+        col = col.child(head(
+            div()
+                .id("close-board")
+                .cursor_pointer()
+                .text_size(px(14.0))
+                .text_color(rgba(BUTTON_LABEL))
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.board_open = false;
+                    cx.notify();
+                }))
+                .child("\u{00d7}")
+                .into_any_element(),
+        ));
+        col = col.child(separator());
+        // Where the exercise is, in one line: the game and the server's
+        // assumed stamp. Both are the server's words — this line has no
+        // figure it computed itself.
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .child(machine(
+                    if board.game.is_empty() {
+                        "no session".to_string()
+                    } else {
+                        board.game.clone()
+                    },
+                    BODY_SILVER,
+                ))
+                .child(tracked("assumed", view::LABEL_PT, CUT_GREY))
+                .child(machine(
+                    board.assumed.clone().unwrap_or_else(|| "\u{2014}".to_string()),
+                    MAP_INK,
+                ))
+                .child(div().flex_1())
+                .child(machine(
+                    match (board.total, board.at) {
+                        (0, _) => "\u{2014}".to_string(),
+                        (n, Some(at)) => format!("step {at} of {n}"),
+                        // No pointer has two readings, and the ledger is what
+                        // tells them apart: an execution that has played
+                        // nothing is not started, and one that has played
+                        // something has ended or skipped it. `end` takes the
+                        // pointer away, so "between steps" is a state the
+                        // exercise really sits in.
+                        (n, None) => {
+                            let played = board
+                                .steps
+                                .iter()
+                                .filter(|s| s.read == StepRead::Played)
+                                .count();
+                            if played == 0 {
+                                format!("not started \u{00b7} {n} step(s)")
+                            } else {
+                                format!("{played} of {n} played \u{00b7} between steps")
+                            }
+                        }
+                    },
+                    BODY_SILVER,
+                )),
+        );
+        col = col.child(separator());
+
+        if board.total == 0 {
+            col = col.child(note(
+                "No steps to read \u{2014} this exercise's book holds none, or it has none authored yet.",
+            ));
+            col = col.child(div().flex_1());
+        } else if board.steps.is_empty() {
+            // A commander between steps: the book holds steps and none of
+            // them is theirs to answer. Not an error, and not an empty plan.
+            col = col.child(note(
+                "No step asks you \u{2014} nothing is playing and nothing is waiting on your declaration.",
+            ));
+            col = col.child(div().flex_1());
+        } else {
+            // --- the rows ---------------------------------------------------
+            let mut list = div()
+                .id("board-steps")
+                .flex_1()
+                .w_full()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(4.0));
+            for row in board.steps.clone() {
+                list = list.child(self.board_row(&row, cx));
+            }
+            col = col.child(list);
+        }
+
+        // --- the feet -------------------------------------------------------
+        //
+        // The one control that is not a step's: the clock. A Game Master
+        // pausing a step pauses the EXERCISE (`POST /games/{id}/pause`), which
+        // closes it to orders — the console's `z.clock` verb, and the reason it
+        // lives on this board rather than in the step rows.
+        col = col.child(separator());
+        if master {
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .flex_wrap()
+                    .child(
                         div()
-                            .id("step-end-session")
+                            .id("board-pause")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.send_set_paused(cx);
+                            }))
+                            .child(button(
+                                // The label follows the VERB's rule, not the
+                                // other way round: `send_set_paused` pauses when
+                                // the clock is running OR unknown, so a button
+                                // reading "Resume" while the click pauses would
+                                // be the console telling the operator the
+                                // opposite of what it does.
+                                if self.clock_running.unwrap_or(true) {
+                                    "Pause clock"
+                                } else {
+                                    "Resume clock"
+                                },
+                                false,
+                                self.pause_busy,
+                                false,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("board-end-session")
                             .cursor_pointer()
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.send_end_session(cx);
                             }))
-                            .child(button("End session \u{2192}", false, false, false)),
-                    );
-                    if !self.end_status.is_empty() {
-                        col = col.child(note(self.end_status.clone()));
-                    }
+                            .child(button(
+                                "End session \u{2192}",
+                                false,
+                                self.end_busy,
+                                false,
+                            )),
+                    )
+                    .child(div().flex_1())
+                    .child(note(
+                        "Play, skip and replay land on the rows above.",
+                    )),
+            );
+            for line in [self.pause_status.clone(), self.step_verb_status.clone(), self.end_status.clone()] {
+                if !line.is_empty() {
+                    col = col.child(note(line));
                 }
             }
+        } else if board.audience == ScenarioAudience::Observer {
+            // The observer's read is the whole plan and the pointer, and the
+            // one thing the board cannot do is said rather than hidden:
+            // replaying a played step's HISTORY needs the runs behind it, and
+            // Minos publishes only `current-step`. Re-winding the exercise to
+            // watch it again would erase what other seats did, which is
+            // exactly what an observer may not do.
+            col = col.child(note(
+                "An observer reads the plan and the pointer. Replaying a played \
+                 step's history needs a run history, which Minos does not \
+                 publish; rewinding the exercise would erase other seats' work, \
+                 so only the Game Master has it.",
+            ));
+        } else {
+            // A commander's foot says which of two states their station is in,
+            // and they are not the same sentence: a step that asks for a
+            // declaration has a button beside it, and one that does not (the
+            // gate is met, or the Game Master started it against an unmet one)
+            // has nothing to press. A board that told them to declare on a row
+            // with no declare is the console pointing at a control it did not
+            // draw.
+            let asked = board.steps.iter().any(|s| s.read == StepRead::Asking);
+            col = col.child(note(if asked {
+                "Declare on the step above. The board opens no other door: what the \
+                 rest of the plan does is the Game Master's business."
+            } else if board.steps.is_empty() {
+                "No step asks you \u{2014} nothing is playing and nothing is waiting on \
+                 your declaration."
+            } else {
+                "Nothing asks you to declare on this step. What the rest of the plan \
+                 does is the Game Master's business."
+            }));
         }
         col.into_any_element()
     }
 
+    /// One step's row: what it is, where the exercise stands on it, the hulls
+    /// it obliges, and the verbs this audience may press.
+    ///
+    /// Drawn from `BoardStep` alone, so the row cannot disagree with the model
+    /// the tests read.
+    fn board_row(&mut self, row: &BoardStep, cx: &mut Context<Self>) -> AnyElement {
+        // The status ink carries the state, the words say it too — colour on
+        // its own is not a status a room can read, and the console's palette
+        // reserves cyan for the pointer rather than spending it on every row.
+        let (status, ink) = match row.read {
+            StepRead::Playing => ("playing", RADAR_CYAN),
+            StepRead::Asking => ("asking", WARNING_SAND),
+            StepRead::Played => ("played", SIGNAL_GREEN),
+            StepRead::Later => ("later", CUT_GREY),
+        };
+        let mut line = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .w(px(22.0))
+                    .flex_shrink_0()
+                    .font_family(view::FACE_MACHINE)
+                    .text_size(px(11.0))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(format!("{:>2}", row.number)),
+            )
+            .child(
+                div()
+                    .w(px(58.0))
+                    .flex_shrink_0()
+                    .child(tracked(status, view::LABEL_PT, ink)),
+            );
+        // The readiness gate, on the step the exercise stands on and nowhere
+        // else: it is the one number the board holds that changes while it is
+        // open. `required` zero is a step that asks nobody — ordinary, and
+        // not a gate that is clear by accident.
+        if let Some(gate) = &row.gate {
+            if gate.required > 0 {
+                line = line.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_baseline()
+                        .gap(px(4.0))
+                        .child(figure(&format!("{}", gate.ready), false, MAP_INK))
+                        .child(tracked(
+                            &format!("of {} ready", gate.required),
+                            view::LABEL_PT,
+                            if gate.may_start { SIGNAL_GREEN } else { WARNING_SAND },
+                        )),
+                );
+            }
+        }
+        line = line
+            .child(
+                div()
+                    .flex_1()
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(view::BODY_PT))
+                    .text_color(rgba(if row.content.is_empty() {
+                        BODY_SILVER.with_alpha(204)
+                    } else {
+                        MAP_INK
+                    }))
+                    .child(if row.content.is_empty() {
+                        "(not written yet)".to_string()
+                    } else {
+                        row.content.clone()
+                    }),
+            )
+            .child(
+                div()
+                    .font_family(view::FACE_MACHINE)
+                    .text_size(px(10.0))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(
+                        row.window
+                            .as_ref()
+                            .map(|(a, b)| format!("{a}\u{2013}{b}"))
+                            .unwrap_or_else(|| "\u{2014}".to_string()),
+                    ),
+            );
+        // The verbs, in the console's row position: after the words they act
+        // on, before the fact they cannot change.
+        for verb in &row.verbs {
+            let (scenario_id, step_id, verb) = (row.scenario_id, row.step_id, *verb);
+            // One door per verb per step: the same step can carry END and
+            // REPLAY, so the id cannot be the step alone.
+            let door: &'static str = match verb {
+                StepVerb::Play => "board-play",
+                StepVerb::Skip => "board-skip",
+                StepVerb::End => "board-end",
+                StepVerb::Replay => "board-replay",
+            };
+            line = line.child(
+                div()
+                    .id((door, step_id as usize))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.send_step_verb(scenario_id, step_id, verb, cx);
+                    }))
+                    .child(button(verb.label(), true, self.step_verb_busy, false)),
+            );
+        }
+        // The commander's own row carries the declare — the ONE write their
+        // station owns, and the reason the board is theirs to open at all.
+        if row.read == StepRead::Asking && self.scenario_audience() == ScenarioAudience::Commander {
+            let (scenario_id, step_id) = (row.scenario_id, row.step_id);
+            let you_ready = self
+                .session
+                .step
+                .as_ref()
+                .and_then(|s| s.asking.as_ref())
+                .is_some_and(|a| a.you_ready);
+            let declare_status = self.step_declare_status.clone();
+            line = line.child(
+                div()
+                    .id("board-declare")
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.send_step_declare(scenario_id, step_id, !you_ready, cx);
+                    }))
+                    .child(button(
+                        if you_ready { "WITHDRAW" } else { "DECLARE READY" },
+                        false,
+                        self.step_declare_busy,
+                        false,
+                    )),
+            );
+            if !declare_status.is_empty() {
+                line = line.child(note(declare_status));
+            }
+        }
+        let mut card = div().flex().flex_col().gap(px(3.0)).child(line);
+        // Under the row: the scenario it belongs to and the hulls it obliges.
+        // The hulls are the server's resolved read (`related`), so a step that
+        // was never related says so rather than listing none.
+        let mut under = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .pl(px(30.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                    .child(row.scenario.clone()),
+            );
+        under = under.child(
+            div()
+                .text_size(px(10.0))
+                .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                .child(if row.units.is_empty() {
+                    "\u{00b7} no hulls related".to_string()
+                } else {
+                    format!("\u{00b7} {}", row.units.join(", "))
+                }),
+        );
+        // Who is holding the gate, in the server's own two answers: `may_start`
+        // says whether, and the outstanding call signs say who. A screen that
+        // showed the count and not the names would leave the Game Master to
+        // work out whom to chase.
+        if let Some(gate) = row.gate.as_ref().filter(|g| !g.may_start && !g.outstanding.is_empty())
+        {
+            under = under.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgba(WARNING_SAND))
+                    .child(format!("\u{00b7} held by {}", gate.outstanding.join(", "))),
+            );
+        }
+        card = card.child(under);
+        // The pointer's own edge, and the only one the board lights: a row
+        // that is merely played must not compete with the step in play.
+        if matches!(row.read, StepRead::Playing) {
+            card = card
+                .pl(px(8.0))
+                .border_l(px(2.0))
+                .border_color(rgba(RADAR_CYAN));
+        }
+        card.into_any_element()
+    }
     /// The Inspector: the SELECTED hull's detail, docked along the bottom.
     ///
     /// A dock, not a window: the console recomputes its place every frame so
@@ -9461,7 +10114,30 @@ impl IslandDemo {
                     .text_color(rgba(MAP_INK))
                     .child("New step"),
             );
-            col = col.child(self.compose_field(7, "What must happen", cx));
+            // The content field and its PIN, on one row: the pin writes INTO
+            // this field, so the two are drawn as what they are — one field
+            // with a way of quoting a place into it.
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(div().flex_1().child(self.compose_field(7, "What must happen", cx)))
+                    .child(
+                        div()
+                            .id("step-pin")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.arm_pin(cx);
+                            }))
+                            .child(button("Pin", false, false, false)),
+                    ),
+            );
+            col = col.child(note(
+                "A pin quotes the map: arm it, click the water, and the coordinate \
+                 lands in the step's words. The Book shuts while it is armed.",
+            ));
             col = col.child(
                 div()
                     .flex()
@@ -9840,6 +10516,18 @@ fn unproject_frame_px(
     (lat, lon)
 }
 
+/// A pin's coordinates, as they are written INTO a step's words.
+///
+/// The same `{lat}, {lon}` at four decimals the Inspector reads a fix back
+/// with, deliberately: a number quoted off the map into a step and the number
+/// the inspector shows for that place must be the same digits, or an exercise
+/// is authored against one position and reviewed against another. Four
+/// decimals is about eleven metres — a hull is a hundred and twenty long — so
+/// the pin says "here" and not "this rivet".
+fn pin_text(lat: f64, lon: f64) -> String {
+    format!("at {lat:.4}, {lon:.4}")
+}
+
 /// The acquisition reticle: four corner brackets, one stroke weight.
 ///
 /// Drawn rather than composited from a quad because GPUI 0.2.2 has no
@@ -10194,6 +10882,10 @@ impl Render for IslandDemo {
         // The raw frame is already paintable — nothing to wait for, so this
         // is a swap, not a gate. A promotion that needed a decode would not
         // belong here; see `gate::FrameGate` for that path's numbers.
+        // The console's own run ledger, noted on the frame that draws the
+        // pointer: `end` takes the pointer away, and this is what lets the
+        // board keep saying which steps are behind the exercise.
+        self.note_step_pointer();
         if let Some((no, w, h, bgra, at, zoom)) = self.incoming.take() {
             self.gate.show(window, cx, no, (w, h), bgra);
             // The map's pixel space, learned from the frame itself: the live
@@ -10585,7 +11277,7 @@ impl Render for IslandDemo {
                     // Armed, the surface shows it: a crosshair where a pan
                     // would be, because the next click that stays put places
                     // instead of panning.
-                    .cursor(if self.pending_place.is_some() {
+                    .cursor(if self.pending_place.is_some() || self.pin_arm {
                         CursorStyle::Crosshair
                     } else {
                         CursorStyle::Arrow
@@ -10595,7 +11287,7 @@ impl Render for IslandDemo {
                         // Armed, the press anchors instead of panning: only a
                         // press that stays put places, and a press that moves
                         // past 6px becomes a pan like any other.
-                        if view.pending_place.is_some() {
+                        if view.pending_place.is_some() || view.pin_arm {
                             view.place_down = Some(at);
                         } else {
                             view.pan = Some(at);
@@ -10639,6 +11331,19 @@ impl Render for IslandDemo {
                         // draft is part of the exercise.
                         if view.place_down.take().is_some() {
                             let vp = viewport(window);
+                            // The pin first: it is the one click that carries
+                            // a coordinate out of the map, and it must not be
+                            // read as an armed hull's deploy.
+                            if view.pin_arm {
+                                if vp.2 > 0.0 && vp.3 > 0.0 {
+                                    let fx = f64::from(f32::from(ev.position.x) / vp.2)
+                                        .clamp(0.0, 1.0);
+                                    let fy = f64::from(f32::from(ev.position.y) / vp.3)
+                                        .clamp(0.0, 1.0);
+                                    view.place_pin(fx, fy, cx);
+                                }
+                                return;
+                            }
                             if vp.2 > 0.0 && vp.3 > 0.0 {
                                 let fx = f64::from(f32::from(ev.position.x) / vp.2)
                                     .clamp(0.0, 1.0);
@@ -10823,7 +11528,7 @@ impl Render for IslandDemo {
                     .id("step-reminder")
                     .cursor_pointer()
                     .on_click(cx.listener(|view, _, _, cx| {
-                        view.open_step_detail(cx);
+                        view.open_board(cx);
                     }))
                     .child(
                         div()
@@ -10839,6 +11544,45 @@ impl Render for IslandDemo {
                             .text_size(px(11.0))
                             .text_color(rgba(MAP_INK))
                             .child(rem.text),
+                    ),
+            );
+        }
+        // THE ARMED PIN. One line, where the reminder rides, because it is
+        // the same kind of thing: the console telling the operator what the
+        // next click will do. It is clickable, and the click is the way out —
+        // GPUI 0.2.2 has no Escape binding here, and a mode with no visible
+        // way out is a mode people get stuck in.
+        if self.pin_arm {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(34.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .h(px(24.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .overflow_hidden()
+                    .bg(rgba(RADAR_CYAN.with_alpha(210)))
+                    .id("pin-armed")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        // Cancel: the Book comes back with its words untouched,
+                        // which is the state the operator left it in.
+                        view.pin_arm = false;
+                        view.open_only(WhichPanel::Book);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .font_family(view::FACE_HUMAN)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(11.0))
+                            .text_color(rgba(CONSOLE_NIGHT))
+                            .child("PIN \u{00b7} click the map to quote it into the step \u{00b7} click this line to cancel"),
                     ),
             );
         }
@@ -11014,10 +11758,15 @@ impl Render for IslandDemo {
                     )
                     .into_any_element(),
             )
-        } else if self.book_open {
+        } else if self.book_open && !self.pin_arm {
             // The book is an authoring form too — scenarios and steps are
             // read, the title and step rows write — so it shares the
             // authoring card for the same reason.
+            //
+            // It stands aside while a PIN is armed: the pin is a map click,
+            // and a modal over the map is a form with nothing to click. The
+            // arm comes from the Book, so the flag that shut it is the one
+            // that brings it back (`place_pin`).
             Some(
                 div()
                     .absolute()
@@ -11036,6 +11785,34 @@ impl Render for IslandDemo {
                             .h(px(FORM_H))
                             .child(modal_silhouette_at(FORM_W, FORM_H))
                             .child(self.book_body(cx)),
+                    )
+                    .into_any_element(),
+            )
+        } else if self.board_open {
+            // The scenario takes the FRAME, not a column: that is the move the
+            // owner asked for, and the sizes say why — a book with a dozen
+            // steps, their hulls and their verbs is three times the widest
+            // panel the column can hold. It rides the authoring card's
+            // silhouette in its own size, because it is a surface the operator
+            // ACTS on, not a readout.
+            Some(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgba(Rgba::black_alpha(150)))
+                    .child(
+                        div()
+                            .relative()
+                            .w(px(BOARD_W))
+                            .h(px(BOARD_H))
+                            .child(modal_silhouette_at(BOARD_W, BOARD_H))
+                            .child(self.board_body(cx)),
                     )
                     .into_any_element(),
             )
@@ -12074,6 +12851,16 @@ pub struct SessionView {
     /// per step, so one unreadable step leaves an absent entry rather than
     /// no session.
     pub related: Vec<StepRelatedView>,
+    /// Each step's readiness GATE, read per step beside `related` while the
+    /// exercise runs: whether the step may start, how many of the people it
+    /// asks have declared, and which of them are holding it up.
+    ///
+    /// The `current-step` read carries counts only for the step that asks THIS
+    /// caller, so a Game Master — whom no step asks — would see no gate at
+    /// all. That is the wrong answer for the one seat that has to decide
+    /// whether to start a step, and it is why the board reads the gate itself.
+    /// Empty outside execution, where nothing is played.
+    pub gates: Vec<StepGateView>,
     /// The held game's id, which every order names.
     pub game_id: i64,
     /// Whether this shell holds a session at all. `false` shows the sign-in
@@ -12464,6 +13251,18 @@ pub enum ToBinary {
         step_id: i64,
         ready: bool,
     },
+    /// One Game Master verb at one step: play, skip, end or rewind. The binary
+    /// owns the POST; the shell only asks, naming the step its row drew — the
+    /// ids ride the button, never a cached guess.
+    ///
+    /// One message for the four, because they are one vocabulary in one place:
+    /// the board's rows differ only in which verb they carry, and a second
+    /// message would be a second chance to aim at the wrong step.
+    StepVerb {
+        scenario_id: i64,
+        step_id: i64,
+        verb: StepVerb,
+    },
     /// A Closure timeline page, from the Assessment island's Timeline tab.
     /// `append` carries the cursor's next page (`load more`); false reloads
     /// from the first page under the current filters. The binary owns the
@@ -12515,6 +13314,22 @@ pub struct SignedIn {
 /// assumed from the draft, because the server names the id and the state.
 pub struct CreatedSession {
     pub session: SessionView,
+    /// A sentence the WRITE itself produced, when it produced one. The rewind
+    /// is the case that matters: erasing an abandoned attempt answers with
+    /// what it cost, and a Game Master who just erased twenty reports is
+    /// entitled to be told so rather than left with "replayed". Empty is the
+    /// ordinary answer — most of these writes say nothing beyond "read back".
+    pub note: String,
+}
+
+impl CreatedSession {
+    /// A write that answered with the re-read session and nothing else.
+    pub fn held(session: SessionView) -> Self {
+        Self {
+            session,
+            note: String::new(),
+        }
+    }
 }
 
 /// The sign-in answer, drained like every other feed. `Err` carries what to
@@ -12626,6 +13441,7 @@ impl Default for SessionView {
             me: 0,
             my_role: String::new(),
             mine: Vec::new(),
+            gates: Vec::new(),
             game_id: 0,
             signed_in: true,
             zoom: 0.0,
@@ -12709,8 +13525,30 @@ pub struct PieceView {
 pub struct StepRelatedView {
     pub scenario_id: i64,
     pub step_id: i64,
+    /// The refs the editor checks against, as `(kind, id)`.
     pub posts: Vec<(String, i64)>,
+    /// The SAME refs resolved to names by the server, in the same order. The
+    /// editor wants ids and the Scenario board wants names — one read, two
+    /// readers, rather than the board joining ids against a taxonomy it does
+    /// not hold.
+    pub names: Vec<String>,
     pub personnel: Vec<String>,
+}
+
+/// One step's readiness gate, as the board draws it: whether the step may
+/// start, how many of the people it asks have declared, and who has not.
+///
+/// `outstanding` carries call signs rather than a count, because a Game Master
+/// looking at a held step needs to know WHO to chase; the count alone is the
+/// same number twice.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepGateView {
+    pub scenario_id: i64,
+    pub step_id: i64,
+    pub may_start: bool,
+    pub required: i64,
+    pub ready: i64,
+    pub outstanding: Vec<String>,
 }
 
 /// One message in the session's inbox, as the comms panel shows it.
@@ -12771,6 +13609,117 @@ pub struct StepAsk {
     pub required: i64,
     pub outstanding: i64,
     pub you_ready: bool,
+}
+
+/// Who is reading the exercise, as the Scenario board decides it.
+///
+/// Three audiences, from the seat this machine holds: the Game Master (and
+/// the judge-side roles that run the exercise with them), an observer, and a
+/// unit commander. The board draws one model for all three and differs only in
+/// what it lets them press.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScenarioAudience {
+    /// Every step, its hulls, the pointer, and the verbs that move it.
+    Master,
+    /// The same read, and no verb: an observer watches.
+    Observer,
+    /// The step this seat owes and the declare — nothing about the rest of
+    /// the plan.
+    Commander,
+}
+
+/// Where one step stands, as the board reads it.
+///
+/// Derived from the server's pointer rather than from a local record of runs:
+/// "played" is "the exercise is past it", which is what moving on means and
+/// needs no history to claim. A step can be BOTH in play and waiting on its
+/// gate, so the readiness counts ride beside this rather than inside it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StepRead {
+    /// The step in play.
+    Playing,
+    /// The step the readiness gate is waiting on.
+    Asking,
+    /// Past it: the exercise has moved on.
+    Played,
+    /// Not reached yet.
+    Later,
+}
+
+/// One verb a Game Master may press on a step.
+///
+/// The four Minos publishes (`/play`, `/skip`, `/end`, `/rewind`), in the words
+/// the board uses. `Replay` is the rewind: the clock goes back to where the
+/// step began and the abandoned attempt is erased, which is what
+/// "re-activate the steps before" asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StepVerb {
+    Play,
+    Skip,
+    End,
+    Replay,
+}
+
+impl StepVerb {
+    /// The row's label, and the console's tracked-caps verb.
+    pub fn label(self) -> &'static str {
+        match self {
+            StepVerb::Play => "PLAY",
+            StepVerb::Skip => "SKIP",
+            StepVerb::End => "END",
+            StepVerb::Replay => "REPLAY",
+        }
+    }
+
+    /// The path segment: the word Minos takes, which is the verb and not its
+    /// label (`replay` is `POST .../rewind`).
+    pub fn id(self) -> &'static str {
+        match self {
+            StepVerb::Play => "play",
+            StepVerb::Skip => "skip",
+            StepVerb::End => "end",
+            StepVerb::Replay => "rewind",
+        }
+    }
+}
+
+/// One step, as the Scenario board draws it: what it is, where the exercise
+/// stands on it, the hulls it obliges, and what this audience may press.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoardStep {
+    pub scenario_id: i64,
+    pub scenario: String,
+    pub step_id: i64,
+    /// 1-based position in the whole book — the number the row draws. A gap
+    /// in Minos's `position` is legal, so this counts the read order rather
+    /// than trusting a field.
+    pub number: usize,
+    pub content: String,
+    pub window: Option<(String, String)>,
+    pub read: StepRead,
+    /// The readiness gate, on the step the exercise stands on — in play or
+    /// next to start — and nowhere else: it is the one count that changes
+    /// while the board is open, and a gate on a step two plays away is noise.
+    pub gate: Option<StepGateView>,
+    /// The hulls the step obliges, by the server's resolved names.
+    pub units: Vec<String>,
+    pub verbs: Vec<StepVerb>,
+}
+
+/// The exercise's scenario, whole: every step in play order, the pointer, and
+/// the one line about the server's clock that dates all of it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScenarioBoard {
+    pub audience: ScenarioAudience,
+    pub game: String,
+    pub assumed: Option<String>,
+    /// The pointer's 1-based number, absent when the server names no step.
+    pub at: Option<usize>,
+    /// How many steps the book holds — the denominator of `at`, and NOT
+    /// `steps.len()`: a commander's board carries one row and the header still
+    /// says where that row sits in the whole plan.
+    pub total: usize,
+    pub steps: Vec<BoardStep>,
 }
 
 /// Which credential field has the keyboard.
@@ -13918,6 +14867,8 @@ pub fn run(
                                         root.apply_readiness(created.session);
                                     } else if root.step_declare_busy {
                                         root.apply_step_declare(created.session);
+                                    } else if root.step_verb_busy {
+                                        root.apply_step_verb(created.session, created.note);
                                     } else if root.msg_busy {
                                         root.apply_message(created.session);
                                     } else if root.roster_busy {
@@ -13975,6 +14926,9 @@ pub fn run(
                                     } else if root.step_declare_busy {
                                         root.step_declare_busy = false;
                                         root.step_declare_status = why;
+                                    } else if root.step_verb_busy {
+                                        root.step_verb_busy = false;
+                                        root.step_verb_status = why;
                                     } else if root.msg_busy {
                                         root.msg_busy = false;
                                         root.msg_status = why;
@@ -15942,8 +16896,9 @@ mod tests {
         set_state(&view, cx, "execution");
         assert_eq!(
             read(&view, cx),
-            vec!["operator", "step", "command", "crew", "log"],
-            "execution is the working surface: step, command, room, and the feed"
+            vec!["operator", "command", "crew", "log"],
+            "execution is the working surface: command, room, and the feed \u{2014} \
+             the step is the middle of the frame now, not a column island"
         );
         set_state(&view, cx, "closure");
         assert_eq!(
@@ -15951,7 +16906,7 @@ mod tests {
             vec!["operator", "assessment", "log", "crew"],
             "closure is the debrief: what it was, what happened, and who was there"
         );
-        // A SEAT, exercise side: execution narrows to identity and the step,
+        // A SEAT, exercise side: execution narrows to identity and the helm,
         // and ONLY execution. In planning they are still seating the room, so
         // taking the column off them would take away the surface that does it.
         cx.update(|_window, app| {
@@ -15987,10 +16942,11 @@ mod tests {
         set_state(&view, cx, "execution");
         // The organizer column goes; the helm stays. A player station that
         // lost its command surface in execution would have nothing to do in
-        // the state it exists for.
+        // the state it exists for. The step is neither — it is the board's,
+        // in the middle, where every seat reads the same surface.
         assert_eq!(
             read(&view, cx),
-            vec!["operator", "step", "command"],
+            vec!["operator", "command"],
             "a player station loses the organizer column but keeps its helm"
         );
     }
@@ -18190,6 +19146,7 @@ mod tests {
                 scenario_id: 4,
                 step_id: 7,
                 posts: vec![("hull".to_string(), 8)],
+                names: vec!["KRI Abdul Halim Perdanakusuma".to_string()],
                 personnel: vec!["SUPERUSER".to_string()],
             }],
             ..SessionView::default()
@@ -18445,6 +19402,583 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing reached the sink");
     }
 
+    // --- the Scenario board ------------------------------------------------
+    //
+    // One model for all three audiences, so these tests read the board the way
+    // the rows draw it: no render, no pixel. What differs between a Game
+    // Master, an observer and a commander is exactly what these pin — the
+    // rows a seat is shown, and the verbs it may press.
+
+    /// A two-scenario book: three steps, with the workbook's own windows and
+    /// one related hull, so a row has something to say in every column.
+    fn board_session(step: Option<StepView>) -> SessionView {
+        SessionView {
+            game: "SHOOT-01".to_string(),
+            state: "execution".to_string(),
+            execution: true,
+            game_id: 1,
+            step,
+            book: vec![
+                BookScenario {
+                    id: 4,
+                    title: "First light".to_string(),
+                    steps: vec![
+                        BookStep {
+                            id: 7,
+                            content: "Sweep the northern approaches".to_string(),
+                            window: Some(("0600".to_string(), "0700".to_string())),
+                        },
+                        BookStep {
+                            id: 8,
+                            content: "Establish the barrier".to_string(),
+                            window: Some(("0700".to_string(), "0930".to_string())),
+                        },
+                    ],
+                },
+                BookScenario {
+                    id: 5,
+                    title: "Second light".to_string(),
+                    steps: vec![BookStep {
+                        id: 9,
+                        content: "Screen the traffic lanes".to_string(),
+                        window: None,
+                    }],
+                },
+            ],
+            related: vec![StepRelatedView {
+                scenario_id: 4,
+                step_id: 8,
+                posts: vec![("hull".to_string(), 8)],
+                names: vec!["KRI Abdul Halim Perdanakusuma".to_string()],
+                personnel: Vec::new(),
+            }],
+            // The server's gate read, per step. Step 7 asks two and one has
+            // declared; step 8 asks one and nobody has.
+            gates: vec![
+                StepGateView {
+                    scenario_id: 4,
+                    step_id: 7,
+                    may_start: false,
+                    required: 2,
+                    ready: 1,
+                    outstanding: vec!["KAPTEN".to_string()],
+                },
+                StepGateView {
+                    scenario_id: 4,
+                    step_id: 8,
+                    may_start: false,
+                    required: 1,
+                    ready: 0,
+                    outstanding: vec!["LAKSAMANA".to_string()],
+                },
+            ],
+            ..SessionView::default()
+        }
+    }
+
+    /// One seat in the room, which is how the board decides its audience.
+    fn seated(mut session: SessionView, role: &str, judge: bool) -> SessionView {
+        session.me = 2;
+        session.my_role = role.to_string();
+        session.people = vec![PersonView {
+            id: 2,
+            name: "Super User".to_string(),
+            call_sign: "SUPERUSER".to_string(),
+            role: role.to_string(),
+            role_id: 10,
+            judge,
+            ready: false,
+            present: true,
+        }];
+        session
+    }
+
+    /// The playing step, for a book whose first scenario is being executed.
+    fn playing(step_id: i64) -> StepView {
+        StepView {
+            assumed_time: "2000-01-01T10:00:00+07:00".to_string(),
+            playing: Some(StepLine {
+                scenario_id: 4,
+                step_id,
+                scenario: "First light".to_string(),
+                content: "Establish the barrier".to_string(),
+                state: "playing".to_string(),
+            }),
+            asking: None,
+        }
+    }
+
+    /// The Game Master's read: every step of the book in play order, where the
+    /// exercise is, the hulls each step obliges, and the verbs that follow
+    /// from where it is — END and REPLAY on the step in play, REPLAY on the
+    /// steps already behind it, nothing on the ones ahead.
+    #[gpui::test]
+    fn the_board_reads_the_whole_book_and_where_the_exercise_is(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = board_session(Some(playing(8)));
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let board = cx.update(|_window, app| view.read(app).scenario_board());
+        assert_eq!(board.audience, ScenarioAudience::Master, "no seat runs the exercise");
+        assert_eq!(board.total, 3, "the whole book is on the board");
+        assert_eq!(board.at, Some(2), "the pointer is the step in play");
+        assert_eq!(board.game, "SHOOT-01");
+        assert_eq!(
+            board.assumed.as_deref(),
+            Some("2000-01-01 10:00:00"),
+            "the server's stamp, trimmed the console's way"
+        );
+        let rows: Vec<(usize, StepRead)> =
+            board.steps.iter().map(|s| (s.number, s.read)).collect();
+        assert_eq!(
+            rows,
+            vec![
+                (1, StepRead::Played),
+                (2, StepRead::Playing),
+                (3, StepRead::Later),
+            ],
+            "past, present, future — in the book's order"
+        );
+        // The verbs follow the read, and only the Game Master is offered any.
+        assert_eq!(board.steps[0].verbs, vec![StepVerb::Replay], "behind: re-activate it");
+        assert_eq!(
+            board.steps[1].verbs,
+            vec![StepVerb::End, StepVerb::Replay],
+            "in play: end it, or replay it from its own start"
+        );
+        assert!(board.steps[2].verbs.is_empty(), "ahead: nothing to press");
+        // The step in play carries its own gate: one of its hull's commanders
+        // has not declared.
+        let gate = board.steps[1].gate.as_ref().expect("the playing row carries its gate");
+        assert_eq!(gate.required, 1);
+        assert_eq!(gate.outstanding, vec!["LAKSAMANA".to_string()]);
+        assert!(board.steps[0].gate.is_none(), "a played step carries no gate");
+        // And the row says whose business the step is, by the server's names.
+        assert_eq!(board.steps[1].units, vec!["KRI Abdul Halim Perdanakusuma".to_string()]);
+        assert!(board.steps[0].units.is_empty(), "an unrelated step names no hull");
+        assert_eq!(board.steps[1].scenario, "First light", "and which scenario it belongs to");
+    }
+
+    /// A FRESH execution: the clock has a stamp, nothing is in play and no
+    /// step asks this caller. The first step is still startable — a board with
+    /// no verb here is a board from which an exercise could never begin — and
+    /// it is the ONLY row armed, because playing the second step would jump
+    /// the plan with one press.
+    #[gpui::test]
+    fn a_fresh_execution_arms_the_first_step(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = board_session(Some(StepView {
+            assumed_time: "2000-01-01T10:00:00+07:00".to_string(),
+            playing: None,
+            asking: None,
+        }));
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let board = cx.update(|_window, app| view.read(app).scenario_board());
+        assert_eq!(board.at, None, "no pointer: nothing has started");
+        assert_eq!(board.total, 3, "but the plan is there to start");
+        assert_eq!(
+            board.steps[0].verbs,
+            vec![StepVerb::Play, StepVerb::Skip],
+            "the first step can be started"
+        );
+        assert!(board.steps[1].verbs.is_empty(), "and only the first");
+        assert!(board.steps[0].gate.is_some(), "its gate rides the row");
+        assert!(board.steps[1].gate.is_none(), "and nobody else's does");
+
+        // The same board for an observer arms nothing: reading a plan is not
+        // driving it.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = seated(
+            board_session(Some(StepView {
+                assumed_time: String::new(),
+                playing: None,
+                asking: None,
+            })),
+            "Observer",
+            true,
+        );
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let board = cx.update(|_window, app| view.read(app).scenario_board());
+        assert!(
+            board.steps.iter().all(|s| s.verbs.is_empty()),
+            "an observer starts nothing"
+        );
+    }
+
+    /// A step the console WATCHED play stays played after the run ends — the
+    /// one case Minos's single `current-step` read cannot answer, because
+    /// `end` takes the pointer away and leaves a book that looks untouched.
+    /// The ledger is what carries it, and the head moves on with it.
+    #[gpui::test]
+    fn a_watched_step_stays_played_after_it_ends(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // The exercise is between steps: a stamp, and no pointer at all.
+        let session = board_session(Some(StepView {
+            assumed_time: "2000-01-01T10:00:00+07:00".to_string(),
+            playing: None,
+            asking: None,
+        }));
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        // What the console saw before the end: step 7 was in play.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| demo.step_seen.push((4, 7)))
+        });
+        let board = cx.update(|_window, app| view.read(app).scenario_board());
+        assert_eq!(board.at, None, "no pointer: the run has ended");
+        assert_eq!(board.steps[0].read, StepRead::Played, "but it was watched");
+        assert_eq!(
+            board.steps[0].verbs,
+            vec![StepVerb::Replay],
+            "so it can be re-activated"
+        );
+        assert_eq!(
+            board.steps[1].verbs,
+            vec![StepVerb::Play, StepVerb::Skip],
+            "and the head has moved to the next step"
+        );
+        assert!(board.steps[1].gate.is_some(), "the gate goes with the head");
+        assert!(board.steps[0].gate.is_none(), "and leaves the step behind");
+        // A step nobody watched stays "later": the ledger is evidence, never
+        // an assumption, so a console that joined late claims nothing.
+        assert_eq!(board.steps[2].read, StepRead::Later);
+    }
+
+    /// The ledger itself: it notes a step IN PLAY, once, and forgets
+    /// everything when the held game changes — one exercise's runs are not
+    /// evidence about another's. A step that only ASKS is not a run.
+    #[gpui::test]
+    fn the_ledger_notes_played_steps_and_forgets_a_new_game(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut session = board_session(Some(playing(8)));
+        session.game_id = 1;
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let note = |view: &gpui::Entity<IslandDemo>, cx: &mut gpui::VisualTestContext| {
+            cx.update(|_window, app| view.update(app, |demo, _| demo.note_step_pointer()))
+        };
+        note(&view, cx);
+        note(&view, cx);
+        let seen = cx.update(|_window, app| view.read(app).step_seen.clone());
+        assert_eq!(seen, vec![(4, 8)], "the step in play, noted once");
+
+        // A GATE is not a run, and it also says what has NOT run: the server
+        // asks the first unreached step, so a gate at step 7 means step 8 is
+        // not behind the exercise either — `rewind` puts a step back to
+        // un-reached exactly this way, and another client's rewind reads the
+        // same. That is the half a local record of writes could never see.
+        let ask = |step_id: i64| -> Option<StepView> {
+            Some(StepView {
+                assumed_time: String::new(),
+                playing: None,
+                asking: Some(StepAsk {
+                    scenario_id: 4,
+                    step_id,
+                    scenario: "First light".to_string(),
+                    content: String::new(),
+                    required: 1,
+                    outstanding: 1,
+                    you_ready: false,
+                }),
+            })
+        };
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.session.step = ask(7);
+                demo.note_step_pointer();
+            })
+        });
+        let seen = cx.update(|_window, app| view.read(app).step_seen.clone());
+        assert!(
+            seen.is_empty(),
+            "a gate at step 7 means nothing at or after it has run"
+        );
+
+        // And a gate on a step this console recorded takes it back as well.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.session.step = Some(playing(8));
+                demo.note_step_pointer();
+            })
+        });
+        let seen = cx.update(|_window, app| view.read(app).step_seen.clone());
+        assert_eq!(seen, vec![(4, 8)], "the step in play, noted again");
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.session.step = ask(8);
+                demo.note_step_pointer();
+            })
+        });
+        let seen = cx.update(|_window, app| view.read(app).step_seen.clone());
+        assert!(seen.is_empty(), "a step the gate asks again is not played");
+
+        // A new hold is a new exercise.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.session.game_id = 9;
+                demo.note_step_pointer();
+            })
+        });
+        let (seen, game) = cx.update(|_window, app| {
+            let d = view.read(app);
+            (d.step_seen.clone(), d.step_seen_game)
+        });
+        assert!(seen.is_empty(), "a different game starts with no history");
+        assert_eq!(game, 9);
+    }
+
+    /// The gate's row: the counts are the board's one live number, and the
+    /// asking step carries PLAY and SKIP rather than END.
+    #[gpui::test]
+    fn the_board_carries_the_gate_and_its_verbs_on_the_asking_step(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = board_session(Some(StepView {
+            assumed_time: "2000-01-01T10:00:00+07:00".to_string(),
+            playing: None,
+            asking: Some(StepAsk {
+                scenario_id: 4,
+                step_id: 7,
+                scenario: "First light".to_string(),
+                content: "Sweep the northern approaches".to_string(),
+                required: 2,
+                outstanding: 1,
+                you_ready: false,
+            }),
+        }));
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let board = cx.update(|_window, app| view.read(app).scenario_board());
+        assert_eq!(board.at, Some(1), "between steps the gate names where the exercise stands");
+        assert_eq!(board.steps[0].read, StepRead::Asking);
+        let gate = board.steps[0].gate.as_ref().expect("the asking row carries the gate");
+        assert_eq!((gate.ready, gate.required), (1, 2), "one of two has declared");
+        assert_eq!(gate.outstanding, vec!["KAPTEN".to_string()], "and who is holding it");
+        assert!(!gate.may_start, "so the step may not start");
+        assert_eq!(board.steps[0].verbs, vec![StepVerb::Play, StepVerb::Skip]);
+        assert_eq!(board.steps[1].read, StepRead::Later, "the rest is still ahead");
+        // A gate on a step two plays away is noise, and is not carried.
+        assert!(board.steps[1].gate.is_none(), "only the step the exercise stands on");
+    }
+
+    /// An observer reads exactly what the Game Master reads, and presses
+    /// nothing: the same rows, the same pointer, no verb on any of them.
+    #[gpui::test]
+    fn an_observer_reads_the_plan_and_presses_nothing(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = seated(board_session(Some(playing(8))), "Observer", true);
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let board = cx.update(|_window, app| view.read(app).scenario_board());
+        assert_eq!(board.audience, ScenarioAudience::Observer);
+        assert_eq!(board.steps.len(), 3, "the observer is shown the whole plan");
+        assert_eq!(board.at, Some(2), "and where the exercise is in it");
+        assert!(
+            board.steps.iter().all(|s| s.verbs.is_empty()),
+            "an observer affects nothing"
+        );
+        // And the write refuses even if a caller aims one by hand: the row is
+        // the client's guard, this is the message's.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = seated(board_session(Some(playing(8))), "Observer", true);
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let sent = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.send_step_verb(4, 8, StepVerb::Replay, cx)
+            })
+        });
+        assert!(!sent, "an observer sends nothing");
+        assert!(rx.try_recv().is_err(), "and nothing reached the sink");
+    }
+
+    /// A commander sees the ONE step their station owes, and no other row at
+    /// all — the plan a player can read whole is a plan they will steer
+    /// against.
+    #[gpui::test]
+    fn a_commander_sees_only_the_step_that_asks_them(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = seated(
+            board_session(Some(StepView {
+                assumed_time: String::new(),
+                playing: None,
+                asking: Some(StepAsk {
+                    scenario_id: 4,
+                    step_id: 8,
+                    scenario: "First light".to_string(),
+                    content: "Establish the barrier".to_string(),
+                    required: 1,
+                    outstanding: 1,
+                    you_ready: false,
+                }),
+            })),
+            "Commando",
+            false,
+        );
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let board = cx.update(|_window, app| view.read(app).scenario_board());
+        assert_eq!(board.audience, ScenarioAudience::Commander);
+        assert_eq!(board.steps.len(), 1, "one row, and it is the one that asks");
+        assert_eq!(board.steps[0].step_id, 8);
+        assert_eq!(board.steps[0].read, StepRead::Asking);
+        let gate = board.steps[0].gate.as_ref().expect("their own step carries the gate");
+        assert_eq!((gate.ready, gate.required), (0, 1), "nobody has declared yet");
+        assert!(board.steps[0].verbs.is_empty(), "a commander drives no step");
+        assert_eq!(board.total, 3, "but the header still says where it sits in the plan");
+        assert_eq!(board.at, Some(2));
+    }
+
+    /// The Game Master's verb crosses the sink as ONE message naming the step
+    /// the row drew, and the latch keeps a second press from crossing it
+    /// twice.
+    #[gpui::test]
+    fn a_game_master_drives_a_step_through_the_one_message(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = board_session(Some(playing(8)));
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let sent = cx.update(|_window, app| {
+            view.update(app, |demo, cx| demo.send_step_verb(4, 7, StepVerb::Replay, cx))
+        });
+        assert!(sent, "the Game Master's re-activate reaches the sink");
+        match rx.try_recv().expect("the verb reached the sink") {
+            ToBinary::StepVerb {
+                scenario_id,
+                step_id,
+                verb,
+            } => assert_eq!((scenario_id, step_id, verb), (4, 7, StepVerb::Replay)),
+            other => panic!("expected a step verb, got {other:?}"),
+        }
+        // In flight, the same press sends nothing a second time.
+        let again = cx.update(|_window, app| {
+            view.update(app, |demo, cx| demo.send_step_verb(4, 7, StepVerb::Replay, cx))
+        });
+        assert!(!again, "a verb in flight does not send twice");
+        assert!(rx.try_recv().is_err());
+        // And the answer lands: the session is held whole and the rewind's
+        // cost sentence rides it into the feed.
+        let held = board_session(Some(playing(7)));
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.apply_step_verb(held, "step 7 replayed \u{2014} erased 3 order(s)".to_string())
+            })
+        });
+        let demo = cx.update(|_window, app| {
+            let d = view.read(app);
+            (d.step_verb_busy, d.step_verb_status.clone(), d.log_feed.back().cloned())
+        });
+        assert!(!demo.0, "the latch clears on the answer");
+        assert!(demo.1.contains("erased 3 order(s)"), "the cost is the status line");
+        assert_eq!(demo.2.as_deref(), Some(demo.1.as_str()), "and it reached the feed");
+    }
+
+    /// The pin: the map click becomes the step composer's words, at the same
+    /// four decimals the Inspector reads a fix back with.
+    #[gpui::test]
+    fn a_pin_writes_its_coordinate_into_the_step_text(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(
+                fixture_roster(),
+                8,
+                0,
+                board_session(Some(playing(8))),
+                tx,
+            )
+        });
+        // A frame with a real camera, and the author mid-sentence — but NOT
+        // armed, because the first thing to pin is that an ordinary click on
+        // the map is an ordinary click: the pin is a mode, not a hijack.
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.map_dims = (1280.0, 720.0);
+                demo.map_center = (-6.1, 106.9);
+                demo.map_render_zoom = 12.0;
+                demo.book_open = true;
+                demo.step_draft.content = "Take station".to_string();
+                let _ = cx;
+            })
+        });
+        let stray = cx.update(|_window, app| {
+            view.update(app, |demo, cx| demo.place_pin(0.5, 0.5, cx))
+        });
+        assert!(!stray, "a pin lands only while armed");
+        let text = cx.update(|_window, app| view.read(app).step_draft.content.clone());
+        assert_eq!(text, "Take station", "and leaves the words alone");
+
+
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.arm_pin(cx)));
+        let (shut, armed) = cx.update(|_window, app| {
+            let d = view.read(app);
+            (d.book_open, d.pin_arm)
+        });
+        assert!(armed, "the arm is the mode");
+        assert!(!shut, "and the Book stands aside: the map is what gets clicked");
+
+        // Now the armed click, at a known ground.
+        let (lat, lon) = (-6.1042f64, 106.8816f64);
+        let (px, py) = project_frame_px(lat, lon, (-6.1, 106.9), 12.0, 1280.0, 720.0);
+        let landed = cx.update(|_window, app| {
+            view.update(app, |demo, cx| demo.place_pin(px / 1280.0, py / 720.0, cx))
+        });
+        assert!(landed, "the armed click lands");
+        let (text, armed, open) = cx.update(|_window, app| {
+            let d = view.read(app);
+            (d.step_draft.content.clone(), d.pin_arm, d.book_open)
+        });
+        assert!(
+            text.starts_with("Take station at -6.1042, 106.8816"),
+            "the pin's coordinate lands after the words already there: {text}"
+        );
+        assert!(!armed, "one click, one pin");
+        assert!(open, "and the composer comes back to be written in");
+
+        // A second pin appends rather than replacing: an instruction can name
+        // two places.
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.arm_pin(cx)));
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| demo.place_pin(0.5, 0.5, cx))
+        });
+        let text = cx.update(|_window, app| view.read(app).step_draft.content.clone());
+        assert_eq!(text.matches(" at ").count(), 2, "two pins, two coordinates: {text}");
+        // And the format is one string, pinned: a change here changes what an
+        // authored step says.
+        assert_eq!(pin_text(-6.104166, 106.881611), "at -6.1042, 106.8816");
+
+        // A frame has to have told the shell where the map is: before the
+        // first one, a click is not a place, and the arm survives it so the
+        // next click lands.
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.arm_pin(cx);
+                demo.map_dims = (0.0, 0.0);
+                demo.step_draft.content = "Take station".to_string();
+            })
+        });
+        let early = cx.update(|_window, app| {
+            view.update(app, |demo, cx| demo.place_pin(0.5, 0.5, cx))
+        });
+        assert!(!early, "no frame, no ground");
+        let (armed, text) = cx.update(|_window, app| {
+            let d = view.read(app);
+            (d.pin_arm, d.step_draft.content.clone())
+        });
+        assert!(armed, "the arm survives a click the map could not answer");
+        assert_eq!(text, "Take station", "and nothing was written");
+    }
+
     /// The reminder strip names the ONE asking step — scenario, instruction
     /// and counts in one line — with the indicator lit while it waits on
     /// this caller. Pure: the strip draws this, so the test reads it
@@ -18560,18 +20094,21 @@ mod tests {
         );
     }
 
-    /// Opening from the strip is the step modal itself — the scenario, the
+    /// Opening from the strip is the Scenario BOARD itself — the plan, the
     /// step and the declare row already live there, so the strip grows no
-    /// panel of its own. The click calls exactly this, and the half worth
-    /// pinning is the REVEAL: `reveal` is consumed by the very next frame
-    /// (`render`'s `reveal.take()`), so a test that reads the field after a
-    /// frame asserts on a value the frame is supposed to eat. It passed for a
-    /// while only because a sibling test's `SHEET` global made `render` return
-    /// early, before the column ran at all — the mask, not the behaviour. This
-    /// asserts the outcome instead: the island is on the band.
+    /// panel of its own.
+    ///
+    /// The old version of this test pinned a column REVEAL, and the move to
+    /// the middle of the frame is what retires it: the strip used to reach for
+    /// an island that could sit below the fold, and the board cannot — it is
+    /// the frame. What is worth pinning now is the whole order: the board is
+    /// shut, the strip's click opens it, and the frame draws it.
     #[gpui::test]
-    fn opening_the_reminder_opens_the_step_modal(cx: &mut gpui::TestAppContext) {
+    fn opening_the_reminder_opens_the_scenario_board(cx: &mut gpui::TestAppContext) {
         let (tx, _rx) = std::sync::mpsc::channel();
+        // The book holds the step the server names, because that is the only
+        // way a pointer can point at it: a board reads the plan and says where
+        // the exercise is IN it.
         let session = SessionView {
             execution: true,
             state: "execution".to_string(),
@@ -18588,14 +20125,20 @@ mod tests {
                     you_ready: false,
                 }),
             }),
+            book: vec![BookScenario {
+                id: 12,
+                title: "First move".to_string(),
+                steps: vec![BookStep {
+                    id: 16,
+                    content: "Take station east of the buoy".to_string(),
+                    window: Some(("1000".to_string(), "1100".to_string())),
+                }],
+            }],
             ..SessionView::default()
         };
         let (view, cx) = cx.add_window_view(|_, _| {
             IslandDemo::new(fixture_roster(), 8, 0, session, tx)
         });
-        // A window where the column actually overflows, or the reveal is
-        // clamped to zero and proves nothing.
-        cx.simulate_resize(gpui::size(gpui::px(768.0), gpui::px(838.0)));
         let tick = |cx: &mut gpui::VisualTestContext| {
             cx.simulate_mouse_move(
                 gpui::point(gpui::px(5.0), gpui::px(5.0)),
@@ -18604,35 +20147,24 @@ mod tests {
             )
         };
         tick(cx);
-        // Shut, the way an operator who closed it would have left it.
-        cx.update(|_window, app| {
-            view.update(app, |demo, _| demo.set_island_open(view::IslandKey::Step, false))
-        });
         assert!(
-            !cx.update(|_window, app| view.read(app).step_open),
-            "the island starts shut"
+            !cx.update(|_window, app| view.read(app).board_open),
+            "the board starts shut"
         );
-        // The strip's click.
-        cx.update(|_window, app| view.update(app, |demo, cx| demo.open_step_detail(cx)));
+        // The strip's click, which is `open_step_detail`'s replacement.
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.open_board(cx)));
         assert!(
-            cx.update(|_window, app| view.read(app).step_open),
-            "the click opens the island"
+            cx.update(|_window, app| view.read(app).board_open),
+            "the click opens the board"
         );
-        // And the next frame honours the reveal.
+        // And the frame paints it: a panel that opens a flag and draws nothing
+        // is the failure this whole family of tests exists for.
         tick(cx);
-        let (sc, want) = cx.update(|window, app| {
-            let d = view.read(app);
-            let band = zone_band_at(viewport(window), d.zone_w, d.side_dock_left);
-            let slots = d.column_slots();
-            let i = slots
-                .iter()
-                .position(|s| s.key == view::IslandKey::Step)
-                .expect("the step island is in the column");
-            let (_, y) = view::zone_slot_origin(band, &slots, i);
-            (d.zone_scroll, y - band.1)
+        let drawn = cx.update(|_window, app| {
+            view.read(app).scenario_board()
         });
-        assert!(want > 0.0, "the step island starts below the band");
-        assert_eq!(sc, want, "and the click scrolled it onto the band");
+        assert_eq!(drawn.at, Some(1), "the board points at the asking step");
+        assert_eq!(drawn.total, 1);
     }
 
     /// The sign-in card is the one panel that must exist before any other, and

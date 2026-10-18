@@ -472,7 +472,7 @@ fn main() {
                                     eprintln!("placed {unit_id} at {lat:.4}, {lon:.4}");
                                     match fetch_session(&host2, &token2, Some(game_id)) {
                                         Some(s) => {
-                                            Ok(tfg::shell_gpui::CreatedSession { session: s })
+                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
                                         }
                                         None => Err(
                                             "the hull was placed, but the session could not be read"
@@ -539,7 +539,7 @@ fn main() {
                                             );
                                             match fetch_session(&host2, &token2, Some(game_id)) {
                                                 Some(s) => Ok(
-                                                    tfg::shell_gpui::CreatedSession { session: s },
+                                                    tfg::shell_gpui::CreatedSession::held(s),
                                                 ),
                                                 None => Err(
                                                     "the hull was placed, but the session could not be read"
@@ -638,7 +638,7 @@ fn main() {
                                     s.zoom = tfg::map_render::MAP_ZOOM;
                                     game_id = s.game_id;
                                     eprintln!("holding {} ({})", s.game, s.state);
-                                    Ok(tfg::shell_gpui::CreatedSession { session: s })
+                                    Ok(tfg::shell_gpui::CreatedSession::held(s))
                                 }
                                 None => Err("could not hold that session".to_string()),
                             }
@@ -682,7 +682,7 @@ fn main() {
                                                 .map(|c| c.2)
                                                 .unwrap_or(tfg::map_render::MAP_ZOOM);
                                             game_id = s.game_id;
-                                            Ok(tfg::shell_gpui::CreatedSession { session: s })
+                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
                                         }
                                         None => Err(
                                             "created, but the session could not be read"
@@ -717,7 +717,7 @@ fn main() {
                                 Ok(sc) => {
                                     eprintln!("added scenario {} {:?}", sc.id, sc.title);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession { session: s }),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
                                         None => Err(
                                             "added, but the book could not be read".to_string(),
                                         ),
@@ -763,7 +763,7 @@ fn main() {
                                         eprintln!("added a step to scenario {}", sc.id);
                                         match fetch_session(&host2, &token2, Some(game_id)) {
                                             Some(s) => {
-                                                Ok(tfg::shell_gpui::CreatedSession { session: s })
+                                                Ok(tfg::shell_gpui::CreatedSession::held(s))
                                             }
                                             None => Err(
                                                 "added, but the book could not be read".to_string(),
@@ -793,7 +793,7 @@ fn main() {
                                     eprintln!("removed step {step_id} from scenario {}", sc.id);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
                                         Some(s) => {
-                                            Ok(tfg::shell_gpui::CreatedSession { session: s })
+                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
                                         }
                                         None => Err(
                                             "removed, but the book could not be read".to_string(),
@@ -833,7 +833,7 @@ fn main() {
                                         }
                                     );
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession { session: s }),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
                                         None => Err(
                                             "declared, but the session could not be read"
                                                 .to_string(),
@@ -863,7 +863,7 @@ fn main() {
                                 Ok(()) => {
                                     eprintln!("roster synced: {} write(s)", writes.len());
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession { session: s }),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
                                         None => Err(
                                             "the room was written, but the session could not be read"
                                                 .to_string(),
@@ -900,7 +900,7 @@ fn main() {
                                 Ok(()) => {
                                     eprintln!("force synced: {} write(s)", writes.len());
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession { session: s }),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
                                         None => Err(
                                             "the force was written, but the session could not be read"
                                                 .to_string(),
@@ -989,11 +989,9 @@ fn main() {
                                                         &token2,
                                                         Some(game_id),
                                                     ) {
-                                                        Some(s) => Ok(
-                                                            tfg::shell_gpui::CreatedSession {
-                                                                session: s,
-                                                            },
-                                                        ),
+                                                        Some(s) => {
+                                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
+                                                        }
                                                         None => Err(
                                                             "moved to preparation, but the session \
                                                              could not be read"
@@ -1030,7 +1028,7 @@ fn main() {
                                 Ok(_) => {
                                     eprintln!("time factor set to {factor:.0}\u{00d7}");
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession { session: s }),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
                                         None => Err(
                                             "pace set, but the session could not be read"
                                                 .to_string(),
@@ -1064,7 +1062,7 @@ fn main() {
                                 Ok(g) => {
                                     eprintln!("{} advanced to {}", g.name, g.state);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession { session: s }),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
                                         None => Err(
                                             "advanced, but the session could not be read"
                                                 .to_string(),
@@ -1094,7 +1092,7 @@ fn main() {
                                 Ok(g) => {
                                     eprintln!("{} ended ({})", g.name, g.state);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession { session: s }),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
                                         None => Err(
                                             "ended, but the session could not be read"
                                                 .to_string(),
@@ -1327,7 +1325,7 @@ fn main() {
                                         r.posts.len()
                                     );
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession { session: s }),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
                                         None => Err(
                                             "saved, but the book could not be read".to_string(),
                                         ),
@@ -1369,7 +1367,7 @@ fn main() {
                                         }
                                     );
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession { session: s }),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
                                         None => Err(
                                             "declared, but the session could not be read"
                                                 .to_string(),
@@ -1377,6 +1375,84 @@ fn main() {
                                     }
                                 }
                                 Err(e) => Err(format!("step declaration failed: {e}")),
+                            }
+                        };
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
+                    tfg::shell_gpui::ToBinary::StepVerb {
+                        scenario_id,
+                        step_id,
+                        verb,
+                    } => {
+                        // The Game Master's four verbs, on ONE message: the
+                        // console's `play_step`, `skip_step`, `end_step` and
+                        // `rewind_step`, which Minos has published all along.
+                        //
+                        // The shell does not track runs and does not need to:
+                        // every one of these names a step in the path, and the
+                        // step the shell names is the row the operator pressed.
+                        // The server arbitrates the seat on top of that, and
+                        // its refusal comes back as the sentence the board
+                        // shows.
+                        //
+                        // The answer echoes the new pointer by RE-READ rather
+                        // than by assumption (`current-step` is the only route
+                        // that publishes it). A rewind answers with what the
+                        // erasure cost instead of a run, so that sentence is
+                        // carried back with the session — the one write here
+                        // with something to say.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to drive a step".to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            let op: Result<Option<String>, String> = match verb {
+                                tfg::shell_gpui::StepVerb::Play => master
+                                    .play_step(&token2, game_id, scenario_id, step_id)
+                                    .map(|_| None)
+                                    .map_err(|e| e.to_string()),
+                                tfg::shell_gpui::StepVerb::Skip => master
+                                    .skip_step(&token2, game_id, scenario_id, step_id)
+                                    .map(|_| None)
+                                    .map_err(|e| e.to_string()),
+                                tfg::shell_gpui::StepVerb::End => master
+                                    .end_step(&token2, game_id, scenario_id, step_id)
+                                    .map(|_| None)
+                                    .map_err(|e| e.to_string()),
+                                tfg::shell_gpui::StepVerb::Replay => master
+                                    .rewind_step(&token2, game_id, scenario_id, step_id)
+                                    .map(|r| {
+                                        Some(format!(
+                                            "step {step_id} replayed \u{2014} erased {} order(s), {} report(s), {} telegram(s), {} judgement(s), {} step(s)",
+                                            r.erased_orders,
+                                            r.erased_reports,
+                                            r.erased_telegrams,
+                                            r.erased_judgements,
+                                            r.erased_steps
+                                        ))
+                                    })
+                                    .map_err(|e| e.to_string()),
+                            };
+                            match op {
+                                Ok(note) => {
+                                    if let Some(n) = &note {
+                                        eprintln!("{n}");
+                                    }
+                                    match fetch_session(&host2, &token2, Some(game_id)) {
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession {
+                                            session: s,
+                                            note: note.unwrap_or_default(),
+                                        }),
+                                        None => Err(
+                                            "the step moved, but the session could not be read"
+                                                .to_string(),
+                                        ),
+                                    }
+                                }
+                                Err(e) => Err(format!("step {} refused: {e}", verb.label().to_lowercase())),
                             }
                         };
                         if create_tx.send(outcome).is_err() {
@@ -1419,7 +1495,7 @@ fn main() {
                                 Ok(m) => {
                                     eprintln!("sent telegram #{} (broadcast)", m.id);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession { session: s }),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
                                         None => Err(
                                             "sent, but the thread could not be read".to_string(),
                                         ),
@@ -2313,6 +2389,7 @@ fn fetch_session(
                         scenario_id: s.id,
                         step_id: st.id,
                         posts: r.posts.iter().map(|p| (p.kind.clone(), p.id)).collect(),
+                        names: r.posts.iter().map(|p| p.name.clone()).collect(),
                         personnel: r
                             .personnel
                             .iter()
@@ -2328,6 +2405,46 @@ fn fetch_session(
             })
         })
         .collect();
+    // Each step's GATE, beside its related list and only while the exercise
+    // runs: a planning room is not playing a step, so the read there would be
+    // asking about a gate that has not opened. Best-effort per step like the
+    // related fan-out — one unreadable step leaves an absent gate, never no
+    // session — and it is what the Scenario board needs, because
+    // `current-step` carries a gate only for the caller a step ASKS, and no
+    // step asks the Game Master.
+    let gates: Vec<tfg::shell_gpui::StepGateView> = if state == "execution" {
+        scenarios
+            .iter()
+            .flat_map(|s| {
+                s.steps.iter().filter_map(|st| {
+                    master
+                        .step_readiness(token, game_id, s.id, st.id)
+                        .ok()
+                        .map(|r| tfg::shell_gpui::StepGateView {
+                            scenario_id: s.id,
+                            step_id: st.id,
+                            may_start: r.may_start,
+                            required: r.required,
+                            ready: r.ready,
+                            outstanding: r
+                                .personnel
+                                .iter()
+                                .filter(|p| !p.ready)
+                                .map(|p| {
+                                    if p.call_sign.trim().is_empty() {
+                                        format!("user {}", p.user_id)
+                                    } else {
+                                        p.call_sign.clone()
+                                    }
+                                })
+                                .collect(),
+                        })
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let book = scenarios
         .into_iter()
         .map(|s| tfg::shell_gpui::BookScenario {
@@ -2460,6 +2577,7 @@ fn fetch_session(
         groups,
         echelons,
         related,
+        gates,
         facts,
         readiness,
         directory,

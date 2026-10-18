@@ -875,3 +875,152 @@ shifts content by — with its picture at native resolution.
 `cargo test --lib`: 546 pass, the same four pre-existing failures.
 `cargo test --bin tfg`: 5 pass, two of them new (the EXIF decode and the jump
 sign).
+
+## The Scenario board, and a pin for the composer
+
+Three things the owner asked for, and one of them moved a surface out of the
+column.
+
+### The board is in the middle, because a scenario is not a 300pt panel
+
+The `STEP` island is GONE. It carried the running step, the readiness gate and
+the declare row, and it was honest as far as it went — but a scenario is the
+whole book, which of its steps have been played, the hulls each step obliges,
+the gate, and (for the Game Master) the verbs that move it. Four of those fit a
+column; the rest were either missing or below the fold, which is a panel saying
+the plan is smaller than it is.
+
+`board_body` is one card in the centre of the frame (`BOARD_W`x`BOARD_H`, the
+authoring silhouette in its own size) with a row per step of the whole book in
+play order. Each row carries its number, its state, its readiness gate, its
+words, its window, and the hulls the server resolved for it (`related.names` —
+the names were already in the binary's answer and were being dropped, so the
+board cost no new read). The step the exercise stands on is lit with the cyan
+edge and the word PLAYING; the row's verbs sit after the words they act on.
+
+Two doors, and neither is the column: the band's `SCENARIO` button (execution
+only — the plan is written in the Book, played here) and the reminder strip,
+whose click used to scroll the column to an island that could be below the fold.
+Both land on the same surface; the strip's capture is pixel-identical to the
+band's.
+
+`zone_islands(Execution, …)` is now `[Operator, Command, Crew, Log]` for an
+organizer and `[Operator, Command]` for a seated player. `IslandKey::Step` is
+deleted rather than left unpushed: a key with no body is a slot waiting to be
+filled by the next person who reads the enum.
+
+### Three audiences, one model
+
+`scenario_board()` builds the rows once and the board draws them; what differs
+between the seats is what each row may press. The audience comes from the SEAT,
+not from a preference:
+
+| seat | audience | sees | presses |
+| --- | --- | --- | --- |
+| no seat, `Game Master`, `Controller`, `Deputy` | Master | every step, its hulls, the pointer, every gate | PLAY · SKIP · END · REPLAY, and the clock |
+| `Observer`, and every other judge-side seat | Observer | the same rows and the same pointer | nothing |
+| `Commando`, and any seat that takes part | Commander | the ONE step their station owes | DECLARE READY / WITHDRAW |
+
+The Game Master is a *participant* seat in Minos (`is_judge_side: false`, "Runs
+the exercise"), so the console's existing `player_station()` rule would have read
+them as a commander. The role names are matched because that is the only
+machine-readable thing Minos says about who runs an exercise — the same way the
+clock grant is described.
+
+The four verbs are `ToBinary::StepVerb`, one message for one vocabulary, and the
+binary calls the routes Minos has published all along (`/play`, `/skip`, `/end`,
+`/rewind`). The earlier handoff said these were "un-aimable" without a runs read;
+that was wrong, and the correction is now in the handoff itself. What a runs read
+would add is HISTORY, not aim: the step a verb names is the row the operator
+pressed, and the server has the last word on the seat.
+
+A `rewind` answers with what the erasure COST instead of a run, so `CreatedSession`
+grew a `note` — the board shows "step 4 replayed — erased 2 order(s), 0
+report(s), … " under the verbs. A Game Master who just erased an attempt is
+entitled to be told what it took.
+
+### Played, and the one place the board needs a memory
+
+"Played" is derived: a step is behind the exercise if it sits before the pointer
+(`current-step`), which needs no history to claim. `end`, though, takes the
+pointer AWAY — the server stops naming any step, and a book that looks untouched
+is what comes back. So the shell keeps `step_seen`: the steps this console has
+actually WATCHED in play, noted once per frame in `render` (a dozen drains install
+the session, and a ledger written from each is one with a dozen chances to miss
+one).
+
+It is labelled as observation, not as the server's record, and it is corrected by
+the server wherever the server can speak: a step the GATE is asking about is not
+behind the exercise, so the ledger is truncated at that step — which is exactly
+how a `rewind` (this console's or another's) is learned, since rewinding puts a
+step back to un-reached and asking its seats again. A step the console never saw
+stays LATER rather than being assumed done.
+
+After an `end` the board therefore reads `1 of 4 played · between steps`, shows
+the finished row as PLAYED with REPLAY, and arms the first unplayed row with
+PLAY and SKIP. One row is armed at a time, always: playing the step after the
+pointer would let one stray press jump the plan.
+
+### The observer's replay, said plainly
+
+An observer reads the whole plan and the pointer, and the board says why that is
+all it can be: replaying a played step's HISTORY needs the runs behind it, and
+Minos publishes only `current-step`. Rewinding the exercise to watch it again is
+the other reading of "replay", and it ERASES other seats' orders and reports —
+so it stays with the Game Master. The foot of the observer's board says both
+sentences instead of offering a button that would lie.
+
+### The pin
+
+The Book's step row grew a `PIN`. Armed, the Book stands aside (a modal over the
+map is a form with nothing to click), a cyan strip says what the next click will
+do — and IS the way out, because GPUI 0.2.2 has no Escape binding here — and the
+map takes the click. The click is unprojected locally (`frame_unproject`, the
+same inverse the planning drops use) and the coordinate is written INTO the
+step's words: `Take station east of the buoy at -6.1047, 106.9895`.
+
+Four decimals, deliberately the same `{lat}, {lon}` the Inspector reads a fix
+back with: a position quoted off the map into a step and the position the
+inspector shows for that place have to be the same digits, or an exercise is
+authored against one number and reviewed against another. Four decimals is about
+eleven metres; the pin says "here", not "this rivet".
+
+The pin is TEXT and nothing else — no shape parked on the map. That is what was
+asked for, and it needs no storage question: the step's content is the record.
+A second pin appends rather than replacing, so an instruction can name two
+places. Any other door in the console cancels an armed pin, because a mode that
+survived the operator walking off would make the next map click quote a
+coordinate nobody asked for.
+
+### Verification, driven on `:99`
+
+A game was built through the API for each audience (`SHOOT-01` for the pin,
+`COMMANDER PROOF`, `OBSERVER PROOF`, `DECLARE PROOF`), advanced
+planning → preparation → execution with readiness declared, and the binary was
+driven with `xdrv` and captured.
+
+| claim | capture |
+| --- | --- |
+| the pin lands in the composer's words | `b2` (typed), `b4` (armed: strip + Book gone), `b5` (`… at -6.1047, 106.9895`, Book back), `b6` (the step posted with it) |
+| the Game Master sees the book, the gate and the hulls | `d1`: `not started · 4 step(s)`, `0 OF 1 READY`, `KRI Ahmad Yani · held by LAKSAMANA` |
+| PLAY lands and the pointer moves | `d2`: `step 1 of 4`, PLAYING, END/REPLAY, `1 OF 1 READY` |
+| a refused PLAY says why | `c2`: `step play refused: HTTP 409 … 1 of 1 participant(s) related to this step have not declared themselves ready.` |
+| END leaves "between steps" and arms the next | `d3`: `1 of 4 played · between steps`, row 1 PLAYED + REPLAY, row 2 PLAY/SKIP with its gate |
+| REPLAY reports the erasure | `d4`: `step 4 replayed — erased 2 order(s), 0 report(s), …` |
+| the commander sees one step and declares | `q1` → `q2`: `ASKING`, `0 OF 1 READY`, DECLARE READY → `1 OF 1 READY`, WITHDRAW |
+| the commander sees no other row and no GM verb | `k1`: `step 1 of 3`, one row, PLAYING, no verbs |
+| the observer sees everything and presses nothing | `w1`: three rows, the pointer, the gates, no verbs, the replay sentence |
+| the reminder strip opens the board | `w5` is pixel-identical to `w1` |
+
+Unit tests, all in `shell_gpui::tests`: `the_board_reads_the_whole_book_and_where_the_exercise_is`,
+`a_fresh_execution_arms_the_first_step`, `the_board_carries_the_gate_and_its_verbs_on_the_asking_step`,
+`an_observer_reads_the_plan_and_presses_nothing`, `a_commander_sees_only_the_step_that_asks_them`,
+`a_game_master_drives_a_step_through_the_one_message`,
+`a_watched_step_stays_played_after_it_ends`,
+`the_ledger_notes_played_steps_and_forgets_a_new_game`,
+`a_pin_writes_its_coordinate_into_the_step_text`, and
+`opening_the_reminder_opens_the_scenario_board` (which replaced the island-reveal
+test the move retired).
+
+`cargo test --lib`: 554 pass, the same four pre-existing failures.
+`cargo test --bin tfg`: 5 pass.
