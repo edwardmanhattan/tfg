@@ -38,7 +38,7 @@ use gpui::{
     ParentElement, PathBuilder, Render, ScrollHandle, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement,
     Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, fill, img,
-    point, prelude::*, px, size,
+    point, prelude::*, px, size, Corners,
 };
 
 use std::borrow::Cow;
@@ -473,6 +473,13 @@ struct IslandDemo {
     /// The glyph draws until the photo arrives — progressive fill, and a
     /// hull with no picture keeps its glyph, which is the honest fallback.
     thumbs: HashMap<i64, Arc<gpui::RenderImage>>,
+    /// The published length and beam of each pictured hull, in metres, keyed
+    /// the same way. Carried beside the photograph because the manifest that
+    /// declares a picture also declares the hull's measured proportions, and
+    /// a thumbnail drawn on the world without them is the square box this
+    /// map is not allowed to draw. Absent means unpublished: the map draws
+    /// the glyph rather than inventing a size.
+    hull_sizes: HashMap<i64, (f64, f64)>,
     /// The drill position, one rung each. A parent change clears everything
     /// below it (the console's `drill_*` rule); `None` group means the first
     /// tab, so an unseeded open still shows a full column set.
@@ -1516,6 +1523,7 @@ impl IslandDemo {
             drag_entity: None,
             drop_hover: None,
             thumbs: HashMap::new(),
+            hull_sizes: HashMap::new(),
             fleet_tax: FleetTaxonomy::default(),
             // Seeded drill for a headless capture: the leaf column (and its
             // thumbnails) is four clicks deep, and a capture cannot click.
@@ -2301,8 +2309,11 @@ impl IslandDemo {
             // The console counts the DRAFT here (`N PIECES`), not the hulls
             // in the world: the register is what the picker browses, and an
             // island whose note counts something it does not show is a note
-            // about a different island.
-            view::IslandKey::Fleet => format!("{} PIECES", self.session.pieces.len()),
+            // about a different island. Counted from the same merge the body
+            // lists, for exactly that reason — a hull dropped a second ago
+            // is in the draft and not on the wire, and the band is what the
+            // operator checks to see the drop landed.
+            view::IslandKey::Fleet => format!("{} PIECES", self.deployed_pieces().len()),
             // The console's `N SEATED`, which the read already carries.
             view::IslandKey::Players => format!("{} SEATED", self.session.seats),
             view::IslandKey::Groups => format!(
@@ -3082,10 +3093,11 @@ impl IslandDemo {
         // the miller columns below own the scroll; in flat mode this whole
         // block rides at the top of the scrolling list.
         let mut force = div().flex().flex_col().gap(px(4.0));
-        force = force.child(small(format!(
-            "IN THE EXERCISE \u{2014} {}",
-            self.session.pieces.len()
-        )));
+        // What the exercise holds, server-known and locally staged alike —
+        // the same merge the Fleet island lists, so the picker's count and
+        // the island's cannot disagree about how many hulls are deployed.
+        let pieces = self.deployed_pieces();
+        force = force.child(small(format!("IN THE EXERCISE \u{2014} {}", pieces.len())));
         let crew = self.crew_choices();
         // The pills show when the operator holds no PLAYER-side seat: the
         // room is empty, or the operator's own seat is judge-side — which
@@ -3138,10 +3150,10 @@ impl IslandDemo {
                 }
             }
         }
-        if self.session.pieces.is_empty() {
+        if pieces.is_empty() {
             force = force.child(small("No pieces yet.".to_string()));
         }
-        for p in self.session.pieces.clone() {
+        for p in pieces {
             let p_label = p.label.clone();
             let mut row = div()
                 .flex()
@@ -3263,10 +3275,9 @@ impl IslandDemo {
             }
         // One register row per hull, capped: the picker is a card, and the
         // island's own count says how many exist beyond it.
-        let in_draft: Vec<i64> = self.session.pieces.iter().map(|p| p.id).collect();
         for (i, row) in self.roster.iter().take(24).cloned().collect::<Vec<_>>().into_iter().enumerate() {
             let unit_id = row.unit_id.parse::<i64>().unwrap_or(-1);
-            let taken = in_draft.contains(&unit_id);
+            let taken = self.in_exercise(unit_id);
             let name = row.name.clone();
             let hull = row.hull.clone();
             list = list.child(
@@ -3555,7 +3566,6 @@ impl IslandDemo {
         let sel_cat = self.drill_category;
         let sel_type = self.drill_type;
         let sel_class = self.drill_class;
-        let in_draft: Vec<i64> = self.session.pieces.iter().map(|p| p.id).collect();
         let title = |t: String| {
             div()
                 .font_family(view::FACE_HUMAN)
@@ -3712,7 +3722,7 @@ impl IslandDemo {
             }
             for u in units {
                 let unit_id = u.id.parse::<i64>().unwrap_or(-1);
-                let taken = in_draft.contains(&unit_id);
+                let taken = self.in_exercise(unit_id);
                 let name = u.name.clone();
                 // The drag source: the whole row arms the hull, and the ghost
                 // carries its thumbnail and name. The map surface drops it:
@@ -3858,6 +3868,60 @@ impl IslandDemo {
             .into_any_element()
     }
 
+    /// Every hull the exercise holds, the server's and the operator's own.
+    ///
+    /// The session's pieces are what Minos knows about; the draft holds the
+    /// ones dropped while planning that the advance has not written yet. The
+    /// Fleet island is where the operator reads back what they have
+    /// deployed, so it lists both: a hull deployed a second ago is in the
+    /// exercise now, and a list that waits for a round trip to admit it reads
+    /// as "the drop did nothing". A drafted hull the session already names is
+    /// listed ONCE, from the session — the server's copy is the authoritative
+    /// one, and two rows for one hull would be two answers.
+    ///
+    /// The drafted additions are ordered by name. The draft is a map, and a
+    /// list that reshuffles between frames is a list nobody can aim at.
+    fn deployed_pieces(&self) -> Vec<PieceView> {
+        let mut pieces = self.session.pieces.clone();
+        // The operator's unsaved edits, laid over the server's rows: the
+        // draft is NEWER for the facts it holds — a hull re-placed a second
+        // ago is at the new position — while the session owns the identity
+        // and any placement it already knew about, because `reseed_drafts`
+        // starts every server hull with no start of its own.
+        for p in &mut pieces {
+            if let Some(h) = self.force.get(p.id) {
+                p.placed = p.placed || h.start.is_some();
+                p.commander_id = p.commander_id.or(h.commander_id);
+            }
+        }
+        // Then the hulls only the draft knows: deployed locally, not on the
+        // wire. Ordered by name, because the draft is a map and a list that
+        // reshuffles between frames is a list nobody can aim at.
+        let mut staged: Vec<&crate::force::DraftHull> = self
+            .force
+            .hulls()
+            .filter(|h| !pieces.iter().any(|p| p.id == h.unit_id))
+            .collect();
+        staged.sort_by(|a, b| a.name.cmp(&b.name));
+        pieces.extend(staged.into_iter().map(|h| PieceView {
+            id: h.unit_id,
+            label: h.name.clone(),
+            commander_id: h.commander_id,
+            placed: h.start.is_some(),
+        }));
+        pieces
+    }
+
+    /// True when the hull is in the exercise: on the server's list, or in the
+    /// operator's own draft. The two questions have one answer — a hull added
+    /// a second ago is in the exercise before the advance writes it — and the
+    /// picker's rows ask it to decide between "add" and "assigned"/"place".
+    /// Reading only the session's list made a locally-added hull look absent,
+    /// so the click-to-place path the picker promises was never offered.
+    fn in_exercise(&self, unit_id: i64) -> bool {
+        self.force.contains(unit_id) || self.session.pieces.iter().any(|p| p.id == unit_id)
+    }
+
     fn fleet_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let small = |t: String| {
             div()
@@ -3877,7 +3941,8 @@ impl IslandDemo {
                 .child(small("Pick or create a session first.".into()))
                 .into_any_element();
         }
-        let staged = self.session.pieces.len();
+        let pieces = self.deployed_pieces();
+        let staged = pieces.len();
         col = col.child(
             div()
                 .id("fleet-picker-door")
@@ -3899,11 +3964,11 @@ impl IslandDemo {
         );
         col = col.child(separator());
         col = col.child(small("PIECES".to_string()));
-        if self.session.pieces.is_empty() {
+        if pieces.is_empty() {
             col = col.child(small("No pieces yet \u{2014} assign register hulls above.".into()));
             return col.into_any_element();
         }
-        for p in &self.session.pieces {
+        for p in &pieces {
             // What is embarked aboard this hull lives in the Embarked
             // modal — this row only opens it, the console's rule (`show…`
             // beside a weak `Embarked`, and the comment that the row owns
@@ -5270,14 +5335,6 @@ impl IslandDemo {
         fy: f64,
         cx: &mut Context<Self>,
     ) -> bool {
-        let who = match self.own_commander() {
-            Ok(who) => who,
-            Err(why) => {
-                self.force_status = why;
-                cx.notify();
-                return false;
-            }
-        };
         if !self.force.contains(unit_id) {
             let mut draft = self.force.clone();
             draft.upsert(crate::force::DraftHull {
@@ -5286,15 +5343,17 @@ impl IslandDemo {
                 hull_number: String::new(),
                 class_id: String::new(),
                 start: None,
-                commander_id: Some(who),
+                // NO commander here. The organizer deploys first and assigns
+                // seats later — the commander is a BACKEND rule, and the whole
+                // point of planning is that the backend's limitations do not
+                // apply until the advance. `force::plan` refuses the whole
+                // advance on an uncommanded hull, which is exactly where that
+                // limitation belongs: at the sync, not in the draft.
+                commander_id: None,
                 host: None,
             });
             self.force = draft;
         }
-        // The commander is SET, not merely taken for a new hull: a drafted
-        // piece with nobody to steer it is the state `force::plan` refuses
-        // whole, and the drop is the operator saying "this one, under me".
-        self.force.set_commander(unit_id, Some(who));
         let (lat, lon) = self.frame_unproject(fx, fy);
         self.force.set_start(unit_id, Some(crate::force::Start { lat, lon }));
         self.force.set_host(unit_id, None);
@@ -5314,14 +5373,6 @@ impl IslandDemo {
     /// own start is CLEARED: a hull aboard another has no position of its own,
     /// and a `Place` beside the `Embark` would be a claim the server refuses.
     fn stage_embark_local(&mut self, host: i64, child: i64, name: &str, cx: &mut Context<Self>) -> bool {
-        let who = match self.own_commander() {
-            Ok(who) => who,
-            Err(why) => {
-                self.force_status = why;
-                cx.notify();
-                return false;
-            }
-        };
         if !self.force.contains(child) {
             let mut draft = self.force.clone();
             draft.upsert(crate::force::DraftHull {
@@ -5330,14 +5381,13 @@ impl IslandDemo {
                 hull_number: String::new(),
                 class_id: String::new(),
                 start: None,
-                commander_id: Some(who),
+                // No commander — the organizer embarks first, assigns seats
+                // later; the advance is where the backend's rule applies.
+                commander_id: None,
                 host: None,
             });
             self.force = draft;
         }
-        // Same as the bare-water drop: the commander is SET so a piece that
-        // entered the exercise uncommanded is writable when the advance comes.
-        self.force.set_commander(child, Some(who));
         self.force.set_host(child, Some(host));
         self.force.set_start(child, None);
         self.force_status =
@@ -5472,7 +5522,7 @@ impl IslandDemo {
     /// the truth about where it is, and two frames over one hull would be two
     /// answers. Projected from the draft's own lat/lon at the frame's camera,
     /// because a staged hull has no fix for the binary to project.
-    fn planned_marks(&self) -> Vec<(f64, f64, MapSymbolShape)> {
+    fn planned_marks(&self) -> Vec<(f64, f64, MapSymbolShape, i64, f64)> {
         let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
         if mw <= 0.0 || mh <= 0.0 {
             return Vec::new();
@@ -5492,7 +5542,7 @@ impl IslandDemo {
                     mw,
                     mh,
                 );
-                Some((x, y, self.fleet_symbol(h.unit_id)))
+                Some((x, y, self.fleet_symbol(h.unit_id), h.unit_id, start.lat))
             })
             .collect()
     }
@@ -5645,13 +5695,20 @@ impl IslandDemo {
                 return name.clone();
             }
         }
-        if let Some(p) = self.session.pieces.iter().find(|p| p.id == unit_id) {
-            return p.label.clone();
-        }
-        if let Some(h) = self.force.get(unit_id) {
-            return h.name.clone();
-        }
-        format!("#{unit_id}")
+        self.piece_name(unit_id).unwrap_or_else(|| format!("#{unit_id}"))
+    }
+
+    /// A piece's label, from whichever copy of the exercise holds it: the
+    /// session's list, or the operator's draft. `None` only when the hull is
+    /// in neither — the state a removal elsewhere leaves behind, and the one
+    /// the armed click refuses.
+    fn piece_name(&self, unit_id: i64) -> Option<String> {
+        self.session
+            .pieces
+            .iter()
+            .find(|p| p.id == unit_id)
+            .map(|p| p.label.clone())
+            .or_else(|| self.force.get(unit_id).map(|h| h.name.clone()))
     }
 
     /// Give one entity row the whole drag-and-drop vocabulary: it arms a drag
@@ -9403,6 +9460,15 @@ impl IslandDemo {
         // drawn as planned markers, dashed and dimmed. Cloned for the same
         // reason `live` is — the paint closure is `move`.
         let planned = self.planned_marks();
+        // The zoom the map is rendered at, and the photographs keyed by unit
+        // id. Both cloned for the same reason `live` is.
+        let zoom = self.map_render_zoom;
+        let thumbs = self.thumbs.clone();
+        // The published dimensions keyed by unit id: at the photograph's zoom
+        // a hull is sized by its real length and beam, so the lookup must not
+        // walk the tree per marker. Cloned for the same reason `thumbs` is —
+        // the paint closure is `move`.
+        let sizes = self.hull_sizes.clone();
         div().absolute().top(px(0.0)).left(px(0.0)).child(canvas(
             |bounds, _, _| bounds,
             move |_bounds, _, window, _| {
@@ -9425,9 +9491,51 @@ impl IslandDemo {
                         paint_reticle(window, (cx, cy), SELECT_R, RADAR_CYAN);
                     }
                     // The affiliation frame (interior + cased outline), then
-                    // the taxonomy glyph inside it. `planned` is false for a
-                    // live hull: it is in the exercise and on the wire, and
-                    // the dashed treatment is for the STAGED marks below.
+                    // the taxonomy glyph inside it — unless the hull has a
+                    // picture at this zoom. `planned` is false for a live
+                    // hull: it is in the exercise and on the wire, and the
+                    // dashed treatment is for the STAGED marks below.
+                    //
+                    // At the photograph's zoom the hull's OWN PICTURE replaces
+                    // the glyph: close enough to read a ship, the picture is
+                    // the honest identifier — the same photograph the picker's
+                    // rows carry. The picture is sized by the ship's
+                    // PUBLISHED dimensions — a hull is 120 m long whether the
+                    // map draws it or not, and a square box stretched over
+                    // that is a lie about its proportions. A hull with no
+                    // published dimensions, or with no picture, falls through
+                    // to the glyph, the shape it can always name.
+                    if let Some(uid) = m.id.parse::<i64>().ok() {
+                        if let Some((photo, (loa, beam))) =
+                            portrait(&thumbs, &sizes, uid, zoom)
+                        {
+                            // The frame is drawn with a Fill fit, so the
+                            // window's own stretch is the ground's stretch:
+                            // one metre covers `mpp / sx` window pixels
+                            // across and `mpp / sy` down. Sizing the picture
+                            // any other way would shrink or swell the ship
+                            // against the water it sits in.
+                            let mpp = meters_per_pixel(m.latitude, zoom);
+                            let length_px = (loa / mpp) as f32 * sx;
+                            let beam_px = (beam / mpp) as f32 * sy;
+                            let b = Bounds::new(
+                                point(px(cx - length_px / 2.0), px(cy - beam_px / 2.0)),
+                                size(px(length_px), px(beam_px)),
+                            );
+                            // The corner radius scales with the photograph: a
+                            // fixed 4 px on a 3 px-tall ship would round it
+                            // into a capsule.
+                            let r = px(length_px.min(beam_px).min(8.0) / 2.0);
+                            let _ = window.paint_image(
+                                b,
+                                Corners::all(r),
+                                photo.clone(),
+                                0,
+                                false,
+                            );
+                            continue;
+                        }
+                    }
                     paint_frame(window, (cx, cy), m.affiliation, false, m.stale, BOX_PX);
                     paint_glyph(
                         window,
@@ -9443,9 +9551,36 @@ impl IslandDemo {
                 // affiliation source (the binary resolves the LIVE markers'
                 // from the store), so a planned hull says "nobody has said"
                 // rather than borrowing a side it cannot prove.
-                for (px, py, shape) in &planned {
-                    let cx = (*px as f32) * sx;
-                    let cy = (*py as f32) * sy;
+                for (x, y, shape, uid, lat) in &planned {
+                    let cx = (*x as f32) * sx;
+                    let cy = (*y as f32) * sy;
+                    // At the photograph's zoom, the staged hull's own picture
+                    // replaces the glyph, exactly as a live hull's does —
+                    // sized by its published dimensions, for the same reason.
+                    if let Some((photo, (loa, beam))) =
+                        portrait(&thumbs, &sizes, *uid, zoom)
+                    {
+                        // The window's stretch is the ground's stretch, as at
+                        // the live site above.
+                        let mpp = meters_per_pixel(*lat, zoom);
+                        let length_px = (loa / mpp) as f32 * sx;
+                        let beam_px = (beam / mpp) as f32 * sy;
+                        let b = Bounds::new(
+                            point(px(cx - length_px / 2.0), px(cy - beam_px / 2.0)),
+                            size(px(length_px), px(beam_px)),
+                        );
+                        // The radius scales with the picture, as a live
+                        // hull's does — see the live site above.
+                        let r = px(length_px.min(beam_px).min(8.0) / 2.0);
+                        let _ = window.paint_image(
+                            b,
+                            Corners::all(r),
+                            photo.clone(),
+                            0,
+                            false,
+                        );
+                        continue;
+                    }
                     paint_frame(
                         window,
                         (cx, cy),
@@ -9475,6 +9610,73 @@ impl IslandDemo {
 /// never a second convention: a planned marker drawn from a start and a live
 /// marker projected by the binary from a fix must share one pixel space.
 const WORLD_BASE_PX: f64 = 512.0;
+
+/// Earth's equatorial circumference, metres. Mirrors
+/// `map_render::EARTH_EQUATOR_M` for the reason [`WORLD_BASE_PX`] gives —
+/// the shell cannot name `map_render`, so the thumbnail's true scale
+/// repeats the arithmetic here.
+const EARTH_EQUATOR_M: f64 = 40_075_016.686;
+
+/// Metres per map pixel at a latitude and zoom — the exact twin of
+/// `map_render::meters_per_pixel`, repeated for the reason in
+/// [`WORLD_BASE_PX`]. The latitude is clamped to the Web Mercator cut-off
+/// so a hull near the pole divides by a real cosine rather than a vanishing
+/// one. This is the conversion a hull's photograph is sized by: the ship's
+/// real length and beam in metres become the pixels the thumbnail is drawn
+/// at, so the image on the water is the ship's own proportions.
+fn meters_per_pixel(latitude: f64, zoom: f64) -> f64 {
+    let lat = latitude.clamp(-85.051_128_78, 85.051_128_78);
+    EARTH_EQUATOR_M * lat.to_radians().cos() / (WORLD_BASE_PX * 2f64.powf(zoom))
+}
+
+/// The zoom at which a hull stops being a symbol on this map and becomes its
+/// own picture.
+///
+/// Not a legibility guess: at 14 the ground is about 4.8 m per pixel over
+/// Jakarta, so a 120 m hull is a 25-pixel ship — a sliver, but a sliver the
+/// operator can see the shape of, and the resolution at which the console
+/// stops saying "some frigate" and starts saying "this one". Below it the
+/// symbol box (20 px at this shell's marker layer) is the larger mark and the
+/// honest one, so the glyph stays.
+const PHOTO_ZOOM: f64 = 14.0;
+
+/// A hull's published length and beam, or nothing.
+///
+/// Both dimensions or neither, and both positive: a length without a beam
+/// cannot produce a true-to-scale picture, and inventing the missing half
+/// would be a lie about the world. `None` is a real answer — the backend has
+/// published nothing for most hulls — and the map draws the glyph instead.
+fn hull_scale(loa_m: Option<f64>, beam_m: Option<f64>) -> Option<(f64, f64)> {
+    match (loa_m, beam_m) {
+        (Some(loa), Some(beam)) if loa > 0.0 && beam > 0.0 => Some((loa, beam)),
+        _ => None,
+    }
+}
+
+/// The picture to draw for a hull at `zoom`, with the dimensions that size
+/// it — or nothing, and the caller draws the glyph.
+///
+/// The one place that decides whether a hull is a photograph or a symbol on
+/// the map. It answers in the map's pixels because that is what the layer
+/// paints in; the conversion to the window is the layer's own stretch, not
+/// this function's business.
+///
+/// Every refusal here is a real state, not an error: below [`PHOTO_ZOOM`]
+/// the symbol is the larger mark, a hull with no picture has nothing to
+/// draw, and a hull with no published dimensions has no honest size.
+fn portrait<'a>(
+    thumbs: &'a HashMap<i64, Arc<gpui::RenderImage>>,
+    sizes: &HashMap<i64, (f64, f64)>,
+    unit_id: i64,
+    zoom: f64,
+) -> Option<(&'a Arc<gpui::RenderImage>, (f64, f64))> {
+    if zoom < PHOTO_ZOOM {
+        return None;
+    }
+    let photo = thumbs.get(&unit_id)?;
+    let size = sizes.get(&unit_id).copied()?;
+    Some((photo, size))
+}
 
 /// The map-frame pixel a ground position projects to, for a `w` x `h` frame
 /// centred on `center` at `zoom`. The exact twin of
@@ -10316,10 +10518,15 @@ impl Render for IslandDemo {
                     .on_mouse_up(MouseButton::Left, cx.listener(|view, ev: &MouseUpEvent, window, cx| {
                         // The armed click: a press that never became a pan
                         // deploys the armed hull at the release fractions.
-                        // Strict, unlike the drop: the arm was struck on a
-                        // drafted row, and a hull that left the exercise
-                        // since is refused rather than silently re-added by
-                        // a click.
+                        //
+                        // The SAME verb as a drop, deliberately: an armed
+                        // row and a dragged row say one thing, so both go
+                        // through `drop_unit` — staged locally while
+                        // planning, posted afterwards. Posting directly here
+                        // would have refused every hull the operator added
+                        // to the draft, because the server's list does not
+                        // know it yet; the exercise is the gate, and the
+                        // draft is part of the exercise.
                         if view.place_down.take().is_some() {
                             let vp = viewport(window);
                             if vp.2 > 0.0 && vp.3 > 0.0 {
@@ -10328,24 +10535,22 @@ impl Render for IslandDemo {
                                 let fy = f64::from(f32::from(ev.position.y) / vp.3)
                                     .clamp(0.0, 1.0);
                                 if let Some(unit_id) = view.pending_place {
-                                    if view.session.pieces.iter().any(|p| p.id == unit_id) {
-                                        // The staged line names the hull, so
-                                        // the armed click carries the label the
-                                        // session read holds — the same value
-                                        // `live_hulls` mirrors.
-                                        let name = view
-                                            .session
-                                            .pieces
-                                            .iter()
-                                            .find(|p| p.id == unit_id)
-                                            .map(|p| p.label.clone())
-                                            .unwrap_or_default();
-                                        view.send_deploy(unit_id, &name, fx, fy, cx);
-                                        return;
+                                    match view.piece_name(unit_id) {
+                                        Some(name) => {
+                                            view.drop_unit(
+                                                unit_id, &name, fx, fy, None, cx,
+                                            );
+                                        }
+                                        // Strict, unlike the drop: the arm was
+                                        // struck on a row, and a hull that left
+                                        // the exercise since is refused rather
+                                        // than silently re-added by a click.
+                                        None => {
+                                            view.force_status =
+                                                "that hull left the exercise \u{2014}                                                  add it again first"
+                                                    .to_string();
+                                        }
                                     }
-                                    view.force_status =
-                                        "that hull left the exercise \u{2014} add it again first"
-                                            .to_string();
                                 }
                             }
                             view.pending_place = None;
@@ -12507,14 +12712,23 @@ pub fn fixture_roster() -> Vec<RosterRow> {
 }
 
 /// One decoded hull photograph from the background fetch: the unit plus
-/// straight-alpha RGBA bytes at thumbnail size. Decoded off-thread (the
-/// shell only ever sees bytes); the `RenderImage` is minted on first
-/// paint, the same raw path the map frames take.
+/// straight-alpha RGBA bytes at thumbnail size, and the hull's published
+/// length and beam. Decoded off-thread (the shell only ever sees bytes);
+/// the `RenderImage` is minted on first paint, the same raw path the map
+/// frames take.
+///
+/// The dimensions ride WITH the picture because the manifest that declares a
+/// photograph also declares the measurements Minos published for the hull,
+/// and the map's true-scale thumbnail needs both. They are `Option` because
+/// unpublished is a real answer: a hull can have a picture and no figures,
+/// and the map must then draw the glyph rather than invent a size.
 pub struct ThumbRaw {
     pub unit_id: i64,
     pub w: u32,
     pub h: u32,
     pub rgba: Vec<u8>,
+    pub loa_m: Option<f64>,
+    pub beam_m: Option<f64>,
 }
 
 /// The photo trickle, drained like every other feed. `None` most ticks;
@@ -12880,6 +13094,8 @@ mod fleet_taxonomy_tests {
             rgba: vec![
                 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
             ],
+            loa_m: None,
+            beam_m: None,
         };
         assert!(thumb_image(raw).is_some(), "well-formed bytes paint");
     }
@@ -12891,8 +13107,96 @@ mod fleet_taxonomy_tests {
             w: 2,
             h: 2,
             rgba: vec![255, 0, 0],
+            loa_m: None,
+            beam_m: None,
         };
         assert!(thumb_image(raw).is_none(), "short bytes paint nothing");
+    }
+
+    /// Both published dimensions or neither: a length without a beam cannot
+    /// produce a true-to-scale picture, and inventing the missing half would
+    /// be a lie about the world.
+    #[test]
+    fn a_hull_is_sized_only_by_both_published_dimensions() {
+        assert_eq!(hull_scale(Some(120.5), Some(16.2)), Some((120.5, 16.2)));
+        assert_eq!(hull_scale(Some(101.0), None), None, "no beam, no size");
+        assert_eq!(hull_scale(None, Some(16.2)), None, "no length, no size");
+        assert_eq!(hull_scale(Some(0.0), Some(16.2)), None, "zero is not a size");
+        assert_eq!(hull_scale(Some(120.5), Some(-1.0)), None, "nor is negative");
+    }
+
+    /// The map draws a hull's picture only when it has one AND the figures to
+    /// size it, at the zoom where a picture says more than a symbol. Every
+    /// other case is the glyph, which is what the marker layer falls back to.
+    #[test]
+    fn a_hull_is_a_picture_only_with_a_photo_a_size_and_the_zoom() {
+        let mut thumbs: HashMap<i64, Arc<gpui::RenderImage>> = HashMap::new();
+        let raw = ThumbRaw {
+            unit_id: 1,
+            w: 2,
+            h: 2,
+            rgba: vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ],
+            loa_m: Some(120.5),
+            beam_m: Some(16.2),
+        };
+        // The drain's own route: the size is registered from the same batch
+        // the photograph arrives in, and only when both dimensions published.
+        let size = hull_scale(raw.loa_m, raw.beam_m);
+        thumbs.insert(raw.unit_id, thumb_image(raw).expect("bytes paint"));
+        let mut sizes: HashMap<i64, (f64, f64)> = HashMap::new();
+        if let Some(size) = size {
+            sizes.insert(1, size);
+        }
+
+        assert!(
+            portrait(&thumbs, &sizes, 1, 14.0).is_some(),
+            "a photographed, measured hull is its picture at the photo zoom"
+        );
+        assert!(
+            portrait(&thumbs, &sizes, 1, 13.0).is_none(),
+            "zoomed out, the symbol is the larger and honest mark"
+        );
+        assert!(
+            portrait(&thumbs, &sizes, 2, 14.0).is_none(),
+            "a hull with no picture keeps its glyph"
+        );
+        sizes.clear();
+        assert!(
+            portrait(&thumbs, &sizes, 1, 14.0).is_none(),
+            "a picture with no published size has no honest scale"
+        );
+    }
+
+    /// The shell's mirrored ground resolution is the same arithmetic as
+    /// `map_render`'s: the equator at zoom 0 is one earth circumference
+    /// over the 512-pixel world, and each zoom halves the ground a pixel
+    /// holds — so a hull's photograph is sized by the same scale the tiles
+    /// are drawn at.
+    #[test]
+    fn the_ground_resolution_matches_the_world() {
+        let eq_z0 = meters_per_pixel(0.0, 0.0);
+        assert!(
+            (eq_z0 - 40_075_016.686 / 512.0).abs() < 1e-6,
+            "the equator at zoom 0 is one circumference over the world: {eq_z0}"
+        );
+        assert!(
+            (meters_per_pixel(0.0, 1.0) - eq_z0 / 2.0).abs() < 1e-9,
+            "each zoom halves the ground a pixel holds"
+        );
+        assert!(
+            (meters_per_pixel(60.0, 4.0) - meters_per_pixel(0.0, 4.0) * 60f64.to_radians().cos()).abs()
+                < 1e-9,
+            "the latitude's cosine is the Mercator stretch"
+        );
+        // The store's own Sigma fixture at zoom 14 over Jakarta: a
+        // 120.5 m hull is 25.4 px long and 3.4 px wide — the thumbnail's
+        // size, and the reason a square box was a lie.
+        let mpp = meters_per_pixel(-6.108, 14.0);
+        assert!((mpp - 4.7502).abs() < 0.001, "a pixel holds {mpp} m there");
+        assert!((120.5 / mpp - 25.367).abs() < 0.01, "the photograph's length");
+        assert!((16.2 / mpp - 3.410).abs() < 0.01, "the photograph's beam");
     }
 
     fn host_demo() -> IslandDemo {
@@ -13395,6 +13699,14 @@ pub fn run(
                         thumb_drain.update(app, |root: &mut IslandDemo, cx| {
                             for raw in batch {
                                 let id = raw.unit_id;
+                                // The proportions are registered even when
+                                // the picture is already held: they travel in
+                                // the same manifest entry, a re-fetch carries
+                                // them again, and the map needs them whether
+                                // the image was minted this pass or last.
+                                if let Some(size) = hull_scale(raw.loa_m, raw.beam_m) {
+                                    root.hull_sizes.insert(id, size);
+                                }
                                 if root.thumbs.contains_key(&id) {
                                     continue;
                                 }
@@ -14292,8 +14604,9 @@ mod tests {
     }
 
     /// A drop on bare water while planning unprojects the drop point LOCALLY
-    /// and stages it: the draft carries a ground `Start`, the hull is assigned
-    /// on the way in, and nothing is posted.
+    /// and stages it: the draft carries a ground `Start`, the hull joins
+    /// UNCOMMANDED — the organizer deploys first and names seats later — and
+    /// nothing is posted.
     #[gpui::test]
     fn a_planning_drop_stages_a_start_and_posts_nothing(cx: &mut gpui::TestAppContext) {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -14330,11 +14643,107 @@ mod tests {
         cx.update(|_window, app| {
             let hull = view.read(app).force.get(1).cloned().expect("the hull joined");
             let start = hull.start.expect("the drop staged a ground start");
-            assert_eq!(hull.commander_id, Some(2), "assigned to the operator's seat");
+            assert_eq!(
+                hull.commander_id, None,
+                "the commander is a backend rule the advance applies, not the drop — the organizer deploys first"
+            );
             assert_eq!(hull.host, None, "a bare-water drop clears any host");
             assert!(
                 start.lat.abs() < 1e-9 && start.lon.abs() < 1e-9,
                 "the frame's centre unprojects to the map centre: {start:?}"
+            );
+        });
+    }
+
+    /// The Fleet island lists what has been DEPLOYED, not only what the
+    /// backend has acknowledged: a hull dropped while planning is in the
+    /// exercise the moment it lands, and an island that waits for the advance
+    /// to admit it reads as "the drop did nothing" — which is exactly how the
+    /// first planning session was read.
+    #[gpui::test]
+    fn the_fleet_island_lists_a_locally_deployed_hull(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            // The session the operator is in holds NO pieces: this is a fresh
+            // exercise, and everything on the map was placed by hand.
+            pieces: Vec::new(),
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 2, 0, session, tx);
+            demo.map_dims = (1000.0, 1000.0);
+            demo.map_center = (0.0, 0.0);
+            demo.map_render_zoom = 4.0;
+            demo
+        });
+        cx.update(|_window, app| {
+            assert!(
+                view.read(app).deployed_pieces().is_empty(),
+                "nothing deployed yet"
+            );
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(1, "KRI Ahmad Yani", 0.5, 0.5, None, cx)
+            })
+        });
+        cx.update(|_window, app| {
+            let deployed = view.read(app).deployed_pieces();
+            assert_eq!(deployed.len(), 1, "the dropped hull is in the exercise");
+            assert_eq!(deployed[0].id, 1);
+            assert_eq!(deployed[0].label, "KRI Ahmad Yani");
+            assert!(deployed[0].placed, "it was dropped on water, so it is placed");
+            assert!(
+                view.read(app).in_exercise(1),
+                "the picker offers \"place\" for exactly the hulls it says are in the exercise"
+            );
+        });
+    }
+
+    /// A hull the session already holds is listed ONCE — from the session,
+    /// whose copy is authoritative. The draft holds the same hull whenever the
+    /// operator re-places it, and two rows for one hull would be two answers.
+    #[gpui::test]
+    fn the_fleet_island_lists_a_server_hull_once(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            pieces: vec![PieceView {
+                id: 1,
+                label: "KRI Ahmad Yani".to_string(),
+                commander_id: Some(2),
+                placed: false,
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 2, 0, session, tx);
+            demo.map_dims = (1000.0, 1000.0);
+            demo.map_center = (0.0, 0.0);
+            demo.map_render_zoom = 4.0;
+            demo
+        });
+        cx.update(|_window, app| {
+            assert_eq!(view.read(app).deployed_pieces().len(), 1, "one hull");
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(1, "KRI Ahmad Yani", 0.5, 0.5, None, cx)
+            })
+        });
+        cx.update(|_window, app| {
+            let deployed = view.read(app).deployed_pieces();
+            assert_eq!(deployed.len(), 1, "the draft does not double-list it");
+            assert!(
+                deployed[0].placed,
+                "the row reports the position the operator just set"
             );
         });
     }
@@ -14383,16 +14792,22 @@ mod tests {
             let hull = view.read(app).force.get(1).cloned().expect("the child joined");
             assert_eq!(hull.host, Some(8), "staged aboard the host");
             assert_eq!(hull.start, None, "a hull aboard another has no start of its own");
-            assert_eq!(hull.commander_id, Some(2));
+            assert_eq!(
+                hull.commander_id, None,
+                "the embark stages uncommanded — the seat is named later, at the advance"
+            );
         });
     }
 
-    /// A planning drop with no seat is refused in the tightest loop: the
-    /// refusal is the console's own sentence, the hull never joins the draft,
-    /// and nothing is posted — no round trip is spent on a write that cannot
-    /// name a commander.
+    /// A planning drop with no seat is NOT refused: the organizer deploys
+    /// first and names seats later, so the hull joins the draft UNCOMMANDED
+    /// and nothing is posted. The commander rule is the backend's, and it
+    /// bites exactly where it belongs — at the advance, where `force::plan`
+    /// refuses the whole move on the uncommanded hull.
     #[gpui::test]
-    fn a_planning_drop_without_a_seat_is_refused_locally(cx: &mut gpui::TestAppContext) {
+    fn a_planning_drop_without_a_seat_stages_and_the_advance_refuses(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let (tx, rx) = std::sync::mpsc::channel();
         let session = SessionView {
             state: "planning".to_string(),
@@ -14412,15 +14827,37 @@ mod tests {
                 demo.drop_unit(1, "KRI Ahmad Yani", 0.5, 0.5, None, cx)
             })
         });
-        assert!(rx.try_recv().is_err(), "nothing posts without a seat");
+        assert!(rx.try_recv().is_err(), "a planning drop posts nothing");
         cx.update(|_window, app| {
             let demo = view.read(app);
+            let hull = demo
+                .force
+                .get(1)
+                .cloned()
+                .expect("the hull joined the draft all the same");
+            assert_eq!(
+                hull.commander_id, None,
+                "no seat was needed to deploy — the commander is named later"
+            );
             assert!(
-                demo.force_status.contains("holds no seat"),
-                "the console's own refusal: {}",
+                demo.force_status.contains("staged locally"),
+                "the console's own sentence: {}",
                 demo.force_status
             );
-            assert!(!demo.force.contains(1), "and the hull never joined the draft");
+            match crate::force::plan(&demo.force, &demo.live_hulls()) {
+                Err(gap) => {
+                    assert_eq!(
+                        gap.reason,
+                        crate::force::GapReason::Uncommanded,
+                        "the advance is where the backend's commander rule bites"
+                    );
+                    assert!(
+                        gap.hulls.iter().any(|h| h.contains("Ahmad Yani")),
+                        "the sentence names the hull it refuses: {gap:?}"
+                    );
+                }
+                Ok(_) => panic!("an uncommanded hull refuses the whole advance"),
+            }
         });
     }
 
@@ -14532,7 +14969,10 @@ mod tests {
                 hull.start, None,
                 "a hull aboard another has no start of its own"
             );
-            assert_eq!(hull.commander_id, Some(2), "assigned to the operator's own seat");
+            assert_eq!(
+                hull.commander_id, None,
+                "the embark stages uncommanded — the seat is named on the Player picker, the advance is where Minos's rule bites"
+            );
         });
     }
 
@@ -17003,6 +17443,61 @@ mod tests {
             }
             other => panic!("expected a deploy, got {other:?}"),
         }
+    }
+
+    /// The armed click is the SAME verb as a drop, so while planning it stages
+    /// and posts nothing — and it works for a hull the operator added to the
+    /// draft, which the server's list does not know yet. The first version
+    /// gated the click on the session's pieces, so the "place" pill it had
+    /// just offered answered "that hull left the exercise".
+    #[gpui::test]
+    fn the_armed_click_stages_a_locally_added_hull(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let session = SessionView {
+                state: "planning".to_string(),
+                game: "Game 15".to_string(),
+                game_id: 45,
+                me: 2,
+                // A fresh exercise: nothing on the server's list yet.
+                pieces: Vec::new(),
+                ..SessionView::default()
+            };
+            let mut demo = IslandDemo::new(fixture_roster(), 2, 0, session, tx);
+            demo.map_dims = (800.0, 600.0);
+            demo.map_center = (0.0, 0.0);
+            demo.map_render_zoom = 11.0;
+            demo
+        });
+        cx.simulate_resize(gpui::size(gpui::px(768.0), gpui::px(838.0)));
+        let (w, h) = cx.update(|window, _| {
+            let s = window.viewport_size();
+            (f32::from(s.width), f32::from(s.height))
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.stage_assign(1, "KRI Ahmad Yani", 2)
+                    .expect("the hull joins the draft");
+                demo.arm_place(1, "KRI Ahmad Yani", cx);
+                assert!(demo.in_exercise(1), "the arm was struck on its own row");
+            })
+        });
+        while rx.try_recv().is_ok() {}
+        // The same map point the drop path uses: below the modal, on water.
+        cx.simulate_click(
+            gpui::point(gpui::px(w - 68.0), gpui::px(h - 58.0)),
+            gpui::Modifiers::default(),
+        );
+        assert!(rx.try_recv().is_err(), "a planning click posts nothing");
+        cx.update(|_window, app| {
+            let demo = view.read(app);
+            let hull = demo.force.get(1).expect("still in the exercise");
+            assert!(
+                hull.start.is_some(),
+                "the armed click staged a start, exactly as a drop does"
+            );
+            assert_eq!(demo.pending_place, None, "the arm is spent");
+        });
     }
 
     /// The hold toggle follows the last answer — held resumes, otherwise

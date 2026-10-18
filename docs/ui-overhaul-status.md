@@ -704,3 +704,105 @@ probe pixel as an oracle instead of reading a picture. `xdrv click()` now holds
 the press for 70ms, because a zero-length press+release is dropped often enough
 to read as a dead control. And the app needs 30 seconds after launch before it
 will take input at all — 14 is not enough, and the symptom is silence.
+## The GPUI shell, fourth pass: a hull's picture at its own size, and a fleet the island can admit
+
+Took over the GPUI cutover with two complaints from the operator, both read off
+a driven window: at `z14` a deployed hull still drew its NATO glyph instead of
+its photograph, and the Fleet island said `0 PIECES` while a hull the operator
+had just placed stood on the map. Both were real, and neither was where it
+first looked.
+
+**The picture was never reachable.** The map's thumbnail is sized by the hull's
+published length and beam, and the previous pass joined those figures into the
+fleet taxonomy from the local `unit_specs` mirror. That mirror is filled by
+`sync_spec`, which ran for `session.pieces` only — and in a *planning* exercise
+the hulls that get drawn are in the operator's **draft**, which the server has
+never heard of. So a fresh exercise had no dimensions for exactly the hulls on
+the map, `sizes()` came back empty, and every marker fell through to the glyph.
+The handoff's log check ("hull 1's spec synced") was true and beside the point:
+hull 1 was in a *different* session's list at the time.
+
+The fix deletes the join rather than widening it. Minos' unit-image **manifest
+already declares `loa_m` and `beam_m` beside the picture** — the same entry the
+egui console's `UnitVisual::from_entry` read — so the picture and its
+proportions now travel together to the shell in one `ThumbRaw`. One request
+covers every pictured hull, no store read is involved, and the map is sized by
+the same fact that supplied the image. `FleetTaxonomy::sizes`, the taxonomy's
+two leaf fields and the `build_fleet_taxonomy` join are gone; a hull with a
+picture but no published figures still draws its glyph, which is the honest
+answer and is pinned by a test.
+
+**The size was in map pixels, painted in window pixels.** Marker positions are
+scaled to the window (`sx = win_w / map_dims.0`) but the thumbnail's length and
+beam were not, so a resized window drew a hull at the wrong size against the
+water it sits in. The picture is now `loa / mpp × sx` by `beam / mpp × sy` — the
+frame is drawn with a `Fill` fit, so the window's own stretch IS the ground's
+stretch. `portrait()` is the one function that decides "photograph or glyph" at
+a zoom, and its refusals (zoomed out, no picture, no published size) are what a
+test asserts.
+
+**The Fleet island listed the server, not the exercise.** `fleet_body` iterated
+`session.pieces`, so a hull deployed locally — in the draft, not yet written
+through the advance — was invisible there while the picker showed it. The island
+and its band now read `deployed_pieces()`, the one merge: the session's rows with
+the operator's newer edits laid over them, then the draft's own hulls, ordered by
+name so the list cannot reshuffle between frames. The picker's `IN THE EXERCISE`
+count uses the same merge, so the two cannot disagree.
+
+Two smaller versions of the same defect fell out of driving it:
+
+- The picker's drill rows decided "assigned / place" from `session.pieces`, so a
+  hull the operator had just added had no `place` pill at all. Now `in_exercise()`.
+- The armed click then posted directly and gated on `session.pieces`, so the
+  `place` pill it had just offered answered *"that hull left the exercise"*. The
+  armed click is now the SAME verb as a drop (`drop_unit`): staged while
+  planning, posted afterwards. One row of the matrix, not a second rule.
+
+### Verified on the private display
+
+Driven at 760x620 on `:99`, a planning exercise with **zero** server pieces (the
+seeded six removed for the run and restored after), the hull added through the
+picker and placed by the armed click:
+
+- Fleet island band: `1 PIECES`; body: `FLEET PICKER (1 IN THE DRAFT)` and one
+  row, `KRI Ahmad Yani · placed`. The picker shows one already-synced hull; the
+  island shows it because the draft holds it, which is the whole point.
+- `z13`: the NATO glyph, in its frame, at the marker.
+- `z14`: the photograph, measured on the capture at **25 x 4 px** — the spec's
+  120.5 m x 16.2 m at Jakarta's 4.75 m/px, `z14`, times the window's stretch.
+  Not a square, not a glyph.
+- `z15+`: the marker leaves the viewport, because the camera centre is preserved
+  and zooming magnifies the offset from it. That is projection, not drift.
+
+`cargo test --lib`: 545 pass, the same four pre-existing failures
+(`book::prune_drops_relations_for_vanished_drafts`,
+`map_render::quad_bow_follows_the_compass`,
+`roster::seats_come_before_roles_before_unseats`,
+`sim::order_move_applies_then_higher_overrides_loudly`).
+
+### Not verified, and why
+
+- **The live-marker path.** A server-placed hull takes the same `portrait()` call
+  and the same sizing, but there is no live wire on this machine (`ws://` is
+  refused; replay is empty), so no fix-fed marker was ever photographed at the
+  zoom. Unit-tested; not seen.
+- **Rotation.** The egui path rotates the photograph to the hull's heading
+  (`rotated_unit_quad`). GPUI 0.2.2's `paint_image` takes an axis-aligned
+  `Bounds` and no rotation is available, so a course-bearing hull would need a
+  quad painting path. Not attempted, and not promised.
+- **Legibility.** At `z14` a 120 m hull is 25 px long and 4 px tall: true to
+  scale, and too small to read a silhouette. From `z16` (~100 x 14 px) the
+  picture reads. If the console wants the egui ladder's rule instead — draw the
+  picture only once its footprint is worth reading — that is a threshold change
+  in `portrait()`, not a new mechanism.
+
+### The trap that reads as a hang
+
+A freshly mapped GPUI window has not presented a frame, and `import -window`
+captures it **black** until X sends it an Expose. Focusing the window is what
+triggers the first present — which is why a launch can look hung for minutes and
+then paint the instant a click lands on it, and why one earlier pass recorded a
+flaky launch that never rendered. `xdrv focus` only looked for the *egui*
+window, so against every GPUI build it answered "no egui window" and did
+nothing. It now falls back to the `tfg` window, and the first thing a driven run
+should do after `xdrv list` prints an id is `xdrv focus`.

@@ -204,8 +204,18 @@ int main(int argc, char **argv) {
         if (ks == NoSymbol) { fprintf(stderr, "no such key: %s\n", argv[2]); rc = 2; }
         else tap(ks, mods);
     } else if (!strcmp(cmd, "focus")) {
+        /* The window to focus is the CONSOLE's, whichever build it is: the
+         * egui client, or the GPUI one that replaced it. Asking only for
+         * "egui" made this command a no-op against every GPUI build
+         * ("no egui window"), and the consequence is not a missing focus
+         * ring: a freshly mapped GPUI window has not presented a frame yet,
+         * so `import -window` captures it BLACK until X sends it an Expose.
+         * Focusing it is what triggers that first present, which is why a
+         * launch could look hung for minutes and then paint the moment a
+         * click landed on it. */
         Window w = find(dpy, root, "egui", 0);
-        if (w == None) { fprintf(stderr, "no egui window\n"); return 2; }
+        if (w == None) w = find(dpy, root, "tfg", 0);
+        if (w == None) { fprintf(stderr, "no console window (egui or tfg)\n"); return 2; }
         XRaiseWindow(dpy, w);
         XSetInputFocus(dpy, w, RevertToParent, CurrentTime);
         XFlush(dpy);

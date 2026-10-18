@@ -161,6 +161,24 @@ fn main() {
                     eprintln!("store: sync failed ({e}); symbols fall back to class names")
                 }
             }
+            // Each held hull's published figures, mirrored per hull. The
+            // store's `unit_specs` is where a hull's measured figures live
+            // (speed, draft, displacement), and the sim's catalog is what
+            // registers classes from it (`catalog::upsert_class`) — a table
+            // nothing ever fills is a table the next screen reads as "no
+            // published specification" for every hull. Best-effort per hull:
+            // a hull with no published version stays unpublished, which is a
+            // real state and not a failure.
+            //
+            // Map thumbnails do NOT come from here: the picture manifest
+            // declares each pictured hull's length and beam beside its
+            // image, so the map is sized by the same entry that supplies the
+            // photograph — see `ThumbRaw`.
+            for piece in &session.pieces {
+                if let Err(e) = master.sync_spec(&token, conn, piece.id) {
+                    eprintln!("store: spec for hull {} not synced ({e})", piece.id);
+                }
+            }
         }
     }
     // Read once: the taxonomy and the assignment tables do not move under us.
@@ -1788,6 +1806,13 @@ fn spawn_thumb_fetch(
                     w,
                     h,
                     rgba: small.into_raw(),
+                    // The manifest declares the hull's published measurements
+                    // beside the picture, so the map can draw the photograph at
+                    // true scale without a second request per hull. Both ride
+                    // the one entry, and neither is invented: an unpublished
+                    // figure travels as `None` and the map draws the glyph.
+                    loa_m: e.loa_m,
+                    beam_m: e.beam_m,
                 }])
                 .is_err()
             {
