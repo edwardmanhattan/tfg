@@ -1024,3 +1024,40 @@ test the move retired).
 
 `cargo test --lib`: 554 pass, the same four pre-existing failures.
 `cargo test --bin tfg`: 5 pass.
+
+### The pin you can pick up and drop
+
+The arm-then-click pin is still there and is no longer the only gesture: the
+Book's `PIN` is now a **yellow pin you DRAG onto the water**. Dragged, the Book
+stands aside (the same `dragging` flag the Fleet picker hides on), the pointer
+carries a small yellow `pin · quote` ghost, and the release point is unprojected
+and written into the step's words. Clicked, it arms exactly what it used to.
+Both paths go through one act (`quote_pin`), so the drag and the click cannot
+quote two different numbers for the same water — pinned by
+`a_dropped_pin_quotes_what_an_armed_click_would`.
+
+The mark is drawn, not typed: four quadratic curves and a filled hole in
+`pin_glyph`, in the theme's `ALERT_YELLOW` (#FFFF00) — the one deliberately loud
+colour in the console, because it is a thing you pick up rather than a status.
+`PinDragPayload` carries nothing at all: a pin is not an entity, so its TYPE is
+the whole message and the map's second typed `on_drop` is its only reader. A pin
+that travelled as a `UnitDragPayload` with a flag would have answered the entity
+drop vocabulary, and every row in the console would have accepted a gesture that
+means none of them.
+
+**Two defects the drag exposed, both older than it.** GPUI delivers a press to
+EVERY hovered hitbox down the chain, so a press inside a card also lands on the
+full-window map surface underneath it — which sets the map's pan handle. The
+fleet picker had already recorded this and blocks it with
+`block_mouse_except_scroll`; the Book's card and the Scenario board's now do the
+same. And the pan itself: a gesture that leaves a card started life with a pan
+attached, so the map slid out from under the ghost and the drop named ground
+that had moved. `set_dragging(true)` now clears the pan handle, because a press
+that became a drag is not a pan.
+
+Verified on `:99`: `r1` (the yellow control in the Book), `t6` (mid-drag — Book
+gone, the `pin · quote` ghost under the pointer), `t2` (dropped: `at -6.1675,
+107.0141`, and the map did NOT move), `t4`/`t5` (a second drop north-west quoted
+a point north-west of the first, so the release point is what is read), `u1`
+(clicked: the armed strip), `u2` (the armed click appended a fourth coordinate).
+The Book's field still takes typing after the block (`u3`).

@@ -193,11 +193,16 @@ struct IslandDemo {
     /// session and neither may eat the other's answer.
     step_verb_busy: bool,
     step_verb_status: String,
-    /// A pin being placed: while true the map takes one click, turns it into
-    /// coordinates and puts them in the step composer's text. The Book hides
-    /// while it is armed, because the operator cannot click a map they cannot
-    /// see.
+    /// A pin being placed by CLICK: while true the map takes one click, turns
+    /// it into coordinates and puts them in the step composer's text. The Book
+    /// hides while it is armed, because the operator cannot click a map they
+    /// cannot see. The DRAGGED pin needs no arm — its release is the click —
+    /// so this flag belongs to the click-to-place path alone.
     pin_arm: bool,
+    /// Whether the pointer is over the Book's pin, so its border lifts. One
+    /// boolean, because the mark's only interaction state is "you can pick
+    /// this up".
+    pin_hot: bool,
     /// What this console has WATCHED the exercise play, since it held the
     /// game: `(scenario, step)` for every step `current-step` has named as the
     /// one in play, in the order first seen.
@@ -738,6 +743,66 @@ fn close_cross(hot: bool) -> impl IntoElement {
             path.line_to(point(cx - d, cy + d));
             if let Ok(path) = path.build() {
                 window.paint_path(path, rgba(ink));
+            }
+        },
+    )
+    .size_full()
+}
+
+/// The pin, drawn: a teardrop with a hole, in the theme's yellow.
+///
+/// Drawn rather than typed and rather than an SVG, for the same reason the
+/// island close is a painted cross: the console's face has no pin glyph, and
+/// this is four quadratic curves and a dot, which `PathBuilder` can state
+/// exactly at any size.
+///
+/// `ink` is the mark's whole state: `ALERT_YELLOW` at rest — the one thing in
+/// the console that is yellow, because it is a thing you PICK UP rather than a
+/// status — lifted while the pointer is over it, and dimmed when a pin is
+/// already armed (the next click is the map's, not this control's).
+fn pin_glyph(r: f32, ink: Rgba) -> impl IntoElement {
+    canvas(
+        |bounds, _, _| bounds,
+        move |bounds, _, window, _| {
+            let ink = rgba(ink);
+            let cx = bounds.origin.x + bounds.size.width / 2.0;
+            let cy = bounds.origin.y + bounds.size.height / 2.0;
+            // The head sits high and the tip low, so the mark's own centre of
+            // mass is where the eye puts it: a teardrop centred on the box
+            // reads as a balloon.
+            let head = cy - px(r * 0.45);
+            let tip = cy + px(r * 1.35);
+            let mut p = PathBuilder::stroke(px(1.6));
+            p.move_to(point(cx, head - px(r)));
+            // Head, left side, down to the tip, up the right side, closed.
+            p.curve_to(
+                point(cx - px(r), head),
+                point(cx - px(r * 1.06), head - px(r * 0.62)),
+            );
+            p.curve_to(
+                point(cx, tip),
+                point(cx - px(r * 0.96), head + px(r * 0.72)),
+            );
+            p.curve_to(
+                point(cx + px(r), head),
+                point(cx + px(r * 0.96), head + px(r * 0.72)),
+            );
+            p.curve_to(
+                point(cx, head - px(r)),
+                point(cx + px(r * 1.06), head - px(r * 0.62)),
+            );
+            if let Ok(path) = p.build() {
+                window.paint_path(path, ink);
+            }
+            // The hole, filled: a stroked circle this small is a dot with a
+            // rim, and the mark needs a hole, not a bullseye.
+            let d = px(r * 0.32);
+            let mut hole = PathBuilder::fill();
+            hole.move_to(point(cx - d, head));
+            hole.curve_to(point(cx + d, head), point(cx, head - px(r * 0.62)));
+            hole.curve_to(point(cx - d, head), point(cx, head + px(r * 0.62)));
+            if let Ok(hole) = hole.build() {
+                window.paint_path(hole, ink);
             }
         },
     )
@@ -1444,6 +1509,7 @@ impl IslandDemo {
             step_verb_busy: false,
             step_verb_status: String::new(),
             pin_arm: false,
+            pin_hot: false,
             step_seen: Vec::new(),
             step_seen_game: 0,
             // The feed starts empty and is only ever appended to: there is no
@@ -5741,7 +5807,15 @@ impl IslandDemo {
     fn set_dragging(&mut self, dragging: bool, cx: &mut Context<Self>) {
         if self.dragging != dragging {
             self.dragging = dragging;
-            if !dragging {
+            if dragging {
+                // A press that became a drag is not a pan. The map's pan
+                // handle can already be set by the very press that started
+                // the gesture — GPUI delivers that press to the surfaces
+                // under the card too — and a map that slides away while the
+                // ghost is in the air moves the ground the drop will name.
+                self.pan = None;
+                self.place_down = None;
+            } else {
                 self.drag_entity = None;
                 self.drop_hover = None;
             }
@@ -7905,10 +7979,32 @@ impl IslandDemo {
         if !self.pin_arm {
             return false;
         }
-        // The click is only a PLACE once a frame has told the shell how big the
-        // map is and where its camera sits; before that, unprojecting would
-        // write the coordinate of nothing into the step. The arm survives, so
-        // the operator's next click — a moment later — lands.
+        let landed = self.quote_pin(fx, fy, cx);
+        // A click the map could not answer writes nothing, so the arm
+        // survives it: the next click — a moment later, once the frame has
+        // arrived — lands.
+        self.pin_arm = !landed;
+        landed
+    }
+
+    /// A DROPPED pin: the drag's release is the click, so there is nothing to
+    /// arm. Its own entry point rather than a flag on `place_pin`, because the
+    /// two gestures are different callers of one act and a test drives each
+    /// the way its caller does.
+    fn drop_pin(&mut self, fx: f64, fy: f64, cx: &mut Context<Self>) -> bool {
+        self.pin_arm = false;
+        self.quote_pin(fx, fy, cx)
+    }
+
+    /// Write a map point into the step composer's words — the ONE act behind
+    /// both gestures, so a dropped pin and an armed click cannot quote two
+    /// different numbers for the same water.
+    ///
+    /// Returns whether anything was written. Nothing is, before the first map
+    /// frame: a click is only a PLACE once a frame has told the shell how big
+    /// the map is and where its camera sits, and unprojecting before that
+    /// writes the coordinate of nothing into a step.
+    fn quote_pin(&mut self, fx: f64, fy: f64, cx: &mut Context<Self>) -> bool {
         if self.map_dims.0 <= 0.0 || self.map_dims.1 <= 0.0 {
             self.feed("the map has not drawn yet \u{2014} click again in a moment".to_string());
             cx.notify();
@@ -7921,7 +8017,6 @@ impl IslandDemo {
             content.push(' ');
         }
         content.push_str(&text);
-        self.pin_arm = false;
         // The composer comes back: a pin exists so the author can keep writing
         // around it, and a modal that stayed shut would make them reopen it to
         // see what they pinned.
@@ -7929,6 +8024,57 @@ impl IslandDemo {
         self.feed(format!("pinned {text}"));
         cx.notify();
         true
+    }
+
+    /// The Book's pin: a yellow teardrop you PICK UP and drop on the water.
+    ///
+    /// Both gestures are real and land in the same act. The DRAG is the direct
+    /// one — the pointer carries the mark over the map and lets go, and the map
+    /// unprojects the release — and for a pointer that cannot drag (or a
+    /// harness) a CLICK arms the same mechanism and the next map click places
+    /// it. They differ only in who reads the point.
+    fn pin_control(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        // The mark's ink is its whole state: full yellow at rest, dimmed while
+        // a click has already been armed (the next click is the map's, not
+        // this control's), and its border lifts while the pointer is on it.
+        let ink = if self.pin_arm {
+            ALERT_YELLOW.with_alpha(120)
+        } else {
+            ALERT_YELLOW
+        };
+        let hot = self.pin_hot && !self.pin_arm;
+        div()
+            .id("step-pin")
+            .cursor(if self.pin_arm {
+                CursorStyle::Crosshair
+            } else {
+                CursorStyle::PointingHand
+            })
+            .on_click(cx.listener(|view, _, _, cx| view.arm_pin(cx)))
+            // The drag arms nothing: the release is the gesture's whole
+            // statement, and the map's own drop listener reads it.
+            .on_drag(PinDragPayload, |_, _, _, app| app.new(|_| PinGhost))
+            .on_hover(cx.listener(|view, hot: &bool, _, cx| {
+                if view.pin_hot != *hot {
+                    view.pin_hot = *hot;
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .rounded(px(CONTROL_RADIUS))
+                    .border(px(1.0))
+                    .border_color(rgba(if hot { ALERT_YELLOW } else { HAIRLINE_SLATE }))
+                    .bg(rgba(BUTTON_GRAPHITE))
+                    .child(div().w(px(13.0)).h(px(17.0)).child(pin_glyph(4.5, ink)))
+                    .child(tracked("pin", view::LABEL_PT, ink)),
+            )
     }
 
     /// Apply the re-read session a declaration answer returned: the counts
@@ -10124,19 +10270,12 @@ impl IslandDemo {
                     .items_center()
                     .gap(px(6.0))
                     .child(div().flex_1().child(self.compose_field(7, "What must happen", cx)))
-                    .child(
-                        div()
-                            .id("step-pin")
-                            .cursor_pointer()
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.arm_pin(cx);
-                            }))
-                            .child(button("Pin", false, false, false)),
-                    ),
+                    .child(self.pin_control(cx)),
             );
             col = col.child(note(
-                "A pin quotes the map: arm it, click the water, and the coordinate \
-                 lands in the step's words. The Book shuts while it is armed.",
+                "A pin quotes the map: DRAG it onto the water, or click it and then \
+                 click the map. The coordinate lands in the step's words, and the \
+                 Book stands aside for the gesture.",
             ));
             col = col.child(
                 div()
@@ -11384,7 +11523,35 @@ impl Render for IslandDemo {
                     // map's drop is one row of the matrix rather than a second
                     // rule. The handler runs without the view, so it re-enters
                     // through the entity — the same re-entry every drain uses.
-                    .can_drop(|v, _, _| v.is::<UnitDragPayload>())
+                    // Two kinds of thing land here: an entity (a hull, a
+                    // person, a group) and the Book's PIN. The predicate is
+                    // the union, and the two typed listeners below each take
+                    // their own — GPUI dispatches a drop by the dragged
+                    // value's type, so one element can carry both without
+                    // either reading the other's payload.
+                    .can_drop(|v, _, _| {
+                        v.is::<UnitDragPayload>() || v.is::<PinDragPayload>()
+                    })
+                    // The pin's drop: the release point IS the statement. No
+                    // hit-test, no host, no verdict — the map unprojects it and
+                    // the coordinate goes into the step's words, which is the
+                    // whole of what a pin means.
+                    .on_drop({
+                        let demo = cx.entity();
+                        move |_payload: &PinDragPayload, window: &mut Window, app: &mut App| {
+                            let size = window.viewport_size();
+                            let (w, h) = (f32::from(size.width), f32::from(size.height));
+                            if w <= 0.0 || h <= 0.0 {
+                                return;
+                            }
+                            let at = window.mouse_position();
+                            let fx = f64::from((f32::from(at.x) / w).clamp(0.0, 1.0));
+                            let fy = f64::from((f32::from(at.y) / h).clamp(0.0, 1.0));
+                            let _ = demo.update(app, |view, cx| {
+                                view.drop_pin(fx, fy, cx);
+                            });
+                        }
+                    })
                     .on_drop({
                         let demo = cx.entity();
                         move |payload: &UnitDragPayload, window: &mut Window, app: &mut App| {
@@ -11758,7 +11925,7 @@ impl Render for IslandDemo {
                     )
                     .into_any_element(),
             )
-        } else if self.book_open && !self.pin_arm {
+        } else if self.book_open && !self.pin_arm && !self.dragging {
             // The book is an authoring form too — scenarios and steps are
             // read, the title and step rows write — so it shares the
             // authoring card for the same reason.
@@ -11783,6 +11950,16 @@ impl Render for IslandDemo {
                             .relative()
                             .w(px(FORM_W))
                             .h(px(FORM_H))
+                            // The card truncates hover, the way the fleet
+                            // picker does: GPUI delivers a press to EVERY
+                            // hovered hitbox down the chain, so a press inside
+                            // the authoring card ALSO reached the full-window
+                            // map surface underneath it and set the map's pan
+                            // handle. Nothing showed while the card covered the
+                            // map — but a gesture that leaves the card (the
+                            // PIN, dragged out) started life with a pan
+                            // attached, and the map followed the drag.
+                            .block_mouse_except_scroll()
                             .child(modal_silhouette_at(FORM_W, FORM_H))
                             .child(self.book_body(cx)),
                     )
@@ -11811,6 +11988,11 @@ impl Render for IslandDemo {
                             .relative()
                             .w(px(BOARD_W))
                             .h(px(BOARD_H))
+                            // Same rule as the Book's card: a press inside a
+                            // card must not also reach the map surface behind
+                            // it, or every press on a verb would leave the
+                            // map's pan handle set.
+                            .block_mouse_except_scroll()
                             .child(modal_silhouette_at(BOARD_W, BOARD_H))
                             .child(self.board_body(cx)),
                     )
@@ -13881,6 +14063,53 @@ impl UnitDragPayload {
                 name: name.to_string(),
             },
         }
+    }
+}
+
+/// What the Book's pin carries when it is DRAGGED: a place, and nothing else.
+///
+/// A pin is not an entity — there is nothing in the exercise for a drop to
+/// change — so this payload has no fields. Its TYPE is the whole message: GPUI
+/// dispatches a drop by the dragged value's `TypeId`, so a marker type is
+/// exactly what that wants, and the map's second drop listener is the only
+/// reader.
+///
+/// It is deliberately NOT a `UnitDragPayload` with a flag: a pin that travelled
+/// as a hull would answer `resolve_drop`'s entity vocabulary, and every drop
+/// target in the console would accept a gesture that means none of them.
+#[derive(Clone, Copy, Debug)]
+pub struct PinDragPayload;
+
+/// The pin under the pointer: the mark, and the word that says what letting go
+/// does. Small, because it is a thing the operator is placing, not a window.
+struct PinGhost;
+
+impl Render for PinGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .bg(rgba(PANEL_SLATE.with_alpha(232)))
+            .border(px(1.0))
+            .border_color(rgba(ALERT_YELLOW))
+            .child(
+                div()
+                    .w(px(13.0))
+                    .h(px(17.0))
+                    .child(pin_glyph(4.5, ALERT_YELLOW)),
+            )
+            .child(
+                div()
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(11.0))
+                    .text_color(rgba(ALERT_YELLOW))
+                    .child("quote"),
+            )
     }
 }
 
@@ -19607,6 +19836,58 @@ mod tests {
         assert!(
             board.steps.iter().all(|s| s.verbs.is_empty()),
             "an observer starts nothing"
+        );
+    }
+
+    /// A DROPPED pin quotes the same point an armed click would. The two
+    /// gestures are one act with two callers, so the pin cannot say two
+    /// different things about the same water — and a drop needs no arm, since
+    /// its release is the click.
+    #[gpui::test]
+    fn a_dropped_pin_quotes_what_an_armed_click_would(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, board_session(Some(playing(8))), tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.map_dims = (1280.0, 720.0);
+                demo.map_center = (-6.1, 106.9);
+                demo.map_render_zoom = 12.0;
+                demo.book_open = true;
+            })
+        });
+        // The drop, with nothing armed.
+        let landed = cx.update(|_window, app| {
+            view.update(app, |demo, cx| demo.drop_pin(0.31, 0.42, cx))
+        });
+        assert!(landed, "a dropped pin lands without an arm");
+        let dropped = cx.update(|_window, app| view.read(app).step_draft.content.clone());
+        assert!(dropped.starts_with("at -"), "the drop wrote a coordinate: {dropped}");
+        assert!(
+            !cx.update(|_window, app| view.read(app).pin_arm),
+            "and left nothing armed"
+        );
+        assert!(
+            cx.update(|_window, app| view.read(app).book_open),
+            "the composer is back, as it is after a click"
+        );
+
+        // The same point by the click path, on a cleared draft.
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.step_draft.content.clear();
+                demo.arm_pin(cx);
+            })
+        });
+        let clicked = cx.update(|_window, app| {
+            view.update(app, |demo, cx| demo.place_pin(0.31, 0.42, cx))
+        });
+        assert!(clicked);
+        let quoted = cx.update(|_window, app| view.read(app).step_draft.content.clone());
+        assert_eq!(
+            quoted, dropped,
+            "one act, one answer: the drag and the click quote the same water"
         );
     }
 
