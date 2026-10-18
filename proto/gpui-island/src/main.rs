@@ -44,8 +44,30 @@ mod geo {
 mod force;
 #[path = "../../../src/roster.rs"]
 mod roster;
+// The drag-and-drop vocabulary is a leaf: no `use`, no toolkit, no kernel — so
+// the shell can name `crate::dnd` and the proto compiles the very same file.
+// `groups` is deliberately NOT shimmed: it pulls `crate::command` and would
+// cascade, so the shell never names it.
+#[path = "../../../src/dnd.rs"]
+mod dnd;
 #[path = "../../../src/halo.rs"]
 mod halo;
+
+// `sfx` is the UI's sounds, which only the shipped binary plays: it opens an
+// audio device through rodio, and this proto exists to stay clear of that
+// whole tree. The shell names `crate::sfx::play` for every click, ding and
+// buzz, so the proto carries the same shape as a silent no-op — the console's
+// sounds are garnish, and a chrome loop is not a console.
+#[allow(dead_code)]
+mod sfx {
+    #[derive(Debug, Clone, Copy)]
+    pub enum Sfx {
+        Click,
+        Ding,
+        Buzz,
+    }
+    pub fn play(_kind: Sfx) {}
+}
 
 #[path = "../../../src/shell_gpui.rs"]
 mod shell;
