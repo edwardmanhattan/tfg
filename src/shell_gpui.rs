@@ -411,6 +411,12 @@ struct IslandDemo {
     /// that nothing has posted; each edit still plans and posts at once AFTER
     /// planning, for the same reason the force's does.
     roster_draft: crate::roster::RosterDraft,
+    /// The task organisation as the operator has it, before Minos has heard
+    /// of it. Seeded from the session's hierarchy on every read; while
+    /// planning it holds new groups, edits, removals and unit placements
+    /// that nothing has posted, and the whole draft is written through at
+    /// the move to preparation.
+    groups: crate::groups::GroupsDraft,
     /// Control's draft: the game-time multiplier being adjusted, and the
     /// latch on the write. `None` means "not touched yet", which is how the
     /// draft picks up Minos's own value on the first frame the island draws
@@ -1541,6 +1547,7 @@ impl IslandDemo {
             roster_busy: false,
             roster_status: String::new(),
             roster_draft: crate::roster::RosterDraft::new(),
+            groups: crate::groups::GroupsDraft::new(),
             force_busy: false,
             force_status: String::new(),
             deploy_busy: false,
@@ -2221,7 +2228,8 @@ impl IslandDemo {
             // answer.
             view::IslandKey::Essentials
             | view::IslandKey::Control
-            | view::IslandKey::Review => true,
+            | view::IslandKey::Review
+            | view::IslandKey::Groups => true,
             // The evaluation surfaces: the console presents both
             // unconditionally, and neither is a question the column exists to
             // answer — a closed feed is still a feed, and a closed debrief
@@ -2242,6 +2250,7 @@ impl IslandDemo {
             | view::IslandKey::Essentials
             | view::IslandKey::Control
             | view::IslandKey::Review
+            | view::IslandKey::Groups
             | view::IslandKey::Log
             | view::IslandKey::Assessment => {}
         }
@@ -2260,6 +2269,7 @@ impl IslandDemo {
             view::IslandKey::Essentials => self.essentials_body(cx),
             view::IslandKey::Control => self.control_body(cx),
             view::IslandKey::Players => self.players_body(cx),
+            view::IslandKey::Groups => self.groups_body(cx),
             view::IslandKey::Crew => self.crew_body(cx),
             view::IslandKey::Review => self.review_body(cx),
             view::IslandKey::Command => self.command_body(cx),
@@ -2295,6 +2305,10 @@ impl IslandDemo {
             view::IslandKey::Fleet => format!("{} PIECES", self.session.pieces.len()),
             // The console's `N SEATED`, which the read already carries.
             view::IslandKey::Players => format!("{} SEATED", self.session.seats),
+            view::IslandKey::Groups => format!(
+                "{} GROUPS",
+                self.groups.frame_groups().count() + self.groups.staged_groups().count()
+            ),
             view::IslandKey::Crew => format!("{} IN ROOM", self.session.present),
             // The plan's terms: the state is already the band's job on
             // Operator, so this says which PHASE of the plan it is.
@@ -4426,7 +4440,148 @@ impl IslandDemo {
         col.into_any_element()
     }
 
-    /// REVIEW — the gate: what Minos still wants, the key, and the advance.
+    /// GROUPS — the task organisation: the forest of groups, their commanders
+    /// and their member hulls. Authored locally while planning; the whole
+    /// draft is written through at the move to preparation.
+    fn groups_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .p(px(view::PANEL_PAD));
+        if self.session.game_id == 0 {
+            return col.child(note("No session held.")).into_any_element();
+        }
+        // Collect every group the draft knows (frame + staged) without
+        // duplicating an id that has both a frame row and a staged edit.
+        let mut seen: Vec<i64> = Vec::new();
+        let mut rows: Vec<crate::groups::StagedGroup> = Vec::new();
+        for g in self.groups.frame_groups() {
+            if !seen.contains(&g.local_id) {
+                seen.push(g.local_id);
+                rows.push(g.clone());
+            }
+        }
+        for g in self.groups.staged_groups() {
+            if !seen.contains(&g.local_id) {
+                seen.push(g.local_id);
+                rows.push(g.clone());
+            }
+        }
+        if rows.is_empty() {
+            col = col.child(note("No groups yet."));
+        }
+        // Depth by parent walk, with a cycle guard.
+        let depth_of = |id: i64, groups: &crate::groups::GroupsDraft| -> usize {
+            let mut d = 0usize;
+            let mut cur = id;
+            let mut guard = 0usize;
+            while let Some(g) = groups.get(cur) {
+                if let Some(p) = g.parent {
+                    cur = p;
+                    d += 1;
+                    guard += 1;
+                    if guard > 64 {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            d
+        };
+        for g in rows {
+            let gid = g.local_id;
+            let name = g.name.clone();
+            let kind = format!("{:?}", g.kind);
+            let members = g.units.len();
+            let commander = g
+                .commander_id
+                .map(|u| format!("seat {u}"))
+                .unwrap_or_else(|| "\u{2014}".to_string());
+            let target = crate::dnd::DropTarget::Group { group_id: gid };
+            let accent = crate::shell_gpui::drop_ink(
+                self.drop_hover.as_ref(),
+                self.drag_entity.as_ref(),
+                &target,
+            );
+            let payload = crate::shell_gpui::UnitDragPayload {
+                unit_id: gid,
+                name: name.clone(),
+                symbol: crate::shell_gpui::MapSymbolShape::Dot,
+                thumb: None,
+                entity: crate::dnd::DragEntity::Group {
+                    group_id: gid,
+                    name: name.clone(),
+                },
+            };
+            let row = div()
+                .id(("group-row", gid as usize))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .pl(px(4.0 + 14.0 * depth_of(gid, &self.groups) as f32))
+                .py(px(3.0))
+                .rounded(px(3.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(11.0))
+                        .text_color(rgba(MAP_INK))
+                        .child(format!("{name} \u{00b7} {kind}")),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgba(BODY_SILVER))
+                        .child(format!("{members} hulls")),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgba(BODY_SILVER))
+                        .child(commander),
+                );
+            col = col.child(Self::take_entity_drop(
+                row,
+                payload,
+                target,
+                (name.clone(), crate::shell_gpui::MapSymbolShape::Dot, None),
+                accent,
+                cx,
+            ));
+        }
+        // A small create affordance: a new root group at the lowest echelon.
+        // `view_ids` is private to the draft, so count staged rows instead.
+        if let Some(ec) = self.session.echelons.first().cloned() {
+            let name = format!("New group {}", self.groups.staged_groups().count() + 1);
+            let kind = crate::groups::GroupKind::from_echelon(&ec.name);
+            if let Some(kind) = kind {
+                let ec_id = ec.id;
+                col = col.child(
+                    div()
+                        .id("group-new")
+                        .cursor_pointer()
+                        .px(px(4.0))
+                        .py(px(3.0))
+                        .rounded(px(3.0))
+                        .text_size(px(10.5))
+                        .text_color(rgba(RADAR_CYAN))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            let n = format!("New group {}", view.groups.staged_groups().count() + 1);
+                            match view.groups.stage_group(ec_id, &n, kind, None, None, vec![]) {
+                                Ok(_) => view.force_status = format!("{n} staged"),
+                                Err(why) => view.force_status = why,
+                            }
+                            cx.notify();
+                        }))
+                        .child("new group"),
+                );
+            }
+        }
+        col.into_any_element()
+    }
     ///
     /// The console's `z.review`. Three things and they belong together: the
     /// checklist the server publishes, the room key the Game Master reads out
@@ -4882,6 +5037,14 @@ impl IslandDemo {
             .collect()
     }
 
+    /// The task organisation as the server last held it — the draft's
+    /// reference. The session already carries it in the right shape, so this
+    /// is a clone; it exists so the advance and the plan call sites read like
+    /// `live_hulls()` and `live_seats()`.
+    fn live_groups(&self) -> Vec<crate::groups::LiveGroup> {
+        self.session.groups.clone()
+    }
+
     /// Re-seed BOTH drafts from what the session holds.
     ///
     /// One call, because they are re-seeded for one reason: a session read
@@ -4927,6 +5090,12 @@ impl IslandDemo {
             });
         }
         self.roster_draft = seats;
+
+        // The task organisation is re-seeded the same way: the server's frame
+        // becomes the reference, and any staged work the operator had is kept
+        // (seed replaces the frame, not the edits). A hold is a new reference,
+        // so nothing is staged at this point.
+        self.groups.seed(&self.session.groups);
     }
 
     /// Who may be handed a piece: every seat in the room. A hull with nobody
@@ -5418,14 +5587,45 @@ impl IslandDemo {
                 self.force_status = why;
                 false
             }
-            // The task organisation is a later slice: the vocabulary answers,
-            // and the shell has no surface to stage it on. Say so out loud
-            // rather than swallow the gesture.
-            DropVerdict::Enlist { .. }
-            | DropVerdict::NestGroup { .. }
-            | DropVerdict::CommandGroup { .. } => {
-                self.force_status = "the task organisation is a later slice".to_string();
-                false
+            DropVerdict::Enlist { group_id, unit_id } => {
+                let current = self
+                    .groups
+                    .get(group_id)
+                    .map(|g| g.units.clone())
+                    .unwrap_or_default();
+                if current.contains(&unit_id) {
+                    // Already a member: nothing to stage, but the gesture is
+                    // not a refusal — the hull is where the drop says it is.
+                    true
+                } else {
+                    let mut units = current;
+                    units.push(unit_id);
+                    match self.groups.set_units(group_id, units) {
+                        Ok(()) => true,
+                        Err(why) => {
+                            self.force_status = why;
+                            false
+                        }
+                    }
+                }
+            }
+            DropVerdict::CommandGroup { group_id, user_id } => {
+                match self.groups.set_commander(group_id, Some(user_id)) {
+                    Ok(()) => true,
+                    Err(why) => {
+                        self.force_status = why;
+                        false
+                    }
+                }
+            }
+            DropVerdict::NestGroup { child, parent } => {
+                match self.groups.set_parent(child, Some(parent)) {
+                    Ok(()) => true,
+                    Err(why) => {
+                        self.force_status = why;
+                        false
+                    }
+                }
             }
         };
         // The sound reads the SAME outcome the draft was given: a ding for a
@@ -5508,7 +5708,9 @@ impl IslandDemo {
                     v.downcast_ref::<UnitDragPayload>().is_some_and(|p| {
                         matches!(
                             p.entity,
-                            DragEntity::Unit { .. } | DragEntity::Player { .. }
+                            DragEntity::Unit { .. }
+                                | DragEntity::Player { .. }
+                                | DragEntity::Group { .. }
                         ) && !drops_on_itself(&p.entity, &target)
                     })
                 }
@@ -6047,6 +6249,7 @@ impl IslandDemo {
             live_hulls,
             roster: self.roster_draft.clone(),
             live_seats,
+            groups: crate::groups::plan(&self.groups, &self.live_groups()),
         });
         cx.notify();
         true
@@ -11543,6 +11746,14 @@ pub struct SessionView {
     /// The pieces of the exercise: hulls assigned to the held game, the
     /// relate editor's checkbox list. Best-effort like the book.
     pub pieces: Vec<PieceView>,
+    /// The task organisation as Minos last held it: the forest of groups with
+    /// their commanders and member hulls. Best-effort like the book; the
+    /// shell drafts against it locally and writes the whole draft through at
+    /// the advance.
+    pub groups: Vec<crate::groups::LiveGroup>,
+    /// The echelon vocabulary the task organisation is built from — the
+    /// words a new group is named with. Lowest first.
+    pub echelons: Vec<crate::backend::EchelonLevel>,
     /// What each step obliges, resolved by the server. Read per step because
     /// steps arrive only nested in the book — a small fan-out, best-effort
     /// per step, so one unreadable step leaves an absent entry rather than
@@ -11874,6 +12085,7 @@ pub enum ToBinary {
         live_hulls: Vec<crate::force::LiveHull>,
         roster: crate::roster::RosterDraft,
         live_seats: Vec<crate::roster::LiveSeat>,
+        groups: Vec<crate::groups::GroupWrite>,
     },
     /// The game clock's multiplier, from Control's Apply. One field, one
     /// endpoint (`PATCH /games/{id}/time-factor`), and the answer is a re-read
@@ -12118,6 +12330,8 @@ impl Default for SessionView {
             judgements: Vec::new(),
             reviews: Vec::new(),
             pieces: Vec::new(),
+            groups: Vec::new(),
+            echelons: Vec::new(),
             related: Vec::new(),
             facts: GameFacts::default(),
             readiness: None,
@@ -14056,6 +14270,7 @@ mod tests {
                 live_hulls,
                 roster: _,
                 live_seats,
+                groups: _,
             } => {
                 assert!(force.contains(1), "the staged hull crossed");
                 assert!(
@@ -15090,6 +15305,7 @@ mod tests {
                 "control",
                 "fleet",
                 "players",
+                "groups",
                 "review"
             ],
             "planning: the plan, its clock, its force, its room, its gate"
@@ -15140,6 +15356,7 @@ mod tests {
                 "control",
                 "fleet",
                 "players",
+                "groups",
                 "review"
             ],
             "a player station keeps the planning column"
@@ -16021,7 +16238,7 @@ mod tests {
         });
         assert_eq!(
             keys,
-            vec!["operator", "essentials", "control", "fleet", "players", "review"],
+            vec!["operator", "essentials", "control", "fleet", "players", "groups", "review"],
             "the column recomposes around the held game"
         );
     }

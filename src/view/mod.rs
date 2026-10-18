@@ -904,6 +904,10 @@ pub enum IslandKey {
     /// the room key to hand out, and the advance itself. The console's
     /// `z.review`.
     Review,
+    /// The task organisation: the forest of task groups, their commanders and
+    /// their member hulls. The console's `z.groups`, authored locally while
+    /// planning and committed at the advance.
+    Groups,
     /// The caller's own command: seat, commanded hulls, their live fixes,
     /// the readiness gate and the helm.
     Command,
@@ -950,6 +954,7 @@ impl IslandKey {
             IslandKey::Players => "PLAYERS",
             IslandKey::Crew => "CREW",
             IslandKey::Review => "REVIEW",
+            IslandKey::Groups => "GROUPS",
             IslandKey::Command => "COMMAND",
             IslandKey::Step => "STEP",
             IslandKey::Log => "LOG",
@@ -972,6 +977,7 @@ impl IslandKey {
             IslandKey::Players => "players",
             IslandKey::Crew => "crew",
             IslandKey::Review => "review",
+            IslandKey::Groups => "groups",
             IslandKey::Command => "command",
             IslandKey::Step => "step",
             IslandKey::Log => "log",
@@ -987,7 +993,7 @@ impl IslandKey {
 /// it changes with the exercise's state. What this list fixes is the identity
 /// the operator's open/closed choice hangs off, and it is declared once so no
 /// code path can hold a subset and quietly drop one.
-pub const COLUMN_ISLANDS: [IslandKey; 12] = [
+pub const COLUMN_ISLANDS: [IslandKey; 13] = [
     IslandKey::Operator,
     IslandKey::Essentials,
     IslandKey::Control,
@@ -1000,6 +1006,7 @@ pub const COLUMN_ISLANDS: [IslandKey; 12] = [
     IslandKey::Log,
     IslandKey::Assessment,
     IslandKey::Sessions,
+    IslandKey::Groups,
 ];
 
 /// One slot in the column: which island, and how tall its footprint is.
@@ -1031,8 +1038,9 @@ pub struct IslandSlot {
 ///   A signed-out shell still shows the login card, not the column.
 /// - `z.essentials` and `z.control` (Planning) are the game's own terms and
 ///   pace. No read route exists for either here.
-/// - `z.groups` is the task organisation, and `/hierarchy` is empty for every
-///   dev game — an island that claimed it would be an island of empty boxes.
+/// - `z.groups` is the task organisation. It used to be omitted because
+///   `/hierarchy` was empty for every dev game; the console authors it locally
+///   while planning and commits it at the advance, so the column now carries it.
 /// - `z.log` IS ported, and rides the organizer's Execution column as the
 ///   console's own Execution column carries it. What is NOT ported is the
 ///   journal half — its files and map replay are local scratch with no
@@ -1076,6 +1084,7 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
             out.push(slot(IslandKey::Control, 210.0));
             out.push(slot(IslandKey::Fleet, 320.0));
             out.push(slot(IslandKey::Players, 280.0));
+            out.push(slot(IslandKey::Groups, 280.0));
             out.push(slot(IslandKey::Review, 380.0));
         }
         // Preparation is the gate. The console's Readiness island is
@@ -1741,6 +1750,7 @@ mod tests {
                 Control_key(),
                 Fleet_key(),
                 Players_key(),
+                Groups_key(),
                 Review_key(),
             ]
         );
@@ -1793,6 +1803,9 @@ mod tests {
     }
     fn Review_key() -> IslandKey {
         IslandKey::Review
+    }
+    fn Groups_key() -> IslandKey {
+        IslandKey::Groups
     }
     fn Command_key() -> IslandKey {
         IslandKey::Command
@@ -1916,7 +1929,7 @@ mod tests {
         // Control at 210 for the hold (see the Planning arm).
         assert_eq!(
             zone_stack_height(&slots),
-            172.0 + 380.0 + 210.0 + 320.0 + 280.0 + 380.0 + 12.0
+            172.0 + 380.0 + 210.0 + 320.0 + 280.0 + 280.0 + 380.0 + 14.0
         );
     }
 
@@ -1950,9 +1963,9 @@ mod tests {
         let slots = zone_islands(GameState::Planning, false);
         assert_eq!(
             zone_stack_height(&slots),
-            172.0 + 380.0 + 210.0 + 320.0 + 280.0 + 380.0 + 12.0
+            172.0 + 380.0 + 210.0 + 320.0 + 280.0 + 280.0 + 380.0 + 14.0
         );
-        assert_eq!(zone_overflow(zone_stack_height(&slots), band), 1214.0);
+        assert_eq!(zone_overflow(zone_stack_height(&slots), band), 1496.0);
         // A short stack in a tall band scrolls not at all.
         assert_eq!(zone_overflow(100.0, band), 0.0);
     }

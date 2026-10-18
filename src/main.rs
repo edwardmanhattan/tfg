@@ -907,6 +907,7 @@ fn main() {
                         live_hulls,
                         roster,
                         live_seats,
+                        groups,
                     } => {
                         // LEAVE PLANNING. The drafts cross whole because the
                         // token lives HERE and the drafts live THERE: the
@@ -931,14 +932,12 @@ fn main() {
                                 Err(gap) => Err(gap.to_string()),
                                 Ok(force_writes) => {
                                     let roster_writes = tfg::roster::plan(&roster, &live_seats);
-                                    // The shell holds no task-organisation
-                                    // draft yet, so the tree flush is planned
-                                    // from an empty draft and an empty live
-                                    // frame: it emits nothing and posts
-                                    // nothing. The call is here so the ORDER
-                                    // is stated in one place.
-                                    let groups_writes =
-                                        tfg::groups::plan(&tfg::groups::GroupsDraft::new(), &[]);
+                                    // The shell now carries the real draft and
+                                    // computes the writes; the server's live
+                                    // frame travels inside the draft's seed,
+                                    // so the plan diffs against what Minos
+                                    // holds.
+                                    let groups_writes = groups;
                                     let flush =
                                         flush_force(&master, &token2, game_id, &force_writes)
                                             .and_then(|()| {
@@ -2144,6 +2143,38 @@ fn fetch_session(
             placed: placed_ids.contains(&u.unit_id),
         })
         .collect();
+    // The task organisation, flattened from the server's recursive forest.
+    // The read names the LEVEL, never a rank; an echelon we do not
+    // recognise is not this client's rank to invent, so its node is
+    // dropped. Members and commanders are not part of this route, so the
+    // frame carries none — the draft adds them on top.
+    fn flatten_groups(
+        nodes: &[tfg::backend::HierarchyNode],
+        out: &mut Vec<tfg::groups::LiveGroup>,
+    ) {
+        for n in nodes {
+            if let Some(kind) = tfg::groups::GroupKind::from_echelon(&n.echelon_name) {
+                out.push(tfg::groups::LiveGroup {
+                    group_id: n.id,
+                    name: n.name.clone(),
+                    kind,
+                    parent: n.parent_id,
+                    commander_id: None,
+                    units: Vec::new(),
+                });
+            }
+            flatten_groups(&n.children, out);
+        }
+    }
+    let groups = master
+        .game_hierarchy(token, game_id)
+        .map(|forest| {
+            let mut out = Vec::new();
+            flatten_groups(&forest, &mut out);
+            out
+        })
+        .unwrap_or_default();
+    let echelons = master.echelon_levels(token).unwrap_or_default();
     // The game's own roles, as the seat form offers them. Read rather than
     // hardcoded: a deployment that relabels a seat keeps working, and the
     // judge flag is the only thing the mirror says about who steers.
@@ -2332,6 +2363,8 @@ fn fetch_session(
         // step counts all drink from it.
         book,
         pieces,
+        groups,
+        echelons,
         related,
         facts,
         readiness,

@@ -50,6 +50,13 @@ mod roster;
 // cascade, so the shell never names it.
 #[path = "../../../src/dnd.rs"]
 mod dnd;
+// `command` is a near-leaf (only `geo::coordinates`, already shimmed
+// above) and `groups` depends on it alone — so the shell may now name
+// `crate::groups`, which it needs for the task-organisation island.
+#[path = "../../../src/command.rs"]
+mod command;
+#[path = "../../../src/groups.rs"]
+mod groups;
 #[path = "../../../src/halo.rs"]
 mod halo;
 
