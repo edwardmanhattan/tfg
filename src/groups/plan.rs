@@ -125,7 +125,13 @@ impl GroupsDraft {
     /// Edits against groups the server no longer lists are dropped by
     /// [`Self::prune`].
     pub fn seed(&mut self, live: &[LiveGroup]) {
-        self.frame = live.iter().map(staged_from_live).collect();
+        self.frame = live
+            .iter()
+            .map(|l| {
+                let staged = staged_from_live(l);
+                (staged.local_id, staged)
+            })
+            .collect();
         let ids: Vec<i64> = live.iter().map(|l| l.group_id).collect();
         self.reconcile(&ids);
     }

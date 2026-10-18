@@ -5477,7 +5477,16 @@ impl IslandDemo {
         // the row is both parented (the drill row hangs its banner and verbs
         // off the returned element) and parented-to (`col.child(row)`), so
         // both bounds are needed or the generic stops being a Div chain.
-        E: InteractiveElement + Styled + ParentElement + IntoElement + Sized,
+        // `StatefulInteractiveElement` is the one that carries `on_drag`,
+        // `can_drop` and `on_drop`, and only a `Stateful<_>` implements it —
+        // which is why every caller hands in a row that has already taken an
+        // `.id()`.
+        E: InteractiveElement
+            + StatefulInteractiveElement
+            + Styled
+            + ParentElement
+            + IntoElement
+            + Sized,
     {
         let weak = cx.entity().downgrade();
         let demo = cx.entity();
@@ -12372,7 +12381,9 @@ impl UnitDragPayload {
     /// name is the whole of what a person's drag has to say.
     fn for_person(user_id: i64, name: &str) -> Self {
         UnitDragPayload {
-            unit_id,
+            // No hull here: Minos files a seat under the user's id, and that
+            // is what the ghost's id field carries for a person.
+            unit_id: user_id,
             name: name.to_string(),
             symbol: MapSymbolShape::Dot,
             thumb: None,
@@ -16192,18 +16203,24 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut session = SessionView::default();
+            // The CHILD is listed first, and that is load-bearing: the picker
+            // draws every piece row ABOVE the taxonomy drill, and the sweep
+            // below takes the first row that starts a drag. Listing the host
+            // first would hand the sweep the host's own row, and a hull
+            // dropped on its own marker is refused — which would prove the
+            // refusal, not the embark.
             session.pieces = vec![
-                PieceView {
-                    id: 8,
-                    label: "KRI Ahmad Yani".to_string(),
-                    commander_id: None,
-                    placed: true,
-                },
                 PieceView {
                     id: 13,
                     label: "KRI Yos Sudarso".to_string(),
                     commander_id: None,
                     placed: false,
+                },
+                PieceView {
+                    id: 8,
+                    label: "KRI Ahmad Yani".to_string(),
+                    commander_id: None,
+                    placed: true,
                 },
             ];
             let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
