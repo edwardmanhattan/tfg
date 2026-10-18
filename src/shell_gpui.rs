@@ -44,6 +44,7 @@ use gpui::{
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 
+use crate::dnd::{DragEntity, DropTarget, DropVerdict};
 use crate::halo::{self as halo};
 use crate::map_gate::{self as gate, FrameSlot, RawReplay};
 use crate::book::ComposerDraft;
@@ -447,6 +448,17 @@ struct IslandDemo {
     /// fleet picker hides for exactly the drag's lifetime, so the drop can
     /// land anywhere on the map instead of on the modal's own card.
     dragging: bool,
+    /// The SEMANTIC half of the drag in flight: what the pointer is carrying,
+    /// as [`crate::dnd`] reads it. Set when a source arms its `on_drag` and
+    /// cleared when the drag ends, because the ghost is how a drag LOOKS and
+    /// this is what it MEANS — the only thing the hover indicator and
+    /// [`crate::dnd::resolve_drop`] ever read.
+    drag_entity: Option<DragEntity>,
+    /// The droppable under the pointer while a drag is in flight — the row
+    /// whose indicator is lit. `None` off every row and whenever no drag is
+    /// running. Cleared with the drag (`set_dragging(false, …)`), so a stale
+    /// target never outlives the gesture that named it.
+    drop_hover: Option<DropTarget>,
     /// The picker's drill tree: Asset Group > Category > Type > Class >
     /// hull, built once by the binary off the synced mirror. Empty on
     /// fixture runs — the picker falls back to its flat register list.
@@ -1495,6 +1507,8 @@ impl IslandDemo {
             end_status: String::new(),
             fleet_open: std::env::var("TFG_FLEET").as_deref() == Ok("1"),
             dragging: false,
+            drag_entity: None,
+            drop_hover: None,
             thumbs: HashMap::new(),
             fleet_tax: FleetTaxonomy::default(),
             // Seeded drill for a headless capture: the leaf column (and its
@@ -3185,7 +3199,31 @@ impl IslandDemo {
                     }))
                     .child(button("remove", true, false, false)),
             );
-            force = force.child(row);
+            // The piece as a drop target and a drag source: a hull dropped
+            // here embarks aboard THIS hull, and this row's hull can be
+            // dragged away onto another. The one vocabulary, on the row.
+            let target = DropTarget::Unit { unit_id: p.id };
+            let accent = drop_ink(self.drop_hover.as_ref(), self.drag_entity.as_ref(), &target);
+            let symbol = self.fleet_symbol(p.id);
+            let thumb = self.thumbs.get(&p.id).cloned();
+            let payload = UnitDragPayload {
+                unit_id: p.id,
+                name: p.label.clone(),
+                symbol,
+                thumb: thumb.clone(),
+                entity: DragEntity::Unit {
+                    unit_id: p.id,
+                    name: p.label.clone(),
+                },
+            };
+            force = force.child(Self::take_entity_drop(
+                row.id(("piece-row", p.id as usize)),
+                payload,
+                target,
+                (p.label.clone(), symbol, thumb),
+                accent,
+                cx,
+            ));
         }
         if self.fleet_tax.groups.is_empty() {
             // No taxonomy (fixture runs, offline machines): the flat
@@ -3729,7 +3767,13 @@ impl IslandDemo {
                             .child(button("place", true, false, false)),
                     );
                 }
-                l = l.child(
+                // The row's own drop target: the hull. A hull dropped on a
+                // hull embarks; the row refuses a drop on ITSELF
+                // (`drops_on_itself`), the one gesture a row does not take.
+                let target = DropTarget::Unit { unit_id };
+                let accent =
+                    drop_ink(self.drop_hover.as_ref(), self.drag_entity.as_ref(), &target);
+                let row = Self::take_entity_drop(
                     div()
                         .id(("drill-drag", unit_id as usize))
                         .flex()
@@ -3738,14 +3782,15 @@ impl IslandDemo {
                         .px(px(4.0))
                         .py(px(4.0))
                         .rounded(px(3.0))
-                        .w_full()
-                        .on_drag(payload, move |_, _, _, cx| {
-                            cx.new(|_| DragGhost {
-                                name: ghost_name.clone(),
-                                symbol: ghost_symbol,
-                                thumb: ghost_thumb.clone(),
-                            })
-                        })
+                        .w_full(),
+                    payload,
+                    target,
+                    (ghost_name, ghost_symbol, ghost_thumb),
+                    accent,
+                    cx,
+                );
+                l = l.child(
+                    row
                         // The banner first: the photograph spans the row's
                         // full width, and the identity sits under it — the
                         // ship is the row's first word, not a stamp
@@ -3857,48 +3902,72 @@ impl IslandDemo {
                 }
                 _ => "show\u{2026}".to_string(),
             };
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .w(px(6.0))
-                            .h(px(6.0))
-                            .rounded(px(3.0))
-                            .flex_shrink_0()
-                            .bg(rgba(if p.placed { SIGNAL_GREEN } else { STALE_SAND })),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .font_family(view::FACE_HUMAN)
-                            .text_size(px(11.0))
-                            .text_color(rgba(MAP_INK))
-                            .child(p.label.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.5))
-                            .text_color(rgba(if p.placed { BODY_SILVER } else { ALERT_YELLOW }))
-                            .child(if p.placed { "placed" } else { "unplaced" }),
-                    )
-                    .child(
-                        div()
-                            .id(("embark-open", pid as usize))
-                            .cursor_pointer()
-                            .flex_shrink_0()
-                            .text_size(px(10.5))
-                            .text_color(rgba(BODY_SILVER))
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.open_embarked(pid);
-                                cx.notify();
-                            }))
-                            .child(door),
-                    ),
-            );
+            // The crew island's piece row is a drop target and a drag source
+            // too: a hull released on it embarks aboard, and it can be
+            // dragged off onto another. Same `take_entity_drop`, same
+            // `resolve_drop`, same ink.
+            let target = DropTarget::Unit { unit_id: pid };
+            let accent = drop_ink(self.drop_hover.as_ref(), self.drag_entity.as_ref(), &target);
+            let symbol = self.fleet_symbol(pid);
+            let thumb = self.thumbs.get(&pid).cloned();
+            let payload = UnitDragPayload {
+                unit_id: pid,
+                name: p.label.clone(),
+                symbol,
+                thumb: thumb.clone(),
+                entity: DragEntity::Unit {
+                    unit_id: pid,
+                    name: p.label.clone(),
+                },
+            };
+            let row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .rounded(px(3.0))
+                        .flex_shrink_0()
+                        .bg(rgba(if p.placed { SIGNAL_GREEN } else { STALE_SAND })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .font_family(view::FACE_HUMAN)
+                        .text_size(px(11.0))
+                        .text_color(rgba(MAP_INK))
+                        .child(p.label.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgba(if p.placed { BODY_SILVER } else { ALERT_YELLOW }))
+                        .child(if p.placed { "placed" } else { "unplaced" }),
+                )
+                .child(
+                    div()
+                        .id(("embark-open", pid as usize))
+                        .cursor_pointer()
+                        .flex_shrink_0()
+                        .text_size(px(10.5))
+                        .text_color(rgba(BODY_SILVER))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.open_embarked(pid);
+                            cx.notify();
+                        }))
+                        .child(door),
+                );
+            col = col.child(Self::take_entity_drop(
+                row.id(("fleet-piece", pid as usize)),
+                payload,
+                target,
+                (p.label.clone(), symbol, thumb),
+                accent,
+                cx,
+            ));
         }
         col.into_any_element()
     }
@@ -4233,57 +4302,73 @@ impl IslandDemo {
         }
         for p in &self.session.people {
             let mine = p.id == self.session.me;
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .h(px(20.0))
-                    .px(px(4.0))
-                    .rounded(px(3.0))
-                    .bg(rgba(if mine {
-                        RADAR_CYAN.with_alpha(38)
-                    } else {
-                        Rgba::black_alpha(0)
-                    }))
-                    .child(
-                        div()
-                            .w(px(78.0))
-                            .font_family(view::FACE_MACHINE)
-                            .text_size(px(11.0))
-                            .text_color(rgba(if mine { RADAR_CYAN } else { MAP_INK }))
-                            .child(if p.call_sign.is_empty() {
-                                "\u{2014}".to_string()
-                            } else {
-                                p.call_sign.clone()
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(11.0))
-                            .text_color(rgba(MAP_INK))
-                            .child(p.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.5))
-                            .text_color(rgba(BODY_SILVER))
-                            .child(if p.judge {
-                                format!("{} \u{00b7} judge", p.role)
-                            } else {
-                                p.role.clone()
-                            }),
-                    )
-                    .child(
-                        div()
-                            .w(px(52.0))
-                            .text_size(px(10.5))
-                            .text_color(rgba(if p.ready { RADAR_CYAN } else { BODY_SILVER }))
-                            .child(if p.ready { "ready" } else { "\u{2014}" }),
-                    ),
-            );
+            // The row is a drag source AND a drop target, like every entity
+            // row: a person dragged out of here lands on a hull as its
+            // commander, and a hull dragged in lands on them the same way.
+            // The row takes neither a drop on ITSELF (`drops_on_itself`) nor
+            // the person-on-person gesture, which `resolve_drop` refuses in
+            // words so the release buzzes rather than shrugging.
+            let target = DropTarget::Player { user_id: p.id };
+            let accent = drop_ink(self.drop_hover.as_ref(), self.drag_entity.as_ref(), &target);
+            let payload = UnitDragPayload::for_person(p.id, &p.name);
+            let row = div()
+                .id(("player-row", p.id as usize))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .h(px(20.0))
+                .px(px(4.0))
+                .rounded(px(3.0))
+                .bg(rgba(if mine {
+                    RADAR_CYAN.with_alpha(38)
+                } else {
+                    Rgba::black_alpha(0)
+                }))
+                .child(
+                    div()
+                        .w(px(78.0))
+                        .font_family(view::FACE_MACHINE)
+                        .text_size(px(11.0))
+                        .text_color(rgba(if mine { RADAR_CYAN } else { MAP_INK }))
+                        .child(if p.call_sign.is_empty() {
+                            "\u{2014}".to_string()
+                        } else {
+                            p.call_sign.clone()
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(11.0))
+                        .text_color(rgba(MAP_INK))
+                        .child(p.name.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgba(BODY_SILVER))
+                        .child(if p.judge {
+                            format!("{} \u{00b7} judge", p.role)
+                        } else {
+                            p.role.clone()
+                        }),
+                )
+                .child(
+                    div()
+                        .w(px(52.0))
+                        .text_size(px(10.5))
+                        .text_color(rgba(if p.ready { RADAR_CYAN } else { BODY_SILVER }))
+                        .child(if p.ready { "ready" } else { "\u{2014}" }),
+                );
+            col = col.child(Self::take_entity_drop(
+                row,
+                payload,
+                target,
+                (p.name.clone(), MapSymbolShape::Dot, None),
+                accent,
+                cx,
+            ));
         }
         col.into_any_element()
     }
@@ -4945,18 +5030,17 @@ impl IslandDemo {
         fy: f64,
         host: Option<i64>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let taken = self.session.pieces.iter().any(|p| p.id == unit_id);
         // WHILE PLANNING the drop is a LOCAL act: the hull joins the draft
         // (assigned on the way in, if the exercise does not hold it) and
         // nothing posts. The advance writes the whole draft through.
         if self.staging() {
-            if let Some(host) = host {
-                self.stage_embark_local(host, unit_id, name, cx);
+            return if let Some(host) = host {
+                self.stage_embark_local(host, unit_id, name, cx)
             } else {
-                self.stage_place_local(unit_id, name, fx, fy, cx);
-            }
-            return;
+                self.stage_place_local(unit_id, name, fx, fy, cx)
+            };
         }
         if taken {
             if let Some(host) = host {
@@ -4964,14 +5048,14 @@ impl IslandDemo {
             } else {
                 self.send_deploy(unit_id, name, fx, fy, cx);
             }
-            return;
+            return true;
         }
         let who = match self.own_commander() {
             Ok(who) => who,
             Err(why) => {
                 self.force_status = why;
                 cx.notify();
-                return;
+                return false;
             }
         };
         if let Some(host) = host {
@@ -4996,6 +5080,7 @@ impl IslandDemo {
             });
         }
         cx.notify();
+        true
     }
 
     /// A drop on bare water, WHILE PLANNING: put the hull in the draft at the
@@ -5015,13 +5100,13 @@ impl IslandDemo {
         fx: f64,
         fy: f64,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let who = match self.own_commander() {
             Ok(who) => who,
             Err(why) => {
                 self.force_status = why;
                 cx.notify();
-                return;
+                return false;
             }
         };
         if !self.force.contains(unit_id) {
@@ -5049,6 +5134,7 @@ impl IslandDemo {
         self.force_status =
             format!("{name} staged locally \u{2014} move to preparation writes it");
         cx.notify();
+        true
     }
 
     /// A drop onto a host, WHILE PLANNING: put the hull aboard it in the
@@ -5058,13 +5144,13 @@ impl IslandDemo {
     /// operator's own seat, exactly as the bare-water drop does. The hull's
     /// own start is CLEARED: a hull aboard another has no position of its own,
     /// and a `Place` beside the `Embark` would be a claim the server refuses.
-    fn stage_embark_local(&mut self, host: i64, child: i64, name: &str, cx: &mut Context<Self>) {
+    fn stage_embark_local(&mut self, host: i64, child: i64, name: &str, cx: &mut Context<Self>) -> bool {
         let who = match self.own_commander() {
             Ok(who) => who,
             Err(why) => {
                 self.force_status = why;
                 cx.notify();
-                return;
+                return false;
             }
         };
         if !self.force.contains(child) {
@@ -5088,6 +5174,7 @@ impl IslandDemo {
         self.force_status =
             format!("{name} staged aboard {host} locally \u{2014} move to preparation writes it");
         cx.notify();
+        true
     }
 
     /// Embark a dragged hull aboard a placed host: latch the flight on the
@@ -5245,11 +5332,215 @@ impl IslandDemo {
     /// polls it). The fleet picker hides for the drag's lifetime so the
     /// drop can land anywhere on the map — a modal over the middle of the
     /// ocean is a wall between the hull and its water.
+    ///
+    /// The END clears what the drag was carrying: the entity and the row it
+    /// was hovering are true only of the gesture that just finished, and a
+    /// light left on after the release is a claim about a pointer that is
+    /// no longer there.
     fn set_dragging(&mut self, dragging: bool, cx: &mut Context<Self>) {
         if self.dragging != dragging {
             self.dragging = dragging;
+            if !dragging {
+                self.drag_entity = None;
+                self.drop_hover = None;
+            }
             cx.notify();
         }
+    }
+
+    /// Record what the pointer is carrying, the moment a source arms its
+    /// `on_drag`. `set_dragging(false, …)` clears it when the gesture ends —
+    /// one owner for the drag's lifetime, set by the source, cleared by the
+    /// poll, so neither can leave the other's half behind.
+    fn begin_drag(&mut self, entity: DragEntity, cx: &mut Context<Self>) {
+        self.drag_entity = Some(entity);
+        cx.notify();
+    }
+
+    /// Stage one drop, from wherever it landed. THE ONE PLACE A GESTURE
+    /// BECOMES AN ACT: the map's release, a row's release and a test all
+    /// arrive here with the same vocabulary, so the hover ink, the sound and
+    /// the staged draft all read the same [`crate::dnd::resolve_drop`] answer
+    /// and can never disagree about what the gesture meant.
+    fn handle_drop(&mut self, entity: &DragEntity, target: DropTarget, cx: &mut Context<Self>) {
+        let verdict = crate::dnd::resolve_drop(entity, &target);
+        self.apply_verdict(entity, verdict, cx);
+    }
+
+    /// Route one verdict through the shell's own staging verbs.
+    ///
+    /// Local-first is preserved by construction: `Deploy` and `Embark` go to
+    /// [`Self::drop_unit`], which stages while planning and posts otherwise;
+    /// `AssignCommander` goes to [`Self::stage_handover`] when the hull is
+    /// already drafted and to [`Self::stage_assign`] when it is not. A
+    /// `Refused` verdict is never staged — it says its sentence and buzzes.
+    ///
+    /// `landed` is the staging's own answer, not the verdict's: an accepted
+    /// verdict the shell then refuses locally (a drop with no seat) is a
+    /// buzz, because nothing was staged to ding about.
+    fn apply_verdict(&mut self, entity: &DragEntity, verdict: DropVerdict, cx: &mut Context<Self>) {
+        let landed = match verdict {
+            DropVerdict::Deploy { unit_id, fx, fy } => {
+                let name = self.hull_name(entity, unit_id);
+                self.drop_unit(unit_id, &name, fx, fy, None, cx)
+            }
+            DropVerdict::Embark { host, child } => {
+                let name = self.hull_name(entity, child);
+                // No fractions: a hull aboard another has no water of its
+                // own, and `drop_unit`'s embark arm never reads them.
+                self.drop_unit(child, &name, 0.0, 0.0, Some(host), cx)
+            }
+            DropVerdict::AssignCommander { unit_id, user_id } => {
+                let name = self.hull_name(entity, unit_id);
+                let who = self
+                    .crew_choices()
+                    .iter()
+                    .find(|(id, _)| *id == user_id)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_else(|| format!("seat {user_id}"));
+                let result = if self.force.contains(unit_id) {
+                    self.stage_handover(unit_id, user_id)
+                } else {
+                    self.stage_assign(unit_id, &name, user_id)
+                };
+                match result {
+                    Ok(()) => {
+                        self.force_status = format!("{name} handed to {who}");
+                        true
+                    }
+                    Err(why) => {
+                        self.force_status = why;
+                        false
+                    }
+                }
+            }
+            DropVerdict::Refused { why } => {
+                self.force_status = why;
+                false
+            }
+            // The task organisation is a later slice: the vocabulary answers,
+            // and the shell has no surface to stage it on. Say so out loud
+            // rather than swallow the gesture.
+            DropVerdict::Enlist { .. }
+            | DropVerdict::NestGroup { .. }
+            | DropVerdict::CommandGroup { .. } => {
+                self.force_status = "the task organisation is a later slice".to_string();
+                false
+            }
+        };
+        // The sound reads the SAME outcome the draft was given: a ding for a
+        // gesture that landed, a buzz for one the client refused. It is fired
+        // here, once, at the one seam between a verdict and its staging.
+        crate::sfx::play(drop_sound(landed));
+        cx.notify();
+    }
+
+    /// The display name a verdict needs for a hull. The carried entity names
+    /// itself when it IS the hull (a hull drag); otherwise the row's target
+    /// is looked up in the live register and then the draft, so a person
+    /// dropped onto a hull still stages it under the name the operator sees.
+    fn hull_name(&self, entity: &DragEntity, unit_id: i64) -> String {
+        if let DragEntity::Unit { unit_id: carried, name } = entity {
+            if *carried == unit_id {
+                return name.clone();
+            }
+        }
+        if let Some(p) = self.session.pieces.iter().find(|p| p.id == unit_id) {
+            return p.label.clone();
+        }
+        if let Some(h) = self.force.get(unit_id) {
+            return h.name.clone();
+        }
+        format!("#{unit_id}")
+    }
+
+    /// Give one entity row the whole drag-and-drop vocabulary: it arms a drag
+    /// (recording what the pointer carries), takes a hull or a person as a
+    /// drop, refuses a drop on itself, lights while it is the target with the
+    /// ink the verdict earns, and routes the release through the one
+    /// [`Self::handle_drop`]. Shared by the fleet picker's rows, the crew
+    /// island's piece rows and the players island's rows so three surfaces
+    /// cannot drift into three slightly different drop rules.
+    ///
+    /// `accent` is [`drop_ink`]'s answer for this row this frame — `Some` only
+    /// while the row is the target under the pointer.
+    fn take_entity_drop<E>(
+        el: E,
+        payload: UnitDragPayload,
+        target: DropTarget,
+        ghost: (String, MapSymbolShape, Option<Arc<gpui::RenderImage>>),
+        accent: Option<Rgba>,
+        cx: &mut Context<Self>,
+    ) -> E
+    where
+        // `ParentElement`/`IntoElement` are separate traits in this toolkit:
+        // the row is both parented (the drill row hangs its banner and verbs
+        // off the returned element) and parented-to (`col.child(row)`), so
+        // both bounds are needed or the generic stops being a Div chain.
+        E: InteractiveElement + Styled + ParentElement + IntoElement + Sized,
+    {
+        let weak = cx.entity().downgrade();
+        let demo = cx.entity();
+        let (ghost_name, ghost_symbol, ghost_thumb) = ghost;
+        let mut el = el
+            .on_drag(payload, move |p: &UnitDragPayload, _, _, app| {
+                let entity = p.entity.clone();
+                let _ = weak.update(app, |view, cx| view.begin_drag(entity, cx));
+                app.new(|_| DragGhost {
+                    name: ghost_name.clone(),
+                    symbol: ghost_symbol,
+                    thumb: ghost_thumb.clone(),
+                })
+            })
+            // Take a hull or a person; refuse a drop on the row's own entity.
+            .can_drop({
+                let target = target.clone();
+                move |v, _, _| {
+                    v.downcast_ref::<UnitDragPayload>().is_some_and(|p| {
+                        matches!(
+                            p.entity,
+                            DragEntity::Unit { .. } | DragEntity::Player { .. }
+                        ) && !drops_on_itself(&p.entity, &target)
+                    })
+                }
+            })
+            .on_drop({
+                let target = target.clone();
+                move |payload: &UnitDragPayload, _, app| {
+                    let entity = payload.entity.clone();
+                    let target = target.clone();
+                    let _ = demo
+                        .update(app, |view, cx| view.handle_drop(&entity, target.clone(), cx));
+                }
+            })
+            // GPUI forces hover false for the whole drag (`is_hovered` is
+            // guarded by `!has_active_drag`), so this only ever clears a
+            // light the move hook below left on.
+            .on_hover(cx.listener({
+                let target = target.clone();
+                move |view, hot: &bool, _, cx| {
+                    if !*hot && view.drop_hover.as_ref() == Some(&target) {
+                        view.drop_hover = None;
+                        cx.notify();
+                    }
+                }
+            }))
+            // The light's one setter during a drag: a move listener fires for
+            // the row it is over, and that row's own `is_hovered` decided it —
+            // the hook GPUI gives us while `on_hover` is suppressed.
+            .on_mouse_move(cx.listener({
+                let target = target.clone();
+                move |view, _: &MouseMoveEvent, _, cx| {
+                    if view.dragging && view.drop_hover.as_ref() != Some(&target) {
+                        view.drop_hover = Some(target.clone());
+                        cx.notify();
+                    }
+                }
+            }));
+        if let Some(ink) = accent {
+            el = el.border(px(1.0)).border_color(rgba(ink));
+        }
+        el
     }
 
     /// Arm click-to-place for a drafted hull: the next map click that stays
@@ -9733,6 +10024,22 @@ impl Render for IslandDemo {
                 view.pointer = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
                 cx.notify();
             }))
+            // THE ONE PRIMARY-CLICK HOOK. This listener sits on the console's
+            // root — the outermost element, the ancestor of every hitbox — so
+            // GPUI's bubble dispatch delivers a primary press to it ONCE,
+            // wherever the press landed, and the click sound needs no call
+            // site of its own. A press that becomes a drag plays it too,
+            // which is honest: the operator did press.
+            //
+            // The honesty to keep: GPUI truncates hover at a
+            // `block_mouse_except_scroll` edge (the island panels and the
+            // picker card use it to stop the map behind them taking the
+            // pointer), so a press INSIDE one of those cards does not reach
+            // this hitbox and is not heard. Over bare map and the chrome
+            // outside the panels, it is.
+            .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, _| {
+                crate::sfx::play(crate::sfx::Sfx::Click);
+            })
             .child(
                 // The map surface (U6), painted first so it sits behind
                 // every piece of chrome. `Fill` (not `Contain`): this is a
@@ -9837,12 +10144,14 @@ impl Render for IslandDemo {
                             cx.notify();
                         }
                     }))
-                    // The drop side of the picker's drag: a hull released
-                    // over bare map deploys there. The predicate names the
-                    // payload type, so stray drags (there are no others yet,
-                    // but the zone grip will grow one) never land here. The
-                    // handler runs without the view, so it re-enters through
-                    // the entity — the same re-entry every drain uses.
+                    // The drop side of the map: an entity released over the
+                    // map. The target is built from the same hit-test the
+                    // whole vocabulary is: a placed hull's marker under the
+                    // release makes a `Unit { host }` target, bare water makes
+                    // `Map { fx, fy }`. Both go through `resolve_drop`, so the
+                    // map's drop is one row of the matrix rather than a second
+                    // rule. The handler runs without the view, so it re-enters
+                    // through the entity — the same re-entry every drain uses.
                     .can_drop(|v, _, _| v.is::<UnitDragPayload>())
                     .on_drop({
                         let demo = cx.entity();
@@ -9855,17 +10164,17 @@ impl Render for IslandDemo {
                             let at = window.mouse_position();
                             let fx = f64::from((f32::from(at.x) / w).clamp(0.0, 1.0));
                             let fy = f64::from((f32::from(at.y) / h).clamp(0.0, 1.0));
-                            let unit_id = payload.unit_id;
-                            let unit_name = payload.name.clone();
+                            let entity = payload.entity.clone();
                             let _ = demo.update(app, |view, cx| {
-                                // A drop on a host embarks; anywhere else
-                                // deploys — and a hull outside the exercise
-                                // is assigned on the way in, because placing
-                                // IS assigning. The host is the nearest
-                                // placed piece's marker, so a drop between
-                                // hulls still names water, not a neighbour.
-                                let host = view.drop_host_at(fx, fy);
-                                view.drop_unit(unit_id, &unit_name, fx, fy, host, cx);
+                                let target = match view.drop_host_at(fx, fy) {
+                                    Some(host) => DropTarget::Unit { unit_id: host },
+                                    None => DropTarget::Map { fx, fy },
+                                };
+                                // `resolve_drop` decides: a hull on a host
+                                // embarks, on bare water deploys, and a person
+                                // on the map is refused with its sentence. The
+                                // shell only stages what comes back.
+                                view.handle_drop(&entity, target, cx);
                             });
                         }
                     })
@@ -12015,11 +12324,20 @@ pub struct FleetTaxLeaf {
     pub symbol: MapSymbolShape,
 }
 
-/// What a fleet-picker leaf row carries when dragged: the hull's id, its
-/// name for the ghost, and its glyph. `Clone` because the drop side reads
-/// the same value the source armed — one value, two readers, no re-lookup.
+/// What a source row carries when dragged: the hull's id, its name for the
+/// ghost, and its glyph — plus the semantic [`DragEntity`] every drop reads.
+/// `Clone` because the drop side reads the same value the source armed — one
+/// value, two readers, no re-lookup.
+///
+/// The ghost's half (`unit_id`/`symbol`/`thumb`) is how the drag LOOKS; the
+/// `entity` is what it MEANS, and it is the only half [`crate::dnd`] reads.
+/// The two travel together because a drag that looked like a hull but meant a
+/// person would be the exact lie this vocabulary exists to remove.
 #[derive(Clone, Debug)]
 pub struct UnitDragPayload {
+    /// The id Minos files this source under — a hull id, or a person's user
+    /// id when the payload carries a seat. Travels with the ghost; the
+    /// MEANING is `entity`, and no drop reads this.
     pub unit_id: i64,
     pub name: String,
     pub symbol: MapSymbolShape,
@@ -12027,6 +12345,8 @@ pub struct UnitDragPayload {
     /// shows the same face the row does. An `Arc`, so the drag shares the
     /// shell's copy rather than the bytes.
     pub thumb: Option<Arc<gpui::RenderImage>>,
+    /// What the drag means to the drop vocabulary.
+    pub entity: DragEntity,
 }
 
 impl UnitDragPayload {
@@ -12034,12 +12354,83 @@ impl UnitDragPayload {
     /// embarkations under, with the row's own display values along for the
     /// ghost. Pure, so the harness pins it without a pointer.
     fn for_leaf(leaf: &FleetTaxLeaf, thumb: Option<Arc<gpui::RenderImage>>) -> Self {
+        let unit_id = leaf.id.parse::<i64>().unwrap_or(-1);
         UnitDragPayload {
-            unit_id: leaf.id.parse::<i64>().unwrap_or(-1),
+            unit_id,
             name: leaf.name.clone(),
             symbol: leaf.symbol,
             thumb,
+            entity: DragEntity::Unit {
+                unit_id,
+                name: leaf.name.clone(),
+            },
         }
+    }
+
+    /// The payload a person's row arms: a seat, not a piece, so it carries no
+    /// glyph and no photograph — the Dot is the honest placeholder and the
+    /// name is the whole of what a person's drag has to say.
+    fn for_person(user_id: i64, name: &str) -> Self {
+        UnitDragPayload {
+            unit_id,
+            name: name.to_string(),
+            symbol: MapSymbolShape::Dot,
+            thumb: None,
+            entity: DragEntity::Player {
+                user_id,
+                name: name.to_string(),
+            },
+        }
+    }
+}
+
+/// Whether a drop would land on the very entity the pointer carries — the
+/// one gesture a row does not accept, so a hull never embarks on itself and a
+/// person never commands themselves. The analogue of the refusal
+/// [`crate::dnd::resolve_drop`] writes; here it only decides whether the row
+/// takes the gesture at all.
+fn drops_on_itself(entity: &DragEntity, target: &DropTarget) -> bool {
+    match (entity, target) {
+        (DragEntity::Unit { unit_id, .. }, DropTarget::Unit { unit_id: host }) => unit_id == host,
+        (DragEntity::Player { user_id, .. }, DropTarget::Player { user_id: other }) => user_id == other,
+        (DragEntity::Group { group_id, .. }, DropTarget::Group { group_id: other }) => {
+            group_id == other
+        }
+        _ => false,
+    }
+}
+
+/// The ink a row paints while it is the drop target under the pointer:
+/// [`SIGNAL_GREEN`] when the drop would LAND, [`FAULT_RED`] when it would be
+/// refused, `None` when this row is not the target. It reads the SAME
+/// [`crate::dnd::resolve_drop`] answer the drop stages and the sound plays,
+/// which is the whole point: a light that predicts something other than what
+/// the release does would be worse than no light.
+fn drop_ink(
+    hover: Option<&DropTarget>,
+    entity: Option<&DragEntity>,
+    target: &DropTarget,
+) -> Option<Rgba> {
+    if hover != Some(target) {
+        return None;
+    }
+    let accept = entity
+        .map(|e| crate::dnd::resolve_drop(e, target).accepted())
+        .unwrap_or(false);
+    Some(if accept { SIGNAL_GREEN } else { FAULT_RED })
+}
+
+/// The sound a verdict's staging earns: a ding for a gesture that landed, a
+/// buzz for one the client refused. Split from [`IslandDemo::apply_verdict`]
+/// so the harness can pin WHICH sound without an audio device — the sfx module
+/// is fire-and-forget and a silent machine is a passing test either way, so the
+/// decision is what a test can honestly assert, and the verdict is what it
+/// reads.
+fn drop_sound(landed: bool) -> crate::sfx::Sfx {
+    if landed {
+        crate::sfx::Sfx::Ding
+    } else {
+        crate::sfx::Sfx::Buzz
     }
 }
 
@@ -13805,6 +14196,193 @@ mod tests {
             );
             assert!(!demo.force.contains(1), "and the hull never joined the draft");
         });
+    }
+
+    /// A planning session with the operator seated and one more seat to hand
+    /// a hull to. The shared setup of the drop tests below.
+    fn drop_session() -> SessionView {
+        let seat = |id: i64, name: &str, call_sign: &str| PersonView {
+            id,
+            name: name.to_string(),
+            call_sign: call_sign.to_string(),
+            role: "Commando".to_string(),
+            role_id: 19,
+            judge: false,
+            ready: false,
+            present: true,
+        };
+        SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            people: vec![
+                seat(2, "Super User", "SUPERUSER"),
+                seat(3, "Second Seat", "SECOND"),
+            ],
+            ..SessionView::default()
+        }
+    }
+
+    /// The entity a hull row carries: the semantic half, which is all
+    /// `resolve_drop` reads.
+    fn carried(unit_id: i64, name: &str) -> DragEntity {
+        DragEntity::Unit {
+            unit_id,
+            name: name.to_string(),
+        }
+    }
+
+    /// A hull dropped on a PERSON'S ROW is an assignment: one verdict
+    /// (`AssignCommander`), read by the row's hover ink, the release's sound
+    /// and the staging alike. While planning it stages locally and posts
+    /// nothing — the advance is what writes the draft through.
+    #[gpui::test]
+    fn a_drop_on_a_person_row_hands_the_hull_over(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, drop_session(), tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.handle_drop(
+                    &carried(1, "KRI Ahmad Yani"),
+                    DropTarget::Player { user_id: 3 },
+                    cx,
+                )
+            })
+        });
+        assert!(
+            rx.try_recv().is_err(),
+            "planning stages: the hand-over posts nothing"
+        );
+        cx.update(|_window, app| {
+            let demo = view.read(app);
+            assert_eq!(
+                demo.force.get(1).and_then(|h| h.commander_id),
+                Some(3),
+                "the hull joined the draft under the seat it was dropped on"
+            );
+            assert!(
+                demo.force_status.contains("Second Seat"),
+                "the line names the person it was handed to: {}",
+                demo.force_status
+            );
+        });
+    }
+
+    /// A hull dropped on ANOTHER HULL's row embarks it — the same verdict the
+    /// map's own release builds when it lands near a placed marker, driven
+    /// through the one `handle_drop` so a row and the map cannot drift into
+    /// two slightly different drop rules.
+    #[gpui::test]
+    fn a_drop_on_a_unit_row_embarks_the_hull(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, drop_session(), tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.handle_drop(
+                    &carried(1, "KRI Ahmad Yani"),
+                    DropTarget::Unit { unit_id: 8 },
+                    cx,
+                )
+            })
+        });
+        assert!(
+            rx.try_recv().is_err(),
+            "planning stages: the embark posts nothing"
+        );
+        cx.update(|_window, app| {
+            let hull = view
+                .read(app)
+                .force
+                .get(1)
+                .cloned()
+                .expect("the child joined the draft");
+            assert_eq!(hull.host, Some(8), "staged aboard the row it was dropped on");
+            assert_eq!(
+                hull.start, None,
+                "a hull aboard another has no start of its own"
+            );
+            assert_eq!(hull.commander_id, Some(2), "assigned to the operator's own seat");
+        });
+    }
+
+    /// A REFUSED gesture is a verdict too. A hull dropped on its own row is
+    /// refused in the vocabulary's own words, stages nothing and posts
+    /// nothing — the buzz it earns is honest because the hover ink read the
+    /// same refusal before the release.
+    #[gpui::test]
+    fn a_refused_drop_stages_nothing_and_says_why(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, drop_session(), tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.handle_drop(
+                    &carried(1, "KRI Ahmad Yani"),
+                    DropTarget::Unit { unit_id: 1 },
+                    cx,
+                )
+            })
+        });
+        assert!(rx.try_recv().is_err(), "a refusal spends no round trip");
+        cx.update(|_window, app| {
+            let demo = view.read(app);
+            assert!(
+                demo.force_status.contains("itself"),
+                "the refusal says its own sentence: {}",
+                demo.force_status
+            );
+            assert!(!demo.force.contains(1), "and nothing joined the draft");
+        });
+    }
+
+    /// The ink a hovered row paints IS the verdict it would stage, read
+    /// through the same `resolve_drop` — green when the drop would land, red
+    /// when it would be refused — and a row never lights for a drop it does
+    /// not take at all. The SOUND is read off the same verdict, so the light
+    /// and the release's ding or buzz can never disagree either. Pure, so all
+    /// three are pinned without a pointer or a speaker.
+    #[test]
+    fn the_highlight_and_the_refusal_read_one_verdict() {
+        let unit = carried(1, "KRI Ahmad Yani");
+        let other = DropTarget::Unit { unit_id: 8 };
+        let itself = DropTarget::Unit { unit_id: 1 };
+        assert_eq!(drop_ink(None, Some(&unit), &other), None, "no ink off the row");
+        assert_eq!(
+            drop_ink(Some(&other), Some(&unit), &other),
+            Some(SIGNAL_GREEN),
+            "a drop that would land lights the accept ink"
+        );
+        assert_eq!(
+            drop_ink(Some(&itself), Some(&unit), &itself),
+            Some(FAULT_RED),
+            "a drop the vocabulary refuses lights the refuse ink"
+        );
+        let landed = crate::dnd::resolve_drop(&unit, &other);
+        assert!(landed.accepted(), "the drop onto the other hull lands");
+        assert!(
+            matches!(drop_sound(landed.accepted()), crate::sfx::Sfx::Ding),
+            "the landing dings"
+        );
+        let refused = crate::dnd::resolve_drop(&unit, &itself);
+        assert!(
+            !refused.accepted(),
+            "and the refuse ink is the same answer the staging reads"
+        );
+        assert!(
+            matches!(drop_sound(refused.accepted()), crate::sfx::Sfx::Buzz),
+            "a refused gesture buzzes"
+        );
+        assert!(
+            drops_on_itself(&unit, &itself),
+            "a row does not take a drop on its own entity"
+        );
+        assert!(!drops_on_itself(&unit, &other));
     }
 
     /// A staged start becomes a planned marker: projected from the draft's own
