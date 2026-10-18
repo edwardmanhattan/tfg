@@ -806,3 +806,72 @@ flaky launch that never rendered. `xdrv focus` only looked for the *egui*
 window, so against every GPUI build it answered "no egui window" and did
 nothing. It now falls back to the `tfg` window, and the first thing a driven run
 should do after `xdrv list` prints an id is `xdrv focus`.
+
+## The GPUI shell, fifth pass: why the hulls were blurry, and a door that centres one
+
+Two reports off a driven window at `z18`: the hull picture is very blurry, and
+the ships face the wrong way. A third ask: a per-row control on the Fleet island
+that frames that hull.
+
+**The blur had one cause and it was ours.** `spawn_thumb_fetch` decoded each
+picture with `img.thumbnail(192, 192)` — a real thumbnail, kept from when the
+only consumer was a picker row. The map, meanwhile, paints the picture at the
+hull's REAL size: a 120 m destroyer at the console's own `ZOOM_MAX` (18) is
+about 400 px long, so a 192 px bitmap was upscaled 2x exactly when the operator
+zoomed in to look at it. The fix is to keep the picture's own resolution, capped
+at 2048 px on the long side so a 6000 px upload cannot cost tens of megabytes per
+hull; the rows, the ghost and the banner downscale it themselves. Confirmed on a
+capture at `z18`: the box is 1:1 with the 400 px source and there is no
+interpolation left to see.
+
+**A picture's own orientation is now applied on decode.** `image::load_from_memory`
+ignores EXIF `Orientation` by design, so a photograph stored as "rotate 90" —
+the normal way a phone or a camera records that it was turned — decoded on its
+side, and every consumer inherited it. A top-down ship on its side on a north-up
+chart reads as a hull steaming north, which looks like a projection bug and is
+not one. `decode_picture` now reads the tag off the decoder and applies it once,
+before the picture goes anywhere. Pinned by a test that encodes a PNG with a
+hand-built EXIF block (`Orientation = 6`) and asserts the decoded dimensions are
+the quarter-turned pair, plus the no-tag and "orientation 1" cases that must be
+no-ops.
+
+**Rotation to the hull's course is NOT implemented, and this is why.** The egui
+client rotated the photograph to the hull's heading through `rotated_unit_quad`.
+GPUI 0.2.2 offers no equivalent at paint time: `Window::paint_image` takes only
+`bounds`, `corner_radii`, the image and a frame index — the scene's
+`PolychromeSprite` has no transformation field, and the only element that can
+rotate is `svg` (`with_rotation`). So the map draws each picture on the asset's
+own axis, and a hull whose course is not that axis is drawn the wrong way round.
+Doing it properly means rotating the raster on the CPU into an axis-aligned
+bounding-box sprite and caching it per hull and course bucket — real work, and
+unverifiable on this machine, because the fix feed is empty here (no live wire)
+and a staged hull carries no heading at all. `IMAGE_FORWARD_HEADING_DEG` (bow to
+the right) is the axis convention it would have to honour. Left for a decision
+rather than done half-way.
+
+**The fleet row's focus door.** Each piece row now carries a reticle at the row's
+right end (between the name and the placed/unplaced word) that asks the camera to
+frame THAT hull. `piece_ground` answers "where is it": the fix when the wire has
+reported one, otherwise the start the operator staged; the mark is drawn dimmed
+and takes no click for a hull with neither, because a door that frames `(0, 0)` is
+a lie about where the hull is. `jump_to_selection` (the Inspector's `Centre`) is
+now the same verb addressed by hull, so the two cannot disagree.
+
+**And a sign error that had been hiding the whole feature.** The binary's jump
+handler unprojected `mw/2 + shift_px` from the hull, which moves the camera
+*toward* the hull's east and parks the hull `shift` pixels to the WEST of the
+frame centre — under the floating zone, which is the half of the frame the shift
+exists to clear. Both the Inspector's `Centre` and the new focus door therefore
+appeared to do nothing at all: the camera moved, and the hull it should have
+framed sat behind the column, invisible. The shift is the CONTENT's move, so the
+camera moves the other way (`mw/2 - shift`). `jump_goal` is now a named function
+with a test that projects the hull back through the goal and asserts it lands on
+the visible centre for a left dock, a right dock and no dock.
+
+Verified on the private display: the door was clicked at `z18` and the hull
+appeared at `x = 560` — the frame's centre (380) plus the 180 px the left dock
+shifts content by — with its picture at native resolution.
+
+`cargo test --lib`: 546 pass, the same four pre-existing failures.
+`cargo test --bin tfg`: 5 pass, two of them new (the EXIF decode and the jump
+sign).

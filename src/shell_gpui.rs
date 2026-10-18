@@ -469,9 +469,11 @@ struct IslandDemo {
     /// hull, built once by the binary off the synced mirror. Empty on
     /// fixture runs — the picker falls back to its flat register list.
     pub fleet_tax: FleetTaxonomy,
-    /// Hull photographs, minted on first paint as the fetcher lands them.
-    /// The glyph draws until the photo arrives — progressive fill, and a
-    /// hull with no picture keeps its glyph, which is the honest fallback.
+    /// Hull photographs, minted on first paint as the fetcher lands them, at
+    /// the picture's own resolution — the map sizes them by the hull's real
+    /// dimensions, so a thumbnail-sized copy would be a blurred hull at high
+    /// zoom. The glyph draws until the photo arrives — progressive fill, and
+    /// a hull with no picture keeps its glyph, which is the honest fallback.
     thumbs: HashMap<i64, Arc<gpui::RenderImage>>,
     /// The published length and beam of each pictured hull, in metres, keyed
     /// the same way. Carried beside the photograph because the manifest that
@@ -692,6 +694,56 @@ fn close_cross(hot: bool) -> impl IntoElement {
             path.line_to(point(cx - d, cy + d));
             if let Ok(path) = path.build() {
                 window.paint_path(path, rgba(ink));
+            }
+        },
+    )
+    .size_full()
+}
+
+/// The Fleet row's focus door: a reticle, at row size.
+///
+/// The same mark the map puts on the SELECTED hull, shrunk to a control: a
+/// ring with four ticks and a centre dot. Drawn rather than typed because the
+/// console's face has no crosshair glyph — the same reason the island close is
+/// a painted cross and not `✕`.
+///
+/// `enabled` is the hull's own answer to "is there a ground to centre on": a
+/// hull that has neither reported nor been placed has nothing to frame, and the
+/// mark dims rather than pretending the button would do something.
+fn focus_glyph(enabled: bool) -> impl IntoElement {
+    let ink = if enabled {
+        rgba(BODY_SILVER)
+    } else {
+        rgba(BODY_SILVER.with_alpha(70))
+    };
+    canvas(
+        |bounds, _, _| bounds,
+        move |bounds, _, window, _| {
+            let cx = bounds.origin.x + bounds.size.width / 2.0;
+            let cy = bounds.origin.y + bounds.size.height / 2.0;
+            let r = px(4.0);
+            let mut path = PathBuilder::stroke(px(1.2));
+            // A ring, as two half arcs: the path builder has no circle.
+            path.move_to(point(cx + r, cy));
+            path.arc_to(point(r, r), px(0.0), false, true, point(cx - r, cy));
+            path.arc_to(point(r, r), px(0.0), false, true, point(cx + r, cy));
+            // Four ticks, so the mark still reads as a reticle at 15 px; a
+            // bare ring this small is a dot.
+            for (dx, dy) in [(1.0f32, 0.0f32), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                path.move_to(point(cx + px(dx * 4.6), cy + px(dy * 4.6)));
+                path.line_to(point(cx + px(dx * 6.2), cy + px(dy * 6.2)));
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, ink);
+            }
+            let d = px(1.0);
+            let mut dot = PathBuilder::fill();
+            dot.move_to(point(cx - d, cy - d));
+            dot.line_to(point(cx + d, cy - d));
+            dot.line_to(point(cx + d, cy + d));
+            dot.line_to(point(cx - d, cy + d));
+            if let Ok(dot) = dot.build() {
+                window.paint_path(dot, ink);
             }
         },
     )
@@ -1797,23 +1849,55 @@ impl IslandDemo {
 
     /// Centre the map on the SELECTED hull — the console's `request_frame`.
     ///
-    /// Returns false (and sends nothing) when the selection has no fix: a
-    /// hull that has never reported has no ground to centre on, and asking
-    /// the map thread to frame `(0, 0)` would be a lie about where it is.
-    /// The shift compensates the floating zone (`camera_centre_shift`), so a
+    /// Returns false (and sends nothing) when the selection has no ground: a
+    /// hull that has neither reported nor been placed is nowhere, and asking
+    /// the map thread to frame `(0, 0)` would be a lie about where it is. The
+    /// shift compensates the floating zone (`camera_centre_shift`), so a
     /// centred hull lands on the VISIBLE middle rather than under the chrome.
     fn jump_to_selection(&mut self, cx: &mut Context<Self>) -> bool {
-        let fix = self
+        let Some(unit_id) = self
             .roster
             .get(self.selected)
-            .and_then(|r| self.live.iter().find(|m| m.id == r.unit_id));
-        let Some(m) = fix else {
+            .and_then(|r| r.unit_id.parse::<i64>().ok())
+        else {
+            return false;
+        };
+        self.jump_to_piece(unit_id, cx)
+    }
+
+    /// The ground a hull is known to be at: its fix when the wire has reported
+    /// one, and otherwise the start the operator staged on the map.
+    ///
+    /// `None` is a real answer and not a missing one: a hull that has neither
+    /// reported nor been placed is nowhere, and framing it would frame `(0,0)`.
+    fn piece_ground(&self, unit_id: i64) -> Option<(f64, f64)> {
+        self.live
+            .iter()
+            .find(|m| m.id == unit_id.to_string())
+            .map(|m| (m.latitude, m.longitude))
+            .or_else(|| {
+                self.force
+                    .get(unit_id)
+                    .and_then(|h| h.start)
+                    .map(|s| (s.lat, s.lon))
+            })
+    }
+
+    /// Centre the map on ONE hull — the Fleet island's per-row focus door.
+    ///
+    /// The same ask as `jump_to_selection`, addressed by hull rather than by
+    /// roster position, because the fleet row is where the operator is looking
+    /// when they lose a hull on a 400-pixel ocean. A hull with no ground
+    /// (neither a fix nor a staged start) sends nothing and says so by
+    /// returning false; the row draws its door inert for exactly those hulls.
+    fn jump_to_piece(&mut self, unit_id: i64, cx: &mut Context<Self>) -> bool {
+        let Some((lat, lon)) = self.piece_ground(unit_id) else {
             return false;
         };
         let shift_px = camera_centre_shift(self.zone_w, self.side_dock_left, !self.show_side_zone);
         let _ = self.order_tx.send(ToBinary::Jump {
-            lat: m.latitude,
-            lon: m.longitude,
+            lat,
+            lon,
             shift_px,
         });
         cx.notify();
@@ -3999,6 +4083,31 @@ impl IslandDemo {
                     name: p.label.clone(),
                 },
             };
+            // The focus door: centre the map on THIS hull. A hull the
+            // console has no ground for — never reported, never placed —
+            // draws the mark dimmed and takes no click, because a button that
+            // frames `(0, 0)` is a lie about where the hull is.
+            let ground = self.piece_ground(pid).is_some();
+            let focus: AnyElement = if ground {
+                div()
+                    .id(("fleet-focus", pid as usize))
+                    .cursor_pointer()
+                    .w(px(15.0))
+                    .h(px(15.0))
+                    .flex_shrink_0()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.jump_to_piece(pid, cx);
+                    }))
+                    .child(focus_glyph(true))
+                    .into_any_element()
+            } else {
+                div()
+                    .w(px(15.0))
+                    .h(px(15.0))
+                    .flex_shrink_0()
+                    .child(focus_glyph(false))
+                    .into_any_element()
+            };
             let row = div()
                 .flex()
                 .flex_row()
@@ -4020,6 +4129,7 @@ impl IslandDemo {
                         .text_color(rgba(MAP_INK))
                         .child(p.label.clone()),
                 )
+                .child(focus)
                 .child(
                     div()
                         .text_size(px(10.5))
@@ -12712,10 +12822,12 @@ pub fn fixture_roster() -> Vec<RosterRow> {
 }
 
 /// One decoded hull photograph from the background fetch: the unit plus
-/// straight-alpha RGBA bytes at thumbnail size, and the hull's published
-/// length and beam. Decoded off-thread (the shell only ever sees bytes);
-/// the `RenderImage` is minted on first paint, the same raw path the map
-/// frames take.
+/// straight-alpha RGBA bytes at the picture's own resolution (capped, see
+/// `spawn_thumb_fetch`), and the hull's published length and beam. Decoded
+/// off-thread (the shell only ever sees bytes); the `RenderImage` is minted
+/// on first paint, the same raw path the map frames take. Resolution is
+/// load-bearing: the map paints this at the hull's real size, so a shrunken
+/// fetch is a blurred hull at high zoom.
 ///
 /// The dimensions ride WITH the picture because the manifest that declares a
 /// photograph also declares the measurements Minos published for the hull,
@@ -15330,6 +15442,77 @@ mod tests {
             ToBinary::Jump { shift_px, .. } => {
                 assert_eq!(shift_px, -180.0, "a right dock shifts content left");
             }
+            other => panic!("expected a jump, got {other:?}"),
+        }
+    }
+
+    /// The Fleet row's focus door frames the hull it sits on: the fix when
+    /// the wire has one, the operator's staged start otherwise — and nothing
+    /// at all for a hull with no ground, which is the state the row draws the
+    /// mark dimmed for.
+    #[gpui::test]
+    fn the_fleet_focus_door_frames_its_own_hull(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo =
+                IslandDemo::new(fixture_roster(), 8, 0, SessionView::default(), tx);
+            demo.map_dims = (1000.0, 1000.0);
+            demo.map_center = (0.0, 0.0);
+            demo.map_render_zoom = 11.0;
+            // Hull 1 is deployed but has no fix: the operator placed it.
+            demo.force.upsert(crate::force::DraftHull {
+                unit_id: 1,
+                name: "KRI Ahmad Yani".to_string(),
+                hull_number: String::new(),
+                class_id: String::new(),
+                start: Some(crate::force::Start {
+                    lat: -6.108,
+                    lon: 106.91,
+                }),
+                commander_id: None,
+                host: None,
+            });
+            demo
+        });
+        assert!(
+            cx.update(|_window, app| view.update(app, |demo, cx| demo.jump_to_piece(1, cx))),
+            "a placed hull has a ground to frame"
+        );
+        match rx.try_recv().expect("the staged ground reached the sink") {
+            ToBinary::Jump { lat, lon, shift_px } => {
+                assert_eq!((lat, lon), (-6.108, 106.91));
+                assert_eq!(shift_px, 180.0, "the left dock shifts content right");
+            }
+            other => panic!("expected a jump, got {other:?}"),
+        }
+        // A hull that is nowhere sends nothing: the door is inert on that row.
+        assert!(
+            !cx.update(|_window, app| view.update(app, |demo, cx| demo.jump_to_piece(2, cx))),
+            "no ground, no jump"
+        );
+        assert!(rx.try_recv().is_err(), "and nothing reached the sink");
+        // The wire wins when it has a fix: the hull has moved since it was
+        // placed, and the live picture is the truth about where it is.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.live.push(LiveMarker {
+                    id: "1".to_string(),
+                    x: 0.0,
+                    y: 0.0,
+                    stale: false,
+                    symbol: MapSymbolShape::Frigate,
+                    affiliation: symbology::Affiliation::Unknown,
+                    heading_deg: Some(90.0),
+                    speed_kn: Some(12.0),
+                    latitude: -7.88,
+                    longitude: 112.54,
+                    trail: 3,
+                });
+            })
+        });
+        assert!(cx.update(|_window, app| view.update(app, |demo, cx| demo.jump_to_piece(1, cx))));
+        match rx.try_recv().expect("the fix reached the sink") {
+            ToBinary::Jump { lat, lon, .. } => assert_eq!((lat, lon), (-7.88, 112.54)),
             other => panic!("expected a jump, got {other:?}"),
         }
     }

@@ -386,14 +386,7 @@ fn main() {
                         // lands on the visible middle, not under the zone.
                         let (mw, mh) = (tfg::map_render::MAP_W, tfg::map_render::MAP_H);
                         let zoom = camera2.lock().map(|c| c.2).unwrap_or(tfg::map_render::MAP_ZOOM);
-                        let goal = tfg::map_render::unproject_mercator(
-                            mw / 2.0 + f64::from(shift_px),
-                            mh / 2.0,
-                            (lat, lon),
-                            zoom,
-                            mw,
-                            mh,
-                        );
+                        let goal = jump_goal(lat, lon, shift_px, zoom, mw, mh);
                         if let Ok(mut cam) = camera2.lock() {
                             *cam = (goal.0, goal.1, zoom);
                         }
@@ -1753,11 +1746,64 @@ fn main() {
     );
 }
 
+/// Decode a unit picture, honouring the orientation its own metadata declares.
+///
+/// A photograph from a camera carries an EXIF `Orientation` tag instead of
+/// rotating its pixels (JPEG's most common encoding of "this was shot
+/// sideways"), and `image::load_from_memory` deliberately ignores it — the tag
+/// is metadata, and decoding does what the bytes say. A top-down shot stored
+/// as "rotate 90" therefore decodes on its side, and a hull on its side on a
+/// north-up chart reads as a hull steaming north when it is not. That looks
+/// like a projection bug and is not one.
+///
+/// The tag is part of what the pixels MEAN, so it is applied here, once, before
+/// the picture goes anywhere: every consumer downstream (the map, the picker's
+/// rows, the drag ghost) then shares one upright frame.
+///
+/// A format without an orientation tag decodes exactly as before: PNG says
+/// `NoTransforms`, and so does a JPEG that carries none.
+fn decode_picture(bytes: &[u8]) -> Option<image::DynamicImage> {
+    use image::ImageDecoder as _;
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
+    Some(img)
+}
+
+/// The camera centre that puts a hull on the map's VISIBLE centre.
+///
+/// `shift_px` is the shell's `camera_centre_shift`: how far the CONTENT moves to
+/// clear the floating zone, positive to the right for a left dock. The camera
+/// therefore moves the other way — a hull that must appear 180 px right of the
+/// frame centre is one whose camera sits 180 px to its WEST. Unprojecting
+/// `mw/2 + shift` would move the camera east and park the hull UNDER the zone,
+/// which is exactly the half of the frame the shift exists to clear; that sign
+/// error made the Inspector's `Centre` and the Fleet row's focus door look like
+/// they did nothing at all, when both were centring the hull behind the column.
+fn jump_goal(lat: f64, lon: f64, shift_px: f32, zoom: f64, w: f64, h: f64) -> (f64, f64) {
+    tfg::map_render::unproject_mercator(
+        w / 2.0 - f64::from(shift_px),
+        h / 2.0,
+        (lat, lon),
+        zoom,
+        w,
+        h,
+    )
+}
+
 /// Hull photographs, fetched off-thread: the manifest says which hulls
 /// have pictures, one presigned URL per hull resolves the bytes, and each
-/// decoded thumbnail rides the channel the moment it lands — the picker
-/// fills in progressively while the glyphs hold the rows. Memory only (no
-/// disk cache yet); a hull with no picture costs no request.
+/// decoded picture rides the channel the moment it lands — the picker fills
+/// in progressively while the glyphs hold the rows. The picture keeps its own
+/// resolution (see the cap below): the map paints it at the hull's real size,
+/// so a thumbnail-sized copy would be a blurred hull at high zoom. Memory only
+/// (no disk cache yet); a hull with no picture costs no request.
 ///
 /// Runs at startup AND after every sign-in: a launch without credentials
 /// fetches nothing, and a card sign-in later must not leave the rows
@@ -1795,17 +1841,40 @@ fn spawn_thumb_fetch(
             };
             let bytes = dl.get(&url).send().and_then(|r| r.bytes());
             let Ok(bytes) = bytes else { continue };
-            let Ok(img) = image::load_from_memory(&bytes) else {
+            let Some(img) = decode_picture(&bytes) else {
                 continue;
             };
-            let small = img.thumbnail(192, 192).to_rgba8();
-            let (w, h) = (small.width(), small.height());
+            // The picture keeps its OWN resolution, capped only so a huge
+            // upload cannot cost tens of megabytes per hull.
+            //
+            // It used to be `img.thumbnail(192, 192)` — a thumbnail in the
+            // strict sense — and that is what made the map blurry: the map
+            // paints the picture at the hull's REAL size, which at the
+            // console's own `ZOOM_MAX` (18) is about 400 px for a destroyer,
+            // so a 192 px bitmap was upscaled into mush exactly when the
+            // operator zoomed in to look at it. The cap sits above the
+            // largest box the map can ask for (a 400 m hull at 18 is ~1.3 k
+            // px); the rows, the ghost and the banner downscale it
+            // themselves, which is what a whole-picture element is for.
+            const PICTURE_MAX_PX: u32 = 2048;
+            let long = img.width().max(img.height());
+            let picture = if long > PICTURE_MAX_PX {
+                img.resize(
+                    PICTURE_MAX_PX,
+                    PICTURE_MAX_PX,
+                    image::imageops::FilterType::Lanczos3,
+                )
+            } else {
+                img
+            };
+            let upright = picture.to_rgba8();
+            let (w, h) = (upright.width(), upright.height());
             if thumb_tx
                 .send(vec![tfg::shell_gpui::ThumbRaw {
                     unit_id: e.unit_id,
                     w,
                     h,
-                    rgba: small.into_raw(),
+                    rgba: upright.into_raw(),
                     // The manifest declares the hull's published measurements
                     // beside the picture, so the map can draw the photograph at
                     // true scale without a second request per hull. Both ride
@@ -2557,6 +2626,107 @@ fn flush_groups(
 /// How many extra frames to ask for after the first, so MapLibre's tiles have
 /// time to arrive before a capture. A stand-in for the camera.
 const WARMUP_FRAMES: u64 = 24;
+
+#[cfg(test)]
+mod picture_tests {
+    use super::*;
+
+    /// A minimal EXIF block declaring one orientation: a little-endian TIFF
+    /// header with a single IFD entry (`0x0112`, SHORT, count 1, the value) and
+    /// no next IFD. That is all `Orientation::from_exif_chunk` reads.
+    fn exif_orientation(value: u16) -> Vec<u8> {
+        let mut exif = Vec::new();
+        exif.extend_from_slice(b"II\x2A\x00"); // little-endian TIFF magic
+        exif.extend_from_slice(&8u32.to_le_bytes()); // IFD0 at offset 8
+        exif.extend_from_slice(&1u16.to_le_bytes()); // one entry
+        exif.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+        exif.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+        exif.extend_from_slice(&1u32.to_le_bytes()); // count
+        exif.extend_from_slice(&u32::from(value).to_le_bytes()); // value
+        exif.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+        exif
+    }
+
+    fn png_with_exif(exif: Option<Vec<u8>>) -> Vec<u8> {
+        use image::ImageEncoder as _;
+        // 4x2, with one bright column so a rotation is visible in the pixels.
+        let img = image::RgbaImage::from_fn(4, 2, |x, _| {
+            image::Rgba([if x == 3 { 255 } else { 0 }, 0, 0, 255])
+        });
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut bytes);
+        if let Some(exif) = exif {
+            encoder.set_exif_metadata(exif).expect("exif chunk");
+        }
+        encoder
+            .write_image(img.as_raw(), 4, 2, image::ExtendedColorType::Rgba8)
+            .expect("encode");
+        bytes
+    }
+
+    /// The picture's OWN orientation is applied on decode, and a picture that
+    /// declares none is untouched.
+    ///
+    /// This is the difference between a hull drawn on its side and a hull
+    /// drawn along its axis: `image::load_from_memory` ignores the EXIF tag by
+    /// design, so a photograph stored as "rotate 90" arrives sideways and every
+    /// consumer — map, row, ghost — inherits the error.
+    #[test]
+    fn a_pictures_own_orientation_is_applied_on_decode() {
+        let plain = decode_picture(&png_with_exif(None)).expect("a PNG with no tag decodes");
+        assert_eq!((plain.width(), plain.height()), (4, 2), "no tag, no turn");
+
+        let turned =
+            decode_picture(&png_with_exif(Some(exif_orientation(6)))).expect("a tagged PNG decodes");
+        assert_eq!(
+            (turned.width(), turned.height()),
+            (2, 4),
+            "orientation 6 is one quarter turn"
+        );
+
+        // A tag that says nothing is also a no-op, so the default path is the
+        // one every PNG in the register already takes.
+        let untagged = decode_picture(&png_with_exif(Some(exif_orientation(1))))
+            .expect("orientation 1 decodes");
+        assert_eq!((untagged.width(), untagged.height()), (4, 2));
+    }
+
+    /// Bytes that are not an image decode to nothing rather than panicking: a
+    /// truncated download paints no hull, never a torn one.
+    #[test]
+    fn a_corrupt_picture_decodes_to_nothing() {
+        assert!(decode_picture(b"not an image").is_none());
+    }
+}
+
+#[cfg(test)]
+mod camera_tests {
+    use super::*;
+
+    /// A jump puts the hull on the VISIBLE centre, not merely on the frame's.
+    ///
+    /// The shell's shift says how far the content moves to clear the floating
+    /// zone (positive = right for a left dock), so this is the one assertion
+    /// that can catch the sign: project the hull back through the goal and it
+    /// must land `shift` pixels to the right of the frame centre — the half of
+    /// the frame the zone is not covering.
+    #[test]
+    fn a_jump_puts_the_hull_on_the_visible_centre() {
+        let (lat, lon) = (-6.108, 106.9237);
+        let (w, h) = (800.0, 600.0);
+        let zoom = 14.0;
+        for shift in [180.0f32, -180.0, 0.0] {
+            let goal = jump_goal(lat, lon, shift, zoom, w, h);
+            let (x, y) = tfg::map_render::project_mercator(lat, lon, goal, zoom, w, h);
+            assert!(
+                (x - (w / 2.0 + f64::from(shift))).abs() < 1e-6,
+                "shift {shift}: the hull projects to {x}, wanted {}",
+                w / 2.0 + f64::from(shift)
+            );
+            assert!((y - h / 2.0).abs() < 1e-6, "shift {shift}: vertical centre");
+        }
+    }
+}
 
 #[cfg(test)]
 mod fleet_taxonomy_tests {
