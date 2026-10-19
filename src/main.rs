@@ -16,6 +16,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
@@ -228,24 +229,56 @@ fn main() {
         armed: Arc::new(AtomicBool::new(false)),
         initial_log: paths.initial_log.clone(),
     });
+    // The GAME FEED: the authoritative movement of the held exercise.
+    //
+    // The socket's command channel belongs to the wire that is up NOW, and
+    // the wire is re-made whenever the token changes — so the console's
+    // handle on it is a cell, not a value. The watches are re-declared on
+    // the new wire, because a fresh actor watches nothing until it is told.
+    let live_ctl: tfg::gamefeed::LiveCtl = Arc::new(Mutex::new(None));
+    // The socket's events. The order publications arrive here, and an order
+    // publication carries a POSITION: it is the first word about where the
+    // hull went, and it arrives before any plot read.
+    let (live_event_tx, live_event_rx) = mpsc::channel();
+    // The held session, shared with the plot reader: which game, which
+    // token, which state. The binary writes it; the reader reads it.
+    let hold: tfg::gamefeed::GameHoldCell = Arc::new(Mutex::new(tfg::gamefeed::GameHold {
+        token: token.clone(),
+        game_id: session.game_id,
+        state: session.state.clone(),
+        kick: 0,
+    }));
+    // The game fixes, on their own channel: the plot reader, the order
+    // publications and the order's own answer all land here, and the
+    // registry ingests them on the GAME path — never the wire's.
+    let (game_fix_tx, game_fix_rx) = mpsc::channel::<Vec<tfg::geo::track::Fix>>();
     // Swap the boot wire for the live one immediately: the same `WireKind`
     // the egui console sends, over the same socket URL the kernel derives.
     // No token (no credentials) means no live wire — the empty boot wire
     // stands, and staleness stays seeded, honestly.
     if !token.is_empty() {
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        let (event_tx, _event_rx) = mpsc::channel();
-        let _ = wire_ctl_tx.send(tfg::shell_threads::WireKind::Live {
-            ws_url: tfg::backend::websocket_url(&host),
-            rest_base: host.clone(),
-            token: token.clone(),
-            cmd_tx,
-            cmd_rx,
-            event_tx,
-            wake_tx: wire_wake_tx.clone(),
-        });
-        eprintln!("wire: live {}", tfg::backend::websocket_url(&host));
+        start_live_wire(
+            &host,
+            &token,
+            &wire_ctl_tx,
+            &live_ctl,
+            &live_event_tx,
+            &wire_wake_tx,
+        );
     }
+    // The plot reader: where a Minos-driven hull is, read on a cadence while
+    // a game is held. It is the working source of movement — the positions
+    // channel is specified but silent (see `gamefeed`).
+    let _plot_handle = tfg::gamefeed::spawn_plot_thread(tfg::gamefeed::PlotThreadConfig {
+        host: host.clone(),
+        hold: hold.clone(),
+        fix_tx: game_fix_tx.clone(),
+        live: Some(live_ctl.clone()),
+        shutdown: shutdown.clone(),
+    });
+    // The watches follow the session: the broadcast channel for the held
+    // game, and the positions channel once the exercise is running.
+    sync_session(&hold, &live_ctl, &token, session.game_id, &session.state);
 
     // The registry the fix feed drains into. Owned here, beside the poll
     // thread it serves: the shell stays a renderer of liveness, and the
@@ -298,6 +331,19 @@ fn main() {
         // card sign-in fetches again on the new token — a launch without
         // credentials must not glyph-hold the rows forever.
         let thumb_fetch_tx = thumb_tx.clone();
+        // The game feed rides in too: the order's own answer is a position,
+        // and the session the console holds is what the socket watches.
+        let hold2 = hold.clone();
+        let live_ctl2 = live_ctl.clone();
+        let wire_ctl2 = wire_ctl_tx.clone();
+        let live_event2 = live_event_tx.clone();
+        let wire_wake2 = wire_wake_tx.clone();
+        let game_fix2 = game_fix_tx.clone();
+        // The held session's state, as the server last read it. The socket's
+        // positions channel is watched only in execution, and this is the
+        // word that says so. Read before the closure, because the session
+        // itself belongs to the shell.
+        let mut state2 = session.state.clone();
         std::thread::spawn(move || {
             // Mutated by the sign-in/sign-out answers below: a card sign-in
             // replaces the startup token (empty when the shell opened on the
@@ -336,16 +382,32 @@ fn main() {
                             f64::from(order.speed_kn),
                             None,
                         ) {
-                            Ok(fix) => tfg::shell_gpui::HelmStatus {
-                                unit_id: order.unit_id.clone(),
-                                ok: true,
-                                text: format!(
-                                    "applied {:.0}\u{00b0} / {:.1} kn{}",
-                                    fix.heading,
-                                    fix.speed,
-                                    if fix.clamped { " (clamped)" } else { "" }
-                                ),
-                            },
+                            Ok(fix) => {
+                                // The order's ANSWER is a position: the hull
+                                // is here, on a new leg, at the scenario's
+                                // instant. It is ingested on the game path, so
+                                // the marker moves the moment the order lands
+                                // instead of waiting out the plot's cadence.
+                                let applied = tfg::backend::GameOrderEvent {
+                                    game_id,
+                                    fix: fix.clone(),
+                                };
+                                let _ = game_fix2.send(vec![tfg::gamefeed::order_fix(&applied)]);
+                                // And the plot is asked for at once, so the
+                                // hull advances along the new leg rather than
+                                // sitting at its origin until the next read.
+                                tfg::gamefeed::kick(&hold2);
+                                tfg::shell_gpui::HelmStatus {
+                                    unit_id: order.unit_id.clone(),
+                                    ok: true,
+                                    text: format!(
+                                        "applied {:.0}\u{00b0} / {:.1} kn{}",
+                                        fix.heading,
+                                        fix.speed,
+                                        if fix.clamped { " (clamped)" } else { "" }
+                                    ),
+                                }
+                            }
                             Err(e) => tfg::shell_gpui::HelmStatus {
                                 unit_id: order.unit_id.clone(),
                                 ok: false,
@@ -591,10 +653,24 @@ fn main() {
                                 }
                                 spawn_thumb_fetch(
                                     host2.clone(),
-                                    token,
+                                    token.clone(),
                                     thumb_fetch_tx.clone(),
                                 );
+                                // The socket comes up on the new token: a
+                                // console that signed in from the card had
+                                // no wire at all, and the wire is where the
+                                // exercise's order publications arrive.
+                                start_live_wire(
+                                    &host2,
+                                    &token,
+                                    &wire_ctl2,
+                                    &live_ctl2,
+                                    &live_event2,
+                                    &wire_wake2,
+                                );
                                 game_id = 0;
+                                state2 = String::new();
+                                sync_session(&hold2, &live_ctl2, &token2, game_id, &state2);
                                 Ok(tfg::shell_gpui::SignedIn {
                                     roster: rows,
                                     roster_total: total,
@@ -622,6 +698,17 @@ fn main() {
                         tfg::backend::last_user_clear(&paths.last_user);
                         token2.clear();
                         user2.clear();
+                        // The socket goes with the token: an idle wire that
+                        // still holds a session is a wire the server will
+                        // soon refuse, and the console says nothing about
+                        // it. The empty wire is the honest one.
+                        let _ = wire_ctl2.send(tfg::shell_threads::WireKind::Empty);
+                        if let Ok(mut slot) = live_ctl2.lock() {
+                            *slot = None;
+                        }
+                        game_id = 0;
+                        state2 = String::new();
+                        sync_session(&hold2, &live_ctl2, "", game_id, &state2);
                         eprintln!("signed out — token and keyring cleared");
                     }
                     tfg::shell_gpui::ToBinary::HoldSession { game_id: hold } => {
@@ -637,6 +724,10 @@ fn main() {
                                     s.signed_in = true;
                                     s.zoom = tfg::map_render::MAP_ZOOM;
                                     game_id = s.game_id;
+                                    state2 = s.state.clone();
+                                    // The watches follow the held game, and
+                                    // the plot reader starts reading it.
+                                    sync_session(&hold2, &live_ctl2, &token2, game_id, &state2);
                                     eprintln!("holding {} ({})", s.game, s.state);
                                     Ok(tfg::shell_gpui::CreatedSession::held(s))
                                 }
@@ -682,6 +773,14 @@ fn main() {
                                                 .map(|c| c.2)
                                                 .unwrap_or(tfg::map_render::MAP_ZOOM);
                                             game_id = s.game_id;
+                                            state2 = s.state.clone();
+                                            sync_session(
+                                                &hold2,
+                                                &live_ctl2,
+                                                &token2,
+                                                game_id,
+                                                &state2,
+                                            );
                                             Ok(tfg::shell_gpui::CreatedSession::held(s))
                                         }
                                         None => Err(
@@ -923,15 +1022,22 @@ fn main() {
                         // LEAVE PLANNING. The drafts cross whole because the
                         // token lives HERE and the drafts live THERE: the
                         // shell cannot compute the writes and this side cannot
-                        // see the drafts. The force is planned FIRST, and a
+                        // see the drafts. The force is PLANNED first, and a
                         // `ForceGap` refuses the move WHOLE — nothing is
                         // posted, because issuing the rest would half-commit
                         // the very draft the advance exists to record.
-                        // Otherwise the force, the roster and the task
-                        // organisation are written through in the order the
-                        // server accepts them, the first refusal stopping the
-                        // rest, and only a clean flush transitions the game to
-                        // preparation. The answer is the re-read session.
+                        //
+                        // The FLUSH order is the order the server accepts,
+                        // and seats come before hulls: a commander write names
+                        // a participant, and the picker's whole flow is
+                        // local-first — a player staged a minute ago commands
+                        // a hull staged a minute ago, and neither exists on
+                        // the server until this moment. Unseats land AFTER the
+                        // force, so nobody is briefly seatless while their
+                        // hull is still being handed over. The first refusal
+                        // stops the rest, and only a clean flush transitions
+                        // the game to preparation. The answer is the re-read
+                        // session.
                         let outcome = if token2.is_empty() {
                             Err("signed out \u{2014} sign in to move the plan to preparation"
                                 .to_string())
@@ -943,30 +1049,54 @@ fn main() {
                                 Err(gap) => Err(gap.to_string()),
                                 Ok(force_writes) => {
                                     let roster_writes = tfg::roster::plan(&roster, &live_seats);
+                                    let (seat_writes, unseat_writes): (
+                                        Vec<_>,
+                                        Vec<_>,
+                                    ) = roster_writes
+                                        .iter()
+                                        .cloned()
+                                        .partition(|w| {
+                                            !matches!(
+                                                w,
+                                                tfg::roster::RosterWrite::Unseat { .. }
+                                            )
+                                        });
                                     // The shell now carries the real draft and
                                     // computes the writes; the server's live
                                     // frame travels inside the draft's seed,
                                     // so the plan diffs against what Minos
                                     // holds.
                                     let groups_writes = groups;
-                                    let flush =
-                                        flush_force(&master, &token2, game_id, &force_writes)
-                                            .and_then(|()| {
-                                                flush_roster(
-                                                    &master,
-                                                    &token2,
-                                                    game_id,
-                                                    &roster_writes,
-                                                )
-                                            })
-                                            .and_then(|()| {
-                                                flush_groups(
-                                                    &master,
-                                                    &token2,
-                                                    game_id,
-                                                    &groups_writes,
-                                                )
-                                            });
+                                    let flush = flush_roster(
+                                        &master,
+                                        &token2,
+                                        game_id,
+                                        &seat_writes,
+                                    )
+                                    .and_then(|()| {
+                                        flush_force(
+                                            &master,
+                                            &token2,
+                                            game_id,
+                                            &force_writes,
+                                        )
+                                    })
+                                    .and_then(|()| {
+                                        flush_roster(
+                                            &master,
+                                            &token2,
+                                            game_id,
+                                            &unseat_writes,
+                                        )
+                                    })
+                                    .and_then(|()| {
+                                        flush_groups(
+                                            &master,
+                                            &token2,
+                                            game_id,
+                                            &groups_writes,
+                                        )
+                                    });
                                     match flush {
                                         Err(why) => Err(why),
                                         Ok(()) => {
@@ -1062,7 +1192,21 @@ fn main() {
                                 Ok(g) => {
                                     eprintln!("{} advanced to {}", g.name, g.state);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
+                                        Some(s) => {
+                                            // The exercise is running: the
+                                            // positions channel is declared
+                                            // and the plot reader starts
+                                            // reading, both at once.
+                                            state2 = s.state.clone();
+                                            sync_session(
+                                                &hold2,
+                                                &live_ctl2,
+                                                &token2,
+                                                game_id,
+                                                &state2,
+                                            );
+                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
+                                        }
                                         None => Err(
                                             "advanced, but the session could not be read"
                                                 .to_string(),
@@ -1092,7 +1236,21 @@ fn main() {
                                 Ok(g) => {
                                     eprintln!("{} ended ({})", g.name, g.state);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
+                                        Some(s) => {
+                                            // The exercise is closed: the
+                                            // positions channel is let go,
+                                            // because nothing publishes on
+                                            // it any more.
+                                            state2 = s.state.clone();
+                                            sync_session(
+                                                &hold2,
+                                                &live_ctl2,
+                                                &token2,
+                                                game_id,
+                                                &state2,
+                                            );
+                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
+                                        }
                                         None => Err(
                                             "ended, but the session could not be read"
                                                 .to_string(),
@@ -1704,6 +1862,9 @@ fn main() {
     // it renders or projects at.
     let camera_frame = camera.clone();
     let camera_fix = camera.clone();
+    // The socket's own log cadence: one line every ten publications, so
+    // the wire says what it is carrying without drowning the plot's line.
+    let mut wire_log_ticks: u32 = 0;
 
     // The picker's drill tree, read once off the synced mirror like the
     // symbol resolver above it: the taxonomy does not move under us, and a
@@ -1767,6 +1928,73 @@ fn main() {
             // the registry is quiet, not wrong, and the shell keeps its rows
             // and its markers as they were.
             let mut batch = Vec::new();
+            // The GAME fixes first: the exercise's own positions, on the
+            // game path. They are ingested apart from the wire's, because a
+            // game fix is scenario-stamped (never aged against the wall
+            // clock) and because the wire's silence must not mark a running
+            // exercise's hulls stale.
+            while let Ok(fixes) = game_fix_rx.try_recv() {
+                registry.poll_game(fixes);
+            }
+            // The socket's events. The order publication is the one that
+            // moves a hull: it carries the position the order put it at,
+            // which arrives before any plot read can report one.
+            while let Ok(event) = live_event_rx.try_recv() {
+                match event {
+                    tfg::backend::LiveEvent::GamePositions(update) => {
+                        let fixes = tfg::gamefeed::game_fixes(&update);
+                        // The socket's own line, throttled to match the
+                        // plot's: which path is carrying the movement is
+                        // worth saying out loud, and a line a second is
+                        // noise.
+                        wire_log_ticks += 1;
+                        if wire_log_ticks % 10 == 0 {
+                            eprintln!(
+                                "wire feed: {} hull(s) on game {} @ {}",
+                                fixes.len(),
+                                update.game_id,
+                                update.assumed_time
+                            );
+                        }
+                        if !fixes.is_empty() {
+                            registry.poll_game(fixes);
+                        }
+                    }
+                    tfg::backend::LiveEvent::OrderIssued(event) => {
+                        let fix = tfg::gamefeed::order_fix(&event);
+                        registry.poll_game(vec![fix]);
+                    }
+                    tfg::backend::LiveEvent::Vanished(ids) => {
+                        for id in ids {
+                            registry.remove_ship(&id);
+                        }
+                    }
+                    tfg::backend::LiveEvent::Connected { client_id } => {
+                        eprintln!("wire: connected ({client_id})");
+                    }
+                    tfg::backend::LiveEvent::Reconnecting { attempt, wait_secs } => {
+                        eprintln!("wire: reconnecting (attempt {attempt}, {wait_secs}s)");
+                    }
+                    tfg::backend::LiveEvent::Refused { code, reason } => {
+                        eprintln!("wire: refused ({code}): {reason}");
+                    }
+                    tfg::backend::LiveEvent::SocketError(e) => {
+                        eprintln!("wire: socket error: {e}");
+                    }
+                    tfg::backend::LiveEvent::RefreshDue => {
+                        eprintln!("wire: token expired (109) — the socket needs a new one");
+                    }
+                    tfg::backend::LiveEvent::Message(m) => {
+                        eprintln!("wire: message ({}) {}", m.kind, m.content);
+                    }
+                    tfg::backend::LiveEvent::Announced(list) => {
+                        eprintln!("wire: {} vessel(s) announced", list.len());
+                    }
+                    tfg::backend::LiveEvent::Resynced => {
+                        eprintln!("wire: resynced");
+                    }
+                }
+            }
             while let Ok(fixes) = poll_rx.try_recv() {
                 registry.poll(fixes);
             }
@@ -2159,6 +2387,57 @@ fn resolve_affiliation(id: &str, ctx: &Option<StoreCtx>) -> tfg::symbology::Affi
     })
 }
 
+/// Bring the live socket up on a token, and keep the console's handle on it.
+///
+/// The wire's command channel belongs to the wire that is up NOW: the actor
+/// owns the receiving end, so a wire that is swapped for a new one takes a
+/// new channel with it. The console's handle is therefore a cell, and the
+/// watches are re-declared on the new channel — a fresh actor watches
+/// nothing until it is told, which is the rule the egui console followed
+/// when it re-declared after a sign-in.
+///
+/// The events channel is shared: every wire reports into the same place, and
+/// the console reads one stream.
+fn start_live_wire(
+    host: &str,
+    token: &str,
+    wire_ctl_tx: &mpsc::Sender<tfg::shell_threads::WireKind>,
+    live_ctl: &tfg::gamefeed::LiveCtl,
+    event_tx: &mpsc::Sender<tfg::backend::LiveEvent>,
+    wake_tx: &mpsc::Sender<()>,
+) {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let _ = wire_ctl_tx.send(tfg::shell_threads::WireKind::Live {
+        ws_url: tfg::backend::websocket_url(host),
+        rest_base: host.to_string(),
+        token: token.to_string(),
+        cmd_tx: cmd_tx.clone(),
+        cmd_rx,
+        event_tx: event_tx.clone(),
+        wake_tx: wake_tx.clone(),
+    });
+    if let Ok(mut slot) = live_ctl.lock() {
+        *slot = Some(cmd_tx);
+    }
+    eprintln!("wire: live {}", tfg::backend::websocket_url(host));
+}
+
+/// Write the held session into the shared cell, and re-declare the socket's
+/// watches for it.
+///
+/// One call, because the two belong together: a watch declared for a
+/// session the cell does not name is a watch on somebody else's exercise.
+fn sync_session(
+    hold: &tfg::gamefeed::GameHoldCell,
+    live_ctl: &tfg::gamefeed::LiveCtl,
+    token: &str,
+    game_id: i64,
+    state: &str,
+) {
+    tfg::gamefeed::set_hold(hold, token, game_id, state);
+    tfg::gamefeed::sync_watch(live_ctl, hold);
+}
+
 /// The held session: the game this account is SEATED in, and its room.
 ///
 /// Read-only on purpose. The console JOINS (a room key, a write) and reads the
@@ -2295,29 +2574,49 @@ fn fetch_session(
     // The pieces every relate checkbox names: hulls assigned to THIS game,
     // because the server refuses any other hull with a 400. Same list the
     // seat joins its hulls from — one read, two readers.
-    // Which of them sits on the map. A separate read because it is a
-    // separate fact: a hull is in the exercise whether or not it has been
-    // placed, and the console's draft carries the same two fields side by
-    // side. Best-effort — an unreadable placements list leaves every hull
+    // Which of them sits on the map, and where. A separate read because it
+    // is a separate fact: a hull is in the exercise whether or not it has
+    // been placed, and the console's draft carries the same two fields side
+    // by side. Best-effort — an unreadable placements list leaves every hull
     // unplaced rather than failing the whole session read.
-    let placed_ids: Vec<i64> = master
+    //
+    // The coordinates are kept, not only the fact: a focus control in the
+    // crew screen has no live fix to aim at in a fresh execution, and the
+    // placement is the ground the exercise actually recorded.
+    let placements: Vec<(i64, f64, f64)> = master
         .placements_list(token, game_id)
-        .map(|p| p.placements.iter().map(|g| g.unit_id).collect())
+        .map(|p| {
+            p.placements
+                .iter()
+                .map(|g| (g.unit_id, g.latitude, g.longitude))
+                .collect()
+        })
         .unwrap_or_default();
     let pieces = units
         .iter()
-        .map(|u| tfg::shell_gpui::PieceView {
-            id: u.unit_id,
-            label: format!("{} ({})", u.unit_name, u.hull_number),
-            commander_id: u.commander_id,
-            placed: placed_ids.contains(&u.unit_id),
+        .map(|u| {
+            let start = placements
+                .iter()
+                .find(|(id, _, _)| *id == u.unit_id)
+                .map(|(_, lat, lon)| (*lat, *lon));
+            tfg::shell_gpui::PieceView {
+                id: u.unit_id,
+                label: format!("{} ({})", u.unit_name, u.hull_number),
+                commander_id: u.commander_id,
+                commander_name: u.commander_name.clone(),
+                hierarchy_node: u.hierarchy_node,
+                start,
+                placed: start.is_some(),
+            }
         })
         .collect();
     // The task organisation, flattened from the server's recursive forest.
     // The read names the LEVEL, never a rank; an echelon we do not
     // recognise is not this client's rank to invent, so its node is
-    // dropped. Members and commanders are not part of this route, so the
-    // frame carries none — the draft adds them on top.
+    // dropped. The node's commander IS carried — the crew screen shows a
+    // commander's task group beneath their seat. Member hulls arrive on the
+    // pieces (each carries its `hierarchy_node`), so the draft adds them
+    // from there rather than from this tree.
     fn flatten_groups(
         nodes: &[tfg::backend::HierarchyNode],
         out: &mut Vec<tfg::groups::LiveGroup>,
@@ -2329,7 +2628,7 @@ fn fetch_session(
                     name: n.name.clone(),
                     kind,
                     parent: n.parent_id,
-                    commander_id: None,
+                    commander_id: n.commander_id,
                     units: Vec::new(),
                 });
             }

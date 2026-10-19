@@ -1061,3 +1061,281 @@ gone, the `pin · quote` ghost under the pointer), `t2` (dropped: `at -6.1675,
 a point north-west of the first, so the release point is what is read), `u1`
 (clicked: the armed strip), `u2` (the armed click appended a fourth coordinate).
 The Book's field still takes typing after the block (`u3`).
+
+### The commander's rail, and the compass that pointed the wrong way
+
+The commander's dashboard was a **rounded, translucent panel floating eight
+points off the bottom of the window**, and it was ugly for reasons that had
+nothing to do with taste:
+
+- The tile map's own labels came through the type that sat on them. A
+  console read across an exercise room, under glare, cannot put its readings
+  on top of a map and call it legible.
+- The panel was a card, and a card that is 1904pt wide with 800pt of content
+  is a card with a void in it. The right half of the strip was the map,
+  showing through.
+- The course compass **did not render**. It was a cyan smudge about twenty
+  pixels across, in the wrong corner of its own box, pointing at a bearing
+  the readout beside it disagreed with.
+- The speed control was a 110pt slider — a knot every three points.
+- The identity rows were laid out inline, so each value started wherever its
+  label ended: the hull number under `HULL`, the group name under the group
+  icon, the embark line under the anchor. Three values, three columns.
+- The photograph sat in a portrait box, letterboxed, with three quarters of
+  the frame empty.
+
+**The compass was the interesting one, and the cause is a GPUI rule worth
+writing down.** A `canvas` is a **block-level** element, and so is a `div`.
+A block child of a block parent is measured at its content's height, and a
+canvas has no content, so **a canvas inside a block parent is measured at
+ZERO HEIGHT** unless it is given a size. The dial's canvas sat in
+`div().w(80).h(80).relative()`, so it was measured 80 × 0. The radius came
+out at `min(w, h) / 2 - 2` = **−2**: the ring collapsed, the graduations
+shrank to a few pixels around the hub, and the needle — drawn from the
+canvas's own top edge rather than the dial's centre — pointed wherever the
+top edge was. The pointer maths used the *div's* bounds, so the readout was
+right and the needle was somewhere else entirely: a control that reads 34°
+and draws north. The canvas now carries `.size_full()`, and the face is
+measured about the same centre the pointer maths uses.
+
+The same idiom was checked everywhere else: every other `canvas` in the
+console either carries an explicit size (`.size_full()`, `.size(px(14))`)
+or paints from absolute coordinates rather than from its own bounds. The
+dial was the only one that was broken, and the only one that read its own
+bounds for geometry.
+
+**The rail.** Opaque, square, flush with the window's edges, one 1px
+`CUT_GREY` rule along the top — the map ends at the rule instead of running
+under the chrome. Three channels, separated by 1px rules: the picture and the
+name, the identity rows, and the helm. The rail's widths are a pure function
+of the window's width (`rail_widths`), so the layout the operator sees and
+the layout the test checks cannot drift apart.
+
+**The helm is an instrument now.** A course is a circle, so it is a compass:
+a rim, twelve graduations with the cardinals longer, a north wedge, and a
+needle with a hub and a short tail. A speed is a range, so it is a
+**graduated scale**: a track, the value's ink extent along it, a tick every
+two knots with a long one every ten, and the numbers under it — five knots
+apart on a long track, ten on a middling one, because a number every 275
+points on a 1100pt scale is three stray labels rather than a scale. The
+scale's track sits at the compass's **hub height**, so the two instruments
+share one horizon instead of floating at unrelated heights, and the labels
+for both are on ONE row with the controls under them (the first version put
+each control's label in the control's own column, and a compass 80pt tall
+next to a slider 22pt tall put the two labels at different heights).
+
+**The speed scale takes the slack.** The rail's width goes to the one
+element that gets better with length; a knot every three points is a slider,
+and a knot every twenty is an instrument. The compass and the scale are
+therefore the last things to shrink on a narrow window, and the picture and
+the column of facts give way first.
+
+**The instruments settle.** A needle that teleports between two bearings
+reads as a glitch, so the compass eases onto a new draft over 220ms with an
+exponential ease-out, and the scale's fill eases with it. The bearing eases
+the **short** way round, so 350° to 10° is twenty degrees forward. A
+pointer **drag** drops the ease entirely: while the operator is holding the
+control the instrument IS the hand, and anything that trails the hand is
+lag, not motion. The console's own frame loop is the map's — half a second
+a frame on a software rasteriser — so the settle asks for frames of its own
+(`window.request_animation_frame`).
+
+**The picture is framed at its own proportions.** A hull plan is four to
+one, and a four-to-one picture in a portrait box is a postage stamp in a
+vitrine. The tile is now as tall as the picture is wide-by-tall, and it is
+square, because nothing on an instrument is rounded except the controls you
+turn.
+
+Verified on the private display, driving the real binary against the
+deployment the operator uses (`api.tfg.development.crossnet.co.id`, session
+`DEMO-SCENARIO-UI`, signed in as the commander who holds `KRI Ahmad Yani
+(KRI-351)`), at 1920 × 1150 and at 760 × 620. The captures are in
+`.impeccable/review/`: `rail-before.png` (the strip as it was),
+`rail-after.png` (the rail), `rail-helm-dragged.png` (the two controls after
+a drag) and `rail-order-refused.png` (the answer to a real order).
+
+| | what the capture shows |
+|---|---|
+| the rail | opaque, square, full width, one rule along the top; the map ends at the rule |
+| the compass | a rim, twelve graduations, the north wedge, and the needle at 0° — pointing UP, which is what 0° means |
+| the compass under a drag | dragged east: the readout says **77°** and the needle points **77°** — the two agree, which they did not before |
+| the scale under a drag | dragged to 13.1 kn: the figure reads **13.1 kn**, the cyan fill runs to the thumb, and the thumb sits on the 13 graduation |
+| the identity column | `HULL / KRI-351`, `GROUP / Gugus Alpha`, `EMBARK / nothing embarked` — one right-aligned column, three hairlines |
+| the picture | the hull plan at its own proportions, square frame, name under it |
+| 760 × 620 | the compact rail: the picture and the facts shrink, the compass and the scale do not, and nothing overflows |
+
+**The write, verified against the local stack** (a throwaway database, so a
+real order could be posted without touching the deployment the operator
+uses). Game `DASH-11`, a Commando seat holding `KRI Ahmad Yani (DD-1002)` in
+`Gugus Alpha`, in execution. The helm drafted 67° / 9.6 kn, `SET HELM` was
+pressed, and the server answered:
+
+> refused: HTTP 409: Conflict occurred — This unit's maximum speed is unknown,
+> so the order cannot be clamped and was not applied. Publish one for the
+> medium it moves in, with PUT /units/{id}/speeds.
+
+which the rail showed, in the refusal's ink, in the space under the verb.
+
+**And the answer had to be bounded to be readable.** The server's refusals
+are SENTENCES, and a sentence in a column this narrow is more lines than the
+rail has height for: the first version of the answer ran off the bottom of
+the band and was cut off by the window. The answer is now cut to the room
+the rail has under the verb — three lines — with an ellipsis, and the part
+that names the problem is the part that is kept. The rail's height is
+therefore sized for three lines of answer, and the answer can never be what
+pushes the band over.
+
+Unit tests, all in `shell_gpui::tests`: `the_rail_gives_the_scale_what_is_left`,
+`the_scale_numbers_sit_on_their_graduations`,
+`the_helm_instruments_settle_on_the_draft` (which pins the ease-out, the
+short way round the compass, and that a drag drops the settle) and
+`the_order_s_answer_is_cut_to_the_rail`.
+
+`cargo test --lib`: 578 pass, the same four pre-existing failures.
+
+**A defect found on the way, not fixed here.** A seat that is not an
+administrator **cannot sign in at all**: `fetch_roster` reads
+`GET /units?page_size=200`, which the server answers 403 for anyone without
+the administrative grant, and the sign-in reports the refusal as *sign-in
+refused — check the identifier and password*. The credential is right and the
+console says it is wrong. The commander seat this rail is built for is
+exactly the seat that cannot get in. It is a one-line answer — the roster is
+the console's own unit catalogue, and a commander needs their own units, not
+the whole register — but it is a product answer about what a non-administrator
+sees on the sign-in card, so it is recorded here rather than changed.
+
+## The game mechanics: a commanded hull that actually MOVES
+
+The operator's complaint was one sentence: the previous EGUI console's backend
+worked — *the units, if commanded, move, as the backend emits through the
+websocket* — and the GPUI console did not. He was right, and the reason is
+worse than a missing feature: **the GPUI console had no game-mechanics path at
+all.** The live socket's events were received into a channel and dropped on the
+floor (`let (event_tx, _event_rx) = mpsc::channel();`), the game channels were
+never watched, and nothing ever read the exercise's plot. A hull could be
+ORDERED from the rail — that half works, and the previous pass proved it — and
+then it stood still on the map forever, because nothing was listening for where
+the server had put it.
+
+The kernel was never the problem. `Registry::poll_game`, the game fix source,
+the trailing blend and the whole `Fix` model were all ported and all correct:
+the egui console's `ingest_game_positions` had become `gamefeed::game_fixes`
+waiting for a caller. The GPUI binary simply never called any of it.
+
+### What the movement is made of, and where each piece comes from
+
+**Three sources, one seam** (`src/gamefeed.rs`):
+
+1. **`GET /games/{id}/positions`** — the exercise's derived plot, advanced along
+   the fix chain to the scenario's now. The realtime protocol names it the
+   interim answer to the silent positions channel, and it is the source that
+   works today: read once a second while the exercise is running, and once
+   every five while it is not, so the transition into execution is noticed
+   without the console being told.
+2. **`game:<id>:positions`** — the socket's own position stream. The protocol
+   says the channel is specified and silent, and the server here publishes on
+   it anyway (the local stack's log says `service: published a position
+   snapshot`, once a second), so the console subscribes and ingests it. The
+   subscription is declared the moment the exercise is running, and the
+   payload is the agreed shape.
+3. **`game.order_issued`** on `game:<id>` — the order's own position, published
+   the moment the order lands. It is the FIRST word about where the hull went,
+   and it arrives before any plot read can report one.
+
+All three become the same thing: a `Fix` with `FixSource::Game`, ingested on
+the registry's GAME path — never the wire's, so the wire's silence cannot mark
+a running exercise's hulls stale, and never aged against the wall clock,
+because a game fix's instant is the SCENARIO clock and is routinely hours from
+the wall's.
+
+### The bug that would have made it look wired and be dead
+
+The first version stamped each fix with the position's own `assumed_time`. It
+looked right — the position carries it, after all — and it is the LEG's start,
+not the round's: a hull ordered at 13:00 reports 13:00 for as long as it
+steers on that leg. So every read of a moving hull carried the SAME instant,
+and the registry — which orders by instant — accepted the first and refused
+every one after it. **The hull stood still on the map while the server moved
+it**, and the console's own log said the exercise was running.
+
+It was found by driving, not by reading: the server's plot advanced every ten
+seconds and the marker's pixel did not move by one. The rule is now the
+round's instant, with a test that asserts it twice over — once on the stamp,
+and once through the registry, that two rounds of a moving hull both land
+(`two_rounds_of_a_moving_hull_both_land`).
+
+### The verification, driven
+
+Against a local Minos (Postgres, valkey, Minos and a Centrifugo v5 built from
+the same tree), a game in execution with one hull placed, published with a
+speed and commanded by the account that signs in.
+
+| | what the evidence says |
+|---|---|
+| the order | the rail's compass was dragged to 233° and `SET HELM` pressed; the rail answered **`applied 233° / 29.9 kn`** — the server's own numbers, the speed clamped from 37.2 to the hull's published 29.9 |
+| the feed | the log carries both paths, once a second: `game feed: 1 hull(s) @ … — 1 at -5.912259, 107.192129 (232.6° 29.9 kn)` (the plot) and `wire feed: 1 hull(s) on game 1 @ …` (the socket) |
+| the marker | the same region of the map, 70 seconds apart, the marker **49 px west and 35 px south** — the new course, at the new speed |
+
+The captures are in `.impeccable/review/`: `move-before.png`, `move-after.png`
+and `move-side-by-side.png`.
+
+**The console's own camera has to follow.** The hull is a few kilometres off
+the map's centre, and the console has no focus door in execution, so the
+camera was panned onto it by hand. That is worth saying plainly: the
+movement is verified, and the gesture that makes it readable at a glance is
+not there. A hull that is not near the centre of the window is a hull the
+operator has to go and find.
+
+### Two things found on the way, neither of them the movement
+
+**The rail's answer was clipped by the window, not by its column — FIXED.**
+At the window the operator's desktop gave the console (640 points wide, which
+is 960 X11 pixels at the scale the compositor was running), the rail's verb
+column was the last 148 points, and the answer ran past the right edge:
+`applied 40° / 29.` and the rest of the sentence — and the `SET HELM` button
+itself — were off-screen. The previous pass wrote that the answer is "cut to
+the room the rail has under the verb — three lines — with an ellipsis"; what
+happened is that the TEXT was not cut at all, and the window cut it
+mid-figure. The verb is the console's primary action, and at this width it
+was a 20-point sliver.
+
+**The arithmetic was the cause, and the arithmetic was wrong.** The rail's
+widths are a pure function of the window's width, and the scale was the
+remainder with a floor of 48 points: when the window was too narrow for the
+floors, the floor was honoured and the rail was allowed to overflow. The
+overflow went RIGHT, because the verb is the last channel. So the scale's
+floor was bought with the verb.
+
+The rule now: **the rail is the window, at every width**, and the points the
+scale's floor needs come from the channels that give way first — the picture,
+then the column of facts, then the compass's face — and the verb is the LAST
+thing squeezed, and only in a window too narrow for the rail's floors. The
+floors are now stated: the picture keeps 144 points (the hull's NAME is the
+one thing in that channel that is not a picture), the facts 150 (the longest
+reading whole), the compass 64 (a face you can still grab), the verb 72 (the
+button itself) and the scale 48. A test walks the widths from 500 to 2560
+and asserts that the channels and the chrome add up to the window, every
+time (`the_rail_fits_the_window_and_keeps_its_verb`).
+
+Verified on the operator's own window, at 640 points: the `SET HELM` button
+is whole, and the server's answer reads **`applied 6° / 29.9 kn`** — the
+whole sentence, on one line, inside the window. The order that produced it
+was the compass dragged to 6° and the verb pressed, and the hull's own course
+came back on the rail as 6.1°, which is the server's answer read back out of
+the fix. Captures: `.impeccable/review/rail-narrow-before.png` and
+`rail-narrow-fixed.png`.
+
+**A capture on XWayland is stale, and it reads as a dead feature.** The
+X11 `import -window` of a Vulkan window on XWayland returns the last frame the
+X server held, not the window's current content: two captures 70 seconds apart
+were BYTE-IDENTICAL while the console was alive and the hull was moving, and
+the only captures that showed the movement were the compositor's (`grim`).
+Worth writing down because the failure mode is the exact opposite of the usual
+one — a stale capture says "nothing happens", and the conclusion drawn from it
+is "the feature is broken" rather than "the picture is old".
+
+`cargo test --lib`: 585 pass, the same four pre-existing failures
+(`book::prune_drops_relations_for_vanished_drafts`,
+`map_render::quad_bow_follows_the_compass`,
+`roster::seats_come_before_roles_before_unseats`,
+`sim::order_move_applies_then_higher_overrides_loudly`).

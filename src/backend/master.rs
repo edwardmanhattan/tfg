@@ -1854,6 +1854,7 @@ impl MinosMaster {
             name: v["name"].as_str().unwrap_or("").to_string(),
             icon: v["icon"].as_str().unwrap_or("").to_string(),
             note: v["note"].as_str().unwrap_or("").to_string(),
+            commander_id: v["id_commander"].as_i64(),
             children: v["children"]
                 .as_array()
                 .cloned()
@@ -3013,6 +3014,10 @@ pub struct HierarchyNode {
     pub name: String,
     pub icon: String,
     pub note: String,
+    /// The participant appointed to command this node, when one is. The tree
+    /// read carries it; the shell needs it so a crew screen can show the task
+    /// group under the person who commands it.
+    pub commander_id: Option<i64>,
     pub children: Vec<HierarchyNode>,
 }
 

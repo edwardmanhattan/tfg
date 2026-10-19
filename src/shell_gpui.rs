@@ -32,13 +32,13 @@
 //! `ShipApp` port starts from this shell and grows into it.
 
 use gpui::{
-    AnyElement, App, AppContext, Application, AsyncApp, Bounds, Context, CursorStyle, FontWeight,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit,
+    AnyElement, App, AppContext, Application, AssetSource, AsyncApp, Bounds, Context, CursorStyle,
+    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit,
     ParentElement, PathBuilder, Render, ScrollHandle, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement,
     Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, fill, img,
-    point, prelude::*, px, size, Corners,
+    point, prelude::*, px, size, svg, Corners,
 };
 
 use std::borrow::Cow;
@@ -70,6 +70,45 @@ fn rgba(c: Rgba) -> gpui::Rgba {
     }
 }
 
+/// The console's SVG icon source: the icons are compiled into the binary, not
+/// read from disk.
+///
+/// GPUI's `svg()` element resolves its path through the app's `AssetSource`,
+/// and `Application::new()` installs `()` — which answers `None` for every
+/// path, so an SVG would paint nothing at all. A filesystem source would be
+/// the obvious fix and is the wrong one here: the app ships air-gapped and its
+/// working directory at runtime is not the project's, so a relative path would
+/// resolve differently on the delivery host than it does in development. An
+/// in-memory source makes the icon a compile-time fact instead.
+struct EmbeddedIcons;
+
+impl AssetSource for EmbeddedIcons {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        let bytes: &'static [u8] = match path {
+            "icons/compass.svg" => include_bytes!("../assets/icons/compass.svg"),
+            "icons/gauge.svg" => include_bytes!("../assets/icons/gauge.svg"),
+            "icons/pin.svg" => include_bytes!("../assets/icons/pin.svg"),
+            "icons/group.svg" => include_bytes!("../assets/icons/group.svg"),
+            "icons/embark.svg" => include_bytes!("../assets/icons/embark.svg"),
+            _ => return Ok(None),
+        };
+        Ok(Some(Cow::Borrowed(bytes)))
+    }
+
+    fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(Vec::new())
+    }
+}
+
+/// One SVG icon in a given ink.
+///
+/// GPUI renders an SVG as a monochrome sprite in the element's text colour, so
+/// the file's own colours are irrelevant and the ink is set here — the same
+/// seam as `rgba`. The path is a compile-time constant because the source is.
+fn icon(path: &'static str, w: f32, h: f32, ink: Rgba) -> impl IntoElement {
+    svg().path(path).w(px(w)).h(px(h)).text_color(rgba(ink))
+}
+
 /// One island's own state: whether the operator has it open, and the
 /// measurements its body publishes.
 ///
@@ -85,8 +124,8 @@ fn rgba(c: Rgba) -> gpui::Rgba {
 /// map is the one thing that makes them unreadable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WhichPanel {
-    /// No modal. One of the six, or nothing — and `open_only` takes the
-    /// whole thing, so closing one cannot leave another half-open behind it.
+    /// No modal. One of them, or nothing — and `open_only` takes the whole
+    /// thing, so closing one cannot leave another half-open behind it.
     None,
     /// The hull register, opened from the Fleet island's door. The console's
     /// `WhichModal::Fleet`.
@@ -99,8 +138,11 @@ enum WhichPanel {
     Book,
     /// The Scenario board: the exercise's plan, its pointer and its verbs, in
     /// the middle of the frame. Visibility is `board_open`, which the reminder
-    /// strip and the band's door both write.
+    /// strip and the execution widget both write.
     Board,
+    /// The execution phase's crew screen: every player by role, and the hulls
+    /// or task groups a commander holds.
+    Crew,
     Comms,
     /// One hull's passengers, opened from the Fleet island's piece rows.
     /// The console's floating "Embarked" island, which this shell has no
@@ -179,6 +221,10 @@ struct IslandDemo {
     /// thing that makes it unreadable. So the door moved to the band and the
     /// pane stays undimmed.
     comms_open: bool,
+    /// The execution phase's CREW modal: every player, segmented by role, with
+    /// a commander's hulls and task groups beneath them. Opened from the
+    /// widget rail, not from the column — in execution the column is gone.
+    crew_modal_open: bool,
     /// The Scenario board: the exercise's whole plan, where it is in it, the
     /// hulls each step obliges, the readiness gate, and the Game Master's
     /// verbs — in the MIDDLE of the frame rather than down the side.
@@ -188,6 +234,14 @@ struct IslandDemo {
     /// per step, the gate and four verbs, and a 300pt column carries four of
     /// those and hides the rest. The column keeps what belongs in a column.
     board_open: bool,
+    /// The step whose related hulls the board's right-hand section shows.
+    ///
+    /// SELECTED IS NOT ACTIVE: the active step is the server's pointer, and it
+    /// is marked on its own row. Selection only chooses which step's
+    /// instruction and hulls are read below, so an operator can look at a
+    /// later step's force without moving the exercise. `None` means "follow
+    /// the pointer", which is what a freshly opened board wants.
+    board_selected: Option<(i64, i64)>,
     /// The step-verb latch and its status line, on the shared answer feed —
     /// the same shape as the declare's, because both answer with a re-read
     /// session and neither may eat the other's answer.
@@ -350,6 +404,10 @@ struct IslandDemo {
     helm_heading: Option<f32>,
     helm_speed: Option<f32>,
     helm_status: Option<HelmStatus>,
+    /// The instruments' own motion: the values the compass and the scale are
+    /// DRAWING, easing toward the draft. `None` means "the instruments are
+    /// the draft" — which is the state a pointer drag leaves them in.
+    helm_anim: Option<HelmAnim>,
     /// The order sink. The shell WRITES through this and reads no API.
     order_tx: OrderSink,
     /// The camera's zoom, as the map controls last set it. The shell keeps the
@@ -549,6 +607,15 @@ struct IslandDemo {
     embark_over: HashMap<i64, Vec<crate::backend::OverCapacity>>,
     embark_busy: bool,
     embark_status: String,
+    /// Which hosts the commander dashboard has already asked for, and the
+    /// game those asks belong to. The dashboard needs both directions of
+    /// the embark relationship — what this seat's unit carries, and whether
+    /// another unit carries it — and the composition is published per host,
+    /// so every piece is asked once. The game id is the reset key: a new
+    /// exercise is a new composition, and the last one's asks must not
+    /// satisfy it.
+    commander_embark_asked: Vec<i64>,
+    commander_embark_game: i64,
     /// The Fleet picker's latch and verdict. The latch is the shared answer
     /// feed's; the line is what the panel says about the last edit, which is
     /// where a refusal from `force::plan` lands.
@@ -614,6 +681,11 @@ struct IslandDemo {
     /// window by it — so the shell never names the map's size. Zero until a
     /// frame arrives, which draws no markers.
     map_dims: (f32, f32),
+    /// The last viewport the map was drawn in. The map frame is COVERED into
+    /// it (uniform scale, centred), and a focus shift arrives in window
+    /// points; the frame-pixel shift needs both sizes. Zero before the first
+    /// frame, when no focus door is live anyway.
+    last_viewport: (f32, f32),
     /// The sprite the compositing probe uses. Built unconditionally so the
     /// probe does not depend on the marker layer's configuration.
     probe_sprite: std::sync::Arc<gpui::RenderImage>,
@@ -651,8 +723,262 @@ const FLEET_H: f32 = 580.0;
 /// 760x620 window still shows it whole — the board is the surface an operator
 /// opens INSTEAD of the column, and a card that overflows a small window is a
 /// card whose last rows nobody can reach.
-const BOARD_W: f32 = 700.0;
-const BOARD_H: f32 = 560.0;
+const BOARD_W: f32 = 720.0;
+const BOARD_H: f32 = 580.0;
+
+// ---------------------------------------------------------------------------
+// The commander's rail
+//
+// The execution phase's own instrument: a band along the bottom of the window
+// carrying the unit this seat commands, the relationships around it, and the
+// helm that moves it.
+//
+// It is a RAIL, not a card. The first version of this was a rounded,
+// translucent panel floating eight points off the bottom edge, and the map's
+// own labels showed through the type that sat on them: a console that is
+// read in an exercise room, under glare, cannot put its readings on top of a
+// tile map and call it legible. So the rail is opaque, square, and flush with
+// the window's edges, and the map stops at its top rule rather than running
+// under it.
+//
+// Its height is a FRACTION of the window, not a constant, because the rail is
+// a proportion of the map rather than an object with its own size: a fixed
+// height would read as a fifth of the frame on a 620pt window and as an
+// eighth on a taller one. The fraction is the shape; the clamp keeps it
+// usable on a short window and stops it sprawling on a tall one.
+const DASH_H_FRAC: f32 = 0.16;
+const DASH_H_MIN: f32 = 156.0;
+const DASH_H_MAX: f32 = 176.0;
+/// The follow control: the commander's one-tap door onto their own unit.
+/// Sized to sit clear of the rail's top edge, which is where the operator's
+/// own drawing puts it.
+const FOLLOW_W: f32 = 48.0;
+const FOLLOW_H: f32 = 40.0;
+
+/// The rail's channels.
+///
+/// The first two are fixed, and the helm takes the rest. The helm is the
+/// channel with a control in it, and a control needs room to be a control:
+/// the speed scale is a scale, and a scale that is 110pt long is a slider
+/// with a slider's problem (a knot every three points), while the same
+/// control at 600pt is a graduated instrument. So the slack goes to the
+/// track, which is the one element in the rail that gets better with length.
+const DASH_UNIT_W: f32 = 264.0;
+const DASH_ID_W: f32 = 250.0;
+/// The verb column: the button, and the answer the server gave it.
+const DASH_ORDER_W: f32 = 208.0;
+/// The helm channel's own padding, and the gap between its three cells.
+const DASH_RAIL_PAD: f32 = 16.0;
+const DASH_RAIL_GAP: f32 = 18.0;
+/// The rail's label size: a tracked-caps label one step above the panel's
+/// `LABEL_PT`. The rail is read from across the room and at a glance, and a
+/// label the same size as its value is a second value.
+const DASH_LABEL_PT: f32 = 11.0;
+/// The speed scale's ceiling, in knots. The class max is the honest ceiling
+/// and the shell does not hold the class here, so this is the register's
+/// largest class — a scale to it never invents a speed the server would
+/// clamp as absurd, and the server still clamps.
+const DASH_SPEED_MAX_KN: f32 = 40.0;
+/// The heading compass's diameter.
+const DASH_DIAL: f32 = 104.0;
+/// The speed scale's own height: the track plus the graduations that hang
+/// under it.
+const DASH_SCALE_H: f32 = 26.0;
+/// Where the scale's track sits inside its own box.
+const DASH_SCALE_TRACK_Y: f32 = 7.0;
+/// How long the helm's instruments take to settle on a new draft, in
+/// seconds.
+///
+/// Long enough to read as a movement rather than a jump, short enough that
+/// the instrument still feels connected to the hand. A pointer DRAG does not
+/// use it: while the operator is holding the control, the instrument is the
+/// pointer, and anything that trails the pointer is lag.
+const HELM_EASE_S: f32 = 0.22;
+
+/// The settle: how far the instruments have moved, as a fraction of the way,
+/// given the seconds since the draft changed.
+///
+/// Exponential ease-out: the instrument is already showing a value, so it
+/// moves fastest at the start and settles onto the draft. A linear move
+/// reads as a machine being switched off.
+fn helm_ease(elapsed: f32) -> f32 {
+    let t = (elapsed / HELM_EASE_S).clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// The way round the compass from one bearing to another: the short one.
+///
+/// 350° to 10° is twenty degrees forward, not three hundred and forty
+/// degrees backward. The needle crossing north the long way is the single
+/// most conspicuous way an instrument can look broken.
+fn helm_turn(from: f32, to: f32) -> f32 {
+    (to - from + 540.0).rem_euclid(360.0) - 180.0
+}
+
+/// The order's answer, cut to the room the rail has.
+///
+/// The server's refusals are SENTENCES, and a sentence in a column this
+/// narrow is more lines than the rail has height for. The beginning of a
+/// refusal names the problem — "This unit's maximum speed is unknown" — so
+/// the first lines are the ones that are kept, and the rest is cut with an
+/// ellipsis rather than clipped off the bottom of the band. A status that
+/// runs off the edge of the instrument is a status nobody can read.
+fn bounded_status(text: &str, width: f32, lines: f32) -> String {
+    // The status is set in the human face at 10.5pt: a condensed face is
+    // about five and a half points a character, and a line of that face is
+    // about nineteen points tall.
+    let per_line = (width / 5.5).floor().max(1.0) as usize;
+    let budget = (per_line as f32 * lines).floor().max(1.0) as usize;
+    if text.chars().count() <= budget {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(budget.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// The rail's widths, from the window's width.
+///
+/// Pure arithmetic, and a test asserts it: the rail is drawn from these
+/// numbers and nothing else, so the layout the operator sees and the layout
+/// the test checks cannot drift apart.
+///
+/// The scale's width is the REMAINDER, and it is the last thing to shrink:
+/// the picture can be smaller and the identity column can be narrower, but
+/// a control that is too small to grab is a control that has been taken
+/// away.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RailWidths {
+    /// The picture and the name.
+    unit: f32,
+    /// The identity rows.
+    identity: f32,
+    /// The speed scale's track.
+    scale: f32,
+    /// The verb and the answer.
+    order: f32,
+    /// The compass's diameter.
+    dial: f32,
+}
+
+/// The rail's widths at a given window width.
+///
+/// **The rail FITS the window, always.** The four channels and the chrome
+/// between them add up to the window's width, at every width, and the verb's
+/// column is the last thing that is ever squeezed. The arithmetic used to
+/// floor the SCALE and let the rest overflow, and the overflow went to the
+/// right — which is where the verb lives: at 640 points the `SET HELM` button
+/// was a twenty-point sliver at the window's edge and the server's answer was
+/// cut mid-figure. A rail that overflows does not lose its least important
+/// part; it loses the end, and the end is the console's primary action.
+///
+/// The order of sacrifice is the design's: the picture gives way first, then
+/// the column of facts, then the compass's face. The verb and the scale keep
+/// their floors — a verb you cannot see and a scale you cannot grab are both
+/// gone, and the verb is worse.
+fn rail_widths(viewport_w: f32) -> RailWidths {
+    // A narrow window gets a compact rail: a smaller picture, a narrower
+    // column of readings, a smaller compass and a narrower verb column.
+    let (unit_pref, identity_pref, order_pref, dial_pref) = if viewport_w < 1080.0 {
+        (176.0, 196.0, 148.0, 84.0)
+    } else {
+        (DASH_UNIT_W, DASH_ID_W, DASH_ORDER_W, DASH_DIAL)
+    };
+    // The floors: below these a channel is no longer what it says it is.
+    // The picture's floor keeps the hull's NAME under it, which is the one
+    // thing in that channel that is not a picture; the facts' floor keeps
+    // the longest reading whole; the compass's floor is a face you can still
+    // grab; the verb's floor is the button itself.
+    const UNIT_FLOOR: f32 = 144.0;
+    const IDENTITY_FLOOR: f32 = 150.0;
+    const DIAL_FLOOR: f32 = 64.0;
+    const ORDER_FLOOR: f32 = 72.0;
+    const SCALE_FLOOR: f32 = 48.0;
+    // The chrome the rail spends whatever the window is: the rule between
+    // the channels, the helm channel's padding, and the gap either side of
+    // the scale.
+    let chrome = 2.0 + 2.0 * DASH_RAIL_PAD + 2.0 * DASH_RAIL_GAP;
+    let mut unit = unit_pref;
+    let mut identity = identity_pref;
+    let mut dial = dial_pref;
+    let mut order = order_pref;
+    // The scale is the REMAINDER: the window less the chrome and the three
+    // channels that are sized. It is the last thing to shrink, and the only
+    // one that gives up its floor for the others.
+    let mut scale = viewport_w - chrome - order - unit - identity - dial;
+    if scale < SCALE_FLOOR {
+        // The points the scale's floor needs, and where they come from:
+        // the picture, then the facts, then the compass's face, and the verb
+        // LAST. Every one of them gives only what it has above its floor.
+        let mut excess = SCALE_FLOOR - scale;
+        let mut take = |room: f32, excess: &mut f32| {
+            let taken = room.max(0.0).min(*excess);
+            *excess -= taken;
+            taken
+        };
+        let from_unit = take(unit - UNIT_FLOOR, &mut excess);
+        unit -= from_unit;
+        let from_identity = take(identity - IDENTITY_FLOOR, &mut excess);
+        identity -= from_identity;
+        let from_dial = take(dial - DIAL_FLOOR, &mut excess);
+        dial -= from_dial;
+        let from_order = take(order - ORDER_FLOOR, &mut excess);
+        order -= from_order;
+        // The scale takes back what the others gave, and whatever is left of
+        // its floor it keeps: a window narrower than the rail's floors is a
+        // window this console cannot fill, and the scale is the part that
+        // can afford to be the part that is missing.
+        scale = SCALE_FLOOR - excess;
+    }
+    RailWidths {
+        unit,
+        identity,
+        scale: scale.max(0.0),
+        order,
+        dial,
+    }
+}
+
+/// The speed scale's graduations, in knots, for a track of `w` points.
+///
+/// A scale whose graduations touch is a smear, and a smear is worse than a
+/// coarse scale: the operator reads the exact figure above it and uses the
+/// scale for the shape of the answer, not for the last knot.
+fn scale_graduations(w: f32) -> f32 {
+    if w >= 560.0 {
+        2.0
+    } else if w >= 280.0 {
+        5.0
+    } else if w >= 140.0 {
+        10.0
+    } else {
+        20.0
+    }
+}
+
+/// The speed scale's NUMBERS, in knots, for a track of `w` points.
+///
+/// Finer than the graduations on a long track, because a number every ten
+/// knots on a 1100pt scale is a number every 275 points and reads as three
+/// stray labels rather than as a scale.
+fn scale_numbers(w: f32) -> f32 {
+    if w >= 700.0 {
+        5.0
+    } else if w >= 380.0 {
+        10.0
+    } else if w >= 200.0 {
+        20.0
+    } else {
+        40.0
+    }
+}
+/// The order's answer, in lines. Three is what the rail has under the verb
+/// once the controls and the padding have taken their share of the band, and
+/// three lines of a refusal is enough to name the problem.
+const DASH_STATUS_LINES: f32 = 3.0;
+/// The SVG icons' edge, in the rail. Big enough to read as a subject rather
+/// than as a speck beside a word.
+const DASH_ICON: f32 = 15.0;
 
 /// The leaf column's content width — what a row's banner spans. The
 /// modal (700) minus the picker's padding (12 + 28) and the three fixed
@@ -819,6 +1145,184 @@ fn pin_glyph(r: f32, ink: Rgba) -> impl IntoElement {
 /// `enabled` is the hull's own answer to "is there a ground to centre on": a
 /// hull that has neither reported nor been placed has nothing to frame, and the
 /// mark dims rather than pretending the button would do something.
+/// The heading compass's face: a ring, twelve graduations, a north wedge,
+/// and a needle at the drafted course. Drawn rather than typed for the same
+/// reason the pin is — the console's face has no dial, and a ring is two arcs
+/// plus a line.
+///
+/// The compass convention is the whole point: 0° is UP, 90° is RIGHT, so the
+/// screen angle is offset by −90° when drawing and +90° when reading
+/// ([`IslandDemo::dial_pointer`]).
+///
+/// **The face is measured, and the measurement is the whole fix.** The first
+/// version of this drew into a `canvas` that sat in a block-level parent, so
+/// GPUI measured the canvas at ZERO HEIGHT: the radius came out negative, the
+/// ring collapsed, the graduations shrank to a few pixels around the hub, and
+/// the needle — drawn from the canvas's own top edge rather than the dial's
+/// centre — pointed at a bearing the readout did not agree with. A control
+/// that reads 34° and draws north is worse than no control, so the canvas
+/// now carries an explicit size and the needle is drawn about the same
+/// centre the pointer maths uses.
+fn paint_dial(window: &mut Window, bounds: Bounds<gpui::Pixels>, heading: f32, armed: bool) {
+    let cx = bounds.origin.x + bounds.size.width / 2.0;
+    let cy = bounds.origin.y + bounds.size.height / 2.0;
+    // A tenth of the face is left clear inside the ring, so the needle has
+    // somewhere to live and the graduations are not cut off by the rim.
+    let r = (bounds.size.width.min(bounds.size.height) / 2.0) - px(11.0);
+    if r <= px(0.0) {
+        return;
+    }
+    let face = if armed {
+        CUT_GREY.with_alpha(210)
+    } else {
+        CUT_GREY.with_alpha(150)
+    };
+    // The rim: one hairline, the same weight as the rail's own rules, so the
+    // compass is a drawn instrument and not an ornament.
+    let mut ring = PathBuilder::stroke(px(1.0));
+    ring.move_to(point(cx + r, cy));
+    ring.arc_to(point(r, r), px(0.0), false, true, point(cx - r, cy));
+    ring.arc_to(point(r, r), px(0.0), false, true, point(cx + r, cy));
+    if let Ok(path) = ring.build() {
+        window.paint_path(path, rgba(face));
+    }
+    // Twelve graduations, every 30°, the cardinals longer and heavier. They
+    // hang INSIDE the rim, so the face reads as a scale rather than as a
+    // spoked wheel.
+    for i in 0..12 {
+        let screen = (i as f32 * 30.0 - 90.0).to_radians();
+        let (dx, dy) = (screen.cos(), screen.sin());
+        let cardinal = i % 3 == 0;
+        let inner = r - px(if cardinal { 8.0 } else { 4.5 });
+        let outer = r - px(1.5);
+        let mut tick = PathBuilder::stroke(px(if cardinal { 1.4 } else { 1.0 }));
+        tick.move_to(point(cx + dx * inner, cy + dy * inner));
+        tick.line_to(point(cx + dx * outer, cy + dy * outer));
+        if let Ok(path) = tick.build() {
+            window.paint_path(path, rgba(if cardinal { face } else { face.with_alpha(120) }));
+        }
+    }
+    // North: a wedge at the top of the face, so "up is north" is a thing the
+    // operator can see rather than a rule they have to remember. The needle
+    // pointing at it IS a course of zero.
+    let nw = px(4.0);
+    let nh = px(7.0);
+    let mut north = PathBuilder::fill();
+    north.move_to(point(cx - nw, cy - r + px(1.0)));
+    north.line_to(point(cx + nw, cy - r + px(1.0)));
+    north.line_to(point(cx, cy - r + nh));
+    if let Ok(path) = north.build() {
+        window.paint_path(path, rgba(face));
+    }
+    // The needle: from the hub out to the graduations, with a short tail so
+    // the hub reads as a pivot and not as a stray dot. The course figure is
+    // read ABOVE the face, so the needle can be the compass's own and run
+    // the full radius.
+    let screen = (heading - 90.0).to_radians();
+    let (dx, dy) = (screen.cos(), screen.sin());
+    let needle = if armed {
+        RADAR_CYAN
+    } else {
+        RADAR_CYAN.with_alpha(150)
+    };
+    let mut shaft = PathBuilder::stroke(px(2.0));
+    shaft.move_to(point(cx, cy));
+    shaft.line_to(point(cx + dx * (r - px(9.0)), cy + dy * (r - px(9.0))));
+    if let Ok(path) = shaft.build() {
+        window.paint_path(path, rgba(needle));
+    }
+    let mut tail = PathBuilder::stroke(px(2.0));
+    tail.move_to(point(cx, cy));
+    tail.line_to(point(cx - dx * px(9.0), cy - dy * px(9.0)));
+    if let Ok(path) = tail.build() {
+        window.paint_path(path, rgba(needle));
+    }
+    let hub = px(2.5);
+    let mut dot = PathBuilder::fill();
+    dot.move_to(point(cx - hub, cy - hub));
+    dot.line_to(point(cx + hub, cy - hub));
+    dot.line_to(point(cx + hub, cy + hub));
+    dot.line_to(point(cx - hub, cy + hub));
+    if let Ok(dot) = dot.build() {
+        window.paint_path(dot, rgba(needle));
+    }
+}
+
+/// The speed scale's face: a graduated track, a fill to the thumb, and the
+/// thumb. The fill is the value's ink extent — the same number read as a
+/// length, which is the console's own "quantity as ink extent" rule.
+///
+/// The graduations are what make it a SCALE rather than a slider: a tick
+/// every two knots, a longer one every ten, so the operator can read the
+/// draft off the instrument without reading the figure. The figure above it
+/// is the exact number; the scale is the approximate one, and a console that
+/// offered only the figure would ask for a drag to answer a question the
+/// operator is really asking.
+fn paint_scale(
+    window: &mut Window,
+    bounds: Bounds<gpui::Pixels>,
+    frac: f32,
+    armed: bool,
+    step_kn: f32,
+) {
+    let h = px(6.0);
+    let cy = bounds.origin.y + px(DASH_SCALE_TRACK_Y);
+    let x0 = bounds.origin.x;
+    let x1 = bounds.origin.x + bounds.size.width;
+    let thumb_x = x0 + bounds.size.width * frac.clamp(0.0, 1.0);
+    let mut track = PathBuilder::fill();
+    track.move_to(point(x0, cy - h / 2.0));
+    track.line_to(point(x1, cy - h / 2.0));
+    track.line_to(point(x1, cy + h / 2.0));
+    track.line_to(point(x0, cy + h / 2.0));
+    if let Ok(path) = track.build() {
+        window.paint_path(path, rgba(HAIRLINE_SLATE));
+    }
+    let ink = if armed {
+        RADAR_CYAN
+    } else {
+        RADAR_CYAN.with_alpha(150)
+    };
+    let mut fill = PathBuilder::fill();
+    fill.move_to(point(x0, cy - h / 2.0));
+    fill.line_to(point(thumb_x, cy - h / 2.0));
+    fill.line_to(point(thumb_x, cy + h / 2.0));
+    fill.line_to(point(x0, cy + h / 2.0));
+    if let Ok(path) = fill.build() {
+        window.paint_path(path, rgba(ink));
+    }
+    // The graduations, under the track. How fine they are is the caller's
+    // decision, so the DOM's numbers and these ticks cannot disagree about
+    // where ten knots is.
+    let steps = (DASH_SPEED_MAX_KN / step_kn).round() as i32;
+    for step in 0..=steps {
+        let knot = step as f32 * step_kn;
+        let x = x0 + bounds.size.width * (knot / DASH_SPEED_MAX_KN);
+        let major = (knot % 10.0).abs() < 0.001;
+        let len = if major { px(7.0) } else { px(4.0) };
+        let mut tick = PathBuilder::stroke(px(1.0));
+        tick.move_to(point(x, cy + h / 2.0 + px(1.0)));
+        tick.line_to(point(x, cy + h / 2.0 + px(1.0) + len));
+        if let Ok(path) = tick.build() {
+            window.paint_path(path, rgba(if major {
+                CUT_GREY.with_alpha(200)
+            } else {
+                CUT_GREY.with_alpha(110)
+            }));
+        }
+    }
+    // The thumb: a diamond, the console's own mark for "the value is here".
+    let tr = px(7.0);
+    let mut thumb = PathBuilder::fill();
+    thumb.move_to(point(thumb_x, cy - tr));
+    thumb.line_to(point(thumb_x + tr, cy));
+    thumb.line_to(point(thumb_x, cy + tr));
+    thumb.line_to(point(thumb_x - tr, cy));
+    if let Ok(path) = thumb.build() {
+        window.paint_path(path, rgba(MAP_INK));
+    }
+}
+
 fn focus_glyph(enabled: bool) -> impl IntoElement {
     let ink = if enabled {
         rgba(BODY_SILVER)
@@ -1138,6 +1642,47 @@ fn machine(text: impl Into<SharedString>, ink: Rgba) -> impl IntoElement {
         .child(text.into())
 }
 
+/// One row in the commander's rail: a tracked-caps label, an SVG icon when
+/// the row has one, and the value right-aligned.
+///
+/// The icon is the row's SUBJECT, so it sits between the label and the
+/// value — "group" is a word, the formation is the thing.
+///
+/// The value is RIGHT-ALIGNED, and that is the fix. The first version of the
+/// rail laid the values out inline, so each one began wherever its label
+/// ended: the hull number started under "HULL", the group name under the
+/// group icon, the embark line under the anchor. Three values, three
+/// different columns, and the eye re-read every row instead of tracking one.
+/// Right-aligned, they are a column the operator can scan down.
+fn identity_row(label: &str, value: &str, icon_path: Option<&'static str>) -> AnyElement {
+    let mut key = div().flex().flex_row().items_center().gap(px(6.0)).flex_shrink_0();
+    key = key.child(tracked(label, DASH_LABEL_PT, CUT_GREY));
+    if let Some(path) = icon_path {
+        key = key.child(icon(path, DASH_ICON, DASH_ICON, CUT_GREY));
+    }
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(10.0))
+        .pb(px(5.0))
+        .border_b(px(view::PANEL_EDGE))
+        .border_color(rgba(HAIRLINE_SLATE))
+        .child(key)
+        .child(
+            div()
+                .flex_1()
+                .truncate()
+                .text_right()
+                .font_family(view::FACE_HUMAN)
+                .text_size(px(view::BODY_PT))
+                .text_color(rgba(MAP_INK))
+                .child(value.to_string()),
+        )
+        .into_any_element()
+}
+
 impl IslandDemo {
     /// Render one island of the column.
     ///
@@ -1426,6 +1971,11 @@ impl IslandDemo {
                 if let Some(m) = self.live.iter().find(|m| m.id == ship.id) {
                     self.helm_heading = m.heading_deg;
                     self.helm_speed = m.speed_kn;
+                    // The instruments settle onto the hull's own course
+                    // rather than snapping to it: the rail arrives with the
+                    // exercise already running, and a compass that jumps to
+                    // a bearing nobody dragged is a glitch.
+                    self.helm_ease_to();
                 }
             }
         }
@@ -1506,6 +2056,7 @@ impl IslandDemo {
             // `TFG_BOARD=1` opens the scenario board for a headless capture,
             // the same seed-the-state precedent as `TFG_SETTINGS`.
             board_open: std::env::var("TFG_BOARD").as_deref() == Ok("1"),
+            board_selected: None,
             step_verb_busy: false,
             step_verb_status: String::new(),
             pin_arm: false,
@@ -1562,6 +2113,7 @@ impl IslandDemo {
             // exactly the capture that kept appearing: not a stray focus click
             // at all, a flag that defaulted the wrong way.
             comms_open: std::env::var("TFG_COMMS").as_deref() == Ok("1"),
+            crew_modal_open: false,
             inspect_open: std::env::var("TFG_INSPECT").as_deref() == Ok("1"),
             // No seeded pointer. The prototype seeded one over an island so a
             // capture would show a lit rim with no input; a console's rims
@@ -1637,6 +2189,7 @@ impl IslandDemo {
             helm_heading: None,
             helm_speed: None,
             helm_status: None,
+            helm_anim: None,
             order_tx,
             map_zoom,
             pan: None,
@@ -1721,6 +2274,8 @@ impl IslandDemo {
             embark_over: HashMap::new(),
             embark_busy: false,
             embark_status: String::new(),
+            commander_embark_asked: Vec::new(),
+            commander_embark_game: 0,
             roster_busy: false,
             roster_status: String::new(),
             roster_draft: crate::roster::RosterDraft::new(),
@@ -1765,6 +2320,7 @@ impl IslandDemo {
             drag_moved: false,
             live: Vec::new(),
             map_dims: (0.0, 0.0),
+            last_viewport: (0.0, 0.0),
             reveal: None,
         };
         // Seed the drafts from the held session. The startup hold CAN be a
@@ -1982,6 +2538,27 @@ impl IslandDemo {
         self.jump_to_piece(unit_id, cx)
     }
 
+    /// One live marker's position in the CURRENT frame's pixel space.
+    ///
+    /// The binary also hands over `x`/`y`, projected at the camera it held
+    /// when it built the batch. Those are a snapshot, not a place: when the
+    /// camera zooms or pans and no new fix arrives, the old pixel stays where
+    /// it was while the map redraws around it — the hull slides off its own
+    /// latitude and longitude. The shell holds the frame's camera and the
+    /// marker's ground, so it projects the marker every frame from those,
+    /// using the same arithmetic `map_render` uses. A fix therefore stays on
+    /// its water through any zoom.
+    fn marker_frame_px(&self, marker: &LiveMarker) -> (f64, f64) {
+        project_frame_px(
+            marker.latitude,
+            marker.longitude,
+            self.map_center,
+            self.map_render_zoom,
+            f64::from(self.map_dims.0),
+            f64::from(self.map_dims.1),
+        )
+    }
+
     /// The ground a hull is known to be at: its fix when the wire has reported
     /// one, and otherwise the start the operator staged on the map.
     ///
@@ -1998,6 +2575,42 @@ impl IslandDemo {
                     .and_then(|h| h.start)
                     .map(|s| (s.lat, s.lon))
             })
+            // The exercise's own placement, which is the only ground a freshly
+            // executing game has before any device or order reports a fix.
+            .or_else(|| {
+                self.session
+                    .pieces
+                    .iter()
+                    .find(|p| p.id == unit_id)
+                    .and_then(|p| p.start)
+            })
+    }
+
+    /// The chrome's visible-centre shift, converted from window points to
+    /// frame pixels. The map is COVERED into the window, so a 360pt zone is
+    /// not 360 frame pixels; the focus unprojects in the frame's own space.
+    fn frame_shift_px(&self, shift_px: f32) -> f32 {
+        // No frame yet: nothing to scale against, and a focus click before
+        // the first map draw is a click at a door that is not live. Hand the
+        // shift back unchanged rather than pretending a zero scale.
+        if self.map_dims.0 <= 0.0
+            || self.map_dims.1 <= 0.0
+            || self.last_viewport.0 <= 0.0
+            || self.last_viewport.1 <= 0.0
+        {
+            return shift_px;
+        }
+        let (scale, _, _) = map_view(
+            f64::from(self.map_dims.0),
+            f64::from(self.map_dims.1),
+            f64::from(self.last_viewport.0),
+            f64::from(self.last_viewport.1),
+        );
+        if scale > 0.0 {
+            (f64::from(shift_px) / scale) as f32
+        } else {
+            shift_px
+        }
     }
 
     /// Centre the map on ONE hull — the Fleet island's per-row focus door.
@@ -2011,7 +2624,15 @@ impl IslandDemo {
         let Some((lat, lon)) = self.piece_ground(unit_id) else {
             return false;
         };
-        let shift_px = camera_centre_shift(self.zone_w, self.side_dock_left, !self.show_side_zone);
+        // Execution has no side column, so its visible centre is the
+        // window's: the shift must not push the hull under chrome that is
+        // not there.
+        let zone_visible = !self.session.execution && self.show_side_zone;
+        let shift_px = self.frame_shift_px(camera_centre_shift(
+            self.zone_w,
+            self.side_dock_left,
+            !zone_visible,
+        ));
         let _ = self.order_tx.send(ToBinary::Jump {
             lat,
             lon,
@@ -2019,6 +2640,57 @@ impl IslandDemo {
         });
         cx.notify();
         true
+    }
+
+    /// Centre the map on a task group: the mean of the grounds of the hulls
+    /// beneath it in this exercise's tree.
+    ///
+    /// A task group has no map object of its own, so "focus the group" is
+    /// "frame the force it holds". A group whose hulls have no ground sends
+    /// nothing and returns false, the same rule `jump_to_piece` follows.
+    fn jump_to_group(&mut self, group_id: i64, cx: &mut Context<Self>) -> bool {
+        let Some((lat, lon)) = self.group_ground(group_id) else {
+            return false;
+        };
+        // Execution has no side column, so its visible centre is the
+        // window's: the shift must not push the hull under chrome that is
+        // not there.
+        let zone_visible = !self.session.execution && self.show_side_zone;
+        let shift_px = self.frame_shift_px(camera_centre_shift(
+            self.zone_w,
+            self.side_dock_left,
+            !zone_visible,
+        ));
+        let _ = self.order_tx.send(ToBinary::Jump {
+            lat,
+            lon,
+            shift_px,
+        });
+        cx.notify();
+        true
+    }
+
+    /// The mean ground of the hulls beneath a task group, or `None` when none
+    /// of them has a position. Split out of `jump_to_group` because the crew
+    /// row needs the same answer to decide whether its focus door is live.
+    fn group_ground(&self, group_id: i64) -> Option<(f64, f64)> {
+        let nodes = self.group_subtree_ids(group_id);
+        let mut sum = (0.0f64, 0.0f64);
+        let mut count = 0usize;
+        for piece in &self.session.pieces {
+            if !piece
+                .hierarchy_node
+                .is_some_and(|node| nodes.contains(&node))
+            {
+                continue;
+            }
+            if let Some((lat, lon)) = self.piece_ground(piece.id) {
+                sum.0 += lat;
+                sum.1 += lon;
+                count += 1;
+            }
+        }
+        (count > 0).then(|| (sum.0 / count as f64, sum.1 / count as f64))
     }
 
     /// Sign out: tell the binary to drop its token, then show the card.
@@ -2030,6 +2702,7 @@ impl IslandDemo {
     fn sign_out(&mut self, cx: &mut Context<Self>) {
         let _ = self.order_tx.send(ToBinary::SignOut);
         self.session.signed_in = false;
+        self.crew_modal_open = false;
         self.live.clear();
         self.helm_status = None;
         self.login_busy = false;
@@ -2192,51 +2865,34 @@ impl IslandDemo {
             .flex_row()
             .items_center()
             .gap(px(10.0));
-        // The scenario's door, in the console's own left-to-right order: the
-        // plan first, then the mail, then the settings, then the way out.
-        //
-        // Present only while the exercise RUNS. The book is where a plan is
-        // written and it has its own door on the held session; this is where
-        // one is played, and offering it in planning would be a board of a
-        // pointer that does not exist yet.
-        if self.session.execution {
+        // In EXECUTION both doors moved to the widget rail: the scenario and
+        // the comms hub are widgets on the map now, and duplicating them in
+        // the band would give the same surface two entries. The band keeps
+        // settings and the way out.
+        if !self.session.execution {
             right = right
                 .child(
                     div()
-                        .id("board-door")
+                        .id("comms-door")
                         .cursor_pointer()
                         .on_click(cx.listener(|view, _, _, cx| {
-                            // A door, not a switch: the board's own close is a
-                            // cross, and a band button that toggled it would
-                            // make the strip the only way in.
-                            view.open_only(WhichPanel::Board);
+                            // The console's door: it flips its floating comms
+                            // island. This shell has no floating panes, so the
+                            // same door opens the same surface in the modal
+                            // zone — and a second press shuts it, which is what
+                            // a door does.
+                            if view.comms_open {
+                                view.comms_open = false;
+                            } else {
+                                view.open_only(WhichPanel::Comms);
+                            }
                             cx.notify();
                         }))
-                        .child(button("Scenario", true, false, false)),
+                        .child(button(mail, true, false, false)),
                 )
                 .child(sep());
         }
         right = right
-            .child(
-                div()
-                    .id("comms-door")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        // The console's door: it flips its floating comms
-                        // island. This shell has no floating panes, so the
-                        // same door opens the same surface in the modal
-                        // zone — and a second press shuts it, which is what
-                        // a door does.
-                        if view.comms_open {
-                            view.comms_open = false;
-                        } else {
-                            view.open_only(WhichPanel::Comms);
-                        }
-                        cx.notify();
-                    }))
-                    .child(button(mail, true, false, false)),
-            )
-            .child(sep())
             .child(
                 div()
                     .id("settings-door")
@@ -2298,6 +2954,7 @@ impl IslandDemo {
         self.composer_open = which == WhichPanel::Composer;
         self.book_open = which == WhichPanel::Book;
         self.board_open = which == WhichPanel::Board;
+        self.crew_modal_open = which == WhichPanel::Crew;
         // Any door but the Book's cancels a pin: a mode that survived the
         // operator walking off to another surface would make the next map
         // click somewhere else quote a coordinate nobody asked for.
@@ -2368,6 +3025,15 @@ impl IslandDemo {
         // means the real seat decides, which is the honest default.
         let player = self.player_station();
         let mut slots = view::zone_islands(phase, player);
+        // EXECUTION HAS NO SIDE COLUMN. The owner's direction: the account,
+        // the crew, the scenario and comms are widgets on the map in this
+        // phase, and each opens its own modal. The column is planning and
+        // preparation furniture, so clearing it here removes the islands, the
+        // band's hit area, the wheel's chain and the ownership resolve at
+        // once — one gate, not four paint conditions.
+        if matches!(phase, crate::gamestate::GameState::Execution) {
+            slots.clear();
+        }
         // The operator's own choice, applied to the state's slots. The flags
         // are the panel-open flags the shell already carried, so a capture
         // seed and a test still name the same thing.
@@ -2957,11 +3623,18 @@ impl IslandDemo {
     /// piece arrives unplaced and the pip says so.
     /// The Player picker: the directory accounts are seated from, and the room.
     ///
-    /// The console's `player_picker_modal`. The directory is the read; the room
-    /// is what the operator has said about it, and every edit posts through
-    /// `roster::plan` at once — so, exactly as with the force, the draft is a
-    /// mirror of what Minos holds and a session read can re-seed it without
-    /// discarding work.
+    /// The console's `player_picker_modal`, as the flow the game master
+    /// actually works in three steps: PICK an account from the directory,
+    /// ASSIGN it a role, and — when that role is player-side, the side that
+    /// commands — HAND IT a deployed piece from the exercise. The third step
+    /// used to live only in the Fleet picker, backwards from how a room is
+    /// built; it is here now, next to the seat it belongs to.
+    ///
+    /// All three steps are LOCAL while the game is being planned: the draft
+    /// is what Minos will hold after the Session island's advance, and a
+    /// session read re-seeds it without discarding work. The room list
+    /// shows the DRAFT overlaid on the server's frame ([`Self::room_rows`]),
+    /// so every staged click is visible before it is written.
     ///
     /// What this does NOT do is ask for a call sign. Minos requires one on a
     /// seat and the console's form asks the operator for it; here the account's
@@ -3027,9 +3700,25 @@ impl IslandDemo {
             .gap(px(4.0))
             .flex_1()
             .overflow_y_scroll();
+        // The picker's one line of feedback, under the header so every
+        // section's clicks have their answer beside them — the seat, the
+        // move and the handover all speak here.
+        if !self.roster_status.is_empty() {
+            list = list.child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgba(if self.roster_busy { BODY_SILVER } else { ALERT_YELLOW }))
+                    .child(self.roster_status.clone()),
+            );
+        }
+        // THE ROOM, as the draft has it: the seat staged a second ago is in
+        // the room now, a role change reads as one, and each player-side row
+        // says which hull it commands — or that it commands none, which is
+        // the gap the section below fixes.
+        let room = self.room_rows();
         list = list.child(small(format!(
             "IN THE ROOM \u{2014} {}",
-            self.session.people.len()
+            room.iter().filter(|r| !r.removed).count()
         )));
         if self.session.roles.is_empty() {
             list = list.child(small(
@@ -3037,10 +3726,11 @@ impl IslandDemo {
                     .to_string(),
             ));
         }
-        if self.session.people.is_empty() {
+        let pieces = self.deployed_pieces();
+        if room.is_empty() {
             list = list.child(small("Nobody seated.".to_string()));
         }
-        for p in self.session.people.clone() {
+        for r in room.iter().cloned() {
             let mut row = div()
                 .flex()
                 .flex_row()
@@ -3054,50 +3744,147 @@ impl IslandDemo {
                     .flex_1()
                     .text_size(px(11.0))
                     .text_color(rgba(MAP_INK))
-                    .child(p.name.clone()),
+                    .child(r.name.clone()),
             );
-            row = row.child(
+            let mut badges = div().flex().flex_row().items_center().gap(px(6.0));
+            badges = badges.child(
                 div()
                     .text_size(px(10.5))
-                    .text_color(rgba(if p.judge { BODY_SILVER } else { RADAR_CYAN }))
-                    .child(if p.judge {
-                        format!("{} \u{00b7} directs", p.role)
+                    .text_color(rgba(if r.judge { BODY_SILVER } else { RADAR_CYAN }))
+                    .child(if r.judge {
+                        format!("{} \u{00b7} directs", r.role)
                     } else {
-                        format!("{} \u{00b7} steers", p.role)
+                        format!("{} \u{00b7} steers", r.role)
                     }),
             );
-            row = row.child(
-                div()
-                    .id(("unseat", p.id as usize))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        match view.stage_unseat(p.id) {
-                            Ok(()) => view.roster_status = format!("{} unseated", p.name),
-                            Err(why) => view.roster_status = why,
-                        }
-                        cx.notify();
-                    }))
-                    .child(button("unseat", true, false, false)),
-            );
+            if r.staged {
+                badges = badges.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgba(ALERT_YELLOW))
+                        .child("staged".to_string()),
+                );
+            }
+            if r.removed {
+                badges = badges.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgba(ALERT_YELLOW))
+                        .child("leaves".to_string()),
+                );
+            }
+            if let Some(p) = pieces.iter().find(|p| p.commander_id == Some(r.id)) {
+                badges = badges.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgba(BODY_SILVER))
+                        .child(format!("commands {}", p.label)),
+                );
+            } else if !r.judge && !r.removed {
+                badges = badges.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgba(ALERT_YELLOW))
+                        .child("no command yet".to_string()),
+                );
+            }
+            row = row.child(badges);
+            if !r.removed {
+                let rid = r.id;
+                let rname = r.name.clone();
+                row = row.child(
+                    div()
+                        .id(("unseat", r.id as usize))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            match view.stage_unseat(rid) {
+                                Ok(()) => view.roster_status = format!("{rname} unseated"),
+                                Err(why) => view.roster_status = why,
+                            }
+                            cx.notify();
+                        }))
+                        .child(button("unseat", true, false, false)),
+                );
+            }
+            list = list.child(row);
+        }
+        list = list.child(separator());
+        // NEEDS A COMMAND — step three of the flow, in the picker the flow
+        // started in. A player-side seat that commands nothing is the state
+        // `force::plan` refuses at the advance ("Minos gives every piece a
+        // commander"), and the Fleet picker was the only surface that could
+        // fix it — so the fix comes to the person instead of the person to
+        // the fix. One button per piece IN THE EXERCISE, placed or not; the
+        // click is a staged handover like every other planning edit.
+        let needs_command: Vec<&RoomRow> = room
+            .iter()
+            .filter(|r| !r.judge && !r.removed)
+            .filter(|r| !pieces.iter().any(|p| p.commander_id == Some(r.id)))
+            .collect();
+        list = list.child(small(format!(
+            "NEEDS A COMMAND \u{2014} {}",
+            needs_command.len()
+        )));
+        if !needs_command.is_empty() && pieces.is_empty() {
+            list = list.child(small(
+                "No pieces are deployed \u{2014} drop hulls on the Fleet island first."
+                    .to_string(),
+            ));
+        }
+        for r in needs_command {
+            let who = r.id;
+            let who_name = r.name.clone();
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(4.0))
+                .py(px(3.0))
+                .rounded(px(3.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(11.0))
+                        .text_color(rgba(MAP_INK))
+                        .child(who_name.clone()),
+                );
+            for p in pieces.iter() {
+                let p_id = p.id;
+                let p_label = p.label.clone();
+                let shown = p.label.clone();
+                let name = who_name.clone();
+                row = row.child(
+                    div()
+                        .id(("needs-command", who as usize * 1000 + p_id as usize))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            match view.stage_command(p_id, &p_label, who) {
+                                Ok(()) => view.roster_status = format!("{name} commands {p_label}"),
+                                Err(why) => view.roster_status = why,
+                            }
+                            cx.notify();
+                        }))
+                        .child(button(shown, true, false, false)),
+                );
+            }
             list = list.child(row);
         }
         list = list.child(separator());
         list = list.child(small("THE DIRECTORY".to_string()));
-        if !self.roster_status.is_empty() {
-            list = list.child(
-                div()
-                    .text_size(px(10.5))
-                    .text_color(rgba(if self.roster_busy { BODY_SILVER } else { ALERT_YELLOW }))
-                    .child(self.roster_status.clone()),
-            );
-        }
         if self.session.directory.is_empty() {
             list = list.child(small("The directory did not answer.".to_string()));
         }
-        let seated: Vec<i64> = self.session.people.iter().map(|p| p.id).collect();
+        // Who is already in the room, per the DRAFT — the same merge the
+        // room list shows, so a staged seat marks its directory row too.
+        let held: std::collections::HashMap<i64, i64> = room
+            .iter()
+            .filter(|r| !r.removed)
+            .map(|r| (r.id, r.role_id))
+            .collect();
         let roles = self.session.roles.clone();
         for (i, u) in self.session.directory.iter().take(20).cloned().collect::<Vec<_>>().into_iter().enumerate() {
-            let taken = seated.contains(&u.id);
+            let held_role = held.get(&u.id).copied();
             // Only the parts the mirror actually carries. A blank rank joined
             // with a separator reads as a row that lost its middle, which is a
             // worse answer than a row with one line in it.
@@ -3135,6 +3922,12 @@ impl IslandDemo {
             // are there because which seat somebody takes is the whole of the
             // decision, and a picker that only offered one answer would be a
             // picker that made it for you.
+            //
+            // A SEATED account's pills are LIVE, not disabled: the held role
+            // is lit and the rest move them there. They used to render dim
+            // and still fire, a control that read as ignoring the click it
+            // was obeying — the move is the click, and the status line says
+            // "moved", never "seated", for it.
             let mut seats = div()
                 .flex()
                 .flex_row()
@@ -3142,20 +3935,30 @@ impl IslandDemo {
                 .gap(px(6.0));
             for role in roles.iter().cloned() {
                 let name = u.name.clone();
-                let role = role.clone();
+                let role_name = role.name.clone();
                 let shown = role.name.clone();
+                let seated_already = held_role.is_some();
+                let hot = held_role == Some(role.id);
+                let role = role.clone();
+                let id = ("seat", u.id as usize * 1000 + role.id as usize);
                 seats = seats.child(
                     div()
-                        .id(("seat", u.id as usize * 1000 + role.id as usize))
+                        .id(id)
                         .cursor_pointer()
                         .on_click(cx.listener(move |view, _, _, cx| {
                             match view.stage_seat(u.id, &name, &role) {
-                                Ok(()) => view.roster_status = format!("{name} seated"),
+                                Ok(()) => {
+                                    view.roster_status = if seated_already {
+                                        format!("{name} \u{2192} {role_name}")
+                                    } else {
+                                        format!("{name} seated as {role_name}")
+                                    };
+                                }
                                 Err(why) => view.roster_status = why,
                             }
                             cx.notify();
                         }))
-                        .child(button(shown, true, taken, taken)),
+                        .child(button(shown, true, false, hot)),
                 );
             }
             row = row.child(seats);
@@ -4129,6 +4932,9 @@ impl IslandDemo {
             id: h.unit_id,
             label: h.name.clone(),
             commander_id: h.commander_id,
+            commander_name: String::new(),
+            hierarchy_node: None,
+            start: h.start.map(|s| (s.lat, s.lon)),
             placed: h.start.is_some(),
         }));
         pieces
@@ -4753,6 +5559,356 @@ impl IslandDemo {
         col.into_any_element()
     }
 
+    /// The execution CREW modal: every player, segmented by role, with the
+    /// hulls and task groups a commander holds and a focus door to the map.
+    ///
+    /// This is the execution phase's crew surface. The column's Crew island is
+    /// a readiness list — who has arrived and who may start — while this is
+    /// the exercise's order of battle by seat: who is in it, and what each
+    /// commander actually has.
+    fn crew_modal_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .size_full()
+            .overflow_hidden()
+            .p(px(PAD))
+            .pr(px(CUT + 8.0));
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .h(px(TITLE_H))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .font_family(view::FACE_HUMAN)
+                                .text_size(px(TITLE_SIZE))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgba(MAP_INK))
+                                .child("Crew"),
+                        )
+                        .child(tracked(
+                            &format!("{} seat(s)", self.session.seats),
+                            view::LABEL_PT,
+                            CUT_GREY,
+                        )),
+                )
+                .child(
+                    div()
+                        .id("close-crew")
+                        .cursor_pointer()
+                        .text_size(px(14.0))
+                        .text_color(rgba(BUTTON_LABEL))
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.crew_modal_open = false;
+                            cx.notify();
+                        }))
+                        .child("\u{00d7}"),
+                ),
+        );
+        col = col.child(separator());
+        col = col.child(note(
+            "Players are grouped by role. A commander's hulls and task groups \
+             sit beneath their seat; the reticle centres that force on the map.",
+        ));
+        col = col.child(separator());
+        if self.session.game_id == 0 {
+            return col.child(note("No session held.")).into_any_element();
+        }
+        if self.session.people.is_empty() {
+            return col.child(note("Nobody seated.")).into_any_element();
+        }
+
+        // Preserve the server's order but group by role, so the exercise side
+        // comes first and each role reads as one block.
+        let mut by_role: Vec<(String, Vec<PersonView>)> = Vec::new();
+        for person in self.session.people.clone() {
+            if let Some((_, list)) = by_role.iter_mut().find(|(role, _)| *role == person.role)
+            {
+                list.push(person);
+            } else {
+                by_role.push((person.role.clone(), vec![person]));
+            }
+        }
+        let mut list = div()
+            .id("crew-modal-list")
+            .flex_1()
+            .w_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(8.0));
+        for (role, people) in by_role {
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(tracked(&role, view::LABEL_PT, RADAR_CYAN))
+                    .child(div().flex_1().h(px(1.0)).bg(rgba(HAIRLINE_SLATE)))
+                    .child(machine(format!("{} person(s)", people.len()), BODY_SILVER)),
+            );
+            for person in people {
+                list = list.child(self.crew_person_card(&person, cx));
+            }
+        }
+        // Hulls nobody commands are still part of the exercise, and a crew
+        // screen that hid them would be an order of battle with a hole in it.
+        let unassigned: Vec<PieceView> = self
+            .session
+            .pieces
+            .iter()
+            .filter(|piece| piece.commander_id.is_none())
+            .cloned()
+            .collect();
+        if !unassigned.is_empty() {
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(tracked("unassigned hulls", view::LABEL_PT, WARNING_SAND))
+                    .child(div().flex_1().h(px(1.0)).bg(rgba(HAIRLINE_SLATE)))
+                    .child(machine(
+                        format!("{} hull(s)", unassigned.len()),
+                        BODY_SILVER,
+                    )),
+            );
+            for piece in unassigned {
+                list = list.child(self.crew_hull_row(&piece, cx));
+            }
+        }
+        col.child(list).into_any_element()
+    }
+
+    /// One person in the crew modal: their seat, then the force they command.
+    fn crew_person_card(&mut self, person: &PersonView, cx: &mut Context<Self>) -> AnyElement {
+        let (mark, ink) = if person.judge {
+            ("judge", IDLE_GREY)
+        } else if !person.present {
+            ("not arrived", ALERT_YELLOW)
+        } else if person.ready {
+            ("ready", SIGNAL_GREEN)
+        } else {
+            ("in room", WARNING_SAND)
+        };
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .p(px(7.0))
+            .rounded(px(6.0))
+            .bg(rgba(PANEL_SLATE.with_alpha(150)))
+            .border(px(1.0))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(view::BODY_PT))
+                            .text_color(rgba(MAP_INK))
+                            .child(person.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family(view::FACE_MACHINE)
+                            .text_size(px(10.0))
+                            .text_color(rgba(BODY_SILVER))
+                            .child(if person.call_sign.is_empty() {
+                                "\u{2014}".to_string()
+                            } else {
+                                person.call_sign.clone()
+                            }),
+                    )
+                    .child(tracked(mark, view::LABEL_PT, ink)),
+            );
+        // A judge commands nothing; its row stops at the seat. Everyone else
+        // gets the force they hold, even when that force is empty — "no
+        // command assigned" is an answer, and the organizer needs it.
+        if !person.judge {
+            let hulls: Vec<PieceView> = self
+                .session
+                .pieces
+                .iter()
+                .filter(|piece| piece.commander_id == Some(person.id))
+                .cloned()
+                .collect();
+            let groups: Vec<crate::groups::LiveGroup> = self
+                .session
+                .groups
+                .iter()
+                .filter(|group| group.commander_id == Some(person.id))
+                .cloned()
+                .collect();
+            if hulls.is_empty() && groups.is_empty() {
+                card = card.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                        .child("no command assigned"),
+                );
+            }
+            for hull in hulls {
+                card = card.child(self.crew_hull_row(&hull, cx));
+            }
+            for group in groups {
+                card = card.child(self.crew_group_row(&group, cx));
+            }
+        }
+        card.into_any_element()
+    }
+
+    /// One commanded hull in the crew modal: face, name, and the focus door.
+    fn crew_hull_row(&mut self, piece: &PieceView, cx: &mut Context<Self>) -> AnyElement {
+        let id = piece.id;
+        let face = Self::thumb_box(
+            self.thumbs.get(&id).cloned(),
+            self.fleet_symbol(id),
+            42.0,
+            28.0,
+            0.8,
+            ObjectFit::Cover,
+        );
+        let ground = self.piece_ground(id).is_some();
+        let focus: AnyElement = if ground {
+            div()
+                .id(("crew-focus-hull", id as usize))
+                .cursor_pointer()
+                .w(px(16.0))
+                .h(px(16.0))
+                .flex_shrink_0()
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.crew_modal_open = false;
+                    view.jump_to_piece(id, cx);
+                }))
+                .child(focus_glyph(true))
+                .into_any_element()
+        } else {
+            div()
+                .w(px(16.0))
+                .h(px(16.0))
+                .flex_shrink_0()
+                .child(focus_glyph(false))
+                .into_any_element()
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(7.0))
+            .pl(px(6.0))
+            .child(face)
+            .child(
+                div()
+                    .flex_1()
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(11.0))
+                    .text_color(rgba(MAP_INK))
+                    .child(piece.label.clone()),
+            )
+            .child(focus)
+            .into_any_element()
+    }
+
+    /// One commanded task group in the crew modal. A group has no map object,
+    /// so its focus door frames the mean ground of the hulls beneath it.
+    fn crew_group_row(
+        &mut self,
+        group: &crate::groups::LiveGroup,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = group.group_id;
+        let ground = self.group_ground(id).is_some();
+        let focus: AnyElement = if ground {
+            div()
+                .id(("crew-focus-group", id as usize))
+                .cursor_pointer()
+                .w(px(16.0))
+                .h(px(16.0))
+                .flex_shrink_0()
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.crew_modal_open = false;
+                    view.jump_to_group(id, cx);
+                }))
+                .child(focus_glyph(true))
+                .into_any_element()
+        } else {
+            div()
+                .w(px(16.0))
+                .h(px(16.0))
+                .flex_shrink_0()
+                .child(focus_glyph(false))
+                .into_any_element()
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(7.0))
+            .pl(px(6.0))
+            .child(
+                div()
+                    .w(px(42.0))
+                    .h(px(28.0))
+                    .flex_shrink_0()
+                    .rounded(px(5.0))
+                    .bg(rgba(PANEL_SLATE))
+                    .child(
+                        canvas(
+                            |b, _, _| b,
+                            move |b, _, window, _| {
+                                let cx =
+                                    f32::from(b.origin.x) + f32::from(b.size.width) / 2.0;
+                                let cy =
+                                    f32::from(b.origin.y) + f32::from(b.size.height) / 2.0;
+                                paint_glyph(window, (cx, cy), MapSymbolShape::Dot, RADAR_CYAN, 1.0);
+                            },
+                        )
+                        .size_full(),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(11.0))
+                            .text_color(rgba(MAP_INK))
+                            .child(group.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family(view::FACE_MACHINE)
+                            .text_size(px(9.5))
+                            .text_color(rgba(BODY_SILVER))
+                            .child("task group"),
+                    ),
+            )
+            .child(focus)
+            .into_any_element()
+    }
+
     /// GROUPS — the task organisation: the forest of groups, their commanders
     /// and their member hulls. Authored locally while planning; the whole
     /// draft is written through at the move to preparation.
@@ -5311,6 +6467,77 @@ impl IslandDemo {
         self.session.people.iter().find(|p| p.id == self.session.me)
     }
 
+    /// The hulls this account commands in the held game, as unit ids.
+    ///
+    /// The session's `mine` is the hulls the server names as directly
+    /// commanded by this seat. A commander who commands a TASK GROUP rather
+    /// than a hull is not named there, so the group's subtree is the
+    /// fallback: the hulls under the groups this seat commands. Both halves
+    /// answer one question — which hulls is this operator steering — because
+    /// the dashboard and the follow door are about the force in their hands,
+    /// not about how the roster happened to list it.
+    fn own_unit_ids(&self) -> Vec<i64> {
+        let direct: Vec<i64> = self
+            .session
+            .mine
+            .iter()
+            .filter_map(|ship| ship.id.parse::<i64>().ok())
+            .collect();
+        if !direct.is_empty() {
+            return direct;
+        }
+        let me = self.session.me;
+        let nodes: Vec<i64> = self
+            .session
+            .groups
+            .iter()
+            .filter(|group| group.commander_id == Some(me))
+            .flat_map(|group| self.group_subtree_ids(group.group_id))
+            .collect();
+        if nodes.is_empty() {
+            return Vec::new();
+        }
+        self.session
+            .pieces
+            .iter()
+            .filter(|piece| piece.hierarchy_node.is_some_and(|node| nodes.contains(&node)))
+            .map(|piece| piece.id)
+            .collect()
+    }
+
+    /// The commander's own unit, as its piece. The first commanded hull is
+    /// the one the dashboard pictures and the follow door centres, which is
+    /// the same default the helm's order target uses.
+    ///
+    /// The piece is rebuilt from `mine` when the session's piece list does
+    /// not carry it, so a hull the server commands but the pieces read omits
+    /// still has a face rather than a hole.
+    fn own_unit(&self) -> Option<PieceView> {
+        let id = *self.own_unit_ids().first()?;
+        if let Some(piece) = self.session.pieces.iter().find(|piece| piece.id == id) {
+            return Some(piece.clone());
+        }
+        let ship = self
+            .session
+            .mine
+            .iter()
+            .find(|ship| ship.id == id.to_string())?;
+        Some(PieceView {
+            id,
+            label: ship.label.clone(),
+            commander_id: Some(self.session.me),
+            ..PieceView::default()
+        })
+    }
+
+    /// Whether this seat commands anything in the held game: a hull
+    /// directly, or a task group whose hulls it holds. The execution
+    /// dashboard and the follow door are a commander's, and a seat that
+    /// commands nothing — an observer, a judge — gets neither.
+    fn is_commander(&self) -> bool {
+        !self.own_unit_ids().is_empty()
+    }
+
     /// Minos's own force, as the draft's `LiveHull` mirror.
     ///
     /// Derived from the session's pieces rather than stored, so there is one
@@ -5411,16 +6638,32 @@ impl IslandDemo {
         self.groups.seed(&self.session.groups);
     }
 
-    /// Who may be handed a piece: every seat in the room. A hull with nobody
-    /// to command it cannot be assigned — `force::plan` refuses the whole plan
-    /// and names the hulls, because handing a piece to whoever happened to be
-    /// seated first is the one answer nobody can undo by looking at the map.
+    /// Who may be handed a piece: every seat in the room, staged seats
+    /// included. A hull with nobody to command it cannot be assigned —
+    /// `force::plan` refuses the whole plan and names the hulls, because
+    /// handing a piece to whoever happened to be seated first is the one
+    /// answer nobody can undo by looking at the map.
+    ///
+    /// The STAGED seats count, because the whole of the picker's flow is
+    /// local-first: a player seated a second ago commands a hull deployed a
+    /// second ago, and a list that waited for the advance would make the
+    /// picker's own third step undoable. A staged removal drops the row —
+    /// the advance unseats them.
     fn crew_choices(&self) -> Vec<(i64, String)> {
-        self.session
+        let mut crew: Vec<(i64, String)> = self
+            .session
             .people
             .iter()
+            .filter(|p| !self.roster_draft.is_removed(p.id))
             .map(|p| (p.id, p.name.clone()))
-            .collect()
+            .collect();
+        for seat in self.roster_draft.staged() {
+            match crew.iter_mut().find(|(id, _)| *id == seat.user_id) {
+                Some(row) => row.1 = seat.user_name.clone(),
+                None => crew.push((seat.user_id, seat.user_name.clone())),
+            }
+        }
+        crew
     }
 
     /// Put a register hull in the draft, and write it through.
@@ -5459,6 +6702,39 @@ impl IslandDemo {
     fn stage_handover(&mut self, unit_id: i64, commander_id: i64) -> Result<(), String> {
         if !self.force.set_commander(unit_id, Some(commander_id)) {
             return Err("that piece is not in the draft".to_string());
+        }
+        if self.staging() {
+            return Ok(());
+        }
+        self.sync_force()
+    }
+
+    /// Hand a deployed piece to somebody from the Player picker's
+    /// needs-a-command step, keeping the hull's other staged facts — a
+    /// handover must not lift a staged placement or embarkation the way a
+    /// wholesale upsert would.
+    ///
+    /// A piece the draft does not hold yet joins it here rather than
+    /// erroring: the picker offers `deployed_pieces()`, which is the
+    /// exercise as a whole, and a refusal for a hull the operator can see
+    /// is the wall this picker exists to remove. Everything else is
+    /// `stage_handover`'s one field. WHILE PLANNING this stages and
+    /// returns, like every other picker edit — the Session island's
+    /// advance is the moment it is written through.
+    fn stage_command(&mut self, unit_id: i64, name: &str, who: i64) -> Result<(), String> {
+        if self.force.contains(unit_id) {
+            if !self.force.set_commander(unit_id, Some(who)) {
+                return Err("that piece is not in the draft".to_string());
+            }
+        } else {
+            let mut hull = crate::force::DraftHull::new(
+                unit_id,
+                name.to_string(),
+                String::new(),
+                String::new(),
+            );
+            hull.commander_id = Some(who);
+            self.force.upsert(hull);
         }
         if self.staging() {
             return Ok(());
@@ -5720,11 +6996,11 @@ impl IslandDemo {
         )
     }
 
-    /// The ground a drop's view fractions point at: the inverse of
+    /// The ground a drop's FRAME fractions point at: the inverse of
     /// [`Self::frame_project`], and the shell-side half of what the binary
-    /// does for a non-staged deploy. The fractions are of the map VIEW, and
-    /// the frame fills it (`ObjectFit::Fill`), so the frame's own dimensions
-    /// are the scale.
+    /// does for a non-staged deploy. The pointer reports window fractions;
+    /// the UI converts them with [`window_fraction_to_frame`] (cover crops
+    /// one axis), and these are the frame's own 0..1 coordinates.
     fn frame_unproject(&self, fx: f64, fy: f64) -> (f64, f64) {
         let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
         unproject_frame_px(
@@ -5761,15 +7037,21 @@ impl IslandDemo {
         walk(&self.fleet_tax.groups, &unit_id.to_string()).unwrap_or(MapSymbolShape::Dot)
     }
 
-    /// The STAGED hulls that sit at a starting position and have no marker on
-    /// the wire yet: the map draws one planned marker per hull, dashed and
-    /// dimmed, so a position the operator set while planning is visible
-    /// before the advance writes it.
+    /// The hulls that sit at a starting position and have no marker on the
+    /// wire yet: the map draws one planned marker per hull, dashed and
+    /// dimmed, so a position is visible before any device reports a fix.
+    ///
+    /// The ground is [`Self::piece_ground`] — the operator's staged start when
+    /// there is one, and the exercise's own placement otherwise — because the
+    /// draft is re-seeded with `start: None` and the placement is the only
+    /// ground a freshly executing game has. Reading it here is what makes a
+    /// commanded hull visible before the wire names it, which is the whole
+    /// difference between a commander who can find their unit and one who
+    /// centres on an empty sea.
     ///
     /// A hull whose fix is already on the wire is SKIPPED: the live marker is
     /// the truth about where it is, and two frames over one hull would be two
-    /// answers. Projected from the draft's own lat/lon at the frame's camera,
-    /// because a staged hull has no fix for the binary to project.
+    /// answers.
     fn planned_marks(&self) -> Vec<(f64, f64, MapSymbolShape, i64, f64)> {
         let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
         if mw <= 0.0 || mh <= 0.0 {
@@ -5778,19 +7060,19 @@ impl IslandDemo {
         self.force
             .hulls()
             .filter_map(|h| {
-                let start = h.start?;
+                let (lat, lon) = self.piece_ground(h.unit_id)?;
                 if self.live.iter().any(|m| m.id == h.unit_id.to_string()) {
                     return None;
                 }
                 let (x, y) = project_frame_px(
-                    start.lat,
-                    start.lon,
+                    lat,
+                    lon,
                     self.map_center,
                     self.map_render_zoom,
                     mw,
                     mh,
                 );
-                Some((x, y, self.fleet_symbol(h.unit_id), h.unit_id, start.lat))
+                Some((x, y, self.fleet_symbol(h.unit_id), h.unit_id, lat))
             })
             .collect()
     }
@@ -6116,7 +7398,8 @@ impl IslandDemo {
         for m in &self.live {
             if let Ok(id) = m.id.parse::<i64>() {
                 if placed.contains(&id) {
-                    consider((m.x - px).hypot(m.y - py), id);
+                    let (mx, my) = self.marker_frame_px(m);
+                    consider((mx - px).hypot(my - py), id);
                 }
             }
         }
@@ -6160,6 +7443,54 @@ impl IslandDemo {
                 role_id: p.role_id,
             })
             .collect()
+    }
+
+    /// The room as the operator has it: Minos's seats overlaid with the
+    /// staged draft — what the Player picker's IN THE ROOM list shows.
+    ///
+    /// The draft wins wherever it holds an opinion: a staged role change
+    /// replaces the live role (seating is local while planning, and a list
+    /// that showed the server's stale role read as "the role change did
+    /// nothing"), a staged seat joins the list before the advance writes
+    /// it, and a staged removal stands as a row marked to leave rather
+    /// than vanishing — the advance is what removes it. Live rows keep the
+    /// server's order; staged newcomers follow in user-id order, so the
+    /// list does not reshuffle between frames.
+    fn room_rows(&self) -> Vec<RoomRow> {
+        let mut rows: Vec<RoomRow> = self
+            .session
+            .people
+            .iter()
+            .map(|p| {
+                let staged_seat = self.roster_draft.get(p.id);
+                RoomRow {
+                    id: p.id,
+                    name: p.name.clone(),
+                    role_id: staged_seat.map(|s| s.role_id).unwrap_or(p.role_id),
+                    role: staged_seat
+                        .map(|s| s.role_name.clone())
+                        .unwrap_or_else(|| p.role.clone()),
+                    judge: staged_seat.map(|s| s.judge).unwrap_or(p.judge),
+                    staged: staged_seat
+                        .is_some_and(|s| s.role_id != p.role_id || s.judge != p.judge),
+                    removed: self.roster_draft.is_removed(p.id),
+                }
+            })
+            .collect();
+        for seat in self.roster_draft.staged() {
+            if !rows.iter().any(|r| r.id == seat.user_id) {
+                rows.push(RoomRow {
+                    id: seat.user_id,
+                    name: seat.user_name.clone(),
+                    role_id: seat.role_id,
+                    role: seat.role_name.clone(),
+                    judge: seat.judge,
+                    staged: true,
+                    removed: false,
+                });
+            }
+        }
+        rows
     }
 
     /// The player-side seats: roles that may command hulls. The server
@@ -6421,6 +7752,49 @@ impl IslandDemo {
             Err(why) => {
                 self.embark_status = why;
             }
+        }
+    }
+
+    /// Ask for the embarkations the commander dashboard needs: what this
+    /// seat's unit carries, and whether another unit carries it.
+    ///
+    /// The composition is published PER HOST (`GET
+    /// /games/{id}/units/{unit}/embarkations`), and there is no reverse route,
+    /// so "am I aboard something?" is answered by asking every other piece.
+    /// The reads are made once per session and land in the same `embarked`
+    /// map the Embarked modal uses, which means a host this has already asked
+    /// for is never asked twice — the modal inherits the answer rather than
+    /// repeating it.
+    ///
+    /// Called from the frame that draws the dashboard: a channel send is the
+    /// whole effect, so no notify is needed, and the `asked` list is what keeps
+    /// it from re-asking every frame until the answers arrive.
+    fn ensure_commander_embark(&mut self) {
+        if self.session.game_id == 0 {
+            return;
+        }
+        // A new exercise is a new composition. The game id is the reset key,
+        // and it is checked here rather than in every session applier because
+        // this is the one reader that remembers across them.
+        if self.commander_embark_game != self.session.game_id {
+            self.commander_embark_game = self.session.game_id;
+            self.commander_embark_asked.clear();
+        }
+        let Some(unit) = self.own_unit_ids().into_iter().next() else {
+            return;
+        };
+        for host in std::iter::once(unit).chain(
+            self.session
+                .pieces
+                .iter()
+                .map(|piece| piece.id)
+                .filter(|id| *id != unit),
+        ) {
+            if self.embarked.contains_key(&host) || self.commander_embark_asked.contains(&host) {
+                continue;
+            }
+            self.commander_embark_asked.push(host);
+            let _ = self.order_tx.send(ToBinary::ReadEmbarked { host });
         }
     }
 
@@ -7938,6 +9312,753 @@ impl IslandDemo {
         None
     }
 
+    /// The execution phase's widget rail: account, crew, scenario, comms.
+    ///
+    /// These four replace the side column AND the band's two doors in
+    /// execution. Each is deliberately small — the phase is about the map, and
+    /// a widget that said everything would be a panel with a map underneath it
+    /// — so it carries one fact and opens its surface on click.
+    fn execution_widgets(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let board = self.scenario_board();
+        let scenario = match (board.total, board.at) {
+            (0, _) => "no steps".to_string(),
+            (_, Some(at)) => format!("current: step {at}"),
+            (n, None) => format!("{n} step(s)"),
+        };
+        let role = self
+            .own_seat()
+            .map(|seat| seat.role.clone())
+            .filter(|role| !role.is_empty())
+            .unwrap_or_else(|| {
+                if self.session.my_role.is_empty() {
+                    "no seat".to_string()
+                } else {
+                    self.session.my_role.clone()
+                }
+            });
+        let name = self
+            .own_seat()
+            .map(|seat| seat.name.clone())
+            .unwrap_or_else(|| {
+                if self.session.game.is_empty() {
+                    "not signed in".to_string()
+                } else {
+                    "operator".to_string()
+                }
+            });
+        div()
+            .absolute()
+            .top(px(64.0))
+            .right(px(10.0))
+            .w(px(196.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(self.execution_widget(
+                "widget-account",
+                "operator",
+                role,
+                Some(name),
+                None,
+                cx,
+            ))
+            .child(self.execution_widget(
+                "widget-crew",
+                "crew",
+                format!("{}/{}", self.session.present, self.session.seats),
+                Some(format!("{} hull(s)", self.session.pieces.len())),
+                Some(WhichPanel::Crew),
+                cx,
+            ))
+            .child(self.execution_widget(
+                "widget-scenario",
+                "scenario",
+                scenario,
+                Some(if board.total == 0 {
+                    "nothing to play".to_string()
+                } else {
+                    format!("{} step(s) in the book", board.total)
+                }),
+                Some(WhichPanel::Board),
+                cx,
+            ))
+            .child(self.execution_widget(
+                "widget-comms",
+                "comms",
+                format!("{}", self.session.messages.len()),
+                Some("message(s) in this exercise".to_string()),
+                Some(WhichPanel::Comms),
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// One execution widget: a tracked label, one value, one quiet line —
+    /// and, when it has a surface, the whole card is the door.
+    fn execution_widget(
+        &mut self,
+        id: &'static str,
+        label: &'static str,
+        value: String,
+        hint: Option<String>,
+        panel: Option<WhichPanel>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut card = div()
+            .id(id)
+            .w_full()
+            .p(px(9.0))
+            .rounded(px(6.0))
+            .bg(rgba(PANEL_SLATE.with_alpha(214)))
+            .border(px(1.0))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(tracked(label, view::LABEL_PT, CUT_GREY))
+            .child(
+                div()
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(13.0))
+                    .text_color(rgba(MAP_INK))
+                    .child(value),
+            );
+        if let Some(hint) = hint {
+            card = card.child(
+                div()
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(10.0))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(hint),
+            );
+        }
+        if let Some(panel) = panel {
+            card = card.cursor_pointer().on_click(cx.listener(move |view, _, _, cx| {
+                view.open_only(panel);
+                cx.notify();
+            }));
+        }
+        card.into_any_element()
+    }
+
+    /// The execution phase's commander rail: the band along the bottom of
+    /// the window that carries the unit this seat commands, the group and
+    /// embark relationships around it, and the helm that moves it.
+    ///
+    /// Commander-only and execution-only, and both gates are the point: the
+    /// rail is the instrument of a seat that has a hull in its hands. A
+    /// planning room has no helm to offer and an observer has no hull to
+    /// picture, so neither gets it. It replaces nothing — the Command island
+    /// still exists in planning — and it is the commander's own surface while
+    /// the exercise runs.
+    ///
+    /// **It is a rail, not a card.** The first version was a rounded,
+    /// translucent panel floating eight points off the bottom edge, and the
+    /// tile map's own labels came through the type that sat on them. A
+    /// console read across an exercise room cannot put its readings on top of
+    /// a map and call it legible, so the rail is opaque, square, and flush
+    /// with the window's edges, and the map ends at its top rule.
+    fn commander_dashboard(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let dash_h = self.dash_height();
+        let widths = rail_widths(self.last_viewport.0);
+        let unit = self.own_unit();
+        let identity = self.dashboard_identity();
+        let mut rail = div()
+            .id("commander-dashboard")
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .h(px(dash_h))
+            .bg(rgba(PANEL_SLATE))
+            .border_t(px(view::PANEL_EDGE))
+            .border_color(rgba(CUT_GREY))
+            .flex()
+            .flex_row()
+            .overflow_hidden()
+            .child(self.dashboard_face(unit.as_ref(), widths.unit));
+        rail = rail.child(self.divider_v());
+        rail = rail.child(self.dashboard_status(&identity, widths.identity));
+        rail = rail.child(self.divider_v());
+        rail = rail.child(self.dashboard_helm(cx, widths));
+        rail.into_any_element()
+    }
+
+    /// The rail's height: a fraction of the window, floored so a short
+    /// window does not starve the compass and capped so a tall one does not
+    /// turn the rail into a shelf. Split out because the follow control has
+    /// to sit clear of the rail's top edge, which means it needs the same
+    /// number.
+    fn dash_height(&self) -> f32 {
+        (self.last_viewport.1 * DASH_H_FRAC).clamp(DASH_H_MIN, DASH_H_MAX)
+    }
+
+    /// The rail's first channel: the commander's own unit. Its photograph
+    /// when the fetcher has landed one, the taxonomy glyph otherwise — the
+    /// same face the crew modal's hull rows carry, because a commander should
+    /// recognise their hull by the same picture everywhere.
+    ///
+    /// **The picture is framed at its own proportions.** The first version
+    /// put it in a fixed portrait box and letterboxed it, which left three
+    /// quarters of the frame empty and the drawing adrift in the middle of
+    /// it: a hull plan is four to one, and a four-to-one picture in a
+    /// portrait box is a postage stamp in a vitrine. The tile is now as tall
+    /// as the picture is wide-by-tall, so the frame is the picture's own
+    /// shape and the name sits under it.
+    fn dashboard_face(&self, unit: Option<&PieceView>, unit_w: f32) -> AnyElement {
+        let mut col = div()
+            .id("dashboard-face")
+            .w(px(unit_w))
+            .flex_shrink_0()
+            .h_full()
+            .px(px(10.0))
+            .py(px(8.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(6.0))
+            .overflow_hidden();
+        if let Some(piece) = unit {
+            let thumb = self.thumbs.get(&piece.id).cloned();
+            // The picture's own size, so the frame is its shape and not a
+            // box that happens to hold it.
+            let (tile_w, tile_h) = match &thumb {
+                Some(pic) => {
+                    let size = pic.size(0);
+                    let w = unit_w - 22.0;
+                    let ar = if size.width.0 > 0 {
+                        size.height.0 as f32 / size.width.0 as f32
+                    } else {
+                        0.25
+                    };
+                    (w, (w * ar).clamp(24.0, 78.0))
+                }
+                None => (unit_w - 22.0, 52.0),
+            };
+            col = col.child(
+                div()
+                    .w(px(tile_w))
+                    .h(px(tile_h))
+                    .flex_shrink_0()
+                    // Square: nothing on an instrument is rounded except the
+                    // controls you turn, and this frame is not a control.
+                    // The clip is what makes the picture's own corners
+                    // square too.
+                    .border(px(1.0))
+                    .border_color(rgba(HAIRLINE_SLATE))
+                    .overflow_hidden()
+                    .child(Self::thumb_box(
+                        thumb,
+                        self.fleet_symbol(piece.id),
+                        tile_w - 2.0,
+                        tile_h - 2.0,
+                        // The glyph is sized to the tile, not to a fixed
+                        // scale: a hull with no photograph yet would
+                        // otherwise show a three-point dot in a frame built
+                        // for a picture.
+                        tile_h / 38.0,
+                        // CONTAIN, not COVER: the unit's whole body is the fact.
+                        // A cropped slice shows a hull's plating, and the
+                        // operator is identifying the ship.
+                        ObjectFit::Contain,
+                    )),
+            );
+            col = col.child(
+                div()
+                    .w_full()
+                    .truncate()
+                    .font_family(view::FACE_HUMAN)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(view::BODY_PT))
+                    .text_color(rgba(MAP_INK))
+                    .child(piece.label.clone()),
+            );
+        } else {
+            col = col.child(note("no unit commanded"));
+        }
+        col.into_any_element()
+    }
+
+    /// The dashboard's second segment, as the unit's identity rows: the hull
+    /// number, the task group it sits under, and its embark relationships.
+    ///
+    /// The hull number is the parenthesised tail of the register's own
+    /// `name (hull)` label. The group is the unit's `hierarchy_node` resolved
+    /// against the session's tree — a piece outside the tree is not in a
+    /// group, which is a fact rather than a gap. The embark half reads the
+    /// `embarked` cache [`Self::ensure_commander_embark`] fills: what this
+    /// unit carries, and the first other unit that carries it.
+    fn dashboard_identity(&self) -> Vec<(&'static str, String, Option<&'static str>)> {
+        let unit = self.own_unit_ids().into_iter().next();
+        let piece = unit.and_then(|id| self.session.pieces.iter().find(|p| p.id == id));
+        let hull = piece
+            .and_then(|p| p.label.split_once(" ("))
+            .map(|(_, tail)| tail.trim_end_matches(')').to_string());
+        let group = unit
+            .and_then(|_id| {
+                let node = piece?.hierarchy_node?;
+                let group = self
+                    .session
+                    .groups
+                    .iter()
+                    .find(|group| group.group_id == node)?;
+                Some(group.name.clone())
+            })
+            .unwrap_or_else(|| "not in a group".to_string());
+        let carrying: Vec<String> = unit
+            .and_then(|id| self.embarked.get(&id))
+            .map(|list| list.iter().map(|unit| unit.name.clone()).collect())
+            .unwrap_or_default();
+        let carried_by = unit.and_then(|id| {
+            self.session
+                .pieces
+                .iter()
+                .filter(|piece| piece.id != id)
+                .find(|piece| {
+                    self.embarked
+                        .get(&piece.id)
+                        .is_some_and(|list| list.iter().any(|unit| unit.id == id))
+                })
+                .map(|piece| piece.label.clone())
+        });
+        let embark = match (carrying.is_empty(), carried_by) {
+            (true, None) => "nothing embarked".to_string(),
+            (true, Some(host)) => format!("aboard {host}"),
+            (false, None) => format!("carrying {}", carrying.join(", ")),
+            (false, Some(host)) => {
+                format!("carrying {}\u{00b7} aboard {host}", carrying.join(", "))
+            }
+        };
+        let mut rows = Vec::new();
+        if let Some(hull) = hull {
+            rows.push(("hull", hull, None));
+        }
+        rows.push(("group", group, Some("icons/group.svg")));
+        rows.push(("embark", embark, Some("icons/embark.svg")));
+        rows
+    }
+
+    /// The rail's second channel: the identity rows, each a tracked-caps
+    /// label, an SVG icon when the row has one, and the value right-aligned.
+    /// A relationship is not a state, so none of it takes a warning colour.
+    fn dashboard_status(
+        &self,
+        identity: &[(&'static str, String, Option<&'static str>)],
+        status_w: f32,
+    ) -> AnyElement {
+        let mut col = div()
+            .id("dashboard-status")
+            .w(px(status_w))
+            .flex_shrink_0()
+            .h_full()
+            .px(px(14.0))
+            .py(px(10.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(7.0))
+            .overflow_hidden();
+        for (label, value, icon) in identity {
+            col = col.child(identity_row(label, value, *icon));
+        }
+        col.into_any_element()
+    }
+
+    /// The rail's third channel: the helm. A heading COMPASS and a speed
+    /// SCALE, then the verb.
+    ///
+    /// Both controls drag rather than nudge. A course is a circle and a speed
+    /// is a range, and a −/+ pill for either is a control that says "a
+    /// number" where the operator is reaching for a compass and a throttle.
+    ///
+    /// **The labels are a row, and the controls are a row under it.** The
+    /// first version put each control's label in the control's own column,
+    /// and because a compass is 80pt tall and a slider 22pt, the two labels
+    /// sat at different heights and the strip read as two unrelated
+    /// gadgets. Here the heading and the speed are read off ONE row of
+    /// labels, and the controls hang under the labels that name them.
+    fn dashboard_helm(&mut self, cx: &mut Context<Self>, widths: RailWidths) -> AnyElement {
+        let armed = self.session.execution && self.order_target().is_some();
+        let status = self
+            .helm_status
+            .as_ref()
+            .map(|status| status.text.clone())
+            .unwrap_or_default();
+        let status_bad = self.helm_status.as_ref().is_some_and(|status| !status.ok);
+        let (heading, speed) = self.helm_display();
+        let course = format!("{heading:.0}\u{00b0}");
+        let knots = format!("{speed:.1}");
+        // The answer has the room the rail leaves it and no more: the rail
+        // is a fixed height, the verb is above the answer, and a refusal
+        // that runs off the bottom of the band is a refusal nobody can read.
+        let status = bounded_status(&status, widths.order, DASH_STATUS_LINES);
+        div()
+            .id("dashboard-helm")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .px(px(DASH_RAIL_PAD))
+            .py(px(8.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(6.0))
+            .overflow_hidden()
+            // The labels: one row, one cell per control, the same cells the
+            // controls below sit in.
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(DASH_RAIL_GAP))
+                    .child(
+                        div()
+                            .w(px(widths.dial))
+                            .flex_shrink_0()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(icon("icons/compass.svg", DASH_ICON, DASH_ICON, CUT_GREY))
+                            .child(tracked("course", DASH_LABEL_PT, CUT_GREY))
+                            .child(figure(&course, true, MAP_INK)),
+                    )
+                    .child(
+                        div()
+                            .w(px(widths.scale))
+                            .flex_shrink_0()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(icon("icons/gauge.svg", DASH_ICON, DASH_ICON, CUT_GREY))
+                            .child(tracked("speed", DASH_LABEL_PT, CUT_GREY))
+                            .child(figure(&knots, true, MAP_INK))
+                            .child(machine("kn", BODY_SILVER)),
+                    )
+                    .child(div().w(px(widths.order)).flex_shrink_0()),
+            )
+            // The controls, in the same cells.
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(DASH_RAIL_GAP))
+                    .child(self.dashboard_compass(cx, heading, widths.dial))
+                    .child(self.dashboard_scale(cx, speed, widths))
+                    .child(
+                        div()
+                            .w(px(widths.order))
+                            .flex_shrink_0()
+                            .flex()
+                            .flex_col()
+                            .items_end()
+                            .justify_end()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .id("dashboard-helm-send")
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        if view.send_helm() {
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .child(button("SET HELM", false, !armed, false)),
+                            )
+                            // The helm's target is the commander's own unit,
+                            // which the first channel already names — a
+                            // second copy would be a label repeated. The
+                            // status line is the write's own answer.
+                            .child(
+                                div()
+                                    .w_full()
+                                    .text_size(px(view::TEXT_SMALL_PT))
+                                    .text_color(rgba(if status_bad { STALE_SAND } else { BODY_SILVER }))
+                                    .child(status),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The heading control: a compass. The rim, the graduations, the north
+    /// wedge and the needle are drawn; the course is read above it. Dragging
+    /// turns it — the compass is the control, and a compass is the shape a
+    /// course already has.
+    ///
+    /// The canvas carries an explicit size, and that is not a detail: a
+    /// `canvas` is a block-level element, so inside a block-level parent
+    /// GPUI measures it at ZERO HEIGHT unless it is told otherwise. The
+    /// first version of this face was measured that way, and the compass
+    /// collapsed to a smudge in the corner of its own box while the readout
+    /// beside it said something else entirely.
+    fn dashboard_compass(&mut self, cx: &mut Context<Self>, heading: f32, dial: f32) -> AnyElement {
+        let armed = self.session.execution && self.order_target().is_some();
+        div()
+            .id("dashboard-course-face")
+            .w(px(dial))
+            .h(px(dial))
+            .flex_shrink_0()
+            .relative()
+            .cursor(CursorStyle::PointingHand)
+            .on_drag(DialDragPayload, |_, _, _, app| app.new(|_| DialGhost))
+            .on_drag_move::<DialDragPayload>(cx.listener(
+                |view, ev: &gpui::DragMoveEvent<DialDragPayload>, _, cx| {
+                    view.dial_pointer(ev.bounds, ev.event.position);
+                    cx.notify();
+                },
+            ))
+            .child(
+                canvas(
+                    |bounds, _, _| bounds,
+                    move |bounds, _, window, _| {
+                        paint_dial(window, bounds, heading, armed);
+                    },
+                )
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
+    /// The speed control: a graduated scale. The track, the fill to the
+    /// thumb, the graduations and the thumb are drawn; the figure above is
+    /// set. Dragging the track sets the speed from the pointer's fraction of
+    /// its length.
+    ///
+    /// The scale is the one thing in the rail that gets BETTER with length,
+    /// so it takes whatever the helm channel has left over: a knot every
+    /// three points is a slider, and a knot every twenty is an instrument
+    /// the operator can read the draft off without reading the figure.
+    fn dashboard_scale(&mut self, cx: &mut Context<Self>, speed: f32, widths: RailWidths) -> AnyElement {
+        let frac = (speed / DASH_SPEED_MAX_KN).clamp(0.0, 1.0);
+        let armed = self.session.execution && self.order_target().is_some();
+        let scale_w = widths.scale;
+        let grad = scale_graduations(scale_w);
+        let numbers = scale_numbers(scale_w);
+        // The numbers, spread across the track: zero at the left end, the
+        // ceiling at the right, and the steps in between at the same
+        // fractions the graduations are at.
+        let mut labels = div()
+            .w(px(scale_w))
+            .flex()
+            .flex_row()
+            .justify_between();
+        let mut knot = 0.0;
+        while knot <= DASH_SPEED_MAX_KN + 0.001 {
+            labels = labels.child(machine(format!("{knot:.0}"), CUT_GREY));
+            knot += numbers;
+        }
+        div()
+            .w(px(scale_w))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            // The track sits at the compass's hub height, so the two
+            // instruments share one horizon.
+            .mt(px(widths.dial / 2.0 - DASH_SCALE_TRACK_Y))
+            .gap(px(3.0))
+            .child(
+                div()
+                    .id("dashboard-speed-scale")
+                    .w_full()
+                    .h(px(DASH_SCALE_H))
+                    .relative()
+                    .cursor(CursorStyle::PointingHand)
+                    .on_drag(SliderDragPayload, |_, _, _, app| app.new(|_| SliderGhost))
+                    .on_drag_move::<SliderDragPayload>(cx.listener(
+                        |view, ev: &gpui::DragMoveEvent<SliderDragPayload>, _, cx| {
+                            view.slider_pointer(ev.bounds, ev.event.position);
+                            cx.notify();
+                        },
+                    ))
+                    .child(
+                        canvas(
+                            |bounds, _, _| bounds,
+                            move |bounds, _, window, _| {
+                                paint_scale(window, bounds, frac, armed, grad);
+                            },
+                        )
+                        .size_full(),
+                    ),
+            )
+            .child(labels)
+            .into_any_element()
+    }
+
+    /// Turn the dial to the pointer: the course is the compass bearing from
+    /// the dial's centre to the pointer. Screen y runs down, so the screen
+    /// angle is offset by 90° to read as a compass — north up, east right.
+    ///
+    /// The instrument FOLLOWS the pointer: the ease is dropped for the
+    /// duration of the drag, because a needle that trails the hand is lag,
+    /// not motion.
+    fn dial_pointer(&mut self, bounds: Bounds<gpui::Pixels>, at: gpui::Point<gpui::Pixels>) {
+        let cx = bounds.origin.x + bounds.size.width / 2.0;
+        let cy = bounds.origin.y + bounds.size.height / 2.0;
+        let dx = f32::from(at.x - cx);
+        let dy = f32::from(at.y - cy);
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        self.helm_heading = Some((dy.atan2(dx).to_degrees() + 90.0).rem_euclid(360.0));
+        self.helm_anim = None;
+    }
+
+    /// Set the speed from the pointer's fraction along the track, clamped to
+    /// the ceiling. The track is the whole range; a pointer past either end is
+    /// the end, not an error.
+    fn slider_pointer(&mut self, bounds: Bounds<gpui::Pixels>, at: gpui::Point<gpui::Pixels>) {
+        let width = f32::from(bounds.size.width);
+        if width <= 0.0 {
+            return;
+        }
+        let frac = (f32::from(at.x - bounds.origin.x) / width).clamp(0.0, 1.0);
+        self.helm_speed = Some(frac * DASH_SPEED_MAX_KN);
+        self.helm_anim = None;
+    }
+
+    /// The values the helm's instruments are drawing: the draft, eased.
+    ///
+    /// The bearing eases the SHORT way round, so 350° to 10° is twenty
+    /// degrees forward and not three hundred and forty degrees backward —
+    /// the same arithmetic the ± control's wrap is, and the reason the
+    /// needle does not spin the long way when the operator crosses north.
+    fn helm_display(&self) -> (f32, f32) {
+        let to_heading = self.helm_heading.unwrap_or(0.0);
+        let to_speed = self.helm_speed.unwrap_or(0.0);
+        let Some(anim) = self.helm_anim else {
+            return (to_heading, to_speed);
+        };
+        let e = helm_ease(anim.at.elapsed().as_secs_f32());
+        let turn = helm_turn(anim.from_heading, anim.to_heading);
+        (
+            (anim.from_heading + turn * e).rem_euclid(360.0),
+            anim.from_speed + (anim.to_speed - anim.from_speed) * e,
+        )
+    }
+
+    /// Start the instruments easing toward the draft.
+    ///
+    /// The ease starts from where the instruments ARE, not from where they
+    /// were when the draft last changed, so a second change mid-settle picks
+    /// up from the frame on screen.
+    fn helm_ease_to(&mut self) {
+        let to_heading = self.helm_heading.unwrap_or(0.0);
+        let to_speed = self.helm_speed.unwrap_or(0.0);
+        let (from_heading, from_speed) = self.helm_display();
+        self.helm_anim = Some(HelmAnim {
+            from_heading,
+            to_heading,
+            from_speed,
+            to_speed,
+            at: std::time::Instant::now(),
+        });
+    }
+
+    /// The ease's clock: settle the instruments, and ask for the frame that
+    /// carries the next step of the movement.
+    ///
+    /// The console's own frame loop is the map's, and on a software
+    /// rasteriser that is a frame every half second — far too slow to
+    /// carry a needle across a compass. So the settle asks for frames of
+    /// its own.
+    fn advance_helm_ease(&mut self, window: &mut Window) {
+        let Some(anim) = self.helm_anim else {
+            return;
+        };
+        if anim.at.elapsed().as_secs_f32() >= HELM_EASE_S {
+            self.helm_anim = None;
+        } else {
+            window.request_animation_frame();
+        }
+    }
+
+    /// Step the helm draft's course by `delta` degrees, wrapping the compass.
+    /// A course is a circle, so 359 + 1 is 0 and 0 − 1 is 359 — the one
+    /// arithmetic the helm's ± controls must get right.
+    fn nudge_helm_course(&mut self, delta: f32) {
+        let base = self.helm_heading.unwrap_or(0.0);
+        self.helm_heading = Some((base + delta).rem_euclid(360.0));
+        self.helm_ease_to();
+    }
+
+    /// Step the helm draft's speed by `delta` knots, never below zero. A
+    /// negative speed is not a reverse order; zero is Hold position, and it
+    /// is the floor the console's own rule sets.
+    fn nudge_helm_speed(&mut self, delta: f32) {
+        let base = self.helm_speed.unwrap_or(0.0);
+        self.helm_speed = Some((base + delta).max(0.0));
+        self.helm_ease_to();
+    }
+
+    /// The commander's one-tap door onto their own unit: the follow control.
+    ///
+    /// The crew modal already has a focus door per hull, but a commander who
+    /// wants to find their own unit should not have to open the whole order
+    /// of battle to do it. This is the same ask as `jump_to_piece`, cut to
+    /// the one hull this seat commands, and it is drawn only while the
+    /// exercise runs and the seat has a ground for that hull — a hull with no
+    /// ground has nowhere to follow to, and the control says so by resting dim
+    /// rather than promising a jump it cannot make.
+    fn follow_control(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(unit) = self.own_unit_ids().into_iter().next() else {
+            return div().into_any_element();
+        };
+        let live = self.piece_ground(unit).is_some();
+        // The console's accent at half alpha: the follow door is "yours",
+        // which is the accent's one meaning, and a translucent field keeps the
+        // map behind it readable. The pin is the mark the console already uses
+        // for "a place you put your finger on".
+        let ink = if live {
+            CONSOLE_NIGHT
+        } else {
+            CONSOLE_NIGHT.with_alpha(150)
+        };
+        div()
+            .id("follow-own-unit")
+            .absolute()
+            .right(px(14.0))
+            .bottom(px(self.dash_height() + 14.0))
+            .w(px(FOLLOW_W))
+            .h(px(FOLLOW_H))
+            .rounded(px(8.0))
+            .bg(rgba(if live {
+                RADAR_CYAN.with_alpha(120)
+            } else {
+                RADAR_CYAN.with_alpha(60)
+            }))
+            .border(px(1.0))
+            .border_color(rgba(if live {
+                RADAR_CYAN
+            } else {
+                RADAR_CYAN.with_alpha(120)
+            }))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.jump_to_piece(unit, cx);
+            }))
+            .child(icon("icons/pin.svg", 18.0, 18.0, ink))
+            .into_any_element()
+    }
+
+    /// A vertical rule between the rail's channels: one hairline, full
+    /// height, the rail's only divider.
+    ///
+    /// `CUT_GREY` rather than `HAIRLINE_SLATE`, for the reason the panel's
+    /// own edge is: the rail sits over a tile map, and a hairline that
+    /// all but disappears over pale land is not a divider.
+    fn divider_v(&self) -> AnyElement {
+        div()
+            .w(px(view::PANEL_EDGE))
+            .h_full()
+            .bg(rgba(CUT_GREY.with_alpha(120)))
+            .into_any_element()
+    }
+
     /// Open the Scenario board from the reminder strip: the plan, the step
     /// this seat owes and the declare row live there, so the strip never grows
     /// its own.
@@ -8395,7 +10516,8 @@ impl IslandDemo {
         // Indonesian label) is what every other role decision in this shell
         // does.
         match seat.role.as_str() {
-            "Game Master" | "Controller" | "Deputy" => ScenarioAudience::Master,
+            "Game Master" | "Penyelenggara" | "Director" | "Direktur" | "Controller"
+            | "Deputy" => ScenarioAudience::Master,
             // Everyone else on the judge side watches: the Observer
             // ("Watches without assessing"), and the scorers, who read the
             // same plan to mark against it.
@@ -8602,23 +10724,44 @@ impl IslandDemo {
 
         // --- the head: the ONE row the exercise can move from ----------------
         //
-        // The step in play, else the one the gate waits on, else the first step
-        // not behind the exercise. That last case is what makes the board
-        // usable at all: on a fresh execution nothing plays and no step asks
-        // the Game Master, and a board with no verb there is a board from which
-        // an exercise could never start.
+        // The step the gate waits on, else the NEXT step after the one the
+        // exercise stands on — the step in play, or the last one it is past.
         //
-        // ONE row is armed with Play/Skip, never a queue of them. A pointer
-        // that exists is the head, and playing the step after it would let one
-        // stray press jump the plan.
-        let head: Option<usize> = if playing.is_some() {
-            None
+        // THE CLOCK HAS NO SAY IN THIS. Playing a step is the Game Master's
+        // ability, not an instant the exercise clock reaches: a step is played
+        // when the Master plays it, out of the plan's own order if that is
+        // what the exercise calls for, so "next" is read off the PLAYS and
+        // never off the step windows or the assumed stamp. The one row armed
+        // with Play/Skip is that next, wherever it sits in the book.
+        let current = if playing.is_some() {
+            steps.iter().position(|r| matches!(r.read, StepRead::Playing))
         } else {
-            steps
-                .iter()
-                .position(|r| matches!(r.read, StepRead::Asking))
-                .or_else(|| steps.iter().position(|r| matches!(r.read, StepRead::Later)))
+            steps.iter().rposition(|r| matches!(r.read, StepRead::Played))
         };
+        let head: Option<usize> = steps
+            .iter()
+            .position(|r| matches!(r.read, StepRead::Asking))
+            .or_else(|| {
+                current
+                    .and_then(|cur| {
+                        steps
+                            .iter()
+                            .enumerate()
+                            .find(|(i, r)| *i > cur && matches!(r.read, StepRead::Later))
+                            .map(|(i, _)| i)
+                    })
+                    // Nothing follows the step the exercise stands on — the
+                    // book's tail is behind it, or this console joined when
+                    // the plays recorded none of the rows before the current
+                    // one. The first startable row keeps the board movable
+                    // anyway: a board with no verb anywhere is a board from
+                    // which an exercise could never resume.
+                    .or_else(|| {
+                        steps
+                            .iter()
+                            .position(|r| matches!(r.read, StepRead::Later))
+                    })
+            });
 
         // --- pass two: the gate and the verbs, from where each row stands ----
         for i in 0..steps.len() {
@@ -8648,11 +10791,12 @@ impl IslandDemo {
                 // station owes and nothing about the rest of the plan.
                 ScenarioAudience::Observer | ScenarioAudience::Commander => Vec::new(),
             };
-            // The gate rides the step the exercise stands on and nowhere else:
-            // it is the one count that changes while the board is open, and a
-            // gate on a step two plays away is noise. Absent is a real answer —
-            // the fan-out is best-effort, and a step whose gate could not be
-            // read claims no count rather than zero.
+            // The gate rides the step the exercise stands on — playing or
+            // asking — and the head, the one next row the Master's play moves
+            // to. It is the one count that changes while the board is open,
+            // and a gate on a step two plays away is noise. Absent is a real
+            // answer — the fan-out is best-effort, and a step whose gate could
+            // not be read claims no count rather than zero.
             let wanted = matches!(read, StepRead::Playing | StepRead::Asking) || is_head;
             steps[i].gate = steps_gate.get(&key).filter(|_| wanted).cloned();
             steps[i].verbs = verbs;
@@ -8670,6 +10814,9 @@ impl IslandDemo {
             assumed: self.assumed_stamp(),
             at,
             total: number,
+            head: head
+                .and_then(|i| steps.get(i))
+                .map(|r| (r.scenario_id, r.step_id)),
             steps,
         }
     }
@@ -8869,7 +11016,34 @@ impl IslandDemo {
             ));
             col = col.child(div().flex_1());
         } else {
-            // --- the rows ---------------------------------------------------
+            // --- two sections -------------------------------------------------
+            //
+            // Section 1 is the whole book in order; section 2 is the SELECTED
+            // step read out in full. The split is the owner's direction: the
+            // row's verbs moved INSIDE its box, and selection — a local read
+            // that never moves the exercise — chooses whose hulls section 2
+            // lists. Active is the server's pointer and is marked on its own
+            // box; selected is this operator's cursor and gets its own border.
+            let selected = self.board_selected_key(&board);
+            let mut left = div()
+                .w(px(392.0))
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(tracked("steps", view::LABEL_PT, CUT_GREY))
+                        .child(machine(
+                            format!("{} step(s)", board.total),
+                            BODY_SILVER,
+                        )),
+                );
             let mut list = div()
                 .id("board-steps")
                 .flex_1()
@@ -8877,11 +11051,26 @@ impl IslandDemo {
                 .overflow_y_scroll()
                 .flex()
                 .flex_col()
-                .gap(px(4.0));
+                .gap(px(6.0));
             for row in board.steps.clone() {
-                list = list.child(self.board_row(&row, cx));
+                list = list.child(self.board_step_box(
+                    &row,
+                    selected == Some((row.scenario_id, row.step_id)),
+                    cx,
+                ));
             }
-            col = col.child(list);
+            left = left.child(list);
+            let right = self.board_detail(&board, selected);
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(12.0))
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(left)
+                    .child(right),
+            );
         }
 
         // --- the feet -------------------------------------------------------
@@ -8939,7 +11128,7 @@ impl IslandDemo {
                     )
                     .child(div().flex_1())
                     .child(note(
-                        "Play, skip and replay land on the rows above.",
+                        "Play, skip, end and replay sit inside each step box.",
                     )),
             );
             for line in [self.pause_status.clone(), self.step_verb_status.clone(), self.end_status.clone()] {
@@ -8983,116 +11172,220 @@ impl IslandDemo {
         col.into_any_element()
     }
 
-    /// One step's row: what it is, where the exercise stands on it, the hulls
-    /// it obliges, and the verbs this audience may press.
+    /// The step whose detail section 2 shows. A stored selection wins while
+    /// it still names a row in the book; otherwise the board follows the
+    /// pointer, and a book with no pointer falls back to its first step.
     ///
-    /// Drawn from `BoardStep` alone, so the row cannot disagree with the model
-    /// the tests read.
-    fn board_row(&mut self, row: &BoardStep, cx: &mut Context<Self>) -> AnyElement {
-        // The status ink carries the state, the words say it too — colour on
-        // its own is not a status a room can read, and the console's palette
-        // reserves cyan for the pointer rather than spending it on every row.
+    /// `None` is the ordinary state after opening the board, and it is
+    /// deliberately not the same as "selected nothing": a board that showed
+    /// an empty second section until the operator clicked would hide the one
+    /// step the exercise is on.
+    fn board_selected_key(&self, board: &ScenarioBoard) -> Option<(i64, i64)> {
+        self.board_selected
+            .filter(|key| {
+                board
+                    .steps
+                    .iter()
+                    .any(|s| (s.scenario_id, s.step_id) == *key)
+            })
+            .or_else(|| {
+                board
+                    .steps
+                    .iter()
+                    .find(|s| matches!(s.read, StepRead::Playing | StepRead::Asking))
+                    .map(|s| (s.scenario_id, s.step_id))
+            })
+            // Between steps the pointer names nothing, and the step the board
+            // follows is the HEAD — the next one after what was played, the
+            // same row the verbs arm — not the book's first row, which may be
+            // long past the exercise.
+            .or_else(|| board.head)
+            .or_else(|| board.steps.first().map(|s| (s.scenario_id, s.step_id)))
+    }
+
+    /// One step as a BOX: the row's facts and, inside the same box, every verb
+    /// this audience may press on it.
+    ///
+    /// Pressing the box SELECTS it — that is section 2's cursor, and it never
+    /// moves the exercise. The ACTIVE step is the server's pointer and is
+    /// marked by state, border and tint on its own box. A selected box carries
+    /// a different border, so "the step I am reading" and "the step being
+    /// played" cannot be mistaken for one another.
+    fn board_step_box(
+        &mut self,
+        row: &BoardStep,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (status, ink) = match row.read {
             StepRead::Playing => ("playing", RADAR_CYAN),
             StepRead::Asking => ("asking", WARNING_SAND),
             StepRead::Played => ("played", SIGNAL_GREEN),
             StepRead::Later => ("later", CUT_GREY),
         };
-        let mut line = div()
+        let active = matches!(row.read, StepRead::Playing | StepRead::Asking);
+        let border = if selected {
+            // Selection is a cursor, not a warning: the neutral lit edge says
+            // "the step this section is reading" without spending the warning
+            // ink a held gate owns.
+            CUT_GREY
+        } else if active {
+            RADAR_CYAN
+        } else {
+            HAIRLINE_SLATE
+        };
+        let key = (row.scenario_id, row.step_id);
+        let mut card = div()
+            .id(("board-step", row.step_id as usize))
+            .w_full()
+            .cursor_pointer()
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.board_selected = Some(key);
+                cx.notify();
+            }))
             .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(
-                div()
-                    .w(px(22.0))
-                    .flex_shrink_0()
-                    .font_family(view::FACE_MACHINE)
-                    .text_size(px(11.0))
-                    .text_color(rgba(BODY_SILVER))
-                    .child(format!("{:>2}", row.number)),
-            )
-            .child(
-                div()
-                    .w(px(58.0))
-                    .flex_shrink_0()
-                    .child(tracked(status, view::LABEL_PT, ink)),
-            );
+            .flex_col()
+            .gap(px(5.0))
+            .p(px(8.0))
+            .rounded(px(6.0))
+            .bg(rgba(if active {
+                PANEL_SLATE
+            } else {
+                PANEL_SLATE.with_alpha(150)
+            }))
+            .border(px(if selected { 2.0 } else { 1.0 }))
+            .border_color(rgba(border));
+        // Selected wins the border, so the ACTIVE row keeps a mark of its own
+        // even while it is the one being read: a thin cyan edge inside the
+        // sand frame. Without it, opening the board would show the step in
+        // play with the same border as any other selected row.
+        if active && selected {
+            card = card.child(div().h(px(2.0)).w_full().rounded(px(1.0)).bg(rgba(RADAR_CYAN)));
+        }
+
+        // The head: the book's number, the state in words, the scenario and
+        // the window. Colour is not a status on its own, which is why the
+        // state is always spelled out beside it.
+        card = card.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .w(px(22.0))
+                        .flex_shrink_0()
+                        .font_family(view::FACE_MACHINE)
+                        .text_size(px(11.0))
+                        .text_color(rgba(BODY_SILVER))
+                        .child(format!("{:>2}", row.number)),
+                )
+                .child(
+                    div()
+                        .w(px(58.0))
+                        .flex_shrink_0()
+                        .child(tracked(status, view::LABEL_PT, ink)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(10.0))
+                        .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                        .child(row.scenario.clone()),
+                )
+                .child(
+                    div()
+                        .font_family(view::FACE_MACHINE)
+                        .text_size(px(10.0))
+                        .text_color(rgba(BODY_SILVER))
+                        .child(
+                            row.window
+                                .as_ref()
+                                .map(|(a, b)| format!("{a}\u{2013}{b}"))
+                                .unwrap_or_else(|| "\u{2014}".to_string()),
+                        ),
+                ),
+        );
+        // The instruction itself, in full. The detail section repeats it
+        // above the hulls; here it is what the operator scans the book for.
+        card = card.child(
+            div()
+                .font_family(view::FACE_HUMAN)
+                .text_size(px(view::BODY_PT))
+                .text_color(rgba(if row.content.is_empty() {
+                    BODY_SILVER.with_alpha(204)
+                } else {
+                    MAP_INK
+                }))
+                .child(if row.content.is_empty() {
+                    "(not written yet)".to_string()
+                } else {
+                    row.content.clone()
+                }),
+        );
         // The readiness gate, on the step the exercise stands on and nowhere
         // else: it is the one number the board holds that changes while it is
-        // open. `required` zero is a step that asks nobody — ordinary, and
-        // not a gate that is clear by accident.
-        if let Some(gate) = &row.gate {
-            if gate.required > 0 {
+        // open. `required` zero is a step that asks nobody.
+        if let Some(gate) = row.gate.as_ref().filter(|g| g.required > 0) {
+            let mut line = div()
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .gap(px(4.0))
+                .child(figure(&format!("{}", gate.ready), false, MAP_INK))
+                .child(tracked(
+                    &format!("of {} ready", gate.required),
+                    view::LABEL_PT,
+                    if gate.may_start { SIGNAL_GREEN } else { WARNING_SAND },
+                ));
+            if !gate.may_start && !gate.outstanding.is_empty() {
                 line = line.child(
                     div()
-                        .flex()
-                        .flex_row()
-                        .items_baseline()
-                        .gap(px(4.0))
-                        .child(figure(&format!("{}", gate.ready), false, MAP_INK))
-                        .child(tracked(
-                            &format!("of {} ready", gate.required),
-                            view::LABEL_PT,
-                            if gate.may_start { SIGNAL_GREEN } else { WARNING_SAND },
+                        .text_size(px(10.0))
+                        .text_color(rgba(WARNING_SAND))
+                        .child(format!(
+                            "\u{00b7} held by {}",
+                            gate.outstanding.join(", ")
                         )),
                 );
             }
+            card = card.child(line);
         }
-        line = line
-            .child(
-                div()
-                    .flex_1()
-                    .font_family(view::FACE_HUMAN)
-                    .text_size(px(view::BODY_PT))
-                    .text_color(rgba(if row.content.is_empty() {
-                        BODY_SILVER.with_alpha(204)
-                    } else {
-                        MAP_INK
-                    }))
-                    .child(if row.content.is_empty() {
-                        "(not written yet)".to_string()
-                    } else {
-                        row.content.clone()
-                    }),
-            )
-            .child(
-                div()
-                    .font_family(view::FACE_MACHINE)
-                    .text_size(px(10.0))
-                    .text_color(rgba(BODY_SILVER))
-                    .child(
-                        row.window
-                            .as_ref()
-                            .map(|(a, b)| format!("{a}\u{2013}{b}"))
-                            .unwrap_or_else(|| "\u{2014}".to_string()),
-                    ),
-            );
-        // The verbs, in the console's row position: after the words they act
-        // on, before the fact they cannot change.
+
+        // The verbs, INSIDE the box they act on. Ready lands beside them on
+        // the one row a commander's station owns.
+        let mut foot = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .flex_wrap();
+        let mut has_action = false;
         for verb in &row.verbs {
+            has_action = true;
             let (scenario_id, step_id, verb) = (row.scenario_id, row.step_id, *verb);
-            // One door per verb per step: the same step can carry END and
-            // REPLAY, so the id cannot be the step alone.
             let door: &'static str = match verb {
                 StepVerb::Play => "board-play",
                 StepVerb::Skip => "board-skip",
                 StepVerb::End => "board-end",
                 StepVerb::Replay => "board-replay",
             };
-            line = line.child(
+            foot = foot.child(
                 div()
                     .id((door, step_id as usize))
                     .cursor_pointer()
                     .on_click(cx.listener(move |view, _, _, cx| {
+                        // A press on a verb also selects the box it is drawn
+                        // on: the operator is looking at that step either way.
+                        view.board_selected = Some((scenario_id, step_id));
                         view.send_step_verb(scenario_id, step_id, verb, cx);
                     }))
                     .child(button(verb.label(), true, self.step_verb_busy, false)),
             );
         }
-        // The commander's own row carries the declare — the ONE write their
-        // station owns, and the reason the board is theirs to open at all.
         if row.read == StepRead::Asking && self.scenario_audience() == ScenarioAudience::Commander {
+            has_action = true;
             let (scenario_id, step_id) = (row.scenario_id, row.step_id);
             let you_ready = self
                 .session
@@ -9100,12 +11393,12 @@ impl IslandDemo {
                 .as_ref()
                 .and_then(|s| s.asking.as_ref())
                 .is_some_and(|a| a.you_ready);
-            let declare_status = self.step_declare_status.clone();
-            line = line.child(
+            foot = foot.child(
                 div()
                     .id("board-declare")
                     .cursor_pointer()
                     .on_click(cx.listener(move |view, _, _, cx| {
+                        view.board_selected = Some((scenario_id, step_id));
                         view.send_step_declare(scenario_id, step_id, !you_ready, cx);
                     }))
                     .child(button(
@@ -9115,60 +11408,341 @@ impl IslandDemo {
                         false,
                     )),
             );
-            if !declare_status.is_empty() {
-                line = line.child(note(declare_status));
+        }
+        if !self.step_declare_status.is_empty()
+            && row.read == StepRead::Asking
+            && self.scenario_audience() == ScenarioAudience::Commander
+        {
+            foot = foot.child(note(self.step_declare_status.clone()));
+        }
+        if !has_action {
+            // No verb is an answer, not a gap: a played step an observer reads
+            // has nothing to press, and saying so is better than an empty row
+            // that looks like a control failed to draw.
+            foot = foot.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                    .child(match row.read {
+                        StepRead::Played => "no action on a played step for this seat",
+                        StepRead::Later => {
+                            "no action \u{2014} the exercise moves where the game master plays"
+                        }
+                        _ => "read only",
+                    }),
+            );
+        }
+        card = card.child(foot);
+        card.into_any_element()
+    }
+
+    /// Section 2: the selected step's FULL instruction, then every hull the
+    /// server resolves for it — face, name and commander, one box each.
+    fn board_detail(
+        &self,
+        board: &ScenarioBoard,
+        selected: Option<(i64, i64)>,
+    ) -> AnyElement {
+        let row = selected.and_then(|key| {
+            board
+                .steps
+                .iter()
+                .find(|s| (s.scenario_id, s.step_id) == key)
+        });
+        let mut detail = div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(tracked("selected step", view::LABEL_PT, CUT_GREY))
+                    .child(
+                        div()
+                            .max_w(px(220.0))
+                            .truncate()
+                            .child(machine(
+                                row.map(|r| format!("#{} \u{00b7} {}", r.number, r.scenario))
+                                    .unwrap_or_else(|| "\u{2014}".to_string()),
+                                BODY_SILVER,
+                            )),
+                    ),
+            );
+        let Some(row) = row else {
+            return detail
+                .child(note("Select a step to read its instruction and hulls."))
+                .into_any_element();
+        };
+
+        // The complete instruction, above the hulls. This is the same server
+        // text the step box carries, shown here in full rather than clipped
+        // to whatever the left column could spare.
+        detail = detail.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .p(px(8.0))
+                .rounded(px(6.0))
+                .bg(rgba(PANEL_SLATE))
+                .border(px(1.0))
+                .border_color(rgba(HAIRLINE_SLATE))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(tracked("step instruction", view::LABEL_PT, CUT_GREY))
+                        .child(
+                            div()
+                                .font_family(view::FACE_MACHINE)
+                                .text_size(px(10.0))
+                                .text_color(rgba(BODY_SILVER))
+                                .child(
+                                    row.window
+                                        .as_ref()
+                                        .map(|(a, b)| format!("{a}\u{2013}{b}"))
+                                        .unwrap_or_else(|| "\u{2014}".to_string()),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("board-instruction")
+                        .font_family(view::FACE_HUMAN)
+                        .text_size(px(12.0))
+                        .line_height(px(17.0))
+                        .max_h(px(120.0))
+                        .overflow_y_scroll()
+                        .text_color(rgba(if row.content.is_empty() {
+                            BODY_SILVER.with_alpha(204)
+                        } else {
+                            MAP_INK
+                        }))
+                        .child(if row.content.is_empty() {
+                            "(not written yet)".to_string()
+                        } else {
+                            row.content.clone()
+                        }),
+                ),
+        );
+
+        let units = self.board_related_units(row);
+        detail = detail.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(tracked("related hulls", view::LABEL_PT, CUT_GREY))
+                .child(machine(
+                    units
+                        .as_ref()
+                        .map(|u| format!("{} hull(s)", u.len()))
+                        .unwrap_or_else(|| "\u{2014}".to_string()),
+                    BODY_SILVER,
+                )),
+        );
+        let mut list = div()
+            .id("board-related")
+            .flex_1()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(4.0));
+        match units {
+            None => {
+                list = list.child(note(
+                    "The related list could not be read for this step. The board \
+                     will not guess which hulls it obliges.",
+                ));
+            }
+            Some(units) if units.is_empty() => {
+                list = list.child(note("No hulls are related to this step."));
+            }
+            Some(units) => {
+                for hull in units {
+                    list = list.child(self.board_hull_card(&hull));
+                }
             }
         }
-        let mut card = div().flex().flex_col().gap(px(3.0)).child(line);
-        // Under the row: the scenario it belongs to and the hulls it obliges.
-        // The hulls are the server's resolved read (`related`), so a step that
-        // was never related says so rather than listing none.
-        let mut under = div()
+        detail.child(list).into_any_element()
+    }
+
+    /// The hulls one step relates, resolved from the server's read.
+    ///
+    /// A HULL entry is the piece itself. A NODE entry is expanded to every
+    /// piece beneath it in this exercise's task organisation, because a step
+    /// that relates "Gugus Alpha" obliges the ships in it, not the group's
+    /// name — the same resolution the readiness gate makes, so the two screens
+    /// cannot disagree about who is being asked.
+    ///
+    /// `None` is "the read did not answer"; an empty list is "it answered and
+    /// names nobody". The board draws them differently for the reason the
+    /// server's own docs give: an unread step is not an unrelated one.
+    fn board_related_units(&self, row: &BoardStep) -> Option<Vec<BoardHull>> {
+        let related = self.related_for(row.scenario_id, row.step_id)?;
+        let mut out: Vec<BoardHull> = Vec::new();
+        let mut seen: Vec<i64> = Vec::new();
+        for (index, (kind, id)) in related.posts.iter().enumerate() {
+            let fallback = related
+                .names
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| format!("{kind} {id}"));
+            match kind.as_str() {
+                "hull" => {
+                    if let Some(piece) = self.session.pieces.iter().find(|p| p.id == *id) {
+                        if seen.contains(&piece.id) {
+                            continue;
+                        }
+                        seen.push(piece.id);
+                        out.push(BoardHull {
+                            id: Some(piece.id),
+                            name: piece.label.clone(),
+                            commander: self.piece_commander(piece),
+                        });
+                    } else if !fallback.is_empty() {
+                        // A hull the piece list has not caught up with is
+                        // still named by the server, so it is shown without a
+                        // face rather than dropped.
+                        out.push(BoardHull {
+                            id: Some(*id),
+                            name: fallback,
+                            commander: "\u{2014}".to_string(),
+                        });
+                    }
+                }
+                "node" => {
+                    let nodes = self.group_subtree_ids(*id);
+                    let before = out.len();
+                    for piece in &self.session.pieces {
+                        if !piece
+                            .hierarchy_node
+                            .is_some_and(|node| nodes.contains(&node))
+                        {
+                            continue;
+                        }
+                        if seen.contains(&piece.id) {
+                            continue;
+                        }
+                        seen.push(piece.id);
+                        out.push(BoardHull {
+                            id: Some(piece.id),
+                            name: piece.label.clone(),
+                            commander: self.piece_commander(piece),
+                        });
+                    }
+                    if out.len() == before {
+                        let group = self.session.groups.iter().find(|g| g.group_id == *id);
+                        out.push(BoardHull {
+                            id: None,
+                            name: group
+                                .map(|g| g.name.clone())
+                                .filter(|n| !n.is_empty())
+                                .unwrap_or(fallback),
+                            commander: group
+                                .and_then(|g| g.commander_id)
+                                .and_then(|id| self.session.people.iter().find(|p| p.id == id))
+                                .map(|p| p.name.clone())
+                                .unwrap_or_else(|| "uncommanded".to_string()),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(out)
+    }
+
+    /// Every node in a task group's subtree, the root included. The session's
+    /// groups carry parents but not members, so this is how a related NODE
+    /// finds the hulls that sit beneath it.
+    fn group_subtree_ids(&self, root: i64) -> Vec<i64> {
+        let mut ids = vec![root];
+        let mut index = 0usize;
+        while index < ids.len() {
+            let parent = ids[index];
+            for group in &self.session.groups {
+                if group.parent == Some(parent) && !ids.contains(&group.group_id) {
+                    ids.push(group.group_id);
+                }
+            }
+            index += 1;
+        }
+        ids
+    }
+
+    /// A piece's commander, by the server's name when it has one and the
+    /// roster's name otherwise. The fallback matters for a hull staged a
+    /// second ago, whose commander id is known before the piece is written.
+    fn piece_commander(&self, piece: &PieceView) -> String {
+        if !piece.commander_name.is_empty() {
+            return piece.commander_name.clone();
+        }
+        piece
+            .commander_id
+            .and_then(|id| self.session.people.iter().find(|p| p.id == id))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "uncommanded".to_string())
+    }
+
+    /// One related hull: its face, its name and who commands it.
+    fn board_hull_card(&self, hull: &BoardHull) -> AnyElement {
+        let face = match hull.id {
+            Some(id) => Self::thumb_face(self.thumbs.get(&id).cloned(), self.fleet_symbol(id)),
+            None => Self::thumb_box(None, MapSymbolShape::Dot, 56.0, 38.0, 1.0, ObjectFit::Cover),
+        };
+        div()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(8.0))
-            .pl(px(30.0))
+            .p(px(6.0))
+            .rounded(px(6.0))
+            .bg(rgba(PANEL_SLATE.with_alpha(140)))
+            .border(px(1.0))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .child(face)
             .child(
                 div()
-                    .text_size(px(10.0))
-                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                    .child(row.scenario.clone()),
-            );
-        under = under.child(
-            div()
-                .text_size(px(10.0))
-                .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                .child(if row.units.is_empty() {
-                    "\u{00b7} no hulls related".to_string()
-                } else {
-                    format!("\u{00b7} {}", row.units.join(", "))
-                }),
-        );
-        // Who is holding the gate, in the server's own two answers: `may_start`
-        // says whether, and the outstanding call signs say who. A screen that
-        // showed the count and not the names would leave the Game Master to
-        // work out whom to chase.
-        if let Some(gate) = row.gate.as_ref().filter(|g| !g.may_start && !g.outstanding.is_empty())
-        {
-            under = under.child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(rgba(WARNING_SAND))
-                    .child(format!("\u{00b7} held by {}", gate.outstanding.join(", "))),
-            );
-        }
-        card = card.child(under);
-        // The pointer's own edge, and the only one the board lights: a row
-        // that is merely played must not compete with the step in play.
-        if matches!(row.read, StepRead::Playing) {
-            card = card
-                .pl(px(8.0))
-                .border_l(px(2.0))
-                .border_color(rgba(RADAR_CYAN));
-        }
-        card.into_any_element()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(12.0))
+                            .text_color(rgba(MAP_INK))
+                            .child(hull.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_baseline()
+                            .gap(px(5.0))
+                            .child(tracked("cmdr", view::LABEL_PT, CUT_GREY))
+                            .child(
+                                div()
+                                    .font_family(view::FACE_HUMAN)
+                                    .text_size(px(10.5))
+                                    .text_color(rgba(BODY_SILVER))
+                                    .child(hull.commander.clone()),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
+
     /// The Inspector: the SELECTED hull's detail, docked along the bottom.
     ///
     /// A dock, not a window: the console recomputes its place every frame so
@@ -10357,12 +12931,12 @@ impl IslandDemo {
     /// The marker layer, now live: one ring per tracked hull, at its
     /// projected fix position.
     ///
-    /// The positions arrive in the MAP frame's pixel space (the binary
-    /// projects each fix with `map_render::project_mercator`), so the layer
-    /// scales them to the window by the frame's dimensions — the shell never
-    /// names the map's size. Inks follow the state vocabulary the sheet
-    /// uses: the selected hull carries SIGNAL, a stale one the amber, a
-    /// fresh one the map ink. There is NO halo: GPUI 0.2.2 has no
+    /// Each fix carries its GROUND; the shell projects it at the current
+    /// frame's camera (see `marker_frame_px`) and places it through the same
+    /// COVER transform as the map picture (see `map_view`). The binary's
+    /// frame-pixel snapshot is not drawn. Inks follow the state vocabulary
+    /// the sheet uses: the selected hull carries SIGNAL, a stale one the
+    /// amber, a fresh one the map ink. There is NO halo: GPUI 0.2.2 has no
     /// per-element blend mode, so the shader's `One/One` cannot be expressed,
     /// and ADR-0019 records what source-over costs. The ring is the channel
     /// either way, which ADR-0015 already said the Low tier is.
@@ -10374,13 +12948,34 @@ impl IslandDemo {
         const GLYPH_SCALE: f32 = 1.35;
         const SELECT_R: f32 = 15.0;
         let (mw, mh) = self.map_dims;
-        let sx = if mw > 0.0 { win_w / mw } else { 0.0 };
-        let sy = if mh > 0.0 { win_h / mh } else { 0.0 };
+        // The same COVER placement the map picture is painted with: one
+        // uniform scale, and the frame CENTRED in the window. Not width and
+        // height scaled independently — that was the drift.
+        let (s, ox, oy) = map_view(
+            f64::from(mw),
+            f64::from(mh),
+            f64::from(win_w),
+            f64::from(win_h),
+        );
+        let s = s as f32;
+        let ox = ox as f32;
+        let oy = oy as f32;
         let selected_id = self.roster.get(self.selected).map(|r| r.unit_id.clone());
         // Cloned out of `self`: the canvas closure is `move`, and holding a
         // borrow of the live list across the paint pass would fight the
-        // element build.
-        let live = self.live.clone();
+        // element build. Each marker is projected HERE, in the shell, from
+        // its own lat/lon at the camera the frame was drawn from — the
+        // binary's `x`/`y` are a snapshot from the tick that built them, and
+        // a zoom with no new fix would leave the marker at the old pixel.
+        let live: Vec<(LiveMarker, f64, f64)> = self
+            .live
+            .iter()
+            .cloned()
+            .map(|marker| {
+                let (x, y) = self.marker_frame_px(&marker);
+                (marker, x, y)
+            })
+            .collect();
         // The staged hulls that sit at a start and are not yet on the wire:
         // drawn as planned markers, dashed and dimmed. Cloned for the same
         // reason `live` is — the paint closure is `move`.
@@ -10397,12 +12992,12 @@ impl IslandDemo {
         div().absolute().top(px(0.0)).left(px(0.0)).child(canvas(
             |bounds, _, _| bounds,
             move |_bounds, _, window, _| {
-                if sx <= 0.0 || sy <= 0.0 {
+                if s <= 0.0 {
                     return;
                 }
-                for m in &live {
-                    let cx = (m.x as f32) * sx;
-                    let cy = (m.y as f32) * sy;
+                for (m, mx, my) in &live {
+                    let cx = ox + (*mx as f32) * s;
+                    let cy = oy + (*my as f32) * s;
                     // Selection is a RETICLE, not a ring: four corner brackets
                     // outside the affiliation frame, with the frame itself
                     // saying which side. A plain ring says "this one" and
@@ -10434,15 +13029,15 @@ impl IslandDemo {
                         if let Some((photo, (loa, beam))) =
                             portrait(&thumbs, &sizes, uid, zoom)
                         {
-                            // The frame is drawn with a Fill fit, so the
-                            // window's own stretch is the ground's stretch:
-                            // one metre covers `mpp / sx` window pixels
-                            // across and `mpp / sy` down. Sizing the picture
-                            // any other way would shrink or swell the ship
+                            // The frame is COVERED into the window with one
+                            // uniform scale, so the ground's scale is the
+                            // picture's: one metre covers `mpp / s` window
+                            // pixels on both axes. Sizing the picture any
+                            // other way would shrink or swell the ship
                             // against the water it sits in.
                             let mpp = meters_per_pixel(m.latitude, zoom);
-                            let length_px = (loa / mpp) as f32 * sx;
-                            let beam_px = (beam / mpp) as f32 * sy;
+                            let length_px = (loa / mpp) as f32 * s;
+                            let beam_px = (beam / mpp) as f32 * s;
                             let b = Bounds::new(
                                 point(px(cx - length_px / 2.0), px(cy - beam_px / 2.0)),
                                 size(px(length_px), px(beam_px)),
@@ -10477,19 +13072,19 @@ impl IslandDemo {
                 // from the store), so a planned hull says "nobody has said"
                 // rather than borrowing a side it cannot prove.
                 for (x, y, shape, uid, lat) in &planned {
-                    let cx = (*x as f32) * sx;
-                    let cy = (*y as f32) * sy;
+                    let cx = ox + (*x as f32) * s;
+                    let cy = oy + (*y as f32) * s;
                     // At the photograph's zoom, the staged hull's own picture
                     // replaces the glyph, exactly as a live hull's does —
                     // sized by its published dimensions, for the same reason.
                     if let Some((photo, (loa, beam))) =
                         portrait(&thumbs, &sizes, *uid, zoom)
                     {
-                        // The window's stretch is the ground's stretch, as at
-                        // the live site above.
+                        // The cover scale is the ground's scale, as at the
+                        // live site above.
                         let mpp = meters_per_pixel(*lat, zoom);
-                        let length_px = (loa / mpp) as f32 * sx;
-                        let beam_px = (beam / mpp) as f32 * sy;
+                        let length_px = (loa / mpp) as f32 * s;
+                        let beam_px = (beam / mpp) as f32 * s;
                         let b = Bounds::new(
                             point(px(cx - length_px / 2.0), px(cy - beam_px / 2.0)),
                             size(px(length_px), px(beam_px)),
@@ -10607,6 +13202,47 @@ fn portrait<'a>(
 /// centred on `center` at `zoom`. The exact twin of
 /// `map_render::project_mercator`, repeated for the reason in
 /// [`WORLD_BASE_PX`].
+/// How the map frame sits in the window: a UNIFORM scale that covers the
+/// window, plus the top-left origin of the scaled frame.
+///
+/// The frame is 800x600 and the window is not, so one of the two dimensions
+/// is cropped. The origin is negative on the cropped axis (the frame is
+/// CENTRED, not anchored at a corner), and it is what both the painted
+/// picture and the marker layer must use. Sizing the picture and the markers
+/// from the window's width and height independently is the bug this exists
+/// to end: two affine transforms of the same ground, drifting apart the
+/// moment the camera moves.
+fn map_view(mw: f64, mh: f64, win_w: f64, win_h: f64) -> (f64, f64, f64) {
+    if mw <= 0.0 || mh <= 0.0 || win_w <= 0.0 || win_h <= 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let scale = (win_w / mw).max(win_h / mh);
+    let ox = (win_w - mw * scale) / 2.0;
+    let oy = (win_h - mh * scale) / 2.0;
+    (scale, ox, oy)
+}
+
+/// A window fraction (what the pointer reports) as a FRAME fraction (what
+/// the binary unprojects). Cover crops, so this is not the identity even
+/// when the image happens to fill the window.
+fn window_fraction_to_frame(
+    fx: f64,
+    fy: f64,
+    mw: f64,
+    mh: f64,
+    win_w: f64,
+    win_h: f64,
+) -> (f64, f64) {
+    let (scale, ox, oy) = map_view(mw, mh, win_w, win_h);
+    if scale <= 0.0 {
+        return (fx, fy);
+    }
+    (
+        ((fx * win_w - ox) / scale / mw).clamp(0.0, 1.0),
+        ((fy * win_h - oy) / scale / mh).clamp(0.0, 1.0),
+    )
+}
+
 fn project_frame_px(
     lat: f64,
     lon: f64,
@@ -11018,6 +13654,11 @@ impl Render for IslandDemo {
     // rather than by boxing at every return site.
     #[allow(refining_impl_trait)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // The helm's instruments settle on their own clock, not on the map's:
+        // the map's frame is a frame every half second on a software
+        // rasteriser, and a needle that moves in half-second steps is not
+        // motion.
+        self.advance_helm_ease(window);
         // The raw frame is already paintable — nothing to wait for, so this
         // is a swap, not a gate. A promotion that needed a decode would not
         // belong here; see `gate::FrameGate` for that path's numbers.
@@ -11359,6 +14000,10 @@ impl Render for IslandDemo {
             CUT_GREY.with_alpha(89)
         };
         let vp = viewport(window);
+        // The focus doors name their shift in window points; the binary
+        // unprojects in frame pixels. Keep the viewport the cover transform
+        // needs (see `map_view`) for the next focus click.
+        self.last_viewport = (vp.2, vp.3);
         // The map's own chrome, computed once for the frame. It sits above
         // the tiles and below the panels, and it is placed in the VISIBLE map
         // — `column_w` is the docked column's live width, so a bar drawn
@@ -11366,7 +14011,11 @@ impl Render for IslandDemo {
         let chrome = map_chrome(
             vp.2,
             vp.3,
-            if self.side_dock_left { self.zone_w } else { 0.0 },
+            if !self.session.execution && self.side_dock_left {
+                self.zone_w
+            } else {
+                0.0
+            },
             self.map_center,
             self.map_render_zoom,
         );
@@ -11449,9 +14098,18 @@ impl Render for IslandDemo {
                         let vp = viewport(window);
                         view.pan = Some((x, y));
                         if mw > 0.0 && mh > 0.0 && vp.2 > 0.0 && vp.3 > 0.0 {
+                            // The drag is in window points; the binary pans
+                            // in FRAME pixels. Cover scales both axes by the
+                            // same number, so one division serves both.
+                            let (s, _, _) = map_view(
+                                f64::from(mw),
+                                f64::from(mh),
+                                f64::from(vp.2),
+                                f64::from(vp.3),
+                            );
                             view.pan_by(
-                                f64::from((x - lx) * mw / vp.2),
-                                f64::from((y - ly) * mh / vp.3),
+                                f64::from(x - lx) / s,
+                                f64::from(y - ly) / s,
                                 cx,
                             );
                         }
@@ -11475,19 +14133,27 @@ impl Render for IslandDemo {
                             // read as an armed hull's deploy.
                             if view.pin_arm {
                                 if vp.2 > 0.0 && vp.3 > 0.0 {
-                                    let fx = f64::from(f32::from(ev.position.x) / vp.2)
-                                        .clamp(0.0, 1.0);
-                                    let fy = f64::from(f32::from(ev.position.y) / vp.3)
-                                        .clamp(0.0, 1.0);
+                                    let (fx, fy) = window_fraction_to_frame(
+                                        f64::from(f32::from(ev.position.x) / vp.2),
+                                        f64::from(f32::from(ev.position.y) / vp.3),
+                                        f64::from(view.map_dims.0),
+                                        f64::from(view.map_dims.1),
+                                        f64::from(vp.2),
+                                        f64::from(vp.3),
+                                    );
                                     view.place_pin(fx, fy, cx);
                                 }
                                 return;
                             }
                             if vp.2 > 0.0 && vp.3 > 0.0 {
-                                let fx = f64::from(f32::from(ev.position.x) / vp.2)
-                                    .clamp(0.0, 1.0);
-                                let fy = f64::from(f32::from(ev.position.y) / vp.3)
-                                    .clamp(0.0, 1.0);
+                                let (fx, fy) = window_fraction_to_frame(
+                                    f64::from(f32::from(ev.position.x) / vp.2),
+                                    f64::from(f32::from(ev.position.y) / vp.3),
+                                    f64::from(view.map_dims.0),
+                                    f64::from(view.map_dims.1),
+                                    f64::from(vp.2),
+                                    f64::from(vp.3),
+                                );
                                 if let Some(unit_id) = view.pending_place {
                                     match view.piece_name(unit_id) {
                                         Some(name) => {
@@ -11548,6 +14214,14 @@ impl Render for IslandDemo {
                             let fx = f64::from((f32::from(at.x) / w).clamp(0.0, 1.0));
                             let fy = f64::from((f32::from(at.y) / h).clamp(0.0, 1.0));
                             let _ = demo.update(app, |view, cx| {
+                                let (fx, fy) = window_fraction_to_frame(
+                                    fx,
+                                    fy,
+                                    f64::from(view.map_dims.0),
+                                    f64::from(view.map_dims.1),
+                                    f64::from(w),
+                                    f64::from(h),
+                                );
                                 view.drop_pin(fx, fy, cx);
                             });
                         }
@@ -11565,6 +14239,14 @@ impl Render for IslandDemo {
                             let fy = f64::from((f32::from(at.y) / h).clamp(0.0, 1.0));
                             let entity = payload.entity.clone();
                             let _ = demo.update(app, |view, cx| {
+                                let (fx, fy) = window_fraction_to_frame(
+                                    fx,
+                                    fy,
+                                    f64::from(view.map_dims.0),
+                                    f64::from(view.map_dims.1),
+                                    f64::from(w),
+                                    f64::from(h),
+                                );
                                 let target = match view.drop_host_at(fx, fy) {
                                     Some(host) => DropTarget::Unit { unit_id: host },
                                     None => DropTarget::Map { fx, fy },
@@ -11577,11 +14259,41 @@ impl Render for IslandDemo {
                             });
                         }
                     })
-                    .children(
-                        self.gate
-                            .image()
-                            .map(|frame| img(frame).w_full().h_full().object_fit(ObjectFit::Fill)),
-                    ),
+                    // The map frame is PAINTED, not laid out as an `img`.
+                    //
+                    // `Img::request_layout` writes the image's intrinsic
+                    // aspect ratio into the style, and GPUI/taffy then sizes
+                    // the box to 4:3 (the frame's 800x600) even with
+                    // `w_full().h_full()`. The window is not 4:3, so the
+                    // picture was anchored at the top-left and its bottom
+                    // cropped, while `markers()` scaled the frame to the
+                    // WINDOW's width and height independently. The map and
+                    // its hulls were therefore two different affine
+                    // transforms of the same ground: pan or zoom and a hull
+                    // slid off its own water. A canvas paints the frame with
+                    // the same COVER placement the marker layer uses, so one
+                    // transform serves both.
+                    .children(self.gate.image().map(|frame| {
+                        let frame = frame.clone();
+                        canvas(
+                            |bounds, _, _| bounds,
+                            move |bounds, _, window, _| {
+                                // COVER, and the same placement `map_view`
+                                // derives below: uniform scale, centred. The
+                                // picture and every marker then share one
+                                // transform of the ground.
+                                let fit = ObjectFit::Cover.get_bounds(bounds, frame.size(0));
+                                let _ = window.paint_image(
+                                    fit,
+                                    Corners::all(px(0.0)),
+                                    frame.clone(),
+                                    0,
+                                    false,
+                                );
+                            },
+                        )
+                        .size_full()
+                    })),
             )
             // The marker layer, as GPUI has to draw it: the epaint state
             // rings, and no shader halo. ADR-0019 has the numbers for why
@@ -11597,8 +14309,15 @@ impl Render for IslandDemo {
             } else {
                 self.markers(vp.2, vp.3).into_any_element()
             })
-            .child(band_el)
-            .child(
+            .child(if self.session.execution {
+                // Execution draws its widgets on the map, not a column.
+                div().into_any_element()
+            } else {
+                band_el.into_any_element()
+            })
+            .child(if self.session.execution {
+                div().into_any_element()
+            } else {
                 div()
                     .absolute()
                     .left(px(grip_box.0))
@@ -11634,8 +14353,9 @@ impl Render for IslandDemo {
                             view.grip = Some((f32::from(ev.position.x), view.zone_w));
                             cx.notify();
                         }),
-                    ),
-            );
+                    )
+                    .into_any_element()
+            });
         // --- the top band ---------------------------------------------------
         //
         // The session's own bar, and the console's composition rather than a
@@ -11668,6 +14388,24 @@ impl Render for IslandDemo {
             root = root.child(el);
         }
         root = root.child(self.top_zone(cx, vp.2));
+        // Execution's four widgets, on the map's right edge. The side column
+        // and the band's Scenario/Comms doors are gone in this phase; these
+        // are their entries, each opening the surface it names.
+        if self.session.execution {
+            root = root.child(self.execution_widgets(cx));
+            // The commander's own surface: the bottom dashboard and the
+            // one-tap follow door. Both are gated on the seat commanding
+            // something, which is the whole reason they are here rather than
+            // on every execution — a seat that commands nothing has no unit
+            // to picture and no hull to steer.
+            if self.is_commander() {
+                // The dashboard's embark half needs the composition; asking is
+                // a channel send, so it happens before the element is built.
+                self.ensure_commander_embark();
+                root = root.child(self.follow_control(cx));
+                root = root.child(self.commander_dashboard(cx));
+            }
+        }
         // The step reminder, just under the top band: the ONE step this
         // caller owes or is on — never the book. A click opens the column's
         // STEP island, where the scenario and the declare row live, so the
@@ -11995,6 +14733,32 @@ impl Render for IslandDemo {
                             .block_mouse_except_scroll()
                             .child(modal_silhouette_at(BOARD_W, BOARD_H))
                             .child(self.board_body(cx)),
+                    )
+                    .into_any_element(),
+            )
+        } else if self.crew_modal_open {
+            // The execution crew screen: players by role, and the force each
+            // commander holds. The same authoring card as the other modals;
+            // the list does the scrolling.
+            Some(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgba(Rgba::black_alpha(150)))
+                    .child(
+                        div()
+                            .relative()
+                            .w(px(FORM_W))
+                            .h(px(FORM_H))
+                            .block_mouse_except_scroll()
+                            .child(modal_silhouette_at(FORM_W, FORM_H))
+                            .child(self.crew_modal_body(cx)),
                     )
                     .into_any_element(),
             )
@@ -12964,6 +15728,32 @@ pub struct PersonView {
     pub present: bool,
 }
 
+/// One seat as the Player picker shows it: Minos's row overlaid with the
+/// staged draft, because the draft is the newer word.
+///
+/// A seat is local while the game is being planned, so a seat staged a
+/// second ago IS in the room as far as the operator is concerned — and a
+/// list that showed only the server's frame read as "the click did
+/// nothing". `staged` and `removed` are the two marks that keep the row
+/// honest about which half it is showing.
+#[derive(Clone, Debug)]
+pub struct RoomRow {
+    pub id: i64,
+    pub name: String,
+    /// The role's ID, from the draft when the draft has an opinion.
+    pub role_id: i64,
+    /// The role's NAME, for display.
+    pub role: String,
+    pub judge: bool,
+    /// The draft is newer than the server's row: a staged seat or a staged
+    /// role change, not yet written.
+    pub staged: bool,
+    /// A staged removal. The row stands, marked, until the advance
+    /// unseats it — vanishing before the write would hide the operator's
+    /// own decision back at them.
+    pub removed: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionView {
     pub game: String,
@@ -13187,6 +15977,22 @@ pub struct HelmStatus {
     pub text: String,
 }
 
+/// The helm's instruments in motion: the values the compass and the scale
+/// are drawing, easing toward the draft.
+///
+/// The draft is the operator's intent; this is what the instrument shows
+/// while it gets there. A needle that teleports between two bearings reads
+/// as a glitch, and a fill that leaps reads as a value that changed for no
+/// reason, so both settle instead.
+#[derive(Clone, Copy, Debug)]
+struct HelmAnim {
+    from_heading: f32,
+    to_heading: f32,
+    from_speed: f32,
+    to_speed: f32,
+    at: std::time::Instant,
+}
+
 /// The new-session draft: the console's `session_creator_body` fields — name
 /// (required) plus every optional the `POST /games` body accepts, so nothing
 /// the edit form owns later is missing here. The shell owns the draft; the
@@ -13271,12 +16077,13 @@ pub enum ToBinary {
     /// visible centre, because the shell has no mercator.
     Jump { lat: f64, lon: f64, shift_px: f32 },
     /// Deploy a hull where the pointer says: the unit plus the drop point as
-    /// fractions of the map view. The shell names fractions, never pixels or
-    /// ground — it knows the viewport, and the frame fills it
-    /// (`ObjectFit::Fill`), so fractions survive any window size. The binary
-    /// unprojects to lat/lon at its own camera and calls `set_placement`,
-    /// because the shell has no mercator. The answer is a re-read session on
-    /// `create_feed`, like every other write here.
+    /// fractions of the map FRAME. The shell names fractions, never pixels or
+    /// ground — it converts the pointer's window fraction through the same
+    /// cover transform it paints with (`window_fraction_to_frame`), so the
+    /// answer survives any window size. The binary unprojects to lat/lon at
+    /// its own camera and calls `set_placement`, because the shell has no
+    /// mercator. The answer is a re-read session on `create_feed`, like every
+    /// other write here.
     DeployUnit { unit_id: i64, fx: f64, fy: f64 },
     /// Assign a register hull and deploy it, in one gesture: the drop of a
     /// hull the exercise does not hold yet. The commander is the
@@ -13691,6 +16498,19 @@ pub struct PieceView {
     /// `force::plan`'s `ForceGap`. Carried because the Fleet picker has to
     /// SHOW who holds each piece, and because the draft is diffed against it.
     pub commander_id: Option<i64>,
+    /// The commander's display name, read from the server's piece rather than
+    /// joined client-side. Empty for a staged hull the draft has not written
+    /// yet, or for a piece nobody commands.
+    pub commander_name: String,
+    /// The task-organisation node the piece sits under, when one does. The
+    /// Scenario board reads it to expand a step that relates a NODE into the
+    /// hulls beneath it.
+    pub hierarchy_node: Option<i64>,
+    /// The starting position the exercise recorded for the piece, when one
+    /// was placed. Carried so a focus control can centre the map on a hull
+    /// before any live fix exists — the placements read is the only ground
+    /// the shell holds at that point.
+    pub start: Option<(f64, f64)>,
     /// Whether the hull sits at a starting position. This is the console's
     /// `DraftHull::start.is_some()`, read from the server's own placements
     /// rather than from a draft — the shell has no draft yet (see the Fleet
@@ -13888,6 +16708,19 @@ pub struct BoardStep {
     pub verbs: Vec<StepVerb>,
 }
 
+/// One hull the selected step relates, as section 2 draws it: the face and
+/// name from the exercise's piece list, the commander from the server's piece
+/// row (or the roster when the piece is still staged).
+///
+/// `id` is `None` for a task-group entry that resolved to no hull, so the card
+/// can draw a group glyph rather than a blank photograph frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoardHull {
+    pub id: Option<i64>,
+    pub name: String,
+    pub commander: String,
+}
+
 /// The exercise's scenario, whole: every step in play order, the pointer, and
 /// the one line about the server's clock that dates all of it.
 #[derive(Clone, Debug, PartialEq)]
@@ -13901,6 +16734,10 @@ pub struct ScenarioBoard {
     /// `steps.len()`: a commander's board carries one row and the header still
     /// says where that row sits in the whole plan.
     pub total: usize,
+    /// The one row the board arms with Play/Skip: the next step after the one
+    /// the exercise stands on, read off what was played, never off the clock.
+    /// `None` when the book holds nothing startable and nothing playing.
+    pub head: Option<(i64, i64)>,
     pub steps: Vec<BoardStep>,
 }
 
@@ -14110,6 +16947,45 @@ impl Render for PinGhost {
                     .text_color(rgba(ALERT_YELLOW))
                     .child("quote"),
             )
+    }
+}
+
+/// The heading dial's drag payload. Its TYPE is the whole message: the dial is
+/// a press-drag, not a drag-and-drop, and the type is what keeps its move
+/// events from being read by the slider's listener.
+#[derive(Clone, Copy, Debug)]
+struct DialDragPayload;
+
+/// The speed slider's drag payload — the same shape, a different type, for the
+/// same reason.
+#[derive(Clone, Copy, Debug)]
+struct SliderDragPayload;
+
+/// The dial's drag ghost: a small ring, so the gesture reads as "I am turning
+/// this" rather than as a dragged object.
+struct DialGhost;
+
+impl Render for DialGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(14.0))
+            .h(px(14.0))
+            .rounded(px(7.0))
+            .border(px(1.5))
+            .border_color(rgba(RADAR_CYAN))
+    }
+}
+
+/// The slider's drag ghost: a short bar.
+struct SliderGhost;
+
+impl Render for SliderGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(4.0))
+            .h(px(18.0))
+            .rounded(px(2.0))
+            .bg(rgba(RADAR_CYAN))
     }
 }
 
@@ -14495,6 +17371,9 @@ mod fleet_taxonomy_tests {
             id: 8,
             label: "host".to_string(),
             commander_id: None,
+            commander_name: String::new(),
+            hierarchy_node: None,
+            start: None,
             placed: true,
         }];
         let mut demo = IslandDemo::new(
@@ -14784,10 +17663,11 @@ fn roster_sheet(
 pub type FrameFeed =
     std::boxed::Box<dyn FnMut() -> Option<(u64, u32, u32, Vec<u8>, (f64, f64), f64)> + Send>;
 
-/// One live ship, as the marker layer draws it. `x`/`y` are in the MAP
-/// frame's pixel space: the binary projects the fix with
-/// `map_render::project_mercator`, and the shell scales to the window by the
-/// frame's dimensions — so the shell never names the map's size.
+/// One live ship, as the marker layer draws it. `x`/`y` are the pixel
+/// snapshot the binary projected when it built the batch; the shell does NOT
+/// draw from them — it reprojects [`Self::latitude`]/[`Self::longitude`] at
+/// the frame's current camera every frame, so a zoom or pan cannot leave a
+/// hull behind at an old pixel.
 #[derive(Clone, Debug)]
 pub struct LiveMarker {
     /// The unit id the wire keys fixes by, shared with the register.
@@ -14890,7 +17770,10 @@ pub fn run(
     session: SessionView,
     fleet_tax: FleetTaxonomy,
 ) {
-    Application::new().run(move |cx: &mut App| {
+    // The SVG icon source, and the only one the app needs: the hull
+    // photographs are `RenderImage`s the binary hands over, so nothing else
+    // reads the asset source.
+    Application::new().with_assets(EmbeddedIcons).run(move |cx: &mut App| {
         // The instrument type scale's faces: Saira Condensed in four weights
         // plus PT Mono. GPUI resolves weight from the font data, so one
         // family name covers the whole Saira range and `FontWeight` picks
@@ -14945,11 +17828,18 @@ pub fn run(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        // The binary's camera opens at `MAP_ZOOM`; the shell's opening zoom
+        // is its own copy (`TFG_ZOOM`, else the session's). Without this ask
+        // the badge says one number and the tiles another until the first
+        // zoom click — a map whose scale is not the scale it claims.
+        let opening_zoom_tx = order_tx.clone();
         let entity = cx.new(|_| {
             let mut demo = IslandDemo::new(roster, roster_total, selected, session, order_tx);
             demo.fleet_tax = fleet_tax;
             demo
         });
+        let opening_zoom = entity.read(cx).map_zoom;
+        let _ = opening_zoom_tx.send(ToBinary::Zoom(opening_zoom));
         let drain = entity.clone();
         let fix_drain = entity.clone();
         let status_drain = entity.clone();
@@ -15626,6 +18516,9 @@ mod tests {
                 id: 8,
                 label: "KRI Abdul Halim Perdanakusuma (KRI-355)".to_string(),
                 commander_id: Some(2),
+                commander_name: String::new(),
+                hierarchy_node: None,
+                start: None,
                 placed: true,
             }],
             ..SessionView::default()
@@ -15830,6 +18723,148 @@ mod tests {
         );
     }
 
+    /// The picker's three steps, local-first: an account is SEATED with a
+    /// role, and because that role is player-side it is handed a deployed
+    /// piece — all of it staged, none of it posted, until the advance. The
+    /// staged seat must be handable a hull before the advance writes it:
+    /// Minos requires the commander to be a participant, and the advance
+    /// flushes seats before the force precisely so this flow survives.
+    #[gpui::test]
+    fn a_staged_commander_hands_a_deployed_piece_locally(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            people: vec![PersonView {
+                id: 2,
+                name: "Super User".to_string(),
+                call_sign: "SUPERUSER".to_string(),
+                role: "Commando".to_string(),
+                role_id: 19,
+                judge: false,
+                ready: false,
+                present: true,
+            }],
+            pieces: vec![PieceView {
+                id: 8,
+                label: "KRI Ahmad Yani (KRI-1)".to_string(),
+                commander_id: Some(2),
+                commander_name: String::new(),
+                hierarchy_node: None,
+                start: None,
+                placed: true,
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        let role = cx.update(|_window, app| {
+            view.read(app).session.roles.first().cloned().unwrap_or(RoleRow {
+                id: 19,
+                name: "Commando".to_string(),
+                judge: false,
+            })
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.reseed_drafts();
+                demo.stage_seat(6, "Budi Santoso", &role)
+                    .expect("a directory account stages a seat");
+                assert!(
+                    demo.crew_choices().iter().any(|(id, _)| *id == 6),
+                    "a staged seat is handable a hull before the advance"
+                );
+                demo.stage_command(8, "KRI Ahmad Yani (KRI-1)", 6)
+                    .expect("a staged player takes a deployed piece");
+                assert_eq!(
+                    demo.force.get(8).and_then(|h| h.commander_id),
+                    Some(6),
+                    "the draft holds the staged commander"
+                );
+                // A piece only the session knows yet joins the draft on the
+                // click rather than erroring: the picker offers the whole
+                // exercise, and a refusal for a visible hull is the wall
+                // the picker exists to remove.
+                demo.stage_command(11, "KRI Banda Aceh (KRI-2)", 6)
+                    .expect("an unseen piece joins the draft commanded");
+                assert_eq!(demo.force.get(11).and_then(|h| h.commander_id), Some(6));
+            })
+        });
+        assert!(
+            rx.try_recv().is_err(),
+            "the whole flow stages locally: nothing is posted until the advance"
+        );
+    }
+
+    /// The room list shows the DRAFT overlaid on the server's frame: a
+    /// staged role change replaces the live role, a staged seat joins the
+    /// list, and a staged removal stands as a row marked to leave. A list
+    /// that showed only Minos's frame made every planning click read as
+    /// "the click did nothing".
+    #[gpui::test]
+    fn the_picker_room_overlays_the_staged_draft_on_the_live_seats(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            people: vec![
+                PersonView {
+                    id: 6,
+                    name: "Budi Santoso".to_string(),
+                    call_sign: "BUDI".to_string(),
+                    role: "Commando".to_string(),
+                    role_id: 19,
+                    judge: false,
+                    ready: false,
+                    present: false,
+                },
+                PersonView {
+                    id: 7,
+                    name: "Caca Handika".to_string(),
+                    call_sign: "CACA".to_string(),
+                    role: "Commando".to_string(),
+                    role_id: 19,
+                    judge: false,
+                    ready: false,
+                    present: false,
+                },
+            ],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        let judge_role = RoleRow { id: 20, name: "Penyelenggara".to_string(), judge: true };
+        let player_role = RoleRow { id: 19, name: "Commando".to_string(), judge: false };
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.reseed_drafts();
+                demo.stage_seat(6, "Budi Santoso", &judge_role);
+                demo.stage_unseat(7);
+                demo.stage_seat(9, "Dedi Saputra", &player_role);
+
+                let room = demo.room_rows();
+                let budi = room.iter().find(|r| r.id == 6).expect("Budi is in the room");
+                assert_eq!(budi.role_id, 20, "the draft's role, not the server's");
+                assert!(budi.judge, "and the draft's side with it");
+                assert!(budi.staged, "marked as newer than the server's row");
+
+                let dedi = room.iter().find(|r| r.id == 9).expect("the staged seat shows");
+                assert!(dedi.staged, "a seat staged here is in the room now");
+
+                let caca = room.iter().find(|r| r.id == 7).expect("the removal stands");
+                assert!(caca.removed, "marked to leave until the advance unseats");
+            })
+        });
+    }
+
     /// The advance crosses the wire carrying the STAGED draft and the live
     /// mirrors it was diffed against — the shell cannot compute the writes
     /// (the token is the binary's) and the binary cannot see the drafts.
@@ -15857,6 +18892,9 @@ mod tests {
                 id: 8,
                 label: "KRI Already Here (KRI-1)".to_string(),
                 commander_id: Some(2),
+                commander_name: String::new(),
+                hierarchy_node: None,
+                start: None,
                 placed: true,
             }],
             ..SessionView::default()
@@ -16014,6 +19052,9 @@ mod tests {
                 id: 1,
                 label: "KRI Ahmad Yani".to_string(),
                 commander_id: Some(2),
+                commander_name: String::new(),
+                hierarchy_node: None,
+                start: None,
                 placed: false,
             }],
             ..SessionView::default()
@@ -16068,6 +19109,9 @@ mod tests {
                 id: 8,
                 label: "KRI Host (KRI-1)".to_string(),
                 commander_id: Some(2),
+                commander_name: String::new(),
+                hierarchy_node: None,
+                start: None,
                 placed: true,
             }],
             ..SessionView::default()
@@ -16405,6 +19449,53 @@ mod tests {
         );
     }
 
+    /// A live marker is placed from its FIX at the frame's current camera,
+    /// never from the pixel snapshot the binary sent. The regression this
+    /// pins is the one an operator sees: zoom the map and a hull slides off
+    /// the water it is actually on, because its old pixel was projected at
+    /// the old zoom.
+    #[test]
+    fn a_live_marker_reprojects_on_zoom() {
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            SessionView::default(),
+            std::sync::mpsc::channel().0,
+        );
+        demo.map_dims = (1000.0, 800.0);
+        demo.map_center = (-6.1, 106.9);
+        demo.map_render_zoom = 11.0;
+        let marker = LiveMarker {
+            id: "5".to_string(),
+            // Deliberately the old snapshot, not where the fix projects.
+            x: 1.0,
+            y: 2.0,
+            stale: false,
+            symbol: MapSymbolShape::Dot,
+            affiliation: symbology::Affiliation::Unknown,
+            heading_deg: None,
+            speed_kn: None,
+            latitude: -6.0,
+            longitude: 107.0,
+            trail: 0,
+        };
+        let at_11 = demo.marker_frame_px(&marker);
+        assert_eq!(
+            at_11,
+            project_frame_px(-6.0, 107.0, (-6.1, 106.9), 11.0, 1000.0, 800.0),
+            "the marker is projected from its fix, not from the wire snapshot"
+        );
+        demo.map_render_zoom = 13.0;
+        let at_13 = demo.marker_frame_px(&marker);
+        assert_eq!(
+            at_13,
+            project_frame_px(-6.0, 107.0, (-6.1, 106.9), 13.0, 1000.0, 800.0),
+            "a new zoom projects the same ground at the new scale"
+        );
+        assert_ne!(at_11, at_13, "and the placement follows the zoom");
+    }
+
     /// The shell's mirrored projection is the same arithmetic as
     /// `map_render`'s: the centre is the frame's centre, and the inverse
     /// round-trips, so a planned marker and a live one share one pixel space.
@@ -16426,6 +19517,45 @@ mod tests {
         );
     }
 
+    /// The picture and the markers share ONE cover transform. These are the
+    /// two cases an operator actually hits: a window wider than the 4:3 frame
+    /// (crop top and bottom) and one taller (crop left and right). The frame
+    /// centre lands on the window centre in both, which is what lets the
+    /// focus and the drop fractions keep using the frame's own pixel space.
+    #[test]
+    fn the_map_cover_transform_centres_the_frame() {
+        // Wider than 4:3: scale by width, crop the vertical overflow.
+        let (s, ox, oy) = map_view(800.0, 600.0, 1536.0, 838.0);
+        assert!((s - 1.92).abs() < 1e-9);
+        assert!(ox.abs() < 1e-9, "width is the covering axis");
+        assert!((oy + 157.0).abs() < 1e-9, "the crop is shared top/bottom");
+        assert!((ox + 400.0 * s - 768.0).abs() < 1e-9);
+        assert!((oy + 300.0 * s - 419.0).abs() < 1e-9);
+
+        // Taller than 4:3: scale by height, crop the horizontal overflow.
+        let (s, ox, oy) = map_view(800.0, 600.0, 768.0, 838.0);
+        assert!((s - 838.0 / 600.0).abs() < 1e-9);
+        assert!(oy.abs() < 1e-9, "height is the covering axis");
+        assert!(ox < 0.0, "the crop is shared left/right");
+        assert!((ox + 400.0 * s - 384.0).abs() < 1e-9);
+        assert!((oy + 300.0 * s - 419.0).abs() < 1e-9);
+    }
+
+    /// A pointer fraction is a WINDOW fraction; the binary unprojects a
+    /// FRAME fraction. Under cover those differ, and the middle of the window
+    /// is still the middle of the frame — the invariant the deploy and the
+    /// pin rely on.
+    #[test]
+    fn a_window_fraction_becomes_the_frame_fraction_under_cover() {
+        let (fx, fy) = window_fraction_to_frame(0.5, 0.5, 800.0, 600.0, 768.0, 838.0);
+        assert!((fx - 0.5).abs() < 1e-9 && (fy - 0.5).abs() < 1e-9);
+        // The window's top-left is inside the horizontally cropped frame,
+        // not the frame's own corner.
+        let (fx, fy) = window_fraction_to_frame(0.0, 0.0, 800.0, 600.0, 768.0, 838.0);
+        assert!((fx - 0.156_324_58).abs() < 1e-6, "left crop: {fx}");
+        assert!(fy.abs() < 1e-9);
+    }
+
     /// The planning fixture both wheel tests drive: the console's six planning
     /// islands, no session seat, and a stack that overflows the window — which
     /// the console's own heights guarantee, and which is the precondition for a
@@ -16445,6 +19575,9 @@ mod tests {
                 commander_id: Some(i64::from(8)),
                 id: 100 + i,
                 label: format!("KRI Hull {i} (KRI-{i})"),
+                commander_name: String::new(),
+                hierarchy_node: None,
+                start: None,
                 placed: i % 2 == 0,
             })
             .collect();
@@ -16640,6 +19773,9 @@ mod tests {
             let mut demo =
                 IslandDemo::new(fixture_roster(), 8, 0, SessionView::default(), tx);
             demo.map_dims = (1000.0, 1000.0);
+            // 1:1 with the frame, so the dock shift below is the frame
+            // shift. The real shell sets this from the window in `render`.
+            demo.last_viewport = (1000.0, 1000.0);
             demo.map_center = (0.0, 0.0);
             demo.map_render_zoom = 11.0;
             // Hull 1 is deployed but has no fix: the operator placed it.
@@ -16664,7 +19800,10 @@ mod tests {
         match rx.try_recv().expect("the staged ground reached the sink") {
             ToBinary::Jump { lat, lon, shift_px } => {
                 assert_eq!((lat, lon), (-6.108, 106.91));
-                assert_eq!(shift_px, 180.0, "the left dock shifts content right");
+                // 180 window points over a 1920-wide viewport is 93.75
+                // frame pixels of the 1000px frame; the shift is carried in
+                // the frame space the binary unprojects.
+                assert_eq!(shift_px, 93.75, "the left dock shifts content right");
             }
             other => panic!("expected a jump, got {other:?}"),
         }
@@ -17125,9 +20264,9 @@ mod tests {
         set_state(&view, cx, "execution");
         assert_eq!(
             read(&view, cx),
-            vec!["operator", "command", "crew", "log"],
-            "execution is the working surface: command, room, and the feed \u{2014} \
-             the step is the middle of the frame now, not a column island"
+            Vec::<String>::new(),
+            "execution has no side column: account, crew, scenario and comms \
+             are widgets on the map, each opening its own modal"
         );
         set_state(&view, cx, "closure");
         assert_eq!(
@@ -17169,14 +20308,13 @@ mod tests {
             "a player station keeps the planning column"
         );
         set_state(&view, cx, "execution");
-        // The organizer column goes; the helm stays. A player station that
-        // lost its command surface in execution would have nothing to do in
-        // the state it exists for. The step is neither — it is the board's,
-        // in the middle, where every seat reads the same surface.
+        // The organizer column goes AND the helm goes with it: execution has
+        // no side column at all. The helm is a later conversation; the
+        // widgets open the account, crew, scenario and comms surfaces.
         assert_eq!(
             read(&view, cx),
-            vec!["operator", "command"],
-            "a player station loses the organizer column but keeps its helm"
+            Vec::<String>::new(),
+            "a player station also runs execution without the side column"
         );
     }
 
@@ -18239,12 +21377,18 @@ mod tests {
                     id: 13,
                     label: "KRI Yos Sudarso".to_string(),
                     commander_id: None,
+                    commander_name: String::new(),
+                    hierarchy_node: None,
+                    start: None,
                     placed: false,
                 },
                 PieceView {
                     id: 8,
                     label: "KRI Ahmad Yani".to_string(),
                     commander_id: None,
+                    commander_name: String::new(),
+                    hierarchy_node: None,
+                    start: None,
                     placed: true,
                 },
             ];
@@ -18257,6 +21401,12 @@ mod tests {
             // Map space 1:1 with the window, so marker pixels ARE window
             // pixels and the drop below names the marker exactly.
             demo.map_dims = (768.0, 838.0);
+            // The marker's ground is the inverse of the pixel the drop
+            // names: the shell now projects every marker from its fix at the
+            // frame's camera, so a marker placed at x/y alone would not land
+            // there.
+            let (marker_lat, marker_lon) =
+                unproject_frame_px(600.0, 750.0, (0.0, 0.0), 0.0, 768.0, 838.0);
             demo.live = vec![LiveMarker {
                 id: "8".to_string(),
                 x: 600.0,
@@ -18266,8 +21416,8 @@ mod tests {
                 affiliation: symbology::Affiliation::Unknown,
                 heading_deg: None,
                 speed_kn: None,
-                latitude: 0.0,
-                longitude: 0.0,
+                latitude: marker_lat,
+                longitude: marker_lon,
                 trail: 0,
             }];
             demo
@@ -18745,6 +21895,9 @@ mod tests {
                 id: 13,
                 label: "KRI Ahmad Yani".to_string(),
                 commander_id: None,
+                commander_name: String::new(),
+                hierarchy_node: None,
+                start: None,
                 placed: false,
             }];
             let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
@@ -19368,8 +22521,8 @@ mod tests {
                 }],
             }],
             pieces: vec![
-                PieceView { id: 8, label: "KRI Abdul Halim Perdanakusuma (KRI-355)".to_string(), commander_id: Some(2), placed: true },
-                PieceView { id: 9, label: "KRI Yos Sudarso (353)".to_string(), commander_id: None, placed: false },
+                PieceView { id: 8, label: "KRI Abdul Halim Perdanakusuma (KRI-355)".to_string(), commander_id: Some(2), commander_name: "Super User".to_string(), hierarchy_node: None, start: None, placed: true },
+                PieceView { id: 9, label: "KRI Yos Sudarso (353)".to_string(), commander_id: None, commander_name: String::new(), hierarchy_node: None, start: None, placed: false },
             ],
             related: vec![StepRelatedView {
                 scenario_id: 4,
@@ -19740,7 +22893,8 @@ mod tests {
     /// The Game Master's read: every step of the book in play order, where the
     /// exercise is, the hulls each step obliges, and the verbs that follow
     /// from where it is — END and REPLAY on the step in play, REPLAY on the
-    /// steps already behind it, nothing on the ones ahead.
+    /// steps already behind it, and PLAY/SKIP armed on the NEXT step after
+    /// the one in play. The clock decides nothing about where play sits.
     #[gpui::test]
     fn the_board_reads_the_whole_book_and_where_the_exercise_is(cx: &mut gpui::TestAppContext) {
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -19776,7 +22930,16 @@ mod tests {
             vec![StepVerb::End, StepVerb::Replay],
             "in play: end it, or replay it from its own start"
         );
-        assert!(board.steps[2].verbs.is_empty(), "ahead: nothing to press");
+        assert_eq!(
+            board.steps[2].verbs,
+            vec![StepVerb::Play, StepVerb::Skip],
+            "the next step after the one in play carries the play, played or not"
+        );
+        assert_eq!(
+            board.head,
+            Some((5, 9)),
+            "the head follows the play: the row after the one in play"
+        );
         // The step in play carries its own gate: one of its hull's commanders
         // has not declared.
         let gate = board.steps[1].gate.as_ref().expect("the playing row carries its gate");
@@ -19789,11 +22952,242 @@ mod tests {
         assert_eq!(board.steps[1].scenario, "First light", "and which scenario it belongs to");
     }
 
+    /// A placement is ground before any live fix exists: the crew screen's
+    /// focus door has to work in a fresh execution, where the map has a
+    /// starting position and no device has reported yet.
+    #[gpui::test]
+    fn a_placement_gives_a_hull_ground_before_any_fix(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut session = board_session(Some(playing(8)));
+        session.pieces = vec![PieceView {
+            id: 5,
+            label: "KRI Ahmad Yani (351)".to_string(),
+            commander_id: Some(6),
+            commander_name: "Budi Santoso".to_string(),
+            hierarchy_node: None,
+            start: Some((-6.1, 106.9)),
+            placed: true,
+        }];
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let ground = cx.update(|_window, app| view.read(app).piece_ground(5));
+        assert_eq!(
+            ground,
+            Some((-6.1, 106.9)),
+            "the exercise's placement is the ground when no fix has arrived"
+        );
+    }
+
+    /// The execution widgets' two doors: opening one closes the other, the
+    /// same one-surface rule every modal door follows.
+    #[gpui::test]
+    fn execution_modals_replace_one_another(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(
+                fixture_roster(),
+                8,
+                0,
+                board_session(Some(playing(8))),
+                tx,
+            )
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| demo.open_only(WhichPanel::Crew))
+        });
+        let (crew, board, comms) = cx.update(|_window, app| {
+            let demo = view.read(app);
+            (demo.crew_modal_open, demo.board_open, demo.comms_open)
+        });
+        assert!(crew, "the crew widget opens the crew modal");
+        assert!(!board && !comms, "and no other surface stays open");
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| demo.open_only(WhichPanel::Board))
+        });
+        let (crew, board) = cx.update(|_window, app| {
+            let demo = view.read(app);
+            (demo.crew_modal_open, demo.board_open)
+        });
+        assert!(board && !crew, "the scenario widget replaces the crew modal");
+    }
+
+    /// SELECTED IS NOT ACTIVE. The board follows the pointer until a box is
+    /// picked, and a picked box stays picked only while it is still in the
+    /// book — a new exercise does not leave a stale cursor behind.
+    #[gpui::test]
+    fn the_board_selects_the_pointer_until_a_step_is_picked(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(
+                fixture_roster(),
+                8,
+                0,
+                board_session(Some(playing(8))),
+                tx,
+            )
+        });
+        let selected = |view: &gpui::Entity<IslandDemo>, cx: &mut gpui::VisualTestContext| {
+            cx.update(|_window, app| {
+                view.update(app, |demo, _| {
+                    let board = demo.scenario_board();
+                    demo.board_selected_key(&board)
+                })
+            })
+        };
+        assert_eq!(
+            selected(&view, cx),
+            Some((4, 8)),
+            "an unpicked board follows the step in play"
+        );
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| demo.board_selected = Some((4, 7)))
+        });
+        assert_eq!(
+            selected(&view, cx),
+            Some((4, 7)),
+            "a picked box is the detail's cursor, not the exercise's pointer"
+        );
+        // A selection naming no row in the book falls back to the pointer
+        // rather than drawing an empty second section.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| demo.board_selected = Some((99, 99)))
+        });
+        assert_eq!(selected(&view, cx), Some((4, 8)));
+    }
+
+    /// Section 2's hulls are the server's related list RESOLVED: a hull is
+    /// itself, a node expands to the pieces beneath it, a piece reached twice
+    /// appears once, and the commander comes from the piece row.
+    #[gpui::test]
+    fn the_board_expands_a_related_node_to_the_hulls_under_it(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut session = board_session(Some(playing(8)));
+        session.people = vec![PersonView {
+            id: 6,
+            name: "Budi Santoso".to_string(),
+            call_sign: "ALPHA-1".to_string(),
+            role: "Commando".to_string(),
+            role_id: 1,
+            judge: false,
+            ready: true,
+            present: true,
+        }];
+        session.pieces = vec![
+            PieceView {
+                id: 5,
+                label: "KRI Ahmad Yani (351)".to_string(),
+                commander_id: Some(6),
+                commander_name: "Budi Santoso".to_string(),
+                hierarchy_node: Some(3),
+                start: None,
+                placed: true,
+            },
+            PieceView {
+                id: 18,
+                label: "KRI Diponegoro (365)".to_string(),
+                commander_id: Some(6),
+                commander_name: String::new(),
+                hierarchy_node: Some(3),
+                start: None,
+                placed: true,
+            },
+            PieceView {
+                id: 84,
+                label: "KRI Banda Aceh (593)".to_string(),
+                commander_id: None,
+                commander_name: String::new(),
+                hierarchy_node: Some(4),
+                start: None,
+                placed: false,
+            },
+        ];
+        session.groups = vec![
+            crate::groups::LiveGroup {
+                group_id: 3,
+                name: "Gugus Alpha".to_string(),
+                kind: crate::groups::GroupKind::SatuanTugas,
+                parent: None,
+                commander_id: None,
+                units: Vec::new(),
+            },
+            crate::groups::LiveGroup {
+                group_id: 4,
+                name: "Unsur Bravo".to_string(),
+                kind: crate::groups::GroupKind::SatuanTugas,
+                parent: Some(3),
+                commander_id: None,
+                units: Vec::new(),
+            },
+        ];
+        session.related = vec![StepRelatedView {
+            scenario_id: 4,
+            step_id: 8,
+            posts: vec![
+                ("node".to_string(), 3),
+                ("hull".to_string(), 5),
+            ],
+            names: vec![
+                "Gugus Alpha".to_string(),
+                "KRI Ahmad Yani".to_string(),
+            ],
+            personnel: Vec::new(),
+        }];
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let hulls = cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                let board = demo.scenario_board();
+                let row = board
+                    .steps
+                    .iter()
+                    .find(|s| s.step_id == 8)
+                    .expect("the playing step");
+                demo.board_related_units(row).expect("the related read answered")
+            })
+        });
+        assert_eq!(
+            hulls
+                .iter()
+                .map(|h| (h.id, h.name.as_str(), h.commander.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(5), "KRI Ahmad Yani (351)", "Budi Santoso"),
+                // The child node's hull follows the root's, and the roster is
+                // the fallback when the piece carries no commander name.
+                (Some(18), "KRI Diponegoro (365)", "Budi Santoso"),
+                (Some(84), "KRI Banda Aceh (593)", "uncommanded"),
+            ],
+            "node expanded, duplicate dropped, commanders resolved"
+        );
+    }
+
+    /// The hosted deployment names the Game Master role `Penyelenggara`, so
+    /// the board must recognise that label as the seat that runs the
+    /// exercise. A judge-side seat that is not the Game Master still only
+    /// watches.
+    #[gpui::test]
+    fn a_penyelenggara_seat_runs_the_exercise(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = seated(board_session(Some(playing(8))), "Penyelenggara", true);
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let board = cx.update(|_window, app| view.read(app).scenario_board());
+        assert_eq!(board.audience, ScenarioAudience::Master);
+        assert_eq!(
+            board.steps[1].verbs,
+            vec![StepVerb::End, StepVerb::Replay],
+            "the seat that runs the exercise presses the verbs"
+        );
+    }
+
     /// A FRESH execution: the clock has a stamp, nothing is in play and no
     /// step asks this caller. The first step is still startable — a board with
     /// no verb here is a board from which an exercise could never begin — and
-    /// it is the ONLY row armed, because playing the second step would jump
-    /// the plan with one press.
+    /// no PLAY has moved the exercise yet, so the book's first row IS the next
+    /// one after the current, and it is the only one armed.
     #[gpui::test]
     fn a_fresh_execution_arms_the_first_step(cx: &mut gpui::TestAppContext) {
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -19836,6 +23230,78 @@ mod tests {
         assert!(
             board.steps.iter().all(|s| s.verbs.is_empty()),
             "an observer starts nothing"
+        );
+    }
+
+    /// The head follows the PLAYS, and the clock has nothing to do with it. A
+    /// Game Master who played the MIDDLE step of a book — out of the plan's
+    /// own order, which is a Master's ability, not an instant the clock
+    /// reaches — finds the next step after that one armed, wherever the book's
+    /// first row sits. The rows before the current one stay "later" when this
+    /// console never watched them: the ledger is evidence, never an
+    /// assumption.
+    #[gpui::test]
+    fn the_head_is_the_next_step_after_what_was_played(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // Between steps: a stamp, and no pointer at all.
+        let session = board_session(Some(StepView {
+            assumed_time: "2000-01-01T10:00:00+07:00".to_string(),
+            playing: None,
+            asking: None,
+        }));
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        // What this console watched: the middle step played. The book's first
+        // row never played in front of it.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| demo.step_seen.push((4, 8)))
+        });
+        let board = cx.update(|_window, app| view.read(app).scenario_board());
+        assert_eq!(board.at, None, "between steps: no pointer");
+        assert_eq!(
+            board.steps[1].read,
+            StepRead::Played,
+            "the watched step is the one the exercise stands on"
+        );
+        assert_eq!(
+            board.steps[1].verbs,
+            vec![StepVerb::Replay],
+            "a played step keeps its replay, wherever it sits in the book"
+        );
+        assert_eq!(board.steps[0].read, StepRead::Later, "unwatched: no claim");
+        assert!(
+            board.steps[0].verbs.is_empty(),
+            "and an unwatched row behind the play arms nothing"
+        );
+        assert_eq!(
+            board.steps[2].verbs,
+            vec![StepVerb::Play, StepVerb::Skip],
+            "the next step AFTER the current one carries the play"
+        );
+        assert_eq!(board.head, Some((5, 9)), "head and verbs agree");
+
+        // And a book played past its tail — no row after the current one —
+        // falls back to the first startable row: a head that vanished with
+        // the last play would leave an exercise no way to move again.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = board_session(Some(StepView {
+            assumed_time: "2000-01-01T10:00:00+07:00".to_string(),
+            playing: None,
+            asking: None,
+        }));
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| demo.step_seen.push((5, 9)))
+        });
+        let board = cx.update(|_window, app| view.read(app).scenario_board());
+        assert_eq!(board.head, Some((4, 7)), "the board reads the played tail");
+        assert_eq!(
+            board.steps[0].verbs,
+            vec![StepVerb::Play, StepVerb::Skip],
+            "and still has somewhere to play from"
         );
     }
 
@@ -20527,5 +23993,491 @@ mod tests {
         });
         assert!(!status.is_empty(), "the card says what is missing");
         assert!(rx.try_recv().is_err(), "nothing was sent");
+    }
+
+    // -----------------------------------------------------------------------
+    // The commander dashboard: the execution phase's own instrument.
+    // -----------------------------------------------------------------------
+
+    /// A session piece's placement is the ground a commanded hull is drawn
+    /// from before any device reports a fix. This is the defect the commander
+    /// saw: the map centred on their unit and showed nothing, because the
+    /// draft is re-seeded with `start: None` and the wire had no fix yet.
+    #[test]
+    fn a_commanded_hull_draws_a_planned_mark_at_its_placement() {
+        let mut session = SessionView::default();
+        session.game_id = 7;
+        session.execution = true;
+        session.mine = vec![MyShip {
+            id: "3".to_string(),
+            label: "KRI Alpha (KRI-3)".to_string(),
+        }];
+        session.pieces = vec![PieceView {
+            id: 3,
+            label: "KRI Alpha (KRI-3)".to_string(),
+            commander_id: Some(2),
+            commander_name: "Super User".to_string(),
+            start: Some((-7.88, 112.54)),
+            placed: true,
+            ..PieceView::default()
+        }];
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        demo.map_dims = (1000.0, 1000.0);
+        demo.map_center = (0.0, 0.0);
+        demo.map_render_zoom = 11.0;
+        let marks = demo.planned_marks();
+        assert_eq!(
+            marks.len(),
+            1,
+            "the placed hull is drawn before the wire names it"
+        );
+        assert_eq!(marks[0].3, 3, "the mark is the commanded hull");
+        assert_eq!(
+            (marks[0].0, marks[0].1),
+            project_frame_px(-7.88, 112.54, (0.0, 0.0), 11.0, 1000.0, 1000.0),
+            "projected from the exercise's placement"
+        );
+    }
+
+    /// Read one row of the dashboard's identity by label, the way the panel
+    /// does.
+    fn identity_value(
+        rows: &[(&'static str, String, Option<&'static str>)],
+        label: &str,
+    ) -> String {
+        rows.iter()
+            .find(|(l, _, _)| *l == label)
+            .map(|(_, v, _)| v.clone())
+            .unwrap_or_default()
+    }
+
+    /// The dashboard's second segment is the unit's identity: the hull number,
+    /// the task group it sits under, and the embark relationship in whichever
+    /// direction it runs.
+    #[test]
+    fn the_dashboard_names_the_group_and_both_embark_directions() {
+        let mut session = SessionView::default();
+        session.game_id = 7;
+        session.execution = true;
+        session.me = 2;
+        session.mine = vec![MyShip {
+            id: "3".to_string(),
+            label: "KRI Alpha (KRI-3)".to_string(),
+        }];
+        session.pieces = vec![
+            PieceView {
+                id: 3,
+                label: "KRI Alpha (KRI-3)".to_string(),
+                commander_id: Some(2),
+                hierarchy_node: Some(30),
+                start: Some((-7.88, 112.54)),
+                ..PieceView::default()
+            },
+            PieceView {
+                id: 4,
+                label: "KRI Beta (KRI-4)".to_string(),
+                commander_id: Some(5),
+                hierarchy_node: Some(30),
+                start: Some((-7.88, 112.54)),
+                ..PieceView::default()
+            },
+        ];
+        session.groups = vec![crate::groups::LiveGroup {
+            group_id: 30,
+            name: "Gugus Alpha".to_string(),
+            kind: crate::groups::GroupKind::Gugus,
+            parent: None,
+            commander_id: Some(5),
+            units: Vec::new(),
+        }];
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        let aboard = |id: i64, name: &str| crate::backend::EmbarkedUnit {
+            id,
+            name: name.to_string(),
+            hull_number: String::new(),
+            class_name: String::new(),
+            is_cleared: true,
+            cleared_at: None,
+        };
+        // What the commander's unit carries.
+        demo.embarked.insert(3, vec![aboard(4, "KRI Beta")]);
+        let rows = demo.dashboard_identity();
+        assert_eq!(identity_value(&rows, "hull"), "KRI-3");
+        assert_eq!(identity_value(&rows, "group"), "Gugus Alpha");
+        assert_eq!(identity_value(&rows, "embark"), "carrying KRI Beta");
+        // What carries the commander's unit: Beta's list names Alpha.
+        demo.embarked.clear();
+        demo.embarked.insert(4, vec![aboard(3, "KRI Alpha")]);
+        let rows = demo.dashboard_identity();
+        assert_eq!(identity_value(&rows, "embark"), "aboard KRI Beta (KRI-4)");
+        // And a unit outside the tree says so rather than borrowing a group.
+        demo.session.pieces[0].hierarchy_node = None;
+        let rows = demo.dashboard_identity();
+        assert_eq!(identity_value(&rows, "group"), "not in a group");
+    }
+
+    /// The order's answer is cut to the room the rail has, and never
+    /// overflows it: a refusal that runs off the bottom of the band is a
+    /// refusal nobody can read.
+    #[test]
+    fn the_order_s_answer_is_cut_to_the_rail() {
+        let short = "applied 67° / 9.6 kn";
+        assert_eq!(
+            bounded_status(short, 208.0, DASH_STATUS_LINES),
+            short,
+            "a short answer is whole"
+        );
+        let long = "refused: HTTP 409: Conflict occurred — This unit's maximum speed is unknown, so the order cannot be clamped and was not applied. Publish one for the medium it moves in, with PUT /units/{id}/speeds.";
+        let cut = bounded_status(long, 208.0, DASH_STATUS_LINES);
+        assert!(cut.chars().count() < long.chars().count(), "a long one is cut");
+        assert!(cut.ends_with('\u{2026}'), "and says that it is cut");
+        assert!(
+            cut.starts_with("refused: HTTP 409"),
+            "and keeps the part that names the problem: {cut}"
+        );
+        // A narrower column holds less, and the answer is still whole when
+        // it fits.
+        let narrow = bounded_status(short, 148.0, DASH_STATUS_LINES);
+        assert_eq!(narrow, short, "a short answer is whole on a narrow rail too");
+    }
+
+    /// The icon source is compiled in: every icon path the dashboard names
+    /// resolves to real SVG bytes, and an unknown path resolves to nothing
+    /// rather than failing.
+    #[test]
+    fn the_icon_source_serves_every_icon() {
+        let source = EmbeddedIcons;
+        for path in [
+            "icons/compass.svg",
+            "icons/gauge.svg",
+            "icons/pin.svg",
+            "icons/group.svg",
+            "icons/embark.svg",
+        ] {
+            let bytes = source.load(path).expect("the source does not fail");
+            let bytes = bytes.unwrap_or_else(|| panic!("{path} is compiled in"));
+            assert!(bytes.starts_with(b"<svg"), "{path} is an SVG document");
+        }
+        assert!(source.load("icons/nope.svg").unwrap().is_none());
+    }
+
+    /// The dashboard and the follow door belong to a seat that commands
+    /// something: a hull directly, or a task group whose hulls it holds.
+    /// Nobody else gets either.
+    #[test]
+    fn the_dashboard_is_a_commanders_and_only_a_commanders() {
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            SessionView::default(),
+            std::sync::mpsc::channel().0,
+        );
+        assert!(!demo.is_commander(), "no session, no command");
+        demo.session.mine = vec![MyShip {
+            id: "3".to_string(),
+            label: "KRI Alpha".to_string(),
+        }];
+        demo.session.pieces = vec![PieceView {
+            id: 3,
+            ..PieceView::default()
+        }];
+        assert!(demo.is_commander(), "a commanded hull makes a commander");
+        // A commander of a task group, not of a hull.
+        demo.session.mine.clear();
+        demo.session.me = 9;
+        demo.session.groups = vec![crate::groups::LiveGroup {
+            group_id: 30,
+            name: "Gugus Alpha".to_string(),
+            kind: crate::groups::GroupKind::Gugus,
+            parent: None,
+            commander_id: Some(9),
+            units: Vec::new(),
+        }];
+        demo.session.pieces[0].hierarchy_node = Some(30);
+        assert!(demo.is_commander(), "a commanded task group is a command");
+        demo.session.groups[0].commander_id = Some(4);
+        assert!(
+            !demo.is_commander(),
+            "a group somebody else holds is not this seat's"
+        );
+    }
+
+    /// The helm's ± controls wrap the compass and floor the speed: a course is
+    /// a circle and zero is Hold position, never a reverse.
+    #[test]
+    fn the_helm_nudges_wrap_the_compass_and_floor_the_speed() {
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            SessionView::default(),
+            std::sync::mpsc::channel().0,
+        );
+        demo.helm_heading = Some(359.0);
+        demo.nudge_helm_course(1.0);
+        assert_eq!(demo.helm_heading, Some(0.0), "the compass wraps");
+        demo.helm_heading = Some(0.0);
+        demo.nudge_helm_course(-1.0);
+        assert_eq!(demo.helm_heading, Some(359.0), "and wraps the other way");
+        demo.helm_speed = Some(0.2);
+        demo.nudge_helm_speed(-0.5);
+        assert_eq!(demo.helm_speed, Some(0.0), "speed floors at hold");
+    }
+
+    /// The rail's widths: the scale takes what is left, and the scale is
+    /// the last thing to be squeezed.
+    #[test]
+    fn the_rail_gives_the_scale_what_is_left() {
+        let wide = rail_widths(1920.0);
+        assert_eq!(wide.unit, DASH_UNIT_W, "the picture keeps its share");
+        assert_eq!(wide.identity, DASH_ID_W, "and so does the column of facts");
+        assert_eq!(wide.order, DASH_ORDER_W, "and the verb keeps its column");
+        assert_eq!(wide.dial, DASH_DIAL, "and the compass its face");
+        // The scale is the remainder: the window less the two reading
+        // channels, the rule between them, the helm's own padding, the
+        // compass, the verb and a gap either side of the scale.
+        let expected = 1920.0
+            - DASH_UNIT_W
+            - DASH_ID_W
+            - 2.0
+            - 2.0 * DASH_RAIL_PAD
+            - DASH_DIAL
+            - DASH_ORDER_W
+            - 2.0 * DASH_RAIL_GAP;
+        assert!(
+            (wide.scale - expected).abs() < 0.01,
+            "the scale is the remainder: {} against {}",
+            wide.scale,
+            expected
+        );
+        // A wider window gives the scale more, and takes nothing from the
+        // channels that carry readings.
+        let wider = rail_widths(2560.0);
+        assert!(wider.scale > wide.scale, "the scale grows with the window");
+        assert_eq!(wider.unit, wide.unit, "and the picture does not shrink");
+        // A narrow window does not squeeze the control: it shrinks the
+        // picture, the column of facts and the verb instead.
+        let narrow = rail_widths(760.0);
+        assert!(narrow.scale > 0.0, "the scale is still a control");
+        assert!(narrow.unit < wide.unit, "the picture gives way first");
+        assert!(narrow.dial < wide.dial, "and the compass after it");
+    }
+
+    /// The rail FITS the window, at every width, and the verb is never the
+    /// thing that is cut.
+    ///
+    /// The arithmetic used to floor the scale and let the rest overflow, and
+    /// the overflow went RIGHT — to the verb, which is the console's primary
+    /// action. At 640 points `SET HELM` was a sliver at the window's edge and
+    /// the server's answer was cut mid-figure. A rail that overflows loses
+    /// its end, and the end is the verb.
+    #[test]
+    fn the_rail_fits_the_window_and_keeps_its_verb() {
+        // The chrome the rail spends whatever the window is: the rule
+        // between the channels, the helm channel's padding, and the gap
+        // either side of the scale.
+        let chrome = 2.0 + 2.0 * DASH_RAIL_PAD + 2.0 * DASH_RAIL_GAP;
+        for w in [
+            500.0, 552.0, 640.0, 760.0, 900.0, 960.0, 1080.0, 1280.0, 1600.0, 1920.0, 2560.0,
+        ] {
+            let widths = rail_widths(w);
+            let total = widths.unit
+                + widths.identity
+                + widths.order
+                + widths.dial
+                + widths.scale
+                + chrome;
+            assert!(
+                (total - w).abs() < 0.01,
+                "the rail is the window: {total} against {w}"
+            );
+            assert!(
+                widths.order >= 72.0,
+                "the verb keeps its floor at {w}: {}",
+                widths.order
+            );
+            assert!(widths.scale >= 0.0, "the scale is never negative at {w}");
+            assert!(
+                widths.dial >= 64.0,
+                "the compass keeps a grabbable face at {w}: {}",
+                widths.dial
+            );
+        }
+    }
+
+    /// The scale's graduations and its numbers both come from the track's
+    /// length, and they must not disagree: a number that is not on its own
+    /// graduation is a scale that lies.
+    #[test]
+    fn the_scale_numbers_sit_on_their_graduations() {        for w in [140.0, 320.0, 480.0, 700.0, 1100.0] {
+            let grad = scale_graduations(w);
+            let numbers = scale_numbers(w);
+            assert!(
+                numbers >= grad,
+                "the numbers are never finer than the graduations: {w}"
+            );
+            assert_eq!(
+                (DASH_SPEED_MAX_KN / numbers).round(),
+                (DASH_SPEED_MAX_KN / numbers).round(),
+                "the numbers divide the ceiling"
+            );
+            assert_eq!(
+                DASH_SPEED_MAX_KN % numbers,
+                0.0,
+                "the last number is the ceiling: {w}"
+            );
+        }
+    }
+
+    /// The instruments settle on a new draft rather than teleporting to it,
+    /// and the bearing settles the SHORT way round the compass.
+    #[test]
+    fn the_helm_instruments_settle_on_the_draft() {
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            SessionView::default(),
+            std::sync::mpsc::channel().0,
+        );
+        // The settle: nothing has moved at the first frame, and everything
+        // has moved at the last.
+        assert_eq!(helm_ease(0.0), 0.0, "the settle starts where it was");
+        assert_eq!(helm_ease(HELM_EASE_S), 1.0, "and ends on the draft");
+        assert!(
+            helm_ease(HELM_EASE_S / 2.0) > 0.5,
+            "and it is most of the way there early: an ease-out, not a ramp"
+        );
+        // The short way round: 350° to 10° is twenty degrees forward.
+        assert_eq!(helm_turn(350.0, 10.0), 20.0, "north is crossed forwards");
+        assert_eq!(helm_turn(10.0, 350.0), -20.0, "and backwards is backwards");
+        assert_eq!(helm_turn(0.0, 90.0), 90.0, "a quarter turn is a quarter");
+        // The instruments start where they are, and end on the draft.
+        demo.helm_heading = Some(10.0);
+        demo.helm_speed = Some(4.0);
+        demo.helm_ease_to();
+        let (heading, speed) = demo.helm_display();
+        assert_eq!(heading, 10.0, "the instruments start where they are");
+        assert_eq!(speed, 4.0, "and the fill starts where it is");
+        // A settled instrument IS the draft, with no animation running.
+        demo.helm_anim = None;
+        let (heading, speed) = demo.helm_display();
+        assert_eq!(heading, 10.0, "a settled instrument is the draft");
+        assert_eq!(speed, 4.0, "and so is the fill");
+        // A pointer drag drops the settle: the instrument IS the hand.
+        demo.helm_heading = Some(10.0);
+        let bounds = Bounds::new(point(px(100.0), px(100.0)), size(px(84.0), px(84.0)));
+        demo.dial_pointer(bounds, point(px(184.0), px(142.0)));
+        assert!(demo.helm_anim.is_none(), "a drag does not lag the hand");
+        assert_eq!(demo.helm_heading, Some(90.0), "and the compass reads east");
+    }
+
+    #[test]
+    fn the_dial_reads_the_pointer_as_a_compass_bearing() {
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            SessionView::default(),
+            std::sync::mpsc::channel().0,
+        );
+        let bounds = Bounds::new(point(px(100.0), px(100.0)), size(px(84.0), px(84.0)));
+        let (cx, cy) = (px(142.0), px(142.0));
+        demo.dial_pointer(bounds, point(cx, px(112.0)));
+        assert_eq!(demo.helm_heading, Some(0.0), "north is 0°");
+        demo.dial_pointer(bounds, point(px(172.0), cy));
+        assert_eq!(demo.helm_heading, Some(90.0), "east is 90°");
+        demo.dial_pointer(bounds, point(cx, px(172.0)));
+        assert_eq!(demo.helm_heading, Some(180.0), "south is 180°");
+        demo.dial_pointer(bounds, point(px(112.0), cy));
+        assert_eq!(demo.helm_heading, Some(270.0), "west is 270°");
+    }
+
+    /// The slider reads the pointer's fraction along the track, clamped to the
+    /// ceiling at both ends.
+    #[test]
+    fn the_slider_sets_the_speed_from_the_pointer() {
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            SessionView::default(),
+            std::sync::mpsc::channel().0,
+        );
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(200.0), px(20.0)));
+        demo.slider_pointer(bounds, point(px(100.0), px(10.0)));
+        assert_eq!(
+            demo.helm_speed,
+            Some(DASH_SPEED_MAX_KN / 2.0),
+            "halfway is half the ceiling"
+        );
+        demo.slider_pointer(bounds, point(px(-50.0), px(10.0)));
+        assert_eq!(demo.helm_speed, Some(0.0), "short of the track is hold");
+        demo.slider_pointer(bounds, point(px(400.0), px(10.0)));
+        assert_eq!(
+            demo.helm_speed,
+            Some(DASH_SPEED_MAX_KN),
+            "past the end is the ceiling"
+        );
+    }
+
+    /// The dashboard's embark half asks for the composition in both
+    /// directions: the commander's own unit, and every other piece that might
+    /// carry it. Once per session — the `asked` list is what stops the frame
+    /// from re-asking until the answers land.
+    #[gpui::test]
+    fn the_commander_embark_ask_covers_both_directions(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut session = SessionView::default();
+        session.game_id = 7;
+        session.me = 2;
+        session.mine = vec![MyShip {
+            id: "3".to_string(),
+            label: "KRI Alpha".to_string(),
+        }];
+        session.pieces = vec![
+            PieceView {
+                id: 3,
+                ..PieceView::default()
+            },
+            PieceView {
+                id: 4,
+                ..PieceView::default()
+            },
+            PieceView {
+                id: 5,
+                ..PieceView::default()
+            },
+        ];
+        let (view, cx) =
+            cx.add_window_view(|_, _| IslandDemo::new(fixture_roster(), 8, 0, session, tx));
+        cx.update(|_window, app| view.update(app, |demo, _| demo.ensure_commander_embark()));
+        let mut hosts = Vec::new();
+        while let Ok(ToBinary::ReadEmbarked { host }) = rx.try_recv() {
+            hosts.push(host);
+        }
+        hosts.sort_unstable();
+        assert_eq!(
+            hosts,
+            vec![3, 4, 5],
+            "the commander's unit and every other piece"
+        );
+        // A second call while the first is in flight asks nothing: the
+        // `asked` list, not the cache, is the gate.
+        cx.update(|_window, app| view.update(app, |demo, _| demo.ensure_commander_embark()));
+        assert!(rx.try_recv().is_err(), "nothing new reached the sink");
     }
 }

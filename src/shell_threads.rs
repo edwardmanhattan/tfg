@@ -246,7 +246,10 @@ pub fn spawn_map_thread(config: MapConfig) -> (Sender<MapReq>, Receiver<MapResp>
             let pump_ms = t0.elapsed().as_millis();
             let rgba = scene.frame_rgba();
             let render_ms = t0.elapsed().as_millis().saturating_sub(pump_ms);
-            eprintln!("map frame {seq}: {}ms (pump {pump}: {pump_ms} + {render_ms} render)", pump_ms + render_ms);
+            eprintln!(
+                "map frame {seq}: {}ms (pump {pump}: {pump_ms} + {render_ms} render) at {:.4},{:.4} z{zoom:.3} {}x{}",
+                pump_ms + render_ms, at.0, at.1, size.0, size.1
+            );
             if resp_tx.send((seq, at, zoom, size, rgba)).is_err() {
                 break; // UI gone
             }

@@ -10,6 +10,9 @@
 //!   in them. This is the seam the shell migration turns on: egui and GPUI
 //!   both read it, and the chrome geometry is testable with no display.
 //! - [`gamestate`]: the exercise lifecycle as one axis. Leaf: no tfg types.
+//! - [`gamefeed`]: the authoritative movement of a Minos exercise — the
+//!   plot read, the order publications, and the game fixes they become.
+//!   Leaf: no GPUI, no shell.
 //! - [`force`]: the operator's force before Minos hears of it, and the diff a stage advance writes.
 //! - [`dnd`]: entity-to-entity drag and drop — what a drop on a hull, a person
 //!   or a group means. Leaf: no GPUI, no draft, no network.
@@ -48,6 +51,7 @@ pub mod dnd;
 pub mod fleet;
 pub mod force;
 pub mod gamestate;
+pub mod gamefeed;
 pub mod gpuprobe;
 pub mod groups;
 pub mod halo;

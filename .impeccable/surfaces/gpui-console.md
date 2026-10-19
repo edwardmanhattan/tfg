@@ -321,7 +321,8 @@ Each slice is verifiable on its own and shrinks the risk of the next, the way
    is invisible and its gesture is undiscoverable.** Same class of defect the
    console's own status doc keeps recording. Fixing that positioning idiom
    fixes the grip and this chrome at once.
-6. **Instrument row.** Four panels across the bottom.
+6. **Instrument row.** Four panels across the bottom. **SUPERSEDED 2026-10-19
+   by the commander's rail** — see "The commander's rail" below.
 
 ### What slice 1 did not prove
 
@@ -496,6 +497,64 @@ is nothing in the egui version to copy it from, and it still needs the "which
 four, holding what" decision before any code. It is also the one slice that
 touches the map's lower band, where `map_chrome` is still gated — so it inherits
 that defect unless the strip problem is solved first.
+
+## The commander's rail
+
+Slice 6 above planned FOUR panels across the bottom: the readiness gate, the
+fleet register, the live log, and the selected unit's inspector. The
+execution phase is not that room. It is a commander's room, and the console
+knows one thing about it: the seat holds a hull. So the bottom band is one
+instrument for that seat, and it carries what that seat's job needs —
+which hull, where it sits, and the helm that moves it.
+
+**What the four panels were for, and what replaced each.** The readiness gate
+and the fleet register are the ORGANISER's and the PLANNER's readings, and
+the execution phase's own widgets already carry them: the top band states
+the phase and the room's readiness, the right column states the crew, the
+scenario and the comms. The live log is the console's own record, and it is
+a panel of its own rather than a channel of a rail. The selected unit's
+inspector is the one that survived, and it became the rail's first channel.
+**So the four panels are not retired: three of them were never the
+execution phase's bottom band, and the fourth is the rail.**
+
+**The rail is a RAIL.** Opaque, square, flush with the window's edges, one
+1px `CUT_GREY` rule along the top. The first version of this was a rounded,
+translucent panel floating eight points off the bottom, and the tile map's
+own labels came through the type that sat on them. A console read across an
+exercise room, under glare, cannot put its readings on top of a map and
+call it legible — and the world this brief already committed to says it
+plainly: *"Panels are square, flat, and separated by one 1px CUT_GREY edge
+— no chamfer, no cast shadow, no bevel, no rim, no gradient."* The rail is
+that rule applied to the bottom of the window.
+
+**Three channels, and the slack goes to the control.** The picture and the
+name; the identity rows (hull number, group, embark) as a right-aligned
+column; and the helm. A course is a circle, so it is a compass; a speed is a
+range, so it is a graduated scale. The scale is the one element that gets
+BETTER with length, so it takes the window's slack, and the compass and the
+scale are the last things to shrink on a narrow window.
+
+**The instruments settle.** A needle that teleports reads as a glitch, so
+the compass eases onto a new draft and the scale's fill eases with it — the
+short way round the compass, and never during a pointer drag, because while
+the operator is holding the control the instrument IS the hand.
+
+Verified by capture against the operator's own deployment at 1920 × 1150 and
+760 × 620, with the drags driven: the compass's needle and its readout agree
+(they did not before — the canvas was measured at zero height, so the face
+collapsed to a smudge and pointed at a bearing the readout denied), and the
+scale's fill, thumb, graduations and figure all follow the pointer. The write
+itself was verified against the local stack, where `SET HELM` drew a real
+refusal from the server and the rail showed it. The build log is
+`docs/ui-overhaul-status.md`, "The commander's rail, and the compass that
+pointed the wrong way".
+
+**Open, and not this slice's work:** a seat that is not an administrator
+cannot sign in — the sign-in reads the whole unit register, which the server
+answers 403, and reports the refusal as a wrong password. The commander
+seat this rail is built for is the seat that cannot get in. The answer is a
+product decision about what a non-administrator's sign-in shows, so it is
+recorded rather than changed.
 
 ## Unresolved
 
