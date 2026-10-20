@@ -2449,6 +2449,10 @@ fn main() {
     // The messages that arrived, drained like every other feed.
     let live_message_feed: tfg::shell_gpui::LiveMessageFeed =
         std::boxed::Box::new(move || live_msg_rx.try_recv().ok());
+    // The HELD game, read live: the personal channel carries traffic for
+    // every exercise this account is in, and only the held exercise's
+    // traffic belongs in the held exercise's inbox.
+    let hold_for_wire = hold.clone();
 
     tfg::shell_gpui::run(
         Box::new(move || {
@@ -2539,6 +2543,21 @@ fn main() {
                         // A MESSAGE ARRIVED. It is handed to the shell,
                         // which merges it into the inbox by id and says
                         // so in the type's own ink and tone.
+                        // The PERSONAL channel is the ACCOUNT's, so it
+                        // carries traffic for every exercise this account
+                        // is in. Only the held exercise's traffic belongs in
+                        // the held exercise's inbox.
+                        let held_game = hold_for_wire
+                            .lock()
+                            .map(|h| h.game_id)
+                            .unwrap_or_default();
+                        if m.game_id != held_game {
+                            eprintln!(
+                                "wire: message for game {} — not the held game ({held_game})",
+                                m.game_id
+                            );
+                            continue;
+                        }
                         eprintln!("wire: message ({}) {}", m.kind, m.content);
                         let to_me = m.recipients.contains(&session.me);
                         let read_at = None;
