@@ -155,6 +155,19 @@ stays real; only the hold is staged. Without it an authenticated startup
 holds first-player-game as before — the seed photographs the choice, not
 the default.
 
+**And two seeds that name the comms surface's STRIP, not a surface.**
+`TFG_COMMS_TAB` takes `all`, `telegram` or `admin` and `TFG_COMMS_SCOPE`
+takes `all`, `tome` or `broadcast` — the console's own words for the kind
+strip and the scope row. They are read at boot beside `TFG_COMMS=1`, and a
+value the build does not know is NO seed: the strip keeps the whole
+traffic. The precedent is `TFG_ASSESS_TAB`, which names the assessment
+strip's tab the same way.
+
+The comms surface is a FLOATING island now — opaque, square, on the
+map's right edge, below the execution rail — not a centred dimmed modal.
+`TFG_COMMS=1` still opens it, and it now stands beside the map instead of
+over it, so a capture of it photographs the map around it too.
+
 **`TFG_SCROLL` and a wheel delta move the column in OPPOSITE directions for the
 same number.** Islands are placed at `origin.1 - zone_scroll` (render, ~5749),
 so a larger offset moves them **up** and reveals the stack's bottom. The wheel
