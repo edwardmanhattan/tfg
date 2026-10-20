@@ -382,7 +382,7 @@ fn main() {
                             f64::from(order.speed_kn),
                             None,
                         ) {
-                            Ok(fix) => {
+                            Ok(tfg::backend::OrderOutcome::Applied(fix)) => {
                                 // The order's ANSWER is a position: the hull
                                 // is here, on a new leg, at the scenario's
                                 // instant. It is ingested on the game path, so
@@ -405,6 +405,23 @@ fn main() {
                                         fix.heading,
                                         fix.speed,
                                         if fix.clamped { " (clamped)" } else { "" }
+                                    ),
+                                }
+                            }
+                            // A HELD ORDER HAS NO FIX, so there is nothing to
+                            // ingest and nothing to draw: the hull has not
+                            // moved. The panel says so, and says what will
+                            // release it.
+                            Ok(tfg::backend::OrderOutcome::Staged(held)) => {
+                                tfg::shell_gpui::HelmStatus {
+                                    unit_id: order.unit_id.clone(),
+                                    ok: true,
+                                    text: format!(
+                                        "staged {:.0}\u{00b0} / {:.1} kn{} \u{2014} {}",
+                                        held.heading_deg,
+                                        held.speed_kn,
+                                        if held.clamped { " (clamped)" } else { "" },
+                                        held.released_by
                                     ),
                                 }
                             }
@@ -1018,26 +1035,29 @@ fn main() {
                         roster,
                         live_seats,
                         groups,
+                        window,
                     } => {
                         // LEAVE PLANNING. The drafts cross whole because the
                         // token lives HERE and the drafts live THERE: the
                         // shell cannot compute the writes and this side cannot
-                        // see the drafts. The force is PLANNED first, and a
-                        // `ForceGap` refuses the move WHOLE — nothing is
-                        // posted, because issuing the rest would half-commit
-                        // the very draft the advance exists to record.
+                        // see the drafts.
                         //
-                        // The FLUSH order is the order the server accepts,
-                        // and seats come before hulls: a commander write names
-                        // a participant, and the picker's whole flow is
-                        // local-first — a player staged a minute ago commands
-                        // a hull staged a minute ago, and neither exists on
-                        // the server until this moment. Unseats land AFTER the
-                        // force, so nobody is briefly seatless while their
-                        // hull is still being handed over. The first refusal
-                        // stops the rest, and only a clean flush transitions
-                        // the game to preparation. The answer is the re-read
-                        // session.
+                        // `tfg::advance::plan` lays the steps out in the order
+                        // the server takes them and refuses the WHOLE move on
+                        // any rule it breaks — the force's, the room's and
+                        // the roster's. Nothing is posted, because issuing
+                        // the rest would half-commit the very draft the
+                        // advance exists to record.
+                        //
+                        // THE ORDER IS THE PLAN'S, not this arm's: the
+                        // window (the exercise's own terms, and the one write
+                        // that needs the administrator's ticket) first, then
+                        // the seats a commander write names, then the force,
+                        // then the role changes — a role change onto the
+                        // judge side RELEASES the hulls that seat commands,
+                        // so it lands after the force has given those
+                        // commands away — then the unseats, the task
+                        // organisation, and the transition last.
                         let outcome = if token2.is_empty() {
                             Err("signed out \u{2014} sign in to move the plan to preparation"
                                 .to_string())
@@ -1045,98 +1065,18 @@ fn main() {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
-                            match tfg::force::plan(&force, &live_hulls) {
-                                Err(gap) => Err(gap.to_string()),
-                                Ok(force_writes) => {
-                                    let roster_writes = tfg::roster::plan(&roster, &live_seats);
-                                    let (seat_writes, unseat_writes): (
-                                        Vec<_>,
-                                        Vec<_>,
-                                    ) = roster_writes
-                                        .iter()
-                                        .cloned()
-                                        .partition(|w| {
-                                            !matches!(
-                                                w,
-                                                tfg::roster::RosterWrite::Unseat { .. }
-                                            )
-                                        });
-                                    // The shell now carries the real draft and
-                                    // computes the writes; the server's live
-                                    // frame travels inside the draft's seed,
-                                    // so the plan diffs against what Minos
-                                    // holds.
-                                    let groups_writes = groups;
-                                    let flush = flush_roster(
-                                        &master,
-                                        &token2,
-                                        game_id,
-                                        &seat_writes,
-                                    )
-                                    .and_then(|()| {
-                                        flush_force(
-                                            &master,
-                                            &token2,
-                                            game_id,
-                                            &force_writes,
-                                        )
-                                    })
-                                    .and_then(|()| {
-                                        flush_roster(
-                                            &master,
-                                            &token2,
-                                            game_id,
-                                            &unseat_writes,
-                                        )
-                                    })
-                                    .and_then(|()| {
-                                        flush_groups(
-                                            &master,
-                                            &token2,
-                                            game_id,
-                                            &groups_writes,
-                                        )
-                                    });
-                                    match flush {
-                                        Err(why) => Err(why),
-                                        Ok(()) => {
-                                            match master.transition_game(
-                                                &token2,
-                                                game_id,
-                                                "preparation",
-                                            ) {
-                                                Ok(g) => {
-                                                    eprintln!(
-                                                        "{} moved to preparation \
-                                                         ({} force, {} roster, {} group write(s))",
-                                                        g.name,
-                                                        force_writes.len(),
-                                                        roster_writes.len(),
-                                                        groups_writes.len()
-                                                    );
-                                                    match fetch_session(
-                                                        &host2,
-                                                        &token2,
-                                                        Some(game_id),
-                                                    ) {
-                                                        Some(s) => {
-                                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
-                                                        }
-                                                        None => Err(
-                                                            "moved to preparation, but the session \
-                                                             could not be read"
-                                                                .to_string(),
-                                                        ),
-                                                    }
-                                                }
-                                                Err(e) => Err(format!(
-                                                    "move to preparation refused: {e}"
-                                                )),
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            advance_to_preparation(
+                                &master,
+                                &host2,
+                                &token2,
+                                game_id,
+                                force,
+                                live_hulls,
+                                roster,
+                                live_seats,
+                                groups,
+                                window,
+                            )
                         };
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -1603,6 +1543,7 @@ fn main() {
                                         Some(s) => Ok(tfg::shell_gpui::CreatedSession {
                                             session: s,
                                             note: note.unwrap_or_default(),
+                                            refusal: None,
                                         }),
                                         None => Err(
                                             "the step moved, but the session could not be read"
@@ -2884,6 +2825,319 @@ fn fetch_session(
     })
 }
 
+/// LEAVE PLANNING: write the whole staged draft through, then move the
+/// exercise to preparation.
+///
+/// The plan is `tfg::advance::plan`'s, and this function only executes it:
+/// the order, the rules and the reasons all live there, where they can be
+/// read and tested without a session. What lives HERE is the three things
+/// only this side can do — ask the server whether this seat may drive the
+/// exercise at all, read the server's own frame so the diff is against the
+/// truth, and name the server's refusals in the console's words.
+///
+/// THE THREE READS, AND WHY THE FIRST ONE COMES FIRST.
+///
+/// - THE AUTHORITY. `GET /game-roles/{id}/permissions` is the only read
+///   that carries a role's grants, and it is gated on the ADMINISTRATOR's
+///   grant — so an administrator learns the answer and a Game Master
+///   participant cannot. The console does not guess on the participant's
+///   behalf: an answer it cannot have is an answer it does not have, and
+///   the server's own refusal is the one that counts.
+/// - THE LIVE FRAME. The server holds whatever the last attempt managed to
+///   write, and a diff against the truth is what makes a retry emit NOTHING
+///   for it instead of re-issuing a write the server answers 409.
+/// - THE TERMS. The planned window is written against the window the server
+///   holds, so only the clock keys that changed go on the wire.
+fn advance_to_preparation(
+    master: &tfg::backend::MinosMaster,
+    host: &str,
+    token: &str,
+    game_id: i64,
+    force: tfg::force::ForceDraft,
+    live_hulls: Vec<tfg::force::LiveHull>,
+    roster: tfg::roster::RosterDraft,
+    live_seats: Vec<tfg::roster::LiveSeat>,
+    groups: Vec<tfg::groups::GroupWrite>,
+    window: tfg::window::WindowDraft,
+) -> Result<tfg::shell_gpui::CreatedSession, String> {
+    // THE AUTHORITY, before anything is written. `Some(false)` is a seat
+    // that KNOWS it may not drive the exercise; `None` is a seat that cannot
+    // find out, and the server decides for it.
+    match may_run_the_exercise(master, host, token, game_id) {
+        Some(false) => {
+            return Err(
+                "this seat does not run the exercise \u{2014} the Game Master drives it, \
+                 so nothing was written"
+                    .to_string(),
+            )
+        }
+        None => eprintln!(
+            "advance: this seat's grants are not knowable to the console \
+             (the permission matrix is the administrator's read), so the server decides"
+        ),
+        Some(true) => {}
+    }
+
+    // THE SERVER'S FRAME, re-read. The mirror that crossed with the drafts
+    // is the console's last word about the server; after a failed attempt
+    // it is a stale one, and a diff against a stale frame re-issues the
+    // writes the server already took.
+    let live_seats = read_live_seats(master, token, game_id, live_seats);
+    let live_hulls = read_live_hulls(master, token, game_id, live_hulls);
+
+    // THE TERMS. The window is written only against the window the server
+    // holds: a window the console could not compare would be a stale copy
+    // of somebody else's plan, and the terms are not the console's to
+    // overwrite.
+    let window_write = match master.game_detail(token, game_id) {
+        Ok(detail) => tfg::advance::window_update(&window, &detail.window),
+        Err(e) => {
+            eprintln!("advance: the exercise's terms could not be read ({e}); the window is left alone");
+            Ok(None)
+        }
+    };
+    let window_write = match window_write {
+        Ok(write) => write,
+        Err(why) => return Err(why),
+    };
+
+    // THE PLAN. Every rule is checked here, before the first write.
+    let steps = match tfg::advance::plan(
+        &force,
+        &live_hulls,
+        &roster,
+        &live_seats,
+        &groups,
+        window_write,
+    ) {
+        Ok(steps) => steps,
+        Err(refusal) => return Err(refusal.to_string()),
+    };
+
+    // THE WRITES, in the plan's order. The first refusal stops the rest.
+    for step in &steps {
+        let outcome: Result<(), String> = match step {
+            // THE TERMS. The window is the exercise's own terms, and the
+            // ticket for them is the ADMINISTRATOR's — a different grant
+            // from the one that moves the exercise, which is the Game
+            // Master's. So a refusal here stops the advance BEFORE
+            // anything is written: the seats, the force and the groups are
+            // untouched, the game is still in `planning` (so the terms can
+            // still be written by somebody who holds the ticket), and the
+            // operator's staged work is theirs.
+            tfg::advance::Step::Window(update) => master
+                .update_game(token, game_id, update)
+                .map(|_| ())
+                .map_err(|e| window_refusal(&e)),
+            tfg::advance::Step::Seat(write)
+            | tfg::advance::Step::Role(write)
+            | tfg::advance::Step::Unseat(write) => {
+                flush_roster(master, token, game_id, std::slice::from_ref(write))
+            }
+            tfg::advance::Step::Force(write) => {
+                flush_force(master, token, game_id, std::slice::from_ref(write))
+            }
+            tfg::advance::Step::Group(write) => {
+                flush_groups(master, token, game_id, std::slice::from_ref(write))
+            }
+            tfg::advance::Step::Transition => master
+                .transition_game(token, game_id, "preparation")
+                .map(|_| ())
+                .map_err(|e| transition_refusal(&e)),
+        };
+        if let Err(why) = outcome {
+            // THE SERVER TOOK PART OF THE DRAFT. The exercise is re-read so
+            // the operator sees the truth, and the answer carries it: the
+            // next attempt diffs against what the server holds, not against
+            // what it held before. The operator's staged work is theirs and
+            // is not touched here.
+            return match fetch_session(host, token, Some(game_id)) {
+                Some(session) => Ok(tfg::shell_gpui::CreatedSession {
+                    session,
+                    note: why.clone(),
+                    refusal: Some(why),
+                }),
+                None => Err(why),
+            };
+        }
+    }
+    eprintln!(
+        "advance: {} write(s) and the exercise moved to preparation",
+        steps.len()
+    );
+    match fetch_session(host, token, Some(game_id)) {
+        Some(session) => Ok(tfg::shell_gpui::CreatedSession::held(session)),
+        None => Err("moved to preparation, but the session could not be read".to_string()),
+    }
+}
+
+/// Whether this seat may move the exercise on, as far as the console can
+/// know.
+///
+/// THE ONLY READ THAT CARRIES A ROLE'S GRANTS IS THE ADMINISTRATOR'S.
+/// `GET /game-roles/{id}/permissions` answers with a role's whole matrix,
+/// and it is gated on the application-level role-vocabulary read — so an
+/// administrator learns the answer and a Game Master participant cannot.
+/// `None` means "not knowable", and the console says so rather than
+/// guessing: a participant's refusal is the server's to make, and the
+/// console's job is to name it when it comes.
+///
+/// The grant itself is `/games/transitions` with the action `transition` —
+/// "Drive the exercise" in the vocabulary the server publishes.
+fn may_run_the_exercise(
+    master: &tfg::backend::MinosMaster,
+    host: &str,
+    token: &str,
+    game_id: i64,
+) -> Option<bool> {
+    let (me, _name) = master.me(token).ok()?;
+    let parts = master.game_participants(token, game_id).ok()?;
+    let role_id = parts.iter().find(|p| p.user_id == me)?.role_id;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let response = client
+        .get(&format!("{host}/game-roles/{role_id}/permissions"))
+        .bearer_auth(token)
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = response.json().ok()?;
+    let permissions = body["data"]["permissions"].as_array()?;
+    Some(permissions.iter().any(|p| {
+        p["object"].as_str() == Some("/games/transitions")
+            && p["action"].as_str() == Some("transition")
+    }))
+}
+
+/// The seats as the server holds them NOW, or the ones that crossed if the
+/// read failed.
+///
+/// The read is what makes a retry honest: the server answers 409 to a
+/// second `POST /games/{id}/participants`, so a diff against a stale frame
+/// would die on the first seat the last attempt had already taken.
+fn read_live_seats(
+    master: &tfg::backend::MinosMaster,
+    token: &str,
+    game_id: i64,
+    carried: Vec<tfg::roster::LiveSeat>,
+) -> Vec<tfg::roster::LiveSeat> {
+    match master.game_participants(token, game_id) {
+        Ok(parts) => live_seats_from(&parts),
+        Err(_) => carried,
+    }
+}
+
+/// The roster's mirror, from the server's own participants answer.
+///
+/// A free function so the rule can be tested without a session: what the
+/// re-read believes about the room is the whole of the retry's honesty, and
+/// a claim about the retry deserves a test that does not need a server.
+fn live_seats_from(parts: &[tfg::backend::Participant]) -> Vec<tfg::roster::LiveSeat> {
+    parts
+        .iter()
+        .map(|p| tfg::roster::LiveSeat {
+            user_id: p.user_id,
+            user_name: p.user_name.clone(),
+            role_id: p.role_id,
+            judge: p.judge,
+        })
+        .collect()
+}
+
+/// The hulls as the server holds them NOW, or the ones that crossed if the
+/// read failed.
+///
+/// The fresh read says WHICH HULLS EXIST and WHO COMMANDS THEM; the
+/// placements read says where they sit. Neither says what a hull is aboard:
+/// no single read carries the embarkation links, so those ride in from the
+/// mirror that crossed — the console's own last word about them.
+fn read_live_hulls(
+    master: &tfg::backend::MinosMaster,
+    token: &str,
+    game_id: i64,
+    carried: Vec<tfg::force::LiveHull>,
+) -> Vec<tfg::force::LiveHull> {
+    let Ok(units) = master.game_units_list(token, game_id) else {
+        return carried;
+    };
+    let placements: Vec<(i64, f64, f64)> = master
+        .placements_list(token, game_id)
+        .map(|p| {
+            p.placements
+                .iter()
+                .map(|g| (g.unit_id, g.latitude, g.longitude))
+                .collect()
+        })
+        .unwrap_or_default();
+    live_hulls_from(&units, &placements, &carried)
+}
+
+/// The force's mirror, from the server's own units and placements.
+///
+/// The commander and the hull's own existence come from the server, because
+/// those are the two facts a re-issued write would be refused for: a second
+/// `POST /games/{id}/units` answers 409, and a second assignment for a
+/// commander the server already has answers "One person commands one thing".
+fn live_hulls_from(
+    units: &[tfg::backend::GameUnit],
+    placements: &[(i64, f64, f64)],
+    carried: &[tfg::force::LiveHull],
+) -> Vec<tfg::force::LiveHull> {
+    units
+        .iter()
+        .map(|u| {
+            let carried_hull = carried.iter().find(|c| c.unit_id == u.unit_id);
+            let start = placements
+                .iter()
+                .find(|(id, _, _)| *id == u.unit_id)
+                .map(|(_, lat, lon)| tfg::force::Start { lat: *lat, lon: *lon });
+            tfg::force::LiveHull {
+                unit_id: u.unit_id,
+                name: u.unit_name.clone(),
+                commander_id: u.commander_id,
+                start: start.or_else(|| carried_hull.and_then(|c| c.start)),
+                host: carried_hull.and_then(|c| c.host),
+            }
+        })
+        .collect()
+}
+
+/// The console's sentence for a refusal of the exercise's own terms.
+///
+/// The server says "Forbidden" and leaves the reason to the reader, and
+/// "forbidden: Forbidden" is not an answer an operator can act on. The
+/// window is the ADMINISTRATOR's ticket — `PATCH /games/{id}` is
+/// `administer(ActionUpdate)` — so the console names that.
+fn window_refusal(e: &tfg::backend::BackendError) -> String {
+    match e {
+        tfg::backend::BackendError::Forbidden { message, .. } => format!(
+            "the planned window is the administrator's to write, and this seat does not \
+             hold that ticket (the server said: {message}) \u{2014} the exercise's terms \
+             were not written"
+        ),
+        other => format!("the planned window was refused: {other}"),
+    }
+}
+
+/// The console's sentence for a refusal of the move itself.
+///
+/// The transition is the Game Master's — `POST /games/{id}/transitions` asks
+/// whether the caller's ROLE may drive the exercise — so the console names
+/// that rather than the server's status word.
+fn transition_refusal(e: &tfg::backend::BackendError) -> String {
+    match e {
+        tfg::backend::BackendError::Forbidden { message, .. } => format!(
+            "this seat does not run the exercise \u{2014} the Game Master drives it \
+             (the server said: {message})"
+        ),
+        other => format!("move to preparation refused: {other}"),
+    }
+}
+
 /// Write a force plan through, one write per endpoint, in `force::plan`'s
 /// order.
 ///
@@ -3043,6 +3297,93 @@ fn flush_groups(
 /// How many extra frames to ask for after the first, so MapLibre's tiles have
 /// time to arrive before a capture. A stand-in for the camera.
 const WARMUP_FRAMES: u64 = 24;
+
+#[cfg(test)]
+mod advance_tests {
+    use super::*;
+
+    fn participant(user_id: i64, name: &str, role_id: i64) -> tfg::backend::Participant {
+        tfg::backend::Participant {
+            user_id,
+            user_name: name.into(),
+            role_id,
+            role_name: format!("role-{role_id}"),
+            judge: false,
+            ready: false,
+            joined_at: None,
+            call_sign: name.to_uppercase(),
+        }
+    }
+
+    fn unit(unit_id: i64, name: &str, commander: Option<i64>) -> tfg::backend::GameUnit {
+        tfg::backend::GameUnit {
+            unit_id,
+            unit_name: name.into(),
+            hull_number: format!("h{unit_id}"),
+            commander_id: commander,
+            commander_name: String::new(),
+            hierarchy_node: None,
+        }
+    }
+
+    /// A FAILED ADVANCE LEAVES THE SERVER HOLDING PART OF THE DRAFT, and a
+    /// retry that diffs against a stale frame re-issues the write the
+    /// server already took — `POST /games/{id}/participants` answers 409 to
+    /// a second seat, so the advance would die on the first seat it had
+    /// already taken. The re-read is what makes the retry honest, and this
+    /// is the claim it makes: against the server's own frame, the retry
+    /// writes NOTHING for what the server already holds.
+    #[test]
+    fn a_re_read_after_a_failed_advance_plans_nothing_for_what_the_server_took() {
+        let mut draft = tfg::roster::RosterDraft::new();
+        draft.stage(tfg::roster::StagedSeat {
+            user_id: 6,
+            user_name: "Budi".into(),
+            role_id: 1,
+            role_name: "role-1".into(),
+            call_sign: "BUDI".into(),
+            judge: false,
+        });
+        // The server took the seat before it refused the rest.
+        let taken = vec![participant(6, "Budi", 1)];
+        let live = live_seats_from(&taken);
+        assert_eq!(
+            tfg::roster::plan(&draft, &live),
+            Vec::new(),
+            "the retry writes nothing for the seat the server already took"
+        );
+    }
+
+    /// The same claim about the force: the hull the server already holds,
+    /// with the commander it already has, is not assigned again — a second
+    /// `POST /games/{id}/units` answers 409, and a second hull for the same
+    /// commander answers "One person commands one thing".
+    #[test]
+    fn a_re_read_after_a_failed_advance_plans_nothing_for_the_hull_it_took() {
+        let mut draft = tfg::force::ForceDraft::new();
+        let mut hull = tfg::force::DraftHull::new(7, "KRI Nanggala".into(), "h7".into(), "c".into());
+        hull.commander_id = Some(3);
+        draft.upsert(hull);
+        let taken = vec![unit(7, "KRI Nanggala", Some(3))];
+        let live = live_hulls_from(&taken, &[], &[]);
+        assert_eq!(
+            tfg::force::plan(&draft, &live),
+            Ok(Vec::new()),
+            "the retry writes nothing for the hull the server already took"
+        );
+    }
+
+    /// The mirror the re-read builds carries the JUDGE side, because a
+    /// judge-side seat may not command and the advance has to see that
+    /// before it writes the force rather than after the server refuses it.
+    #[test]
+    fn the_re_read_carries_the_judge_side() {
+        let mut judge = participant(6, "Budi", 2);
+        judge.judge = true;
+        let live = live_seats_from(&[judge]);
+        assert!(live[0].judge, "the judge side is the mirror's to carry");
+    }
+}
 
 #[cfg(test)]
 mod picture_tests {

@@ -633,6 +633,28 @@ struct IslandDemo {
     /// create feed, like every other session-replacing write here.
     prepare_busy: bool,
     prepare_status: String,
+    /// The staged planned window: the exercise's own terms, drafted on
+    /// Control and written by the advance.
+    ///
+    /// `None` until it is asked for, and then seeded from the server's read
+    /// — the window the exercise already holds is what the operator edits,
+    /// so the editor shows the day and the two ends rather than five empty
+    /// fields. The same shape as Control's factor draft.
+    window_draft: Option<crate::window::WindowDraft>,
+    /// The game the staged window was seeded for. A hold of another
+    /// exercise re-seeds it, because the terms of one exercise are not the
+    /// terms of another and a stale window would be written to the wrong
+    /// game.
+    window_seeded_for: i64,
+    /// The editor's five fields: the real clock's day, its two ends, and the
+    /// exercise clock's two ends. Focus handles, minted on first use —
+    /// `Context::focus_handle` needs a context and `new` has none.
+    window_handles: [Option<gpui::FocusHandle>; 5],
+    /// Which window field has the keyboard.
+    window_focus: usize,
+    /// What the window's own rule says about the draft, and what the last
+    /// advance said about the window.
+    window_status: String,
     /// Click-to-place, the drag's fallback: the armed hull id. Set by the
     /// leaf row's place button; the next map click that is NOT a pan deploys
     /// it there. A drag never arms this (its release lands on the drop, not
@@ -770,6 +792,11 @@ const DASH_ORDER_W: f32 = 208.0;
 /// The helm channel's own padding, and the gap between its three cells.
 const DASH_RAIL_PAD: f32 = 16.0;
 const DASH_RAIL_GAP: f32 = 18.0;
+/// The height of a planned-window field. SHORTER than the credential fields
+/// (`view::AUTH_FIELD_H`): there are five of them in two rows on an island
+/// whose box is a measured thing, and a date and a military time are read
+/// at a glance rather than typed at length.
+const WINDOW_FIELD_H: f32 = 22.0;
 /// The rail's label size: a tracked-caps label one step above the panel's
 /// `LABEL_PT`. The rail is read from across the room and at a glance, and a
 /// label the same size as its value is a second value.
@@ -2285,6 +2312,11 @@ impl IslandDemo {
             deploy_busy: false,
             prepare_busy: false,
             prepare_status: String::new(),
+            window_draft: None,
+            window_seeded_for: 0,
+            window_handles: [None, None, None, None, None],
+            window_focus: 0,
+            window_status: String::new(),
             pending_place: None,
             place_down: None,
             // `TFG_RELATE` is seeded above, with the working set the open
@@ -3393,6 +3425,11 @@ impl IslandDemo {
                 .text_color(rgba(if window.1 { MAP_INK } else { ALERT_YELLOW }))
                 .child(window.0),
         );
+        // Where the window is CHANGED. This island shows the terms the
+        // exercise was given; Control is where they are drafted, because
+        // Control owns the exercise clock and the window is that clock's
+        // band.
+        col = col.child(small("drafted on Control".to_string()));
         col = col.child(separator());
         col = col.child(small("THE PLAN".to_string()));
         let mut said_any = false;
@@ -3601,6 +3638,73 @@ impl IslandDemo {
         );
         if !self.pause_status.is_empty() {
             col = col.child(small(self.pause_status.clone()));
+        }
+        // THE PLANNED WINDOW. The exercise's own terms: when the exercise
+        // runs, on the wall clock and on the exercise clock.
+        //
+        // IT LIVES HERE AND NOT IN ESSENTIALS. Control owns the exercise
+        // clock — the multiplier that runs it and the hold that stops it —
+        // and the window is that clock's band: when it runs and for how
+        // long. Essentials SHOWS the terms the exercise was given; this is
+        // where they are CHANGED, and a summary that became a form would
+        // stop being a summary.
+        //
+        // IT IS STAGED, NOT WRITTEN. Minos accepts a change to the terms
+        // only while the game is in `planning` — a game in preparation
+        // answers "A game's terms may only be changed while it is in
+        // `planning`" — so the terms ride with the drafts and go with the
+        // advance. A window written on its own would be a second way to
+        // reach the same record, and the two would disagree.
+        //
+        // AND IT IS THE ADMINISTRATOR'S TO WRITE. `PATCH /games/{id}` asks
+        // for the administrator's ticket, so the console says so here rather
+        // than letting the operator find it out from a refusal at the
+        // advance.
+        col = col.child(separator());
+        col = col.child(small("PLANNED WINDOW".to_string()));
+        let planning = crate::gamestate::GameState::from_wire(&self.session.state)
+            == crate::gamestate::GameState::Planning;
+        if !planning {
+            col = col.child(small(
+                "the terms may only be changed while the session is in planning".to_string(),
+            ));
+        } else {
+            let label = |t: &str| {
+                div()
+                    .w(px(96.0))
+                    .text_size(px(10.5))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(t.to_string())
+            };
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(label("REAL CLOCK"))
+                    .child(self.window_field(0, "2026-11-01", cx))
+                    .child(self.window_field(1, "0800", cx))
+                    .child(self.window_field(2, "1600", cx)),
+            );
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(label("EXERCISE CLOCK"))
+                    .child(self.window_field(3, "0800", cx))
+                    .child(self.window_field(4, "1600", cx)),
+            );
+            if !self.window_status.is_empty() {
+                col = col.child(small(self.window_status.clone()));
+            }
+            col = col.child(small(
+                "staged — written with the advance, and only a seat holding the \
+                 administrator's ticket can write it"
+                    .to_string(),
+            ));
         }
         col.into_any_element()
     }
@@ -7441,6 +7545,10 @@ impl IslandDemo {
                 user_id: p.id,
                 user_name: p.name.clone(),
                 role_id: p.role_id,
+                // The judge side, because the judge side may not command: a
+                // hull handed to a judge-side seat is refused by the server,
+                // and the advance has to see that before it writes.
+                judge: p.judge,
             })
             .collect()
     }
@@ -7584,6 +7692,131 @@ impl IslandDemo {
         Ok(())
     }
 
+    /// The staged planned window, seeded from the server's read the first
+    /// time it is asked for.
+    ///
+    /// SEEDED FROM THE FACTS, not typed from nothing: the window the
+    /// exercise already holds is what the operator edits, so the editor
+    /// shows the day and the two ends rather than five empty fields. A
+    /// window the console cannot read — a half window on the server, say —
+    /// leaves the draft blank rather than half-read, because a half window
+    /// is not a window the advance could write.
+    fn window_draft(&mut self) -> crate::window::WindowDraft {
+        if self.window_draft.is_none() || self.window_seeded_for != self.session.game_id {
+            self.window_draft = Some(crate::window::WindowDraft::from_read(
+                &self.session.facts.actual_start,
+                &self.session.facts.actual_end,
+                &self.session.facts.assumed_start,
+                &self.session.facts.assumed_end,
+            ));
+            self.window_seeded_for = self.session.game_id;
+        }
+        self.window_draft.clone().unwrap_or_default()
+    }
+
+    /// One window field, hand-rolled like the composer's and the timeline
+    /// filters': a focus handle, a keystroke handler and a value, in the
+    /// machine face because these are dates and military times rather than
+    /// prose.
+    ///
+    /// `idx` is 0 the real clock's day, 1 its start, 2 its end, 3 the
+    /// exercise clock's start, 4 its end — the order `WindowDraft::fields`
+    /// gives, so the keystrokes and the draft cannot disagree about which
+    /// field is which.
+    fn window_field(
+        &mut self,
+        idx: usize,
+        hint: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let handle = match self.window_handles[idx].clone() {
+            Some(h) => h,
+            None => {
+                let h = cx.focus_handle();
+                self.window_handles[idx] = Some(h.clone());
+                h
+            }
+        };
+        let value = self.window_draft().field(idx).to_string();
+        let empty = value.is_empty();
+        let shown = if empty { hint.to_string() } else { value };
+        let focused = self.window_focus == idx;
+        div()
+            .id(("window-field", idx))
+            .track_focus(&handle)
+            .cursor(CursorStyle::IBeam)
+            .h(px(WINDOW_FIELD_H))
+            .w(px(if idx == 0 { 88.0 } else { 62.0 }))
+            .px(px(5.0))
+            .rounded(px(CONTROL_RADIUS))
+            .bg(rgba(DEEP_WELL))
+            .border(px(1.0))
+            .border_color(rgba(if focused { RADAR_CYAN } else { HAIRLINE_SLATE }))
+            .flex()
+            .items_center()
+            .font_family(view::FACE_MACHINE)
+            .text_size(px(11.0))
+            .text_color(rgba(if empty { BODY_SILVER } else { MAP_INK }))
+            .on_mouse_down(MouseButton::Left, cx.listener(move |view, _, window, cx| {
+                window.focus(&handle);
+                view.window_focus = idx;
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(move |view, ev: &KeyDownEvent, window, cx| {
+                view.window_key(idx, &ev.keystroke, window, cx);
+            }))
+            .child(shown)
+            .into_any_element()
+    }
+
+    /// The keystroke half of a window field: printable characters append,
+    /// backspace removes, tab walks the five fields. The card's rule, and
+    /// the composer's.
+    ///
+    /// THE RULE SPEAKS AS SOON AS THE DRAFT IS WRONG, so the operator is
+    /// told while they are still in the field rather than after the round
+    /// trip. The rule is `crate::window`'s — the same one the scenario
+    /// composer asks.
+    fn window_key(
+        &mut self,
+        idx: usize,
+        k: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match k.key.as_str() {
+            "backspace" => {
+                let mut draft = self.window_draft();
+                let mut value = draft.field(idx).to_string();
+                value.pop();
+                draft.set_field(idx, value);
+                self.window_draft = Some(draft);
+            }
+            "tab" => {
+                let next = (idx + 1) % 5;
+                self.window_focus = next;
+                if let Some(h) = self.window_handles[next].clone() {
+                    window.focus(&h);
+                }
+            }
+            _ => {
+                if let Some(text) = k
+                    .key_char
+                    .as_deref()
+                    .filter(|t| !t.is_empty() && !t.chars().any(char::is_control))
+                {
+                    let mut draft = self.window_draft();
+                    let mut value = draft.field(idx).to_string();
+                    value.push_str(text);
+                    draft.set_field(idx, value);
+                    self.window_draft = Some(draft);
+                }
+            }
+        }
+        self.window_status = self.window_draft().problem().unwrap_or_default();
+        cx.notify();
+    }
+
     /// Control's draft, one step along its rail.
     ///
     /// The kernel clamps (`view::factor_nudge`), so a button at the rail is a
@@ -7591,8 +7824,7 @@ impl IslandDemo {
     /// This edits the DRAFT only: nothing is written until Apply, which is the
     /// console's own arrangement — a DragValue that wrote on every drag would
     /// be one PATCH per pixel.
-    fn nudge_factor(&mut self, step: f64) {
-        let read = self.session.facts.time_factor;
+    fn nudge_factor(&mut self, step: f64) {        let read = self.session.facts.time_factor;
         let current = self.factor_draft.unwrap_or(read);
         self.factor_draft = Some(view::factor_nudge(current, step));
         self.factor_status.clear();
@@ -7931,12 +8163,18 @@ impl IslandDemo {
         self.prepare_status = "moving the plan to preparation\u{2026}".to_string();
         let live_hulls = self.live_hulls();
         let live_seats = self.live_seats();
+        // The window goes with the drafts: the exercise's terms may only be
+        // changed while the game is in `planning`, so the advance is the
+        // last moment the window can be written. Read before the send,
+        // because the send borrows the sink and the draft is seeded here.
+        let window = self.window_draft();
         let _ = self.order_tx.send(ToBinary::AdvancePreparation {
             force: self.force.clone(),
             live_hulls,
             roster: self.roster_draft.clone(),
             live_seats,
             groups: crate::groups::plan(&self.groups, &self.live_groups()),
+            window,
         });
         cx.notify();
         true
@@ -16171,12 +16409,22 @@ pub enum ToBinary {
     /// the task organisation — each whole, the first refusal stopping the
     /// rest — and only then transitions the game, answering with the re-read
     /// session.
+    ///
+    /// THE WINDOW RIDES ALONG, because the exercise's terms are part of the
+    /// plan and Minos accepts a change to them only while the game is in
+    /// `planning` — so a window written after the move would be refused. It
+    /// goes with the drafts rather than being written on its own, for the
+    /// same reason the drafts are not written on their own: one decision,
+    /// one flush, one answer.
     AdvancePreparation {
         force: crate::force::ForceDraft,
         live_hulls: Vec<crate::force::LiveHull>,
         roster: crate::roster::RosterDraft,
         live_seats: Vec<crate::roster::LiveSeat>,
         groups: Vec<crate::groups::GroupWrite>,
+        /// The staged planned window: the real clock's day and two ends, and
+        /// the exercise clock's two ends.
+        window: crate::window::WindowDraft,
     },
     /// The game clock's multiplier, from Control's Apply. One field, one
     /// endpoint (`PATCH /games/{id}/time-factor`), and the answer is a re-read
@@ -16309,6 +16557,22 @@ pub struct CreatedSession {
     /// entitled to be told so rather than left with "replayed". Empty is the
     /// ordinary answer — most of these writes say nothing beyond "read back".
     pub note: String,
+    /// The refusal, when the write was REFUSED. `None` is the ordinary
+    /// answer.
+    ///
+    /// A REFUSED WRITE STILL ANSWERS WITH THE SESSION, and that is the whole
+    /// reason this field exists. The server may have taken part of the write
+    /// before it refused the rest, so the exercise is read back and the
+    /// answer carries it: the console's mirror becomes the truth, and the
+    /// next attempt diffs against it instead of re-issuing what the server
+    /// already took. A refusal that arrives with no session leaves the
+    /// console holding a frame the server has already moved past.
+    ///
+    /// The drafts are NOT re-seeded from that session — the operator's
+    /// staged work is theirs, and a refusal is not a reason to throw it
+    /// away. The pane that answers this is the one that knows the
+    /// difference.
+    pub refusal: Option<String>,
 }
 
 impl CreatedSession {
@@ -16317,6 +16581,7 @@ impl CreatedSession {
         Self {
             session,
             note: String::new(),
+            refusal: None,
         }
     }
 }
@@ -18013,10 +18278,28 @@ pub fn run(
                                         // and the drafts it seeds are now the
                                         // record the server just took, so the
                                         // staging latches clear with them.
+                                        //
+                                        // A REFUSED ADVANCE IS NOT THAT. The
+                                        // server may have taken part of the
+                                        // draft before it refused the rest,
+                                        // so the session that comes back is
+                                        // the server's truth and it replaces
+                                        // the held one — but the drafts are
+                                        // NOT re-seeded: the operator's
+                                        // staged work is theirs, and a refusal
+                                        // is not a reason to throw it away.
                                         root.prepare_busy = false;
-                                        root.prepare_status.clear();
-                                        root.session = created.session;
-                                        root.reseed_drafts();
+                                        match created.refusal {
+                                            Some(why) => {
+                                                root.prepare_status = why;
+                                                root.session = created.session;
+                                            }
+                                            None => {
+                                                root.prepare_status.clear();
+                                                root.session = created.session;
+                                                root.reseed_drafts();
+                                            }
+                                        }
                                     } else if root.factor_busy {
                                         root.apply_factor(created.session);
                                     } else if root.advance_busy {
@@ -18916,6 +19199,7 @@ mod tests {
                 roster: _,
                 live_seats,
                 groups: _,
+                window: _,
             } => {
                 assert!(force.contains(1), "the staged hull crossed");
                 assert!(
@@ -18934,6 +19218,83 @@ mod tests {
             !cx.update(|_window, app| view.update(app, |demo, cx| demo.prepare_advance(cx))),
             "an advance in flight sends nothing more"
         );
+    }
+
+    /// The planned window rides with the advance, because Minos accepts a
+    /// change to the exercise's terms only while the game is in `planning`
+    /// — so the advance is the last moment the window can be written, and a
+    /// window written on its own would be a second way to reach the same
+    /// record.
+    #[gpui::test]
+    fn the_advance_carries_the_staged_window(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                // The draft AND the game it was seeded for: the editor
+                // re-seeds from the server's read when the game changes, and
+                // a window staged for THIS game has to survive that.
+                demo.window_draft = Some(crate::window::WindowDraft {
+                    actual_date: "2026-11-01".into(),
+                    actual_start: "0800".into(),
+                    actual_end: "1600".into(),
+                    assumed_start: "0800".into(),
+                    assumed_end: "1600".into(),
+                });
+                demo.window_seeded_for = 45;
+            })
+        });
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.prepare_advance(cx)));
+        match rx.try_recv().expect("the advance reached the sink") {
+            ToBinary::AdvancePreparation { window, .. } => {
+                assert_eq!(window.actual_date, "2026-11-01");
+                assert_eq!(window.actual_start, "0800");
+                assert_eq!(window.assumed_end, "1600");
+            }
+            other => panic!("expected an advance, got {other:?}"),
+        }
+    }
+
+    /// THE EDITOR STARTS FROM THE WINDOW THE EXERCISE ALREADY HOLDS. The
+    /// operator edits the terms the server gave, not five empty fields: a
+    /// form that starts blank invites a second, different window.
+    #[gpui::test]
+    fn the_window_editor_starts_from_the_window_the_server_holds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut facts = GameFacts::default();
+        facts.actual_start = "2026-11-01T08:00:00Z".to_string();
+        facts.actual_end = "2026-11-01T16:00:00Z".to_string();
+        facts.assumed_start = "2000-01-01T08:00:00Z".to_string();
+        facts.assumed_end = "2000-01-01T16:00:00Z".to_string();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            facts,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        let draft = cx.update(|_window, app| view.update(app, |demo, _| demo.window_draft()));
+        assert_eq!(draft.actual_date, "2026-11-01");
+        assert_eq!(draft.actual_start, "0800");
+        assert_eq!(draft.actual_end, "1600");
+        assert_eq!(draft.assumed_start, "0800");
+        assert_eq!(draft.assumed_end, "1600");
+        assert_eq!(draft.problem(), None, "the server's own window is a window");
     }
 
     /// A drop on bare water while planning unprojects the drop point LOCALLY
