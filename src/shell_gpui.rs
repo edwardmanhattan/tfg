@@ -526,6 +526,13 @@ struct IslandDemo {
     /// surface. A row in here draws a NEW chip: the console states
     /// arrival as a STATE, never as an animation.
     comms_unseen: std::collections::HashSet<i64>,
+    /// Whether the composer's controls are open.
+    ///
+    /// **Closed by default, and it is the traffic that needs the room.**
+    /// The island is short — the commander's rail owns the bottom of the
+    /// window — and the envelope line says everything a SEND would send
+    /// without the controls being on the surface.
+    comms_pickers_open: bool,
     /// The newest message id the operator has seen. The watermark the
     /// unseen set is judged against, so a re-read that brings the same
     /// messages does not mark them all new again.
@@ -1502,6 +1509,16 @@ fn seeded_comms_scope() -> CommsScope {
         Ok("broadcast") => CommsScope::Broadcast,
         _ => CommsScope::All,
     }
+}
+
+/// The capture seed's composer's DISCLOSURE, parsed.
+///
+/// `TFG_COMMS_DISPATCH=1` opens the composer's controls, so a capture can
+/// photograph the pickers — the kind, the marking, the degree, the
+/// audience and the identity — without a click. A seed this build does
+/// not know is NO seed, and the controls stay closed.
+fn seeded_comms_dispatch() -> bool {
+    std::env::var("TFG_COMMS_DISPATCH").as_deref() == Ok("1")
 }
 
 /// One execution widget: the label, the value, the quiet line under it, and
@@ -3034,6 +3051,7 @@ impl IslandDemo {
             comms_tab: seeded_comms_tab(),
             comms_scope: seeded_comms_scope(),
             comms_unseen: std::collections::HashSet::new(),
+            comms_pickers_open: seeded_comms_dispatch(),
             comms_seen_max: 0,
             comms_latest_ink: None,
             msg_draft: MsgDraftForm::default(),
@@ -13825,21 +13843,103 @@ impl IslandDemo {
     /// the seats are the roster. Nothing here is a hard-coded number and
     /// nothing here is a verb the server would refuse.
     fn comms_pickers(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // The pickers are a DISCLOSURE, not a wall.
+        //
+        // The island is short — the commander's rail owns the bottom of
+        // the window and the execution rail the top — and a composer that
+        // takes half of what is left leaves the traffic, which is the
+        // half that matters, with room for one and a half rows. So the
+        // envelope is shown as ONE LINE that says what the message will
+        // be, and the controls behind it are opened when the operator
+        // wants to change it.
+        //
+        // The line is not a caption of the draft; it IS the draft's
+        // state, in the console's own chips: the kind, the marking, the
+        // degree and who it goes to. An operator reading it knows what
+        // the SEND button will send without opening anything.
         let mut col = div().flex().flex_col().gap(px(4.0));
-        // The kind and the marking share a line, and the degree and the
-        // identity share the next: the composer's controls are a STRIP,
-        // not a wall. The surface's other half is a list, and a composer
-        // that takes the island leaves nothing to read.
-        let mut line = div().flex().flex_row().items_center().gap(px(5.0)).flex_wrap();
-        line = line.child(self.comms_kind_picker(cx));
-        line = line.child(self.comms_mark_picker(cx));
-        col = col.child(line);
-        let mut line = div().flex().flex_row().items_center().gap(px(5.0)).flex_wrap();
-        line = line.child(self.comms_degree_picker(cx));
-        line = line.child(self.comms_identity_picker(cx));
-        col = col.child(line);
-        col = col.child(self.comms_audience_picker(cx));
+        col = col.child(self.comms_envelope_line(cx));
+        if self.comms_pickers_open {
+            // The kind and the marking share a line, and the degree and
+            // the identity share the next: the composer's controls are a
+            // STRIP, not a wall. The surface's other half is a list, and
+            // a composer that takes the island leaves nothing to read.
+            let mut line = div().flex().flex_row().items_center().gap(px(5.0)).flex_wrap();
+            line = line.child(self.comms_kind_picker(cx));
+            line = line.child(self.comms_mark_picker(cx));
+            col = col.child(line);
+            let mut line = div().flex().flex_row().items_center().gap(px(5.0)).flex_wrap();
+            line = line.child(self.comms_degree_picker(cx));
+            line = line.child(self.comms_identity_picker(cx));
+            col = col.child(line);
+            col = col.child(self.comms_audience_picker(cx));
+        }
         col.into_any_element()
+    }
+
+    /// The composer's envelope, on one line: what a SEND would send.
+    ///
+    /// **It is the draft's state, not a caption of it.** The kind, the
+    /// marking, the degree and the audience are the four things the
+    /// server reads, and the operator picks them on the line BEHIND this
+    /// one — so this line has to name them exactly, or it is a decoration.
+    fn comms_envelope_line(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let kind = self.msg_draft.kind;
+        let mark = self.msg_draft.mark;
+        let degree = self
+            .session
+            .msg_degrees
+            .iter()
+            .find(|d| d.id == self.msg_draft.degree)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| format!("{}", self.msg_draft.degree));
+        let audience = self.comms_audience_summary();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.0))
+            .flex_wrap();
+        row = row.child(
+            div()
+                .id("comms-envelope")
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _, _, cx| {
+                    // The same verb opens and closes the controls: a
+                    // disclosure that can only be opened is a drawer.
+                    view.comms_pickers_open = !view.comms_pickers_open;
+                    cx.notify();
+                }))
+                .child(button("DISPATCH", true, false, self.comms_pickers_open)),
+        );
+        row = row.child(comms_chip(kind.label(), kind.ink()));
+        row = row.child(comms_chip(mark.label(), mark.ink()));
+        row = row.child(comms_value_chip(&degree, CUT_GREY));
+        row = row.child(comms_value_chip(&audience, CUT_GREY));
+        row.into_any_element()
+    }
+
+    /// Who the draft goes to, in one phrase.
+    ///
+    /// The names come from the roster, and the phrase says the list as
+    /// well: a message to two seats and a message to one are different
+    /// dispatches, and a reader must not have to count chips.
+    fn comms_audience_summary(&self) -> String {
+        let name_of = |uid: i64| {
+            self.session
+                .msg_audience
+                .iter()
+                .find(|s| s.user_id == uid)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| format!("user {uid}"))
+        };
+        let mut names: Vec<String> = self.msg_draft.to.iter().map(|u| name_of(*u)).collect();
+        names.extend(self.msg_draft.cc.iter().map(|u| name_of(*u)));
+        match names.len() {
+            0 => "everyone".to_string(),
+            1 => names[0].clone(),
+            _ => format!("{} and {}", names[0], plural(names.len() - 1, "other")),
+        }
     }
 
     /// The KIND picker.
@@ -20166,6 +20266,33 @@ fn comms_chip(label: &str, ink: Rgba) -> impl IntoElement {
         .border(px(1.0))
         .border_color(rgba(ink))
         .child(tracked(label, view::LABEL_PT, ink))
+}
+
+/// A chip carrying a VALUE rather than a label.
+///
+/// The console's face rule sends human words to Saira Condensed and
+/// machine values to PT Mono, and a chip that shouts a person's name in
+/// tracked caps is neither — a name is a word, and words are set in the
+/// human face. The edge still says "this is a label on an instrument",
+/// so the reader knows what it is looking at.
+fn comms_value_chip(label: &str, ink: Rgba) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .px(px(4.0))
+        .py(px(1.0))
+        .rounded(px(2.0))
+        .border(px(1.0))
+        .border_color(rgba(ink))
+        .child(
+            div()
+                .font_family(view::FACE_HUMAN)
+                .text_size(px(view::LABEL_PT))
+                .text_color(rgba(ink))
+                .child(label.to_string()),
+        )
 }
 
 /// The telegram's marker: a machine-face chevron at the head of the row.
