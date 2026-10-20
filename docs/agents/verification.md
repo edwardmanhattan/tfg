@@ -131,8 +131,11 @@ gesture. It is eight tool calls of source-reading, done once.
 ## The loop, in one paragraph
 
 Write the test. Run it. Make it fail for the right reason. Fix the code.
-Run it again. `cargo test --lib` — six seconds, and the four known
-failures in `book`, `map_render`, `roster` and `sim` are known. Only then
+Run it again. `cargo test --lib` — six seconds, and the two known
+failures in `map_render` and `sim` are known. (The `book` and `roster`
+ones were fixed with the local-first planning slice: the book test
+contradicted `BookDraft::prune`'s own rule, and the roster's write
+order was the bug the test was always asserting against.) Only then
 shoot the states the change touches, read the taint line, and look at the
 crop. Report the change with the capture's name and the test's name
 attached, so the next person does not have to take the word for it.
