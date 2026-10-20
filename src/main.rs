@@ -269,12 +269,24 @@ fn main() {
     // publication carries a POSITION: it is the first word about where the
     // hull went, and it arrives before any plot read.
     let (live_event_tx, live_event_rx) = mpsc::channel();
+    // The messages that ARRIVE on the socket, on their own channel.
+    //
+    // The socket carries two kinds of traffic and the console used to
+    // watch only one of them: a BROADCAST arrives on the game's channel
+    // (`game.message_sent`) and an ADDRESSED message arrives on the
+    // account's own (`personal.message_sent`) — probed 2026-10-21, an
+    // addressed message appears on the personal channel and on NOTHING
+    // else, not even on the game's. Both used to be logged and dropped,
+    // so the inbox was a photograph of the last write instead of a live
+    // surface. This channel is the live half.
+    let (live_msg_tx, live_msg_rx) = mpsc::channel::<tfg::shell_gpui::MessageView>();
     // The held session, shared with the plot reader: which game, which
     // token, which state. The binary writes it; the reader reads it.
     let hold: tfg::gamefeed::GameHoldCell = Arc::new(Mutex::new(tfg::gamefeed::GameHold {
         token: token.clone(),
         game_id: session.game_id,
         state: session.state.clone(),
+        user_id: session.me,
         kick: 0,
     }));
     // The game fixes, on their own channel: the plot reader, the order
@@ -307,7 +319,14 @@ fn main() {
     });
     // The watches follow the session: the broadcast channel for the held
     // game, and the positions channel once the exercise is running.
-    sync_session(&hold, &live_ctl, &token, session.game_id, &session.state);
+    sync_session(
+        &hold,
+        &live_ctl,
+        &token,
+        session.game_id,
+        &session.state,
+        session.me,
+    );
 
     // The registry the fix feed drains into. Owned here, beside the poll
     // thread it serves: the shell stays a renderer of liveness, and the
@@ -810,7 +829,15 @@ fn main() {
                                 );
                                 game_id = 0;
                                 state2 = String::new();
-                                sync_session(&hold2, &live_ctl2, &token2, game_id, &state2);
+                                // The account's own id, so the socket can
+                                // watch its PERSONAL channel: an addressed
+                                // message travels there and nowhere else.
+                                let me2 = tfg::backend::MinosMaster::new(&host2)
+                                    .ok()
+                                    .and_then(|m| m.me(&token).ok())
+                                    .map(|(id, _)| id)
+                                    .unwrap_or(0);
+                                sync_session(&hold2, &live_ctl2, &token2, game_id, &state2, me2);
                                 Ok(tfg::shell_gpui::SignedIn {
                                     roster: rows,
                                     roster_total: total,
@@ -848,7 +875,8 @@ fn main() {
                         }
                         game_id = 0;
                         state2 = String::new();
-                        sync_session(&hold2, &live_ctl2, "", game_id, &state2);
+                        // Signed out: no account, so no personal channel.
+                        sync_session(&hold2, &live_ctl2, "", game_id, &state2, 0);
                         eprintln!("signed out — token and keyring cleared");
                     }
                     tfg::shell_gpui::ToBinary::HoldSession { game_id: hold } => {
@@ -866,8 +894,19 @@ fn main() {
                                     game_id = s.game_id;
                                     state2 = s.state.clone();
                                     // The watches follow the held game, and
-                                    // the plot reader starts reading it.
-                                    sync_session(&hold2, &live_ctl2, &token2, game_id, &state2);
+                                    // the plot reader starts reading it. The
+                                    // account's own id rides along, so the
+                                    // socket can watch its PERSONAL channel:
+                                    // an addressed message travels there and
+                                    // nowhere else.
+                                    sync_session(
+                                        &hold2,
+                                        &live_ctl2,
+                                        &token2,
+                                        game_id,
+                                        &state2,
+                                        s.me,
+                                    );
                                     eprintln!("holding {} ({})", s.game, s.state);
                                     Ok(tfg::shell_gpui::CreatedSession::for_write(
                                         s,
@@ -926,6 +965,7 @@ fn main() {
                                                 &token2,
                                                 game_id,
                                                 &state2,
+                                                s.me,
                                             );
                                             Ok(tfg::shell_gpui::CreatedSession::for_write(
                                                 s,
@@ -1426,6 +1466,7 @@ fn main() {
                                                 &token2,
                                                 game_id,
                                                 &state2,
+                                                s.me,
                                             );
                                             Ok(tfg::shell_gpui::CreatedSession::for_write(
                                                 s,
@@ -1476,6 +1517,7 @@ fn main() {
                                                 &token2,
                                                 game_id,
                                                 &state2,
+                                                s.me,
                                             );
                                             Ok(tfg::shell_gpui::CreatedSession::for_write(
                                                 s,
@@ -2001,14 +2043,22 @@ fn main() {
                             return;
                         }
                     }
-                    tfg::shell_gpui::ToBinary::SendTelegram { content } => {
-                        // The comms composer's send, cut to the proven path:
-                        // a broadcast telegram, TERBUKA, BIASA (degree 1) —
-                        // the exact body the write probe posted for its 201.
-                        // Empty `to`/`cc` IS the broadcast by contract. The
-                        // answer echoes the held game, so the thread follows
-                        // it by re-read rather than assumption.
-                        let content = content.trim().to_string();
+                    tfg::shell_gpui::ToBinary::SendMessage { draft } => {
+                        // The comms surface's send, with the WHOLE envelope.
+                        //
+                        // The body is the server's contract field for field
+                        // (probed 2026-10-21): kind, classification, content
+                        // and id_degree are required; to/cc make it
+                        // addressed; id_assumed_role says WHO a judge speaks
+                        // as; id_hierarchy_node says WHERE FROM; id_reply_to
+                        // threads an administrative message. The shell has
+                        // already refused the combinations the server would
+                        // refuse (a non-TERBUKA broadcast, administrative
+                        // mail from a commander's seat, a judge's telegram
+                        // with no role), so what arrives here is legal by
+                        // construction — and the server still has the last
+                        // word.
+                        let content = draft.content.trim().to_string();
                         let outcome = if token2.is_empty() {
                             Err("signed out \u{2014} sign in to send messages".to_string())
                         } else if content.is_empty() {
@@ -2017,30 +2067,30 @@ fn main() {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
-                            let draft = tfg::backend::MsgDraft {
-                                kind: "telegram".to_string(),
-                                classification: "TERBUKA".to_string(),
+                            let wire = tfg::backend::MsgDraft {
+                                kind: draft.kind.wire().to_string(),
+                                classification: draft.mark.wire().to_string(),
                                 content,
-                                to: Vec::new(),
-                                cc: Vec::new(),
-                                assumed_role: None,
-                                reply_to: None,
-                                degree: 1,
-                                msg_type: None,
+                                to: draft.to.clone(),
+                                cc: draft.cc.clone(),
+                                assumed_role: draft.assumed_role,
+                                hierarchy_node: draft.hierarchy_node,
+                                reply_to: draft.reply_to,
+                                degree: draft.degree,
                                 callsign: String::new(),
                                 sending_note: String::new(),
                                 group_name: String::new(),
                                 per: String::new(),
                                 registration_number: String::new(),
                             };
-                            match master.send_message(&token2, game_id, &draft) {
+                            match master.send_message(&token2, game_id, &wire) {
                                 Ok(m) => {
-                                    eprintln!("sent telegram #{} (broadcast)", m.id);
+                                    eprintln!("sent message #{} ({})", m.id, m.kind);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
                                         Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
-                                                s,
-                                                tfg::shell_gpui::WriteId::Message,
-                                            )),
+                                            s,
+                                            tfg::shell_gpui::WriteId::Message,
+                                        )),
                                         None => Err(
                                             "sent, but the thread could not be read".to_string(),
                                         ),
@@ -2051,6 +2101,111 @@ fn main() {
                         };
                         let outcome = outcome.map_err(|why| {
                             tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Message, why)
+                        });
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
+                    tfg::shell_gpui::ToBinary::RefreshInbox => {
+                        // The comms surface's REFRESH. A re-read of the
+                        // held session, applied as the inbox's own write so
+                        // the operator's draft survives it.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to read messages".to_string())
+                        } else {
+                            match fetch_session(&host2, &token2, Some(game_id)) {
+                                Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                    s,
+                                    tfg::shell_gpui::WriteId::Inbox,
+                                )),
+                                None => Err("the inbox could not be read".to_string()),
+                            }
+                        };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Inbox, why)
+                        });
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
+                    tfg::shell_gpui::ToBinary::MarkMessageRead { message_id } => {
+                        // The read receipt. It exists only for an ADDRESSED
+                        // message: the server refuses one for a broadcast
+                        // ("A message sent to everybody has no individual
+                        // receipt"), so asking for it on a broadcast is a
+                        // refusal the surface reports rather than hides.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to read messages".to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            match master.mark_read(&token2, game_id, message_id) {
+                                Ok(m) => {
+                                    eprintln!("receipt recorded for message #{message_id}");
+                                    match fetch_session(&host2, &token2, Some(game_id)) {
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                            s,
+                                            tfg::shell_gpui::WriteId::Receipt,
+                                        )),
+                                        None => Err(
+                                            "read, but the thread could not be read".to_string(),
+                                        ),
+                                    }
+                                }
+                                Err(e) => Err(format!("receipt refused: {e}")),
+                            }
+                        };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Receipt, why)
+                        });
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
+                    tfg::shell_gpui::ToBinary::DeleteMessage { message_id } => {
+                        // Withdraw (the author) or hide (an addressee). The
+                        // server takes two branches and answers them
+                        // differently -- 200 for the author's withdrawal,
+                        // 404 for the recipient's hide even though the
+                        // tombstone is written -- so the branch is named
+                        // here and the surface can say what happened.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to remove messages".to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            match master.delete_message_view(&token2, game_id, message_id) {
+                                Ok(tfg::backend::DeleteOutcome::Withdrawn(m)) => {
+                                    eprintln!("withdrew message #{}", m.id);
+                                    match fetch_session(&host2, &token2, Some(game_id)) {
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                            s,
+                                            tfg::shell_gpui::WriteId::Delete,
+                                        )),
+                                        None => Err(
+                                            "removed, but the thread could not be read".to_string(),
+                                        ),
+                                    }
+                                }
+                                Ok(tfg::backend::DeleteOutcome::Hidden) => {
+                                    eprintln!("hid message #{message_id}");
+                                    match fetch_session(&host2, &token2, Some(game_id)) {
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                            s,
+                                            tfg::shell_gpui::WriteId::Delete,
+                                        )),
+                                        None => Err(
+                                            "hidden, but the thread could not be read".to_string(),
+                                        ),
+                                    }
+                                }
+                                Err(e) => Err(format!("remove refused: {e}")),
+                            }
+                        };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Delete, why)
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -2291,6 +2446,9 @@ fn main() {
     }
     let thumb_feed: tfg::shell_gpui::ThumbFeed =
         std::boxed::Box::new(move || thumb_rx.try_recv().ok());
+    // The messages that arrived, drained like every other feed.
+    let live_message_feed: tfg::shell_gpui::LiveMessageFeed =
+        std::boxed::Box::new(move || live_msg_rx.try_recv().ok());
 
     tfg::shell_gpui::run(
         Box::new(move || {
@@ -2378,7 +2536,44 @@ fn main() {
                         eprintln!("wire: token expired (109) — the socket needs a new one");
                     }
                     tfg::backend::LiveEvent::Message(m) => {
+                        // A MESSAGE ARRIVED. It is handed to the shell,
+                        // which merges it into the inbox by id and says
+                        // so in the type's own ink and tone.
                         eprintln!("wire: message ({}) {}", m.kind, m.content);
+                        let to_me = m.recipients.contains(&session.me);
+                        let read_at = None;
+                        let view = tfg::shell_gpui::MessageView {
+                            id: m.id,
+                            kind: m.kind.clone(),
+                            class_code: m.class_code.clone(),
+                            class_label: m.class_label.clone(),
+                            sender: m.sender.clone(),
+                            // An event NEVER carries the real author when
+                            // an identity was assumed -- not even for the
+                            // Game Master -- so the console shows the
+                            // assumed identity alone there, by
+                            // construction.
+                            author_id: m.author_id,
+                            assumed: m.author_id.is_none(),
+                            broadcast: m.broadcast,
+                            content: m.content.clone(),
+                            at: m.created_at.clone(),
+                            degree: m.degree_name.clone(),
+                            reply_to: m.reply_to,
+                            to_me,
+                            read_at,
+                            recipients: m
+                                .recipients
+                                .iter()
+                                .map(|uid| tfg::shell_gpui::MsgRecipientView {
+                                    user_id: *uid,
+                                    kind: String::new(),
+                                    name: String::new(),
+                                    read_at: None,
+                                })
+                                .collect(),
+                        };
+                        let _ = live_msg_tx.send(view);
                     }
                     tfg::backend::LiveEvent::Announced(list) => {
                         eprintln!("wire: {} vessel(s) announced", list.len());
@@ -2439,6 +2634,7 @@ fn main() {
         embark_spec_feed,
         thumb_feed,
         spec_feed,
+        live_message_feed,
         order_tx,
         roster,
         roster_total,
@@ -2827,8 +3023,14 @@ fn sync_session(
     token: &str,
     game_id: i64,
     state: &str,
+    user_id: i64,
 ) {
     tfg::gamefeed::set_hold(hold, token, game_id, state);
+    // The account's own id, for the PERSONAL channel. It rides here
+    // because the watch is declared with the session, and an addressed
+    // message arrives on the account's channel whether or not a game is
+    // held.
+    tfg::gamefeed::set_user(hold, user_id);
     tfg::gamefeed::sync_watch(live_ctl, hold);
 }
 
@@ -2910,12 +3112,75 @@ fn fetch_session_rows(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::Se
     Some(rows)
 }
 
+/// How many messages the session read asks for.
+///
+/// The server's own maximum (`page_size` is clamped at 200), so one read
+/// carries a busy exercise's whole traffic. A busier one pages, and the
+/// surface says so from the server's own count.
+const INBOX_PAGE: u64 = 200;
+
+/// One inbox message as the comms surface draws it.
+///
+/// **The projection keeps every field the server published.** The two
+/// facts the console computes for itself are the ones the server does
+/// not publish per-caller:
+///
+/// - `to_me` — the caller is a NAMED recipient. The server's own
+///   `only_mine` filter means exactly this (the caller is in the `to` or
+///   the `cc` list), and computing it here saves a second read.
+/// - `read_at` — the CALLER's own receipt. The server publishes a
+///   receipt per recipient, and only one of them is this console's
+///   business.
+///
+/// `assumed` is the absence of an author id where a role was claimed:
+/// the server omits the real author then, and the console must not
+/// guess it back.
+fn project_message(
+    m: &tfg::backend::InboxMsg,
+    me: i64,
+    parts: &[tfg::backend::Participant],
+) -> tfg::shell_gpui::MessageView {
+    let name_of = |user_id: i64| {
+        parts
+            .iter()
+            .find(|p| p.user_id == user_id)
+            .map(|p| p.user_name.clone())
+            .unwrap_or_default()
+    };
+    let mine = m.recipients.iter().find(|r| r.user_id == me);
+    tfg::shell_gpui::MessageView {
+        id: m.id,
+        kind: m.kind.clone(),
+        class_code: m.class_code.clone(),
+        class_label: m.class_label.clone(),
+        sender: m.sender.clone(),
+        author_id: m.author_id,
+        assumed: m.assumed_role_id.is_some(),
+        broadcast: m.broadcast,
+        content: m.content.clone(),
+        at: m.created_at.clone(),
+        degree: m.degree_name.clone(),
+        reply_to: m.reply_to,
+        to_me: mine.is_some(),
+        read_at: mine.and_then(|r| r.read_at.clone()),
+        recipients: m
+            .recipients
+            .iter()
+            .map(|r| tfg::shell_gpui::MsgRecipientView {
+                user_id: r.user_id,
+                kind: r.kind.clone(),
+                name: name_of(r.user_id),
+                read_at: r.read_at.clone(),
+            })
+            .collect(),
+    }
+}
+
 fn fetch_session(
     host: &str,
     token: &str,
     pinned: Option<i64>,
-) -> Option<tfg::shell_gpui::SessionView> {
-    let master = tfg::backend::MinosMaster::new(host).ok()?;
+) -> Option<tfg::shell_gpui::SessionView> {    let master = tfg::backend::MinosMaster::new(host).ok()?;
     let (me, _name) = master.me(token).ok()?;
     let games = master.games_list(token).ok()?;
     // The newest game this account is seated in wins; the newest readable one
@@ -3265,6 +3530,44 @@ fn fetch_session(
     } else {
         Vec::new()
     };
+    // The inbox. ONE read, and the whole of it: the page is the
+    // server's maximum (200) and the count is the server's own, so the
+    // surface can say "showing 200 of 340" rather than draw a truncated
+    // list as if it were the whole traffic.
+    //
+    // A FAILED READ IS NOT AN EMPTY INBOX. The old code swallowed the
+    // error into `unwrap_or_default()`, so a 403 (this account is not on
+    // the roster) and a network failure both drew as "No messages in this
+    // exercise." — a statement the console cannot make. Now the failure
+    // travels as a sentence, and the list is empty because nothing was
+    // read.
+    let (messages, inbox_total, inbox_error) =
+        match master.inbox_page(token, game_id, None, false, 1, INBOX_PAGE) {
+            Ok(page) => (
+                page.messages
+                    .iter()
+                    .map(|m| project_message(m, me, &parts))
+                    .collect::<Vec<tfg::shell_gpui::MessageView>>(),
+                page.total_records,
+                None,
+            ),
+            Err(e) => (Vec::new(), 0, Some(e.to_string())),
+        };
+    // The composer's catalogue: the degrees the server accepts and the
+    // scenario roles THIS game has issued. Both are read, never guessed
+    // — a degree is a foreign key and a role is refused unless the game
+    // issued it.
+    let msg_degrees = master.message_degrees(token).unwrap_or_default();
+    let msg_roles = master.scenario_roles(token, game_id).unwrap_or_default();
+    let msg_audience = parts
+        .iter()
+        .map(|p| tfg::shell_gpui::AudienceSeat {
+            user_id: p.user_id,
+            name: p.user_name.clone(),
+            role: p.role_name.clone(),
+            judge: p.judge,
+        })
+        .collect();
     Some(tfg::shell_gpui::SessionView {
         // The camera's opening zoom is the MAP's constant and the caller sets
         // it: the session read has no business knowing the map's defaults.
@@ -3291,19 +3594,13 @@ fn fetch_session(
         execution: state == "execution",
         mine,
         game_id,
-        messages: master
-            .inbox_list(token, game_id, None, false)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|m| tfg::shell_gpui::MessageView {
-                sender: m.sender,
-                kind: m.kind,
-                class_label: m.class_label,
-                content: m.content,
-                at: m.created_at,
-                broadcast: m.broadcast,
-            })
-            .collect(),
+        // The inbox read above.
+        messages,
+        inbox_total,
+        inbox_error,
+        msg_degrees,
+        msg_roles,
+        msg_audience,
         // The step read. `None` is a real state — the server stamps a step
         // only once the scenario clock has an anchor — and the panel says so
         // rather than drawing an empty step.

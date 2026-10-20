@@ -634,8 +634,23 @@ impl ClientInner {
                                                 Ok(Err(err)) => (0, err.to_string().into()),
                                                 Err(err) => (0, err.to_string().into()),
                                             };
-                                            sub.move_to_unsubscribed(code, &reason);
-                                            Err(())
+                                            // 105 IS "already subscribed", and for the PERSONAL channel that
+                                            // is the FEATURE working: the server subscribes every account to
+                                            // `personal:<user id>` when it hands out the connect token, so an
+                                            // explicit subscribe is answered 105. The stock SDK treats every
+                                            // error as a refusal and drops the channel -- which silently loses
+                                            // every publication on it, because a push is only routed to a
+                                            // subscription that is in the SUBSCRIBED state.
+                                            //
+                                            // So 105 is taken as the subscription it names: the channel IS
+                                            // subscribed, and the publications are the whole point.
+                                            if code == 105 {
+                                                sub.move_to_subscribed(Vec::new());
+                                                Ok(())
+                                            } else {
+                                                sub.move_to_unsubscribed(code, &reason);
+                                                Err(())
+                                            }
                                         };
                                         for ch in sub.on_subscribed_ch.drain(..) {
                                             let _ = ch.send(msg);

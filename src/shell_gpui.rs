@@ -485,13 +485,43 @@ struct IslandDemo {
     /// execution and its Readiness island in preparation — one surface, one
     /// place, which is the whole reason it is a column island and not both.
     command_open: bool,
-    /// The Comms panel: the session's inbox and the telegram composer.
-    /// The console keeps it a FLOATING island opened from the band's comms
-    /// door, not a column island and not a centred modal — an inbox is
-    /// something you read beside the map, and a dim over the map is the one
-    /// thing that makes it unreadable. So the door moved to the band and the
-    /// pane stays undimmed.
+    /// The Comms surface: the session's inbox and the composer.
+    ///
+    /// It is a FLOATING island over the map, opened from the band's
+    /// comms door and from the execution rail's comms widget — not a
+    /// column island and not a centred modal. An inbox is something you
+    /// read BESIDE the map, and a dim over the map is the one thing that
+    /// makes it unreadable.
     comms_open: bool,
+    /// Which kind the operator is looking at. The strip is the console's
+    /// only ask about the traffic, and the server's kinds are exactly two
+    /// (telegram, administrative) — so the strip is the vocabulary, not a
+    /// filter over a longer one.
+    comms_tab: CommsTab,
+    /// Which slice of the kind the operator is looking at: everything,
+    /// only what was addressed to them, or only the broadcasts.
+    comms_scope: CommsScope,
+    /// The message ids that arrived since the operator last looked at the
+    /// surface. A row in here draws a NEW chip: the console states
+    /// arrival as a STATE, never as an animation.
+    comms_unseen: std::collections::HashSet<i64>,
+    /// The newest message id the operator has seen. The watermark the
+    /// unseen set is judged against, so a re-read that brings the same
+    /// messages does not mark them all new again.
+    comms_seen_max: i64,
+    /// The ink the comms chip carries: the newest message's own kind's
+    /// ink. The band and the rail chip are the console's announcement —
+    /// a state, not an animation.
+    comms_latest_ink: Option<Rgba>,
+    /// The composer's own draft — kind, marking, degree, audience, the
+    /// identity a judge speaks as, and the words.
+    ///
+    /// The degrees, the scenario roles and the roster it is filled from
+    /// live on the SESSION, not here: they are read by the binary and
+    /// they are the same facts the server holds, so a second copy in the
+    /// shell would be a second answer.
+    msg_draft: MsgDraftForm,
+
     /// The execution phase's CREW modal: every player, segmented by role, with
     /// a commander's hulls and task groups beneath them. Opened from the
     /// widget rail, not from the column — in execution the column is gone.
@@ -797,7 +827,6 @@ struct IslandDemo {
     /// states the cut rather than showing controls with no effect. Rides
     /// field index 10 of the composer's hand-rolled plumbing — one field
     /// implementation, not two — and tabs to itself.
-    msg_content: String,
     msg_busy: bool,
     msg_status: Status,
     /// The operator's force: what is in the exercise, as THEY have said it.
@@ -2921,6 +2950,14 @@ impl IslandDemo {
             // exactly the capture that kept appearing: not a stray focus click
             // at all, a flag that defaulted the wrong way.
             comms_open: std::env::var("TFG_COMMS").as_deref() == Ok("1"),
+            // The kind strip and the scope start on the whole traffic:
+            // the operator narrows, the console does not narrow for them.
+            comms_tab: CommsTab::default(),
+            comms_scope: CommsScope::default(),
+            comms_unseen: std::collections::HashSet::new(),
+            comms_seen_max: 0,
+            comms_latest_ink: None,
+            msg_draft: MsgDraftForm::default(),
             crew_modal_open: false,
             // `TFG_UNIT` names the unit the details panel opens on, and
             // opens it. The same precedent as `TFG_SEL`: pin the state,
@@ -3072,7 +3109,6 @@ impl IslandDemo {
             readiness_status: Status::empty(),
             step_declare_busy: false,
             step_declare_status: Status::empty(),
-            msg_content: String::new(),
             msg_busy: false,
             msg_status: Status::empty(),
             force: crate::force::ForceDraft::new(),
@@ -12710,52 +12746,191 @@ impl IslandDemo {
         self.step_declare_status.clear();
     }
 
-    /// Send the comms panel's telegram row — the console's `send_message`,
-    /// cut to the proven broadcast path.
+    /// Send the comms surface's composer — the console's `send_message`,
+    /// with the whole envelope.
     ///
-    /// Returns false (and sends nothing) for the three non-sends: a game
-    /// that is not executing (the server only takes messages there), blank
-    /// content (the console's own sentence refuses it first), and a send
-    /// already in flight. The same rule the SEND button enforces, kept in
-    /// one place so a test exercises exactly what the click does.
-    fn send_telegram(&mut self, cx: &mut Context<Self>) -> bool {
+    /// Returns false (and sends nothing) for the non-sends, and every one
+    /// of them is a rule the SERVER enforces too, so the console refuses
+    /// locally what the server would refuse with a 400 (the console's own
+    /// law: hide a verb the backend would refuse rather than showing one
+    /// that 409s):
+    ///
+    /// - a game that is not executing (the server takes messages only
+    ///   there — a 409 naming the phase);
+    /// - blank content, or content past the server's 8000 characters;
+    /// - a BROADCAST with a marking other than TERBUKA ("A message with
+    ///   no `to` and no `cc` is a broadcast, and only `TERBUKA` may be a
+    ///   broadcast");
+    /// - ADMINISTRATIVE mail from a seat that is not on the judge side
+    ///   ("Administrative messages pass between the Judges and the Game
+    ///   Master");
+    /// - a TELEGRAM from the judge side with no assumed role ("A Telegram
+    ///   message from the Game Master or a Judge must be sent AS a
+    ///   scenario role") and, with one, no node to speak from;
+    /// - a reply on a telegram (only administrative mail is a
+    ///   conversation).
+    fn send_message(&mut self, cx: &mut Context<Self>) -> bool {
         if !self.session.execution {
             self.msg_status = Status::bad("messages send only in execution".to_string());
             cx.notify();
             return false;
         }
-        if self.msg_content.trim().is_empty() {
+        let content = self.msg_draft.content.trim().to_string();
+        if content.is_empty() {
             self.msg_status = Status::bad("write the message first".to_string());
+            cx.notify();
+            return false;
+        }
+        if content.chars().count() > 8000 {
+            self.msg_status = Status::bad("a message holds 8000 characters".to_string());
             cx.notify();
             return false;
         }
         if self.msg_busy {
             return false;
         }
+        let addressed = !self.msg_draft.to.is_empty() || !self.msg_draft.cc.is_empty();
+        if !addressed && self.msg_draft.mark != CommsMark::Open {
+            self.msg_status = Status::bad(
+                "only TERBUKA may be a broadcast \u{2014} name a recipient".to_string(),
+            );
+            cx.notify();
+            return false;
+        }
+        let judge_side = self.own_seat().is_some_and(|s| s.judge);
+        match self.msg_draft.kind {
+            CommsKind::Administrative => {
+                if !judge_side {
+                    self.msg_status = Status::bad(
+                        "administrative mail is between the Judges and the Game Master"
+                            .to_string(),
+                    );
+                    cx.notify();
+                    return false;
+                }
+            }
+            CommsKind::Telegram => {
+                if judge_side {
+                    if self.msg_draft.assumed_role.is_none() {
+                        self.msg_status = Status::bad(
+                            "a telegram from the Game Master must be sent AS a scenario role"
+                                .to_string(),
+                        );
+                        cx.notify();
+                        return false;
+                    }
+                    if self.msg_draft.hierarchy_node.is_none() {
+                        self.msg_status = Status::bad(
+                            "name the node it speaks from \u{2014} the role says who, the node says where from"
+                                .to_string(),
+                        );
+                        cx.notify();
+                        return false;
+                    }
+                } else if self.msg_draft.assumed_role.is_some() {
+                    self.msg_status = Status::bad(
+                        "only the Game Master may send as a scenario role".to_string(),
+                    );
+                    cx.notify();
+                    return false;
+                }
+                if self.msg_draft.reply_to.is_some() {
+                    self.msg_status = Status::bad(
+                        "a telegram is a broadcast of orders, not a conversation".to_string(),
+                    );
+                    cx.notify();
+                    return false;
+                }
+            }
+        }
         self.msg_busy = true;
         self.msg_status = Status::pending("sending\u{2026}".to_string());
-        let _ = self.order_tx.send(ToBinary::SendTelegram {
-            content: self.msg_content.trim().to_string(),
-        });
+        let draft = MsgDraftForm {
+            content,
+            ..self.msg_draft.clone()
+        };
+        let _ = self.order_tx.send(ToBinary::SendMessage { draft });
         cx.notify();
         true
     }
 
-    /// The row's Enter key: the same `send_telegram` the SEND button calls —
-    /// never a copy.
+    /// The composer's send, cut to the proven broadcast path: a telegram,
+    /// TERBUKA, no audience, ordinary degree.
+    ///
+    /// Kept as its own name because it is what the composer calls when
+    /// nothing was picked, and it is the shape the older tests drive.
+    fn send_telegram(&mut self, cx: &mut Context<Self>) -> bool {
+        self.send_message(cx)
+    }
+
+    /// The row's Enter key: the same `send_message` the SEND button calls
+    /// — never a copy.
     fn submit_telegram(&mut self, cx: &mut Context<Self>) {
-        self.send_telegram(cx);
+        self.send_message(cx);
     }
 
     /// Apply the re-read session a send answer returned: the thread arrives
     /// read back with the new message in it, the row clears, and the panel
     /// stays open — the author keeps writing, the way the book stays open
     /// across adds.
+    ///
+    /// **A landed send says so.** The status line used to be cleared, so
+    /// the operator's own message vanished from the surface with no word
+    /// that it had gone.
     fn apply_message(&mut self, session: SessionView) {
         self.msg_busy = false;
         self.session = session;
-        self.msg_content.clear();
-        self.msg_status.clear();
+        self.msg_draft.content.clear();
+        self.msg_status = Status::good("sent".to_string());
+        self.note_seen_watermark();
+    }
+
+    /// Apply a RE-READ of the inbox: the session is installed and the
+    /// operator's own draft SURVIVES it.
+    ///
+    /// The draft is theirs. A refresh that wiped the half-written message
+    /// would be a refresh nobody would dare press.
+    fn apply_inbox(&mut self, session: SessionView) {
+        self.session = session;
+        self.note_seen_watermark();
+    }
+
+    /// Merge a message that ARRIVED on the socket.
+    ///
+    /// **Merged by id, never appended blind.** The next re-read brings
+    /// the same message again, and a list that doubles a message is a
+    /// list nobody trusts. The arrival is also the moment the message
+    /// becomes NEW, and the moment the console says so — in the type's
+    /// own ink, in the tone that type has.
+    fn apply_live_message(&mut self, message: MessageView) {
+        let id = message.id;
+        let kind = CommsKind::from_wire(&message.kind);
+        self.session.messages.retain(|m| m.id != id);
+        self.session.messages.insert(0, message);
+        if id > self.comms_seen_max {
+            self.comms_unseen.insert(id);
+            self.comms_latest_ink = kind.map(|k| k.ink());
+            // The tone is the TYPE's, not the arrival's: a telegram ticks
+            // like a radio call and an administrative message interrupts
+            // like staff correspondence. One arrival, one sound.
+            crate::sfx::play(match kind {
+                Some(CommsKind::Administrative) => crate::sfx::Sfx::Admin,
+                _ => crate::sfx::Sfx::Telegram,
+            });
+        }
+    }
+
+    /// The watermark of what the operator has seen.
+    ///
+    /// The unseen set is judged against the newest id the surface has
+    /// shown: a re-read that brings the same messages must not mark them
+    /// all new again, and an arrival must survive the next re-read as
+    /// still-new until the operator looks.
+    fn note_seen_watermark(&mut self) {
+        let newest = self.session.messages.iter().map(|m| m.id).max().unwrap_or(0);
+        if newest > self.comms_seen_max {
+            self.comms_seen_max = newest;
+        }
     }
 
     /// The server's read for one step's related list, if the fan-out brought
@@ -15469,7 +15644,7 @@ impl IslandDemo {
             7 => &self.step_draft.content,
             8 => &self.step_draft.start_hour,
             9 => &self.step_draft.end_hour,
-            _ => &self.msg_content,
+            _ => &self.msg_draft.content,
         }
     }
 
@@ -15485,7 +15660,7 @@ impl IslandDemo {
             7 => &mut self.step_draft.content,
             8 => &mut self.step_draft.start_hour,
             9 => &mut self.step_draft.end_hour,
-            _ => &mut self.msg_content,
+            _ => &mut self.msg_draft.content,
         }
     }
 
@@ -15643,6 +15818,32 @@ impl IslandDemo {
             WriteId::StepDeclare => self.apply_step_declare(session),
             WriteId::StepVerb => self.apply_step_verb(session, note),
             WriteId::Message => self.apply_message(session),
+            // The inbox re-read. The session is installed and the
+            // operator's own draft SURVIVES it — a refresh that wiped
+            // the half-written message would be a refresh nobody dares
+            // press.
+            WriteId::Inbox => self.apply_inbox(session),
+            // A receipt, recorded. The message is marked read; the
+            // operator's draft is untouched.
+            WriteId::Receipt => {
+                self.msg_busy = false;
+                self.session = session;
+            }
+            // A withdrawal or a hide. The message is gone from this
+            // caller's view, and the surface says so.
+            WriteId::Delete => {
+                self.msg_busy = false;
+                self.session = session;
+                self.msg_status = Status::good("removed".to_string());
+            }
+            // A message that ARRIVED is never answered by this path — it
+            // comes on its own feed, not as a write's answer. The arm
+            // exists so a stray answer cannot be applied as somebody
+            // else's.
+            WriteId::Live => {
+                self.msg_busy = false;
+                self.session = session;
+            }
             WriteId::Roster => {
                 self.roster_busy = false;
                 self.roster_status.clear();
@@ -15758,6 +15959,21 @@ impl IslandDemo {
                 self.step_verb_status = Status::bad(why);
             }
             WriteId::Message => {
+                self.msg_busy = false;
+                self.msg_status = Status::bad(why);
+            }
+            WriteId::Inbox => {
+                self.msg_status = Status::bad(why);
+            }
+            WriteId::Receipt => {
+                self.msg_busy = false;
+                self.msg_status = Status::bad(why);
+            }
+            WriteId::Delete => {
+                self.msg_busy = false;
+                self.msg_status = Status::bad(why);
+            }
+            WriteId::Live => {
                 self.msg_busy = false;
                 self.msg_status = Status::bad(why);
             }
@@ -19720,6 +19936,26 @@ pub struct SessionView {
     pub mine: Vec<MyShip>,
     /// The inbox the caller may see, newest first (the server's order).
     pub messages: Vec<MessageView>,
+    /// The inbox read FAILED, and why.
+    ///
+    /// `None` is the ordinary answer. A failure is a real state — this
+    /// account may not read this exercise's traffic (403), or the server
+    /// was down — and the console must say so instead of drawing an empty
+    /// list that reads as "no messages".
+    pub inbox_error: Option<String>,
+    /// How many messages the exercise holds in all — the server's own
+    /// count, not the length of the page the console holds. A busy
+    /// exercise pages, and the surface must say so rather than draw a
+    /// truncated list as if it were the whole traffic.
+    pub inbox_total: u64,
+    /// The degrees (Derajat) the server accepts, read from its own
+    /// catalogue — the composer offers them and never a guessed number.
+    pub msg_degrees: Vec<crate::backend::MsgDegree>,
+    /// The scenario roles THIS game has issued: the only legal
+    /// `id_assumed_role`, and a judge's telegram needs one.
+    pub msg_roles: Vec<crate::backend::ScenarioRole>,
+    /// The roster, as the audience picker offers it.
+    pub msg_audience: Vec<AudienceSeat>,
     /// The exercise's step and its assumed time, when the server can stamp
     /// one. `None` when the clock has no anchor — a real state, not a gap.
     pub step: Option<StepView>,
@@ -20285,12 +20521,40 @@ pub enum ToBinary {
         step_id: i64,
         related: Vec<(String, i64)>,
     },
-    /// A telegram broadcast from the comms panel's composer row. The binary
-    /// owns the POST; the shell only collects what was typed, like every
-    /// other write. The envelope is the PROVEN path — kind telegram,
-    /// TERBUKA, BIASA, broadcast — because addressed mail, other markings
-    /// and other grades are unprobed; the panel states the cut.
-    SendTelegram { content: String },
+    /// A message from the comms surface's composer. The binary owns the
+    /// POST; the shell only collects what was picked, like every other
+    /// write.
+    ///
+    /// **The draft is the WHOLE envelope, not a broadcast.** The server's
+    /// contract (probed 2026-10-21) accepts a kind, a marking, a degree,
+    /// an audience, an assumed role, a hierarchy node and a reply link —
+    /// and refuses the ones that do not belong together ("A Telegram
+    /// message from the Game Master or a Judge must be sent AS a scenario
+    /// role", "A message with no `to` and no `cc` is a broadcast, and only
+    /// `TERBUKA` may be a broadcast"). The composer collects them and the
+    /// shell checks them; the binary sends them.
+    SendMessage { draft: MsgDraftForm },
+    /// Re-read the inbox, on the surface's own verb.
+    ///
+    /// The tab strip filters what the console already holds, so this is
+    /// not a filter request — it is a REFRESH, for the operator who
+    /// suspects the list is behind. The answer is the session, and it is
+    /// applied as [`WriteId::Inbox`] so the operator's own draft survives
+    /// it.
+    RefreshInbox,
+    /// Record this caller's read receipt on one message.
+    ///
+    /// The receipt is the ONLY place "when did they see it" is kept, and
+    /// the server refuses it for anybody who was not addressed — so a
+    /// broadcast has no receipt and asking for one is a refusal, not a
+    /// silent nothing.
+    MarkMessageRead { message_id: i64 },
+    /// Withdraw a message (the author) or hide it (an addressee). Which
+    /// branch the server takes follows from WHO the caller is, and the
+    /// two answer differently: the author's withdrawal answers 200, the
+    /// recipient's hide answers 404 even though the tombstone is
+    /// written.
+    DeleteMessage { message_id: i64 },
     /// This seat's declaration on the asking step: declare or withdraw. The
     /// binary owns the PUT/DELETE; the shell only asks, naming the step the
     /// row drew — the ids ride the button, never a cached guess.
@@ -20417,6 +20681,18 @@ pub struct CreatedSession {
         StepVerb,
         /// A telegram broadcast.
         Message,
+        /// The inbox re-read, on the comms surface's own refresh verb.
+        Inbox,
+        /// A message that ARRIVED on the socket.
+        ///
+        /// Its own name, because it is not a write: nothing was asked
+        /// for, and the answer must not clear the operator's draft or
+        /// re-seed the drafts underneath them.
+        Live,
+        /// A read receipt, recorded.
+        Receipt,
+        /// A message withdrawn or hidden.
+        Delete,
         /// The roster draft written through.
         Roster,
         /// The force draft written through.
@@ -20607,6 +20883,11 @@ impl Default for SessionView {
             my_ready: false,
             execution: false,
             messages: Vec::new(),
+            inbox_error: None,
+            inbox_total: 0,
+            msg_degrees: Vec::new(),
+            msg_roles: Vec::new(),
+            msg_audience: Vec::new(),
             step: None,
             people: Vec::new(),
             book: Vec::new(),
@@ -20736,15 +21017,311 @@ pub struct StepGateView {
     pub outstanding: Vec<String>,
 }
 
-/// One message in the session's inbox, as the comms panel shows it.
-#[derive(Clone, Debug)]
+/// One message in the session's inbox, as the comms surface shows it.
+///
+/// **Every field the server publishes is carried.** The projection that
+/// used to keep six of them is what made the classification (and the
+/// server's own border colour with it), the degree, the receipt and the
+/// reply link invisible to the console — and the marking is the whole
+/// difference between a routine telegram and a classified one.
+#[derive(Clone, Debug, Default)]
 pub struct MessageView {
-    pub sender: String,
+    /// The server's own id. The identity of the message: a live arrival
+    /// and a polled read are the same message when their ids agree.
+    pub id: i64,
+    /// `telegram` or `administrative` — the server's closed set of two.
     pub kind: String,
+    /// The marking's machine code: TERBUKA, TERBATAS or RAHASIA.
+    pub class_code: String,
+    /// The marking's printed name ("Terbuka", "Rahasia", …).
     pub class_label: String,
-    pub content: String,
-    pub at: String,
+    /// Who the server showed: an assumed role's name where one was
+    /// claimed, else the real author's name.
+    pub sender: String,
+    /// The real author's id, where the caller is entitled to it. `None`
+    /// for a message sent under a role — the server omits the author
+    /// there, and the console must not guess it back.
+    pub author_id: Option<i64>,
+    /// The sender spoke AS a scenario role. The server never reveals the
+    /// author in that case, so the console never shows one either.
+    pub assumed: bool,
+    /// No recipient list: the message went to the whole exercise.
     pub broadcast: bool,
+    pub content: String,
+    /// The server's timestamp, whole.
+    pub at: String,
+    /// The degree's name (BIASA, SEGERA, …) — the urgency the sender
+    /// marked it with.
+    pub degree: String,
+    /// The administrative message this one answers.
+    pub reply_to: Option<i64>,
+    /// THIS caller is a named recipient. The server's `only_mine` filter
+    /// means exactly this, and it is computed here from the recipient
+    /// list rather than paid for as another read.
+    pub to_me: bool,
+    /// When THIS caller read it. `None` for a broadcast: the server
+    /// refuses a receipt for a message nobody was addressed by, so a
+    /// broadcast has none to have.
+    pub read_at: Option<String>,
+    /// Who else was addressed, and whether each of them has read it.
+    pub recipients: Vec<MsgRecipientView>,
+}
+
+/// One addressee, as the comms surface shows it.
+#[derive(Clone, Debug, Default)]
+pub struct MsgRecipientView {
+    pub user_id: i64,
+    /// `to` or `cc`.
+    pub kind: String,
+    /// The name the roster gives them, when the console knows it.
+    pub name: String,
+    pub read_at: Option<String>,
+}
+
+/// The two kinds of message the server has, and the two markings it
+/// allows.
+///
+/// A CLOSED SET, taken from the server's own vocabulary (probed
+/// 2026-10-21): `kind` is `telegram` or `administrative` and nothing
+/// else, and a request carrying a third value is refused with "This
+/// field must be one of telegram administrative." The console keeps the
+/// same two, so the tab strip can never offer a verb the server would
+/// refuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CommsKind {
+    /// Between the personnel: a radio message, a broadcast of orders.
+    #[default]
+    Telegram,
+    /// Between the Judges and the Game Master: staff correspondence.
+    Administrative,
+}
+
+impl CommsKind {
+    /// The wire value. The server's own string, lowercase.
+    pub fn wire(self) -> &'static str {        match self {
+            CommsKind::Telegram => "telegram",
+            CommsKind::Administrative => "administrative",
+        }
+    }
+
+    /// The console's word for it on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            CommsKind::Telegram => "TELEGRAM",
+            CommsKind::Administrative => "ADMIN",
+        }
+    }
+
+    /// The kind the wire names, if it names one the console knows.
+    ///
+    /// An unknown wire value is `None`, not a guess: the server's set is
+    /// closed today, and a value outside it means the server has grown —
+    /// which the console must show honestly rather than fold into one of
+    /// its own two.
+    pub fn from_wire(kind: &str) -> Option<Self> {
+        match kind {
+            "telegram" => Some(CommsKind::Telegram),
+            "administrative" => Some(CommsKind::Administrative),
+            _ => None,
+        }
+    }
+
+    /// The ink this kind's own chrome carries.
+    ///
+    /// Telegram is the LIVE accent — the console spends `RADAR_CYAN` on
+    /// the one thing that is live, and a radio message is that thing.
+    /// Administrative is `WARNING_SAND`: attention without fault, which
+    /// is what staff correspondence is.
+    pub fn ink(self) -> Rgba {
+        match self {
+            CommsKind::Telegram => RADAR_CYAN,
+            CommsKind::Administrative => WARNING_SAND,
+        }
+    }
+}
+
+/// The three markings the server allows, and the ink each one is drawn in.
+///
+/// The server publishes a border colour with every message (`#FF0000`
+/// for RAHASIA, `#000000` otherwise) and it is the SERVER's statement
+/// about the message. The console does not paint with it: the palette
+/// belongs to `view`, and a server hex would bypass it — and every pixel
+/// assertion with it. The CODE is mapped to a console ink instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CommsMark {
+    /// TERBUKA — unclassified. The only marking that may be broadcast.
+    #[default]
+    Open,
+    /// TERBATAS — restricted. Readable by the addressed only.
+    Limited,
+    /// RAHASIA — classified. The one the concept singles out for red.
+    Classified,
+}
+
+impl CommsMark {
+    /// The wire value. The server's own string, uppercase.
+    pub fn wire(self) -> &'static str {
+        match self {
+            CommsMark::Open => "TERBUKA",
+            CommsMark::Limited => "TERBATAS",
+            CommsMark::Classified => "RAHASIA",
+        }
+    }
+
+    /// The console's word for it on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            CommsMark::Open => "TERBUKA",
+            CommsMark::Limited => "TERBATAS",
+            CommsMark::Classified => "RAHASIA",
+        }
+    }
+
+    /// The marking the wire names, if it names one the console knows.
+    pub fn from_wire(code: &str) -> Option<Self> {
+        match code {
+            "TERBUKA" => Some(CommsMark::Open),
+            "TERBATAS" => Some(CommsMark::Limited),
+            "RAHASIA" => Some(CommsMark::Classified),
+            _ => None,
+        }
+    }
+
+    /// The ink this marking is drawn in.
+    pub fn ink(self) -> Rgba {
+        match self {
+            // Open is structure, not news: the hairline's own grey.
+            CommsMark::Open => CUT_GREY,
+            CommsMark::Limited => DATA_AMBER,
+            CommsMark::Classified => FAULT_RED,
+        }
+    }
+}
+
+/// The comms surface's kind strip: what KIND of traffic is on screen.
+///
+/// Two kinds and an ALL, and no more — the server's set is closed, so a
+/// third tab would be a tab the server cannot fill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CommsTab {
+    /// Both kinds, in the server's own order (newest first).
+    #[default]
+    All,
+    /// Radio traffic between the personnel.
+    Telegram,
+    /// Correspondence between the Judges and the Game Master.
+    Admin,
+}
+
+impl CommsTab {
+    /// The tab's word on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            CommsTab::All => "ALL",
+            CommsTab::Telegram => "TELEGRAM",
+            CommsTab::Admin => "ADMIN",
+        }
+    }
+
+    /// The kind this tab shows, if it shows one.
+    pub fn kind(self) -> Option<CommsKind> {
+        match self {
+            CommsTab::All => None,
+            CommsTab::Telegram => Some(CommsKind::Telegram),
+            CommsTab::Admin => Some(CommsKind::Administrative),
+        }
+    }
+
+    /// Does this tab show a message of that kind?
+    pub fn shows(self, kind: &str) -> bool {
+        match self.kind() {
+            None => true,
+            Some(k) => k.wire() == kind,
+        }
+    }
+}
+
+/// The comms surface's scope: WHICH SLICE of the tab is on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CommsScope {
+    /// Everything the tab holds.
+    #[default]
+    All,
+    /// Only what was addressed to THIS caller.
+    ///
+    /// The server's own `only_mine` filter means exactly this — the
+    /// caller is a NAMED recipient, broadcasts excluded — and the console
+    /// computes it from the recipient list rather than paying for another
+    /// read.
+    ToMe,
+    /// Only the broadcasts: the messages with no recipient list at all.
+    Broadcast,
+}
+
+impl CommsScope {
+    /// The chip's word on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            CommsScope::All => "ALL",
+            CommsScope::ToMe => "TO ME",
+            CommsScope::Broadcast => "BROADCAST",
+        }
+    }
+
+    /// Does this scope show that message?
+    pub fn shows(self, m: &MessageView) -> bool {
+        match self {
+            CommsScope::All => true,
+            CommsScope::ToMe => m.to_me,
+            CommsScope::Broadcast => m.broadcast,
+        }
+    }
+}
+
+/// One seat, as the audience picker offers it.
+///
+/// **The roster, and nothing more.** The server refuses an audience that
+/// is not in the exercise ("A recipient is not a participant of this
+/// game"), and for a TELEGRAM it refuses a recipient who commands nothing
+/// ("A Telegram message is addressed to a command post, and `X` holds
+/// none in this game"). The console cannot know which seats hold a post
+/// — the roster does not say — so it offers the seats and lets the
+/// server rule on the ones that would be refused. It never greys a seat
+/// out on a guess.
+#[derive(Clone, Debug, Default)]
+pub struct AudienceSeat {
+    pub user_id: i64,
+    pub name: String,
+    /// The role's name in the exercise.
+    pub role: String,
+    /// The seat is on the judge side (the Game Master, the Judges).
+    pub judge: bool,
+}
+
+/// A message being composed, as the comms surface edits it.
+///
+/// The shell's own shape, and not the backend's: the console's composer
+/// edits FIELDS a person picks, and the backend's draft carries the
+/// wire's spelling of the same thing. The binary translates.
+#[derive(Clone, Debug, Default)]
+pub struct MsgDraftForm {
+    pub kind: CommsKind,
+    pub mark: CommsMark,
+    /// The urgency, as the server's own degree id.
+    pub degree: i64,
+    pub content: String,
+    /// The addressees. Empty means a broadcast — which the server only
+    /// allows for TERBUKA.
+    pub to: Vec<i64>,
+    pub cc: Vec<i64>,
+    /// The scenario role the sender speaks AS. A judge's telegram needs
+    /// one; anybody else's must not have one.
+    pub assumed_role: Option<i64>,
+    /// The task-organisation node the sender speaks FROM. Required
+    /// beside an assumed role, refused without one.
+    pub hierarchy_node: Option<i64>,
+    /// The administrative message this one answers.
+    pub reply_to: Option<i64>,
 }
 
 /// The exercise's step, as the step panel shows it: what is being played, and
@@ -21080,6 +21657,17 @@ pub struct ThumbRaw {
 /// progressively, never all-or-nothing.
 pub type ThumbFeed =
     std::boxed::Box<dyn FnMut() -> Option<Vec<ThumbRaw>> + Send + 'static>;
+
+/// A message that ARRIVED on the socket, drained like every other feed.
+///
+/// Its own feed, and not another arm of the session answer, because a
+/// live arrival is NOT a write: nothing was asked for, there is no
+/// re-read to apply, and the operator's own draft must survive it. The
+/// socket carries both kinds of traffic — a broadcast on the game's
+/// channel, an addressed message on the account's own — and the console
+/// missed both until this feed existed.
+pub type LiveMessageFeed =
+    std::boxed::Box<dyn FnMut() -> Option<MessageView> + Send + 'static>;
 
 /// Mint a paintable thumbnail from decoded bytes. `None` on a byte-count
 /// mismatch — a corrupt fetch paints nothing, never a torn image.
@@ -22064,6 +22652,7 @@ pub fn run_replay(dir: String, burst_ms: u64, looping: bool) {
         std::boxed::Box::new(|| None),
         std::boxed::Box::new(|| None),
         std::boxed::Box::new(|| None),
+        std::boxed::Box::new(|| None),
         std::sync::mpsc::channel().0,
         fixture_roster(),
         125,
@@ -22095,6 +22684,7 @@ pub fn run(
     mut embark_spec_feed: EmbarkSpecFeed,
     mut thumb_feed: ThumbFeed,
     mut spec_feed: SpecFeed,
+    mut live_message_feed: LiveMessageFeed,
     order_tx: OrderSink,
     roster: Vec<RosterRow>,
     roster_total: usize,
@@ -22204,6 +22794,7 @@ pub fn run(
         let status_drain = entity.clone();
         let signin_drain = entity.clone();
         let create_drain = entity.clone();
+        let live_message_drain = entity.clone();
         let timeline_drain = entity.clone();
         let judgements_drain = entity.clone();
         let reviews_drain = entity.clone();
@@ -22375,6 +22966,20 @@ pub fn run(
                                     Ok(created) => root.apply_answer(created),
                                     Err(refusal) => root.apply_refusal(refusal),
                             }
+                            cx.notify();
+                        })
+                    });
+                }
+                // A message that ARRIVED. The socket carries the
+                // broadcast on the game's channel and the addressed one on
+                // the account's own channel; both arrive here, and both
+                // are MERGED into the inbox by id — never appended blind,
+                // because the next re-read brings the same message again
+                // and a list that doubles is a list nobody trusts.
+                if let Some(message) = live_message_feed() {
+                    let _ = cx.update(|app| {
+                        live_message_drain.update(app, |root: &mut IslandDemo, cx| {
+                            root.apply_live_message(message);
                             cx.notify();
                         })
                     });
@@ -28011,13 +28616,13 @@ mod tests {
         };
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
-            demo.msg_content = "telegram proof from the shell".to_string();
+            demo.msg_draft.content = "telegram proof from the shell".to_string();
             demo
         });
         let sent = cx.update(|_window, app| view.update(app, |demo, cx| demo.send_telegram(cx)));
         assert!(sent, "an executing game with a drafted line sends");
         let content = match rx.try_recv().expect("the telegram reached the sink") {
-            ToBinary::SendTelegram { content } => content,
+            ToBinary::SendMessage { draft } => draft.content,
             other => panic!("expected a telegram, got {other:?}"),
         };
         assert_eq!(content, "telegram proof from the shell");
@@ -28035,7 +28640,7 @@ mod tests {
         };
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
-            demo.msg_content = "too early".to_string();
+            demo.msg_draft.content = "too early".to_string();
             demo
         });
         let sent = cx.update(|_window, app| view.update(app, |demo, cx| demo.send_telegram(cx)));

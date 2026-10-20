@@ -88,11 +88,28 @@ pub struct GameMsg {
     pub kind: String,
     pub class_code: String,
     pub class_label: String,
+    /// The colour the server says this marking's border is. Carried
+    /// because it is the server's statement about the message; the
+    /// console draws its own ink, so this is read and not used to paint.
+    pub border_color: String,
     /// Assumed role name, else real author name, else unknown.
     pub sender: String,
+    /// The real author's id, when the publication carries one. An
+    /// event NEVER carries the author when an identity was assumed —
+    /// not even for the Game Master — so this is `None` for a message
+    /// sent under a role.
+    pub author_id: Option<i64>,
+    /// No recipient list: the message went to the whole exercise.
     pub broadcast: bool,
+    /// Who was addressed. Empty for a broadcast.
+    pub recipients: Vec<i64>,
     pub content: String,
     pub callsign: String,
+    /// The degree's id and name.
+    pub degree_id: Option<i64>,
+    pub degree_name: String,
+    /// The administrative message this one answers.
+    pub reply_to: Option<i64>,
     pub created_at: String,
     pub assumed_at: String,
     pub occurred_at: String,
@@ -125,10 +142,25 @@ pub(crate) fn parse_message_event(data: &[u8]) -> Option<GameMsg> {
         kind: d["kind"].as_str().unwrap_or("").to_string(),
         class_code: d["classification"]["code"].as_str().unwrap_or("").to_string(),
         class_label: d["classification"]["label"].as_str().unwrap_or("").to_string(),
+        border_color: d["classification"]["border_color"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
         sender,
+        author_id: d["sender"]["author"]["id"].as_i64(),
         broadcast: d["broadcast"].as_bool().unwrap_or(false),
+        recipients: d["recipients"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| r["id_user"].as_i64())
+            .collect(),
         content: d["content"].as_str().unwrap_or("").to_string(),
         callsign: d["callsign"].as_str().unwrap_or("").to_string(),
+        degree_id: d["degree"]["id"].as_i64(),
+        degree_name: d["degree"]["name"].as_str().unwrap_or("").to_string(),
+        reply_to: d["id_reply_to"].as_i64(),
         created_at: d["created_at"].as_str().unwrap_or("").to_string(),
         assumed_at: d["assumed_at"].as_str().unwrap_or("").to_string(),
         occurred_at: v["occurred_at"].as_str().unwrap_or("").to_string(),

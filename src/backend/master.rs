@@ -1841,6 +1841,18 @@ impl MinosMaster {
     /// marked TERBUKA/TERBATAS/RAHASIA, broadcast when neither to nor
     /// cc names anyone. The answer is the stored message as the caller
     /// may see it (the real author rides only where entitled).
+    ///
+    /// **The body is the server's contract, field for field** (probed
+    /// 2026-10-21 against the dev API): `kind`, `classification`,
+    /// `content` and `id_degree` are all REQUIRED, and everything else
+    /// is optional. Two of the optional ones are not decoration:
+    ///
+    /// - `id_hierarchy_node` — REQUIRED beside `id_assumed_role` when a
+    ///   judge sends a telegram ("the role says who is speaking, and
+    ///   the node says where from"), and FORBIDDEN without it.
+    /// - `id_type` — NOT SENT. The column is an integer foreign key to a
+    ///   `message_types` table that has no rows and no route, so every
+    ///   value the server accepts on the wire is refused by the key.
     pub fn send_message(
         &self,
         token: &str,
@@ -1866,11 +1878,11 @@ impl MinosMaster {
         if let Some(r) = draft.assumed_role {
             body["id_assumed_role"] = serde_json::Value::from(r);
         }
+        if let Some(n) = draft.hierarchy_node {
+            body["id_hierarchy_node"] = serde_json::Value::from(n);
+        }
         if let Some(r) = draft.reply_to {
             body["id_reply_to"] = serde_json::Value::from(r);
-        }
-        if let Some(t) = draft.msg_type {
-            body["id_type"] = serde_json::Value::from(t);
         }
         for (k, v) in [
             ("callsign", &draft.callsign),
@@ -1905,6 +1917,13 @@ impl MinosMaster {
     /// One inbox page (messages ticket): kind + mine narrows ride
     /// along, offset paging binds the UI's prev/next. The leftover
     /// single-100 call above stays for callers with no pager.
+    ///
+    /// **The server's paging parameters are `page_size` and
+    /// `page_number`** (probed 2026-10-21: `limit`/`offset` and
+    /// `page`/`size` are silently ignored), the page is 1-BASED, the
+    /// default size is 25 and the maximum is 200. The meta block names
+    /// are `total_records`, `total_pages`, `page_size`, `current_page`,
+    /// `has_next_page`, `has_previous_page`.
     pub fn inbox_page(
         &self,
         token: &str,
@@ -1962,6 +1981,15 @@ impl MinosMaster {
     /// clears it for everybody, a recipient's hides their own view —
     /// a broadcast a caller merely saw refuses loudly with the
     /// reason. No edit route exists, so none is modeled.
+    ///
+    /// **The two branches answer differently** (probed 2026-10-21): the
+    /// author's withdrawal answers 200 with the message and a
+    /// `sender_deleted_at`, the RECIPIENT's hide answers **404** even
+    /// though the tombstone is written, and anybody else answers 403
+    /// with "This message was not addressed to you…". So the 404 here is
+    /// not a failure to hide — it is the server's way of saying the
+    /// message is gone from this caller's view. [`delete_message_view`]
+    /// reports that branch instead of an error.
     pub fn delete_message(
         &self,
         token: &str,
@@ -1972,6 +2000,51 @@ impl MinosMaster {
         Self::parse_inbox(&data).ok_or_else(|| {
             BackendError::Other(format!("message #{message_id} unreadable after delete"))
         })
+    }
+
+    /// Delete one message and report WHICH branch the server took.
+    ///
+    /// The three outcomes are different answers to different questions:
+    /// the author withdrew it (gone for everybody), a recipient hid it
+    /// (gone for this caller alone), and somebody who was neither
+    /// refuses with the reason. Collapsing them into one error would
+    /// tell the operator "could not delete" after the delete WORKED.
+    pub fn delete_message_view(
+        &self,
+        token: &str,
+        game_id: i64,
+        message_id: i64,
+    ) -> Result<DeleteOutcome, BackendError> {
+        match self.delete_message(token, game_id, message_id) {
+            Ok(msg) => Ok(DeleteOutcome::Withdrawn(msg)),
+            Err(BackendError::Api { status: 404, .. }) => Ok(DeleteOutcome::Hidden),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The degrees (Derajat) the server accepts, from its own catalogue.
+    ///
+    /// `id_degree` is a FOREIGN KEY, not an enum: the values are
+    /// BIASA (1), SEGERA (2), SANGAT SEGERA (3) and KILAT (4) in the
+    /// seed, but the contract says to read them, and an unknown id is a
+    /// 400 that names the catalogue ("Read the accepted values from
+    /// `/helpers` under `message_degrees`"). Reading them means the
+    /// console never hard-codes a number the server may change.
+    pub fn message_degrees(&self, token: &str) -> Result<Vec<MsgDegree>, BackendError> {
+        let data = self.get(token, "/helpers")?;
+        Ok(data["helpers"]["message_degrees"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|d| {
+                Some(MsgDegree {
+                    id: d["id"].as_i64()?,
+                    name: d["name"].as_str().unwrap_or("").to_string(),
+                    label: d["id_name"].as_str().unwrap_or("").to_string(),
+                })
+            })
+            .collect())
     }
 
     /// Closure timeline page (assessment ticket): the merged event
@@ -2991,12 +3064,22 @@ impl MinosMaster {
     /// claimed, else the real author where entitled, else unknown —
     /// the server omits (never blanks) what the caller may not see, so
     /// the island renders assumed identity alone there by construction.
+    ///
+    /// **Everything the server publishes is read.** The projection that
+    /// used to keep six fields is what made the classification, the
+    /// border colour, the degree, the receipt and the reply link
+    /// invisible to the console.
     fn parse_inbox(v: &serde_json::Value) -> Option<InboxMsg> {
         Some(InboxMsg {
             id: v["id"].as_i64()?,
             game_id: v["id_game"].as_i64().unwrap_or(0),
             kind: v["kind"].as_str().unwrap_or("").to_string(),
+            class_code: v["classification"]["code"].as_str().unwrap_or("").to_string(),
             class_label: v["classification"]["label"].as_str().unwrap_or("").to_string(),
+            border_color: v["classification"]["border_color"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
             sender: v["sender"]["assumed_role"]["name"]
                 .as_str()
                 .map(|s| s.to_string())
@@ -3004,10 +3087,22 @@ impl MinosMaster {
                     v["sender"]["author"]["name"].as_str().map(|s| s.to_string())
                 })
                 .unwrap_or_else(|| "unknown sender".to_string()),
+            assumed_role_id: v["sender"]["assumed_role"]["id"].as_i64(),
+            author_id: v["sender"]["author"]["id"].as_i64(),
+            author_name: v["sender"]["author"]["name"].as_str().map(|s| s.to_string()),
             broadcast: v["broadcast"].as_bool().unwrap_or(false),
             content: v["content"].as_str().unwrap_or("").to_string(),
             callsign: v["callsign"].as_str().unwrap_or("").to_string(),
+            sending_note: v["sending_note"].as_str().unwrap_or("").to_string(),
+            group_name: v["group_name"].as_str().unwrap_or("").to_string(),
+            per: v["per"].as_str().unwrap_or("").to_string(),
+            registration_number: v["registration_number"].as_str().unwrap_or("").to_string(),
+            degree_id: v["degree"]["id"].as_i64(),
+            degree_name: v["degree"]["name"].as_str().unwrap_or("").to_string(),
+            reply_to: v["id_reply_to"].as_i64(),
+            assumed_at: v["assumed_at"].as_str().unwrap_or("").to_string(),
             created_at: v["created_at"].as_str().unwrap_or("").to_string(),
+            sender_deleted_at: v["sender_deleted_at"].as_str().map(|s| s.to_string()),
             recipients: v["recipients"]
                 .as_array()
                 .cloned()
@@ -3018,6 +3113,8 @@ impl MinosMaster {
                         user_id: r["id_user"].as_i64()?,
                         kind: r["kind"].as_str().unwrap_or("").to_string(),
                         read_at: r["read_at"].as_str().map(|s| s.to_string()),
+                        deleted: r["deleted"].as_bool().unwrap_or(false),
+                        deleted_at: r["deleted_at"].as_str().map(|s| s.to_string()),
                     })
                 })
                 .collect(),
@@ -3725,23 +3822,88 @@ pub struct GameClock {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MsgRecipient {
     pub user_id: i64,
+    /// `to` or `cc`.
     pub kind: String,
+    /// When this addressee first read it. `None` until the receipt is
+    /// taken — and a broadcast has NO receipts at all, because the
+    /// server refuses a receipt for a message nobody was addressed by.
     pub read_at: Option<String>,
+    /// This addressee hid the message (the delete-for-me branch).
+    pub deleted: bool,
+    /// When they hid it.
+    pub deleted_at: Option<String>,
 }
 
 /// One inbox message as the client draws it (#99).
+///
+/// **Every field the server publishes is kept.** The console drew four
+/// of them and threw the rest away, which is how the classification
+/// (the server's own border colour included) never reached the screen.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InboxMsg {
     pub id: i64,
     pub game_id: i64,
+    /// `telegram` or `administrative` — the server's closed set.
     pub kind: String,
+    /// The marking's machine code: TERBUKA, TERBATAS or RAHASIA.
+    pub class_code: String,
+    /// The marking's printed name ("Terbuka", "Rahasia", …).
     pub class_label: String,
+    /// The colour the SERVER says this marking's border is. Parsed on
+    /// purpose and NOT used to draw: the console's palette is owned by
+    /// `view`, and a server hex would bypass it (and every pixel
+    /// assertion with it). The console maps the CODE to its own ink.
+    pub border_color: String,
+    /// The identity the server showed: an assumed role's name where one
+    /// was claimed, else the real author's name, else unknown.
     pub sender: String,
+    /// The assumed role's id, when the sender spoke as one.
+    pub assumed_role_id: Option<i64>,
+    /// The real author's id — present only where the caller is entitled
+    /// to see it (the author, the Game Master and the Judges).
+    pub author_id: Option<i64>,
+    /// The real author's name, on the same entitlement.
+    pub author_name: Option<String>,
+    /// No `to` and no `cc`: the message went to the whole exercise.
     pub broadcast: bool,
     pub content: String,
     pub callsign: String,
+    /// The author's own note about the dispatch.
+    pub sending_note: String,
+    /// The unit or group the message speaks for.
+    pub group_name: String,
+    /// The "per" line — who it is for.
+    pub per: String,
+    pub registration_number: String,
+    /// The degree's id and name (BIASA, SEGERA, …).
+    pub degree_id: Option<i64>,
+    pub degree_name: String,
+    /// The message this one answers. Only an administrative message can
+    /// be answered; the server refuses the link on a telegram.
+    pub reply_to: Option<i64>,
+    /// The scenario instant the message was written at.
+    pub assumed_at: String,
+    /// When the message was written (the server's authoritative
+    /// timestamp).
     pub created_at: String,
+    /// Set when the author withdrew the message.
+    pub sender_deleted_at: Option<String>,
     pub recipients: Vec<MsgRecipient>,
+}
+
+/// What a delete did, when the server takes more than one branch.
+///
+/// The author withdraws a message for everybody; a recipient hides it
+/// for themselves alone; anybody else is refused. The server answers
+/// 200, 404 and 403 for those three, and the 404 still wrote the
+/// tombstone — so the branch has to be named, or a successful hide
+/// reads as a failure.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteOutcome {
+    /// The author's withdrawal: the message is gone for everybody.
+    Withdrawn(InboxMsg),
+    /// The recipient's hide: gone from this caller's view alone.
+    Hidden,
 }
 
 /// One inbox page with its navigation block (messages ticket): the
@@ -3768,15 +3930,34 @@ pub struct MsgDraft {
     pub content: String,
     pub to: Vec<i64>,
     pub cc: Vec<i64>,
+    /// The scenario role the sender speaks AS. Required for a judge's
+    /// telegram, refused for anybody else's, and legal only for a role
+    /// this game issued.
     pub assumed_role: Option<i64>,
+    /// The task-organisation node the sender speaks FROM. Required
+    /// beside an assumed role ("the role says who is speaking, and the
+    /// node says where from") and refused without one.
+    pub hierarchy_node: Option<i64>,
+    /// The administrative message this one answers.
     pub reply_to: Option<i64>,
+    /// The degree (Derajat) — a foreign key into the server's
+    /// catalogue, read from `/helpers` rather than guessed.
     pub degree: i64,
-    pub msg_type: Option<i64>,
     pub callsign: String,
     pub sending_note: String,
     pub group_name: String,
     pub per: String,
     pub registration_number: String,
+}
+
+/// One degree (Derajat) the server accepts (#99).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MsgDegree {
+    pub id: i64,
+    /// The catalogue's own name: BIASA, SEGERA, SANGAT SEGERA, KILAT.
+    pub name: String,
+    /// The printed label: Biasa, Segera, …
+    pub label: String,
 }
 
 /// One scenario-role identity staff may send as (#99).

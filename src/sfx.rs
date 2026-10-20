@@ -29,6 +29,19 @@ pub enum Sfx {
     Ding,
     /// The client refused an interaction. Low, blunt.
     Buzz,
+    /// A TELEGRAM arrived on the wire.
+    ///
+    /// A short carrier tick, distinct from the click and from the ding:
+    /// the operator must be able to tell "something arrived" from "you
+    /// clicked something" without looking at the screen. Two quick
+    /// high bursts, like a radio acknowledging a call.
+    Telegram,
+    /// An ADMINISTRATIVE message arrived on the wire.
+    ///
+    /// The staff counterpart of the telegram tick: lower and longer,
+    /// because the traffic between the Game Master and the Judges is
+    /// rarer and reads as an interruption rather than as chatter.
+    Admin,
 }
 
 const RATE: u32 = 22_050;
@@ -68,6 +81,18 @@ fn samples(kind: Sfx) -> Vec<f32> {
             v
         }
         Sfx::Buzz => blunt(140.0, 220, 0.30),
+        Sfx::Telegram => {
+            // Two quick high bursts: a carrier acknowledging a call.
+            let mut v = burst(1760.0, 40, 0.20);
+            v.extend(burst(1760.0, 40, 0.20));
+            v
+        }
+        Sfx::Admin => {
+            // Lower and longer: an interruption, not chatter.
+            let mut v = burst(587.0, 90, 0.24);
+            v.extend(burst(440.0, 160, 0.24));
+            v
+        }
     }
 }
 
