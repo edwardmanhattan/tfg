@@ -22,7 +22,7 @@ pub use error::BackendError;
 pub use auth::{AppRole, AuthenticatedUser, MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
 pub use feed::{GameMsg, MinosRest, Snapshot};
 pub use live::{LIVE_BACKOFF_BASE_SECS, LIVE_BACKOFF_CAP_SECS, LiveCmd, LiveEvent, LiveWire};
-pub use master::{AssetGroup, BackendUser, CurrentStepAsking, CurrentStepPlaying, CurrentStepScenario, CurrentStepStep, CurrentStepView, EchelonLevel, EmbarkationCandidate, EmbarkationResult, EmbarkedUnit, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePace, GameRole, GameScenario, GameScenarioStep, GameStepRun, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameReadinessView, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, OverCapacity, ServiceBranchCount, TimeWindow, UnitCapacity, UnitCommander, UnitSpeedEntry, UnitSpeeds, actual_to_rfc3339, assumed_hhmm_to_rfc3339, date_ok, hhmm_ok, hhmm_window_ok, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, RelatedPerson, RelatedPost, Review, ScenarioRole, StepReadiness, StepReadinessPerson, StepRelated, StepRewind, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
+pub use master::{AssetGroup, BackendUser, CurrentStepAsking, CurrentStepPlaying, CurrentStepScenario, CurrentStepStep, CurrentStepView, EchelonLevel, EmbarkationCandidate, EmbarkationResult, EmbarkedUnit, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePace, GameRole, GameScenario, GameScenarioStep, GameStepRun, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameReadinessView, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, OrderOutcome, OverCapacity, PositionSet, ServiceBranchCount, StagedOrder, StagedOrderList, StagedOrderScope, TimeWindow, UnitCapacity, UnitCommander, UnitSpeedEntry, UnitSpeeds, actual_to_rfc3339, assumed_hhmm_to_rfc3339, date_ok, hhmm_ok, hhmm_window_ok, MsgDraft, MsgRecipient, Participant, PlacementList, PositionList, RelatedPerson, RelatedPost, Review, ScenarioRole, StepReadiness, StepReadinessPerson, StepRelated, StepRewind, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
 pub use replay::{FileReplay, now_ts};
 // Shared with live.rs and the tests below; not public API.
 pub(crate) use feed::FeedEvent;
@@ -1027,7 +1027,10 @@ mod tests {
             }
         });
         let master = MinosMaster::new("http://127.0.0.1:18090/api/v1").expect("client builds");
-        let fix = master.order_unit("AT", 3, 13, 45.0, 20.0, None).expect("order");
+        let outcome = master.order_unit("AT", 3, 13, 45.0, 20.0, None).expect("order");
+        let OrderOutcome::Applied(fix) = outcome else {
+            panic!("a 201 order is applied, not held");
+        };
         assert_eq!(fix.unit_id, 13);
         assert!(fix.clamped, "20 kn exceeded the hull's published max");
         assert_eq!(fix.requested_speed, Some(20.0), "ask preserved beside the clamp");
@@ -1037,6 +1040,172 @@ mod tests {
         assert_eq!(plot.assumed_time, "2026-11-01T01:05:00Z", "instant echoed back");
         assert_eq!(plot.positions.len(), 1);
         assert_eq!(plot.positions[0].heading, 45.0);
+    }
+
+    /// A SCENARIO EXERCISE HOLDS AN ORDER until a step that relates the
+    /// hull is played, and the server answers 202 with the held order:
+    /// a heading and a speed, and NO position and NO instant, because
+    /// neither is known until the order is released. Reading that as a
+    /// fix would put a hull on the plot that has not moved, and
+    /// refusing it would report an ordinary order as a failure — so the
+    /// client says which of the two it got.
+    #[test]
+    fn a_held_order_answers_202_and_is_not_a_fix() {
+        let server = tiny_http::Server::http("127.0.0.1:18099").expect("bind test port");
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests().take(1) {
+                assert_eq!(rq.method().as_str(), "POST");
+                assert_eq!(rq.url(), "/api/v1/games/58/units/81/order");
+                let _ = rq.respond(tiny_http::Response::from_string(
+                    r#"{"status_code":202,"message":"Successfull","data":{"id_unit":81,"staged":true,"heading_deg":90.0,"speed_kn":8.0,"speed_ms":4.1155,"clamped":false,"staged_at":"2026-11-01T01:00:00Z","released_by":"the next played step that releases this hull"}}"#,
+                )
+                .with_status_code(202));
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18099/api/v1").expect("client builds");
+        let outcome = master.order_unit("AT", 58, 81, 90.0, 8.0, None).expect("order");
+        let OrderOutcome::Staged(held) = outcome else {
+            panic!("a 202 order is held, not applied");
+        };
+        assert_eq!(held.unit_id, 81);
+        assert_eq!(held.heading_deg, 90.0);
+        assert_eq!(held.speed_kn, 8.0);
+        assert_eq!(held.requested_speed_kn, None, "an honoured order carries no ask");
+        assert!(!held.clamped);
+        assert_eq!(held.staged_at, "2026-11-01T01:00:00Z");
+        assert_eq!(
+            held.released_by, "the next played step that releases this hull",
+            "the server's sentence is carried through, not paraphrased"
+        );
+    }
+
+    /// A HELD ORDER IS VALIDATED AS STRICTLY AS AN APPLIED ONE, because
+    /// a body the client cannot believe is a body it must not draw. A
+    /// 202 that names another hull, or that does not say it was staged,
+    /// is refused the way a malformed 201 is refused: the client refuses
+    /// to lie to itself rather than to fill a gap.
+    #[test]
+    fn a_malformed_held_order_is_refused() {
+        let server = tiny_http::Server::http("127.0.0.1:18100").expect("bind test port");
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests().take(2) {
+                let body = if rq.url() == "/api/v1/games/58/units/81/order" {
+                    // Another hull than the path named.
+                    r#"{"status_code":202,"message":"Successfull","data":{"id_unit":82,"staged":true,"heading_deg":90.0,"speed_kn":8.0,"clamped":false,"staged_at":"2026-11-01T01:00:00Z","released_by":"the next played step that releases this hull"}}"#
+                } else {
+                    // A body that does not say it was staged.
+                    r#"{"status_code":202,"message":"Successfull","data":{"id_unit":81,"heading_deg":90.0,"speed_kn":8.0,"clamped":false,"staged_at":"2026-11-01T01:00:00Z","released_by":"the next played step that releases this hull"}}"#
+                };
+                let _ = rq.respond(
+                    tiny_http::Response::from_string(body).with_status_code(202),
+                );
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18100/api/v1").expect("client builds");
+        let wrong_hull = master.order_unit("AT", 58, 81, 90.0, 8.0, None);
+        assert!(
+            wrong_hull.is_err(),
+            "a held order for another hull is not this hull's order"
+        );
+        let not_staged = master.order_unit("AT", 59, 81, 90.0, 8.0, None);
+        assert!(
+            not_staged.is_err(),
+            "a body that does not say it was staged is not a held order"
+        );
+    }
+
+    /// A STATIC EXERCISE'S POSITION IS SET BY HAND: the route is a PUT
+    /// carrying a latitude and a longitude and nothing else — no
+    /// heading, no speed, no time, because a hull that was set is
+    /// stationary and the instant is the exercise's clock. The answer
+    /// is a JUMP, which is why it is not read as a fix.
+    #[test]
+    fn a_static_position_is_set_by_hand() {
+        let server = tiny_http::Server::http("127.0.0.1:18101").expect("bind test port");
+        std::thread::spawn(move || {
+            for mut rq in server.incoming_requests().take(1) {
+                assert_eq!(rq.method().as_str(), "PUT");
+                assert_eq!(rq.url(), "/api/v1/games/58/units/13/position");
+                let mut text = String::new();
+                rq.as_reader().read_to_string(&mut text).expect("body reads");
+                let v: serde_json::Value = serde_json::from_str(&text).expect("json body");
+                assert_eq!(v["latitude"].as_f64(), Some(-6.0888));
+                assert_eq!(v["longitude"].as_f64(), Some(106.9111));
+                assert!(v.get("heading_deg").is_none(), "a set position states no course");
+                assert!(v.get("assumed_time").is_none(), "the instant is the clock's");
+                let _ = rq.respond(tiny_http::Response::from_string(
+                    r#"{"status_code":201,"message":"Successfull","data":{"id_unit":13,"assumed_time":"2026-11-01T01:00:00Z","kind":"jump","latitude":-6.0888,"longitude":106.9111,"heading_deg":0,"speed_kn":0,"speed_ms":0,"clamped":false,"created_at":"2026-11-01T01:00:00Z","created_by":6}}"#,
+                )
+                .with_status_code(201));
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18101/api/v1").expect("client builds");
+        let set = master
+            .set_unit_position("AT", 58, 13, -6.0888, 106.9111)
+            .expect("set");
+        assert_eq!(set.unit_id, 13);
+        assert_eq!(set.latitude, -6.0888);
+        assert_eq!(set.longitude, 106.9111);
+        assert_eq!(set.assumed_time, "2026-11-01T01:00:00Z");
+    }
+
+    /// WHAT THE EXERCISE IS HOLDING IS LISTABLE, and the list says which
+    /// question it answered: `own` for the commander (the orders waiting
+    /// for the hulls they command) and `game` for the Game Master
+    /// (everything it holds). Inferring the reach from the list's
+    /// length would be a guess, so the server states it.
+    #[test]
+    fn the_held_orders_are_listable() {
+        let server = tiny_http::Server::http("127.0.0.1:18102").expect("bind test port");
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests().take(1) {
+                assert_eq!(rq.method().as_str(), "GET");
+                assert_eq!(rq.url(), "/api/v1/games/58/staged-orders");
+                let _ = rq.respond(tiny_http::Response::from_string(
+                    r#"{"status_code":200,"message":"Successfull","data":{"id_game":58,"scope":"own","items":[{"id_unit":81,"staged":true,"heading_deg":90.0,"speed_kn":8.0,"speed_ms":4.1155,"requested_speed_kn":12.0,"clamped":true,"staged_at":"2026-11-01T01:00:00Z","released_by":"the next played step that releases this hull"}]}}"#,
+                ));
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18102/api/v1").expect("client builds");
+        let list = master.staged_orders("AT", 58).expect("list");
+        assert_eq!(list.game_id, 58);
+        assert_eq!(list.scope, StagedOrderScope::Own);
+        assert_eq!(list.items.len(), 1);
+        let held = &list.items[0];
+        assert_eq!(held.unit_id, 81);
+        assert_eq!(held.heading_deg, 90.0);
+        assert_eq!(held.speed_kn, 8.0);
+        assert_eq!(held.requested_speed_kn, Some(12.0), "the ask rides beside the clamp");
+        assert!(held.clamped);
+    }
+
+    /// THE CALL SIGN IS THE NET'S NAME for somebody in this exercise,
+    /// and it is its own route: a role change clears the seat's
+    /// readiness and a rename must not. The answer is the whole roster,
+    /// as every roster write is.
+    #[test]
+    fn a_participant_can_be_renamed() {
+        let server = tiny_http::Server::http("127.0.0.1:18103").expect("bind test port");
+        std::thread::spawn(move || {
+            for mut rq in server.incoming_requests().take(1) {
+                assert_eq!(rq.method().as_str(), "PATCH");
+                assert_eq!(rq.url(), "/api/v1/games/3/participants/6/call-sign");
+                let mut text = String::new();
+                rq.as_reader().read_to_string(&mut text).expect("body reads");
+                let v: serde_json::Value = serde_json::from_str(&text).expect("json body");
+                assert_eq!(v["call_sign"].as_str(), Some("ALPHA-1"));
+                let _ = rq.respond(tiny_http::Response::from_string(
+                    r#"{"status_code":200,"message":"Successfull","data":{"participants":[{"id_user":6,"user_name":"Budi Santoso","id_game_role":1,"role_name":"Commando","call_sign":"ALPHA-1","is_judge_side":false,"is_ready":true}]}}"#,
+                ));
+            }
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18103/api/v1").expect("client builds");
+        let roster = master
+            .set_participant_call_sign("AT", 3, 6, "ALPHA-1")
+            .expect("rename");
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].user_id, 6);
+        assert_eq!(roster[0].call_sign, "ALPHA-1");
     }
 
     #[test]

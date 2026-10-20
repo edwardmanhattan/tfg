@@ -382,7 +382,7 @@ fn main() {
                             f64::from(order.speed_kn),
                             None,
                         ) {
-                            Ok(fix) => {
+                            Ok(tfg::backend::OrderOutcome::Applied(fix)) => {
                                 // The order's ANSWER is a position: the hull
                                 // is here, on a new leg, at the scenario's
                                 // instant. It is ingested on the game path, so
@@ -405,6 +405,23 @@ fn main() {
                                         fix.heading,
                                         fix.speed,
                                         if fix.clamped { " (clamped)" } else { "" }
+                                    ),
+                                }
+                            }
+                            // A HELD ORDER HAS NO FIX, so there is nothing to
+                            // ingest and nothing to draw: the hull has not
+                            // moved. The panel says so, and says what will
+                            // release it.
+                            Ok(tfg::backend::OrderOutcome::Staged(held)) => {
+                                tfg::shell_gpui::HelmStatus {
+                                    unit_id: order.unit_id.clone(),
+                                    ok: true,
+                                    text: format!(
+                                        "staged {:.0}\u{00b0} / {:.1} kn{} \u{2014} {}",
+                                        held.heading_deg,
+                                        held.speed_kn,
+                                        if held.clamped { " (clamped)" } else { "" },
+                                        held.released_by
                                     ),
                                 }
                             }
