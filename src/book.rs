@@ -310,10 +310,15 @@ impl BookDraft {
 /// One scenario as Minos holds it: the last thing the sync left behind.
 ///
 /// The plan only needs ids — steps of a live scenario are addressed
-/// directly, and titles are never rewritten by the flush.
+/// directly, and titles are never rewritten by the flush. The step ids ride
+/// along because the FLUSH needs them: a step-add answers with the whole
+/// scenario, and the only way to tell which of its steps is the new one is
+/// to know which ones were already there.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveScenario {
     pub id: i64,
+    /// The step ids the server holds, in book order.
+    pub steps: Vec<i64>,
 }
 
 /// Which scenario a staged step is posted to: one the server holds, or
@@ -447,7 +452,7 @@ mod tests {
     use super::*;
 
     fn live(id: i64) -> LiveScenario {
-        LiveScenario { id }
+        LiveScenario { id, steps: Vec::new() }
     }
 
     #[test]
@@ -626,14 +631,31 @@ mod tests {
         assert_eq!(plan(&draft, &[live(11)]).len(), 1);
     }
 
+    /// A relation against a scenario the server no longer lists is dropped:
+    /// posting a link for a row that is not there would 404.
     #[test]
-    fn prune_drops_relations_for_vanished_drafts() {
+    fn prune_drops_relations_for_vanished_scenarios() {
+        let mut draft = BookDraft::new();
+        draft.stage_relations(11, 3, vec![("hull".into(), 13)]);
+        draft.prune(&[]);
+        assert!(draft.step_relations.is_empty());
+    }
+
+    /// A relation on a scenario the DRAFT is about to create is kept: the
+    /// scenario is not vanished, it is not on the server YET, and the flush
+    /// posts the links right behind it.
+    #[test]
+    fn prune_keeps_relations_for_a_staged_scenario() {
         let mut draft = BookDraft::new();
         let local = draft.stage_scenario("Temp");
         let step = draft.stage_step_new(local, "x", None).unwrap();
         draft.stage_relations(local, step, vec![("hull".into(), 13)]);
         draft.prune(&[]);
-        assert!(draft.step_relations.is_empty());
+        assert_eq!(
+            draft.step_relations.len(),
+            1,
+            "the link rides the scenario the flush is about to create"
+        );
     }
 
     // -- the composer's draft ---------------------------------------------

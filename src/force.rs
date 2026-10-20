@@ -128,9 +128,22 @@ pub struct LiveHull {
 
 /// The operator's force, keyed by unit id so every read is a lookup and the
 /// order a list is drawn in never depends on insertion.
+///
+/// THE FRAME IS WHAT THE SERVER LAST SAID, and it is what tells the
+/// operator's edit from the server's row. A re-read happens while the
+/// operator is still authoring — every write triggers one — so a re-seed
+/// that simply overwrote the draft would throw away work the flush has not
+/// written. An entry that still matches the frame is the server's, and one
+/// that differs is the operator's; the frame is replaced, the edits are
+/// kept.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ForceDraft {
     hulls: BTreeMap<i64, DraftHull>,
+    /// What the server last said, per hull. The reference the merge reads.
+    frame: BTreeMap<i64, DraftHull>,
+    /// Hulls the operator has taken out of the exercise. A mark rather than
+    /// an absence, because a re-read would otherwise put the hull back.
+    removed: BTreeSet<i64>,
 }
 
 impl ForceDraft {
@@ -164,19 +177,76 @@ impl ForceDraft {
     /// saying where it sits now, and everything else about it is still what
     /// they said before.
     pub fn upsert(&mut self, hull: DraftHull) {
+        self.removed.remove(&hull.unit_id);
         self.hulls.insert(hull.unit_id, hull);
     }
 
     /// Take a hull out of the exercise. Returns it so the caller can drop the
     /// local half of it — the sim ship, the labels, the selection.
+    ///
+    /// The removal is MARKED, not merely an absence: a re-read replaces the
+    /// draft from the server's frame, and a hull the server still holds
+    /// would come back with it.
     pub fn remove(&mut self, unit_id: i64) -> Option<DraftHull> {
+        self.removed.insert(unit_id);
         self.hulls.remove(&unit_id)
+    }
+
+    /// Set the frame from a read and KEEP the operator's edits.
+    ///
+    /// The merge is the rule, not a convenience: the session read happens
+    /// after every write, so a re-seed that overwrote the draft would
+    /// discard an operator's half-finished plan on the strength of a write
+    /// they had already made. An entry that no longer matches the frame is
+    /// the operator's own statement and survives; one that matches it is
+    /// the server's, and the server's newer word wins.
+    ///
+    /// A hull the operator took out of the exercise stays out while the
+    /// server still holds it — that removal is a statement too.
+    pub fn seed(&mut self, live: &[LiveHull]) {
+        let mut frame: BTreeMap<i64, DraftHull> = BTreeMap::new();
+        for l in live {
+            frame.insert(
+                l.unit_id,
+                DraftHull {
+                    unit_id: l.unit_id,
+                    name: l.name.clone(),
+                    hull_number: String::new(),
+                    class_id: String::new(),
+                    start: l.start,
+                    commander_id: l.commander_id,
+                    host: l.host,
+                },
+            );
+        }
+        let kept: Vec<DraftHull> = self
+            .hulls()
+            .filter(|hull| self.frame.get(&hull.unit_id) != Some(hull))
+            .cloned()
+            .collect();
+        let removals: BTreeSet<i64> = self
+            .removed
+            .iter()
+            .copied()
+            .filter(|id| frame.contains_key(id))
+            .collect();
+        self.hulls = frame.clone();
+        for hull in kept {
+            self.hulls.insert(hull.unit_id, hull);
+        }
+        for id in &removals {
+            self.hulls.remove(id);
+        }
+        self.frame = frame;
+        self.removed = removals;
     }
 
     /// Empty the draft: a released hold, a closed session, a hold that moved
     /// to another game.
     pub fn clear(&mut self) {
         self.hulls.clear();
+        self.frame.clear();
+        self.removed.clear();
     }
 
     /// Say where a hull starts. `None` lifts it off the map without taking it
@@ -1007,5 +1077,81 @@ mod tests {
             live(7, "KRI Nanggala", Some(3), None),
         ];
         assert_eq!(draft.pending(&server), 1);
+    }
+
+    // -- the merge --------------------------------------------------------
+    //
+    // A re-read happens after every write, so the draft is re-seeded while
+    // the operator is still authoring. The merge is what keeps that from
+    // throwing the operator's work away.
+
+    /// The operator's placement survives a re-read: the frame is replaced
+    /// and the edit on top of it is not.
+    #[test]
+    fn a_re_read_keeps_a_staged_placement() {
+        let mut draft = ForceDraft::new();
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        draft.set_start(7, Some(Start { lat: -5.0, lon: 107.0 }));
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        assert_eq!(
+            draft.get(7).and_then(|h| h.start),
+            Some(Start { lat: -5.0, lon: 107.0 }),
+            "the operator's placement is the operator's"
+        );
+    }
+
+    /// A hull the operator dropped on the water survives a re-read: the
+    /// server does not hold it, so the merge has nothing to adopt over it.
+    #[test]
+    fn a_re_read_keeps_a_staged_newcomer() {
+        let mut draft = ForceDraft::new();
+        draft.seed(&[]);
+        let mut h = hull(9, "KRI Sultan", Some((-5.0, 107.0)));
+        h.commander_id = Some(3);
+        draft.upsert(h);
+        draft.seed(&[]);
+        assert!(draft.contains(9), "the staged hull survives the re-read");
+    }
+
+    /// A removal survives a re-read: the server still holds the hull, so
+    /// the merge has to keep it out rather than put it back.
+    #[test]
+    fn a_re_read_keeps_a_staged_removal() {
+        let mut draft = ForceDraft::new();
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        assert!(draft.remove(7).is_some(), "the hull leaves the exercise");
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        assert!(!draft.contains(7), "and it does not come back");
+        assert_eq!(
+            plan(&draft, &[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]),
+            Ok(vec![ForceWrite::Remove {
+                unit_id: 7,
+                name: "KRI Nanggala".into()
+            }]),
+            "the removal is still owed"
+        );
+    }
+
+    /// A hull the operator never touched is the server's, so the server's
+    /// newer word wins: that is the whole point of a re-read.
+    #[test]
+    fn a_re_read_adopts_the_servers_newer_placement() {
+        let mut draft = ForceDraft::new();
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-6.0, 108.0)))]);
+        assert_eq!(
+            draft.get(7).and_then(|h| h.start),
+            Some(Start { lat: -6.0, lon: 108.0 }),
+            "the server's placement is the newer word"
+        );
+    }
+
+    /// A hull the server dropped is gone: it was not the operator's to keep.
+    #[test]
+    fn a_re_read_forgets_a_hull_the_server_dropped() {
+        let mut draft = ForceDraft::new();
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        draft.seed(&[]);
+        assert!(!draft.contains(7));
     }
 }

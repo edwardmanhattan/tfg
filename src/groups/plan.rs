@@ -507,6 +507,30 @@ impl GroupsDraft {
     }
 }
 
+/// Attach the member hulls to the groups they sit in.
+///
+/// The server publishes a unit's group on the UNIT's own row and nowhere
+/// else, so the membership is a join away — and without it every group
+/// reads as "0 hulls" and the diff cannot see a unit the server already
+/// places. A unit that names a group this read does not list is a member
+/// of nothing here: it is dropped rather than given a group nobody holds.
+///
+/// `members` is `(unit id, group id)` per unit, in the exercise's own order.
+pub fn join_members(groups: &mut [LiveGroup], members: &[(i64, i64)]) {
+    for group in groups.iter_mut() {
+        group.units.clear();
+    }
+    for (unit_id, group_id) in members {
+        if let Some(group) = groups.iter_mut().find(|g| g.group_id == *group_id) {
+            group.units.push(*unit_id);
+        }
+    }
+    for group in groups.iter_mut() {
+        group.units.sort_unstable();
+        group.units.dedup();
+    }
+}
+
 /// A node a write names as a parent: one the same flush is about to create
 /// (negative, resolved from the create answer at pump time), or one the
 /// server already holds.
@@ -973,6 +997,49 @@ mod tests {
         assert_eq!(draft.staged_groups().count(), 1);
         assert_eq!(draft.get(5).map(|g| g.commander_id), Some(Some(9)));
         assert!(!draft.is_new(5));
+    }
+
+    // -- the membership join ----------------------------------------------
+    //
+    // The server publishes a unit's group on the unit's own row, so the
+    // membership is a join away. Without the join every group reads as
+    // "0 hulls" and the diff cannot see a unit the server already places.
+
+    /// A unit that names a group joins that group, and one that names a
+    /// group nobody holds joins nothing.
+    #[test]
+    fn a_units_group_is_joined_onto_the_node() {
+        let mut groups = vec![
+            live_group(1, "OpGab", GroupKind::OperasiGabungan, None, None, &[]),
+            live_group(2, "Satgas A", GroupKind::SatuanTugas, Some(1), None, &[]),
+        ];
+        join_members(&mut groups, &[(7, 2), (8, 1), (9, 99)]);
+        assert_eq!(
+            groups.iter().find(|g| g.group_id == 2).map(|g| g.units.clone()),
+            Some(vec![7]),
+            "the hull that names the node is in it"
+        );
+        assert_eq!(
+            groups.iter().find(|g| g.group_id == 1).map(|g| g.units.clone()),
+            Some(vec![8]),
+            "and the hull that names the root is in the root"
+        );
+    }
+
+    /// A hull in no group is in none of them: the join does not invent a
+    /// group for it.
+    #[test]
+    fn a_hull_in_no_group_belongs_to_none() {
+        let mut groups = vec![live_group(
+            1,
+            "OpGab",
+            GroupKind::OperasiGabungan,
+            None,
+            None,
+            &[],
+        )];
+        join_members(&mut groups, &[]);
+        assert!(groups[0].units.is_empty());
     }
 }
 

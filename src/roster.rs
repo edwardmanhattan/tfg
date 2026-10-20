@@ -40,10 +40,20 @@ pub struct StagedSeat {
 /// Keyed by user id: one seat per person per game, the same rule the
 /// server enforces, so re-staging somebody updates their row rather than
 /// doubling it.
+///
+/// THE FRAME IS WHAT THE SERVER LAST SAID, and it is what tells the
+/// operator's edit from the server's row. A re-read happens after every
+/// write, so a re-seed that simply overwrote the draft would unseat a
+/// person the operator had just seated, on the strength of a write they had
+/// already made. A seat whose role still matches the frame is the server's,
+/// and the server's newer word wins; a seat that differs — or that the
+/// server does not hold at all — is the operator's, and it stays.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RosterDraft {
     seats: BTreeMap<i64, StagedSeat>,
     removed: BTreeSet<i64>,
+    /// What the server last said, per seat. The reference the merge reads.
+    frame: BTreeMap<i64, LiveSeat>,
 }
 
 impl RosterDraft {
@@ -69,6 +79,56 @@ impl RosterDraft {
         } else {
             self.removed.remove(&user_id);
         }
+    }
+
+    /// Set the frame from a read and KEEP the operator's edits.
+    ///
+    /// The merge is the rule, not a convenience: the session read happens
+    /// after every write, so a re-seed that overwrote the draft would
+    /// unseat a person the operator had just seated. A seat whose role and
+    /// side still match the FRAME — what the server said last time — is the
+    /// server's, and the server's newer word wins; one that differs, or
+    /// that the frame does not hold at all, is the operator's, and it
+    /// stays.
+    ///
+    /// A staged removal stands while the server still holds the seat, and
+    /// lapses when it does not: the operator's mark was about a row that
+    /// has since gone.
+    pub fn seed(&mut self, live: &[LiveSeat]) {
+        let kept: Vec<StagedSeat> = self
+            .seats
+            .values()
+            .filter(|seat| match self.frame.get(&seat.user_id) {
+                None => true,
+                Some(held) => held.role_id != seat.role_id || held.judge != seat.judge,
+            })
+            .cloned()
+            .collect();
+        let removals: BTreeSet<i64> = self
+            .removed
+            .iter()
+            .copied()
+            .filter(|id| live.iter().any(|l| l.user_id == *id))
+            .collect();
+        self.seats.clear();
+        for l in live {
+            self.seats.insert(
+                l.user_id,
+                StagedSeat {
+                    user_id: l.user_id,
+                    user_name: l.user_name.clone(),
+                    role_id: l.role_id,
+                    role_name: l.role_name.clone(),
+                    call_sign: l.call_sign.clone(),
+                    judge: l.judge,
+                },
+            );
+        }
+        for seat in kept {
+            self.seats.insert(seat.user_id, seat);
+        }
+        self.removed = removals;
+        self.frame = live.iter().map(|l| (l.user_id, l.clone())).collect();
     }
 
     /// Withdraw a staged removal: the operator changed their mind and the
@@ -123,6 +183,7 @@ impl RosterDraft {
     pub fn clear(&mut self) {
         self.seats.clear();
         self.removed.clear();
+        self.frame.clear();
     }
 
     /// How many writes are still owed to the server.
@@ -133,12 +194,22 @@ impl RosterDraft {
 
 /// One seat as Minos holds it: the last thing the sync left behind.
 ///
-/// This is the whole of what a diff needs out of the server.
+/// This is the whole of what a diff needs out of the server, plus the two
+/// fields the MERGE reads: a seat whose role and side still match this row
+/// is the server's, and one that differs is the operator's edit. The call
+/// sign rides along because a seat the server does not hold yet needs one,
+/// and because the merge copies the row it adopts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveSeat {
     pub user_id: i64,
     pub user_name: String,
     pub role_id: i64,
+    /// The role's name, for the row the picker draws.
+    pub role_name: String,
+    /// The seat's call sign, for the same reason.
+    pub call_sign: String,
+    /// Whether the seat is judge-side.
+    pub judge: bool,
 }
 
 /// One roster write the sync owes Minos. Each is one endpoint.
@@ -195,8 +266,13 @@ impl RosterWrite {
 /// same role converges to nothing, a different role becomes a role
 /// change. That is what turns a re-picked directory row from a 409 into
 /// a no-op instead of a refusal in the middle of authoring.
+///
+/// THE ORDER IS SEATS, THEN ROLES, THEN UNSEATS, and it is the order the
+/// module has always claimed: a role write names a person, so every seat
+/// has to land before any role does.
 pub fn plan(draft: &RosterDraft, live: &[LiveSeat]) -> Vec<RosterWrite> {
     let mut writes = Vec::new();
+    let mut roles: Vec<RosterWrite> = Vec::new();
     for seat in draft.staged() {
         match live.iter().find(|l| l.user_id == seat.user_id) {
             None => writes.push(RosterWrite::Seat {
@@ -206,7 +282,7 @@ pub fn plan(draft: &RosterDraft, live: &[LiveSeat]) -> Vec<RosterWrite> {
                 role_name: seat.role_name.clone(),
                 call_sign: seat.call_sign.clone(),
             }),
-            Some(held) if held.role_id != seat.role_id => writes.push(RosterWrite::Role {
+            Some(held) if held.role_id != seat.role_id => roles.push(RosterWrite::Role {
                 user_id: seat.user_id,
                 user_name: seat.user_name.clone(),
                 role_id: seat.role_id,
@@ -215,6 +291,9 @@ pub fn plan(draft: &RosterDraft, live: &[LiveSeat]) -> Vec<RosterWrite> {
             Some(_) => {}
         }
     }
+    // The roles land AFTER every seat: a role write names a person, and a
+    // person the server has not seated yet is nobody.
+    writes.extend(roles);
     for user_id in draft.removals() {
         if let Some(held) = live.iter().find(|l| l.user_id == *user_id) {
             writes.push(RosterWrite::Unseat {
@@ -257,7 +336,14 @@ mod tests {
     }
 
     fn live(user_id: i64, name: &str, role_id: i64) -> LiveSeat {
-        LiveSeat { user_id, user_name: name.into(), role_id }
+        LiveSeat {
+            user_id,
+            user_name: name.into(),
+            role_id,
+            role_name: format!("role-{role_id}"),
+            call_sign: name.to_uppercase(),
+            judge: false,
+        }
     }
 
     #[test]
@@ -363,5 +449,85 @@ mod tests {
     fn only_the_judge_side_is_known_not_to_need_a_command() {
         assert!(!role_may_need_command(true), "judge side never commands");
         assert!(role_may_need_command(false), "everything else may");
+    }
+
+    // -- the merge --------------------------------------------------------
+    //
+    // A re-read happens after every write, so the draft is re-seeded while
+    // the operator is still authoring. The merge is what keeps that from
+    // throwing the operator's work away.
+
+    /// A re-read keeps the seat the operator just staged: the newcomer is
+    /// not on the server, so the merge cannot mistake them for a row it
+    /// should adopt.
+    #[test]
+    fn a_re_read_keeps_a_staged_newcomer() {
+        let mut draft = RosterDraft::new();
+        draft.seed(&[live(6, "Budi", 1)]);
+        draft.stage(seat(9, "Dedi", 1));
+        draft.seed(&[live(6, "Budi", 1)]);
+        assert!(draft.contains(9), "the staged seat survives the re-read");
+        assert_eq!(
+            plan(&draft, &[live(6, "Budi", 1)]).len(),
+            1,
+            "and it is still owed to the server"
+        );
+    }
+
+    /// A staged ROLE change survives a re-read too: the operator's word
+    /// about a seated person is not the server's to overwrite.
+    #[test]
+    fn a_re_read_keeps_a_staged_role_change() {
+        let mut draft = RosterDraft::new();
+        draft.seed(&[live(6, "Budi", 1)]);
+        draft.stage(seat(6, "Budi", 2));
+        draft.seed(&[live(6, "Budi", 1)]);
+        assert_eq!(
+            draft.get(6).map(|s| s.role_id),
+            Some(2),
+            "the staged role is the operator's, not the server's"
+        );
+    }
+
+    /// A staged removal stands while the server still holds the seat: the
+    /// operator's mark is about a row that has not gone yet.
+    #[test]
+    fn a_re_read_keeps_a_staged_removal() {
+        let mut draft = RosterDraft::new();
+        draft.seed(&[live(6, "Budi", 1)]);
+        draft.remove(6, true);
+        draft.seed(&[live(6, "Budi", 1)]);
+        assert!(draft.is_removed(6), "the seat is still marked to leave");
+        assert_eq!(
+            plan(&draft, &[live(6, "Budi", 1)]).len(),
+            1,
+            "and the unseat is still owed"
+        );
+    }
+
+    /// A seat the operator never touched is the server's, so the server's
+    /// newer word wins: that is the whole point of a re-read.
+    #[test]
+    fn a_re_read_adopts_the_servers_newer_seat() {
+        let mut draft = RosterDraft::new();
+        draft.seed(&[live(6, "Budi", 1)]);
+        draft.seed(&[live(6, "Budi", 2)]);
+        assert_eq!(draft.get(6).map(|s| s.role_id), Some(2), "the server's role");
+        assert!(
+            plan(&draft, &[live(6, "Budi", 2)]).is_empty(),
+            "and nothing is owed for it"
+        );
+    }
+
+    /// A seat the server has dropped is gone: the mark was about a row
+    /// that has since left, and keeping it would unseat nobody.
+    #[test]
+    fn a_re_read_forgets_a_removal_of_a_seat_the_server_dropped() {
+        let mut draft = RosterDraft::new();
+        draft.seed(&[live(6, "Budi", 1)]);
+        draft.remove(6, true);
+        draft.seed(&[]);
+        assert!(!draft.is_removed(6), "there is no seat left to leave");
+        assert!(plan(&draft, &[]).is_empty());
     }
 }
