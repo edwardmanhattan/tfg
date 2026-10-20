@@ -145,6 +145,19 @@ The marking is a **per-row treatment, not a tab**: the operator asks
 "telegram or administrative?", not "open or secret?" — the latter is a
 property of a single row.
 
+### The composer's controls are a disclosure
+
+The island is short — the commander's rail owns the bottom of the
+window and the execution rail the top — and four rows of pickers took
+half of what was left, so the traffic had room for one and a half rows.
+
+So the composer draws ONE line that names the envelope the SEND button
+would send — the kind, the marking, the degree and who it goes to — and
+the controls behind it are opened by that line when the operator wants to
+change something. **The line is the draft's state and not a caption of
+it**: an operator reads what they are about to send without opening
+anything, and the surface gives its room to the traffic.
+
 ## Consequences
 
 - The console can now be *told* things: a message that arrives while
@@ -201,3 +214,14 @@ set has no `window_end_at` at all, and the session read died on it
 before the window opened. Every field of that answer is now read
 through `get`: a server answer is data, and data that does not fit the
 shape is missing, never fatal.
+
+Photographed against the same API, with the capture harness (no gesture
+in any of them):
+
+| the picture | what it shows |
+|---|---|
+| the island, ALL tab | the strip with its counts, the scope row, an ADMIN row in `WARNING_SAND` with a `TERBATAS` marking in `DATA_AMBER` and an `UNREAD` mark, a TELEGRAM row in `RADAR_CYAN` with its machine marker, and the envelope line |
+| the island, TELEGRAM tab | the tab picked (cyan edge, bright ink), the count 25, a message sent under an assumed role showing `ASSUMED` and no author |
+| the island, DISPATCH open | the pickers: KIND, MARKING, DEGREE from the server's catalogue, AUDIENCE by name |
+| the island in PLANNING | the band's `COMMS 0` chip, the empty-inbox sentence, and the composer's phase gate |
+| the island with an unreadable inbox | *"The inbox could not be read: forbidden: Forbidden."* and *"Nothing below is missing traffic — it is unread."* — a 403 read as a sentence, not as an empty inbox |
