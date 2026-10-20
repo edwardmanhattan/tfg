@@ -359,9 +359,11 @@ impl MinosMaster {
         )
     }
 
-    /// A committed order is specifically HTTP 201. Other successful
-    /// statuses are not interchangeable with a GameFixRecord and become
-    /// an Unknown result at the command surface.
+    /// A created thing is specifically HTTP 201. Other successful
+    /// statuses are not interchangeable with the answer and become an
+    /// Unknown result at the command surface. An ORDER is not one of
+    /// these: the server answers 201 or 202 for it, and the status says
+    /// which — see [`Self::post_created_or_accepted`].
     fn post_created(
         &self,
         token: &str,
@@ -387,6 +389,37 @@ impl MinosMaster {
         }
         let body: serde_json::Value = response.json()?;
         Ok(body["data"].clone())
+    }
+
+    /// A POST whose answer comes in one of TWO shapes, told apart by
+    /// the status: 201 for an order the server applied, 202 for one it
+    /// is holding. The status IS the discriminator — Minos sends it
+    /// deliberately, so that a client cannot mistake a held order for
+    /// a leg — and the two bodies are not interchangeable: the first
+    /// carries a position and an instant, the second carries neither.
+    ///
+    /// The envelope is unwrapped here and the status carried out
+    /// BESIDE it, because the status is the part of the answer that
+    /// says which body this is.
+    fn post_created_or_accepted(
+        &self,
+        token: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<(reqwest::StatusCode, serde_json::Value), BackendError> {
+        let response = self
+            .client
+            .post(&format!("{}{}", self.base_url, path))
+            .bearer_auth(token)
+            .json(&body)
+            .send()?;
+        let status = response.status();
+        if !status.is_success() {
+            let body: serde_json::Value = response.json().unwrap_or(serde_json::Value::Null);
+            return Err(BackendError::http_error(status.as_u16(), &body));
+        }
+        let body: serde_json::Value = response.json()?;
+        Ok((status, body["data"].clone()))
     }
 
     fn patch(
@@ -1216,6 +1249,17 @@ impl MinosMaster {
     /// for that medium (or the hull's own movement domain when the
     /// order names none). An Amphibious hull has no default medium and
     /// is refused until the order names one — the caller must send it.
+    ///
+    /// THE ANSWER IS ONE OF TWO, AND THE STATUS SAYS WHICH. A `maneuver`
+    /// exercise applies the order at once and answers 201 with the fix
+    /// it closed at. A `scenario` exercise HOLDS the order until a step
+    /// that relates the hull is played, and answers 202 with the held
+    /// order — no position and no instant, because neither is known
+    /// until the order is released. A client that read the 202 body as
+    /// a fix would draw a hull that has not moved; a client that
+    /// refused the 202 would report an ordinary order as a failure.
+    /// So the two are different answers, and the client says which it
+    /// got.
     pub fn order_unit(
         &self,
         token: &str,
@@ -1224,16 +1268,41 @@ impl MinosMaster {
         heading_deg: f64,
         speed_kn: f64,
         medium: Option<&str>,
-    ) -> Result<GameFix, BackendError> {
+    ) -> Result<OrderOutcome, BackendError> {
         let mut body = serde_json::json!({ "heading_deg": heading_deg, "speed_kn": speed_kn });
         if let Some(m) = medium {
             body["medium"] = serde_json::Value::String(m.to_string());
         }
-        let data = self.post_created(
+        let (status, data) = self.post_created_or_accepted(
             token,
             &format!("/games/{game_id}/units/{unit_id}/order"),
             body,
         )?;
+        if status == reqwest::StatusCode::CREATED {
+            return Ok(OrderOutcome::Applied(Self::parse_order_fix(&data, unit_id)?));
+        }
+        if status == reqwest::StatusCode::ACCEPTED {
+            return Ok(OrderOutcome::Staged(Self::parse_staged_order(
+                &data,
+                Some(unit_id),
+            )?));
+        }
+        Err(BackendError::Other(format!(
+            "Minos order response was HTTP {}, expected 201 or 202",
+            status.as_u16()
+        )))
+    }
+
+    /// The fix an applied order closed at. The validation is the
+    /// server's own arithmetic, checked here so that a body the client
+    /// cannot believe is refused rather than drawn: a heading outside
+    /// the compass, a speed below nought, a coordinate off the globe,
+    /// or a `clamped` flag that disagrees with the requested speed the
+    /// body carries beside it.
+    fn parse_order_fix(
+        data: &serde_json::Value,
+        unit_id: i64,
+    ) -> Result<GameFix, BackendError> {
         let malformed = |field: &str| {
             BackendError::Other(format!(
                 "malformed Minos order response: missing or invalid {field}"
@@ -1301,6 +1370,240 @@ impl MinosMaster {
             created_at: data["created_at"].as_str().map(str::to_string),
             created_by: data["created_by"].as_i64(),
         })
+    }
+
+    /// One HELD order, as the server publishes it: what the hull will
+    /// do when the order is released, and nothing about where it is.
+    ///
+    /// The validation is the fix record's own, because a held order is
+    /// the same claim with the instant and the position left out — a
+    /// heading, a speed, and the pair of fields that say the order was
+    /// reduced. `released_by` is the server's sentence naming the
+    /// event that will apply it; it is carried through verbatim rather
+    /// than parsed, because it states the rule instead of describing
+    /// one hull's situation.
+    fn parse_staged_order(
+        v: &serde_json::Value,
+        expected_unit: Option<i64>,
+    ) -> Result<StagedOrder, BackendError> {
+        let malformed = |field: &str| {
+            BackendError::Other(format!(
+                "malformed Minos staged-order response: missing or invalid {field}"
+            ))
+        };
+        let unit_id = v["id_unit"].as_i64().ok_or_else(|| malformed("id_unit"))?;
+        if let Some(expected) = expected_unit {
+            if unit_id != expected {
+                return Err(BackendError::Other(format!(
+                    "malformed Minos staged-order response: id_unit {unit_id} does not match path {expected}"
+                )));
+            }
+        }
+        // The body says it was staged, so a payload that outlives the
+        // response that carried it still knows what it is holding.
+        if v["staged"].as_bool() != Some(true) {
+            return Err(malformed("staged"));
+        }
+        let heading_deg = v["heading_deg"]
+            .as_f64()
+            .ok_or_else(|| malformed("heading_deg"))?;
+        let speed_kn = v["speed_kn"].as_f64().ok_or_else(|| malformed("speed_kn"))?;
+        let clamped = v["clamped"].as_bool().ok_or_else(|| malformed("clamped"))?;
+        let requested_speed_kn = match v.get("requested_speed_kn") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_f64()
+                    .ok_or_else(|| malformed("requested_speed_kn"))?,
+            ),
+        };
+        let staged_at = v["staged_at"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| malformed("staged_at"))?
+            .to_string();
+        let released_by = v["released_by"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| malformed("released_by"))?
+            .to_string();
+        if !heading_deg.is_finite()
+            || !(0.0..360.0).contains(&heading_deg)
+            || !speed_kn.is_finite()
+            || speed_kn < 0.0
+            || requested_speed_kn.is_some_and(|requested| !requested.is_finite() || requested < 0.0)
+            || clamped != requested_speed_kn.is_some()
+            || (clamped && requested_speed_kn.is_some_and(|requested| requested <= speed_kn))
+        {
+            return Err(BackendError::Other(
+                "malformed Minos staged-order response: invalid authoritative values".into(),
+            ));
+        }
+        Ok(StagedOrder {
+            unit_id,
+            heading_deg,
+            speed_kn,
+            requested_speed_kn,
+            clamped,
+            staged_at,
+            released_by,
+        })
+    }
+
+    /// What the exercise is HOLDING, and for whom.
+    ///
+    /// `GET /games/{id}/staged-orders` — one route with two answers,
+    /// and the scope says which was given: `game` for the caller who
+    /// runs the exercise (everything it is holding) and `own` for
+    /// anybody else (the orders waiting for the hulls THIS CALLER
+    /// commands). A commander reads the second to learn that their
+    /// order was received and is not being acted on yet, which is the
+    /// one thing the 202 answer cannot say on its own once the panel
+    /// has been closed.
+    pub fn staged_orders(
+        &self,
+        token: &str,
+        game_id: i64,
+    ) -> Result<StagedOrderList, BackendError> {
+        let data = self.get(token, &format!("/games/{game_id}/staged-orders"))?;
+        Self::parse_staged_orders(&data, game_id)
+    }
+
+    /// The held-orders list, parsed. The scope is read as the server's
+    /// own word; an unrecognised one is `Unknown` rather than a
+    /// refusal, because the list itself is still true and only its
+    /// REACH is in doubt.
+    fn parse_staged_orders(
+        v: &serde_json::Value,
+        game_id: i64,
+    ) -> Result<StagedOrderList, BackendError> {
+        let malformed = |field: &str| {
+            BackendError::Other(format!(
+                "malformed Minos staged-orders response: missing or invalid {field}"
+            ))
+        };
+        let scope = v["scope"].as_str().ok_or_else(|| malformed("scope"))?;
+        let rows = v["items"].as_array().ok_or_else(|| malformed("items"))?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(Self::parse_staged_order(row, None)?);
+        }
+        Ok(StagedOrderList {
+            game_id: v["id_game"].as_i64().unwrap_or(game_id),
+            scope: StagedOrderScope::from_wire(scope),
+            items,
+        })
+    }
+
+    /// Put a hull where the caller says it is, in a STATIC exercise.
+    ///
+    /// `PUT /games/{id}/units/{unit_id}/position` takes a latitude and
+    /// a longitude and nothing else: no heading, no speed, no time. A
+    /// hull that was set is stationary until somebody sets it again, so
+    /// there is no course to state, and the instant is the exercise's
+    /// clock rather than the caller's — a client that stamped its own
+    /// could put a hull anywhere in the timeline.
+    ///
+    /// The server refuses this (409) unless the exercise's mode sets
+    /// its positions. It is the mirror of the order route, and the two
+    /// exercises refuse each other's verbs.
+    ///
+    /// THE ANSWER IS A JUMP RECORD, AND IT IS NOT A `GameFix`.
+    /// `GameFix` has no `kind`, so a fix parsed from a jump would
+    /// present a stationary hull as a leg — a course due north at
+    /// nought knots, which is exactly the reading the server's `kind`
+    /// exists to prevent. So the answer is its own type, carrying the
+    /// three facts a set position has: which hull, at which instant,
+    /// where.
+    pub fn set_unit_position(
+        &self,
+        token: &str,
+        game_id: i64,
+        unit_id: i64,
+        latitude: f64,
+        longitude: f64,
+    ) -> Result<PositionSet, BackendError> {
+        let data = self.put(
+            token,
+            &format!("/games/{game_id}/units/{unit_id}/position"),
+            serde_json::json!({ "latitude": latitude, "longitude": longitude }),
+        )?;
+        Self::parse_position_set(&data, unit_id)
+    }
+
+    /// The jump record a set position answers with. The `kind` is
+    /// checked because the route only ever writes a jump: a leg here
+    /// would mean the hull had been ORDERED somewhere, which is a
+    /// different exercise's verb.
+    fn parse_position_set(
+        v: &serde_json::Value,
+        unit_id: i64,
+    ) -> Result<PositionSet, BackendError> {
+        let malformed = |field: &str| {
+            BackendError::Other(format!(
+                "malformed Minos position response: missing or invalid {field}"
+            ))
+        };
+        let response_unit = v["id_unit"].as_i64().ok_or_else(|| malformed("id_unit"))?;
+        if response_unit != unit_id {
+            return Err(BackendError::Other(format!(
+                "malformed Minos position response: id_unit {response_unit} does not match path {unit_id}"
+            )));
+        }
+        if v["kind"].as_str() != Some("jump") {
+            return Err(malformed("kind"));
+        }
+        let assumed_time = v["assumed_time"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| malformed("assumed_time"))?
+            .to_string();
+        let latitude = v["latitude"]
+            .as_f64()
+            .ok_or_else(|| malformed("latitude"))?;
+        let longitude = v["longitude"]
+            .as_f64()
+            .ok_or_else(|| malformed("longitude"))?;
+        if !latitude.is_finite()
+            || !(-90.0..=90.0).contains(&latitude)
+            || !longitude.is_finite()
+            || !(-180.0..=180.0).contains(&longitude)
+        {
+            return Err(malformed("latitude/longitude"));
+        }
+        Ok(PositionSet {
+            unit_id: response_unit,
+            assumed_time,
+            latitude,
+            longitude,
+        })
+    }
+
+    /// Rename a participant's call sign: what the net calls somebody
+    /// in THIS exercise.
+    ///
+    /// `PATCH /games/{id}/participants/{user_id}/call-sign`. It is not
+    /// a field on the role change, and the separation is the server's
+    /// rather than tidy — a role change CLEARS the seat's readiness,
+    /// and a rename must not, because a call sign is what somebody is
+    /// called and a readiness is a declaration about the role held.
+    ///
+    /// The answer is the whole roster, as every roster write is, so
+    /// the caller redraws from the server's own seats rather than
+    /// from its own guess about the one that changed.
+    pub fn set_participant_call_sign(
+        &self,
+        token: &str,
+        game_id: i64,
+        user_id: i64,
+        call_sign: &str,
+    ) -> Result<Vec<Participant>, BackendError> {
+        let data = self.patch(
+            token,
+            &format!("/games/{game_id}/participants/{user_id}/call-sign"),
+            serde_json::json!({ "call_sign": call_sign }),
+        )?;
+        Ok(Self::parse_roster(&data))
     }
 
     /// Where the fleet is at one assumed instant (C3): the plot read.
@@ -3088,6 +3391,107 @@ pub struct GameFix {
     /// required movement field.
     pub created_at: Option<String>,
     pub created_by: Option<i64>,
+}
+
+/// What an order's answer was, and the two answers are not
+/// interchangeable.
+///
+/// An order in a `maneuver` exercise is applied at once and the server
+/// answers 201 with the fix it closed at. An order in a `scenario`
+/// exercise is HELD until a step that relates the hull is played, and
+/// the server answers 202 with the held order — a heading and a speed
+/// and no position and no instant, because neither is known until the
+/// order is released. The client must be able to say which it got: a
+/// held order is not a fix, and drawing it as one would put a hull on
+/// the plot that has not moved.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderOutcome {
+    /// The order was applied; the hull is on a new leg.
+    Applied(GameFix),
+    /// The order was accepted and is waiting for a step to release it.
+    Staged(StagedOrder),
+}
+
+/// One HELD order, as the server publishes it.
+///
+/// It carries what the hull WILL do when the order is released, which
+/// is not always what the caller asked for: the speed is clamped
+/// against the hull's published maximum at the moment the order is
+/// held, so a commander learns at once that their slider sat one notch
+/// high rather than when the step is played.
+///
+/// `staged_at` is WALL TIME, not an instant on the exercise's clock —
+/// a held order has none, which is the whole of the matter. A client
+/// must never treat it as the time the hull turns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedOrder {
+    pub unit_id: i64,
+    pub heading_deg: f64,
+    pub speed_kn: f64,
+    /// Present only when the order had to be reduced.
+    pub requested_speed_kn: Option<f64>,
+    pub clamped: bool,
+    pub staged_at: String,
+    /// The server's sentence naming the event that will apply the
+    /// order. Carried through verbatim rather than parsed: it states
+    /// the rule rather than describing one hull's situation.
+    pub released_by: String,
+}
+
+/// Which question the held-orders list answered.
+///
+/// The server publishes ONE list with two reaches, and the scope says
+/// which was given: everything the exercise holds for the caller who
+/// runs it, and the orders waiting for the caller's own hulls for
+/// anybody else. Inferring the reach from the list's length would be a
+/// guess, so the server states it and the client keeps the word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedOrderScope {
+    /// The caller runs the exercise: the list is everything it holds.
+    Game,
+    /// The caller commands hulls: the list is the orders waiting for
+    /// them.
+    Own,
+    /// A reach this client does not know. The list is still true; only
+    /// its reach is in doubt.
+    Unknown,
+}
+
+impl StagedOrderScope {
+    /// The Minos wire value. An unrecognised one reads as `Unknown`,
+    /// never as a guess: a list of somebody else's orders read as
+    /// one's own would be a reach the caller does not have.
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "game" => StagedOrderScope::Game,
+            "own" => StagedOrderScope::Own,
+            _ => StagedOrderScope::Unknown,
+        }
+    }
+}
+
+/// What an exercise is holding, and for whom.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedOrderList {
+    pub game_id: i64,
+    pub scope: StagedOrderScope,
+    pub items: Vec<StagedOrder>,
+}
+
+/// A hull's position, set by hand, in a static exercise.
+///
+/// ITS OWN TYPE AND NOT A `GameFix`, because the server's answer to a
+/// set position is a JUMP and `GameFix` cannot say so: it has no
+/// `kind`, so a fix parsed from a jump would present a stationary hull
+/// as a leg — a course due north at nought knots. A jump carries no
+/// course and no speed at all, so the three facts it has are the ones
+/// kept here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionSet {
+    pub unit_id: i64,
+    pub assumed_time: String,
+    pub latitude: f64,
+    pub longitude: f64,
 }
 
 /// One hull's computed position at the answered instant (C3): the leg
