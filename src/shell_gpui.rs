@@ -277,6 +277,23 @@ fn plural(n: usize, noun: &str) -> String {
     }
 }
 
+/// The server's own timestamp, trimmed to what an operator reads at a
+/// glance.
+///
+/// The server publishes a full stamp — date, time and offset — and a comms
+/// row wants the clock, not the calendar. The trim is repeated here rather
+/// than reached for, because the console's own `short_timestamp` lives in
+/// the egui binary and the shell cannot name it; the same rule that keeps
+/// the shell free of `map_render`, and the same cost.
+fn short_timestamp(at: &str) -> String {
+    at.split('T')
+        .nth(1)
+        .map(|t| t.split(['+', '-', 'Z']).next().unwrap_or(t))
+        .map(|t| t.split('.').next().unwrap_or(t))
+        .unwrap_or(at)
+        .to_string()
+}
+
 /// A status line, in the ink its kind carries.
 ///
 /// One component for every status line in the console, so a refusal cannot
@@ -485,13 +502,59 @@ struct IslandDemo {
     /// execution and its Readiness island in preparation — one surface, one
     /// place, which is the whole reason it is a column island and not both.
     command_open: bool,
-    /// The Comms panel: the session's inbox and the telegram composer.
-    /// The console keeps it a FLOATING island opened from the band's comms
-    /// door, not a column island and not a centred modal — an inbox is
-    /// something you read beside the map, and a dim over the map is the one
-    /// thing that makes it unreadable. So the door moved to the band and the
-    /// pane stays undimmed.
+    /// The Comms surface: the session's inbox and the composer.
+    ///
+    /// It is a FLOATING island over the map, opened from the band's comms
+    /// door and from the execution rail's comms widget — not a column
+    /// island and not a centred modal. An inbox is something you read
+    /// BESIDE the map, and a dim over the map is the one thing that makes
+    /// it unreadable.
+    ///
+    /// **Every door that opens it also closes it**, including the island's
+    /// own ×: a surface the operator can only shut by opening something
+    /// else is a surface that strands them.
     comms_open: bool,
+    /// Which kind the operator is looking at. The strip is the console's
+    /// only ask about the traffic, and the server's kinds are exactly two
+    /// (telegram, administrative) — so the strip is the vocabulary, not a
+    /// filter over a longer one.
+    comms_tab: CommsTab,
+    /// Which slice of the kind the operator is looking at: everything,
+    /// only what was addressed to them, or only the broadcasts.
+    comms_scope: CommsScope,
+    /// The message ids that arrived since the operator last looked at the
+    /// surface. A row in here draws a NEW chip: the console states
+    /// arrival as a STATE, never as an animation.
+    comms_unseen: std::collections::HashSet<i64>,
+    /// Whether the composer's controls are open.
+    ///
+    /// **Closed by default, and it is the traffic that needs the room.**
+    /// The island is short — the commander's rail owns the bottom of the
+    /// window — and the envelope line says everything a SEND would send
+    /// without the controls being on the surface.
+    comms_pickers_open: bool,
+    /// The newest message id the operator has seen. The watermark the
+    /// unseen set is judged against, so a re-read that brings the same
+    /// messages does not mark them all new again.
+    comms_seen_max: i64,
+    /// The ink the comms chip carries: the newest message's own kind's
+    /// ink. The band and the rail chip are the console's announcement —
+    /// a state, not an animation.
+    comms_latest_ink: Option<Rgba>,
+    /// The composer's own draft — kind, marking, degree, audience, the
+    /// identity a judge speaks as, and the words.
+    ///
+    /// The degrees, the scenario roles and the roster it is filled from
+    /// live on the SESSION, not here: they are read by the binary and
+    /// they are the same facts the server holds, so a second copy in the
+    /// shell would be a second answer.
+    msg_draft: MsgDraftForm,
+    /// Where the audience picker's next seat lands: in `to`, or in `cc`.
+    ///
+    /// The composer's own state and not the draft's: it says where the
+    /// NEXT pick goes, not what the draft holds.
+    msg_audience_target: AudienceTarget,
+
     /// The execution phase's CREW modal: every player, segmented by role, with
     /// a commander's hulls and task groups beneath them. Opened from the
     /// widget rail, not from the column — in execution the column is gone.
@@ -797,7 +860,6 @@ struct IslandDemo {
     /// states the cut rather than showing controls with no effect. Rides
     /// field index 10 of the composer's hand-rolled plumbing — one field
     /// implementation, not two — and tabs to itself.
-    msg_content: String,
     msg_busy: bool,
     msg_status: Status,
     /// The operator's force: what is in the exercise, as THEY have said it.
@@ -1212,6 +1274,20 @@ const SETTINGS_H: f32 = 380.0;
 const FORM_W: f32 = 520.0;
 const FORM_H: f32 = 580.0;
 
+/// The comms island's width.
+///
+/// **WIDER than the execution rail** (196pt), because the rail is a card
+/// with one value in it and the island carries a strip, a list and a
+/// composer. Narrower than the frame, because the map is still the thing
+/// the operator is reading around it.
+const COMMS_ISLAND_W: f32 = 440.0;
+
+/// The comms island's top, where no execution rail stands in the way.
+///
+/// The band's own bottom plus a margin — the island hangs under the band
+/// rather than over it.
+const COMMS_ISLAND_TOP: f32 = 64.0;
+
 /// The Player picker's card: TWO sections side by side — the app's account
 /// list and the room — so it is wider than the authoring forms and about as
 /// tall. A 520-point card would give neither section room to be a list, and
@@ -1408,6 +1484,43 @@ fn seeded_mode(value: &str) -> Option<crate::gamestate::GameMode> {
     }
 }
 
+/// The capture seed's comms KIND, parsed.
+///
+/// `TFG_COMMS_TAB` names the strip the way the console names it: `all`,
+/// `telegram`, `admin`. A seed this build does not know is NO seed — the
+/// strip keeps the whole traffic — for the same reason as the mode: a
+/// capture that photographed a strip the console would never draw is a
+/// capture of nothing.
+fn seeded_comms_tab() -> CommsTab {
+    match std::env::var("TFG_COMMS_TAB").as_deref() {
+        Ok("telegram") => CommsTab::Telegram,
+        Ok("admin") => CommsTab::Admin,
+        _ => CommsTab::All,
+    }
+}
+
+/// The capture seed's comms SCOPE, parsed.
+///
+/// `TFG_COMMS_SCOPE` names the slice the way the console names it: `all`,
+/// `tome`, `broadcast`. A seed this build does not know is NO seed.
+fn seeded_comms_scope() -> CommsScope {
+    match std::env::var("TFG_COMMS_SCOPE").as_deref() {
+        Ok("tome") => CommsScope::ToMe,
+        Ok("broadcast") => CommsScope::Broadcast,
+        _ => CommsScope::All,
+    }
+}
+
+/// The capture seed's composer's DISCLOSURE, parsed.
+///
+/// `TFG_COMMS_DISPATCH=1` opens the composer's controls, so a capture can
+/// photograph the pickers — the kind, the marking, the degree, the
+/// audience and the identity — without a click. A seed this build does
+/// not know is NO seed, and the controls stay closed.
+fn seeded_comms_dispatch() -> bool {
+    std::env::var("TFG_COMMS_DISPATCH").as_deref() == Ok("1")
+}
+
 /// One execution widget: the label, the value, the quiet line under it, and
 /// the surface it opens.
 ///
@@ -1419,6 +1532,12 @@ struct ExecWidget {
     id: &'static str,
     label: &'static str,
     value: String,
+    /// The ink the value is drawn in.
+    ///
+    /// Most widgets carry the console's bright ink; the comms widget
+    /// carries the newest traffic's own kind's ink, because the widget IS
+    /// the announcement and the announcement is in the type's colour.
+    ink: Rgba,
     hint: Option<String>,
     panel: Option<WhichPanel>,
 }
@@ -2921,6 +3040,22 @@ impl IslandDemo {
             // exactly the capture that kept appearing: not a stray focus click
             // at all, a flag that defaulted the wrong way.
             comms_open: std::env::var("TFG_COMMS").as_deref() == Ok("1"),
+            // The kind strip and the scope start on the whole traffic:
+            // the operator narrows, the console does not narrow for them.
+            //
+            // The capture seeds name the strip's state, the same precedent
+            // as `TFG_ASSESS_TAB`: `all`, `telegram` and `admin` for the
+            // kind, and `all`, `tome` and `broadcast` for the scope. A
+            // seed that names a value this build does not know is no seed
+            // at all — the strip keeps what it had.
+            comms_tab: seeded_comms_tab(),
+            comms_scope: seeded_comms_scope(),
+            comms_unseen: std::collections::HashSet::new(),
+            comms_pickers_open: seeded_comms_dispatch(),
+            comms_seen_max: 0,
+            comms_latest_ink: None,
+            msg_draft: MsgDraftForm::default(),
+            msg_audience_target: AudienceTarget::default(),
             crew_modal_open: false,
             // `TFG_UNIT` names the unit the details panel opens on, and
             // opens it. The same precedent as `TFG_SEL`: pin the state,
@@ -3072,7 +3207,6 @@ impl IslandDemo {
             readiness_status: Status::empty(),
             step_declare_busy: false,
             step_declare_status: Status::empty(),
-            msg_content: String::new(),
             msg_busy: false,
             msg_status: Status::empty(),
             force: crate::force::ForceDraft::new(),
@@ -3220,6 +3354,10 @@ impl IslandDemo {
         // plan was made. Nothing is staged at construction, so this discards
         // nothing — see `reseed_drafts`.
         demo.reseed_drafts();
+        // The composer's degree comes from the server's catalogue, so it is
+        // seeded here rather than hard-coded: a deployment that renumbers
+        // its degrees keeps working.
+        demo.seed_msg_degree();
         demo
     }
 
@@ -3933,14 +4071,12 @@ impl IslandDemo {
         //
         // The comms door carries the count, because the console's does and
         // because an inbox with no count is an inbox you have to open to
-        // find out whether there is anything in it. It toggles the column's
-        // COMMS island — the inbox is something you read beside the map, not
-        // a dialog that takes the frame.
-        let mail = if self.session.messages.is_empty() {
-            "comms".to_string()
-        } else {
-            format!("comms ({})", self.session.messages.len())
-        };
+        // find out whether there is anything in it.
+        //
+        // **The count is in the newest traffic's own ink**, and the unseen
+        // count sits beside it: the chip is the console's announcement of
+        // the traffic, and there is no toast and no flash — a state is
+        // STATED, not animated.
         let mut right = div()
             .flex()
             .flex_row()
@@ -3958,18 +4094,11 @@ impl IslandDemo {
                         .cursor_pointer()
                         .on_click(cx.listener(|view, _, _, cx| {
                             // The console's door: it flips its floating comms
-                            // island. This shell has no floating panes, so the
-                            // same door opens the same surface in the modal
-                            // zone — and a second press shuts it, which is what
-                            // a door does.
-                            if view.comms_open {
-                                view.comms_open = false;
-                            } else {
-                                view.open_only(WhichPanel::Comms);
-                            }
-                            cx.notify();
+                            // island, and a second press shuts it — which is
+                            // what a door does.
+                            view.toggle_comms(cx);
                         }))
-                        .child(button(mail, true, false, false)),
+                        .child(self.comms_chip()),
                 )
                 .child(sep());
         }
@@ -4050,7 +4179,10 @@ impl IslandDemo {
         if which != WhichPanel::Book {
             self.pin_arm = false;
         }
-        self.comms_open = which == WhichPanel::Comms;
+        // The comms island is NOT in this rule, and never was: it is a
+        // surface the operator reads beside the map, not a dialog that
+        // takes the frame. Its own door — the band's, the rail's widget,
+        // or its × — is the only thing that opens and closes it.
         // The embark modal's visibility IS its host: opening anything else
         // clears the host, and opening Embarked keeps the host the opener
         // just set — so one rule cannot strand a stale host under another
@@ -10085,6 +10217,10 @@ impl IslandDemo {
         // read every existing piece as a removal. Nothing is staged at a hold,
         // so there is no work to discard.
         self.reseed_drafts();
+        // The same baseline as a created session: a new hold's traffic is
+        // what the console holds, not what arrived since the operator last
+        // looked.
+        self.note_baseline();
     }
 
     /// Declare or withdraw this seat's readiness — the console's
@@ -11471,6 +11607,7 @@ impl IslandDemo {
                 widget.id,
                 widget.label,
                 widget.value,
+                widget.ink,
                 widget.hint,
                 widget.panel,
                 cx,
@@ -11518,6 +11655,7 @@ impl IslandDemo {
                 id: "widget-account",
                 label: "operator",
                 value: role,
+                ink: MAP_INK,
                 hint: Some(name),
                 panel: None,
             },
@@ -11525,6 +11663,7 @@ impl IslandDemo {
                 id: "widget-crew",
                 label: "crew",
                 value: format!("{}/{}", self.session.present, self.session.seats),
+                ink: MAP_INK,
                 hint: Some(plural(self.session.pieces.len(), "hull")),
                 panel: Some(WhichPanel::Crew),
             },
@@ -11535,6 +11674,7 @@ impl IslandDemo {
                 id: "widget-scenario",
                 label: "scenario",
                 value: scenario,
+                ink: MAP_INK,
                 hint: Some(if board.total == 0 {
                     crate::mode_rules::no_script_sentence().to_string()
                 } else {
@@ -11543,14 +11683,29 @@ impl IslandDemo {
                     panel: Some(WhichPanel::Board),
                 });
             }
+            // The comms widget: the count, in the newest traffic's own
+            // kind's ink, and the unseen count beside it.
+            //
+            // **It is a TOGGLE, like the band's door.** A widget that opens
+            // a surface the operator cannot close is a one-way door, and
+            // the console's rule is that a surface can always be shut by
+            // what opened it.
+            let unseen = self.comms_unseen_count();
+            let held = self.session.messages.len();
             widgets.push(ExecWidget {
                 id: "widget-comms",
                 label: "comms",
-                value: format!("{}", self.session.messages.len()),
-                hint: Some(format!(
-                    "{} in this exercise",
-                    plural(self.session.messages.len(), "message")
-                )),
+                value: format!("{held}"),
+                ink: self.comms_chip_ink(),
+                hint: Some(if unseen > 0 {
+                    format!(
+                        "{} unseen \u{00b7} {} in this exercise",
+                        plural(unseen, "message"),
+                        plural(held, "message")
+                    )
+                } else {
+                    format!("{} in this exercise", plural(held, "message"))
+                }),
                 panel: Some(WhichPanel::Comms),
             });
             widgets
@@ -11571,6 +11726,7 @@ impl IslandDemo {
         id: &'static str,
         label: &'static str,
         value: String,
+        ink: Rgba,
         hint: Option<String>,
         panel: Option<WhichPanel>,
         cx: &mut Context<Self>,
@@ -11591,7 +11747,7 @@ impl IslandDemo {
                 div()
                     .font_family(view::FACE_HUMAN)
                     .text_size(px(view::BODY_PT))
-                    .text_color(rgba(MAP_INK))
+                    .text_color(rgba(ink))
                     .child(value),
             );
         if let Some(hint) = hint {
@@ -11605,8 +11761,14 @@ impl IslandDemo {
         }
         if let Some(panel) = panel {
             card = card.cursor_pointer().on_click(cx.listener(move |view, _, _, cx| {
-                view.open_only(panel);
-                cx.notify();
+                // The comms widget TOGGLES: a surface the operator cannot
+                // close by the thing that opened it is a one-way door.
+                if panel == WhichPanel::Comms {
+                    view.toggle_comms(cx);
+                } else {
+                    view.open_only(panel);
+                    cx.notify();
+                }
             }));
         }
         card.into_any_element()
@@ -12710,52 +12872,263 @@ impl IslandDemo {
         self.step_declare_status.clear();
     }
 
-    /// Send the comms panel's telegram row — the console's `send_message`,
-    /// cut to the proven broadcast path.
+    /// Send the comms surface's composer — the console's `send_message`,
+    /// with the whole envelope.
     ///
-    /// Returns false (and sends nothing) for the three non-sends: a game
-    /// that is not executing (the server only takes messages there), blank
-    /// content (the console's own sentence refuses it first), and a send
-    /// already in flight. The same rule the SEND button enforces, kept in
-    /// one place so a test exercises exactly what the click does.
-    fn send_telegram(&mut self, cx: &mut Context<Self>) -> bool {
+    /// Returns false (and sends nothing) for the non-sends, and every one
+    /// of them is a rule the SERVER enforces too, so the console refuses
+    /// locally what the server would refuse with a 400 (the console's own
+    /// law: hide a verb the backend would refuse rather than showing one
+    /// that 409s):
+    ///
+    /// - a game that is not executing (the server takes messages only
+    ///   there — a 409 naming the phase);
+    /// - blank content, or content past the server's 8000 characters;
+    /// - a BROADCAST with a marking other than TERBUKA ("A message with
+    ///   no `to` and no `cc` is a broadcast, and only `TERBUKA` may be a
+    ///   broadcast");
+    /// - ADMINISTRATIVE mail from a seat that is not on the judge side
+    ///   ("Administrative messages pass between the Judges and the Game
+    ///   Master");
+    /// - a TELEGRAM from the judge side with no assumed role ("A Telegram
+    ///   message from the Game Master or a Judge must be sent AS a
+    ///   scenario role") and, with one, no node to speak from;
+    /// - a reply on a telegram (only administrative mail is a
+    ///   conversation).
+    fn send_message(&mut self, cx: &mut Context<Self>) -> bool {
         if !self.session.execution {
             self.msg_status = Status::bad("messages send only in execution".to_string());
             cx.notify();
             return false;
         }
-        if self.msg_content.trim().is_empty() {
+        let content = self.msg_draft.content.trim().to_string();
+        if content.is_empty() {
             self.msg_status = Status::bad("write the message first".to_string());
+            cx.notify();
+            return false;
+        }
+        if content.chars().count() > 8000 {
+            self.msg_status = Status::bad("a message holds 8000 characters".to_string());
             cx.notify();
             return false;
         }
         if self.msg_busy {
             return false;
         }
+        // The degree is a foreign key the server validates ("That is not a
+        // degree. Read the accepted values from `/helpers` under
+        // `message_degrees`"), and the console takes it from the
+        // catalogue — so a degree the catalogue does not hold is refused
+        // HERE, in the server's words. A catalogue that was never read
+        // says nothing either way, and the server rules on that one.
+        if !self.session.msg_degrees.is_empty()
+            && !self.session.msg_degrees.iter().any(|d| d.id == self.msg_draft.degree)
+        {
+            self.msg_status = Status::bad(
+                "that is not a degree \u{2014} the server accepts only the ones it published"
+                    .to_string(),
+            );
+            cx.notify();
+            return false;
+        }
+        let addressed = !self.msg_draft.to.is_empty() || !self.msg_draft.cc.is_empty();
+        if !addressed && self.msg_draft.mark != CommsMark::Open {
+            self.msg_status = Status::bad(
+                "only TERBUKA may be a broadcast \u{2014} name a recipient".to_string(),
+            );
+            cx.notify();
+            return false;
+        }
+        let judge_side = self.own_seat().is_some_and(|s| s.judge);
+        match self.msg_draft.kind {
+            CommsKind::Administrative => {
+                if !judge_side {
+                    self.msg_status = Status::bad(
+                        "administrative mail is between the Judges and the Game Master"
+                            .to_string(),
+                    );
+                    cx.notify();
+                    return false;
+                }
+            }
+            CommsKind::Telegram => {
+                if judge_side {
+                    if self.msg_draft.assumed_role.is_none() {
+                        self.msg_status = Status::bad(
+                            "a telegram from the Game Master must be sent AS a scenario role"
+                                .to_string(),
+                        );
+                        cx.notify();
+                        return false;
+                    }
+                    if self.msg_draft.hierarchy_node.is_none() {
+                        self.msg_status = Status::bad(
+                            "name the node it speaks from \u{2014} the role says who, the node says where from"
+                                .to_string(),
+                        );
+                        cx.notify();
+                        return false;
+                    }
+                } else if self.msg_draft.assumed_role.is_some() {
+                    self.msg_status = Status::bad(
+                        "only the Game Master may send as a scenario role".to_string(),
+                    );
+                    cx.notify();
+                    return false;
+                }
+                if self.msg_draft.reply_to.is_some() {
+                    self.msg_status = Status::bad(
+                        "a telegram is a broadcast of orders, not a conversation".to_string(),
+                    );
+                    cx.notify();
+                    return false;
+                }
+            }
+        }
         self.msg_busy = true;
         self.msg_status = Status::pending("sending\u{2026}".to_string());
-        let _ = self.order_tx.send(ToBinary::SendTelegram {
-            content: self.msg_content.trim().to_string(),
-        });
+        let draft = MsgDraftForm {
+            content,
+            ..self.msg_draft.clone()
+        };
+        let _ = self.order_tx.send(ToBinary::SendMessage { draft });
         cx.notify();
         true
     }
 
-    /// The row's Enter key: the same `send_telegram` the SEND button calls —
-    /// never a copy.
+    /// The composer's send, cut to the proven broadcast path: a telegram,
+    /// TERBUKA, no audience, ordinary degree.
+    ///
+    /// Kept as its own name because it is what the composer calls when
+    /// nothing was picked, and it is the shape the older tests drive.
+    fn send_telegram(&mut self, cx: &mut Context<Self>) -> bool {
+        self.send_message(cx)
+    }
+
+    /// The row's Enter key: the same `send_message` the SEND button calls
+    /// — never a copy.
     fn submit_telegram(&mut self, cx: &mut Context<Self>) {
-        self.send_telegram(cx);
+        self.send_message(cx);
     }
 
     /// Apply the re-read session a send answer returned: the thread arrives
     /// read back with the new message in it, the row clears, and the panel
     /// stays open — the author keeps writing, the way the book stays open
     /// across adds.
+    ///
+    /// **A landed send says so.** The status line used to be cleared, so
+    /// the operator's own message vanished from the surface with no word
+    /// that it had gone.
     fn apply_message(&mut self, session: SessionView) {
         self.msg_busy = false;
         self.session = session;
-        self.msg_content.clear();
-        self.msg_status.clear();
+        self.msg_draft.content.clear();
+        self.msg_status = Status::good("sent".to_string());
+        self.seed_msg_degree();
+        self.note_seen_watermark();
+    }
+
+    /// Apply a RE-READ of the inbox: the session is installed and the
+    /// operator's own draft SURVIVES it.
+    ///
+    /// The draft is theirs. A refresh that wiped the half-written message
+    /// would be a refresh nobody would dare press.
+    fn apply_inbox(&mut self, session: SessionView) {
+        self.msg_busy = false;
+        self.session = session;
+        self.msg_status = Status::good("refreshed".to_string());
+        self.seed_msg_degree();
+        self.note_seen_watermark();
+    }
+
+    /// Seed the draft's DEGREE from the server's own catalogue.
+    ///
+    /// The degree is a foreign key and the server refuses a message
+    /// without one ("That is not a degree. Read the accepted values from
+    /// `/helpers` under `message_degrees`"), so the console takes the
+    /// catalogue's first entry as the draft's default rather than
+    /// hard-coding a number the server may renumber.
+    fn seed_msg_degree(&mut self) {
+        if self.msg_draft.degree == 0 {
+            if let Some(degree) = self.session.msg_degrees.first() {
+                self.msg_draft.degree = degree.id;
+            }
+        }
+    }
+
+    /// Merge a message that ARRIVED on the socket.
+    ///
+    /// **Merged by id, never appended blind.** The next re-read brings
+    /// the same message again, and a list that doubles a message is a
+    /// list nobody trusts. The arrival is also the moment the message
+    /// becomes NEW, and the moment the console says so — in the type's
+    /// own ink, in the tone that type has.
+    fn apply_live_message(&mut self, message: MessageView) {
+        let id = message.id;
+        let kind = CommsKind::from_wire(&message.kind);
+        self.session.messages.retain(|m| m.id != id);
+        self.session.messages.insert(0, message);
+        if id > self.comms_seen_max {
+            self.comms_unseen.insert(id);
+            self.comms_latest_ink = kind.map(|k| k.ink());
+            // The tone is the TYPE's, not the arrival's: a telegram ticks
+            // like a radio call and an administrative message interrupts
+            // like staff correspondence. One arrival, one sound.
+            crate::sfx::play(match kind {
+                Some(CommsKind::Administrative) => crate::sfx::Sfx::Admin,
+                _ => crate::sfx::Sfx::Telegram,
+            });
+        }
+    }
+
+    /// The watermark of what the operator has seen.
+    ///
+    /// The unseen set is judged against the newest id the surface has
+    /// shown: a re-read that brings the same messages must not mark them
+    /// all new again, and an arrival must survive the next re-read as
+    /// still-new until the operator looks.
+    ///
+    /// **What arrived past the watermark is NEW**, and the operator's own
+    /// message is not news to them — the console knows the author only
+    /// where the server gave it, so a message under an assumed role is
+    /// judged by the identity the server showed.
+    fn note_seen_watermark(&mut self) {
+        for m in &self.session.messages {
+            if m.id > self.comms_seen_max && m.author_id != Some(self.session.me) {
+                self.comms_unseen.insert(m.id);
+            }
+        }
+        let newest = self.session.messages.iter().map(|m| m.id).max().unwrap_or(0);
+        if newest > self.comms_seen_max {
+            self.comms_seen_max = newest;
+        }
+    }
+
+    /// The comms surface's BASELINE: the traffic the console holds when it
+    /// starts.
+    ///
+    /// That traffic is not NEW: there was no last look to be late for, so
+    /// the watermark moves to the newest id it holds and nothing is marked.
+    /// The chip's ink is settled every frame instead — see
+    /// `note_comms_latest`.
+    fn note_baseline(&mut self) {
+        let newest = self.session.messages.iter().map(|m| m.id).max().unwrap_or(0);
+        if newest > self.comms_seen_max {
+            self.comms_seen_max = newest;
+        }
+    }
+
+    /// The chip's ink: the newest traffic's own kind's ink.
+    ///
+    /// **Written every frame, like the step pointer.** The session is
+    /// installed by a dozen drains and the newest message can change in
+    /// any of them, so the chip's ink is settled where the frame is drawn
+    /// rather than in each drain — a rule that lived in one drain would be
+    /// a rule with a dozen chances to miss one.
+    fn note_comms_latest(&mut self) {
+        if let Some(m) = self.session.messages.iter().max_by_key(|m| m.id) {
+            self.comms_latest_ink = CommsKind::from_wire(&m.kind).map(|k| k.ink());
+        }
     }
 
     /// The server's read for one step's related list, if the fan-out brought
@@ -12853,126 +13226,582 @@ impl IslandDemo {
         self.book_status.clear();
     }
 
-    /// The Comms panel (the console's `comms_body` and `messages_island`):
-    /// the session's inbox, newest first, plus the telegram composer row.
+    /// The comms surface's ISLAND: the traffic, the strip that says what
+    /// KIND of traffic it is, and the composer.
     ///
-    /// The console's island also carries a per-step instruction feed and the
-    /// full composer (kind, marking, audience, grade); the feed is a later
-    /// slice and the composer is cut to the proven broadcast path, and the
-    /// panel states both rather than faking either control.
-    fn comms_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let rule = || div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE));
-        // Content-sized, not `size_full`: this column is an ISLAND body now,
-        // and the island's own scroll viewport does the measuring. A
-        // `size_full` child inside a scroll viewport sizes to the viewport
-        // and then clips its own overflow, which is a body that silently
-        // loses its tail instead of scrolling to it.
-        let mut col = div()
+    /// **A floating island, not a modal.** The console's own reasoning
+    /// stands in the field's doc: an inbox is something you read BESIDE the
+    /// map, and a dim over the map is the one thing that makes it
+    /// unreadable. The code was a centred card with a full-frame dim over
+    /// the map — a photograph of the exercise with the traffic laid on top
+    /// of it. This is opaque, square, one 1px `CUT_GREY` edge, and the map
+    /// stays legible around it.
+    ///
+    /// It stands BELOW the execution rail, because the rail carries the
+    /// comms widget that opens this surface: an island that covered the
+    /// door that opened it would be a surface the operator could only
+    /// close with the ×.
+    fn comms_island(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let top = if self.session.execution {
+            self.execution_rail_bottom()
+        } else {
+            COMMS_ISLAND_TOP
+        };
+        // The commander's rail is flush to the bottom of the window, so the
+        // island stands ABOVE it rather than under it.
+        let foot = if self.session.execution && self.is_commander() {
+            self.dash_height()
+        } else {
+            0.0
+        };
+        let height = (self.last_viewport.1 - top - foot - 20.0).clamp(220.0, 620.0);
+        div()
+            .id("comms-island")
+            .absolute()
+            .top(px(top))
+            .right(px(10.0))
+            .w(px(COMMS_ISLAND_W))
+            .h(px(height))
+            .bg(rgba(CONSOLE_NIGHT))
+            .border(px(view::PANEL_EDGE))
+            .border_color(rgba(CUT_GREY))
+            .rounded(px(view::PANEL_RADIUS))
             .flex()
             .flex_col()
-            .gap(px(view::PANEL_GAP))
-            .p(px(view::PANEL_PAD));
-        col = col.child(rule());
-        col = col.child(
-            div()
-                .text_size(px(view::DENSE_PT))
-                .text_color(rgba(BODY_SILVER))
-                .child(format!(
-                    "{} \u{00b7} {}",
-                    if self.session.game.is_empty() {
-                        "no session".to_string()
-                    } else {
-                        self.session.game.clone()
-                    },
-                    self.session.messages.len()
-                )),
-        );
-        col = col.child(rule());
-        if self.session.messages.is_empty() {
-            col = col.child(
-                div()
-                    .text_size(px(view::DENSE_PT))
-                    .text_color(rgba(BODY_SILVER.with_alpha(204)))
-                    .child(if self.session.execution {
-                        "No messages in this exercise."
-                    } else {
-                        "No messages \u{2014} and none can arrive until the game is executing."
-                    }),
-            );
-        }
-        for m in &self.session.messages {
-            // The server's own stamp, trimmed to what an operator reads at a
-            // glance. The console's `short_timestamp` is in the egui binary
-            // and the shell cannot name it, so the trim is repeated here
-            // rather than reached for — the same rule that keeps the shell
-            // free of `map_render`, and the same cost.
-            let at = m
-                .at
-                .split('T')
-                .nth(1)
-                .map(|t| t.split(['+', '-', 'Z']).next().unwrap_or(t))
-                .map(|t| t.split('.').next().unwrap_or(t))
-                .unwrap_or(m.at.as_str())
-                .to_string();
-            col = col.child(
+            .overflow_hidden()
+            // The island is over the map, so a wheel over it is the
+            // console's and the map's is not; and the card truncates the
+            // map's press, the way the fleet picker does, so a click on a
+            // row does not pan the ground behind it.
+            .on_scroll_wheel(swallow_wheel)
+            .block_mouse_except_scroll()
+            .child(self.comms_head(cx))
+            .child(self.comms_tab_strip(cx))
+            .child(self.comms_scope_strip(cx))
+            .child(self.comms_list(cx))
+            .child(self.comms_composer(cx))
+            .into_any_element()
+    }
+
+    /// Where the execution rail ENDS, so the comms island can stand below
+    /// it.
+    ///
+    /// The rail's cards are content-sized, so this is an ESTIMATE and it is
+    /// stated as one: the rail's own top, one card's height per widget and
+    /// the rail's gaps. It only has to be wrong in the safe direction — too
+    /// low and the island stands clear of the rail, too high and it would
+    /// cover the door that opened it.
+    fn execution_rail_bottom(&self) -> f32 {
+        const CARD_H: f32 = 68.0;
+        const GAP: f32 = 6.0;
+        let n = self.execution_widget_set().len() as f32;
+        64.0 + n * CARD_H + (n - 1.0).max(0.0) * GAP + 10.0
+    }
+
+    /// The island's header: the surface's name, what it holds, its REFRESH
+    /// verb and its own CLOSE.
+    ///
+    /// The close is the island's own, and it exists because every other
+    /// surface in the console has one: an island with no way out but the
+    /// thing that opened it is a surface that can strand the operator.
+    fn comms_head(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let visible = self.comms_visible().len();
+        let held = self.session.messages.len();
+        let total = self.session.inbox_total;
+        // The count says what is ON SCREEN, and the server's total says how
+        // much the exercise holds. When they differ the surface is showing
+        // a page, and a page drawn as if it were the whole traffic is a
+        // lie about the exercise.
+        let count = if total > held as u64 {
+            format!("{} of {}", visible, plural(total as usize, "message"))
+        } else {
+            plural(visible, "message")
+        };
+        let ink = self.comms_chip_ink();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .h(px(TITLE_H))
+            .px(px(view::PANEL_PAD))
+            .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap(px(2.0))
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .flex_shrink_0()
+                    .child(panel_title("Comms", MAP_INK))
+                    // The game the traffic belongs to: the inbox is one
+                    // exercise's, and a surface that says "COMMS" without
+                    // saying whose is a surface about an unknown room.
+                    .child(
+                        div()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(view::LABEL_PT))
+                            .text_color(rgba(BODY_SILVER))
+                            .child(if self.session.game.is_empty() {
+                                "no session".to_string()
+                            } else {
+                                self.session.game.clone()
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(machine(count, ink))
+                    .child(
+                        div()
+                            .id("comms-refresh")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.refresh_inbox(cx);
+                            }))
+                            .child(button("REFRESH", true, false, false)),
+                    )
+                    .child(
+                        div()
+                            .id("close-comms")
+                            .cursor_pointer()
+                            .text_size(px(view::BODY_PT))
+                            .text_color(rgba(BUTTON_LABEL))
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.toggle_comms(cx);
+                            }))
+                            .child("\u{00d7}"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The KIND strip: what sort of traffic is on screen.
+    ///
+    /// **The assessment strip's idiom, unchanged.** Four small verbless
+    /// targets became three: a segmented control is one widget with a
+    /// moving part, and this is three targets — nothing to arm, nothing to
+    /// get stuck in. GPUI 0.2.2 ships no Tabs and no SegmentedControl, and
+    /// the console has never used one.
+    ///
+    /// The count on each target is the count INSIDE the current scope, so
+    /// the numbers on the strip and the rows underneath them are the same
+    /// arithmetic: TELEGRAM plus ADMIN is ALL, and a strip whose numbers do
+    /// not add up to the list is a strip nobody trusts.
+    fn comms_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut strip = div()
+            .flex()
+            .flex_row()
+            .gap(px(6.0))
+            .px(px(view::PANEL_PAD))
+            .pb(px(6.0));
+        for (i, tab) in CommsTab::ALL.iter().enumerate() {
+            let tab = *tab;
+            let picked = self.comms_tab == tab;
+            let count = CommsTab::count_in(tab, &self.session.messages, self.comms_scope);
+            strip = strip.child(
+                div()
+                    .id(("comms-tab", i))
+                    .cursor_pointer()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .when(picked, |d| d.bg(rgba(PANEL_SLATE)))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.comms_tab = tab;
+                        cx.notify();
+                    }))
+                    // The picked tab is in the bright ink, not only on a
+                    // tint: "which tab am I on" is the one question a tab
+                    // strip exists to answer.
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.0))
+                            .gap(px(4.0))
                             .child(
                                 div()
                                     .font_family(view::FACE_HUMAN)
                                     .text_size(px(view::DENSE_PT))
-                                    .text_color(rgba(MAP_INK))
-                                    .child(m.sender.clone()),
+                                    .text_color(rgba(if picked { MAP_INK } else { BODY_SILVER }))
+                                    .child(tab.label()),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(view::LABEL_PT))
-                                    .text_color(rgba(BODY_SILVER))
-                                    .child(if m.broadcast {
-                                        format!("{} \u{00b7} broadcast", m.kind)
-                                    } else {
-                                        m.kind.clone()
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(view::LABEL_PT))
-                                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                                    .child(at),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(view::DENSE_PT))
-                            .text_color(rgba(BODY_SILVER))
-                            .child(m.content.clone()),
+                            .child(machine(
+                                count.to_string(),
+                                if picked { MAP_INK } else { CUT_GREY },
+                            )),
                     ),
             );
-            col = col.child(rule());
         }
-        // The composer row: the console's `compose_ui`, cut to the proven
-        // path — a broadcast telegram, TERBUKA, BIASA. Armed only in an
-        // executing game, like the helm: the server only takes messages
-        // there. A blank row never posts (the console's own sentence), and
-        // the button guards in the listener, not only in its styling.
-        col = col.child(rule());
-        col = col.child(
+        strip.into_any_element()
+    }
+
+    /// The SCOPE row: which SLICE of the kind is on screen.
+    ///
+    /// Smaller than the kind strip, and below it, because the scope is the
+    /// narrower question: the kind says what sort of traffic this is, and
+    /// the scope says how much of it this operator is looking at.
+    fn comms_scope_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut strip = div()
+            .flex()
+            .flex_row()
+            .gap(px(6.0))
+            .px(px(view::PANEL_PAD))
+            .pb(px(6.0));
+        for (i, scope) in CommsScope::ALL.iter().enumerate() {
+            let scope = *scope;
+            let picked = self.comms_scope == scope;
+            strip = strip.child(
+                div()
+                    .id(("comms-scope", i))
+                    .cursor_pointer()
+                    .px(px(5.0))
+                    .py(px(1.0))
+                    .rounded(px(3.0))
+                    .when(picked, |d| d.bg(rgba(PANEL_SLATE)))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.comms_scope = scope;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(view::LABEL_PT))
+                            .text_color(rgba(if picked { MAP_INK } else { BODY_SILVER }))
+                            .child(scope.label()),
+                    ),
+            );
+        }
+        strip.into_any_element()
+    }
+
+    /// The list: the traffic the strip and the scope select, newest first.
+    ///
+    /// **It scrolls, and it clips.** The island has a fixed height and the
+    /// list is the one thing inside it that can be longer, so the list
+    /// scrolls inside the island and nothing paints outside it — the
+    /// defect the old modal had, where a long thread ran out over the
+    /// dimmed map.
+    fn comms_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut list = div()
+            .id("comms-list")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scroll()
+            // The scroll viewport paints its own opaque default, which no
+            // ancestor's background shows through.
+            .bg(rgba(CONSOLE_NIGHT))
+            .flex()
+            .flex_col();
+        let held = self.session.messages.len();
+        if self.session.inbox_total > held as u64 {
+            list = list.child(
+                div()
+                    .px(px(view::PANEL_PAD))
+                    .pb(px(4.0))
+                    .child(note(format!(
+                        "Showing {} of {} \u{2014} the server holds more.",
+                        held, self.session.inbox_total
+                    ))),
+            );
+        }
+        if let Some(why) = self.session.inbox_error.clone() {
+            // A READ THAT FAILED is not an empty inbox, and it must never
+            // be drawn as one: "no messages" and "we could not ask" are
+            // different facts and the operator has to be told which one
+            // holds.
+            list = list.child(
+                div()
+                    .px(px(view::PANEL_PAD))
+                    .pb(px(6.0))
+                    .child(note(format!("The inbox could not be read: {why}.")))
+                    .child(
+                        div()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(view::LABEL_PT))
+                            .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                            .child("Nothing below is missing traffic \u{2014} it is unread."),
+                    ),
+            );
+        } else {
+            let visible = self
+                .comms_visible()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<MessageView>>();
+            if visible.is_empty() {
+                list = list.child(
+                    div()
+                        .px(px(view::PANEL_PAD))
+                        .pb(px(6.0))
+                        .child(note(self.comms_empty_sentence())),
+                );
+            } else {
+                for m in visible {
+                    list = list.child(self.comms_row(&m, cx));
+                }
+            }
+        }
+        list.into_any_element()
+    }
+
+    /// What the surface says when the slice on screen holds nothing.
+    ///
+    /// Each state has its own sentence, because "nothing here" means three
+    /// different things: the exercise holds no traffic, this KIND of
+    /// traffic has none, or the traffic there is not addressed to this
+    /// operator. One sentence for all three would be wrong twice out of
+    /// three.
+    fn comms_empty_sentence(&self) -> String {
+        if self.session.messages.is_empty() {
+            return if self.session.execution {
+                "No messages in this exercise.".to_string()
+            } else {
+                "No messages \u{2014} and none can arrive until the game is executing.".to_string()
+            };
+        }
+        match self.comms_scope {
+            CommsScope::ToMe => "Nothing in this exercise was addressed to you.".to_string(),
+            CommsScope::Broadcast => "No broadcasts in this exercise.".to_string(),
+            CommsScope::All => match self.comms_tab {
+                CommsTab::Telegram => "No telegram traffic in this exercise.".to_string(),
+                CommsTab::Admin => "No administrative traffic in this exercise.".to_string(),
+                CommsTab::All => "No messages in this exercise.".to_string(),
+            },
+        }
+    }
+
+    /// One message, drawn with the treatment its kind and marking earn.
+    ///
+    /// **The rail is the TYPE and the chip is the MARKING.** They are two
+    /// axes and the wire keeps them apart: a telegram can be TERBATAS and
+    /// an administrative message can be TERBUKA. So the rail is one 1px
+    /// edge in the kind's ink and the classification is a chip in the
+    /// marking's ink — and the marking never becomes a tab, because the
+    /// operator asks "telegram or administrative?", not "open or secret?".
+    ///
+    /// The server's own `border_color` is NOT drawn. The palette belongs to
+    /// `view`, and a hex the server sent would bypass it.
+    fn comms_row(&mut self, m: &MessageView, cx: &mut Context<Self>) -> AnyElement {
+        let treatment = CommsTreatment::of(m);
+        let kind_ink = treatment.kind_ink();
+        let mark_ink = treatment.mark_ink();
+        let is_new = self.comms_unseen.contains(&m.id);
+        let mine = m.author_id == Some(self.session.me);
+        let addressed = m.to_me;
+        let read = m.read_at.is_some();
+        let id = m.id;
+        // The type's word. A kind this build does not know is shown as the
+        // wire named it, in the structure grey: the console does not fold
+        // an unknown type into one of its own two.
+        let kind_word = match treatment.kind {
+            Some(k) => k.label().to_string(),
+            None => {
+                if m.kind.trim().is_empty() {
+                    "UNKNOWN".to_string()
+                } else {
+                    m.kind.to_uppercase()
+                }
+            }
+        };
+        let kind_chip_ink = match treatment.kind {
+            Some(k) => k.ink(),
+            None => CUT_GREY,
+        };
+
+        let mut chips = div().flex().flex_row().items_center().gap(px(5.0)).flex_shrink_0();
+        if treatment.kind == Some(CommsKind::Telegram) {
+            // The mark that says "radio traffic", and only radio traffic.
+            chips = chips.child(comms_marker(kind_ink));
+        }
+        chips = chips.child(comms_chip(&kind_word, kind_chip_ink));
+        if let Some(mark) = treatment.mark {
+            chips = chips.child(comms_chip(mark.label(), mark_ink));
+        }
+        if is_new {
+            // NEW is a STATE, never a blink: the console's law is that
+            // arrival is announced by being drawn, not by moving.
+            chips = chips.child(comms_chip("NEW", RADAR_CYAN));
+        }
+        // The receipt. A broadcast has none: the server refuses a receipt
+        // for a message nobody was addressed by ("A message sent to
+        // everybody has no individual receipt"), so the row says nothing
+        // about reading one.
+        if let Some(receipt) = comms_receipt(m) {
+            chips = chips.child(comms_chip(
+                if receipt { "READ" } else { "UNREAD" },
+                if receipt { CUT_GREY } else { WARNING_SAND },
+            ));
+        }
+
+        let mut who = div().flex().flex_row().items_center().gap(px(6.0)).min_w_0();
+        who = who.child(
             div()
+                .font_family(view::FACE_HUMAN)
                 .text_size(px(view::DENSE_PT))
-                .text_color(rgba(BODY_SILVER))
-                .child("New telegram"),
+                .text_color(rgba(MAP_INK))
+                .child(m.sender.clone()),
         );
+        if m.assumed {
+            // The identity the server showed and the author it withheld:
+            // a message sent AS a role never names who sent it, and the
+            // console must not guess the author back.
+            who = who.child(comms_chip("ASSUMED", CUT_GREY));
+        }
+        if mine {
+            who = who.child(comms_chip("SENT", CUT_GREY));
+        }
+
+        let mut verbs = div().flex().flex_row().items_center().gap(px(6.0)).flex_shrink_0();
+        if addressed && !read {
+            verbs = verbs.child(
+                div()
+                    .id(("comms-read", id as usize))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.mark_message_read(id, cx);
+                    }))
+                    .child(button("MARK READ", true, false, false)),
+            );
+        }
+        if mine || addressed {
+            // The author withdraws it; an addressee hides it. The server
+            // takes two branches and answers them differently, and only
+            // these two callers may remove a message at all.
+            verbs = verbs.child(
+                div()
+                    .id(("comms-remove", id as usize))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.remove_message(id, cx);
+                    }))
+                    .child(button("REMOVE", true, false, false)),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .py(px(6.0))
+            .px(px(view::PANEL_PAD))
+            .border_l(px(1.0))
+            .border_color(rgba(kind_ink))
+            .border_b(px(1.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(chips)
+                    .child(div().flex_1())
+                    .child(machine(short_timestamp(&m.at), BODY_SILVER.with_alpha(178))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(who)
+                    .child(div().flex_1())
+                    .child(verbs),
+            )
+            .child(
+                div()
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(view::DENSE_PT))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(m.content.clone()),
+            )
+            .into_any_element()
+    }
+
+    /// The messages the kind strip and the scope row select.
+    fn comms_visible(&self) -> Vec<&MessageView> {
+        self.session
+            .messages
+            .iter()
+            .filter(|m| self.comms_tab.shows(&m.kind) && self.comms_scope.shows(m))
+            .collect()
+    }
+
+    /// The ink the comms chip carries: the newest traffic's own kind's ink.
+    ///
+    /// The console's law is that state is STATED, not animated: the chip
+    /// says what kind of traffic arrived last, in that kind's colour, and
+    /// the operator reads the colour instead of watching for a flash.
+    fn comms_chip_ink(&self) -> Rgba {
+        self.comms_latest_ink.unwrap_or(BODY_SILVER)
+    }
+
+    /// How many of the held messages the operator has not looked at.
+    fn comms_unseen_count(&self) -> usize {
+        self.session
+            .messages
+            .iter()
+            .filter(|m| self.comms_unseen.contains(&m.id))
+            .count()
+    }
+
+    /// The band's comms chip: the count, in the newest traffic's own ink,
+    /// and the unseen count beside it.
+    ///
+    /// **The chip is the console's announcement.** There is no toast and no
+    /// flash — the console's law is that a state is stated — so the band
+    /// says what arrived, in the ink that kind of traffic carries, and how
+    /// much of it the operator has not looked at.
+    fn comms_chip(&mut self) -> AnyElement {
+        let count = self.session.messages.len();
+        let ink = self.comms_chip_ink();
+        let unseen = self.comms_unseen_count();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(BUTTON_PADDING.0))
+            .py(px(4.0))
+            .rounded(px(CONTROL_RADIUS))
+            .bg(rgba(BUTTON_GRAPHITE))
+            .border(px(1.0))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .child(tracked("comms", view::LABEL_PT, BUTTON_LABEL))
+            .child(machine(count.to_string(), ink))
+            .when(unseen > 0, |d| {
+                d.child(tracked(&format!("{unseen} new"), view::LABEL_PT, WARNING_SAND))
+            })
+            .into_any_element()
+    }
+
+    /// The composer: the pickers the server honours, the one text field,
+    /// and the SEND.
+    ///
+    /// **One text field, not two.** The content field is the console's own
+    /// hand-rolled input at index 10 — the same one every other composer
+    /// uses — and the pickers beside it are small targets, not fields.
+    fn comms_composer(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let armed = self.session.execution;
+        let status = self.msg_status.clone();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .flex_shrink_0()
+            .px(px(view::PANEL_PAD))
+            .py(px(view::PANEL_PAD));
+        // The console's only divider: a tracked label and a rule to the
+        // edge. It says what the half below it is.
+        col = col.child(section("compose"));
+        col = col.child(self.comms_pickers(cx));
         col = col.child(self.compose_field(10, "message text\u{2026}", cx));
-        let msg_armed = self.session.execution;
-        let msg_status = self.msg_status.clone();
         col = col.child(
             div()
                 .flex()
@@ -12986,23 +13815,468 @@ impl IslandDemo {
                         .on_click(cx.listener(|view, _, _, cx| {
                             view.send_telegram(cx);
                         }))
-                        .child(button("SEND", false, !msg_armed, false)),
+                        .child(button("SEND", false, !armed, false)),
                 )
-                .child(status_line(&msg_status)),
+                .child(status_line(&status)),
         );
-        col = col.child(
-            div()
-                .text_size(px(view::LABEL_PT))
-                .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                .child(if msg_armed {
-                    "A telegram broadcast, TERBUKA / BIASA — kind, marking, \
-                     audience and grade pickers are a later slice, and the hull \
-                     must sit under a task node for the server to take it."
-                } else {
-                    "Composing is a write, and the server takes messages only in execution."
-                }),
-        );
+        // The phase gate is the one thing the composer has to say for
+        // itself: a write the server will refuse is a write the console
+        // states before it is attempted.
+        if !armed {
+            col = col.child(
+                div()
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                    .child("Composing is a write, and the server takes messages only in execution."),
+            );
+        }
         col.into_any_element()
+    }
+
+    /// The composer's pickers: the fields the server honours and the
+    /// console does not guess.
+    ///
+    /// **Every option is the server's.** The kinds are its closed set of
+    /// two, the markings are the three it validates, the degrees come from
+    /// its own catalogue, the roles are the ones THIS game has issued, and
+    /// the seats are the roster. Nothing here is a hard-coded number and
+    /// nothing here is a verb the server would refuse.
+    fn comms_pickers(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // The pickers are a DISCLOSURE, not a wall.
+        //
+        // The island is short — the commander's rail owns the bottom of
+        // the window and the execution rail the top — and a composer that
+        // takes half of what is left leaves the traffic, which is the
+        // half that matters, with room for one and a half rows. So the
+        // envelope is shown as ONE LINE that says what the message will
+        // be, and the controls behind it are opened when the operator
+        // wants to change it.
+        //
+        // The line is not a caption of the draft; it IS the draft's
+        // state, in the console's own chips: the kind, the marking, the
+        // degree and who it goes to. An operator reading it knows what
+        // the SEND button will send without opening anything.
+        let mut col = div().flex().flex_col().gap(px(4.0));
+        col = col.child(self.comms_envelope_line(cx));
+        if self.comms_pickers_open {
+            // The kind and the marking share a line, and the degree and
+            // the identity share the next: the composer's controls are a
+            // STRIP, not a wall. The surface's other half is a list, and
+            // a composer that takes the island leaves nothing to read.
+            let mut line = div().flex().flex_row().items_center().gap(px(5.0)).flex_wrap();
+            line = line.child(self.comms_kind_picker(cx));
+            line = line.child(self.comms_mark_picker(cx));
+            col = col.child(line);
+            let mut line = div().flex().flex_row().items_center().gap(px(5.0)).flex_wrap();
+            line = line.child(self.comms_degree_picker(cx));
+            line = line.child(self.comms_identity_picker(cx));
+            col = col.child(line);
+            col = col.child(self.comms_audience_picker(cx));
+        }
+        col.into_any_element()
+    }
+
+    /// The composer's envelope, on one line: what a SEND would send.
+    ///
+    /// **It is the draft's state, not a caption of it.** The kind, the
+    /// marking, the degree and the audience are the four things the
+    /// server reads, and the operator picks them on the line BEHIND this
+    /// one — so this line has to name them exactly, or it is a decoration.
+    fn comms_envelope_line(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let kind = self.msg_draft.kind;
+        let mark = self.msg_draft.mark;
+        let degree = self
+            .session
+            .msg_degrees
+            .iter()
+            .find(|d| d.id == self.msg_draft.degree)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| format!("{}", self.msg_draft.degree));
+        let audience = self.comms_audience_summary();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.0))
+            .flex_wrap();
+        row = row.child(
+            div()
+                .id("comms-envelope")
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _, _, cx| {
+                    // The same verb opens and closes the controls: a
+                    // disclosure that can only be opened is a drawer.
+                    view.comms_pickers_open = !view.comms_pickers_open;
+                    cx.notify();
+                }))
+                .child(button("DISPATCH", true, false, self.comms_pickers_open)),
+        );
+        row = row.child(comms_chip(kind.label(), kind.ink()));
+        row = row.child(comms_chip(mark.label(), mark.ink()));
+        row = row.child(comms_value_chip(&degree, CUT_GREY));
+        row = row.child(comms_value_chip(&audience, CUT_GREY));
+        row.into_any_element()
+    }
+
+    /// Who the draft goes to, in one phrase.
+    ///
+    /// The names come from the roster, and the phrase says the list as
+    /// well: a message to two seats and a message to one are different
+    /// dispatches, and a reader must not have to count chips.
+    fn comms_audience_summary(&self) -> String {
+        let name_of = |uid: i64| {
+            self.session
+                .msg_audience
+                .iter()
+                .find(|s| s.user_id == uid)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| format!("user {uid}"))
+        };
+        let mut names: Vec<String> = self.msg_draft.to.iter().map(|u| name_of(*u)).collect();
+        names.extend(self.msg_draft.cc.iter().map(|u| name_of(*u)));
+        match names.len() {
+            0 => "everyone".to_string(),
+            1 => names[0].clone(),
+            _ => format!("{} and {}", names[0], plural(names.len() - 1, "other")),
+        }
+    }
+
+    /// The KIND picker.
+    ///
+    /// ADMINISTRATIVE is the Game Master's traffic and the server refuses
+    /// it from anybody else ("Administrative messages pass between the
+    /// Judges and the Game Master"), so a seat that cannot send it is
+    /// never offered it.
+    fn comms_kind_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let judge = self.own_seat().is_some_and(|s| s.judge);
+        let picked = self.msg_draft.kind;
+        let kinds = comms_offered_kinds(judge);
+        let mut row = div().flex().flex_row().items_center().gap(px(5.0)).flex_wrap();
+        row = row.child(tracked("kind", view::LABEL_PT, CUT_GREY));
+        for (i, kind) in kinds.iter().enumerate() {
+            let kind = *kind;
+            let on = picked == kind;
+            row = row.child(
+                div()
+                    .id(("comms-kind", i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.set_msg_kind(kind);
+                        cx.notify();
+                    }))
+                    .child(button(kind.label(), true, false, on)),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// The MARKING picker.
+    ///
+    /// **Only TERBUKA may be a broadcast** ("A message with no `to` and no
+    /// `cc` is a broadcast, and only `TERBUKA` may be a broadcast"), so
+    /// with nobody named the picker offers the one marking the server will
+    /// take rather than offering two it will refuse.
+    fn comms_mark_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let addressed = !self.msg_draft.to.is_empty() || !self.msg_draft.cc.is_empty();
+        let marks = comms_offered_marks(addressed);
+        let picked = self.msg_draft.mark;
+        let mut row = div().flex().flex_row().items_center().gap(px(5.0)).flex_wrap();
+        row = row.child(tracked("mark", view::LABEL_PT, CUT_GREY));
+        for (i, mark) in marks.iter().enumerate() {
+            let mark = *mark;
+            let on = picked == mark;
+            row = row.child(
+                div()
+                    .id(("comms-mark", i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.msg_draft.mark = mark;
+                        cx.notify();
+                    }))
+                    .child(button(mark.label(), true, false, on)),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// The DEGREE picker: the server's own catalogue, never a guessed
+    /// number.
+    fn comms_degree_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let picked = self.msg_draft.degree;
+        let degrees = self.session.msg_degrees.clone();
+        let mut row = div().flex().flex_row().items_center().gap(px(5.0)).flex_wrap();
+        row = row.child(tracked("degree", view::LABEL_PT, CUT_GREY));
+        if degrees.is_empty() {
+            row = row.child(
+                div()
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                    .child("no degrees published \u{2014} the server refuses a message without one"),
+            );
+        }
+        for (i, degree) in degrees.iter().enumerate() {
+            let did = degree.id;
+            let name = degree.name.clone();
+            let on = picked == did;
+            row = row.child(
+                div()
+                    .id(("comms-degree", i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.msg_draft.degree = did;
+                        cx.notify();
+                    }))
+                    .child(button(&name, true, false, on)),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// The AUDIENCE picker: the roster, by name, into TO and into CC.
+    ///
+    /// **The roster and nothing more.** The server refuses an audience that
+    /// is not in the exercise, and for a telegram it refuses a recipient
+    /// who commands nothing — and the roster does not say who commands
+    /// what, so the console cannot grey a seat out on a guess. It offers
+    /// the seats and lets the server rule on the ones it would refuse.
+    ///
+    /// **ONE row of seats, and a target.** A seat's chip says where the
+    /// seat is ("Super User · TO"), so the console keeps its one
+    /// selection treatment — a cyan edge and the bright ink — and the
+    /// reader never has to remember which way the target was pointing.
+    /// One row per seat would be a wall of eight rows in a surface whose
+    /// other half is a LIST.
+    fn comms_audience_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = div().flex().flex_row().items_center().gap(px(5.0)).flex_wrap();
+        row = row.child(tracked("audience", view::LABEL_PT, CUT_GREY));
+        // The target: where the next pick lands.
+        for (i, target) in [AudienceTarget::To, AudienceTarget::Cc].iter().enumerate() {
+            let t = *target;
+            let on = self.msg_audience_target == t;
+            row = row.child(
+                div()
+                    .id(("comms-target", i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.msg_audience_target = t;
+                        cx.notify();
+                    }))
+                    .child(button(t.label(), true, false, on)),
+            );
+        }
+        let seats = self.session.msg_audience.clone();
+        if seats.is_empty() {
+            row = row.child(
+                div()
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                    .child("no seats to address \u{2014} this goes to the whole exercise"),
+            );
+            return row.into_any_element();
+        }
+        for (i, seat) in seats.iter().enumerate() {
+            let uid = seat.user_id;
+            let in_to = self.msg_draft.to.contains(&uid);
+            let in_cc = self.msg_draft.cc.contains(&uid);
+            let where_to = if in_to {
+                Some("TO")
+            } else if in_cc {
+                Some("CC")
+            } else {
+                None
+            };
+            let picked = match self.msg_audience_target {
+                AudienceTarget::To => in_to,
+                AudienceTarget::Cc => in_cc,
+            };
+            let name = seat.name.clone();
+            let label = match where_to {
+                Some(list) => format!("{name} \u{00b7} {list}"),
+                None => name,
+            };
+            row = row.child(
+                div()
+                    .id(("comms-seat", i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.toggle_audience(uid, cx);
+                    }))
+                    .child(comms_seat_chip(&label, picked)),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// The IDENTITY picker: the role a judge speaks AS, and the node it
+    /// speaks FROM.
+    ///
+    /// **Judge-side only.** The server refuses a telegram from anybody
+    /// else that claims an identity ("only the Game Master may send as a
+    /// scenario role"), so a seat that is not on the judge side is never
+    /// offered one. And a judge sending a TELEGRAM needs both halves: the
+    /// role says WHO is speaking ("A Telegram message from the Game Master
+    /// or a Judge must be sent AS a scenario role") and the node says WHERE
+    /// FROM ("A Telegram message sent as a scenario role must name the node
+    /// it speaks FROM").
+    ///
+    /// An ADMINISTRATIVE message needs neither, so the picker is not
+    /// drawn for one — a control the server does not read is a control
+    /// that lies.
+    fn comms_identity_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let judge = self.own_seat().is_some_and(|s| s.judge);
+        if !comms_offers_identity(judge, self.msg_draft.kind) {
+            return div().into_any_element();
+        }
+        // ONE line: the role and the node, side by side. They are two
+        // halves of one fact — who is speaking, and where from — so they
+        // are read together.
+        let mut row = div().flex().flex_row().items_center().gap(px(5.0)).flex_wrap();
+        let picked_role = self.msg_draft.assumed_role;
+        row = row.child(tracked("as", view::LABEL_PT, CUT_GREY));
+        for (i, role) in self.session.msg_roles.clone().iter().enumerate() {
+            let rid = role.id;
+            let name = role.name.clone();
+            let on = picked_role == Some(rid);
+            row = row.child(
+                div()
+                    .id(("comms-role", i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.msg_draft.assumed_role = Some(rid);
+                        cx.notify();
+                    }))
+                    .child(button(&name, true, false, on)),
+            );
+        }
+        let picked_node = self.msg_draft.hierarchy_node;
+        row = row.child(tracked("from", view::LABEL_PT, CUT_GREY));
+        for (i, group) in self.session.groups.clone().iter().enumerate() {
+            let gid = group.group_id;
+            let name = group.name.clone();
+            let on = picked_node == Some(gid);
+            row = row.child(
+                div()
+                    .id(("comms-node", i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.msg_draft.hierarchy_node = Some(gid);
+                        cx.notify();
+                    }))
+                    .child(button(&name, true, false, on)),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// Pick the kind, and take the identity with it.
+    ///
+    /// An ADMINISTRATIVE message is staff correspondence and needs no
+    /// assumed role and no node; a TELEGRAM from the Game Master needs
+    /// both. So changing the kind drops the identity the new kind does
+    /// not want — the draft never carries an identity the server refuses.
+    fn set_msg_kind(&mut self, kind: CommsKind) {
+        self.msg_draft.kind = kind;
+        if kind == CommsKind::Administrative {
+            self.msg_draft.assumed_role = None;
+            self.msg_draft.hierarchy_node = None;
+            self.msg_draft.reply_to = None;
+        }
+    }
+
+    /// Put a seat in the picker's TARGET list, or take it out again.
+    ///
+    /// The two lists are exclusive here: the server takes a seat in `to`
+    /// and the same seat in `cc`, and a draft that says both is a draft
+    /// that says two things about one seat. So a pick in the target list
+    /// takes the seat out of the other one.
+    fn toggle_audience(&mut self, user_id: i64, cx: &mut Context<Self>) {
+        let into_cc = self.msg_audience_target == AudienceTarget::Cc;
+        if into_cc {
+            if self.msg_draft.cc.contains(&user_id) {
+                self.msg_draft.cc.retain(|id| *id != user_id);
+            } else {
+                self.msg_draft.cc.push(user_id);
+                self.msg_draft.to.retain(|id| *id != user_id);
+            }
+        } else if self.msg_draft.to.contains(&user_id) {
+            self.msg_draft.to.retain(|id| *id != user_id);
+        } else {
+            self.msg_draft.to.push(user_id);
+            self.msg_draft.cc.retain(|id| *id != user_id);
+        }
+        // A broadcast may only be TERBUKA, so dropping the last name puts
+        // the marking back where the server will take it.
+        if self.msg_draft.to.is_empty() && self.msg_draft.cc.is_empty() {
+            self.msg_draft.mark = CommsMark::Open;
+        }
+        cx.notify();
+    }
+
+    /// REFRESH: re-read the inbox.
+    ///
+    /// The strip filters what the console already holds, so this is not a
+    /// filter request — it is a REFRESH, for the operator who suspects the
+    /// list is behind.
+    fn refresh_inbox(&mut self, cx: &mut Context<Self>) {
+        if self.msg_busy {
+            return;
+        }
+        self.msg_busy = true;
+        self.msg_status = Status::pending("refreshing\u{2026}".to_string());
+        let _ = self.order_tx.send(ToBinary::RefreshInbox);
+        cx.notify();
+    }
+
+    /// MARK READ: record this caller's receipt on one addressed message.
+    ///
+    /// Only ever offered on a message this caller was addressed by: the
+    /// server refuses a receipt for anybody else ("A message sent to
+    /// everybody has no individual receipt").
+    fn mark_message_read(&mut self, message_id: i64, cx: &mut Context<Self>) {
+        if self.msg_busy {
+            return;
+        }
+        self.msg_busy = true;
+        self.msg_status = Status::pending("recording\u{2026}".to_string());
+        let _ = self.order_tx.send(ToBinary::MarkMessageRead { message_id });
+        cx.notify();
+    }
+
+    /// REMOVE: withdraw it (the author) or hide it (an addressee).
+    fn remove_message(&mut self, message_id: i64, cx: &mut Context<Self>) {
+        if self.msg_busy {
+            return;
+        }
+        self.msg_busy = true;
+        self.msg_status = Status::pending("removing\u{2026}".to_string());
+        let _ = self.order_tx.send(ToBinary::DeleteMessage { message_id });
+        cx.notify();
+    }
+
+    /// The comms island's door: it opens and it closes, and it does not
+    /// touch the other surfaces.
+    ///
+    /// **Closing is the operator's LOOK.** The unseen set is what arrived
+    /// while the surface was shut; the operator has now read the traffic,
+    /// so the next arrivals start a fresh count. That is why the clear
+    /// happens on the CLOSE and not on the open: opening shows the NEW
+    /// chips, and clearing on the open would take them away in the same
+    /// frame.
+    fn toggle_comms(&mut self, cx: &mut Context<Self>) {
+        if self.comms_open {
+            self.comms_open = false;
+            self.comms_unseen.clear();
+            let newest = self.session.messages.iter().map(|m| m.id).max().unwrap_or(0);
+            if newest > self.comms_seen_max {
+                self.comms_seen_max = newest;
+            }
+        } else {
+            self.comms_open = true;
+        }
+        cx.notify();
     }
 
     /// Who is reading the exercise, as the Scenario board reads it.
@@ -15469,7 +16743,7 @@ impl IslandDemo {
             7 => &self.step_draft.content,
             8 => &self.step_draft.start_hour,
             9 => &self.step_draft.end_hour,
-            _ => &self.msg_content,
+            _ => &self.msg_draft.content,
         }
     }
 
@@ -15485,7 +16759,7 @@ impl IslandDemo {
             7 => &mut self.step_draft.content,
             8 => &mut self.step_draft.start_hour,
             9 => &mut self.step_draft.end_hour,
-            _ => &mut self.msg_content,
+            _ => &mut self.msg_draft.content,
         }
     }
 
@@ -15643,6 +16917,32 @@ impl IslandDemo {
             WriteId::StepDeclare => self.apply_step_declare(session),
             WriteId::StepVerb => self.apply_step_verb(session, note),
             WriteId::Message => self.apply_message(session),
+            // The inbox re-read. The session is installed and the
+            // operator's own draft SURVIVES it — a refresh that wiped
+            // the half-written message would be a refresh nobody dares
+            // press.
+            WriteId::Inbox => self.apply_inbox(session),
+            // A receipt, recorded. The message is marked read; the
+            // operator's draft is untouched.
+            WriteId::Receipt => {
+                self.msg_busy = false;
+                self.session = session;
+            }
+            // A withdrawal or a hide. The message is gone from this
+            // caller's view, and the surface says so.
+            WriteId::Delete => {
+                self.msg_busy = false;
+                self.session = session;
+                self.msg_status = Status::good("removed".to_string());
+            }
+            // A message that ARRIVED is never answered by this path — it
+            // comes on its own feed, not as a write's answer. The arm
+            // exists so a stray answer cannot be applied as somebody
+            // else's.
+            WriteId::Live => {
+                self.msg_busy = false;
+                self.session = session;
+            }
             WriteId::Roster => {
                 self.roster_busy = false;
                 self.roster_status.clear();
@@ -15761,6 +17061,22 @@ impl IslandDemo {
                 self.msg_busy = false;
                 self.msg_status = Status::bad(why);
             }
+            WriteId::Inbox => {
+                self.msg_busy = false;
+                self.msg_status = Status::bad(why);
+            }
+            WriteId::Receipt => {
+                self.msg_busy = false;
+                self.msg_status = Status::bad(why);
+            }
+            WriteId::Delete => {
+                self.msg_busy = false;
+                self.msg_status = Status::bad(why);
+            }
+            WriteId::Live => {
+                self.msg_busy = false;
+                self.msg_status = Status::bad(why);
+            }
             WriteId::Roster => {
                 self.roster_busy = false;
                 self.roster_status = Status::bad(why);
@@ -15821,6 +17137,9 @@ impl IslandDemo {
         // so this seeds empty drafts; it is here so the two "a new held game"
         // paths cannot disagree about seeding.
         self.reseed_drafts();
+        // The comms surface's baseline: the traffic this console holds at
+        // its start is not NEW — there was no last look to be late for.
+        self.note_baseline();
     }
 
     /// Submit the book's title row.
@@ -17283,6 +18602,8 @@ impl Render for IslandDemo {
         // pointer: `end` takes the pointer away, and this is what lets the
         // board keep saying which steps are behind the exercise.
         self.note_step_pointer();
+        // The comms chip's ink, settled where the frame is drawn.
+        self.note_comms_latest();
         // The size the map is asked for, measured from the window: the
         // picture is drawn at the window's own device pixels, so it is not a
         // small map stretched over a big one.
@@ -18231,6 +19552,17 @@ impl Render for IslandDemo {
                 root = root.child(self.commander_dashboard(cx));
             }
         }
+        // The comms island: a floating surface over the map, beside it and
+        // not over it.
+        //
+        // It is drawn HERE, as a sibling of the execution rail, and not in
+        // the modal zone — an inbox is something you read BESIDE the map,
+        // and a dim over the map is the one thing that makes it
+        // unreadable. It is drawn before the modal, so a dialog that takes
+        // the frame still takes the frame.
+        if self.comms_open {
+            root = root.child(self.comms_island(cx));
+        }
         // The step reminder, just under the top band: the ONE step this
         // caller owes or is on — never the book. A click opens the column's
         // STEP island, where the scenario and the declare row live, so the
@@ -18669,33 +20001,6 @@ impl Render for IslandDemo {
                     )
                     .into_any_element(),
             )
-        } else if self.comms_open {
-            // The inbox, on the authoring card rather than the readout card:
-            // it holds a message list AND the composer row, which is the
-            // same shape as the book and for the same reason.
-            Some(
-                div()
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(rgba(Rgba::black_alpha(150)))
-                    // A modal is modal: the wheel behind it is the modal's.
-                    .on_scroll_wheel(swallow_wheel)
-                    .child(
-                        div()
-                            .relative()
-                            .w(px(FORM_W))
-                            .h(px(FORM_H))
-                            .child(modal_silhouette_at(FORM_W, FORM_H))
-                            .child(self.comms_body(cx)),
-                    )
-                    .into_any_element(),
-            )
         } else if self.embark_host.is_some() {
             // One hull's passengers, on the readout card rather than the
             // authoring form: the read half carries no compose, and the
@@ -18853,6 +20158,157 @@ fn button(label: impl Into<SharedString>, small: bool, disabled: bool, chosen: b
 /// the body below it.
 fn separator() -> impl IntoElement {
     div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE))
+}
+
+/// The receipt a row shows, if it shows one at all.
+///
+/// `None` means the message carries NO receipt: a broadcast, or a message
+/// this caller was not addressed by. The server refuses a receipt for
+/// anybody who was not addressed ("A message sent to everybody has no
+/// individual receipt"), so the console does not draw one — and does not
+/// offer the verb that would ask for one.
+fn comms_receipt(m: &MessageView) -> Option<bool> {
+    if m.to_me {
+        Some(m.read_at.is_some())
+    } else {
+        None
+    }
+}
+
+/// The kinds the composer offers this seat.
+///
+/// ADMINISTRATIVE is the Game Master's traffic and the server refuses it
+/// from anybody else ("Administrative messages pass between the Judges and
+/// the Game Master"), so a seat that cannot send it is never offered it.
+fn comms_offered_kinds(judge_side: bool) -> Vec<CommsKind> {
+    let mut kinds = vec![CommsKind::Telegram];
+    if judge_side {
+        kinds.push(CommsKind::Administrative);
+    }
+    kinds
+}
+
+/// The markings the composer offers for this draft.
+///
+/// **Only TERBUKA may be a broadcast** ("A message with no `to` and no
+/// `cc` is a broadcast, and only `TERBUKA` may be a broadcast"), so with
+/// nobody named the picker offers the one marking the server will take
+/// rather than offering two it will refuse.
+fn comms_offered_marks(addressed: bool) -> Vec<CommsMark> {
+    let mut marks = vec![CommsMark::Open];
+    if addressed {
+        marks.push(CommsMark::Limited);
+        marks.push(CommsMark::Classified);
+    }
+    marks
+}
+
+/// Whether the composer offers the ASSUMED identity at all.
+///
+/// Judge-side only, and only for a TELEGRAM: an administrative message
+/// needs no role and no node, and a telegram from anybody else that claims
+/// an identity is refused ("only the Game Master may send as a scenario
+/// role").
+fn comms_offers_identity(judge_side: bool, kind: CommsKind) -> bool {
+    judge_side && kind == CommsKind::Telegram
+}
+
+/// One SEAT in the audience row: the name, and where the seat is.
+///
+/// **A name is not a label.** The console's tracked-caps rule is for
+/// LABELS, and a person's name is neither a label nor a verb — so this
+/// chip keeps the name's own case and draws it in the human face at the
+/// label size. The selection is the console's ONE treatment: a cyan edge
+/// and the bright ink.
+fn comms_seat_chip(label: &str, picked: bool) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .px(px(6.0))
+        .py(px(2.0))
+        .rounded(px(CONTROL_RADIUS))
+        .bg(rgba(BUTTON_GRAPHITE))
+        .border(px(1.0))
+        .border_color(rgba(if picked { RADAR_CYAN } else { HAIRLINE_SLATE }))
+        .child(
+            div()
+                .font_family(view::FACE_HUMAN)
+                .text_size(px(view::LABEL_PT))
+                .text_color(rgba(if picked { MAP_INK } else { BUTTON_LABEL }))
+                .child(label.to_string()),
+        )
+}
+
+/// A chip: a tracked-caps word in its own ink, on a 1px edge of that ink.
+///
+/// The console had no chip before the comms surface, and it needed one for
+/// the same reason the comms surface needed a type at all: a row has to
+/// say what KIND of traffic it is and what MARKING it carries, and both
+/// are words in a colour rather than prose. A chip is the smallest thing
+/// that can carry a word in a colour — an edge in that colour and the word
+/// inside it — so the edge says "this is a label" and the ink says "this
+/// is what the label means".
+///
+/// The edge is 1px and the word is the console's own tracked-caps label,
+/// so a chip reads as a label on an instrument and not as a badge from
+/// somewhere else.
+fn comms_chip(label: &str, ink: Rgba) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .px(px(4.0))
+        .py(px(1.0))
+        .rounded(px(2.0))
+        .border(px(1.0))
+        .border_color(rgba(ink))
+        .child(tracked(label, view::LABEL_PT, ink))
+}
+
+/// A chip carrying a VALUE rather than a label.
+///
+/// The console's face rule sends human words to Saira Condensed and
+/// machine values to PT Mono, and a chip that shouts a person's name in
+/// tracked caps is neither — a name is a word, and words are set in the
+/// human face. The edge still says "this is a label on an instrument",
+/// so the reader knows what it is looking at.
+fn comms_value_chip(label: &str, ink: Rgba) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .px(px(4.0))
+        .py(px(1.0))
+        .rounded(px(2.0))
+        .border(px(1.0))
+        .border_color(rgba(ink))
+        .child(
+            div()
+                .font_family(view::FACE_HUMAN)
+                .text_size(px(view::LABEL_PT))
+                .text_color(rgba(ink))
+                .child(label.to_string()),
+        )
+}
+
+/// The telegram's marker: a machine-face chevron at the head of the row.
+///
+/// **A mark, not a word and not a value.** The console's face rule sends
+/// human words to Saira Condensed and machine values to PT Mono, and this
+/// is neither: it is the thing a scope draws so the eye finds the row
+/// before it reads it. It is the only mark on the row, and only a telegram
+/// carries one — a radio call is marked, staff correspondence is not.
+fn comms_marker(ink: Rgba) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .font_family(view::FACE_MACHINE)
+        .text_size(px(view::MACHINE_PT))
+        .text_color(rgba(ink))
+        .child("\u{00bb}")
 }
 
 /// A choice widget (U5's choice slice), from egui's `ui.checkbox` /
@@ -19720,6 +21176,26 @@ pub struct SessionView {
     pub mine: Vec<MyShip>,
     /// The inbox the caller may see, newest first (the server's order).
     pub messages: Vec<MessageView>,
+    /// The inbox read FAILED, and why.
+    ///
+    /// `None` is the ordinary answer. A failure is a real state — this
+    /// account may not read this exercise's traffic (403), or the server
+    /// was down — and the console must say so instead of drawing an empty
+    /// list that reads as "no messages".
+    pub inbox_error: Option<String>,
+    /// How many messages the exercise holds in all — the server's own
+    /// count, not the length of the page the console holds. A busy
+    /// exercise pages, and the surface must say so rather than draw a
+    /// truncated list as if it were the whole traffic.
+    pub inbox_total: u64,
+    /// The degrees (Derajat) the server accepts, read from its own
+    /// catalogue — the composer offers them and never a guessed number.
+    pub msg_degrees: Vec<crate::backend::MsgDegree>,
+    /// The scenario roles THIS game has issued: the only legal
+    /// `id_assumed_role`, and a judge's telegram needs one.
+    pub msg_roles: Vec<crate::backend::ScenarioRole>,
+    /// The roster, as the audience picker offers it.
+    pub msg_audience: Vec<AudienceSeat>,
     /// The exercise's step and its assumed time, when the server can stamp
     /// one. `None` when the clock has no anchor — a real state, not a gap.
     pub step: Option<StepView>,
@@ -20285,12 +21761,40 @@ pub enum ToBinary {
         step_id: i64,
         related: Vec<(String, i64)>,
     },
-    /// A telegram broadcast from the comms panel's composer row. The binary
-    /// owns the POST; the shell only collects what was typed, like every
-    /// other write. The envelope is the PROVEN path — kind telegram,
-    /// TERBUKA, BIASA, broadcast — because addressed mail, other markings
-    /// and other grades are unprobed; the panel states the cut.
-    SendTelegram { content: String },
+    /// A message from the comms surface's composer. The binary owns the
+    /// POST; the shell only collects what was picked, like every other
+    /// write.
+    ///
+    /// **The draft is the WHOLE envelope, not a broadcast.** The server's
+    /// contract (probed 2026-10-21) accepts a kind, a marking, a degree,
+    /// an audience, an assumed role, a hierarchy node and a reply link —
+    /// and refuses the ones that do not belong together ("A Telegram
+    /// message from the Game Master or a Judge must be sent AS a scenario
+    /// role", "A message with no `to` and no `cc` is a broadcast, and only
+    /// `TERBUKA` may be a broadcast"). The composer collects them and the
+    /// shell checks them; the binary sends them.
+    SendMessage { draft: MsgDraftForm },
+    /// Re-read the inbox, on the surface's own verb.
+    ///
+    /// The tab strip filters what the console already holds, so this is
+    /// not a filter request — it is a REFRESH, for the operator who
+    /// suspects the list is behind. The answer is the session, and it is
+    /// applied as [`WriteId::Inbox`] so the operator's own draft survives
+    /// it.
+    RefreshInbox,
+    /// Record this caller's read receipt on one message.
+    ///
+    /// The receipt is the ONLY place "when did they see it" is kept, and
+    /// the server refuses it for anybody who was not addressed — so a
+    /// broadcast has no receipt and asking for one is a refusal, not a
+    /// silent nothing.
+    MarkMessageRead { message_id: i64 },
+    /// Withdraw a message (the author) or hide it (an addressee). Which
+    /// branch the server takes follows from WHO the caller is, and the
+    /// two answer differently: the author's withdrawal answers 200, the
+    /// recipient's hide answers 404 even though the tombstone is
+    /// written.
+    DeleteMessage { message_id: i64 },
     /// This seat's declaration on the asking step: declare or withdraw. The
     /// binary owns the PUT/DELETE; the shell only asks, naming the step the
     /// row drew — the ids ride the button, never a cached guess.
@@ -20417,6 +21921,18 @@ pub struct CreatedSession {
         StepVerb,
         /// A telegram broadcast.
         Message,
+        /// The inbox re-read, on the comms surface's own refresh verb.
+        Inbox,
+        /// A message that ARRIVED on the socket.
+        ///
+        /// Its own name, because it is not a write: nothing was asked
+        /// for, and the answer must not clear the operator's draft or
+        /// re-seed the drafts underneath them.
+        Live,
+        /// A read receipt, recorded.
+        Receipt,
+        /// A message withdrawn or hidden.
+        Delete,
         /// The roster draft written through.
         Roster,
         /// The force draft written through.
@@ -20607,6 +22123,11 @@ impl Default for SessionView {
             my_ready: false,
             execution: false,
             messages: Vec::new(),
+            inbox_error: None,
+            inbox_total: 0,
+            msg_degrees: Vec::new(),
+            msg_roles: Vec::new(),
+            msg_audience: Vec::new(),
             step: None,
             people: Vec::new(),
             book: Vec::new(),
@@ -20736,15 +22257,397 @@ pub struct StepGateView {
     pub outstanding: Vec<String>,
 }
 
-/// One message in the session's inbox, as the comms panel shows it.
-#[derive(Clone, Debug)]
+/// One message in the session's inbox, as the comms surface shows it.
+///
+/// **Every field the server publishes is carried.** The projection that
+/// used to keep six of them is what made the classification (and the
+/// server's own border colour with it), the degree, the receipt and the
+/// reply link invisible to the console — and the marking is the whole
+/// difference between a routine telegram and a classified one.
+#[derive(Clone, Debug, Default)]
 pub struct MessageView {
-    pub sender: String,
+    /// The server's own id. The identity of the message: a live arrival
+    /// and a polled read are the same message when their ids agree.
+    pub id: i64,
+    /// `telegram` or `administrative` — the server's closed set of two.
     pub kind: String,
+    /// The marking's machine code: TERBUKA, TERBATAS or RAHASIA.
+    pub class_code: String,
+    /// The marking's printed name ("Terbuka", "Rahasia", …).
     pub class_label: String,
-    pub content: String,
-    pub at: String,
+    /// Who the server showed: an assumed role's name where one was
+    /// claimed, else the real author's name.
+    pub sender: String,
+    /// The real author's id, where the caller is entitled to it. `None`
+    /// for a message sent under a role — the server omits the author
+    /// there, and the console must not guess it back.
+    pub author_id: Option<i64>,
+    /// The sender spoke AS a scenario role. The server never reveals the
+    /// author in that case, so the console never shows one either.
+    pub assumed: bool,
+    /// No recipient list: the message went to the whole exercise.
     pub broadcast: bool,
+    pub content: String,
+    /// The server's timestamp, whole.
+    pub at: String,
+    /// The degree's name (BIASA, SEGERA, …) — the urgency the sender
+    /// marked it with.
+    pub degree: String,
+    /// The administrative message this one answers.
+    pub reply_to: Option<i64>,
+    /// THIS caller is a named recipient. The server's `only_mine` filter
+    /// means exactly this, and it is computed here from the recipient
+    /// list rather than paid for as another read.
+    pub to_me: bool,
+    /// When THIS caller read it. `None` for a broadcast: the server
+    /// refuses a receipt for a message nobody was addressed by, so a
+    /// broadcast has none to have.
+    pub read_at: Option<String>,
+    /// Who else was addressed, and whether each of them has read it.
+    pub recipients: Vec<MsgRecipientView>,
+}
+
+/// One addressee, as the comms surface shows it.
+#[derive(Clone, Debug, Default)]
+pub struct MsgRecipientView {
+    pub user_id: i64,
+    /// `to` or `cc`.
+    pub kind: String,
+    /// The name the roster gives them, when the console knows it.
+    pub name: String,
+    pub read_at: Option<String>,
+}
+
+/// The two kinds of message the server has, and the two markings it
+/// allows.
+///
+/// A CLOSED SET, taken from the server's own vocabulary (probed
+/// 2026-10-21): `kind` is `telegram` or `administrative` and nothing
+/// else, and a request carrying a third value is refused with "This
+/// field must be one of telegram administrative." The console keeps the
+/// same two, so the tab strip can never offer a verb the server would
+/// refuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CommsKind {
+    /// Between the personnel: a radio message, a broadcast of orders.
+    #[default]
+    Telegram,
+    /// Between the Judges and the Game Master: staff correspondence.
+    Administrative,
+}
+
+impl CommsKind {
+    /// The wire value. The server's own string, lowercase.
+    pub fn wire(self) -> &'static str {        match self {
+            CommsKind::Telegram => "telegram",
+            CommsKind::Administrative => "administrative",
+        }
+    }
+
+    /// The console's word for it on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            CommsKind::Telegram => "TELEGRAM",
+            CommsKind::Administrative => "ADMIN",
+        }
+    }
+
+    /// The kind the wire names, if it names one the console knows.
+    ///
+    /// An unknown wire value is `None`, not a guess: the server's set is
+    /// closed today, and a value outside it means the server has grown —
+    /// which the console must show honestly rather than fold into one of
+    /// its own two.
+    pub fn from_wire(kind: &str) -> Option<Self> {
+        match kind {
+            "telegram" => Some(CommsKind::Telegram),
+            "administrative" => Some(CommsKind::Administrative),
+            _ => None,
+        }
+    }
+
+    /// The ink this kind's own chrome carries.
+    ///
+    /// Telegram is the LIVE accent — the console spends `RADAR_CYAN` on
+    /// the one thing that is live, and a radio message is that thing.
+    /// Administrative is `WARNING_SAND`: attention without fault, which
+    /// is what staff correspondence is.
+    pub fn ink(self) -> Rgba {
+        match self {
+            CommsKind::Telegram => RADAR_CYAN,
+            CommsKind::Administrative => WARNING_SAND,
+        }
+    }
+}
+
+/// The three markings the server allows, and the ink each one is drawn in.
+///
+/// The server publishes a border colour with every message (`#FF0000`
+/// for RAHASIA, `#000000` otherwise) and it is the SERVER's statement
+/// about the message. The console does not paint with it: the palette
+/// belongs to `view`, and a server hex would bypass it — and every pixel
+/// assertion with it. The CODE is mapped to a console ink instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CommsMark {
+    /// TERBUKA — unclassified. The only marking that may be broadcast.
+    #[default]
+    Open,
+    /// TERBATAS — restricted. Readable by the addressed only.
+    Limited,
+    /// RAHASIA — classified. The one the concept singles out for red.
+    Classified,
+}
+
+impl CommsMark {
+    /// The wire value. The server's own string, uppercase.
+    pub fn wire(self) -> &'static str {
+        match self {
+            CommsMark::Open => "TERBUKA",
+            CommsMark::Limited => "TERBATAS",
+            CommsMark::Classified => "RAHASIA",
+        }
+    }
+
+    /// The console's word for it on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            CommsMark::Open => "TERBUKA",
+            CommsMark::Limited => "TERBATAS",
+            CommsMark::Classified => "RAHASIA",
+        }
+    }
+
+    /// The marking the wire names, if it names one the console knows.
+    pub fn from_wire(code: &str) -> Option<Self> {
+        match code {
+            "TERBUKA" => Some(CommsMark::Open),
+            "TERBATAS" => Some(CommsMark::Limited),
+            "RAHASIA" => Some(CommsMark::Classified),
+            _ => None,
+        }
+    }
+
+    /// The ink this marking is drawn in.
+    pub fn ink(self) -> Rgba {
+        match self {
+            // Open is structure, not news: the hairline's own grey.
+            CommsMark::Open => CUT_GREY,
+            CommsMark::Limited => DATA_AMBER,
+            CommsMark::Classified => FAULT_RED,
+        }
+    }
+}
+
+/// The comms surface's kind strip: what KIND of traffic is on screen.
+///
+/// Two kinds and an ALL, and no more — the server's set is closed, so a
+/// third tab would be a tab the server cannot fill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CommsTab {
+    /// Both kinds, in the server's own order (newest first).
+    #[default]
+    All,
+    /// Radio traffic between the personnel.
+    Telegram,
+    /// Correspondence between the Judges and the Game Master.
+    Admin,
+}
+
+impl CommsTab {
+    /// The tab's word on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            CommsTab::All => "ALL",
+            CommsTab::Telegram => "TELEGRAM",
+            CommsTab::Admin => "ADMIN",
+        }
+    }
+
+    /// The kind this tab shows, if it shows one.
+    pub fn kind(self) -> Option<CommsKind> {
+        match self {
+            CommsTab::All => None,
+            CommsTab::Telegram => Some(CommsKind::Telegram),
+            CommsTab::Admin => Some(CommsKind::Administrative),
+        }
+    }
+
+    /// Does this tab show a message of that kind?
+    pub fn shows(self, kind: &str) -> bool {
+        match self.kind() {
+            None => true,
+            Some(k) => k.wire() == kind,
+        }
+    }
+
+    /// Every tab, in the order the strip draws them.
+    pub const ALL: [CommsTab; 3] = [CommsTab::All, CommsTab::Telegram, CommsTab::Admin];
+
+    /// How many messages this tab holds, inside the given scope.
+    ///
+    /// **The scope narrows the COUNT as well as the list.** The strip
+    /// answers "what is in this slice", and a count taken from a wider
+    /// slice than the rows underneath it is a number that does not add up
+    /// — three tabs whose counts sum to more than the rows on screen is
+    /// the kind of arithmetic an operator stops trusting.
+    pub fn count_in(self, messages: &[MessageView], scope: CommsScope) -> usize {
+        messages
+            .iter()
+            .filter(|m| self.shows(&m.kind) && scope.shows(m))
+            .count()
+    }
+}
+
+/// A row's treatment: what TYPE of traffic it is, and what MARKING it
+/// carries.
+///
+/// The two are separate axes and they were separate on the wire: the kind
+/// is the server's closed set of two, the marking is the classification
+/// every message carries whether it is a broadcast or a letter. A telegram
+/// can be TERBATAS and an administrative message can be TERBUKA, so the
+/// row's ink is the kind's and the marking's ink is the chip's — and the
+/// marking never becomes a tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommsTreatment {
+    /// The kind, when the wire named one this build knows.
+    pub kind: Option<CommsKind>,
+    /// The marking, when the wire named one this build knows.
+    pub mark: Option<CommsMark>,
+}
+
+impl CommsTreatment {
+    /// The treatment of one message.
+    pub fn of(m: &MessageView) -> Self {
+        Self {
+            kind: CommsKind::from_wire(&m.kind),
+            mark: CommsMark::from_wire(&m.class_code),
+        }
+    }
+
+    /// The type's ink — the rail's, and the type chip's.
+    ///
+    /// A kind this build does not know falls back to the structure grey:
+    /// an unknown type is not news, and painting it in the accent would
+    /// spend the console's rarest ink on a word nobody has read yet.
+    pub fn kind_ink(&self) -> Rgba {
+        self.kind.map(|k| k.ink()).unwrap_or(CUT_GREY)
+    }
+
+    /// The marking's ink — the classification chip's.
+    pub fn mark_ink(&self) -> Rgba {
+        self.mark.map(|m| m.ink()).unwrap_or(CUT_GREY)
+    }
+}
+
+/// The comms surface's scope: WHICH SLICE of the tab is on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CommsScope {
+    /// Everything the tab holds.
+    #[default]
+    All,
+    /// Only what was addressed to THIS caller.
+    ///
+    /// The server's own `only_mine` filter means exactly this — the
+    /// caller is a NAMED recipient, broadcasts excluded — and the console
+    /// computes it from the recipient list rather than paying for another
+    /// read.
+    ToMe,
+    /// Only the broadcasts: the messages with no recipient list at all.
+    Broadcast,
+}
+
+impl CommsScope {
+    /// The chip's word on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            CommsScope::All => "ALL",
+            CommsScope::ToMe => "TO ME",
+            CommsScope::Broadcast => "BROADCAST",
+        }
+    }
+
+    /// Does this scope show that message?
+    pub fn shows(self, m: &MessageView) -> bool {
+        match self {
+            CommsScope::All => true,
+            CommsScope::ToMe => m.to_me,
+            CommsScope::Broadcast => m.broadcast,
+        }
+    }
+
+    /// Every scope, in the order the row draws them.
+    pub const ALL: [CommsScope; 3] =
+        [CommsScope::All, CommsScope::ToMe, CommsScope::Broadcast];
+}
+
+/// One seat, as the audience picker offers it.
+///
+/// **The roster, and nothing more.** The server refuses an audience that
+/// is not in the exercise ("A recipient is not a participant of this
+/// game"), and for a TELEGRAM it refuses a recipient who commands nothing
+/// ("A Telegram message is addressed to a command post, and `X` holds
+/// none in this game"). The console cannot know which seats hold a post
+/// — the roster does not say — so it offers the seats and lets the
+/// server rule on the ones that would be refused. It never greys a seat
+/// out on a guess.
+#[derive(Clone, Debug, Default)]
+pub struct AudienceSeat {
+    pub user_id: i64,
+    pub name: String,
+    /// The role's name in the exercise.
+    pub role: String,
+    /// The seat is on the judge side (the Game Master, the Judges).
+    pub judge: bool,
+}
+
+/// Where the audience picker's next seat lands: in `to`, or in `cc`.
+///
+/// The server has two lists and the console offers both, and one row per
+/// seat per list is a wall. The target says which list the next pick
+/// joins, and the seat's own chip says where the seat already is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AudienceTarget {
+    /// The addressees: the seats the message is addressed to.
+    #[default]
+    To,
+    /// The copied: the seats that are told without being addressed.
+    Cc,
+}
+
+impl AudienceTarget {
+    /// The chip's word on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            AudienceTarget::To => "TO",
+            AudienceTarget::Cc => "CC",
+        }
+    }
+}
+
+/// A message being composed, as the comms surface edits it.
+///
+/// The shell's own shape, and not the backend's: the console's composer
+/// edits FIELDS a person picks, and the backend's draft carries the
+/// wire's spelling of the same thing. The binary translates.
+#[derive(Clone, Debug, Default)]
+pub struct MsgDraftForm {
+    pub kind: CommsKind,
+    pub mark: CommsMark,
+    /// The urgency, as the server's own degree id.
+    pub degree: i64,
+    pub content: String,
+    /// The addressees. Empty means a broadcast — which the server only
+    /// allows for TERBUKA.
+    pub to: Vec<i64>,
+    pub cc: Vec<i64>,
+    /// The scenario role the sender speaks AS. A judge's telegram needs
+    /// one; anybody else's must not have one.
+    pub assumed_role: Option<i64>,
+    /// The task-organisation node the sender speaks FROM. Required
+    /// beside an assumed role, refused without one.
+    pub hierarchy_node: Option<i64>,
+    /// The administrative message this one answers.
+    pub reply_to: Option<i64>,
 }
 
 /// The exercise's step, as the step panel shows it: what is being played, and
@@ -21080,6 +22983,17 @@ pub struct ThumbRaw {
 /// progressively, never all-or-nothing.
 pub type ThumbFeed =
     std::boxed::Box<dyn FnMut() -> Option<Vec<ThumbRaw>> + Send + 'static>;
+
+/// A message that ARRIVED on the socket, drained like every other feed.
+///
+/// Its own feed, and not another arm of the session answer, because a
+/// live arrival is NOT a write: nothing was asked for, there is no
+/// re-read to apply, and the operator's own draft must survive it. The
+/// socket carries both kinds of traffic — a broadcast on the game's
+/// channel, an addressed message on the account's own — and the console
+/// missed both until this feed existed.
+pub type LiveMessageFeed =
+    std::boxed::Box<dyn FnMut() -> Option<MessageView> + Send + 'static>;
 
 /// Mint a paintable thumbnail from decoded bytes. `None` on a byte-count
 /// mismatch — a corrupt fetch paints nothing, never a torn image.
@@ -22064,6 +23978,7 @@ pub fn run_replay(dir: String, burst_ms: u64, looping: bool) {
         std::boxed::Box::new(|| None),
         std::boxed::Box::new(|| None),
         std::boxed::Box::new(|| None),
+        std::boxed::Box::new(|| None),
         std::sync::mpsc::channel().0,
         fixture_roster(),
         125,
@@ -22095,6 +24010,7 @@ pub fn run(
     mut embark_spec_feed: EmbarkSpecFeed,
     mut thumb_feed: ThumbFeed,
     mut spec_feed: SpecFeed,
+    mut live_message_feed: LiveMessageFeed,
     order_tx: OrderSink,
     roster: Vec<RosterRow>,
     roster_total: usize,
@@ -22204,6 +24120,7 @@ pub fn run(
         let status_drain = entity.clone();
         let signin_drain = entity.clone();
         let create_drain = entity.clone();
+        let live_message_drain = entity.clone();
         let timeline_drain = entity.clone();
         let judgements_drain = entity.clone();
         let reviews_drain = entity.clone();
@@ -22375,6 +24292,20 @@ pub fn run(
                                     Ok(created) => root.apply_answer(created),
                                     Err(refusal) => root.apply_refusal(refusal),
                             }
+                            cx.notify();
+                        })
+                    });
+                }
+                // A message that ARRIVED. The socket carries the
+                // broadcast on the game's channel and the addressed one on
+                // the account's own channel; both arrive here, and both
+                // are MERGED into the inbox by id — never appended blind,
+                // because the next re-read brings the same message again
+                // and a list that doubles is a list nobody trusts.
+                if let Some(message) = live_message_feed() {
+                    let _ = cx.update(|app| {
+                        live_message_drain.update(app, |root: &mut IslandDemo, cx| {
+                            root.apply_live_message(message);
                             cx.notify();
                         })
                     });
@@ -28011,16 +29942,342 @@ mod tests {
         };
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
-            demo.msg_content = "telegram proof from the shell".to_string();
+            demo.msg_draft.content = "telegram proof from the shell".to_string();
             demo
         });
         let sent = cx.update(|_window, app| view.update(app, |demo, cx| demo.send_telegram(cx)));
         assert!(sent, "an executing game with a drafted line sends");
         let content = match rx.try_recv().expect("the telegram reached the sink") {
-            ToBinary::SendTelegram { content } => content,
+            ToBinary::SendMessage { draft } => draft.content,
             other => panic!("expected a telegram, got {other:?}"),
         };
         assert_eq!(content, "telegram proof from the shell");
+    }
+
+    /// The traffic the comms surface works on: one telegram of each
+    /// marking, one administrative letter, and the three facts that make
+    /// the rows differ — a broadcast, an addressed letter nobody has read,
+    /// and a letter sent under a role.
+    fn comms_fixture() -> Vec<MessageView> {
+        vec![
+            MessageView {
+                id: 11,
+                kind: "telegram".to_string(),
+                class_code: "TERBUKA".to_string(),
+                class_label: "Terbuka".to_string(),
+                sender: "KRI Ahmad Yani".to_string(),
+                author_id: Some(2),
+                broadcast: true,
+                content: "Sweep the northern approaches.".to_string(),
+                at: "2026-10-21T08:15:00+07:00".to_string(),
+                degree: "BIASA".to_string(),
+                ..MessageView::default()
+            },
+            MessageView {
+                id: 12,
+                kind: "administrative".to_string(),
+                class_code: "TERBATAS".to_string(),
+                class_label: "Terbatas".to_string(),
+                sender: "Penyelenggara".to_string(),
+                author_id: Some(9),
+                broadcast: false,
+                to_me: true,
+                content: "Hold the second wave until the board says so.".to_string(),
+                at: "2026-10-21T08:20:00+07:00".to_string(),
+                degree: "SEGERA".to_string(),
+                ..MessageView::default()
+            },
+            MessageView {
+                id: 13,
+                kind: "telegram".to_string(),
+                class_code: "RAHASIA".to_string(),
+                class_label: "Rahasia".to_string(),
+                sender: "PROBE-ROLE-A".to_string(),
+                assumed: true,
+                broadcast: false,
+                to_me: true,
+                read_at: Some("2026-10-21T08:31:00+07:00".to_string()),
+                content: "The second wave is not mine.".to_string(),
+                at: "2026-10-21T08:30:00+07:00".to_string(),
+                degree: "KILAT".to_string(),
+                ..MessageView::default()
+            },
+        ]
+    }
+
+    /// The strip's counts are the counts of the SLICE on screen, so the
+    /// three numbers and the rows under them are the same arithmetic.
+    #[gpui::test]
+    fn the_comms_strip_counts_the_traffic_inside_the_scope(cx: &mut gpui::TestAppContext) {
+        let messages = comms_fixture();
+        assert_eq!(CommsTab::All.count_in(&messages, CommsScope::All), 3);
+        assert_eq!(CommsTab::Telegram.count_in(&messages, CommsScope::All), 2);
+        assert_eq!(CommsTab::Admin.count_in(&messages, CommsScope::All), 1);
+        // The scope narrows the COUNT as well as the list.
+        assert_eq!(CommsTab::All.count_in(&messages, CommsScope::Broadcast), 1);
+        assert_eq!(CommsTab::Telegram.count_in(&messages, CommsScope::Broadcast), 1);
+        assert_eq!(CommsTab::Admin.count_in(&messages, CommsScope::Broadcast), 0);
+        assert_eq!(CommsTab::All.count_in(&messages, CommsScope::ToMe), 2);
+        assert_eq!(CommsTab::Admin.count_in(&messages, CommsScope::ToMe), 1);
+        // And the two kinds add up to the whole.
+        let kinds: usize = [CommsTab::Telegram, CommsTab::Admin]
+            .iter()
+            .map(|t| t.count_in(&messages, CommsScope::All))
+            .sum();
+        assert_eq!(kinds, 3, "the strip's numbers are the list's arithmetic");
+    }
+
+    /// The scope is the server's own `only_mine` filter, computed from the
+    /// recipient list: a NAMED addressee, and a broadcast is not one.
+    #[gpui::test]
+    fn the_comms_scope_selects_its_own_slice(cx: &mut gpui::TestAppContext) {
+        let messages = comms_fixture();
+        assert!(CommsScope::All.shows(&messages[0]));
+        assert!(CommsScope::Broadcast.shows(&messages[0]), "a broadcast");
+        assert!(!CommsScope::ToMe.shows(&messages[0]), "nobody addressed it");
+        assert!(CommsScope::ToMe.shows(&messages[1]), "it was addressed here");
+        assert!(!CommsScope::Broadcast.shows(&messages[1]));
+    }
+
+    /// Each type of traffic carries its OWN ink, and the accent is spent
+    /// on the one thing that is live.
+    #[gpui::test]
+    fn each_kind_of_traffic_carries_its_own_ink(cx: &mut gpui::TestAppContext) {
+        let messages = comms_fixture();
+        let telegram = CommsTreatment::of(&messages[0]);
+        assert_eq!(telegram.kind, Some(CommsKind::Telegram));
+        assert_eq!(telegram.kind_ink(), RADAR_CYAN, "the live accent");
+        let admin = CommsTreatment::of(&messages[1]);
+        assert_eq!(admin.kind, Some(CommsKind::Administrative));
+        assert_eq!(admin.kind_ink(), WARNING_SAND, "attention without fault");
+        // A kind this build does not know is not news: it falls back to
+        // the structure grey rather than spending the accent on a word
+        // nobody has read yet.
+        let alien = MessageView {
+            kind: "signal".to_string(),
+            ..MessageView::default()
+        };
+        assert_eq!(CommsTreatment::of(&alien).kind, None);
+        assert_eq!(CommsTreatment::of(&alien).kind_ink(), CUT_GREY);
+    }
+
+    /// The MARKING is a per-row treatment and never a tab, and its ink is
+    /// the console's own — the server's border colour is not painted.
+    #[gpui::test]
+    fn the_marking_is_a_per_row_treatment_and_never_a_tab(cx: &mut gpui::TestAppContext) {
+        assert_eq!(CommsMark::Open.ink(), CUT_GREY, "structure, not news");
+        assert_eq!(CommsMark::Limited.ink(), DATA_AMBER);
+        assert_eq!(CommsMark::Classified.ink(), FAULT_RED);
+        // The marking is read from the server's CODE.
+        assert_eq!(CommsMark::from_wire("TERBATAS"), Some(CommsMark::Limited));
+        assert_eq!(CommsMark::from_wire("SECRET"), None);
+        // And the strip holds KINDS only: a third tab would be a tab the
+        // server cannot fill.
+        assert_eq!(CommsTab::ALL.len(), 3);
+    }
+
+    /// A receipt is only ever drawn for a message this caller was
+    /// ADDRESSED by: the server refuses a receipt for a message nobody
+    /// was addressed by ("A message sent to everybody has no individual
+    /// receipt").
+    #[gpui::test]
+    fn the_receipt_is_only_drawn_for_an_addressed_message(cx: &mut gpui::TestAppContext) {
+        let messages = comms_fixture();
+        assert_eq!(comms_receipt(&messages[0]), None, "a broadcast");
+        assert_eq!(comms_receipt(&messages[1]), Some(false), "addressed, unread");
+        assert_eq!(comms_receipt(&messages[2]), Some(true), "addressed, read");
+    }
+
+    /// What arrived is NEW until the operator has LOOKED, and the looking
+    /// is the closing of the surface — so the chip survives the opening
+    /// and is taken by the closing.
+    #[gpui::test]
+    fn what_arrived_is_new_until_the_operator_looks(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            me: 2,
+            messages: comms_fixture(),
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        cx.update(|_window, app| view.update(app, |demo, _| demo.note_seen_watermark()));
+        let unseen = cx.update(|_window, app| view.read(app).comms_unseen.len());
+        assert_eq!(unseen, 2, "the operator's own message is not news to them");
+        // A re-read that brings the same messages must not mark them all
+        // new again.
+        cx.update(|_window, app| view.update(app, |demo, _| demo.note_seen_watermark()));
+        let unseen = cx.update(|_window, app| view.read(app).comms_unseen.len());
+        assert_eq!(unseen, 2, "the same traffic is not new traffic");
+        // An arrival on the wire is new.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.apply_live_message(MessageView {
+                    id: 20,
+                    kind: "telegram".to_string(),
+                    sender: "KRI Cakra".to_string(),
+                    content: "Contact on the northern buoy.".to_string(),
+                    at: "2026-10-21T08:40:00+07:00".to_string(),
+                    ..MessageView::default()
+                })
+            })
+        });
+        let unseen = cx.update(|_window, app| view.read(app).comms_unseen.len());
+        assert_eq!(unseen, 3, "the arrival is new");
+        // And the chip's ink is the newest traffic's own kind's ink.
+        let ink = cx.update(|_window, app| view.read(app).comms_latest_ink);
+        assert_eq!(ink, Some(RADAR_CYAN));
+        // Closing the surface IS the looking.
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.toggle_comms(cx)));
+        let (open, unseen) = cx.update(|_window, app| {
+            let demo = view.read(app);
+            (demo.comms_open, demo.comms_unseen.len())
+        });
+        assert!(open, "the surface opened");
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.toggle_comms(cx)));
+        let unseen = cx.update(|_window, app| view.read(app).comms_unseen.len());
+        assert_eq!(unseen, 0, "the operator has looked at the traffic");
+    }
+
+    /// The composer never offers a verb the server would refuse.
+    #[gpui::test]
+    fn the_composer_never_offers_what_the_server_refuses(cx: &mut gpui::TestAppContext) {
+        // ADMINISTRATIVE passes between the Judges and the Game Master.
+        assert_eq!(comms_offered_kinds(false), vec![CommsKind::Telegram]);
+        assert_eq!(
+            comms_offered_kinds(true),
+            vec![CommsKind::Telegram, CommsKind::Administrative]
+        );
+        // Only TERBUKA may be a broadcast.
+        assert_eq!(comms_offered_marks(false), vec![CommsMark::Open]);
+        assert_eq!(
+            comms_offered_marks(true),
+            vec![CommsMark::Open, CommsMark::Limited, CommsMark::Classified]
+        );
+        // The assumed identity is the Game Master's alone, and only a
+        // telegram wants one.
+        assert!(!comms_offers_identity(false, CommsKind::Telegram));
+        assert!(comms_offers_identity(true, CommsKind::Telegram));
+        assert!(!comms_offers_identity(true, CommsKind::Administrative));
+    }
+
+    /// The picked kind travels with the draft, and taking the kind takes
+    /// the identity the new kind does not want.
+    #[gpui::test]
+    fn the_picked_kind_travels_and_takes_the_identity_with_it(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.msg_draft.assumed_role = Some(4);
+                demo.msg_draft.hierarchy_node = Some(5);
+                demo.set_msg_kind(CommsKind::Administrative);
+            })
+        });
+        let draft = cx.update(|_window, app| view.read(app).msg_draft.clone());
+        assert_eq!(draft.kind, CommsKind::Administrative);
+        assert_eq!(draft.assumed_role, None, "staff mail carries no identity");
+        assert_eq!(draft.hierarchy_node, None);
+    }
+
+    /// The island is a door that opens and closes, and every door that
+    /// opens it can close it.
+    #[gpui::test]
+    fn the_comms_island_opens_and_closes(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            messages: comms_fixture(),
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let open = cx.update(|_window, app| view.read(app).comms_open);
+        assert!(!open, "it starts shut");
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.toggle_comms(cx)));
+        let open = cx.update(|_window, app| view.read(app).comms_open);
+        assert!(open, "the door opens it");
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.toggle_comms(cx)));
+        let open = cx.update(|_window, app| view.read(app).comms_open);
+        assert!(!open, "and the same door shuts it");
+    }
+
+    /// The surface's three verbs reach the server, each naming the
+    /// message it is about.
+    #[gpui::test]
+    fn the_comms_verbs_reach_the_server(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            messages: comms_fixture(),
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.refresh_inbox(cx)));
+        match rx.try_recv().expect("the refresh reached the sink") {
+            ToBinary::RefreshInbox => {}
+            other => panic!("expected a refresh, got {other:?}"),
+        }
+        // The write in flight blocks the next verb until it lands, so the
+        // test releases it the way the answer would.
+        cx.update(|_window, app| view.update(app, |demo, _| demo.msg_busy = false));
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.mark_message_read(12, cx)));
+        match rx.try_recv().expect("the receipt reached the sink") {
+            ToBinary::MarkMessageRead { message_id } => assert_eq!(message_id, 12),
+            other => panic!("expected a receipt, got {other:?}"),
+        }
+        cx.update(|_window, app| view.update(app, |demo, _| demo.msg_busy = false));
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.remove_message(13, cx)));
+        match rx.try_recv().expect("the removal reached the sink") {
+            ToBinary::DeleteMessage { message_id } => assert_eq!(message_id, 13),
+            other => panic!("expected a removal, got {other:?}"),
+        }
+    }
+
+    /// Each state says its OWN sentence: an empty inbox, an empty KIND, an
+    /// empty SCOPE and a truncated inbox are four different facts.
+    #[gpui::test]
+    fn each_comms_state_says_its_own_sentence(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let sentence = cx.update(|_window, app| view.read(app).comms_empty_sentence());
+        assert_eq!(sentence, "No messages in this exercise.");
+        // The tab with no traffic of that kind.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.session.messages = comms_fixture();
+                demo.comms_tab = CommsTab::Admin;
+            })
+        });
+        let sentence = cx.update(|_window, app| view.read(app).comms_empty_sentence());
+        assert_eq!(sentence, "No administrative traffic in this exercise.");
+        // And the scope with nothing in it.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.comms_tab = CommsTab::All;
+                demo.comms_scope = CommsScope::Broadcast;
+                demo.session.messages = vec![comms_fixture().remove(1)];
+            })
+        });
+        let sentence = cx.update(|_window, app| view.read(app).comms_empty_sentence());
+        assert_eq!(sentence, "No broadcasts in this exercise.");
     }
 
     /// And it is SILENT outside execution — the rule the server enforces,
@@ -28035,7 +30292,7 @@ mod tests {
         };
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
-            demo.msg_content = "too early".to_string();
+            demo.msg_draft.content = "too early".to_string();
             demo
         });
         let sent = cx.update(|_window, app| view.update(app, |demo, cx| demo.send_telegram(cx)));
@@ -28361,12 +30618,12 @@ mod tests {
         cx.update(|_window, app| {
             view.update(app, |demo, _| demo.open_only(WhichPanel::Crew))
         });
-        let (crew, board, comms) = cx.update(|_window, app| {
+        let (crew, board) = cx.update(|_window, app| {
             let demo = view.read(app);
-            (demo.crew_modal_open, demo.board_open, demo.comms_open)
+            (demo.crew_modal_open, demo.board_open)
         });
         assert!(crew, "the crew widget opens the crew modal");
-        assert!(!board && !comms, "and no other surface stays open");
+        assert!(!board, "and no other surface stays open");
         cx.update(|_window, app| {
             view.update(app, |demo, _| demo.open_only(WhichPanel::Board))
         });

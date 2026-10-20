@@ -62,6 +62,12 @@ pub struct GameHold {
     /// watched only in `execution` — before the transition there is no fix
     /// chain, so there is nothing to publish.
     pub state: String,
+    /// This account's own user id. The PERSONAL channel is named for it,
+    /// and it is the only channel an ADDRESSED message ever travels
+    /// (probed 2026-10-21: a message with a recipient list is published
+    /// to `personal:<user>` and to nothing else — not even on the game's
+    /// own channel). Zero when signed out.
+    pub user_id: i64,
     /// Bumped to ask for a read NOW. A write that moves a hull (a helm
     /// order) bumps it, so the marker follows the order without waiting out
     /// the poll.
@@ -180,6 +186,19 @@ pub fn set_hold(hold: &GameHoldCell, token: &str, game_id: i64, state: &str) {
     }
 }
 
+/// Write the hold with this account's own id, so the personal channel can
+/// be watched.
+///
+/// Separate from [`set_hold`] because the id is a FACT about the account
+/// and the rest is a fact about the session: the account does not change
+/// when the session does, and a sign-in that reuses the hold must not
+/// have to re-learn it.
+pub fn set_user(hold: &GameHoldCell, user_id: i64) {
+    if let Ok(mut h) = hold.lock() {
+        h.user_id = user_id;
+    }
+}
+
 /// Ask for a plot read now, without changing the session.
 pub fn kick(hold: &GameHoldCell) {
     if let Ok(mut h) = hold.lock() {
@@ -206,11 +225,27 @@ pub fn set_state(hold: &GameHoldCell, state: &str) {
 /// when the fix chain exists and there is anything to publish — and because
 /// a subscription the server refuses is a log line nobody can act on.
 ///
-/// Re-sending the same declaration is free: the actor compares it with what
-/// it holds and does nothing.
+/// **The PERSONAL channel is declared too, and it is not optional.** A
+/// message with a recipient list — an ADDRESSED message, of any marking —
+/// is published to `personal:<user>` and to NOTHING else (probed
+/// 2026-10-21 against the dev API: the frame arrives on `personal:27`
+/// and the game's own channel carries nothing at all, not even a TERBUKA
+/// one). A console that watches only `game:<id>` therefore sees every
+/// broadcast and no addressed message ever — which is the half of the
+/// traffic that matters most.
+///
+/// The server has already subscribed this account to its own personal
+/// channel, so the subscribe comes back "105 already subscribed"; the
+/// vendored SDK treats that as a refusal and drops the channel, so the
+/// SDK is patched to take 105 as the answer it is.
 pub fn sync_watch(live: &LiveCtl, hold: &GameHoldCell) {
-    let (game_id, executing, signed_in) = match hold.lock() {
-        Ok(h) => (h.game_id, h.executing(), !h.token.is_empty()),
+    let (game_id, executing, signed_in, user_id) = match hold.lock() {
+        Ok(h) => (
+            h.game_id,
+            h.executing(),
+            !h.token.is_empty(),
+            h.user_id,
+        ),
         Err(_) => return,
     };
     let cmd_tx = match live.lock() {
@@ -224,8 +259,18 @@ pub fn sync_watch(live: &LiveCtl, hold: &GameHoldCell) {
         None
     };
     let positions = if executing { game } else { None };
+    // The personal channel is the ACCOUNT's, not the session's: it is
+    // watched whenever this account is signed in, whether or not a game
+    // is held, because an addressed message may arrive for an exercise
+    // the console is not holding right now.
+    let personal = if signed_in && user_id != 0 {
+        Some(user_id)
+    } else {
+        None
+    };
     let _ = cmd_tx.send(LiveCmd::WatchGame(game));
     let _ = cmd_tx.send(LiveCmd::WatchGamePositions(positions));
+    let _ = cmd_tx.send(LiveCmd::WatchPersonal(personal));
 }
 
 /// The plot reader's configuration.
@@ -525,12 +570,14 @@ mod tests {
         sync_watch(&live, &cell);
         assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchGame(None))));
         assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchGamePositions(None))));
+        assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchPersonal(None))));
         // A held game: the broadcast channel, and NOT the positions channel
         // before the exercise runs.
         set_hold(&cell, "tok", 7, "planning");
         sync_watch(&live, &cell);
         assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchGame(Some(7)))));
         assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchGamePositions(None))));
+        assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchPersonal(None))));
         // In execution: both.
         set_hold(&cell, "tok", 7, "execution");
         sync_watch(&live, &cell);
@@ -539,10 +586,44 @@ mod tests {
             cmd_rx.try_recv(),
             Ok(LiveCmd::WatchGamePositions(Some(7)))
         ));
+        assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchPersonal(None))));
         // A signed-out console watches nothing, even with a game in hand.
         set_hold(&cell, "", 7, "execution");
         sync_watch(&live, &cell);
         assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchGame(None))));
         assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchGamePositions(None))));
+        assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchPersonal(None))));
+    }
+
+    /// The PERSONAL channel is watched whenever the account is signed in.
+    ///
+    /// This is the channel an ADDRESSED message travels on, and it is the
+    /// ONLY one: probed 2026-10-21 against the dev API, a message with a
+    /// recipient list arrives on `personal:<user id>` and on nothing else
+    /// — not on the game's own channel, not even for TERBUKA. A console
+    /// that watches only the game channel therefore sees every broadcast
+    /// and no addressed message ever, which is the half of the traffic
+    /// that matters most.
+    #[test]
+    fn the_personal_channel_is_watched_while_signed_in() {
+        let cell: GameHoldCell = Arc::new(Mutex::new(GameHold::default()));
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let live: LiveCtl = Arc::new(Mutex::new(Some(cmd_tx)));
+        // Signed in, with an account and no game held: the personal
+        // channel is still watched, because an addressed message may
+        // arrive for an exercise the console is not holding right now.
+        set_hold(&cell, "tok", 0, "");
+        set_user(&cell, 27);
+        sync_watch(&live, &cell);
+        assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchGame(None))));
+        assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchGamePositions(None))));
+        assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchPersonal(Some(27)))));
+        // Signed out: no account, no channel.
+        set_hold(&cell, "", 7, "execution");
+        set_user(&cell, 0);
+        sync_watch(&live, &cell);
+        assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchGame(None))));
+        assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchGamePositions(None))));
+        assert!(matches!(cmd_rx.try_recv(), Ok(LiveCmd::WatchPersonal(None))));
     }
 }
