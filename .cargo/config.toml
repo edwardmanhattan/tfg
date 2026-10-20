@@ -15,13 +15,19 @@
 [env]
 MLN_LOCAL_REPOSITORY = "/home/edward/Work/Crossnet/tfg/vendor/maplibre_native/target/maplibre-native"
 
-# THIS worktree's own build tree.
+# THIS checkout's own build tree.
 #
 # Cargo's final `target/debug/tfg` is whichever build ran LAST, so two
 # checkouts sharing one target dir overwrite each other's binary — and a
 # capture then photographs the OTHER agent's console, which looks exactly
-# like your own edits having vanished. A worktree with its own target
+# like your own edits having vanished. A checkout with its own target
 # cannot be overwritten by another checkout, and the vendored MapLibre
 # C++ checkout above is still shared, so the expensive part is built once.
+#
+# The path is RELATIVE to this file, so every checkout gets a target
+# beside itself and a hard-coded absolute path here would send the MAIN
+# checkout's builds into a worktree's tree — the same collision, wearing
+# the other hat. Cargo resolves a relative `target-dir` against the
+# directory holding this file's parent, which is the checkout root.
 [build]
-target-dir = "/home/edward/.local/share/opencode/worktree/161ea8/login-radar/target"
+target-dir = "target"
