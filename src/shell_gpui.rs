@@ -2141,6 +2141,13 @@ impl IslandDemo {
     /// Build the view's state. Split out of `run` so a test can construct
     /// it headlessly — no window, no wire, no map thread — and drive the
     /// selection handler the way the compositor would.
+    ///
+    /// THE CAPTURE SEEDS ARE READ HERE, ONCE, AT BOOT: `TFG_ZOOM`,
+    /// `TFG_RELATE`, `TFG_SETTINGS`, `TFG_PEOPLE`, `TFG_CREW`,
+    /// `TFG_COMMAND`, `TFG_BOARD`, `TFG_COMMS`, `TFG_INSPECT`,
+    /// `TFG_SESSIONS`, `TFG_ASSESS_TAB`, `TFG_SCROLL`, `TFG_READOUT` and
+    /// `TFG_MODE`. A seed read per frame is a rule that changes under the
+    /// operator's feet, so every one of them is a field.
     fn new(
         roster: Vec<RosterRow>,
         roster_total: usize,
@@ -3550,7 +3557,9 @@ impl IslandDemo {
             // it is: a mode this build does not know is NOT shown as a
             // guess, it is shown as no mode at all, because the console
             // offers nothing on the strength of a word it cannot read.
-            f.mode.wire().unwrap_or("no mode"),
+            // The SEEDED mode reads here too, so a capture photographs the
+            // mode the console is actually behaving in.
+            self.mode().wire().unwrap_or("no mode"),
             state.label().to_lowercase(),
             format!("{} pace", f.pace)
         )));
@@ -7103,9 +7112,10 @@ impl IslandDemo {
         // A STATIC EXERCISE'S POSITIONS ARE SET BY HAND (ADR-0021). The
         // server refuses every order there with a 409, so the console's
         // gesture is a drag and the drop IS the position: no heading, no
-        // speed, no time of the client's own. The host hit-test does not
-        // apply — a hull that is placed is not a hull that is embarked.
-        if self.positions_set_by_hand() {
+        // speed, no time of the client's own. A drop onto a HOST is not one
+        // of those — an embarkation is a different act, and the embark arm
+        // carries no ground to place.
+        if self.positions_set_by_hand() && host.is_none() {
             return self.send_set_position(unit_id, name, fx, fy, cx);
         }
         if taken {
@@ -7789,6 +7799,14 @@ impl IslandDemo {
     /// has a draft `Start` and no fix, so nothing but this projection can say
     /// where it is.
     fn drop_host_at(&self, fx: f64, fy: f64) -> Option<i64> {
+        // A STATIC EXERCISE HAS NO HOSTS ON THE MAP (ADR-0021): its hulls
+        // are PLACED, not embarked, and the console's gesture there is a
+        // position. The hit-test is skipped, so a drop beside another hull
+        // is still a position and not an embarkation of a hull that the
+        // operator was trying to move.
+        if self.positions_set_by_hand() {
+            return None;
+        }
         let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
         if mw <= 0.0 || mh <= 0.0 {
             return None;
@@ -15906,7 +15924,10 @@ impl Render for IslandDemo {
                 .top(px(34.0))
                 .left(px(0.0))
                 .right(px(0.0))
-                .h(px(22.0))
+                // The strip grows by the verb's own height: a pill clipped by
+                // the band that carries it is a control the operator cannot
+                // read, and the band is the only place the question is asked.
+                .h(px(if step_verb.is_some() { 28.0 } else { 22.0 }))
                 .flex()
                 .flex_row()
                 .items_center()
