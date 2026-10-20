@@ -213,3 +213,38 @@ _Avoid_: tour, guide
 **Log**:
 The append-only action journal of a session: one entry per action or event, replayable from genesis and retraceable per game minute. Entries name a commander seat as actor; fixes are cited by sequence, never duplicated.
 _Avoid_: track (that's the position record, see Track)
+
+## Comms
+
+**Message**:
+One communication inside an exercise, as Minos holds it. It has a KIND, a MARKING, a DEGREE, an audience (or none), and content. A Message is the server's record: the console never keeps a message the server does not hold, and the console's copy is refreshed by the socket and by the read.
+_Avoid_: mail (that's the staff correspondence only), note, post (that's the book's)
+
+**Telegram**:
+The KIND of message that passes between the personnel — radio traffic, an order broadcast. A telegram sent by the Game Master or a Judge must be sent AS a scenario role, and it is a broadcast of orders rather than a conversation: the server refuses a reply on it.
+_Avoid_: radio message, dispatch
+
+**Administrative**:
+The KIND of message that passes between the Judges and the Game Master. Staff only — the server refuses it from any other seat — and the only kind that can be answered (a reply links to the message it answers).
+_Avoid_: staff mail (that's the idea), memo
+
+**Marking**:
+The per-message classification: TERBUKA (open), TERBATAS (restricted) or RAHASIA (classified). It gates who may read the message — only TERBUKA may be a broadcast — and it is the message's own border colour. The server publishes the colour; the console maps the CODE to its own ink and never paints with the server's hex.
+_Avoid_: classification (that is a hull's category in the taxonomy), priority (that is the degree)
+
+**Degree**:
+The urgency a sender marked a message with: BIASA, SEGERA, SANGAT SEGERA or KILAT. A lookup value on the server, read from its own catalogue; it is stored and displayed and drives nothing.
+_Avoid_: rank (that's a seat), priority
+
+**Broadcast**:
+A message with no recipient list: every participant of the exercise may read it. Only TERBUKA may be one. The server derives broadcast from the empty recipient list — there is no flag to set.
+_Avoid_: general, all
+
+**Receipt**:
+The instant an addressed recipient read a message, kept per recipient. A broadcast has none: the server refuses a receipt for a message nobody was addressed by. The receipt matrix is what the sender is entitled to see.
+_Avoid_: read flag (that's the console's own unread bookkeeping), seen
+
+**Assumed identity**:
+The scenario role a sender spoke AS. When a message carries one, the server withholds the real author — from everybody, the Game Master included — so the console shows the assumed identity alone and never guesses the author back.
+_Avoid_: alias, pen name, role (that's the seat)
+

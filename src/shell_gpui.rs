@@ -19071,6 +19071,49 @@ fn separator() -> impl IntoElement {
     div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE))
 }
 
+/// A chip: a tracked-caps word in its own ink, on a 1px edge of that ink.
+///
+/// The console had no chip before the comms surface, and it needed one for
+/// the same reason the comms surface needed a type at all: a row has to
+/// say what KIND of traffic it is and what MARKING it carries, and both
+/// are words in a colour rather than prose. A chip is the smallest thing
+/// that can carry a word in a colour — an edge in that colour and the word
+/// inside it — so the edge says "this is a label" and the ink says "this
+/// is what the label means".
+///
+/// The edge is 1px and the word is the console's own tracked-caps label,
+/// so a chip reads as a label on an instrument and not as a badge from
+/// somewhere else.
+fn comms_chip(label: &str, ink: Rgba) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .px(px(4.0))
+        .py(px(1.0))
+        .rounded(px(2.0))
+        .border(px(1.0))
+        .border_color(rgba(ink))
+        .child(tracked(label, view::LABEL_PT, ink))
+}
+
+/// The telegram's marker: a machine-face chevron at the head of the row.
+///
+/// **A mark, not a word and not a value.** The console's face rule sends
+/// human words to Saira Condensed and machine values to PT Mono, and this
+/// is neither: it is the thing a scope draws so the eye finds the row
+/// before it reads it. It is the only mark on the row, and only a telegram
+/// carries one — a radio call is marked, staff correspondence is not.
+fn comms_marker(ink: Rgba) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .font_family(view::FACE_MACHINE)
+        .text_size(px(view::MACHINE_PT))
+        .text_color(rgba(ink))
+        .child("\u{00bb}")
+}
+
 /// A choice widget (U5's choice slice), from egui's `ui.checkbox` /
 /// `ui.toggle_value` at the app theme. The box is `icon_width` (14) square —
 /// `spacing.icon_width`, `icon_width_inner` (8) for the mark — with the
@@ -21239,6 +21282,64 @@ impl CommsTab {
             Some(k) => k.wire() == kind,
         }
     }
+
+    /// Every tab, in the order the strip draws them.
+    pub const ALL: [CommsTab; 3] = [CommsTab::All, CommsTab::Telegram, CommsTab::Admin];
+
+    /// How many messages this tab holds, inside the given scope.
+    ///
+    /// **The scope narrows the COUNT as well as the list.** The strip
+    /// answers "what is in this slice", and a count taken from a wider
+    /// slice than the rows underneath it is a number that does not add up
+    /// — three tabs whose counts sum to more than the rows on screen is
+    /// the kind of arithmetic an operator stops trusting.
+    pub fn count_in(self, messages: &[MessageView], scope: CommsScope) -> usize {
+        messages
+            .iter()
+            .filter(|m| self.shows(&m.kind) && scope.shows(m))
+            .count()
+    }
+}
+
+/// A row's treatment: what TYPE of traffic it is, and what MARKING it
+/// carries.
+///
+/// The two are separate axes and they were separate on the wire: the kind
+/// is the server's closed set of two, the marking is the classification
+/// every message carries whether it is a broadcast or a letter. A telegram
+/// can be TERBATAS and an administrative message can be TERBUKA, so the
+/// row's ink is the kind's and the marking's ink is the chip's — and the
+/// marking never becomes a tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommsTreatment {
+    /// The kind, when the wire named one this build knows.
+    pub kind: Option<CommsKind>,
+    /// The marking, when the wire named one this build knows.
+    pub mark: Option<CommsMark>,
+}
+
+impl CommsTreatment {
+    /// The treatment of one message.
+    pub fn of(m: &MessageView) -> Self {
+        Self {
+            kind: CommsKind::from_wire(&m.kind),
+            mark: CommsMark::from_wire(&m.class_code),
+        }
+    }
+
+    /// The type's ink — the rail's, and the type chip's.
+    ///
+    /// A kind this build does not know falls back to the structure grey:
+    /// an unknown type is not news, and painting it in the accent would
+    /// spend the console's rarest ink on a word nobody has read yet.
+    pub fn kind_ink(&self) -> Rgba {
+        self.kind.map(|k| k.ink()).unwrap_or(CUT_GREY)
+    }
+
+    /// The marking's ink — the classification chip's.
+    pub fn mark_ink(&self) -> Rgba {
+        self.mark.map(|m| m.ink()).unwrap_or(CUT_GREY)
+    }
 }
 
 /// The comms surface's scope: WHICH SLICE of the tab is on screen.
@@ -21276,6 +21377,10 @@ impl CommsScope {
             CommsScope::Broadcast => m.broadcast,
         }
     }
+
+    /// Every scope, in the order the row draws them.
+    pub const ALL: [CommsScope; 3] =
+        [CommsScope::All, CommsScope::ToMe, CommsScope::Broadcast];
 }
 
 /// One seat, as the audience picker offers it.
