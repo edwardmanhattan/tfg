@@ -542,6 +542,7 @@ impl MinosMaster {
                     id: g["id"].as_i64()?,
                     name: g["name"].as_str().unwrap_or("").to_string(),
                     state: g["state"].as_str().unwrap_or("").to_string(),
+                    mode: g["mode"].as_str().unwrap_or("").to_string(),
                 })
             })
             .collect())
@@ -798,6 +799,7 @@ impl MinosMaster {
             id: data["id"].as_i64().unwrap_or(0),
             name: data["name"].as_str().unwrap_or("").to_string(),
             state: data["state"].as_str().unwrap_or("planning").to_string(),
+            mode: "".to_string(),
         })
     }
 
@@ -851,6 +853,7 @@ impl MinosMaster {
             id: data["id"].as_i64().unwrap_or(game_id),
             name: data["name"].as_str().unwrap_or("").to_string(),
             state: data["state"].as_str().unwrap_or(to).to_string(),
+            mode: "".to_string(),
         })
     }
 
@@ -3041,6 +3044,12 @@ pub struct GameRow {
     pub id: i64,
     pub name: String,
     pub state: String,
+    /// The exercise's mode, as the server states it.
+    ///
+    /// The mode changes what the console may offer, so a list of exercises
+    /// that threw it away left the operator unable to tell a scenario
+    /// exercise from a maneuver one before holding it.
+    pub mode: String,
 }
 
 /// A game's planned window: two clocks, each with a start and an end.

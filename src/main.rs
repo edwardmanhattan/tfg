@@ -2616,6 +2616,7 @@ fn fetch_session_rows(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::Se
             state: g.state.clone(),
             my_role: role,
             judge,
+            mode: g.mode.clone(),
         });
     }
     Some(rows)

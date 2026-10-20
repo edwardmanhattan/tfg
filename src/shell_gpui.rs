@@ -2246,6 +2246,7 @@ impl IslandDemo {
                         id: 44,
                         name: "GPUI step proof".to_string(),
                         state: "execution".to_string(),
+            mode: String::new(),
                         my_role: "Commando".to_string(),
                         judge: false,
                     },
@@ -2253,6 +2254,7 @@ impl IslandDemo {
                         id: 38,
                         name: "probe-gm-roule".to_string(),
                         state: "preparation".to_string(),
+            mode: String::new(),
                         my_role: "Penyelenggara".to_string(),
                         judge: true,
                     },
@@ -2260,6 +2262,7 @@ impl IslandDemo {
                         id: 9,
                         name: "Game 8".to_string(),
                         state: "planning".to_string(),
+            mode: String::new(),
                         my_role: "Commando".to_string(),
                         judge: false,
                     },
@@ -5537,6 +5540,16 @@ impl IslandDemo {
                             .text_size(px(10.5))
                             .text_color(rgba(BODY_SILVER))
                             .child(s.state.to_uppercase()),
+                    )
+                    // THE MODE, beside the state: the two are the exercise's
+                    // axes, and the mode is the one that decides what the
+                    // console may offer once the exercise is held.
+                    .child(
+                        div()
+                            .font_family(view::FACE_MACHINE)
+                            .text_size(px(10.5))
+                            .text_color(rgba(CUT_GREY))
+                            .child(s.mode.to_uppercase()),
                     )
                     .child(
                         div()
@@ -17520,6 +17533,11 @@ pub struct SessionRow {
     pub state: String,
     pub my_role: String,
     pub judge: bool,
+    /// The exercise's mode, as the server states it. The picker shows it,
+    /// because the mode decides what the console may offer and an operator
+    /// holding several exercises cannot tell a scenario exercise from a
+    /// maneuver one by its name.
+    pub mode: String,
 }
 
 /// One piece of the exercise: a hull assigned to the held game. The server's
@@ -22145,6 +22163,7 @@ mod tests {
                     id: 44,
                     name: "GPUI step proof".to_string(),
                     state: "execution".to_string(),
+            mode: String::new(),
                     my_role: "Commando".to_string(),
                     judge: false,
                 },
@@ -22152,6 +22171,7 @@ mod tests {
                     id: 9,
                     name: "Game 8".to_string(),
                     state: "planning".to_string(),
+            mode: String::new(),
                     my_role: String::new(),
                     judge: false,
                 },
@@ -22229,6 +22249,7 @@ mod tests {
                     id: 44,
                     name: "GPUI step proof".to_string(),
                     state: "execution".to_string(),
+            mode: String::new(),
                     my_role: "Commando".to_string(),
                     judge: false,
                 },
@@ -22236,6 +22257,7 @@ mod tests {
                     id: 9,
                     name: "Game 8".to_string(),
                     state: "planning".to_string(),
+            mode: String::new(),
                     my_role: String::new(),
                     judge: false,
                 },
