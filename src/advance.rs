@@ -29,6 +29,10 @@
 //! - UNSEATS AFTER THE FORCE, for the same reason the force comes first:
 //!   nobody is briefly seatless while their hull is still being handed
 //!   over.
+//! - THE BOOK LAST. A step's related list names hulls and task-organisation
+//!   nodes, so the force and the task organisation have to exist before the
+//!   book is posted. A new scenario's steps come after the scenario, and a
+//!   removed step comes after the scenario it is removed from.
 //! - THE TRANSITION LAST. A refused flush refuses the advance, and the goal
 //!   is forgotten rather than retried implicitly: the exercise is still in
 //!   `planning` and the operator can fix the plan and go again.
@@ -67,7 +71,19 @@ pub enum Step {
     /// Take somebody off the roster.
     Unseat(RosterWrite),
     /// One task-organisation write.
-    Group(GroupWrite),
+    ///
+    /// The whole task organisation is ONE step, not one step per write: the
+    /// writes name each other (a node's parent, the hull in it), and a node
+    /// this flush creates only has a server id once it has been created. One
+    /// step keeps that map inside the flush that builds it.
+    Groups(Vec<GroupWrite>),
+    /// The scenario book, whole.
+    ///
+    /// LAST, because a step's related list names hulls AND task-organisation
+    /// nodes: the force and the groups have to exist before the book is
+    /// posted. A new scenario's steps come after the scenario, and a removed
+    /// step comes after the scenario it is removed from.
+    Book(Vec<crate::book::BookWrite>),
     /// Move the exercise to preparation. The last thing, and the only one
     /// that changes what every participant may see.
     Transition,
@@ -185,6 +201,7 @@ pub fn plan(
     roster: &RosterDraft,
     live_seats: &[LiveSeat],
     groups: &[GroupWrite],
+    book: &[crate::book::BookWrite],
     window: Option<GameUpdate>,
 ) -> Result<Vec<Step>, Refusal> {
     // THE FORCE'S OWN RULES: a hull with nobody to steer it, one person
@@ -229,8 +246,11 @@ pub fn plan(
     for write in roster_writes.iter().filter(|w| matches!(w, RosterWrite::Unseat { .. })) {
         steps.push(Step::Unseat(write.clone()));
     }
-    for write in groups {
-        steps.push(Step::Group(write.clone()));
+    if !groups.is_empty() {
+        steps.push(Step::Groups(groups.to_vec()));
+    }
+    if !book.is_empty() {
+        steps.push(Step::Book(book.to_vec()));
     }
     steps.push(Step::Transition);
     Ok(steps)
@@ -264,6 +284,8 @@ mod tests {
             user_id,
             user_name: name.into(),
             role_id,
+            role_name: format!("role-{role_id}"),
+            call_sign: name.to_uppercase(),
             judge,
         }
     }
@@ -294,6 +316,7 @@ mod tests {
             &RosterDraft::new(),
             &[],
             &[],
+            &[],
             Some(window()),
         )
         .expect("a plan");
@@ -305,7 +328,8 @@ mod tests {
                 Step::Force(_) => "force",
                 Step::Role(_) => "role",
                 Step::Unseat(_) => "unseat",
-                Step::Group(_) => "group",
+                Step::Groups(_) => "group",
+                Step::Book(_) => "book",
                 Step::Transition => "transition",
             })
             .collect();
@@ -327,7 +351,7 @@ mod tests {
         roster.stage(seat(9, "Caca", 2, false));
         roster.stage(seat(6, "Budi", 3, true));
         let live = vec![live_seat(6, "Budi", 1, false)];
-        let steps = plan(&force, &[], &roster, &live, &[], None).expect("a plan");
+        let steps = plan(&force, &[], &roster, &live, &[], &[], None).expect("a plan");
         let kinds: Vec<&str> = steps
             .iter()
             .map(|s| match s {
@@ -336,7 +360,8 @@ mod tests {
                 Step::Force(_) => "force",
                 Step::Role(_) => "role",
                 Step::Unseat(_) => "unseat",
-                Step::Group(_) => "group",
+                Step::Groups(_) => "group",
+                Step::Book(_) => "book",
                 Step::Transition => "transition",
             })
             .collect();
@@ -357,7 +382,7 @@ mod tests {
         let mut roster = RosterDraft::new();
         roster.stage(seat(6, "Budi", 2, true));
         let live = vec![live_seat(6, "Budi", 1, false)];
-        let refusal = plan(&force, &[], &roster, &live, &[], None)
+        let refusal = plan(&force, &[], &roster, &live, &[], &[], None)
             .expect_err("the role change would release the hull");
         match refusal {
             Refusal::Stripped(hazard) => {
@@ -374,7 +399,7 @@ mod tests {
         let mut force = ForceDraft::new();
         force.upsert(hull(7, "KRI Nanggala", Some(3)));
         force.upsert(hull(8, "KRI Rangsat", Some(3)));
-        let refusal = plan(&force, &[], &RosterDraft::new(), &[], &[], None)
+        let refusal = plan(&force, &[], &RosterDraft::new(), &[], &[], &[], None)
             .expect_err("one person commands one thing");
         assert!(matches!(refusal, Refusal::Force(_)), "{refusal:?}");
     }
@@ -387,7 +412,7 @@ mod tests {
         force.upsert(hull(7, "KRI Nanggala", Some(6)));
         let roster = RosterDraft::new();
         let live = vec![live_seat(6, "Budi", 1, true)];
-        let refusal = plan(&force, &[], &roster, &live, &[], None)
+        let refusal = plan(&force, &[], &roster, &live, &[], &[], None)
             .expect_err("a judge commands nothing");
         assert!(matches!(refusal, Refusal::Force(_)), "{refusal:?}");
     }
