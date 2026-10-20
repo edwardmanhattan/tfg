@@ -136,6 +136,20 @@ pub enum GameMode {
     Unknown,
 }
 
+impl Default for GameMode {
+    /// `Unknown`, and never a guess.
+    ///
+    /// The default is what a session read that FAILED leaves behind, and it
+    /// must fail closed: a mode the client did not read may not offer a
+    /// helm, a scenario surface or a clock verb. A default of `Maneuver`
+    /// would be the friendlier mistake and the dangerous one — it would
+    /// offer the whole instrument rail to an exercise whose mode nobody
+    /// has named.
+    fn default() -> Self {
+        GameMode::Unknown
+    }
+}
+
 impl GameMode {
     /// The Minos wire value, or `None` for the client-only mode.
     ///

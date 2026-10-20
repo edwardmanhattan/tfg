@@ -10,6 +10,8 @@
 //!   in them. This is the seam the shell migration turns on: egui and GPUI
 //!   both read it, and the chrome geometry is testable with no display.
 //! - [`gamestate`]: the exercise lifecycle as one axis. Leaf: no tfg types.
+//! - [`mode_rules`]: the console's own rules about a mode — which verbs each
+//!   mode earns, and why they are not the server's. Leaf: no tfg types.
 //! - [`gamefeed`]: the authoritative movement of a Minos exercise — the
 //!   plot read, the order publications, and the game fixes they become.
 //!   Leaf: no GPUI, no shell.
@@ -66,6 +68,7 @@ pub mod log;
 pub mod map_gate;
 pub mod map_render;
 pub mod markers;
+pub mod mode_rules;
 pub mod overlay;
 pub mod paths;
 pub mod phase;

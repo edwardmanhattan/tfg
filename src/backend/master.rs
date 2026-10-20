@@ -1582,6 +1582,74 @@ impl MinosMaster {
         })
     }
 
+    /// Publish ONE FRAME of a drag, and record nothing.
+    ///
+    /// `POST /games/{id}/units/{unit_id}/position/preview` takes the same
+    /// body as the commit and answers with the frame it published. It is
+    /// the route a client calls REPEATEDLY while somebody drags: the frame
+    /// reaches the other participants' boards and stops there, and a commit
+    /// per pointer movement would put a row in the chain for every frame.
+    ///
+    /// The answer is the server's own echo of the frame, so the caller can
+    /// see what the other participants were shown — including the instant
+    /// the server stamped it with, which is the one thing a client cannot
+    /// compute for itself.
+    pub fn preview_unit_position(
+        &self,
+        token: &str,
+        game_id: i64,
+        unit_id: i64,
+        latitude: f64,
+        longitude: f64,
+    ) -> Result<PositionPreview, BackendError> {
+        let data = self.post(
+            token,
+            &format!("/games/{game_id}/units/{unit_id}/position/preview"),
+            serde_json::json!({ "latitude": latitude, "longitude": longitude }),
+        )?;
+        Self::parse_position_preview(&data, unit_id)
+    }
+
+    /// One frame of a drag, as the server echoed it.
+    ///
+    /// NOT the commit's `PositionSet`: that one is a recorded jump, and this
+    /// one is a pointer's position that the server knows nothing about
+    /// until the next frame replaces it. The assumed time is kept because a
+    /// client drawing the board interpolates between snapshots on the
+    /// assumed clock, and a frame carrying no instant could not be placed
+    /// in that sequence.
+    fn parse_position_preview(
+        v: &serde_json::Value,
+        unit_id: i64,
+    ) -> Result<PositionPreview, BackendError> {
+        let malformed = |field: &str| {
+            BackendError::Other(format!(
+                "malformed Minos drag-preview response: missing or invalid {field}"
+            ))
+        };
+        let response_unit = v["id_unit"].as_i64().ok_or_else(|| malformed("id_unit"))?;
+        if response_unit != unit_id {
+            return Err(BackendError::Other(format!(
+                "malformed Minos drag-preview response: id_unit {response_unit} does not match path {unit_id}"
+            )));
+        }
+        let latitude = v["latitude"].as_f64().ok_or_else(|| malformed("latitude"))?;
+        let longitude = v["longitude"].as_f64().ok_or_else(|| malformed("longitude"))?;
+        if !latitude.is_finite()
+            || !(-90.0..=90.0).contains(&latitude)
+            || !longitude.is_finite()
+            || !(-180.0..=180.0).contains(&longitude)
+        {
+            return Err(malformed("latitude/longitude"));
+        }
+        Ok(PositionPreview {
+            unit_id: response_unit,
+            assumed_time: v["assumed_time"].as_str().unwrap_or_default().to_string(),
+            latitude,
+            longitude,
+        })
+    }
+
     /// Rename a participant's call sign: what the net calls somebody
     /// in THIS exercise.
     ///
@@ -3497,6 +3565,21 @@ pub struct StagedOrderList {
 /// kept here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionSet {
+    pub unit_id: i64,
+    pub assumed_time: String,
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+/// One FRAME of a drag, as the server echoed it.
+///
+/// NOT the commit's `PositionSet`. That one is a recorded jump — a fact
+/// about where a hull IS; this one is where a pointer is, which the server
+/// knows nothing about until the next frame replaces it. Modelling a frame
+/// as a position would invite a client to store it beside the
+/// authoritative ones.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionPreview {
     pub unit_id: i64,
     pub assumed_time: String,
     pub latitude: f64,

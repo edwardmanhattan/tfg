@@ -614,6 +614,11 @@ struct IslandDemo {
     /// running. Cleared with the drag (`set_dragging(false, …)`), so a stale
     /// target never outlives the gesture that named it.
     drop_hover: Option<DropTarget>,
+    /// When the last drag frame went out. The throttle for the preview
+    /// route: the frames are published to the other participants' boards,
+    /// so a client that posted every pointer movement would spend the
+    /// exercise's round trips on a gesture nobody is watching yet.
+    preview_at: Option<std::time::Instant>,
     /// The picker's drill tree: Asset Group > Category > Type > Class >
     /// hull, built once by the binary off the synced mirror. Empty on
     /// fixture runs — the picker falls back to its flat register list.
@@ -674,6 +679,14 @@ struct IslandDemo {
     /// The Player picker's latch and verdict.
     roster_busy: bool,
     roster_status: String,
+    /// The capture seed's MODE, read at boot. `Some` means a headless
+    /// capture asked for a mode the live exercise may not be in — the same
+    /// seed-the-state precedent as `TFG_PHASE`, and the only reason the
+    /// console can photograph a scenario or a static exercise without three
+    /// live exercises. It is read ONCE, here, because an environment
+    /// variable read per frame is a rule that changes under the operator's
+    /// feet.
+    mode_seed: Option<crate::gamestate::GameMode>,
     force_busy: bool,
     force_status: String,
     /// A deploy in flight, latched apart from the force writes: the answer
@@ -921,6 +934,57 @@ fn bounded_status(text: &str, width: f32, lines: f32) -> String {
     out
 }
 
+/// The capture seed's mode, parsed.
+///
+/// `TFG_MODE` names a mode the way the server does, and a seed this build
+/// does not know is NO seed: the exercise keeps the mode the server gave
+/// it. A capture that asked for a mode the console cannot read would
+/// photograph a surface the console would never draw, which is the one
+/// thing a capture is for.
+fn seeded_mode(value: &str) -> Option<crate::gamestate::GameMode> {
+    match value {
+        "maneuver" | "scenario" | "static" => {
+            Some(crate::gamestate::GameMode::from_wire(value))
+        }
+        _ => None,
+    }
+}
+
+/// One execution widget: the label, the value, the quiet line under it, and
+/// the surface it opens.
+///
+/// A VALUE, so the SET of widgets the execution rail draws is something a
+/// test can read, and the drawing is a fold over one list. The set is where
+/// ADR-0021's rule about the scenario widget lives: the widget is in the
+/// list in a scenario exercise and out of it everywhere else.
+struct ExecWidget {
+    id: &'static str,
+    label: &'static str,
+    value: String,
+    hint: Option<String>,
+    panel: Option<WhichPanel>,
+}
+
+/// What the rail's helm channel draws.
+///
+/// ADR-0021: the instruments belong to a `maneuver` exercise and to nothing
+/// else. Everywhere else the channel carries the MODE'S SENTENCE where the
+/// instruments were — not a greyed-out compass, which reads as a control
+/// that failed — and in a `static` exercise it carries the sentence and the
+/// hulls this seat commands, because the console's only way to set a
+/// position is to drag a hull onto the map and the rail is where the
+/// commander's hulls are named.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RailHelm {
+    /// The compass, the speed scale and the verb.
+    Instruments,
+    /// The mode's sentence, and nothing else.
+    Sentence(&'static str),
+    /// The mode's sentence, and the hulls this seat commands as things to
+    /// pick up.
+    SetByHand { sentence: &'static str },
+}
+
 /// The rail's widths, from the window's width.
 ///
 /// Pure arithmetic, and a test asserts it: the rail is drawn from these
@@ -1022,6 +1086,15 @@ fn rail_widths(viewport_w: f32) -> RailWidths {
         dial,
     }
 }
+
+/// The gap between two drag frames.
+///
+/// The server's own note on the preview route says a client sends frames
+/// "throttled to roughly ten a second", and ten a second is what a pointer
+/// moving at a walking pace produces. A client that posted every pointer
+/// movement would spend the exercise's round trips on a gesture nobody is
+/// watching yet.
+const PREVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The speed scale's graduations, in knots, for a track of `w` points.
 ///
@@ -2068,6 +2141,13 @@ impl IslandDemo {
     /// Build the view's state. Split out of `run` so a test can construct
     /// it headlessly — no window, no wire, no map thread — and drive the
     /// selection handler the way the compositor would.
+    ///
+    /// THE CAPTURE SEEDS ARE READ HERE, ONCE, AT BOOT: `TFG_ZOOM`,
+    /// `TFG_RELATE`, `TFG_SETTINGS`, `TFG_PEOPLE`, `TFG_CREW`,
+    /// `TFG_COMMAND`, `TFG_BOARD`, `TFG_COMMS`, `TFG_INSPECT`,
+    /// `TFG_SESSIONS`, `TFG_ASSESS_TAB`, `TFG_SCROLL`, `TFG_READOUT` and
+    /// `TFG_MODE`. A seed read per frame is a rule that changes under the
+    /// operator's feet, so every one of them is a field.
     fn new(
         roster: Vec<RosterRow>,
         roster_total: usize,
@@ -2331,6 +2411,7 @@ impl IslandDemo {
             dragging: false,
             drag_entity: None,
             drop_hover: None,
+            preview_at: None,
             thumbs: HashMap::new(),
             hull_sizes: HashMap::new(),
             fleet_tax: FleetTaxonomy::default(),
@@ -2365,6 +2446,12 @@ impl IslandDemo {
             commander_embark_game: 0,
             roster_busy: false,
             roster_status: String::new(),
+            // The capture seed's mode, read once at boot. A seed that names
+            // a mode this build does not know is no seed at all: the
+            // exercise keeps the mode the server gave it.
+            mode_seed: std::env::var("TFG_MODE")
+                .ok()
+                .and_then(|value| seeded_mode(&value)),
             roster_draft: crate::roster::RosterDraft::new(),
             groups: crate::groups::GroupsDraft::new(),
             book: crate::book::BookDraft::new(),
@@ -3469,7 +3556,13 @@ impl IslandDemo {
         );
         col = col.child(small(format!(
             "{} \u{00b7} {} \u{00b7} {}",
-            if f.mode.is_empty() { "no mode" } else { &f.mode },
+            // The mode as the server's word, and the server's word is what
+            // it is: a mode this build does not know is NOT shown as a
+            // guess, it is shown as no mode at all, because the console
+            // offers nothing on the strength of a word it cannot read.
+            // The SEEDED mode reads here too, so a capture photographs the
+            // mode the console is actually behaving in.
+            self.mode().wire().unwrap_or("no mode"),
             state.label().to_lowercase(),
             format!("{} pace", f.pace)
         )));
@@ -6526,6 +6619,20 @@ impl IslandDemo {
         // listener, not only in its styling: a disabled look that still
         // posts is the one thing this must not be.
         col = col.child(section("HELM"));
+        // ADR-0021: the helm belongs to a maneuver exercise. In a scenario
+        // exercise there is no free-standing helm (the step is the
+        // commander's verb) and in a static one there is no order at all
+        // (the server refuses every one with a 409), so the instruments and
+        // the verb are NOT drawn — not greyed out, not drawn — and the
+        // mode's sentence stands where they were.
+        //
+        // The side column is not drawn in execution, so this copy is not the
+        // live one; the rail is. But it is a copy of the same widget, and a
+        // copy that answers a different rule is a copy that lies.
+        if !self.helm_offered() {
+            col = col.child(note(crate::mode_rules::helm_sentence(self.mode())));
+            return col.into_any_element();
+        }
         // Which hull the order is FOR, above the verb that sends it. The
         // console's dashboard puts the active hull in a ComboBox; here the
         // rows above are the picker and this line is the answer, so a posted
@@ -6636,11 +6743,20 @@ impl IslandDemo {
     /// WRITE.
     ///
     /// Returns false when nothing may be sent: no execution, no commanded
-    /// hull, or no draft. That is the SAME rule the button enforces, kept in
-    /// one place so a test exercises exactly what the click does — the server
-    /// enforces it too, with a 409, which is why the check is here at all
-    /// rather than only in the response handler.
+    /// hull, no draft, or a MODE WITH NO HELM. That is the SAME rule the
+    /// button enforces, kept in one place so a test exercises exactly what
+    /// the click does — the server enforces it too, with a 409, which is why
+    /// the check is here at all rather than only in the response handler.
+    ///
+    /// The mode check is the console's own rule and it is NARROWER than the
+    /// server's: a `scenario` exercise accepts an order (and holds it), and
+    /// the console offers no helm there at all (ADR-0021). An order in a
+    /// scenario exercise is the step's business, and the commander's verb on
+    /// the step is the declaration.
     fn send_helm(&mut self) -> bool {
+        if !self.helm_offered() {
+            return false;
+        }
         if !self.session.execution {
             return false;
         }
@@ -7006,6 +7122,15 @@ impl IslandDemo {
                 self.stage_place_local(unit_id, name, fx, fy, cx)
             };
         }
+        // A STATIC EXERCISE'S POSITIONS ARE SET BY HAND (ADR-0021). The
+        // server refuses every order there with a 409, so the console's
+        // gesture is a drag and the drop IS the position: no heading, no
+        // speed, no time of the client's own. A drop onto a HOST is not one
+        // of those — an embarkation is a different act, and the embark arm
+        // carries no ground to place.
+        if self.positions_set_by_hand() && host.is_none() {
+            return self.send_set_position(unit_id, name, fx, fy, cx);
+        }
         if taken {
             if let Some(host) = host {
                 self.send_embark(host, unit_id, name, cx);
@@ -7045,6 +7170,114 @@ impl IslandDemo {
         }
         cx.notify();
         true
+    }
+
+    /// Whether this exercise's positions are set BY HAND, and the console's
+    /// drag gesture is the way one is set.
+    ///
+    /// ADR-0021: a static exercise has no order at all — the server refuses
+    /// every one of them with a 409 — so the only way a hull moves there is
+    /// for somebody to put it there, and the console's gesture for that is a
+    /// drag onto the map.
+    fn positions_set_by_hand(&self) -> bool {
+        self.mode().positions_are_set()
+    }
+
+    /// Put a hull where the pointer says it is, in a static exercise.
+    ///
+    /// ADR-0021. The drop IS the position: the route takes a latitude and a
+    /// longitude and nothing else, so there is no course to state and no
+    /// speed to claim — the server stamps the instant from the exercise's
+    /// own clock, and the hull stays where it was put until somebody puts
+    /// it somewhere else.
+    ///
+    /// THE GATE IS THE HULL'S OWN. A commander sets the hulls they command.
+    /// The server's rule is wider — a Game Master may correct anybody's
+    /// board — and the console's is narrower on purpose: a drag that moves
+    /// somebody else's hull is not a gesture the console offers, and a
+    /// refusal that names the hull is better than a position set in a mode
+    /// the operator did not choose.
+    ///
+    /// ONE commit, on the release. A commit per pointer movement would put
+    /// a row in the chain for every frame, which is exactly why the server
+    /// has a preview route at all.
+    fn send_set_position(
+        &mut self,
+        unit_id: i64,
+        name: &str,
+        fx: f64,
+        fy: f64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.positions_set_by_hand() {
+            return false;
+        }
+        if !self.own_unit_ids().contains(&unit_id) {
+            self.force_status = format!(
+                "{name} is not yours to place \u{2014} a commander sets the hulls they command"
+            );
+            cx.notify();
+            return false;
+        }
+        let _ = self.order_tx.send(ToBinary::SetPosition { unit_id, fx, fy });
+        self.feed(format!("position set by hand \u{2014} {name}"));
+        cx.notify();
+        true
+    }
+
+    /// One FRAME of a drag, published to the other participants' boards and
+    /// recorded nowhere.
+    ///
+    /// The preview route is the cheap one: it reads the game and the piece,
+    /// clears the same gates the commit clears, and publishes a frame. It
+    /// is what a client calls REPEATEDLY while somebody drags, so the
+    /// frames are throttled here to about ten a second — a client that
+    /// posts every pointer movement would spend the exercise's round trips
+    /// on a gesture nobody is watching yet.
+    ///
+    /// The COMMIT is the release, and only the release: one row in the
+    /// chain per drag, not one per frame.
+    fn drag_preview_frame(
+        &mut self,
+        unit_id: i64,
+        at: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.positions_set_by_hand() {
+            return;
+        }
+        if !self.own_unit_ids().contains(&unit_id) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Some(last) = self.preview_at {
+            if now.duration_since(last) < PREVIEW_INTERVAL {
+                return;
+            }
+        }
+        self.preview_at = Some(now);
+        let size = window.viewport_size();
+        let (w, h) = (f32::from(size.width), f32::from(size.height));
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let fx = f64::from((f32::from(at.x) / w).clamp(0.0, 1.0));
+        let fy = f64::from((f32::from(at.y) / h).clamp(0.0, 1.0));
+        // The same cover transform the drop uses, so a frame and the commit
+        // that follows it name the same ground.
+        let (fx, fy) = window_fraction_to_frame(
+            fx,
+            fy,
+            f64::from(self.map_dims.0),
+            f64::from(self.map_dims.1),
+            f64::from(w),
+            f64::from(h),
+        );
+        let _ = self
+            .order_tx
+            .send(ToBinary::PreviewPosition { unit_id, fx, fy });
+        cx.notify();
     }
 
     /// A drop on bare water, WHILE PLANNING: put the hull in the draft at the
@@ -7579,6 +7812,14 @@ impl IslandDemo {
     /// has a draft `Start` and no fix, so nothing but this projection can say
     /// where it is.
     fn drop_host_at(&self, fx: f64, fy: f64) -> Option<i64> {
+        // A STATIC EXERCISE HAS NO HOSTS ON THE MAP (ADR-0021): its hulls
+        // are PLACED, not embarked, and the console's gesture there is a
+        // position. The hit-test is skipped, so a drop beside another hull
+        // is still a position and not an embarkation of a hull that the
+        // operator was trying to move.
+        if self.positions_set_by_hand() {
+            return None;
+        }
         let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
         if mw <= 0.0 || mh <= 0.0 {
             return None;
@@ -7981,6 +8222,23 @@ impl IslandDemo {
         self.factor_status.clear();
     }
 
+    /// Whether the clock control's verb is PAUSE.
+    ///
+    /// ONE rule, read by the button's label AND by the write it sends, so a
+    /// button that reads "Resume" while the click pauses is impossible.
+    ///
+    /// ADR-0021: in a scenario exercise the clock runs inside a step, the
+    /// server refuses a resume between the beats with a 409, and the
+    /// exercise opens stopped — so the console offers a pause and never a
+    /// resume. In the other two modes the verb follows the last clock
+    /// answer, as it always did.
+    fn clock_verb_is_pause(&self) -> bool {
+        if !self.clock_may_resume() {
+            return true;
+        }
+        self.clock_running.unwrap_or(true)
+    }
+
     /// Pause or resume the scenario clock — the console's
     /// `pause_or_resume_minos`, as a message. Held resumes, otherwise
     /// pauses, unknown pauses: the console's rule, decided shell-side from
@@ -7989,6 +8247,11 @@ impl IslandDemo {
     /// answer is the GameClock to display. A remembered denial refuses
     /// locally with the grant sentence instead of spending a POST the
     /// server has already refused.
+    ///
+    /// In a scenario exercise the verb is a pause and only a pause: the
+    /// clock runs inside a step, and the server refuses a resume between
+    /// the beats (ADR-0021). The rule is one predicate, and the label
+    /// reads the same one.
     ///
     /// Returns whether a request went out, so a test exercises exactly
     /// what the click does.
@@ -8004,7 +8267,7 @@ impl IslandDemo {
         if self.session.game_id == 0 {
             return false;
         }
-        let paused = self.clock_running.unwrap_or(true);
+        let paused = self.clock_verb_is_pause();
         self.pause_busy = true;
         self.pause_status = if paused {
             "pausing\u{2026}"
@@ -9659,12 +9922,14 @@ impl IslandDemo {
     /// Declare or withdraw this seat's readiness on the asking step — the
     /// console's `declare_step`, as a message.
     ///
-    /// Returns false (and sends nothing) for the three non-sends: no step
-    /// asks this seat, the named step is not the asking one (a stale click
-    /// after the re-read moved on), or a declaration already in flight. The
-    /// same rule the row's button enforces, kept in one place so a test
-    /// exercises exactly what the click does — the server arbitrates the
-    /// seat on top, loudly.
+    /// Returns false (and sends nothing) for the non-sends: no step asks
+    /// this seat, the named step is not the asking one (a stale click
+    /// after the re-read moved on), a declaration already in flight, or a
+    /// MODE WITH NO STEP. The last one is ADR-0021's: the step is a
+    /// scenario exercise's, and outside one there is no step to declare
+    /// for. The same rule the row's button enforces, kept in one place so a
+    /// test exercises exactly what the click does — the server arbitrates
+    /// the seat on top, loudly.
     fn send_step_declare(
         &mut self,
         scenario_id: i64,
@@ -9672,6 +9937,9 @@ impl IslandDemo {
         ready: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.step_declare_offered() {
+            return false;
+        }
         let asking = self
             .session
             .step
@@ -9699,6 +9967,18 @@ impl IslandDemo {
         });
         cx.notify();
         true
+    }
+
+    /// The step this caller may declare readiness for, when there is one.
+    ///
+    /// The reminder strip's verb and the board's pill are the SAME
+    /// declaration, and they answer the same question — which step is asking
+    /// this seat — so one reader names it for both. The third fact is
+    /// whether this seat has already declared, which is what the two labels
+    /// differ on.
+    fn asking_step(&self) -> Option<(i64, i64, bool)> {
+        let asking = self.session.step.as_ref().and_then(|s| s.asking.as_ref())?;
+        Some((asking.scenario_id, asking.step_id, asking.you_ready))
     }
 
     /// The one step the reminder strip names: what this caller owes the
@@ -9738,7 +10018,42 @@ impl IslandDemo {
     /// execution. Each is deliberately small — the phase is about the map, and
     /// a widget that said everything would be a panel with a map underneath it
     /// — so it carries one fact and opens its surface on click.
+    ///
+    /// ADR-0021: the SCENARIO widget belongs to a scenario exercise alone.
+    /// A maneuver exercise has no book and a static one has no step, so the
+    /// widget is not drawn there at all — a widget that says "no steps" over
+    /// an exercise that was never going to have any reads as a broken
+    /// surface rather than as an absence.
     fn execution_widgets(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let widgets = self.execution_widget_set();
+        let mut rail = div()
+            .absolute()
+            .top(px(64.0))
+            .right(px(10.0))
+            .w(px(196.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0));
+        for widget in widgets {
+            rail = rail.child(self.execution_widget(
+                widget.id,
+                widget.label,
+                widget.value,
+                widget.hint,
+                widget.panel,
+                cx,
+            ));
+        }
+        rail.into_any_element()
+    }
+
+    /// The widgets the execution rail draws, in order.
+    ///
+    /// A VALUE, so a test can read what the rail would draw without a
+    /// rendered frame to read it from — and so the drawing is a fold over
+    /// one list rather than a chain of calls that could each answer a
+    /// different rule.
+    fn execution_widget_set(&self) -> Vec<ExecWidget> {
         let board = self.scenario_board();
         let scenario = match (board.total, board.at) {
             (0, _) => "no steps".to_string(),
@@ -9766,51 +10081,44 @@ impl IslandDemo {
                     "operator".to_string()
                 }
             });
-        div()
-            .absolute()
-            .top(px(64.0))
-            .right(px(10.0))
-            .w(px(196.0))
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .child(self.execution_widget(
-                "widget-account",
-                "operator",
-                role,
-                Some(name),
-                None,
-                cx,
-            ))
-            .child(self.execution_widget(
-                "widget-crew",
-                "crew",
-                format!("{}/{}", self.session.present, self.session.seats),
-                Some(format!("{} hull(s)", self.session.pieces.len())),
-                Some(WhichPanel::Crew),
-                cx,
-            ))
-            .child(self.execution_widget(
-                "widget-scenario",
-                "scenario",
-                scenario,
-                Some(if board.total == 0 {
-                    "nothing to play".to_string()
+        let mut widgets = vec![
+            ExecWidget {
+                id: "widget-account",
+                label: "operator",
+                value: role,
+                hint: Some(name),
+                panel: None,
+            },
+            ExecWidget {
+                id: "widget-crew",
+                label: "crew",
+                value: format!("{}/{}", self.session.present, self.session.seats),
+                hint: Some(format!("{} hull(s)", self.session.pieces.len())),
+                panel: Some(WhichPanel::Crew),
+            },
+        ];
+        // The scenario widget, in a scenario exercise and nowhere else.
+        if self.scenario_exercise() {
+            widgets.push(ExecWidget {
+                id: "widget-scenario",
+                label: "scenario",
+                value: scenario,
+                hint: Some(if board.total == 0 {
+                    crate::mode_rules::no_script_sentence().to_string()
                 } else {
                     format!("{} step(s) in the book", board.total)
                 }),
-                Some(WhichPanel::Board),
-                cx,
-            ))
-            .child(self.execution_widget(
-                "widget-comms",
-                "comms",
-                format!("{}", self.session.messages.len()),
-                Some("message(s) in this exercise".to_string()),
-                Some(WhichPanel::Comms),
-                cx,
-            ))
-            .into_any_element()
+                panel: Some(WhichPanel::Board),
+            });
+        }
+        widgets.push(ExecWidget {
+            id: "widget-comms",
+            label: "comms",
+            value: format!("{}", self.session.messages.len()),
+            hint: Some("message(s) in this exercise".to_string()),
+            panel: Some(WhichPanel::Comms),
+        });
+        widgets
     }
 
     /// One execution widget: a tracked label, one value, one quiet line —
@@ -10097,7 +10405,98 @@ impl IslandDemo {
     /// sat at different heights and the strip read as two unrelated
     /// gadgets. Here the heading and the speed are read off ONE row of
     /// labels, and the controls hang under the labels that name them.
+    /// The exercise's mode, as the console's rules read it.
+    ///
+    /// ONE place. The session's own parsed mode, unless the capture seed
+    /// forces another. Every rule below reads this, so the session and the
+    /// seed can never both answer.
+    fn mode(&self) -> crate::gamestate::GameMode {
+        self.mode_seed.unwrap_or(self.session.facts.mode)
+    }
+
+    /// Whether the helm is offered in this exercise.
+    ///
+    /// ADR-0021: the helm belongs to a `maneuver` exercise and to nothing
+    /// else. The server's own rule (`GameMode::allows_steering`) is WIDER —
+    /// it allows a `scenario` exercise, because the server will hold an
+    /// order there until a step releases it — and the console's rule is
+    /// narrower on purpose: a scenario exercise is played through its steps,
+    /// and a free-standing helm would be an instrument whose every answer
+    /// is "held".
+    fn helm_offered(&self) -> bool {
+        crate::mode_rules::helm_offered(self.mode())
+    }
+
+    /// Whether this exercise is played from a Game Master's book.
+    ///
+    /// ADR-0021: the scenario surfaces — the board, the widget, the step's
+    /// verbs — belong to this mode alone. A `maneuver` exercise has no book
+    /// to play and a `static` one has no step to declare readiness for.
+    fn scenario_exercise(&self) -> bool {
+        crate::mode_rules::scenario_exercise(self.mode())
+    }
+
+    /// Whether the commander's step verb is offered: the declaration that
+    /// says this station is ready for the step the exercise asks.
+    ///
+    /// ADR-0021: in a scenario exercise the step IS the commander's verb.
+    /// Outside one there is no step, so the verb is not drawn at all — and
+    /// `send_step_declare` refuses it, so the button is not a decoration
+    /// over a write the console would make.
+    fn step_declare_offered(&self) -> bool {
+        crate::mode_rules::step_declare_offered(self.mode())
+    }
+
+    /// Whether the Game Master's step verbs are offered: play, skip, end,
+    /// replay.
+    ///
+    /// ADR-0021: they drive a step, and only a scenario exercise has steps.
+    fn step_verbs_offered(&self) -> bool {
+        crate::mode_rules::step_verbs_offered(self.mode())
+    }
+
+    /// Whether the clock may be resumed from this console.
+    ///
+    /// ADR-0021: in a scenario exercise the clock runs inside a step, the
+    /// server refuses a resume between the beats with a 409, and the
+    /// exercise opens stopped — so the console offers a pause and never a
+    /// resume. The other two modes keep the pair they always had.
+    fn clock_may_resume(&self) -> bool {
+        crate::mode_rules::clock_may_resume(self.mode())
+    }
+
+    /// The helm channel of the rail, as a value: the instruments, or the
+    /// mode's sentence.
+    ///
+    /// ADR-0021: the instruments are NOT drawn greyed out where there is no
+    /// helm — they are not drawn at all, and the mode's sentence stands
+    /// where they were. A value, so a test can read what the rail would
+    /// draw without a rendered frame to read it from.
+    fn rail_helm(&self) -> RailHelm {
+        let mode = self.mode();
+        if crate::mode_rules::helm_offered(mode) {
+            RailHelm::Instruments
+        } else if mode.positions_are_set() {
+            RailHelm::SetByHand {
+                sentence: crate::mode_rules::helm_sentence(mode),
+            }
+        } else {
+            RailHelm::Sentence(crate::mode_rules::helm_sentence(mode))
+        }
+    }
+
     fn dashboard_helm(&mut self, cx: &mut Context<Self>, widths: RailWidths) -> AnyElement {
+        // ADR-0021: the instruments are drawn in a maneuver exercise and NOWHERE
+        // else. A scenario exercise has no free-standing helm, and a static
+        // one has no order at all; the channel carries the mode's sentence
+        // instead, in their place.
+        let helm = self.rail_helm();
+        if let RailHelm::Sentence(sentence) = helm {
+            return self.dashboard_helm_sentence(sentence, widths);
+        }
+        if let RailHelm::SetByHand { sentence } = helm {
+            return self.dashboard_helm_set_by_hand(sentence, cx);
+        }
         let armed = self.session.execution && self.order_target().is_some();
         let status = self
             .helm_status
@@ -10199,6 +10598,149 @@ impl IslandDemo {
                             ),
                     ),
             )
+            .into_any_element()
+    }
+
+    /// The helm channel of the rail where there is no helm: the mode's
+    /// sentence, in the instruments' place.
+    ///
+    /// ADR-0021. NOT a greyed-out compass and NOT an empty channel: an
+    /// instrument that cannot be used reads as a control that failed, and
+    /// an empty channel reads as nothing at all. The sentence says what the
+    /// mode has instead — the step for a scenario exercise, the hand for a
+    /// static one — so the operator is told the way forward and not only
+    /// the refusal.
+    fn dashboard_helm_sentence(&mut self, sentence: &'static str, widths: RailWidths) -> AnyElement {
+        div()
+            .id("dashboard-helm")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .px(px(DASH_RAIL_PAD))
+            .py(px(8.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(6.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .w(px(widths.order + widths.dial + widths.scale))
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(view::BODY_PT))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(sentence),
+            )
+            .into_any_element()
+    }
+
+    /// The helm channel of the rail in a static exercise: the mode's
+    /// sentence, and the hulls this seat commands as things to PICK UP.
+    ///
+    /// ADR-0021: a static exercise's positions are set by hand, so the
+    /// console's verb is a drag — and a drag needs something to hold. The
+    /// rail is where the commander's hulls are already named, so the chips
+    /// go there rather than in a panel the operator has to open first.
+    ///
+    /// Only the hulls THIS SEAT commands are chips. The server will let a
+    /// Game Master move anybody's hull, but the console's rule is the
+    /// narrower one: a commander sets their own, and the chip a seat does
+    /// not own is not drawn at all.
+    fn dashboard_helm_set_by_hand(
+        &mut self,
+        sentence: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mine: Vec<(i64, String)> = self
+            .own_unit_ids()
+            .into_iter()
+            .filter_map(|id| {
+                self.piece_name(id)
+                    .map(|name| (id, name))
+                    .or_else(|| self.session.mine.iter().find(|s| s.id == id.to_string()).map(|s| (id, s.label.clone())))
+            })
+            .collect();
+        let mut chips = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(6.0));
+        for (id, name) in mine {
+            let symbol = self.fleet_symbol(id);
+            let thumb = self.thumbs.get(&id).cloned();
+            let payload = UnitDragPayload {
+                unit_id: id,
+                name: name.clone(),
+                symbol,
+                thumb: thumb.clone(),
+                entity: DragEntity::Unit {
+                    unit_id: id,
+                    name: name.clone(),
+                },
+            };
+            let ghost = (name.clone(), symbol, thumb);
+            let weak = cx.entity().downgrade();
+            chips = chips.child(
+                div()
+                    .id(("hull-chip", id as usize))
+                    .cursor(CursorStyle::OpenHand)
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
+                    .px(px(7.0))
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .border(px(1.0))
+                    .border_color(rgba(HAIRLINE_SLATE))
+                    .on_drag(payload, move |p: &UnitDragPayload, _, _, app| {
+                        let entity = p.entity.clone();
+                        let _ = weak.update(app, |view, cx| view.begin_drag(entity, cx));
+                        app.new(|_| DragGhost {
+                            name: ghost.0.clone(),
+                            symbol: ghost.1,
+                            thumb: ghost.2.clone(),
+                        })
+                    })
+                    // The FRAMES of the drag, while it is in the air: the
+                    // preview route, which records nothing and is published to
+                    // the other participants' boards. The COMMIT happens once,
+                    // on the release — a commit per pointer movement would put
+                    // a row in the chain for every frame.
+                    .on_drag_move::<UnitDragPayload>(cx.listener(
+                        move |view, ev: &gpui::DragMoveEvent<UnitDragPayload>, window, cx| {
+                            view.drag_preview_frame(id, ev.event.position, window, cx);
+                        },
+                    ))
+                    .child(
+                        div()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(11.0))
+                            .text_color(rgba(MAP_INK))
+                            .child(name),
+                    ),
+            );
+        }
+        div()
+            .id("dashboard-helm")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .px(px(DASH_RAIL_PAD))
+            .py(px(8.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(8.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(view::BODY_PT))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(sentence),
+            )
+            .child(chips)
             .into_any_element()
     }
 
@@ -11207,8 +11749,12 @@ impl IslandDemo {
             let read = steps[i].read;
             let key = (steps[i].scenario_id, steps[i].step_id);
             let is_head = Some(i) == head;
+            // ADR-0021: the Game Master's verbs drive a step, and only a
+            // scenario exercise has steps. In a maneuver or a static
+            // exercise the board draws NO verbs at all — the row says what
+            // is there, and nothing offers to play it.
             let verbs = match audience {
-                ScenarioAudience::Master => match read {
+                ScenarioAudience::Master if self.step_verbs_offered() => match read {
                     // The step in play: END closes it, REPLAY re-activates it
                     // from its own start (the server erases the abandoned
                     // attempt and says what it cost).
@@ -11227,8 +11773,12 @@ impl IslandDemo {
                 },
                 // An observer reads and does not drive: the same rows, the same
                 // pointer, no verbs. A commander is told the one thing their
-                // station owes and nothing about the rest of the plan.
-                ScenarioAudience::Observer | ScenarioAudience::Commander => Vec::new(),
+                // station owes and nothing about the rest of the plan. And a
+                // Game Master in an exercise with no steps has no step to
+                // drive, so the same answer.
+                ScenarioAudience::Observer
+                | ScenarioAudience::Commander
+                | ScenarioAudience::Master => Vec::new(),
             };
             // The gate rides the step the exercise stands on — playing or
             // asking — and the head, the one next row the Master's play moves
@@ -11274,6 +11824,11 @@ impl IslandDemo {
     /// a CLIENT-side guard, not a security one — the server refuses a seat it
     /// does not recognise — but a client that offered the button anyway would
     /// be lying about the console's own vocabulary.
+    ///
+    /// AND ONLY IN A SCENARIO EXERCISE (ADR-0021): these verbs drive a
+    /// step, and only a scenario exercise has steps. A maneuver exercise's
+    /// book is empty and a static one has no step to play, so the verbs are
+    /// not drawn there and this refuses them.
     fn send_step_verb(
         &mut self,
         scenario_id: i64,
@@ -11282,6 +11837,9 @@ impl IslandDemo {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.step_verb_busy || self.session.game_id == 0 {
+            return false;
+        }
+        if !self.step_verbs_offered() {
             return false;
         }
         if self.scenario_audience() != ScenarioAudience::Master {
@@ -11536,12 +12094,15 @@ impl IslandDemo {
                             }))
                             .child(button(
                                 // The label follows the VERB's rule, not the
-                                // other way round: `send_set_paused` pauses when
-                                // the clock is running OR unknown, so a button
-                                // reading "Resume" while the click pauses would
-                                // be the console telling the operator the
-                                // opposite of what it does.
-                                if self.clock_running.unwrap_or(true) {
+                                // other way round: the click pauses when the
+                                // clock is running, when it is unknown, and
+                                // ALWAYS in a scenario exercise — where the
+                                // server refuses a resume between the beats
+                                // (ADR-0021). A button reading "Resume" while
+                                // the click pauses would be the console
+                                // telling the operator the opposite of what it
+                                // does.
+                                if self.clock_verb_is_pause() {
                                     "Pause clock"
                                 } else {
                                     "Resume clock"
@@ -11570,6 +12131,16 @@ impl IslandDemo {
                         "Play, skip, end and replay sit inside each step box.",
                     )),
             );
+            // The clock's own rule, said where the clock's button is
+            // (ADR-0021): in a scenario exercise the clock runs inside a
+            // step, it opens stopped, and a resume between the beats is
+            // refused — so the console offers a pause and never a resume.
+            if self.scenario_exercise() {
+                col = col.child(note(
+                    "The clock runs with the step: it opens stopped, and the server \
+                     refuses a resume between the beats, so there is no resume here.",
+                ));
+            }
             for line in [self.pause_status.clone(), self.step_verb_status.clone(), self.end_status.clone()] {
                 if !line.is_empty() {
                     col = col.child(note(line));
@@ -11823,7 +12394,14 @@ impl IslandDemo {
                     .child(button(verb.label(), true, self.step_verb_busy, false)),
             );
         }
-        if row.read == StepRead::Asking && self.scenario_audience() == ScenarioAudience::Commander {
+        // ADR-0021: the declaration is the commander's verb on the current
+        // step, and a step is a scenario exercise's. In a maneuver or a
+        // static exercise the pill is NOT drawn — not greyed out, not
+        // drawn — because there is no step to declare for.
+        if row.read == StepRead::Asking
+            && self.scenario_audience() == ScenarioAudience::Commander
+            && self.step_declare_offered()
+        {
             has_action = true;
             let (scenario_id, step_id) = (row.scenario_id, row.step_id);
             let you_ready = self
@@ -12917,6 +13495,15 @@ impl IslandDemo {
                 self.session = session;
                 self.reseed_drafts();
             }
+            // A POSITION SET BY HAND. The session comes back with the hull
+            // where it was put, and the drafts are re-seeded from it like any
+            // other write: the server's truth is the frame the next diff is
+            // taken against.
+            WriteId::Position => {
+                self.force_status.clear();
+                self.session = session;
+                self.reseed_drafts();
+            }
             WriteId::Prepare => {
                 // The advance wrote the staged draft through and moved the
                 // game on. The re-read session REPLACES the held one first:
@@ -13011,6 +13598,9 @@ impl IslandDemo {
             WriteId::Force | WriteId::Deploy => {
                 self.force_busy = false;
                 self.deploy_busy = false;
+                self.force_status = why;
+            }
+            WriteId::Position => {
                 self.force_status = why;
             }
             WriteId::Prepare => {
@@ -15319,41 +15909,82 @@ impl Render for IslandDemo {
             // The console's own pair: sand while the step waits on this
             // caller, signal green once declared or when only naming play.
             let dot = if rem.needs_you { WARNING_SAND } else { SIGNAL_GREEN };
-            root = root.child(
-                div()
-                    .absolute()
-                    .top(px(34.0))
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .h(px(22.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(10.0))
-                    .overflow_hidden()
-                    .bg(rgba(Rgba::black_alpha(120)))
-                    .id("step-reminder")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.open_board(cx);
-                    }))
-                    .child(
-                        div()
-                            .w(px(8.0))
-                            .h(px(8.0))
-                            .rounded(px(4.0))
-                            .bg(rgba(dot))
-                            .flex_shrink_0(),
+            // THE COMMANDER'S STEP VERB, ON THE STRIP THAT ASKS FOR IT
+            // (ADR-0021). The strip says what this caller owes, so the
+            // answer belongs on the strip: a commander who has to open the
+            // board to declare readiness has been asked a question the
+            // screen did not let them answer.
+            //
+            // The label NAMES THE STEP, because the game-level readiness
+            // ("ready to start") is a different fact and the two must not
+            // read as one.
+            let step_verb = if self.step_declare_offered()
+                && self.scenario_audience() == ScenarioAudience::Commander
+            {
+                self.asking_step().map(|(scenario_id, step_id, you_ready)| {
+                    (
+                        scenario_id,
+                        step_id,
+                        if you_ready { "WITHDRAW" } else { "READY FOR THIS STEP" },
+                        !you_ready,
                     )
-                    .child(
-                        div()
-                            .font_family(view::FACE_HUMAN)
-                            .text_size(px(11.0))
-                            .text_color(rgba(MAP_INK))
-                            .child(rem.text),
-                    ),
-            );
+                })
+            } else {
+                None
+            };
+            let mut strip = div()
+                .absolute()
+                .top(px(34.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                // The strip grows by the verb's own height: a pill clipped by
+                // the band that carries it is a control the operator cannot
+                // read, and the band is the only place the question is asked.
+                .h(px(if step_verb.is_some() { 28.0 } else { 22.0 }))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(10.0))
+                .overflow_hidden()
+                .bg(rgba(Rgba::black_alpha(120)))
+                .id("step-reminder")
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.open_board(cx);
+                }))
+                .child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(dot))
+                        .flex_shrink_0(),
+                )
+                .child(
+                    div()
+                        .font_family(view::FACE_HUMAN)
+                        .text_size(px(11.0))
+                        .text_color(rgba(MAP_INK))
+                        .child(rem.text),
+                );
+            if let Some((scenario_id, step_id, label, ready)) = step_verb {
+                strip = strip.child(
+                    div()
+                        .id("step-reminder-declare")
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            // The strip's own click opens the board; this one
+                            // answers the question, so the board does not
+                            // open under it.
+                            cx.stop_propagation();
+                            view.send_step_declare(scenario_id, step_id, ready, cx);
+                        }))
+                        .child(button(label, true, self.step_declare_busy, false)),
+                );
+            }
+            root = root.child(strip);
         }
         // THE ARMED PIN. One line, where the reminder rides, because it is
         // the same kind of thing: the console telling the operator what the
@@ -16812,7 +17443,14 @@ pub struct RoleRow {
 #[derive(Clone, Debug, Default)]
 pub struct GameFacts {
     /// `scenario` in the seed. The server's word, shown as read.
-    pub mode: String,
+    ///
+    /// PARSED ONCE, WHERE THE SESSION IS READ, into the mode the rules
+    /// speak of: every rule about a mode is a function of this value, and a
+    /// rule that compared the spelling at each site would be a rule that
+    /// could be spelled two ways. `Unknown` is the default, so a session
+    /// read that failed leaves the exercise with no mode at all — and no
+    /// mode means no helm, no scenario surface and no clock verb.
+    pub mode: crate::gamestate::GameMode,
     /// The pace as the operator reads it: `standard`, `fast`, or the raw
     /// token when the server names one this build does not know. An
     /// unrecognised pace is NOT a pace — it keeps its ceremony, which is the
@@ -16945,10 +17583,22 @@ impl SessionDraft {
 
 /// The three modes the server documents, in the console's order, with the
 /// console's own one-line meanings.
+///
+/// ADR-0021: the `scenario` line used to say that "personnel steer like
+/// maneuver", which was the SERVER's rule and not the console's. The
+/// console offers no free-standing helm in a scenario exercise at all: the
+/// exercise is played through its steps, and the commander's verb on the
+/// current step is to declare readiness for it.
 pub const SESSION_MODES: [(&str, &str); 3] = [
     ("maneuver", "the exercise integrates helm orders"),
-    ("scenario", "personnel steer like maneuver; the Game Master plays steps around them"),
-    ("static", "positions are set by hand — helm orders are refused"),
+    (
+        "scenario",
+        "steps are played by the Game Master; the commander declares readiness",
+    ),
+    (
+        "static",
+        "the positions are set by hand — drag a hull on the map; orders are refused",
+    ),
 ];
 
 /// Which compose field has the keystrokes: the judgement score or the
@@ -16997,6 +17647,24 @@ pub enum ToBinary {
     /// mercator. The answer is a re-read session on `create_feed`, like every
     /// other write here.
     DeployUnit { unit_id: i64, fx: f64, fy: f64 },
+    /// Put a hull where the pointer says, in an exercise whose positions are
+    /// SET BY HAND.
+    ///
+    /// ADR-0021. The same fractions the deploy names, and the same
+    /// unprojection, but the route is a different one: no heading, no speed
+    /// and no instant of the client's own — the server stamps the jump from
+    /// the exercise's clock, because a hull that is set is stationary until
+    /// somebody sets it again. The answer is a re-read session, like every
+    /// other write here.
+    SetPosition { unit_id: i64, fx: f64, fy: f64 },
+    /// ONE FRAME of a drag, published to the other participants' boards and
+    /// recorded nowhere.
+    ///
+    /// The preview route exists because a commit per pointer movement would
+    /// put a row in the chain for every frame, and a jump per frame is not
+    /// a track. The frames go out while the drag is in the air; the commit
+    /// is the release.
+    PreviewPosition { unit_id: i64, fx: f64, fy: f64 },
     /// Assign a register hull and deploy it, in one gesture: the drop of a
     /// hull the exercise does not hold yet. The commander is the
     /// operator's own seat (the shell refuses seatless first); the binary
@@ -17313,6 +17981,8 @@ pub struct CreatedSession {
         Force,
         /// A hull placed or embarked outside planning.
         Deploy,
+        /// A hull's position set by hand, in a static exercise.
+        Position,
         /// The staged draft written through and the game moved on.
         Prepare,
         /// The staged draft written through, phase unchanged.
@@ -20672,6 +21342,13 @@ mod tests {
         let session = SessionView {
             execution: true,
             my_role: "Commando".to_string(),
+            // A MANEUVER EXERCISE (ADR-0021): the helm belongs to that mode
+            // alone, so a session that named no mode would have no helm to
+            // send with.
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
             mine: vec![MyShip {
                 id: "8".to_string(),
                 label: "KRI Test (KRI-1)".to_string(),
@@ -23085,7 +23762,15 @@ mod tests {
                 fixture_roster(),
                 8,
                 0,
-                SessionView::default(),
+                SessionView {
+                    // A MANEUVER EXERCISE (ADR-0021): the clock's pair stays
+                    // as it is there, and the verb follows the last answer.
+                    facts: GameFacts {
+                        mode: crate::gamestate::GameMode::Maneuver,
+                        ..GameFacts::default()
+                    },
+                    ..SessionView::default()
+                },
                 tx,
             );
             demo.session.game_id = 5;
@@ -23385,6 +24070,10 @@ mod tests {
         let session = SessionView {
             execution: true,
             my_role: "Commando".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
             mine: vec![
                 MyShip { id: "8".to_string(), label: "KRI First (KRI-1)".to_string() },
                 MyShip { id: "9".to_string(), label: "KRI Second (KRI-2)".to_string() },
@@ -23432,6 +24121,10 @@ mod tests {
         let session = SessionView {
             execution: true,
             my_role: "Commando".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
             mine: vec![MyShip { id: "8".to_string(), label: "KRI First".to_string() }],
             ..SessionView::default()
         };
@@ -23693,6 +24386,450 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing reached the sink");
     }
 
+    /// The helm is SILENT in a scenario exercise: no order, no message, no
+    /// sink.
+    ///
+    /// ADR-0021. The SERVER would take an order here and HOLD it until a
+    /// step released it, so a helm that posted one would be offering a verb
+    /// whose every answer is "held" — and the operator would learn what
+    /// that means from the server rather than from the screen. The
+    /// console's own verb on the current step is the declaration.
+    #[gpui::test]
+    fn the_helm_is_silent_in_a_scenario_exercise(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            my_role: "Commando".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Scenario,
+                ..GameFacts::default()
+            },
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Test (KRI-1)".to_string(),
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.helm_heading = Some(90.0);
+            demo.helm_speed = Some(12.0);
+            demo
+        });
+        let sent = cx.update(|_window, app| view.update(app, |demo, _| demo.send_helm()));
+        assert!(!sent, "a scenario exercise has no helm to send with");
+        assert!(rx.try_recv().is_err(), "nothing reached the sink");
+    }
+
+    /// And the helm is SILENT in a static exercise: the server refuses every
+    /// order there with a 409, and a static exercise's positions are set by
+    /// hand instead.
+    #[gpui::test]
+    fn the_helm_is_silent_in_a_static_exercise(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            my_role: "Commando".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Static,
+                ..GameFacts::default()
+            },
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Test (KRI-1)".to_string(),
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.helm_heading = Some(90.0);
+            demo.helm_speed = Some(12.0);
+            demo
+        });
+        let sent = cx.update(|_window, app| view.update(app, |demo, _| demo.send_helm()));
+        assert!(!sent, "a static exercise refuses every order");
+        assert!(rx.try_recv().is_err(), "nothing reached the sink");
+    }
+
+    /// And the helm is SILENT when the mode is UNKNOWN: the mode the server
+    /// did not say, or a word this build has not heard of, is not a mode
+    /// that may steer. It fails closed.
+    #[gpui::test]
+    fn the_helm_is_silent_when_the_mode_is_unknown(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            my_role: "Commando".to_string(),
+            // No mode at all: the read of the session's terms failed, or the
+            // server named a mode this build does not know.
+            facts: GameFacts::default(),
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Test (KRI-1)".to_string(),
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.helm_heading = Some(90.0);
+            demo.helm_speed = Some(12.0);
+            demo
+        });
+        let sent = cx.update(|_window, app| view.update(app, |demo, _| demo.send_helm()));
+        assert!(!sent, "an unknown mode is not a mode that may steer");
+        assert!(rx.try_recv().is_err(), "nothing reached the sink");
+    }
+
+    /// And the helm DOES order in a maneuver exercise: the same call, the
+    /// same draft, and the order goes out. A rule that silenced the helm
+    /// everywhere would pass the three refusals above and leave the
+    /// console with no instrument at all.
+    #[gpui::test]
+    fn the_helm_orders_in_a_maneuver_exercise(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            my_role: "Commando".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Test (KRI-1)".to_string(),
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.helm_heading = Some(90.0);
+            demo.helm_speed = Some(12.0);
+            demo
+        });
+        let sent = cx.update(|_window, app| view.update(app, |demo, _| demo.send_helm()));
+        assert!(sent, "a maneuver exercise orders");
+        match rx.try_recv().expect("the order reached the sink") {
+            ToBinary::Helm(order) => assert_eq!(order.unit_id, "8"),
+            other => panic!("expected a helm order, got {other:?}"),
+        }
+    }
+
+    /// The RAIL draws no helm outside a maneuver exercise: the channel
+    /// carries the mode's sentence where the instruments were.
+    ///
+    /// ADR-0021. NOT a greyed-out compass — an instrument that cannot be
+    /// used reads as a control that failed — and not an empty channel,
+    /// which reads as nothing at all. The sentence names the remedy the
+    /// mode has: the step for a scenario exercise, the hand for a static
+    /// one.
+    #[gpui::test]
+    fn the_rail_draws_no_helm_outside_maneuver(cx: &mut gpui::TestAppContext) {
+        for (mode, expected) in [
+            (
+                crate::gamestate::GameMode::Scenario,
+                RailHelm::Sentence(crate::mode_rules::helm_sentence(
+                    crate::gamestate::GameMode::Scenario,
+                )),
+            ),
+            (
+                crate::gamestate::GameMode::Static,
+                RailHelm::SetByHand {
+                    sentence: crate::mode_rules::helm_sentence(
+                        crate::gamestate::GameMode::Static,
+                    ),
+                },
+            ),
+            (
+                crate::gamestate::GameMode::Unknown,
+                RailHelm::Sentence(crate::mode_rules::helm_sentence(
+                    crate::gamestate::GameMode::Unknown,
+                )),
+            ),
+        ] {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let session = SessionView {
+                execution: true,
+                facts: GameFacts {
+                    mode,
+                    ..GameFacts::default()
+                },
+                ..SessionView::default()
+            };
+            let (view, cx) = cx.add_window_view(|_, _| {
+                IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+            });
+            let rail = cx.update(|_window, app| view.read(app).rail_helm());
+            assert_eq!(rail, expected, "{mode:?} drew the wrong channel");
+        }
+        // And the maneuver exercise draws the instruments.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let rail = cx.update(|_window, app| view.read(app).rail_helm());
+        assert_eq!(rail, RailHelm::Instruments, "a maneuver exercise steers");
+    }
+
+    /// The step's DECLARATION is a scenario exercise's verb, and it is
+    /// absent outside one.
+    ///
+    /// ADR-0021: the pill is not drawn and the write refuses. Both halves
+    /// matter — a drawn button over a refused write is a lie about what the
+    /// console does, and a refusing button nobody can see is a mystery.
+    #[gpui::test]
+    fn the_step_declare_is_absent_outside_a_scenario_exercise(cx: &mut gpui::TestAppContext) {
+        for mode in [
+            crate::gamestate::GameMode::Maneuver,
+            crate::gamestate::GameMode::Static,
+            crate::gamestate::GameMode::Unknown,
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let session = SessionView {
+                execution: true,
+                facts: GameFacts {
+                    mode,
+                    ..GameFacts::default()
+                },
+                step: Some(StepView {
+                    assumed_time: "2000-01-01T10:00:00+07:00".to_string(),
+                    playing: None,
+                    asking: Some(StepAsk {
+                        scenario_id: 12,
+                        step_id: 16,
+                        scenario: "First move".to_string(),
+                        content: "Take station east of the buoy".to_string(),
+                        required: 1,
+                        outstanding: 1,
+                        you_ready: false,
+                    }),
+                }),
+                ..SessionView::default()
+            };
+            let (view, cx) = cx.add_window_view(|_, _| {
+                IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+            });
+            let offered = cx.update(|_window, app| view.read(app).step_declare_offered());
+            assert!(!offered, "{mode:?} has no step to declare for");
+            let sent = cx.update(|_window, app| {
+                view.update(app, |demo, cx| demo.send_step_declare(12, 16, true, cx))
+            });
+            assert!(!sent, "{mode:?} refuses the declaration");
+            assert!(rx.try_recv().is_err(), "nothing reached the sink");
+        }
+        // And in a scenario exercise it is there, and it declares.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Scenario,
+                ..GameFacts::default()
+            },
+            step: Some(StepView {
+                assumed_time: "2000-01-01T10:00:00+07:00".to_string(),
+                playing: None,
+                asking: Some(StepAsk {
+                    scenario_id: 12,
+                    step_id: 16,
+                    scenario: "First move".to_string(),
+                    content: "Take station east of the buoy".to_string(),
+                    required: 1,
+                    outstanding: 1,
+                    you_ready: false,
+                }),
+            }),
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let offered = cx.update(|_window, app| view.read(app).step_declare_offered());
+        assert!(offered, "a scenario exercise asks for readiness");
+        let sent = cx.update(|_window, app| {
+            view.update(app, |demo, cx| demo.send_step_declare(12, 16, true, cx))
+        });
+        assert!(sent, "the asking step declares");
+        match rx.try_recv().expect("the declaration reached the sink") {
+            ToBinary::DeclareStep { scenario_id, step_id, ready } => {
+                assert_eq!((scenario_id, step_id, ready), (12, 16, true));
+            }
+            other => panic!("expected a declaration, got {other:?}"),
+        }
+    }
+
+    /// A scenario exercise offers NO RESUME between the beats, and a
+    /// maneuver exercise offers the pair it always had.
+    ///
+    /// ADR-0021: in a scenario exercise the clock runs inside a step, the
+    /// server refuses a resume between the beats with a 409, and the
+    /// exercise opens stopped — so the console's verb is a pause and only
+    /// a pause. The rule is ONE predicate, and the button's label reads it
+    /// as well as the write does.
+    #[gpui::test]
+    fn a_scenario_exercise_offers_no_resume_between_beats(cx: &mut gpui::TestAppContext) {
+        for (mode, expect_pause) in [
+            (crate::gamestate::GameMode::Scenario, true),
+            (crate::gamestate::GameMode::Maneuver, false),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let session = SessionView {
+                execution: true,
+                facts: GameFacts {
+                    mode,
+                    ..GameFacts::default()
+                },
+                game_id: 5,
+                ..SessionView::default()
+            };
+            let (view, cx) = cx.add_window_view(|_, _| {
+                let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+                // The clock is HELD, so the maneuver pair would resume.
+                demo.clock_running = Some(false);
+                demo
+            });
+            let sent =
+                cx.update(|_window, app| view.update(app, |demo, cx| demo.send_set_paused(cx)));
+            assert!(sent, "{mode:?} offers the clock's verb");
+            match rx.try_recv().expect("the clock write reached the sink") {
+                ToBinary::SetPaused { paused } => {
+                    assert_eq!(paused, expect_pause, "{mode:?} chose the wrong verb");
+                }
+                other => panic!("expected a clock write, got {other:?}"),
+            }
+        }
+    }
+
+    /// The SCENARIO WIDGET is absent outside a scenario exercise.
+    ///
+    /// ADR-0021: a widget that says "no steps" over an exercise that was
+    /// never going to have any reads as a broken surface rather than as an
+    /// absence. The rail's widgets are a value, so the set is read here
+    /// rather than inferred from a rendered frame.
+    #[gpui::test]
+    fn the_scenario_widget_is_absent_outside_a_scenario_exercise(cx: &mut gpui::TestAppContext) {
+        for (mode, present) in [
+            (crate::gamestate::GameMode::Scenario, true),
+            (crate::gamestate::GameMode::Maneuver, false),
+            (crate::gamestate::GameMode::Static, false),
+            (crate::gamestate::GameMode::Unknown, false),
+        ] {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let session = SessionView {
+                execution: true,
+                facts: GameFacts {
+                    mode,
+                    ..GameFacts::default()
+                },
+                ..SessionView::default()
+            };
+            let (view, cx) = cx.add_window_view(|_, _| {
+                IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+            });
+            let widgets = cx.update(|_window, app| view.read(app).execution_widget_set());
+            let drawn = widgets.iter().any(|w| w.id == "widget-scenario");
+            assert_eq!(drawn, present, "{mode:?} drew the wrong widgets");
+            // The other three are always there.
+            assert_eq!(widgets.len(), if present { 4 } else { 3 }, "{mode:?}");
+        }
+    }
+
+    /// A STATIC EXERCISE'S POSITIONS ARE SET BY HAND: the drop is a position
+    /// write, and no order goes out with it.
+    ///
+    /// ADR-0021. The server refuses every order in a static exercise with a
+    /// 409, so a helm order from a drag would be a request the server
+    /// answers with a refusal; the position route takes the same ground and
+    /// answers with a jump.
+    #[gpui::test]
+    fn a_static_drag_emits_a_position_write_and_no_order(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            state: "execution".to_string(),
+            game_id: 7,
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Static,
+                ..GameFacts::default()
+            },
+            me: 2,
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Test (KRI-1)".to_string(),
+            }],
+            pieces: vec![PieceView {
+                id: 8,
+                label: "KRI Test (KRI-1)".to_string(),
+                commander_id: Some(2),
+                ..PieceView::default()
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        // The shell asks about the embark composition on its own account, and
+        // that question is not this test's: drain it, and read what the
+        // DRAG said.
+        while rx.try_recv().is_ok() {}
+        let sent = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(8, "KRI Test (KRI-1)", 0.25, 0.75, None, cx)
+            })
+        });
+        assert!(sent, "the drop lands");
+        match rx.try_recv().expect("the position write reached the sink") {
+            ToBinary::SetPosition { unit_id, fx, fy } => {
+                assert_eq!(unit_id, 8, "the dragged hull is the one that moved");
+                assert!((fx - 0.25).abs() < 1e-9 && (fy - 0.75).abs() < 1e-9);
+            }
+            other => panic!("expected a position write, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "and no order went with it");
+    }
+
+    /// The capture seed FORCES the mode, the way `TFG_PHASE` forces the
+    /// phase.
+    ///
+    /// A capture cannot photograph a mode without three live exercises, and
+    /// the console's seeds are read at boot — so the seed is one field, and
+    /// every rule reads it in place of the session's own mode. A seed that
+    /// names a mode this build does not know is no seed at all: the
+    /// exercise keeps the mode the server gave it.
+    #[gpui::test]
+    fn the_mode_seed_forces_the_mode(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.mode_seed = Some(crate::gamestate::GameMode::Static);
+            demo
+        });
+        let mode = cx.update(|_window, app| view.read(app).mode());
+        assert_eq!(mode, crate::gamestate::GameMode::Static, "the seed wins");
+        let helm = cx.update(|_window, app| view.read(app).helm_offered());
+        assert!(!helm, "and the rules read the seed, not the session");
+        // The seed's own vocabulary is the server's.
+        assert_eq!(
+            seeded_mode("scenario"),
+            Some(crate::gamestate::GameMode::Scenario)
+        );
+        assert_eq!(seeded_mode("dynamic"), None, "a mode this build does not know");
+    }
+
     /// The composer row is the shell's second WRITE, so its contract is pinned
     /// here like the helm's: the drafted content goes out as ONE telegram
     /// broadcast, and it is the same `send_telegram` the SEND button calls —
@@ -23757,6 +24894,13 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let session = SessionView {
             execution: true,
+            // A SCENARIO EXERCISE (ADR-0021): the step's declaration is
+            // that mode's verb, and outside one there is no step to declare
+            // for.
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Scenario,
+                ..GameFacts::default()
+            },
             step: Some(StepView {
                 assumed_time: "2000-01-01T10:00:00+07:00".to_string(),
                 playing: None,
@@ -23841,6 +24985,15 @@ mod tests {
             state: "execution".to_string(),
             execution: true,
             game_id: 1,
+            // A SCENARIO EXERCISE (ADR-0021). The board's steps and the
+            // Game Master's verbs belong to that mode alone, so a board
+            // session that named no mode would be a board with no verbs on
+            // it — and the test would be asserting a surface the console
+            // does not draw.
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Scenario,
+                ..GameFacts::default()
+            },
             step,
             book: vec![
                 BookScenario {
