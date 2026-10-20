@@ -116,6 +116,33 @@ pub fn no_script_sentence() -> &'static str {
     "This exercise has no script: there are no steps to play."
 }
 
+/// The line the planning column carries in place of the scenario book's
+/// door, when the exercise is not a scenario one.
+///
+/// A SCRIPT IS A SCENARIO EXERCISE'S MECHANISM, and it is the server's:
+/// the step's gate, the step's clock and the step ceiling are scenario-only
+/// (`minos/internal/services/game_step_ceiling.go`), so a book written in a
+/// maneuver exercise is a set of pages nothing will ever play. The server
+/// tolerates the write; the console does not offer the door, because a door
+/// that opens onto pages that do nothing is a lie about what the exercise
+/// is.
+pub fn book_sentence(mode: GameMode) -> &'static str {
+    match mode {
+        GameMode::Maneuver => {
+            "A script belongs to a scenario exercise \u{2014} this one is played by orders."
+        }
+        GameMode::Static => {
+            "A script belongs to a scenario exercise \u{2014} this one's positions \
+             are set by hand."
+        }
+        GameMode::Scenario => "",
+        GameMode::Unknown => {
+            "This build does not know the exercise's mode, so it cannot tell a \
+             scenario exercise from another \u{2014} and it offers no script."
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +224,19 @@ mod tests {
         }
         assert!(helm_sentence(GameMode::Scenario).contains("step"));
         assert!(helm_sentence(GameMode::Static).contains("by hand"));
+    }
+
+    /// The book's door belongs to a scenario exercise, and the line that
+    /// stands in its place names why. A door that opened onto pages nothing
+    /// would ever play would be a lie about the exercise.
+    #[test]
+    fn the_scripts_door_belongs_to_a_scenario_exercise_alone() {
+        assert_eq!(book_sentence(GameMode::Scenario), "", "a scenario exercise has the door");
+        for mode in [GameMode::Maneuver, GameMode::Static, GameMode::Unknown] {
+            let sentence = book_sentence(mode);
+            assert!(!sentence.is_empty(), "{mode:?} needs a reason");
+            assert!(sentence.ends_with('.'), "{sentence:?} is not a sentence");
+            assert!(sentence.contains("scenario"), "{sentence:?} does not say which");
+        }
     }
 }

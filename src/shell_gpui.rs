@@ -3623,22 +3623,32 @@ impl IslandDemo {
         // ABSENT outside planning rather than greyed out: authoring is a
         // planning-time act and the server refuses it after, so a control
         // that would 403 is a lie about what this session can do.
+        //
+        // AND ABSENT OUTSIDE A SCENARIO EXERCISE, with the reason in its
+        // place: the step's gate, the step's clock and the step ceiling are
+        // the server's and they are scenario-only, so a book written in a
+        // maneuver exercise is a set of pages nothing will ever play. The
+        // server tolerates the write; the console does not offer the door.
         if crate::gamestate::GameState::from_wire(&self.session.state)
             == crate::gamestate::GameState::Planning
         {
             col = col.child(separator());
             let scenarios = self.session.book.len();
             let steps: usize = self.session.book.iter().map(|s| s.steps.len()).sum();
-            col = col.child(
-                div()
-                    .id("scenario-composer-door")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.open_only(WhichPanel::Book);
-                        cx.notify();
-                    }))
-                    .child(button("Scenario composer".to_string(), false, false, false)),
-            );
+            if self.scenario_exercise() {
+                col = col.child(
+                    div()
+                        .id("scenario-composer-door")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.open_only(WhichPanel::Book);
+                            cx.notify();
+                        }))
+                        .child(button("Scenario composer".to_string(), false, false, false)),
+                );
+            } else {
+                col = col.child(small(crate::mode_rules::book_sentence(self.mode()).to_string()));
+            }
             if scenarios > 0 {
                 col = col.child(small(format!(
                     "{scenarios} scenario(s), {steps} step(s)."

@@ -7,7 +7,9 @@ console was answering it in the wrong places.
 
 ## Status
 
-Accepted.
+Accepted. Carries forward ADR-0008 (the backend is authoritative over the
+phase) to the mode: the server's word is the mode, and the mode is what
+decides which controls the console may draw.
 
 ## Context
 
@@ -103,3 +105,30 @@ in `src/mode_rules.rs` and are NOT the server's `allows_steering`.**
   the preview route while the drag is in the air, and the commit is the
   release — a commit per pointer movement would put a row in the chain for
   every frame, which is exactly why the preview route exists.
+  - The gesture is offered for the caller's OWN hulls only, and the server
+    would also let the Game Master correct any hull. That is a deliberate
+    narrowing: the console offers what a commander may do, and the Game
+    Master's corrections are the Game Master's own surface.
+
+## Verified
+
+Against the deployed dev API, 2026-10-20:
+
+- The three modes are the legal three. `POST /games` with `mode: "dynamic"`
+  answers 400 — "This field must be one of maneuver static scenario" — and
+  the three legal values are accepted.
+- A scenario order is **held**: `POST /games/{id}/units/{uid}/order` answers
+  **202** with `staged: true` and the server's own `released_by` ("the next
+  played step that releases this hull"), and no position. A maneuver order
+  answers **201** with the fix. A static order is refused **409**: "This
+  exercise's positions are set rather than simulated".
+- A static position is set by hand: `PUT /games/{id}/units/{uid}/position`
+  answers **201** with a jump record (`kind: "jump"`, heading 0, speed 0),
+  and the same route in a scenario exercise answers **409**.
+- A scenario exercise's clock runs inside a step: `POST /games/{id}/resume`
+  with no step playing answers **409** — "This exercise's clock runs inside a
+  step, and no step is playing".
+- A step's gate waits for the related commander's readiness: the play is
+  refused with "1 of 1 participant(s) related to this step have not declared
+  themselves ready", and the declaration (`PUT …/steps/{tid}/readiness`)
+  answers it.

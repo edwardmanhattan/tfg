@@ -199,8 +199,8 @@ The session phase after End: frozen map plus journal transcript, read-only. Neve
 _Avoid_: finished (that's the file, not the phase), archive
 
 **Mode**:
-The engine switch: simulation (the sim ticks) or presentation (wire-only, owned ships frozen). Orthogonal to phase.
-_Avoid_: state (that's the phase axis)
+The exercise's mode as Minos states it and the console reads it: `maneuver`, `static` or `scenario`. The mode decides the verbs — a maneuver exercise steers by helm order, a scenario exercise is played through its steps (no helm; the commander's verb on the current step is the step ready), and a static exercise sets positions by hand. Fixed at creation, re-read on every session read, and a mode the console does not know is no mode: it fails closed. Orthogonal to phase.
+_Avoid_: state (that's the phase axis), engine (that's the retired console's simulation/presentation switch)
 
 **Island**:
 One floating panel (Session, Roster, Inspector, Orders, Log) over the fullscreen map. Closable and reopenable; replaces dock menus.
