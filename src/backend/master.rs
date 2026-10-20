@@ -2875,17 +2875,37 @@ impl MinosMaster {
         fn parse_half(
             v: &serde_json::Value,
         ) -> Option<(CurrentStepScenario, CurrentStepStep)> {
-            let sc = v["scenario"].as_object()?;
-            let st = v["step"].as_object()?;
+            // Every field is READ through `get`, never indexed.
+            //
+            // A step with no window has no `window_end_at` key AT ALL —
+            // the key is absent, not null — and `v["key"]` PANICS on an
+            // absent key. That killed the console on a step whose window
+            // had not been set (2026-10-21, game 72's "Audit beat"): the
+            // session read died before the window opened, and the console
+            // showed nothing at all. A server answer is DATA, and data
+            // that does not fit the shape is missing, never fatal.
+            let sc = v.get("scenario")?.as_object()?;
+            let st = v.get("step")?.as_object()?;
             Some((
                 CurrentStepScenario {
-                    id: sc["id"].as_i64()?,
-                    title: sc["title"].as_str().unwrap_or("").to_string(),
+                    id: sc.get("id").and_then(|i| i.as_i64()).unwrap_or(0),
+                    title: sc
+                        .get("title")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 },
                 CurrentStepStep {
-                    id: st["id"].as_i64()?,
-                    content: st["content"].as_str().unwrap_or("").to_string(),
-                    window_end_at: st["window_end_at"].as_str().map(|s| s.to_string()),
+                    id: st.get("id").and_then(|i| i.as_i64()).unwrap_or(0),
+                    content: st
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    window_end_at: st
+                        .get("window_end_at")
+                        .and_then(|w| w.as_str())
+                        .map(|s| s.to_string()),
                 },
             ))
         }
@@ -2916,7 +2936,7 @@ impl MinosMaster {
             })
         });
         CurrentStepView {
-            assumed_time: v["assumed_time"].as_str().map(|s| s.to_string()),
+            assumed_time: v.get("assumed_time").and_then(|t| t.as_str()).map(|s| s.to_string()),
             current,
             asking,
         }
