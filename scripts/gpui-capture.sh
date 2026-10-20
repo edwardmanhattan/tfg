@@ -70,7 +70,18 @@ if ! timeout "$T" grim -o eDP-1 /tmp/gpui_preflight.png 2>/dev/null; then
 fi
 rm -f /tmp/gpui_preflight.png
 
-pkill -x tfg 2>/dev/null || true
+# Only THIS checkout's stale app, and only the ones built from it.
+#
+# `pkill -x tfg` kills every `tfg` on the machine, and another agent
+# may be running this console from their own worktree at the same
+# moment: their window disappears mid-capture and their work is
+# interrupted for no reason. The path is what tells the two apart.
+for stale in $(pgrep -x tfg 2>/dev/null); do
+    exe=$(readlink "/proc/$stale/exe" 2>/dev/null || true)
+    case "$exe" in
+        "$PWD"/target/debug/tfg) kill "$stale" 2>/dev/null || true ;;
+    esac
+done
 sleep 0.5
 
 # 2. The trap: however this script ends, the app does too.
@@ -84,8 +95,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# The run log is per-CHECKOUT. Two agents running this console at once
+# wrote to one path, so each capture's taint report was the other
+# agent's — a capture could be reported as tainted (or clean) on the
+# strength of somebody else's mouse.
+RUN_LOG="/tmp/gpui_run.$(basename "$PWD").log"
+
 # shellcheck disable=SC2086
-env $EXTRA_ENV ./target/debug/tfg > /tmp/gpui_run.log 2>&1 &
+env $EXTRA_ENV ./target/debug/tfg > "$RUN_LOG" 2>&1 &
 PID=$!
 echo "launched pid $PID  (env: ${EXTRA_ENV:-none})"
 
@@ -99,18 +116,27 @@ RECT=$(timeout "$T" hyprctl -j clients | python3 -c "
 import json,sys,os
 pid=int(os.environ.get('PID') or 0)
 rows=json.load(sys.stdin)
+# THE PID FIRST. Two agents can run this console at once — each in its
+# own worktree — and they share the window CLASS, so matching on the
+# class alone picks WHICHEVER window the compositor lists first, which
+# may be the other agent's. A capture then photographs someone else's
+# console, and it looks exactly like your own edits having vanished.
+#
+# The pid is the process THIS script launched, so it names this
+# capture's own window and nobody else's. The class stays as the
+# fallback for the case where the pid is gone (a re-exec, a launcher).
 for c in rows:
-    if c.get('class','')=='tfg-gpui':
+    if pid and c.get('pid')==pid:
         a,s=c['at'],c['size']
         print(a[0],a[1],s[0],s[1],c.get('workspace',{}).get('name',''),c.get('address','')); break
 else:
     for c in rows:
-        if pid and c.get('pid')==pid:
+        if c.get('class','')=='tfg-gpui':
             a,s=c['at'],c['size']
             print(a[0],a[1],s[0],s[1],c.get('workspace',{}).get('name',''),c.get('address','')); break
 " || true)
 if [ -z "$RECT" ]; then
-    echo "no tfg-gpui window (did it exit? see /tmp/gpui_run.log)" >&2
+    echo "no tfg-gpui window (did it exit? see $RUN_LOG)" >&2
     exit 4
 fi
 read -r X Y W H WWS WADDR <<< "$RECT"
@@ -167,25 +193,25 @@ echo "captured $OUT  ($(stat -c%s "$OUT") bytes)"
 # seeded for. This happened on 2026-10-20 during a sweep: a transient
 # fetch failure, and the capture came back as a console nobody asked
 # about.
-if grep -q 'falling back to the fixture' /tmp/gpui_run.log 2>/dev/null; then
+if grep -q 'falling back to the fixture' "$RUN_LOG" 2>/dev/null; then
   echo "TAINTED: the hosted API did not answer and the console fell back to" >&2
   echo "its fixture roster. This picture is of the FIXTURE, not the hosted" >&2
   echo "deployment. Re-run it when the API is up." >&2
 fi
 
-WHEELS=$(grep -c 'TFG_INPUT wheel' /tmp/gpui_run.log 2>/dev/null || true)
-CLICKS=$(grep -c 'TFG_INPUT click' /tmp/gpui_run.log 2>/dev/null || true)
+WHEELS=$(grep -c 'TFG_INPUT wheel' "$RUN_LOG" 2>/dev/null || true)
+CLICKS=$(grep -c 'TFG_INPUT click' "$RUN_LOG" 2>/dev/null || true)
 WHEELS=${WHEELS:-0}; CLICKS=${CLICKS:-0}
 echo "input during capture: $WHEELS wheel, $CLICKS click"
 # WHERE the wheels landed: over the column they scroll it, over the map
 # they zoom it, over the chrome they do neither. The tally by place is
 # the diagnosis, and it costs one more grep.
 for place in wheel-column wheel-map wheel-chrome; do
-  n=$(grep -c "TFG_INPUT $place" /tmp/gpui_run.log 2>/dev/null || true)
+  n=$(grep -c "TFG_INPUT $place" "$RUN_LOG" 2>/dev/null || true)
   n=${n:-0}
   [ "$n" -gt 0 ] && echo "  $n $place"
 done
-grep 'TFG_INPUT wheel' /tmp/gpui_run.log 2>/dev/null | tail -3 | sed 's/^/  last: /' || true
+grep 'TFG_INPUT wheel' "$RUN_LOG" 2>/dev/null | tail -3 | sed 's/^/  last: /' || true
 if [ "$WHEELS" -gt 0 ] || [ "$CLICKS" -gt 0 ]; then
   echo "TAINTED: the operator touched the console while this capture ran." >&2
   echo "The picture is a real state of the console, but not the state the" >&2

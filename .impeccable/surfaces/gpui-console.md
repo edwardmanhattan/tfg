@@ -794,12 +794,60 @@ driven by the map's frames would have needed its own drain to keep ticking
 past the theatre's settling. A surface with no clock has no reason to ask
 for frames, and the drain loop is gone with it.
 
-**And the console says one thing once.** The slab carries the STATE
-(`signing in…`) and the line under it carries the EVENT, and only one of them
-is ever talking: the busy status line is suppressed, because the slab
-already says it. The status slot is RESERVED rather than conditional — a card
-that grows a line when the server answers moves the scope under the
-operator's hands, and decoration that moves is a bug in the decoration.
+**And the console says one thing once.** The scope's caption carries the
+STATE (`signing in…`) and the line under the fields carries the EVENT, and
+only one of them is ever talking: the busy status line is suppressed, because
+the caption already says it. The status slot is RESERVED rather than
+conditional — a card that grows a line when the server answers moves the
+scope under the operator's hands, and decoration that moves is a bug in the
+decoration.
+
+## The sign-in, again (2026-10-20)
+
+Three changes to the same card, and the reason for them is one thing: the
+card was carrying a NAME, a CURSOR and a VERB, and it was carrying all three
+as afterthoughts.
+
+**THE WORDMARK.** The name is now the largest text on the console, and the
+only text allowed to be large. It is set in **Cinzel** — a Roman-capital
+inscriptional serif, the letterforms of an engraved plate — tracked at a
+sixth of its size, which is the gap a stone-cutter leaves between letters and
+the thing that makes an inscription read as an inscription rather than as a
+word in a bigger size. Cinzel is a THIRD face and the design system's rule
+says two faces and no third; the rule stands for the console's TEXT, and
+this is the one place where the text is a name rather than a reading, so the
+face is spent on six letters and on nothing else.
+
+**THE CARET.** The credential fields are hand-rolled — GPUI 0.2.2 ships no
+text field, only the input plumbing — so the console draws the cursor too.
+It stands after the value, in the focused field only, in the accent, and it
+BLINKS: a steady bar reads as a character the operator typed, and a blinking
+one reads as a cursor. The blink is the console's own tick, not the
+system's, so it is the same beat on every machine, and the caret is lit the
+moment a field takes the keyboard, because that is the moment a cursor
+which happened to be dark would most easily be mistaken for a field that has
+stopped accepting input.
+
+**THE SCOPE IS THE VERB.** The plain SIGN IN slab is gone. The scope is the
+control: the operator presses the radar, and the radar is the only thing on
+the card that can be pressed. It says everything the slab said and more. It
+BRIGHTENS when the door is armed — both credentials are there — and it LITS
+while the round trip is out, and both are tweened, because a radar that jumps
+from grey to lit reads as a different picture rather than as the same
+instrument changing state.
+
+Those are two facts, so they are two channels, not one colour spent twice:
+`lit` is the link being out, and `bright` is the door being armed. A console
+that spends one colour on two states spends the colour on neither, and an
+operator who cannot tell "armed" from "waiting" cannot tell whether the
+press will do anything. The caption under the scope is a CAPTION and not a
+button — tracked caps in the console's own label style, with no slab and no
+box — and it is part of the scope's pressable group, so the two are one
+control. A verb nobody can read is a verb nobody will press.
+
+**The card's own left edge is one margin.** The wordmark stands on the same
+left edge as the field labels under it, because a name that hangs over the
+edge of its own card is a name that was pasted on rather than engraved.
 
 **`TFG_SIGNIN=busy|refused`** stages the card's own state for a headless
 capture, the same seed-the-state precedent as `TFG_SETTINGS`. Both are
