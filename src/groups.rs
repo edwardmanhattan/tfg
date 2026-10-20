@@ -19,7 +19,7 @@ mod plan;
 mod scopes;
 
 pub use model::{Group, GroupKind};
-pub use plan::{plan, GroupRef, GroupWrite, GroupsDraft, LiveGroup, StagedGroup};
+pub use plan::{join_members, plan, GroupRef, GroupWrite, GroupsDraft, LiveGroup, StagedGroup};
 pub use scopes::Scope;
 
 /// The session's group forest.

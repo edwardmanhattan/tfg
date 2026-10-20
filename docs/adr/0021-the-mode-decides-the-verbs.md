@@ -1,5 +1,10 @@
 # ADR-0021: The mode decides the verbs
 
+The console's mode was a string in one field, compared at the places that
+needed it, and the mode it read was the SERVER's mode: the mode that says
+whether the wire will take an order. That was the wrong question, and the
+console was answering it in the wrong places.
+
 ## Status
 
 Accepted. Carries forward ADR-0008 (the backend is authoritative over the
@@ -8,71 +13,102 @@ decides which controls the console may draw.
 
 ## Context
 
-The console read the exercise's mode exactly once, to print it in the
-Essentials island. Every control was drawn for every exercise. That was not a
-cosmetic gap — it was three wrong controls in two of the three modes.
+Minos has three modes, and they are the server's own (`models.GameMode`):
 
-The server's rules, read from `minos/internal/models/game.go` and confirmed
-against the deployed dev API:
+- `maneuver` — orders apply at once, the server clamps and answers.
+- `scenario` — the server ACCEPTS an order and HOLDS it (HTTP 202) until a
+  played step releases the hull.
+- `static` — the server refuses every order with a 409; the positions are
+  put there by hand.
 
-- `maneuver` — the server integrates orders over assumed time. An order posts
-  at once and is clamped.
-- `scenario` — the exercise is played through its STEPS. An order is HELD
-  (HTTP 202, a staged order with no position) until a played step releases
-  the hull. A step's gate waits for the readiness the related participants
-  declare for that step. The clock runs inside a step: the exercise opens
-  stopped, and a resume between beats is refused.
-- `static` — positions are set rather than simulated. An order is refused
-  (HTTP 409). A hull is moved by hand, with
-  `PUT /games/{id}/units/{unit_id}/position` — a jump, with no heading and no
-  speed — and the drag's frames go to
-  `POST /games/{id}/units/{unit_id}/position/preview`, which publishes without
-  recording.
+The server's own predicate is `GameMode.AllowsSteering`, and it answers
+"may an ORDER move a hull". It says yes for `maneuver` and `scenario`,
+because in a scenario exercise the order is held rather than refused.
 
-The product decision (owner, 2026-10-20):
+The console drew a helm — a compass, a speed scale and a SET HELM button —
+wherever it had a commanded hull in an executing exercise, in every mode.
+So in a scenario exercise it offered a free-standing instrument whose every
+answer was "held", and in a static exercise it offered an instrument whose
+every answer was a 409. The operator had to learn both facts from the
+server, at the moment of the press.
 
-- **maneuver** — the commander gets the helm.
-- **scenario** — **no seat gets a helm.** A scenario exercise is played
-  through its steps; the commander's only verb on the current step is to
-  declare readiness for that step.
-- **static** — no helm either; a hull is set by hand on the map.
+The console's rules are not the server's rules. What the console offers is
+a different question: what does this station DO in this exercise?
+
+- **maneuver** — the commander gets the helm. An order posts at once.
+- **scenario** — NO SEAT gets a helm. The exercise is played through its
+  STEPS, and the commander's only verb on the current step is to declare
+  readiness for it. The Game Master plays, skips, ends and replays steps.
+  The clock runs inside a step: a scenario exercise opens stopped and the
+  server refuses a resume between the beats.
+- **static** — no helm either. The positions are set BY HAND: the commander
+  drags a hull on the map in execution and the hull jumps there. The
+  commit route (`PUT /games/{id}/units/{unit_id}/position`) takes a
+  latitude and a longitude and nothing else; the preview route
+  (`POST .../position/preview`) publishes the frames of the drag to the
+  other participants' boards and records nothing.
+
+An exercise whose mode the server did not say is `Unknown`, and it fails
+closed: no helm, no scenario surfaces, no clock verb.
 
 ## Decision
 
-**The mode is a type, and each mode has its own set of verbs.**
+**The mode is read once, where the session is read, into a `GameMode`, and
+every verb is a predicate on that one value. The console's predicates live
+in `src/mode_rules.rs` and are NOT the server's `allows_steering`.**
 
-- `src/gamestate.rs` carries `GameMode { Maneuver, Static, Scenario, Unknown }`
-  beside `GameState`. A mode the server did not say is `Unknown`, never a
-  guess, and `Unknown` fails closed: no helm, no scenario surfaces.
-- The console's rules are its own, and they are NOT the server's
-  `AllowsSteering()`. The server can hold an order in a scenario exercise;
-  the console does not offer a free-standing helm there, because a scenario
-  exercise is played through its steps. The two rules answer different
-  questions and each is named for what it is.
-- A control that the server would refuse is not drawn. Not greyed out, not
-  drawn: a compass that cannot be used is a lie about the state, and the
-  console's own rule has always been that a disabled look that still posts is
-  the one thing it must not ship.
-- Where a mode has no control, the console draws the mode's sentence in the
-  place the control was, naming the fact and the remedy.
+- The mode reaches the shell as `SessionView.facts.mode: GameMode`, parsed
+  in `main.rs::fetch_session` — the one place the session is read. A rule
+  that compared the mode's spelling at each site would be a rule that could
+  be spelled two ways.
+- The shell holds one predicate per rule (`helm_offered`,
+  `scenario_exercise`, `step_declare_offered`, `step_verbs_offered`,
+  `clock_may_resume`), each with a doc comment naming the rule it enforces.
+  The pure rules live in `mode_rules` with their own unit tests; the shell
+  is a thin caller, so a test exercises exactly what the click does.
+- Where there is no helm, the instruments are NOT drawn greyed out — they
+  are not drawn at all, and the mode's sentence stands where they were. A
+  disabled-looking control reads as a control that failed; an empty channel
+  reads as nothing at all.
+- The writes refuse as well as the drawings refuse. `send_helm` refuses
+  outside a maneuver exercise, `send_step_declare` refuses outside a
+  scenario exercise, and `send_step_verb` refuses outside one.
+- The scenario surfaces — the board's step verbs, the scenario widget, the
+  step's declaration — belong to a scenario exercise alone.
+- The clock's verb is ONE predicate, read by the button's label and by the
+  write it sends. In a scenario exercise it is a pause and only a pause.
+- The game-level readiness ("ready to start") and the step-level readiness
+  are two different facts. The step's verb is named for the step
+  ("READY FOR THIS STEP" / "WITHDRAW") and is reachable from the reminder
+  strip, so the commander does not have to open the board to answer the
+  question the strip is asking.
 
 ## Consequences
 
-- The server's `allows_steering` stays on `GameMode` because the client must
-  not be the only place that knows it — but the helm predicate is a different
-  one, and the two must not be confused.
-- A scenario exercise's commander answers the step, not the helm. The step's
-  readiness and the exercise's readiness are two different facts with two
-  different gates (a step's gate, and the preparation→execution gate), and
-  the console must not draw them with the same word.
-- A static exercise is steerable only if the console offers the hand-set
-  position gesture. Without it, static is a dead end: a refused helm and
-  nothing else.
-- Captures need one exercise per mode, or a mode seed. `TFG_MODE` forces the
-  mode at boot, the way `TFG_PHASE` forces the phase.
-- The mode is fixed at creation (the server has no route that changes it) and
-  is re-read on every session read, so a joined exercise is mode-correct
-  without the console ever having created it.
+- The console's copy of the modes (`SESSION_MODES`) had to change: it
+  described `scenario` as "personnel steer like maneuver", which was the
+  server's rule and is now the console's opposite.
+- The helm is drawn in ONE place in execution (the commander's rail) and
+  one place outside it (the Command island). Both copies obey the same
+  rule; a copy that answers a different rule is a copy that lies.
+- A capture could not photograph a mode without three live exercises, so
+  there is a `TFG_MODE` seed, read at boot, that forces the session's mode
+  the way `TFG_PHASE` forces the phase. A seed naming a mode this build
+  does not know is no seed at all.
+- The console's rules and the server's can now disagree — deliberately, and
+  only in one place: `mode_rules::helm_offered` versus
+  `GameMode::allows_steering`. The comment on each says why. A reader who
+  finds the disagreement has to read the two comments, which is the point:
+  the disagreement is the decision, not an oversight.
+- The static exercise's drag is a NEW gesture: the rail's helm channel
+  carries the commander's hulls as things to pick up, the frames go out on
+  the preview route while the drag is in the air, and the commit is the
+  release — a commit per pointer movement would put a row in the chain for
+  every frame, which is exactly why the preview route exists.
+  - The gesture is offered for the caller's OWN hulls only, and the server
+    would also let the Game Master correct any hull. That is a deliberate
+    narrowing: the console offers what a commander may do, and the Game
+    Master's corrections are the Game Master's own surface.
 
 ## Verified
 
@@ -101,4 +137,3 @@ Against the deployed dev API, 2026-10-20:
   lands on the server, and the exercise then reaches `execution`. Before the
   window rode the advance, a console-run exercise could reach `preparation`
   and never leave it: the terms are only writable while `planning`.
-

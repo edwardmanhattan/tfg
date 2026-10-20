@@ -175,6 +175,7 @@ _Avoid_: staged roster, local roster, unsaved roster_
 
 **Helm order**:
 A commander's heading-and-speed order for one hull, posted at once with `POST /games/{id}/units/{unit_id}/order` in every mode that takes orders (maneuver and scenario alike; static takes hand-set positions and refuses orders). There is no client-side hold for a step — the server owns timing, and an accepted order applies immediately.
+The CONSOLE offers the helm in a maneuver exercise alone (ADR-0021): a scenario exercise is played through its steps, so the commander's verb there is the step's readiness, and the server's holding of an order is a fact about the wire, not a reason to offer an instrument.
 _Avoid_: planned helm, queued order, pending order (the server queues nothing, and the client no longer holds anything either)_
 
 **Step ready**:
