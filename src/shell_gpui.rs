@@ -415,6 +415,48 @@ impl IslandState {
     }
 }
 
+/// What the staged drafts still owe the server, by draft.
+///
+/// The count is the ADVANCE's bill, so it is the sum of the four drafts'
+/// own counts — each module counts its own writes and this only adds them
+/// up. The sentence names each draft that owes something, because a bare
+/// total hides the one thing the operator cannot see otherwise: WHICH draft
+/// is holding the move up. A count that said "3" when the groups and the
+/// book were the two things staged would send the operator to the wrong
+/// island.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct StagedCounts {
+    force: usize,
+    roster: usize,
+    groups: usize,
+    book: usize,
+}
+
+impl StagedCounts {
+    fn total(&self) -> usize {
+        self.force + self.roster + self.groups + self.book
+    }
+
+    /// The sentence under the advance button, and the one under the sync.
+    fn sentence(&self) -> String {
+        if self.total() == 0 {
+            return "nothing staged \u{2014} this just moves the session on".to_string();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for (n, name) in [
+            (self.force, "force"),
+            (self.roster, "roster"),
+            (self.groups, "group"),
+            (self.book, "book"),
+        ] {
+            if n > 0 {
+                parts.push(format!("{n} {name}"));
+            }
+        }
+        format!("{} staged write(s) \u{2014} {}", self.total(), parts.join(", "))
+    }
+}
+
 struct IslandDemo {
     /// The column, one entry per island the console knows, in a fixed
     /// order. Membership is `view::zone_islands`' job and changes with the
@@ -791,6 +833,16 @@ struct IslandDemo {
     /// that nothing has posted, and the whole draft is written through at
     /// the move to preparation.
     groups: crate::groups::GroupsDraft,
+    /// The scenario book as the operator has it, before Minos has heard of
+    /// it: brand-new scenarios with their steps, plus step adds, step cuts
+    /// and related lists against scenarios the server holds.
+    ///
+    /// The console's own module — `tfg::book` is toolkit-free, so the draft,
+    /// its rules and its `plan()` write generation are ported rather than
+    /// reinvented. WHILE PLANNING the book's authoring acts STAGE here and
+    /// post nothing; outside planning they post at once, because there is no
+    /// stage left to wait for.
+    book: crate::book::BookDraft,
     /// Control's draft: the game-time multiplier being adjusted, and the
     /// latch on the write. `None` means "not touched yet", which is how the
     /// draft picks up Minos's own value on the first frame the island draws
@@ -839,6 +891,11 @@ struct IslandDemo {
     /// running. Cleared with the drag (`set_dragging(false, …)`), so a stale
     /// target never outlives the gesture that named it.
     drop_hover: Option<DropTarget>,
+    /// When the last drag frame went out. The throttle for the preview
+    /// route: the frames are published to the other participants' boards,
+    /// so a client that posted every pointer movement would spend the
+    /// exercise's round trips on a gesture nobody is watching yet.
+    preview_at: Option<std::time::Instant>,
     /// The picker's drill tree: Asset Group > Category > Type > Class >
     /// hull, built once by the binary off the synced mirror. Empty on
     /// fixture runs — the picker falls back to its flat register list.
@@ -924,6 +981,14 @@ struct IslandDemo {
     /// The Player picker's latch and verdict.
     roster_busy: bool,
     roster_status: Status,
+    /// The capture seed's MODE, read at boot. `Some` means a headless
+    /// capture asked for a mode the live exercise may not be in — the same
+    /// seed-the-state precedent as `TFG_PHASE`, and the only reason the
+    /// console can photograph a scenario or a static exercise without three
+    /// live exercises. It is read ONCE, here, because an environment
+    /// variable read per frame is a rule that changes under the operator's
+    /// feet.
+    mode_seed: Option<crate::gamestate::GameMode>,
     force_busy: bool,
     force_status: Status,
     /// A deploy in flight, latched apart from the force writes: the answer
@@ -935,6 +1000,33 @@ struct IslandDemo {
     /// create feed, like every other session-replacing write here.
     prepare_busy: bool,
     prepare_status: Status,
+    /// The staged planned window: the exercise's own terms, drafted on
+    /// Control and written by the advance.
+    ///
+    /// `None` until it is asked for, and then seeded from the server's read
+    /// — the window the exercise already holds is what the operator edits,
+    /// so the editor shows the day and the two ends rather than five empty
+    /// fields. The same shape as Control's factor draft.
+    window_draft: Option<crate::window::WindowDraft>,
+    /// The game the staged window was seeded for. A hold of another
+    /// exercise re-seeds it, because the terms of one exercise are not the
+    /// terms of another and a stale window would be written to the wrong
+    /// game.
+    window_seeded_for: i64,
+    /// The editor's five fields: the real clock's day, its two ends, and the
+    /// exercise clock's two ends. Focus handles, minted on first use —
+    /// `Context::focus_handle` needs a context and `new` has none.
+    window_handles: [Option<gpui::FocusHandle>; 5],
+    /// Which window field has the keyboard.
+    window_focus: usize,
+    /// What the window's own rule says about the draft, and what the last
+    /// advance said about the window.
+    window_status: Status,
+    /// The SYNC control: the staged writes written through WITHOUT moving
+    /// the exercise's phase. Its own latch and its own line, because a sync
+    /// that moved the game on would be the advance wearing another name.
+    sync_busy: bool,
+    sync_status: Status,
     /// Click-to-place, the drag's fallback: the armed hull id. Set by the
     /// leaf row's place button; the next map click that is NOT a pan deploys
     /// it there. A drag never arms this (its release lands on the drop, not
@@ -1191,6 +1283,11 @@ const DASH_ORDER_W: f32 = 208.0;
 /// The helm channel's own padding, and the gap between its three cells.
 const DASH_RAIL_PAD: f32 = 16.0;
 const DASH_RAIL_GAP: f32 = 18.0;
+/// The height of a planned-window field. SHORTER than the credential fields
+/// (`view::AUTH_FIELD_H`): there are five of them in two rows on an island
+/// whose box is a measured thing, and a date and a military time are read
+/// at a glance rather than typed at length.
+const WINDOW_FIELD_H: f32 = 22.0;
 /// The rail's label size: a tracked-caps label one step above the panel's
 /// `LABEL_PT`. The rail is read from across the room and at a glance, and a
 /// label the same size as its value is a second value.
@@ -1295,6 +1392,57 @@ fn bounded_status(text: &str, width: f32, lines: f32) -> String {
     out
 }
 
+/// The capture seed's mode, parsed.
+///
+/// `TFG_MODE` names a mode the way the server does, and a seed this build
+/// does not know is NO seed: the exercise keeps the mode the server gave
+/// it. A capture that asked for a mode the console cannot read would
+/// photograph a surface the console would never draw, which is the one
+/// thing a capture is for.
+fn seeded_mode(value: &str) -> Option<crate::gamestate::GameMode> {
+    match value {
+        "maneuver" | "scenario" | "static" => {
+            Some(crate::gamestate::GameMode::from_wire(value))
+        }
+        _ => None,
+    }
+}
+
+/// One execution widget: the label, the value, the quiet line under it, and
+/// the surface it opens.
+///
+/// A VALUE, so the SET of widgets the execution rail draws is something a
+/// test can read, and the drawing is a fold over one list. The set is where
+/// ADR-0021's rule about the scenario widget lives: the widget is in the
+/// list in a scenario exercise and out of it everywhere else.
+struct ExecWidget {
+    id: &'static str,
+    label: &'static str,
+    value: String,
+    hint: Option<String>,
+    panel: Option<WhichPanel>,
+}
+
+/// What the rail's helm channel draws.
+///
+/// ADR-0021: the instruments belong to a `maneuver` exercise and to nothing
+/// else. Everywhere else the channel carries the MODE'S SENTENCE where the
+/// instruments were — not a greyed-out compass, which reads as a control
+/// that failed — and in a `static` exercise it carries the sentence and the
+/// hulls this seat commands, because the console's only way to set a
+/// position is to drag a hull onto the map and the rail is where the
+/// commander's hulls are named.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RailHelm {
+    /// The compass, the speed scale and the verb.
+    Instruments,
+    /// The mode's sentence, and nothing else.
+    Sentence(&'static str),
+    /// The mode's sentence, and the hulls this seat commands as things to
+    /// pick up.
+    SetByHand { sentence: &'static str },
+}
+
 /// The rail's widths, from the window's width.
 ///
 /// Pure arithmetic, and a test asserts it: the rail is drawn from these
@@ -1396,6 +1544,15 @@ fn rail_widths(viewport_w: f32) -> RailWidths {
         dial,
     }
 }
+
+/// The gap between two drag frames.
+///
+/// The server's own note on the preview route says a client sends frames
+/// "throttled to roughly ten a second", and ten a second is what a pointer
+/// moving at a walking pace produces. A client that posted every pointer
+/// movement would spend the exercise's round trips on a gesture nobody is
+/// watching yet.
+const PREVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The speed scale's graduations, in knots, for a track of `w` points.
 ///
@@ -2623,6 +2780,13 @@ impl IslandDemo {
     /// Build the view's state. Split out of `run` so a test can construct
     /// it headlessly — no window, no wire, no map thread — and drive the
     /// selection handler the way the compositor would.
+    ///
+    /// THE CAPTURE SEEDS ARE READ HERE, ONCE, AT BOOT: `TFG_ZOOM`,
+    /// `TFG_RELATE`, `TFG_SETTINGS`, `TFG_PEOPLE`, `TFG_CREW`,
+    /// `TFG_COMMAND`, `TFG_BOARD`, `TFG_COMMS`, `TFG_INSPECT`,
+    /// `TFG_SESSIONS`, `TFG_ASSESS_TAB`, `TFG_SCROLL`, `TFG_READOUT` and
+    /// `TFG_MODE`. A seed read per frame is a rule that changes under the
+    /// operator's feet, so every one of them is a field.
     fn new(
         roster: Vec<RosterRow>,
         roster_total: usize,
@@ -2825,6 +2989,7 @@ impl IslandDemo {
                         id: 44,
                         name: "GPUI step proof".to_string(),
                         state: "execution".to_string(),
+            mode: String::new(),
                         my_role: "Commando".to_string(),
                         judge: false,
                     },
@@ -2832,6 +2997,7 @@ impl IslandDemo {
                         id: 38,
                         name: "probe-gm-roule".to_string(),
                         state: "preparation".to_string(),
+            mode: String::new(),
                         my_role: "Penyelenggara".to_string(),
                         judge: true,
                     },
@@ -2839,6 +3005,7 @@ impl IslandDemo {
                         id: 9,
                         name: "Game 8".to_string(),
                         state: "planning".to_string(),
+            mode: String::new(),
                         my_role: "Commando".to_string(),
                         judge: false,
                     },
@@ -2924,6 +3091,7 @@ impl IslandDemo {
             dragging: false,
             drag_entity: None,
             drop_hover: None,
+            preview_at: None,
             thumbs: HashMap::new(),
             hull_sizes: HashMap::new(),
             fleet_tax: FleetTaxonomy::default(),
@@ -2962,13 +3130,27 @@ impl IslandDemo {
             commander_embark_game: 0,
             roster_busy: false,
             roster_status: Status::empty(),
+            // The capture seed's mode, read once at boot. A seed that names
+            // a mode this build does not know is no seed at all: the
+            // exercise keeps the mode the server gave it.
+            mode_seed: std::env::var("TFG_MODE")
+                .ok()
+                .and_then(|value| seeded_mode(&value)),
             roster_draft: crate::roster::RosterDraft::new(),
             groups: crate::groups::GroupsDraft::new(),
+            book: crate::book::BookDraft::new(),
             force_busy: false,
             force_status: Status::empty(),
             deploy_busy: false,
             prepare_busy: false,
             prepare_status: Status::empty(),
+            window_draft: None,
+            window_seeded_for: 0,
+            window_handles: [None, None, None, None, None],
+            window_focus: 0,
+            window_status: Status::empty(),
+            sync_busy: false,
+            sync_status: Status::empty(),
             pending_place: None,
             place_down: None,
             // `TFG_RELATE` is seeded above, with the working set the open
@@ -4114,8 +4296,12 @@ impl IslandDemo {
             // is in the draft and not on the wire, and the band is what the
             // operator checks to see the drop landed.
             view::IslandKey::Fleet => format!("{} PIECES", self.deployed_pieces().len()),
-            // The console's `N SEATED`, which the read already carries.
-            view::IslandKey::Players => format!("{} SEATED", self.session.seats),
+            // The DRAFT's seat count, not the server's: the band's job is to
+            // say what the operator has, and a person seated a second ago is
+            // seated before the advance writes it. The body below merges the
+            // draft over the server's frame, and a band that counted the
+            // server's seats would contradict the list under it.
+            view::IslandKey::Players => format!("{} SEATED", self.roster_draft.staged().count()),
             view::IslandKey::Groups => format!(
                 "{} GROUPS",
                 self.groups.frame_groups().count() + self.groups.staged_groups().count()
@@ -4275,7 +4461,13 @@ impl IslandDemo {
         );
         col = col.child(small(format!(
             "{} \u{00b7} {} \u{00b7} {}",
-            if f.mode.is_empty() { "no mode" } else { &f.mode },
+            // The mode as the server's word, and the server's word is what
+            // it is: a mode this build does not know is NOT shown as a
+            // guess, it is shown as no mode at all, because the console
+            // offers nothing on the strength of a word it cannot read.
+            // The SEEDED mode reads here too, so a capture photographs the
+            // mode the console is actually behaving in.
+            self.mode().wire().unwrap_or("no mode"),
             state.label().to_lowercase(),
             format!("{} pace", f.pace)
         )));
@@ -4298,6 +4490,11 @@ impl IslandDemo {
                 .text_color(rgba(if window.1 { MAP_INK } else { ALERT_YELLOW }))
                 .child(window.0),
         );
+        // Where the window is CHANGED. This island shows the terms the
+        // exercise was given; Control is where they are drafted, because
+        // Control owns the exercise clock and the window is that clock's
+        // band.
+        col = col.child(small("drafted on Control".to_string()));
         col = col.child(separator());
         col = col.child(small("THE PLAN".to_string()));
         let mut said_any = false;
@@ -4331,22 +4528,32 @@ impl IslandDemo {
         // ABSENT outside planning rather than greyed out: authoring is a
         // planning-time act and the server refuses it after, so a control
         // that would 403 is a lie about what this session can do.
+        //
+        // AND ABSENT OUTSIDE A SCENARIO EXERCISE, with the reason in its
+        // place: the step's gate, the step's clock and the step ceiling are
+        // the server's and they are scenario-only, so a book written in a
+        // maneuver exercise is a set of pages nothing will ever play. The
+        // server tolerates the write; the console does not offer the door.
         if crate::gamestate::GameState::from_wire(&self.session.state)
             == crate::gamestate::GameState::Planning
         {
             col = col.child(separator());
             let scenarios = self.session.book.len();
             let steps: usize = self.session.book.iter().map(|s| s.steps.len()).sum();
-            col = col.child(
-                div()
-                    .id("scenario-composer-door")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.open_only(WhichPanel::Book);
-                        cx.notify();
-                    }))
-                    .child(button("Scenario composer".to_string(), false, false, false)),
-            );
+            if self.scenario_exercise() {
+                col = col.child(
+                    div()
+                        .id("scenario-composer-door")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.open_only(WhichPanel::Book);
+                            cx.notify();
+                        }))
+                        .child(button("Scenario composer".to_string(), false, false, false)),
+                );
+            } else {
+                col = col.child(small(crate::mode_rules::book_sentence(self.mode()).to_string()));
+            }
             if scenarios > 0 {
                 col = col.child(small(format!(
                     "{}, {}.",
@@ -4365,8 +4572,7 @@ impl IslandDemo {
             // control here would either do nothing or repeat a transition the
             // server refuses.
             col = col.child(separator());
-            let pending = self.force.pending(&self.live_hulls())
-                + self.roster_draft.pending(&self.live_seats());
+            let counts = self.staged_counts();
             col = col.child(
                 div()
                     .id("advance-preparation")
@@ -4381,15 +4587,39 @@ impl IslandDemo {
                         false,
                     )),
             );
-            col = col.child(small(if pending == 0 {
-                "nothing staged \u{2014} this just moves the session on".to_string()
-            } else {
-                format!("{} will be sent", plural(pending, "staged write"))
-            }));
+            col = col.child(small(counts.sentence()));
             if !self.prepare_status.is_empty() {
                 if !self.prepare_status.is_empty() {
                 col = col.child(status_line(&self.prepare_status));
             }
+            }
+            // SYNC. The one exception to local-first planning, and the one
+            // the operator asked for: the staged writes reach the server
+            // now, and the exercise's PHASE does not move. It sits beside the
+            // advance because it is the same flush without the transition,
+            // and an operator who wants the record written but the exercise
+            // still in planning looks for it here.
+            col = col.child(separator());
+            col = col.child(
+                div()
+                    .id("sync-staged")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.sync_staged(cx);
+                    }))
+                    .child(button(
+                        "Sync staged writes".to_string(),
+                        false,
+                        self.sync_busy,
+                        false,
+                    )),
+            );
+            col = col.child(small(
+                "writes the staged force, roster, groups and book to the server \u{2014} the phase does not move"
+                    .to_string(),
+            ));
+            if !self.sync_status.is_empty() {
+                col = col.child(status_line(&self.sync_status));
             }
         }
         col.into_any_element()
@@ -4513,6 +4743,73 @@ impl IslandDemo {
             if !self.pause_status.is_empty() {
                 col = col.child(status_line(&self.pause_status));
             }
+        }
+        // THE PLANNED WINDOW. The exercise's own terms: when the exercise
+        // runs, on the wall clock and on the exercise clock.
+        //
+        // IT LIVES HERE AND NOT IN ESSENTIALS. Control owns the exercise
+        // clock — the multiplier that runs it and the hold that stops it —
+        // and the window is that clock's band: when it runs and for how
+        // long. Essentials SHOWS the terms the exercise was given; this is
+        // where they are CHANGED, and a summary that became a form would
+        // stop being a summary.
+        //
+        // IT IS STAGED, NOT WRITTEN. Minos accepts a change to the terms
+        // only while the game is in `planning` — a game in preparation
+        // answers "A game's terms may only be changed while it is in
+        // `planning`" — so the terms ride with the drafts and go with the
+        // advance. A window written on its own would be a second way to
+        // reach the same record, and the two would disagree.
+        //
+        // AND IT IS THE ADMINISTRATOR'S TO WRITE. `PATCH /games/{id}` asks
+        // for the administrator's ticket, so the console says so here rather
+        // than letting the operator find it out from a refusal at the
+        // advance.
+        col = col.child(separator());
+        col = col.child(small("PLANNED WINDOW".to_string()));
+        let planning = crate::gamestate::GameState::from_wire(&self.session.state)
+            == crate::gamestate::GameState::Planning;
+        if !planning {
+            col = col.child(small(
+                "the terms may only be changed while the session is in planning".to_string(),
+            ));
+        } else {
+            let label = |t: &str| {
+                div()
+                    .w(px(96.0))
+                    .text_size(px(10.5))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(t.to_string())
+            };
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(label("REAL CLOCK"))
+                    .child(self.window_field(0, "2026-11-01", cx))
+                    .child(self.window_field(1, "0800", cx))
+                    .child(self.window_field(2, "1600", cx)),
+            );
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(label("EXERCISE CLOCK"))
+                    .child(self.window_field(3, "0800", cx))
+                    .child(self.window_field(4, "1600", cx)),
+            );
+            if !self.window_status.is_empty() {
+                col = col.child(status_line(&self.window_status));
+            }
+            col = col.child(small(
+                "staged — written with the advance, and only a seat holding the \
+                 administrator's ticket can write it"
+                    .to_string(),
+            ));
         }
         col.into_any_element()
     }
@@ -6322,6 +6619,16 @@ impl IslandDemo {
                             .text_color(rgba(BODY_SILVER))
                             .child(s.state.to_uppercase()),
                     )
+                    // THE MODE, beside the state: the two are the exercise's
+                    // axes, and the mode is the one that decides what the
+                    // console may offer once the exercise is held.
+                    .child(
+                        div()
+                            .font_family(view::FACE_MACHINE)
+                            .text_size(px(10.5))
+                            .text_color(rgba(CUT_GREY))
+                            .child(s.mode.to_uppercase()),
+                    )
                     .child(
                         div()
                             .flex_shrink_0()
@@ -7315,6 +7622,20 @@ impl IslandDemo {
         // listener, not only in its styling: a disabled look that still
         // posts is the one thing this must not be.
         col = col.child(section("HELM"));
+        // ADR-0021: the helm belongs to a maneuver exercise. In a scenario
+        // exercise there is no free-standing helm (the step is the
+        // commander's verb) and in a static one there is no order at all
+        // (the server refuses every one with a 409), so the instruments and
+        // the verb are NOT drawn — not greyed out, not drawn — and the
+        // mode's sentence stands where they were.
+        //
+        // The side column is not drawn in execution, so this copy is not the
+        // live one; the rail is. But it is a copy of the same widget, and a
+        // copy that answers a different rule is a copy that lies.
+        if !self.helm_offered() {
+            col = col.child(note(crate::mode_rules::helm_sentence(self.mode())));
+            return col.into_any_element();
+        }
         // Which hull the order is FOR, above the verb that sends it. The
         // console's dashboard puts the active hull in a ComboBox; here the
         // rows above are the picker and this line is the answer, so a posted
@@ -7461,11 +7782,20 @@ impl IslandDemo {
     /// WRITE.
     ///
     /// Returns false when nothing may be sent: no execution, no commanded
-    /// hull, or no draft. That is the SAME rule the button enforces, kept in
-    /// one place so a test exercises exactly what the click does — the server
-    /// enforces it too, with a 409, which is why the check is here at all
-    /// rather than only in the response handler.
+    /// hull, no draft, or a MODE WITH NO HELM. That is the SAME rule the
+    /// button enforces, kept in one place so a test exercises exactly what
+    /// the click does — the server enforces it too, with a 409, which is why
+    /// the check is here at all rather than only in the response handler.
+    ///
+    /// The mode check is the console's own rule and it is NARROWER than the
+    /// server's: a `scenario` exercise accepts an order (and holds it), and
+    /// the console offers no helm there at all (ADR-0021). An order in a
+    /// scenario exercise is the step's business, and the commander's verb on
+    /// the step is the declaration.
     fn send_helm(&mut self) -> bool {
+        if !self.helm_offered() {
+            return false;
+        }
         if !self.session.execution {
             return false;
         }
@@ -7574,26 +7904,18 @@ impl IslandDemo {
     /// Derived from the session's pieces rather than stored, so there is one
     /// source for what the server holds.
     ///
-    /// The session read carries NO starting position — `GameUnit` has no
-    /// placement field, which is why the shell projects the placements read
-    /// separately — so `start` is `None` here. The consequence is deliberate
-    /// and narrow: `plan()` compares the draft's starts against nothing, so a
-    /// draft hull with a live counterpart ALWAYS reads as a placement move and
-    /// emits a `Place`. Re-writing a start the server already has is
-    /// idempotent at the endpoint, so the redundancy is the honest side of the
-    /// trade — a placement the operator can see is worth one repeated PUT.
+    /// The force as Minos holds it, and the WHOLE of what a diff needs out
+    /// of the server: who commands each hull, where it STARTS, and what
+    /// carries it.
     ///
-    /// `host` is `None` for the same reason: the read does not say what
-    /// carries a piece, so the mirror cannot tell a hull already aboard from
-    /// one on the water. Two consequences follow, and both are the shell's
-    /// limit rather than the server's. A seeded hull's draft `host` is `None`
-    /// too, so pass 2 sees `None == None` and writes no embarkation — an
-    /// embarkation the operator did not touch is left standing rather than
-    /// re-stated. But an operator who DROPS a hull onto a host emits one
-    /// `Embark`, and if the server already carries that hull aboard, the
-    /// attach endpoint refuses it ("already inside something") and the whole
-    /// advance stops with that sentence. A hull's host belongs in the session
-    /// read; until it is there, this mirror is one field short and says so.
+    /// The placement and the host were the two fields this mirror was
+    /// missing, and both were missed in the same direction: the diff could
+    /// not see what the server already held, so it wrote it again. A hull
+    /// the server has placed was re-placed on every advance, and a hull the
+    /// server has aboard was re-embarked — which the attach endpoint refuses
+    /// ("already inside something"), so the whole advance stopped there.
+    /// The server's own row carries the placement, and the host comes from
+    /// the embarkation reads the session read fans out over.
     fn live_hulls(&self) -> Vec<crate::force::LiveHull> {
         self.session
             .pieces
@@ -7602,8 +7924,22 @@ impl IslandDemo {
                 unit_id: p.id,
                 name: p.label.clone(),
                 commander_id: p.commander_id,
-                start: None,
-                host: None,
+                start: p
+                    .start
+                    .map(|(lat, lon)| crate::force::Start { lat, lon }),
+                host: self.session.hosts.get(&p.id).copied(),
+            })
+            .collect()
+    }
+
+    /// The book as Minos holds it, for the draft's diff.
+    fn live_scenarios(&self) -> Vec<crate::book::LiveScenario> {
+        self.session
+            .book
+            .iter()
+            .map(|s| crate::book::LiveScenario {
+                id: s.id,
+                steps: s.steps.iter().map(|st| st.id).collect(),
             })
             .collect()
     }
@@ -7616,57 +7952,42 @@ impl IslandDemo {
         self.session.groups.clone()
     }
 
-    /// Re-seed BOTH drafts from what the session holds.
+    /// Re-seed the drafts from what the session holds.
     ///
     /// One call, because they are re-seeded for one reason: a session read
-    /// replaced the pieces and the seats, and both drafts are mirrors of what
-    /// Minos was last told. Two calls would be two chances to re-seed one and
-    /// forget the other.
+    /// replaced the pieces, the seats and the book, and every draft is a
+    /// mirror of what Minos was last told. Two calls would be two chances
+    /// to re-seed one and forget the other.
     ///
-    /// SAFE ONLY WHERE NOTHING IS STAGED. Before this slice every edit posted
-    /// at once, so a re-read could not discard work. While PLANNING the draft
-    /// IS the record — a re-seed would drop edits the server has not been told
-    /// — and the guard is twofold. The callers that could fire with staged
-    /// work are the Session island's advance, which seeds AFTER the read that
-    /// proves the draft was written through, and the three posting write
-    /// latches (`roster_busy`, `force_busy`, `deploy_busy`), whose flags only
-    /// an edit that POSTED sets — and no planning edit posts. The callers that
-    /// seed a planning room seed it BEFORE there is any work to lose:
-    /// construction, a hold and a created session all install a fresh draft
-    /// whose reference is the game just read.
+    /// **A RE-SEED NEVER DISCARDS STAGED WORK.** The old guarantee was the
+    /// opposite — the doc said "SAFE ONLY WHERE NOTHING IS STAGED" and
+    /// relied on latches that no planning edit ever set, so a re-read (and
+    /// every write triggers one) could wipe a half-planned exercise. The
+    /// merge now lives in the modules that own the rules: `force::seed` and
+    /// `roster::seed` replace the FRAME and keep the operator's edits, and
+    /// `groups::seed` has always done the same. What the server says is
+    /// adopted wherever the operator has not said otherwise, and what the
+    /// operator has said stands.
     fn reseed_drafts(&mut self) {
-        let mut draft = crate::force::ForceDraft::new();
-        for p in &self.session.pieces {
-            draft.upsert(crate::force::DraftHull {
-                unit_id: p.id,
-                name: p.label.clone(),
-                hull_number: String::new(),
-                class_id: String::new(),
-                start: None,
-                commander_id: p.commander_id,
-                host: None,
-            });
-        }
-        self.force = draft;
+        // The force: the server's frame, with the operator's placements,
+        // embarkations, commands and removals on top of it.
+        let live_hulls = self.live_hulls();
+        self.force.seed(&live_hulls);
 
-        let mut seats = crate::roster::RosterDraft::new();
-        for p in &self.session.people {
-            seats.stage(crate::roster::StagedSeat {
-                user_id: p.id,
-                user_name: p.name.clone(),
-                role_id: p.role_id,
-                role_name: p.role.clone(),
-                call_sign: p.call_sign.clone(),
-                judge: p.judge,
-            });
-        }
-        self.roster_draft = seats;
+        // The roster: the server's seats, with the operator's staged seats,
+        // role changes and removals on top of them.
+        self.roster_draft.seed(&self.live_seats());
 
-        // The task organisation is re-seeded the same way: the server's frame
-        // becomes the reference, and any staged work the operator had is kept
-        // (seed replaces the frame, not the edits). A hold is a new reference,
-        // so nothing is staged at this point.
+        // The task organisation: the server's frame becomes the reference,
+        // and any staged work the operator had is kept (seed replaces the
+        // frame, not the edits).
         self.groups.seed(&self.session.groups);
+
+        // The book: staged work against a scenario the server no longer
+        // lists is dropped, so a deleted scenario cannot hold orphaned
+        // steps in the draft.
+        let live: Vec<i64> = self.session.book.iter().map(|s| s.id).collect();
+        self.book.prune(&live);
     }
 
     /// Who may be handed a piece: every seat in the room, staged seats
@@ -7712,17 +8033,28 @@ impl IslandDemo {
     /// plan at once, because no advance is left to wait for and the write IS
     /// the edit.
     fn stage_assign(&mut self, unit_id: i64, name: &str, commander_id: i64) -> Result<(), String> {
-        let mut draft = self.force.clone();
-        draft.upsert(crate::force::DraftHull {
-            unit_id,
-            name: name.to_string(),
-            hull_number: String::new(),
-            class_id: String::new(),
-            start: None,
-            commander_id: Some(commander_id),
-            host: None,
-        });
-        self.force = draft;
+        // A hull already in the draft keeps everything else the operator has
+        // said about it: handing a hull to somebody is a change of
+        // commander, not a new hull. Replacing the whole row would drop the
+        // placement and the embarkation, and the diff would then read them
+        // as a move and an un-lift.
+        if self.force.contains(unit_id) {
+            if !self.force.set_commander(unit_id, Some(commander_id)) {
+                return Err("that piece is not in the draft".to_string());
+            }
+        } else {
+            let mut draft = self.force.clone();
+            draft.upsert(crate::force::DraftHull {
+                unit_id,
+                name: name.to_string(),
+                hull_number: String::new(),
+                class_id: String::new(),
+                start: None,
+                commander_id: Some(commander_id),
+                host: None,
+            });
+            self.force = draft;
+        }
         if self.staging() {
             return Ok(());
         }
@@ -7831,6 +8163,15 @@ impl IslandDemo {
                 self.stage_place_local(unit_id, name, fx, fy, cx)
             };
         }
+        // A STATIC EXERCISE'S POSITIONS ARE SET BY HAND (ADR-0021). The
+        // server refuses every order there with a 409, so the console's
+        // gesture is a drag and the drop IS the position: no heading, no
+        // speed, no time of the client's own. A drop onto a HOST is not one
+        // of those — an embarkation is a different act, and the embark arm
+        // carries no ground to place.
+        if self.positions_set_by_hand() && host.is_none() {
+            return self.send_set_position(unit_id, name, fx, fy, cx);
+        }
         if taken {
             if let Some(host) = host {
                 self.send_embark(host, unit_id, name, cx);
@@ -7870,6 +8211,114 @@ impl IslandDemo {
         }
         cx.notify();
         true
+    }
+
+    /// Whether this exercise's positions are set BY HAND, and the console's
+    /// drag gesture is the way one is set.
+    ///
+    /// ADR-0021: a static exercise has no order at all — the server refuses
+    /// every one of them with a 409 — so the only way a hull moves there is
+    /// for somebody to put it there, and the console's gesture for that is a
+    /// drag onto the map.
+    fn positions_set_by_hand(&self) -> bool {
+        self.mode().positions_are_set()
+    }
+
+    /// Put a hull where the pointer says it is, in a static exercise.
+    ///
+    /// ADR-0021. The drop IS the position: the route takes a latitude and a
+    /// longitude and nothing else, so there is no course to state and no
+    /// speed to claim — the server stamps the instant from the exercise's
+    /// own clock, and the hull stays where it was put until somebody puts
+    /// it somewhere else.
+    ///
+    /// THE GATE IS THE HULL'S OWN. A commander sets the hulls they command.
+    /// The server's rule is wider — a Game Master may correct anybody's
+    /// board — and the console's is narrower on purpose: a drag that moves
+    /// somebody else's hull is not a gesture the console offers, and a
+    /// refusal that names the hull is better than a position set in a mode
+    /// the operator did not choose.
+    ///
+    /// ONE commit, on the release. A commit per pointer movement would put
+    /// a row in the chain for every frame, which is exactly why the server
+    /// has a preview route at all.
+    fn send_set_position(
+        &mut self,
+        unit_id: i64,
+        name: &str,
+        fx: f64,
+        fy: f64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.positions_set_by_hand() {
+            return false;
+        }
+        if !self.own_unit_ids().contains(&unit_id) {
+            self.force_status = Status::bad(format!(
+                "{name} is not yours to place \u{2014} a commander sets the hulls they command"
+            ));
+            cx.notify();
+            return false;
+        }
+        let _ = self.order_tx.send(ToBinary::SetPosition { unit_id, fx, fy });
+        self.feed(format!("position set by hand \u{2014} {name}"));
+        cx.notify();
+        true
+    }
+
+    /// One FRAME of a drag, published to the other participants' boards and
+    /// recorded nowhere.
+    ///
+    /// The preview route is the cheap one: it reads the game and the piece,
+    /// clears the same gates the commit clears, and publishes a frame. It
+    /// is what a client calls REPEATEDLY while somebody drags, so the
+    /// frames are throttled here to about ten a second — a client that
+    /// posts every pointer movement would spend the exercise's round trips
+    /// on a gesture nobody is watching yet.
+    ///
+    /// The COMMIT is the release, and only the release: one row in the
+    /// chain per drag, not one per frame.
+    fn drag_preview_frame(
+        &mut self,
+        unit_id: i64,
+        at: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.positions_set_by_hand() {
+            return;
+        }
+        if !self.own_unit_ids().contains(&unit_id) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Some(last) = self.preview_at {
+            if now.duration_since(last) < PREVIEW_INTERVAL {
+                return;
+            }
+        }
+        self.preview_at = Some(now);
+        let size = window.viewport_size();
+        let (w, h) = (f32::from(size.width), f32::from(size.height));
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let fx = f64::from((f32::from(at.x) / w).clamp(0.0, 1.0));
+        let fy = f64::from((f32::from(at.y) / h).clamp(0.0, 1.0));
+        // The same cover transform the drop uses, so a frame and the commit
+        // that follows it name the same ground.
+        let (fx, fy) = window_fraction_to_frame(
+            fx,
+            fy,
+            f64::from(self.map_dims.0),
+            f64::from(self.map_dims.1),
+            f64::from(w),
+            f64::from(h),
+        );
+        let _ = self
+            .order_tx
+            .send(ToBinary::PreviewPosition { unit_id, fx, fy });
+        cx.notify();
     }
 
     /// A drop on bare water, WHILE PLANNING: put the hull in the draft at the
@@ -8660,6 +9109,14 @@ impl IslandDemo {
     /// has a draft `Start` and no fix, so nothing but this projection can say
     /// where it is.
     fn drop_host_at(&self, fx: f64, fy: f64) -> Option<i64> {
+        // A STATIC EXERCISE HAS NO HOSTS ON THE MAP (ADR-0021): its hulls
+        // are PLACED, not embarked, and the console's gesture there is a
+        // position. The hit-test is skipped, so a drop beside another hull
+        // is still a position and not an embarkation of a hull that the
+        // operator was trying to move.
+        if self.positions_set_by_hand() {
+            return None;
+        }
         let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
         if mw <= 0.0 || mh <= 0.0 {
             return None;
@@ -8712,6 +9169,12 @@ impl IslandDemo {
                     "force synced — {}",
                     plural(writes.len(), "write")
                 ));
+                // The latch: the write is in flight, and the panel's line
+                // says so until the answer lands. The drain hands the
+                // answer to this write by its NAME, so the latch is the
+                // operator's read of the state rather than the drain's way
+                // of guessing which write an answer belongs to.
+                self.force_busy = true;
                 let _ = self.order_tx.send(ToBinary::SyncForce { writes });
                 Ok(())
             }
@@ -8728,6 +9191,12 @@ impl IslandDemo {
                 user_id: p.id,
                 user_name: p.name.clone(),
                 role_id: p.role_id,
+                // The judge side, because the judge side may not command: a
+                // hull handed to a judge-side seat is refused by the server,
+                // and the advance has to see that before it writes.
+                judge: p.judge,
+                role_name: p.role.clone(),
+                call_sign: p.call_sign.clone(),
             })
             .collect()
     }
@@ -8963,8 +9432,141 @@ impl IslandDemo {
             "roster synced — {}",
             plural(writes.len(), "write")
         ));
+        // The latch, for the same reason the force's is: the write is in
+        // flight, and the answer comes back named.
+        self.roster_busy = true;
         let _ = self.order_tx.send(ToBinary::SyncRoster { writes });
         Ok(())
+    }
+
+    /// The staged planned window, seeded from the server's read the first
+    /// time it is asked for.
+    ///
+    /// SEEDED FROM THE FACTS, not typed from nothing: the window the
+    /// exercise already holds is what the operator edits, so the editor
+    /// shows the day and the two ends rather than five empty fields. A
+    /// window the console cannot read — a half window on the server, say —
+    /// leaves the draft blank rather than half-read, because a half window
+    /// is not a window the advance could write.
+    fn window_draft(&mut self) -> crate::window::WindowDraft {
+        if self.window_draft.is_none() || self.window_seeded_for != self.session.game_id {
+            self.window_draft = Some(crate::window::WindowDraft::from_read(
+                &self.session.facts.actual_start,
+                &self.session.facts.actual_end,
+                &self.session.facts.assumed_start,
+                &self.session.facts.assumed_end,
+            ));
+            self.window_seeded_for = self.session.game_id;
+        }
+        self.window_draft.clone().unwrap_or_default()
+    }
+
+    /// One window field, hand-rolled like the composer's and the timeline
+    /// filters': a focus handle, a keystroke handler and a value, in the
+    /// machine face because these are dates and military times rather than
+    /// prose.
+    ///
+    /// `idx` is 0 the real clock's day, 1 its start, 2 its end, 3 the
+    /// exercise clock's start, 4 its end — the order `WindowDraft::fields`
+    /// gives, so the keystrokes and the draft cannot disagree about which
+    /// field is which.
+    fn window_field(
+        &mut self,
+        idx: usize,
+        hint: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let handle = match self.window_handles[idx].clone() {
+            Some(h) => h,
+            None => {
+                let h = cx.focus_handle();
+                self.window_handles[idx] = Some(h.clone());
+                h
+            }
+        };
+        let value = self.window_draft().field(idx).to_string();
+        let empty = value.is_empty();
+        let shown = if empty { hint.to_string() } else { value };
+        let focused = self.window_focus == idx;
+        div()
+            .id(("window-field", idx))
+            .track_focus(&handle)
+            .cursor(CursorStyle::IBeam)
+            .h(px(WINDOW_FIELD_H))
+            .w(px(if idx == 0 { 88.0 } else { 62.0 }))
+            .px(px(5.0))
+            .rounded(px(CONTROL_RADIUS))
+            .bg(rgba(DEEP_WELL))
+            .border(px(1.0))
+            .border_color(rgba(if focused { RADAR_CYAN } else { HAIRLINE_SLATE }))
+            .flex()
+            .items_center()
+            .font_family(view::FACE_MACHINE)
+            .text_size(px(11.0))
+            .text_color(rgba(if empty { BODY_SILVER } else { MAP_INK }))
+            .on_mouse_down(MouseButton::Left, cx.listener(move |view, _, window, cx| {
+                window.focus(&handle);
+                view.window_focus = idx;
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(move |view, ev: &KeyDownEvent, window, cx| {
+                view.window_key(idx, &ev.keystroke, window, cx);
+            }))
+            .child(shown)
+            .into_any_element()
+    }
+
+    /// The keystroke half of a window field: printable characters append,
+    /// backspace removes, tab walks the five fields. The card's rule, and
+    /// the composer's.
+    ///
+    /// THE RULE SPEAKS AS SOON AS THE DRAFT IS WRONG, so the operator is
+    /// told while they are still in the field rather than after the round
+    /// trip. The rule is `crate::window`'s — the same one the scenario
+    /// composer asks.
+    fn window_key(
+        &mut self,
+        idx: usize,
+        k: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match k.key.as_str() {
+            "backspace" => {
+                let mut draft = self.window_draft();
+                let mut value = draft.field(idx).to_string();
+                value.pop();
+                draft.set_field(idx, value);
+                self.window_draft = Some(draft);
+            }
+            "tab" => {
+                let next = (idx + 1) % 5;
+                self.window_focus = next;
+                if let Some(h) = self.window_handles[next].clone() {
+                    window.focus(&h);
+                }
+            }
+            _ => {
+                if let Some(text) = k
+                    .key_char
+                    .as_deref()
+                    .filter(|t| !t.is_empty() && !t.chars().any(char::is_control))
+                {
+                    let mut draft = self.window_draft();
+                    let mut value = draft.field(idx).to_string();
+                    value.push_str(text);
+                    draft.set_field(idx, value);
+                    self.window_draft = Some(draft);
+                }
+            }
+        }
+        // The window's own rule, said in the window's ink: a draft the rule
+        // refuses is a fault, and a draft it accepts says nothing.
+        self.window_status = match self.window_draft().problem() {
+            Some(why) => Status::bad(why),
+            None => Status::empty(),
+        };
+        cx.notify();
     }
 
     /// Control's draft, one step along its rail.
@@ -8974,8 +9576,7 @@ impl IslandDemo {
     /// This edits the DRAFT only: nothing is written until Apply, which is the
     /// console's own arrangement — a DragValue that wrote on every drag would
     /// be one PATCH per pixel.
-    fn nudge_factor(&mut self, step: f64) {
-        let read = self.session.facts.time_factor;
+    fn nudge_factor(&mut self, step: f64) {        let read = self.session.facts.time_factor;
         let current = self.factor_draft.unwrap_or(read);
         self.factor_draft = Some(view::factor_nudge(current, step));
         self.factor_status.clear();
@@ -9019,6 +9620,23 @@ impl IslandDemo {
         self.factor_status.clear();
     }
 
+    /// Whether the clock control's verb is PAUSE.
+    ///
+    /// ONE rule, read by the button's label AND by the write it sends, so a
+    /// button that reads "Resume" while the click pauses is impossible.
+    ///
+    /// ADR-0021: in a scenario exercise the clock runs inside a step, the
+    /// server refuses a resume between the beats with a 409, and the
+    /// exercise opens stopped — so the console offers a pause and never a
+    /// resume. In the other two modes the verb follows the last clock
+    /// answer, as it always did.
+    fn clock_verb_is_pause(&self) -> bool {
+        if !self.clock_may_resume() {
+            return true;
+        }
+        self.clock_running.unwrap_or(true)
+    }
+
     /// Pause or resume the scenario clock — the console's
     /// `pause_or_resume_minos`, as a message. Held resumes, otherwise
     /// pauses, unknown pauses: the console's rule, decided shell-side from
@@ -9027,6 +9645,11 @@ impl IslandDemo {
     /// answer is the GameClock to display. A remembered denial refuses
     /// locally with the grant sentence instead of spending a POST the
     /// server has already refused.
+    ///
+    /// In a scenario exercise the verb is a pause and only a pause: the
+    /// clock runs inside a step, and the server refuses a resume between
+    /// the beats (ADR-0021). The rule is one predicate, and the label
+    /// reads the same one.
     ///
     /// Returns whether a request went out, so a test exercises exactly
     /// what the click does.
@@ -9042,7 +9665,7 @@ impl IslandDemo {
         if self.session.game_id == 0 {
             return false;
         }
-        let paused = self.clock_running.unwrap_or(true);
+        let paused = self.clock_verb_is_pause();
         self.pause_busy = true;
         self.pause_status = Status::pending(if paused {
             "pausing\u{2026}"
@@ -9315,15 +9938,90 @@ impl IslandDemo {
         self.prepare_status = Status::pending("moving the plan to preparation\u{2026}".to_string());
         let live_hulls = self.live_hulls();
         let live_seats = self.live_seats();
+        // The window goes with the drafts: the exercise's terms may only be
+        // changed while the game is in `planning`, so the advance is the
+        // last moment the window can be written. Read before the send,
+        // because the send borrows the sink and the draft is seeded here.
+        let window = self.window_draft();
         let _ = self.order_tx.send(ToBinary::AdvancePreparation {
             force: self.force.clone(),
             live_hulls,
             roster: self.roster_draft.clone(),
             live_seats,
             groups: crate::groups::plan(&self.groups, &self.live_groups()),
+                window,
+                book: self.book.clone(),
+                live_scenarios: self.live_scenarios(),
         });
         cx.notify();
         true
+    }
+
+    /// WRITE THE STAGED WRITES THROUGH, and change nothing else.
+    ///
+    /// The one exception to local-first planning, and the one the operator
+    /// asked for: the staged force, roster, task organisation and book reach
+    /// the server now, and the exercise's phase does not move. It is the
+    /// advance's flush without the transition, so the two cannot disagree
+    /// about the order the server accepts the writes in.
+    ///
+    /// Returns whether a request went out, so a test exercises exactly what
+    /// the click does.
+    fn sync_staged(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.sync_busy {
+            return false;
+        }
+        if self.session.game_id == 0 {
+            return false;
+        }
+        self.sync_busy = true;
+        self.sync_status = Status::pending("writing the staged writes through\u{2026}".to_string());
+        let live_hulls = self.live_hulls();
+        let live_seats = self.live_seats();
+        let _ = self.order_tx.send(ToBinary::SyncStaged {
+            force: self.force.clone(),
+            live_hulls,
+            roster: self.roster_draft.clone(),
+            live_seats,
+            groups: crate::groups::plan(&self.groups, &self.live_groups()),
+            book: self.book.clone(),
+            live_scenarios: self.live_scenarios(),
+        });
+        cx.notify();
+        true
+    }
+
+    /// The drafts whose staged work the flush has just WRITTEN THROUGH.
+    ///
+    /// The task organisation and the book are staged under NEGATIVE local
+    /// ids, and the flush resolves them against the server's ids as it
+    /// writes. Once the writes have landed, those local ids name rows the
+    /// server already holds, so keeping them would create the same node —
+    /// or the same scenario — a second time on the next advance. They are
+    /// therefore dropped, and the drafts start again from what the server
+    /// holds.
+    ///
+    /// The force and the roster are not dropped: their drafts are records
+    /// of rows, not of ids, and the merge re-seeds them against the server
+    /// on its own.
+    fn drafts_written_through(&mut self) {
+        self.groups.clear();
+        self.book.clear();
+        self.reseed_drafts();
+    }
+
+    /// What the staged drafts still owe the server, by draft.
+    ///
+    /// Each module counts its own writes, and this only adds them up: a
+    /// second count here would be a second answer waiting to disagree with
+    /// the plan the advance actually runs.
+    fn staged_counts(&self) -> StagedCounts {
+        StagedCounts {
+            force: self.force.pending(&self.live_hulls()),
+            roster: self.roster_draft.pending(&self.live_seats()),
+            groups: self.groups.pending(&self.live_groups()),
+            book: self.book.pending(&self.live_scenarios()),
+        }
     }
 
     /// Leave execution. Organizer-gated by placement, not by this send:
@@ -10654,12 +11352,14 @@ impl IslandDemo {
     /// Declare or withdraw this seat's readiness on the asking step — the
     /// console's `declare_step`, as a message.
     ///
-    /// Returns false (and sends nothing) for the three non-sends: no step
-    /// asks this seat, the named step is not the asking one (a stale click
-    /// after the re-read moved on), or a declaration already in flight. The
-    /// same rule the row's button enforces, kept in one place so a test
-    /// exercises exactly what the click does — the server arbitrates the
-    /// seat on top, loudly.
+    /// Returns false (and sends nothing) for the non-sends: no step asks
+    /// this seat, the named step is not the asking one (a stale click
+    /// after the re-read moved on), a declaration already in flight, or a
+    /// MODE WITH NO STEP. The last one is ADR-0021's: the step is a
+    /// scenario exercise's, and outside one there is no step to declare
+    /// for. The same rule the row's button enforces, kept in one place so a
+    /// test exercises exactly what the click does — the server arbitrates
+    /// the seat on top, loudly.
     fn send_step_declare(
         &mut self,
         scenario_id: i64,
@@ -10667,6 +11367,9 @@ impl IslandDemo {
         ready: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.step_declare_offered() {
+            return false;
+        }
         let asking = self
             .session
             .step
@@ -10693,6 +11396,18 @@ impl IslandDemo {
         });
         cx.notify();
         true
+    }
+
+    /// The step this caller may declare readiness for, when there is one.
+    ///
+    /// The reminder strip's verb and the board's pill are the SAME
+    /// declaration, and they answer the same question — which step is asking
+    /// this seat — so one reader names it for both. The third fact is
+    /// whether this seat has already declared, which is what the two labels
+    /// differ on.
+    fn asking_step(&self) -> Option<(i64, i64, bool)> {
+        let asking = self.session.step.as_ref().and_then(|s| s.asking.as_ref())?;
+        Some((asking.scenario_id, asking.step_id, asking.you_ready))
     }
 
     /// The one step the reminder strip names: what this caller owes the
@@ -10732,7 +11447,45 @@ impl IslandDemo {
     /// execution. Each is deliberately small — the phase is about the map, and
     /// a widget that said everything would be a panel with a map underneath it
     /// — so it carries one fact and opens its surface on click.
+    ///
+    /// ADR-0021: the SCENARIO widget belongs to a scenario exercise alone.
+    /// A maneuver exercise has no book and a static one has no step, so the
+    /// widget is not drawn there at all — a widget that says "no steps" over
+    /// an exercise that was never going to have any reads as a broken
+    /// surface rather than as an absence.
     fn execution_widgets(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let widgets = self.execution_widget_set();
+        let mut rail = div()
+            .absolute()
+            .top(px(64.0))
+            .right(px(10.0))
+            .w(px(196.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            // The widgets are over the map, so a wheel over one of them is
+            // a wheel over the console and not a zoom of the map.
+            .on_scroll_wheel(swallow_wheel);
+        for widget in widgets {
+            rail = rail.child(self.execution_widget(
+                widget.id,
+                widget.label,
+                widget.value,
+                widget.hint,
+                widget.panel,
+                cx,
+            ));
+        }
+        rail.into_any_element()
+    }
+
+    /// The widgets the execution rail draws, in order.
+    ///
+    /// A VALUE, so a test can read what the rail would draw without a
+    /// rendered frame to read it from — and so the drawing is a fold over
+    /// one list rather than a chain of calls that could each answer a
+    /// different rule.
+    fn execution_widget_set(&self) -> Vec<ExecWidget> {
         let board = self.scenario_board();
         let scenario = match (board.total, board.at) {
             (0, _) => "no steps".to_string(),
@@ -10760,57 +11513,47 @@ impl IslandDemo {
                     "operator".to_string()
                 }
             });
-        div()
-            .absolute()
-            .top(px(64.0))
-            .right(px(10.0))
-            .w(px(196.0))
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            // The widgets are over the map, so a wheel over one of them is
-            // a wheel over the console and not a zoom of the map.
-            .on_scroll_wheel(swallow_wheel)
-            .child(self.execution_widget(
-                "widget-account",
-                "operator",
-                role,
-                Some(name),
-                None,
-                cx,
-            ))
-            .child(self.execution_widget(
-                "widget-crew",
-                "crew",
-                format!("{}/{}", self.session.present, self.session.seats),
-                Some(plural(self.session.pieces.len(), "hull")),
-                Some(WhichPanel::Crew),
-                cx,
-            ))
-            .child(self.execution_widget(
-                "widget-scenario",
-                "scenario",
-                scenario,
-                Some(if board.total == 0 {
-                    "nothing to play".to_string()
+        let mut widgets = vec![
+            ExecWidget {
+                id: "widget-account",
+                label: "operator",
+                value: role,
+                hint: Some(name),
+                panel: None,
+            },
+            ExecWidget {
+                id: "widget-crew",
+                label: "crew",
+                value: format!("{}/{}", self.session.present, self.session.seats),
+                hint: Some(plural(self.session.pieces.len(), "hull")),
+                panel: Some(WhichPanel::Crew),
+            },
+        ];
+        // The scenario widget, in a scenario exercise and nowhere else.
+        if self.scenario_exercise() {
+            widgets.push(ExecWidget {
+                id: "widget-scenario",
+                label: "scenario",
+                value: scenario,
+                hint: Some(if board.total == 0 {
+                    crate::mode_rules::no_script_sentence().to_string()
                 } else {
                     format!("{} in the book", plural(board.total as usize, "step"))
                 }),
-                Some(WhichPanel::Board),
-                cx,
-            ))
-            .child(self.execution_widget(
-                "widget-comms",
-                "comms",
-                format!("{}", self.session.messages.len()),
-                Some(format!(
+                    panel: Some(WhichPanel::Board),
+                });
+            }
+            widgets.push(ExecWidget {
+                id: "widget-comms",
+                label: "comms",
+                value: format!("{}", self.session.messages.len()),
+                hint: Some(format!(
                     "{} in this exercise",
                     plural(self.session.messages.len(), "message")
                 )),
-                Some(WhichPanel::Comms),
-                cx,
-            ))
-            .into_any_element()
+                panel: Some(WhichPanel::Comms),
+            });
+            widgets
     }
 
     /// One execution widget: a tracked label, one value, one quiet line —
@@ -11122,7 +11865,98 @@ impl IslandDemo {
     /// sat at different heights and the strip read as two unrelated
     /// gadgets. Here the heading and the speed are read off ONE row of
     /// labels, and the controls hang under the labels that name them.
+    /// The exercise's mode, as the console's rules read it.
+    ///
+    /// ONE place. The session's own parsed mode, unless the capture seed
+    /// forces another. Every rule below reads this, so the session and the
+    /// seed can never both answer.
+    fn mode(&self) -> crate::gamestate::GameMode {
+        self.mode_seed.unwrap_or(self.session.facts.mode)
+    }
+
+    /// Whether the helm is offered in this exercise.
+    ///
+    /// ADR-0021: the helm belongs to a `maneuver` exercise and to nothing
+    /// else. The server's own rule (`GameMode::allows_steering`) is WIDER —
+    /// it allows a `scenario` exercise, because the server will hold an
+    /// order there until a step releases it — and the console's rule is
+    /// narrower on purpose: a scenario exercise is played through its steps,
+    /// and a free-standing helm would be an instrument whose every answer
+    /// is "held".
+    fn helm_offered(&self) -> bool {
+        crate::mode_rules::helm_offered(self.mode())
+    }
+
+    /// Whether this exercise is played from a Game Master's book.
+    ///
+    /// ADR-0021: the scenario surfaces — the board, the widget, the step's
+    /// verbs — belong to this mode alone. A `maneuver` exercise has no book
+    /// to play and a `static` one has no step to declare readiness for.
+    fn scenario_exercise(&self) -> bool {
+        crate::mode_rules::scenario_exercise(self.mode())
+    }
+
+    /// Whether the commander's step verb is offered: the declaration that
+    /// says this station is ready for the step the exercise asks.
+    ///
+    /// ADR-0021: in a scenario exercise the step IS the commander's verb.
+    /// Outside one there is no step, so the verb is not drawn at all — and
+    /// `send_step_declare` refuses it, so the button is not a decoration
+    /// over a write the console would make.
+    fn step_declare_offered(&self) -> bool {
+        crate::mode_rules::step_declare_offered(self.mode())
+    }
+
+    /// Whether the Game Master's step verbs are offered: play, skip, end,
+    /// replay.
+    ///
+    /// ADR-0021: they drive a step, and only a scenario exercise has steps.
+    fn step_verbs_offered(&self) -> bool {
+        crate::mode_rules::step_verbs_offered(self.mode())
+    }
+
+    /// Whether the clock may be resumed from this console.
+    ///
+    /// ADR-0021: in a scenario exercise the clock runs inside a step, the
+    /// server refuses a resume between the beats with a 409, and the
+    /// exercise opens stopped — so the console offers a pause and never a
+    /// resume. The other two modes keep the pair they always had.
+    fn clock_may_resume(&self) -> bool {
+        crate::mode_rules::clock_may_resume(self.mode())
+    }
+
+    /// The helm channel of the rail, as a value: the instruments, or the
+    /// mode's sentence.
+    ///
+    /// ADR-0021: the instruments are NOT drawn greyed out where there is no
+    /// helm — they are not drawn at all, and the mode's sentence stands
+    /// where they were. A value, so a test can read what the rail would
+    /// draw without a rendered frame to read it from.
+    fn rail_helm(&self) -> RailHelm {
+        let mode = self.mode();
+        if crate::mode_rules::helm_offered(mode) {
+            RailHelm::Instruments
+        } else if mode.positions_are_set() {
+            RailHelm::SetByHand {
+                sentence: crate::mode_rules::helm_sentence(mode),
+            }
+        } else {
+            RailHelm::Sentence(crate::mode_rules::helm_sentence(mode))
+        }
+    }
+
     fn dashboard_helm(&mut self, cx: &mut Context<Self>, widths: RailWidths) -> AnyElement {
+        // ADR-0021: the instruments are drawn in a maneuver exercise and NOWHERE
+        // else. A scenario exercise has no free-standing helm, and a static
+        // one has no order at all; the channel carries the mode's sentence
+        // instead, in their place.
+        let helm = self.rail_helm();
+        if let RailHelm::Sentence(sentence) = helm {
+            return self.dashboard_helm_sentence(sentence, widths);
+        }
+        if let RailHelm::SetByHand { sentence } = helm {
+            return self.dashboard_helm_set_by_hand(sentence, cx);
+        }
         let armed = self.session.execution && self.order_target().is_some();
         let status = self
             .helm_status
@@ -11238,6 +12072,149 @@ impl IslandDemo {
                             ),
                     ),
             )
+            .into_any_element()
+    }
+
+    /// The helm channel of the rail where there is no helm: the mode's
+    /// sentence, in the instruments' place.
+    ///
+    /// ADR-0021. NOT a greyed-out compass and NOT an empty channel: an
+    /// instrument that cannot be used reads as a control that failed, and
+    /// an empty channel reads as nothing at all. The sentence says what the
+    /// mode has instead — the step for a scenario exercise, the hand for a
+    /// static one — so the operator is told the way forward and not only
+    /// the refusal.
+    fn dashboard_helm_sentence(&mut self, sentence: &'static str, widths: RailWidths) -> AnyElement {
+        div()
+            .id("dashboard-helm")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .px(px(DASH_RAIL_PAD))
+            .py(px(8.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(6.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .w(px(widths.order + widths.dial + widths.scale))
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(view::BODY_PT))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(sentence),
+            )
+            .into_any_element()
+    }
+
+    /// The helm channel of the rail in a static exercise: the mode's
+    /// sentence, and the hulls this seat commands as things to PICK UP.
+    ///
+    /// ADR-0021: a static exercise's positions are set by hand, so the
+    /// console's verb is a drag — and a drag needs something to hold. The
+    /// rail is where the commander's hulls are already named, so the chips
+    /// go there rather than in a panel the operator has to open first.
+    ///
+    /// Only the hulls THIS SEAT commands are chips. The server will let a
+    /// Game Master move anybody's hull, but the console's rule is the
+    /// narrower one: a commander sets their own, and the chip a seat does
+    /// not own is not drawn at all.
+    fn dashboard_helm_set_by_hand(
+        &mut self,
+        sentence: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mine: Vec<(i64, String)> = self
+            .own_unit_ids()
+            .into_iter()
+            .filter_map(|id| {
+                self.piece_name(id)
+                    .map(|name| (id, name))
+                    .or_else(|| self.session.mine.iter().find(|s| s.id == id.to_string()).map(|s| (id, s.label.clone())))
+            })
+            .collect();
+        let mut chips = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(6.0));
+        for (id, name) in mine {
+            let symbol = self.fleet_symbol(id);
+            let thumb = self.thumbs.get(&id).cloned();
+            let payload = UnitDragPayload {
+                unit_id: id,
+                name: name.clone(),
+                symbol,
+                thumb: thumb.clone(),
+                entity: DragEntity::Unit {
+                    unit_id: id,
+                    name: name.clone(),
+                },
+            };
+            let ghost = (name.clone(), symbol, thumb);
+            let weak = cx.entity().downgrade();
+            chips = chips.child(
+                div()
+                    .id(("hull-chip", id as usize))
+                    .cursor(CursorStyle::OpenHand)
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
+                    .px(px(7.0))
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .border(px(1.0))
+                    .border_color(rgba(HAIRLINE_SLATE))
+                    .on_drag(payload, move |p: &UnitDragPayload, _, _, app| {
+                        let entity = p.entity.clone();
+                        let _ = weak.update(app, |view, cx| view.begin_drag(entity, cx));
+                        app.new(|_| DragGhost {
+                            name: ghost.0.clone(),
+                            symbol: ghost.1,
+                            thumb: ghost.2.clone(),
+                        })
+                    })
+                    // The FRAMES of the drag, while it is in the air: the
+                    // preview route, which records nothing and is published to
+                    // the other participants' boards. The COMMIT happens once,
+                    // on the release — a commit per pointer movement would put
+                    // a row in the chain for every frame.
+                    .on_drag_move::<UnitDragPayload>(cx.listener(
+                        move |view, ev: &gpui::DragMoveEvent<UnitDragPayload>, window, cx| {
+                            view.drag_preview_frame(id, ev.event.position, window, cx);
+                        },
+                    ))
+                    .child(
+                        div()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(11.0))
+                            .text_color(rgba(MAP_INK))
+                            .child(name),
+                    ),
+            );
+        }
+        div()
+            .id("dashboard-helm")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .px(px(DASH_RAIL_PAD))
+            .py(px(8.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(8.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .font_family(view::FACE_HUMAN)
+                    .text_size(px(view::BODY_PT))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(sentence),
+            )
+            .child(chips)
             .into_any_element()
     }
 
@@ -11801,8 +12778,13 @@ impl IslandDemo {
         } else {
             self.relate_open = Some((scenario_id, step_id));
             self.relate_working = self
-                .related_for(scenario_id, step_id)
-                .map(|r| r.posts.clone())
+                .book
+                .related(scenario_id, step_id)
+                .cloned()
+                .or_else(|| {
+                    self.related_for(scenario_id, step_id)
+                        .map(|r| r.posts.clone())
+                })
                 .unwrap_or_default();
         }
         cx.notify();
@@ -11821,12 +12803,25 @@ impl IslandDemo {
     }
 
     /// Save the working set whole — even empty, which is legal and clears
-    /// the list. One message on the sink; busy latches until the re-read
-    /// answers.
+    /// the list.
+    ///
+    /// WHILE PLANNING this STAGES the list against the step it belongs to,
+    /// and posts nothing: the list names hulls and task-organisation nodes,
+    /// and the nodes may be ones this same draft is about to create, so the
+    /// write can only be ordered after the force and the groups. Outside
+    /// planning it posts at once.
     fn save_relate(&mut self, cx: &mut Context<Self>) -> bool {
         let Some((scenario_id, step_id)) = self.relate_open else {
             return false;
         };
+        if self.staging() {
+            self.book
+                .stage_relations(scenario_id, step_id, self.relate_working.clone());
+            self.book_status =
+                Status::good("related list staged locally \u{2014} the advance writes it".to_string());
+            cx.notify();
+            return true;
+        }
         if self.relate_busy {
             return false;
         }
@@ -11849,8 +12844,10 @@ impl IslandDemo {
         self.session = session;
         if let Some((sid, st)) = self.relate_open {
             self.relate_working = self
-                .related_for(sid, st)
-                .map(|r| r.posts.clone())
+                .book
+                .related(sid, st)
+                .cloned()
+                .or_else(|| self.related_for(sid, st).map(|r| r.posts.clone()))
                 .unwrap_or_default();
         }
         self.book_status.clear();
@@ -12285,8 +13282,12 @@ impl IslandDemo {
             let read = steps[i].read;
             let key = (steps[i].scenario_id, steps[i].step_id);
             let is_head = Some(i) == head;
+            // ADR-0021: the Game Master's verbs drive a step, and only a
+            // scenario exercise has steps. In a maneuver or a static
+            // exercise the board draws NO verbs at all — the row says what
+            // is there, and nothing offers to play it.
             let verbs = match audience {
-                ScenarioAudience::Master => match read {
+                ScenarioAudience::Master if self.step_verbs_offered() => match read {
                     // The step in play: END closes it, REPLAY re-activates it
                     // from its own start (the server erases the abandoned
                     // attempt and says what it cost).
@@ -12305,8 +13306,12 @@ impl IslandDemo {
                 },
                 // An observer reads and does not drive: the same rows, the same
                 // pointer, no verbs. A commander is told the one thing their
-                // station owes and nothing about the rest of the plan.
-                ScenarioAudience::Observer | ScenarioAudience::Commander => Vec::new(),
+                // station owes and nothing about the rest of the plan. And a
+                // Game Master in an exercise with no steps has no step to
+                // drive, so the same answer.
+                ScenarioAudience::Observer
+                | ScenarioAudience::Commander
+                | ScenarioAudience::Master => Vec::new(),
             };
             // The gate rides the step the exercise stands on — playing or
             // asking — and the head, the one next row the Master's play moves
@@ -12352,6 +13357,11 @@ impl IslandDemo {
     /// a CLIENT-side guard, not a security one — the server refuses a seat it
     /// does not recognise — but a client that offered the button anyway would
     /// be lying about the console's own vocabulary.
+    ///
+    /// AND ONLY IN A SCENARIO EXERCISE (ADR-0021): these verbs drive a
+    /// step, and only a scenario exercise has steps. A maneuver exercise's
+    /// book is empty and a static one has no step to play, so the verbs are
+    /// not drawn there and this refuses them.
     fn send_step_verb(
         &mut self,
         scenario_id: i64,
@@ -12360,6 +13370,9 @@ impl IslandDemo {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.step_verb_busy || self.session.game_id == 0 {
+            return false;
+        }
+        if !self.step_verbs_offered() {
             return false;
         }
         if self.scenario_audience() != ScenarioAudience::Master {
@@ -12608,12 +13621,15 @@ impl IslandDemo {
                             }))
                             .child(button(
                                 // The label follows the VERB's rule, not the
-                                // other way round: `send_set_paused` pauses when
-                                // the clock is running OR unknown, so a button
-                                // reading "Resume" while the click pauses would
-                                // be the console telling the operator the
-                                // opposite of what it does.
-                                if self.clock_running.unwrap_or(true) {
+                                // other way round: the click pauses when the
+                                // clock is running, when it is unknown, and
+                                // ALWAYS in a scenario exercise — where the
+                                // server refuses a resume between the beats
+                                // (ADR-0021). A button reading "Resume" while
+                                // the click pauses would be the console
+                                // telling the operator the opposite of what it
+                                // does.
+                                if self.clock_verb_is_pause() {
                                     "Pause clock"
                                 } else {
                                     "Resume clock"
@@ -12642,6 +13658,16 @@ impl IslandDemo {
                         "Play, skip, end and replay sit inside each step box.",
                     )),
             );
+            // The clock's own rule, said where the clock's button is
+            // (ADR-0021): in a scenario exercise the clock runs inside a
+            // step, it opens stopped, and a resume between the beats is
+            // refused — so the console offers a pause and never a resume.
+            if self.scenario_exercise() {
+                col = col.child(note(
+                    "The clock runs with the step: it opens stopped, and the server \
+                     refuses a resume between the beats, so there is no resume here.",
+                ));
+            }
             for line in [&self.pause_status, &self.step_verb_status, &self.end_status] {
                 if !line.is_empty() {
                     col = col.child(status_line(line));
@@ -12895,7 +13921,14 @@ impl IslandDemo {
                     .child(button(verb.label(), true, self.step_verb_busy, false)),
             );
         }
-        if row.read == StepRead::Asking && self.scenario_audience() == ScenarioAudience::Commander {
+        // ADR-0021: the declaration is the commander's verb on the current
+        // step, and a step is a scenario exercise's. In a maneuver or a
+        // static exercise the pill is NOT drawn — not greyed out, not
+        // drawn — because there is no step to declare for.
+        if row.read == StepRead::Asking
+            && self.scenario_audience() == ScenarioAudience::Commander
+            && self.step_declare_offered()
+        {
             has_action = true;
             let (scenario_id, step_id) = (row.scenario_id, row.step_id);
             let you_ready = self
@@ -14586,6 +15619,191 @@ impl IslandDemo {
     /// the binary already did (the session arrives read back, not assumed).
     /// Split out of the feed drain so a test drives exactly what the tick
     /// does — the sign-in drain's inline apply is the older shape.
+    /// Hand one answer to the write that asked for it.
+    ///
+    /// The answer names its write ([`WriteId`]), so two writes in flight can
+    /// never be confused: the second answer is applied as the second write,
+    /// not as whichever latch happened to be set first. That is the whole
+    /// reason the identity travels — the previous dispatch read the latches
+    /// in order, and a second answer matched none of them and fell through
+    /// to the catch-all, which re-seeded the force draft and wiped the
+    /// session composer's draft on the strength of a book write.
+    fn apply_answer(&mut self, created: CreatedSession) {
+        let CreatedSession {
+            session,
+            note,
+            refusal,
+            write,
+        } = created;
+        match write {
+            WriteId::Book => self.apply_book(session),
+            WriteId::Step => self.apply_step(session),
+            WriteId::Relate => self.apply_relate(session),
+            WriteId::Readiness => self.apply_readiness(session),
+            WriteId::StepDeclare => self.apply_step_declare(session),
+            WriteId::StepVerb => self.apply_step_verb(session, note),
+            WriteId::Message => self.apply_message(session),
+            WriteId::Roster => {
+                self.roster_busy = false;
+                self.roster_status.clear();
+                // The session is installed BEFORE the drafts are re-seeded:
+                // the re-seed reads it, and a re-seed against the OLD
+                // session would re-frame the draft with what the server
+                // held before this write.
+                self.session = session;
+                self.reseed_drafts();
+            }
+            WriteId::Force => {
+                self.force_busy = false;
+                self.force_status.clear();
+                self.session = session;
+                self.reseed_drafts();
+            }
+            WriteId::Deploy => {
+                self.deploy_busy = false;
+                self.force_status.clear();
+                self.session = session;
+                self.reseed_drafts();
+            }
+            // A POSITION SET BY HAND. The session comes back with the hull
+            // where it was put, and the drafts are re-seeded from it like any
+            // other write: the server's truth is the frame the next diff is
+            // taken against.
+            WriteId::Position => {
+                self.force_status.clear();
+                self.session = session;
+                self.reseed_drafts();
+            }
+            WriteId::Prepare => {
+                // The advance wrote the staged draft through and moved the
+                // game on. The re-read session REPLACES the held one first:
+                // `reseed_drafts` reads it, and the drafts it seeds are now
+                // the record the server just took, so the staging latches
+                // clear with them. The answer says how many writes it
+                // took, which is the one thing the operator wants to know
+                // about a move they just made.
+                self.prepare_busy = false;
+                self.session = session;
+                match refusal {
+                    // A REFUSED ADVANCE IS NOT A CLEAN ONE. The server may
+                    // have taken part of the draft before it refused the
+                    // rest, so the session that comes back is the server's
+                    // truth and it replaces the held one — but the drafts are
+                    // NOT re-seeded: the operator's staged work is theirs,
+                    // and a refusal is not a reason to throw it away.
+                    Some(why) => self.prepare_status = Status::bad(why),
+                    None => {
+                        self.prepare_status = Status::good(note);
+                        self.drafts_written_through();
+                    }
+                }
+            }
+            WriteId::Sync => {
+                // The staged writes went through and the phase did not move.
+                // The answer says how many writes it took, and the draft is
+                // re-seeded from it, so what the server now holds becomes
+                // the frame the next diff is taken against.
+                self.sync_busy = false;
+                self.session = session;
+                match refusal {
+                    Some(why) => self.sync_status = Status::bad(why),
+                    None => {
+                        self.sync_status = Status::good(note);
+                        self.drafts_written_through();
+                    }
+                }
+            }
+            WriteId::Factor => self.apply_factor(session),
+            WriteId::Advance => {
+                self.advance_busy = false;
+                self.advance_status.clear();
+                self.session = session;
+            }
+            WriteId::End => self.apply_end(session),
+            WriteId::Hold => self.apply_hold(session),
+            WriteId::Session => self.apply_created(session),
+        }
+    }
+
+    /// Put a refusal on the panel the write that earned it asked from.
+    ///
+    /// The refusal names its write for the same reason the answer does: a
+    /// second write's refusal must not be read as the first's, or an
+    /// operator watching the book is told about the roster.
+    fn apply_refusal(&mut self, refusal: WriteRefusal) {
+        let why = refusal.why;
+        match refusal.write {
+            WriteId::Book => {
+                self.book_busy = false;
+                self.book_status = Status::bad(why);
+            }
+            WriteId::Step => {
+                self.step_busy = false;
+                self.book_status = Status::bad(why);
+            }
+            WriteId::Relate => {
+                self.relate_busy = false;
+                self.book_status = Status::bad(why);
+            }
+            WriteId::Readiness => {
+                self.readiness_busy = false;
+                self.readiness_status = Status::bad(why);
+            }
+            WriteId::StepDeclare => {
+                self.step_declare_busy = false;
+                self.step_declare_status = Status::bad(why);
+            }
+            WriteId::StepVerb => {
+                self.step_verb_busy = false;
+                self.step_verb_status = Status::bad(why);
+            }
+            WriteId::Message => {
+                self.msg_busy = false;
+                self.msg_status = Status::bad(why);
+            }
+            WriteId::Roster => {
+                self.roster_busy = false;
+                self.roster_status = Status::bad(why);
+            }
+            WriteId::Force | WriteId::Deploy => {
+                self.force_busy = false;
+                self.deploy_busy = false;
+                self.force_status = Status::bad(why);
+            }
+            WriteId::Position => {
+                self.force_status = Status::bad(why);
+            }
+            WriteId::Prepare => {
+                self.prepare_busy = false;
+                self.prepare_status = Status::bad(why);
+            }
+            WriteId::Sync => {
+                self.sync_busy = false;
+                self.sync_status = Status::bad(why);
+            }
+            WriteId::Factor => {
+                self.factor_busy = false;
+                self.factor_status = Status::bad(why);
+            }
+            WriteId::Advance => {
+                self.advance_busy = false;
+                self.advance_status = Status::bad(why);
+            }
+            WriteId::End => {
+                self.end_busy = false;
+                self.end_status = Status::bad(why);
+            }
+            WriteId::Hold => {
+                self.hold_busy = false;
+                self.hold_status = Status::bad(why);
+            }
+            WriteId::Session => {
+                self.compose_busy = false;
+                self.compose_status = Status::bad(why);
+            }
+        }
+    }
+
     fn apply_created(&mut self, session: SessionView) {
         self.compose_busy = false;
         self.session = session;
@@ -14605,9 +15823,14 @@ impl IslandDemo {
         self.reseed_drafts();
     }
 
-    /// Submit the book's title row. The binary owns the POST, like every
-    /// other write — one message on the sink — and a titleless row never
-    /// becomes one, in the console's own sentence.
+    /// Submit the book's title row.
+    ///
+    /// WHILE PLANNING this STAGES: the scenario joins the book draft and
+    /// nothing is posted, because the server only takes pages in planning
+    /// and the advance is the moment the draft is written through. Outside
+    /// planning the title posts at once, like every other edit there is no
+    /// stage left to wait for. A titleless row never becomes one, in the
+    /// console's own sentence.
     fn submit_book(&mut self, cx: &mut Context<Self>) {
         if self.book_title.trim().is_empty() {
             self.book_status = Status::bad("a scenario needs a title".to_string());
@@ -14617,11 +15840,18 @@ impl IslandDemo {
         if self.book_busy {
             return;
         }
+        let title = self.book_title.trim().to_string();
+        if self.staging() {
+            self.book.stage_scenario(&title);
+            self.book_title.clear();
+            self.book_status =
+                Status::good(format!("{title} staged locally \u{2014} the advance writes it"));
+            cx.notify();
+            return;
+        }
         self.book_busy = true;
         self.book_status = Status::pending("adding\u{2026}".to_string());
-        let _ = self.order_tx.send(ToBinary::AddScenario {
-            title: self.book_title.trim().to_string(),
-        });
+        let _ = self.order_tx.send(ToBinary::AddScenario { title });
         cx.notify();
     }
 
@@ -14632,9 +15862,17 @@ impl IslandDemo {
     /// step draft clears with it: its words are on the server now.
     fn apply_book(&mut self, session: SessionView) {
         self.book_busy = false;
-        self.step_busy = false;
         self.session = session;
         self.book_title.clear();
+        self.book_status.clear();
+    }
+
+    /// Apply the re-read a STEP write returned. The session is held, the
+    /// step draft clears — its words are on the server now — and the panel
+    /// stays open.
+    fn apply_step(&mut self, session: SessionView) {
+        self.step_busy = false;
+        self.session = session;
         self.step_draft = ComposerDraft::default();
         self.book_status.clear();
     }
@@ -14645,9 +15883,22 @@ impl IslandDemo {
     /// state, and the panel draws it weak), so only the window rule can
     /// refuse: `problem()` is the console's own check, run here rather than
     /// re-derived.
+    ///
+    /// WHILE PLANNING this STAGES into the book draft, on whichever scenario
+    /// is open: a scenario the server holds, or one this same draft is about
+    /// to create. Either way nothing posts, and the flush orders the step
+    /// behind the scenario it belongs to.
     fn submit_step(&mut self, cx: &mut Context<Self>) {
         let open = self
             .book_open_scenario
+            // A scenario this draft is about to create is the likeliest
+            // target: the author has just written it, and the steps they
+            // add next belong to it.
+            .or_else(|| {
+                self.staging()
+                    .then(|| self.book.staged_news().last().map(|s| s.local_id))
+                    .flatten()
+            })
             .or_else(|| self.session.book.first().map(|s| s.id));
         let Some(scenario_id) = open else {
             self.book_status = Status::bad("add a scenario first".to_string());
@@ -14662,12 +15913,33 @@ impl IslandDemo {
         if self.step_busy {
             return;
         }
-        self.step_busy = true;
-        self.book_status = Status::pending("adding\u{2026}".to_string());
+
         let window = self
             .step_draft
             .window()
             .map(|(a, b)| (a.to_string(), b.to_string()));
+        if self.staging() {
+            if scenario_id < 0 {
+                self.book.stage_step_new(
+                    scenario_id,
+                    &self.step_draft.content,
+                    window,
+                );
+            } else {
+                self.book.stage_step_add(
+                    scenario_id,
+                    &self.step_draft.content,
+                    window,
+                );
+            }
+            self.step_draft = ComposerDraft::default();
+            self.book_status =
+                Status::good("step staged locally \u{2014} the advance writes it".to_string());
+            cx.notify();
+            return;
+        }
+        self.step_busy = true;
+        self.book_status = Status::pending("adding\u{2026}".to_string());
         let _ = self.order_tx.send(ToBinary::AddStep {
             scenario_id,
             content: self.step_draft.content.clone(),
@@ -14676,9 +15948,27 @@ impl IslandDemo {
         cx.notify();
     }
 
-    /// Remove a step from its scenario. Deletes AT ONCE — harsher than the
-    /// console's staged cut, and the panel's aside says so.
+    /// Remove a step from its scenario.
+    ///
+    /// WHILE PLANNING this STAGES the cut, so the step stands until the
+    /// advance and can be withdrawn; a step this draft is about to create is
+    /// simply dropped, because nothing was ever written for it. Outside
+    /// planning it deletes at once — harsher than the console's staged cut,
+    /// and the panel's aside says so.
     fn remove_step(&mut self, scenario_id: i64, step_id: i64, cx: &mut Context<Self>) {
+        if self.staging() {
+            if scenario_id < 0 {
+                self.book.drop_new_step(scenario_id, step_id);
+            } else if step_id < 0 {
+                self.book.drop_added_step(scenario_id, step_id);
+            } else {
+                self.book.stage_step_cut(scenario_id, step_id);
+            }
+            self.book_status =
+                Status::good("removal staged locally \u{2014} the advance writes it".to_string());
+            cx.notify();
+            return;
+        }
         if self.step_busy {
             return;
         }
@@ -14713,7 +16003,21 @@ impl IslandDemo {
             .child(weak_line("relate — hulls and nodes this step obliges".to_string()));
         match self.related_for(scenario_id, step_id) {
             None => {
-                ed = ed.child(weak_line("the related list could not be read".to_string()));
+                // A step this draft is about to create has no server read to
+                // show: its list is the draft's, and the draft's is what the
+                // editor is editing.
+                if let Some(refs) = self.book.related(scenario_id, step_id) {
+                    ed = ed.child(weak_line(format!(
+                        "obliges {} post(s), staged",
+                        refs.len()
+                    )));
+                } else if scenario_id < 0 || step_id < 0 {
+                    ed = ed.child(weak_line(
+                        "a staged step — its list is what the draft holds".to_string(),
+                    ));
+                } else {
+                    ed = ed.child(weak_line("the related list could not be read".to_string()));
+                }
             }
             Some(r) if r.personnel.is_empty() => {
                 ed = ed.child(weak_line("obliges nobody yet".to_string()));
@@ -14790,16 +16094,16 @@ impl IslandDemo {
     }
 
     /// The Book panel: the held game's scenarios with their steps (read),
-    /// plus the new-scenario title row (the one write).
+    /// plus the new-scenario title row and the staged rows the draft holds.
     ///
-    /// The read is the console's `book_view` without the staging: server
-    /// scenarios in book order with staged cuts hidden and staged adds
-    /// appended have no meaning here, because this shell stages nothing —
-    /// adds post at once, and the aside below states the difference. Steps
-    /// are numbered in order with their windows; empty content reads weak,
-    /// because unwritten is an authoring state, not an error. Remove, relate
-    /// and window editing are the staging machinery's, and are named in that
-    /// sentence rather than faked.
+    /// The read is the console's `book_view` WITH the staging: server
+    /// scenarios in book order, the steps this draft is about to add
+    /// appended and marked, the steps it is about to cut marked, and the
+    /// scenarios it is about to create drawn after the server's. Outside
+    /// planning there is nothing staged to draw, and the aside below says
+    /// so rather than faking a staging. Steps are numbered in order with
+    /// their windows; empty content reads weak, because unwritten is an
+    /// authoring state, not an error.
     fn book_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let rule = || div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE));
         // Content-sized, not `size_full`: this column is an ISLAND body now,
@@ -14847,7 +16151,7 @@ impl IslandDemo {
                     } else {
                         self.session.game.clone()
                     },
-                    self.session.book.len()
+                    self.session.book.len() + self.book.staged_news().count()
                 )),
         );
         col = col.child(rule());
@@ -14863,9 +16167,26 @@ impl IslandDemo {
         // the console's landing rule for an author reopening to keep working.
         let open_id = self
             .book_open_scenario
+            .or_else(|| {
+                self.staging()
+                    .then(|| self.book.staged_news().last().map(|s| s.local_id))
+                    .flatten()
+            })
             .or_else(|| self.session.book.first().map(|s| s.id));
         for sc in self.session.book.clone() {
             let open = Some(sc.id) == open_id;
+            // The steps this scenario will HAVE, which is the server's plus
+            // the ones this draft is about to add: a scenario's step count
+            // that ignored the staged steps would say "2 step(s)" about a
+            // scenario the operator has just given a third.
+            let staged_steps: Vec<crate::book::StagedStep> =
+                self.book.added_steps(sc.id).cloned().collect();
+            let cuts = sc
+                .steps
+                .iter()
+                .filter(|st| self.book.is_cut(sc.id, st.id))
+                .count();
+            let step_count = sc.steps.len() + staged_steps.len() - cuts;
             col = col.child(
                 div()
                     .id(("book-scenario", sc.id as usize))
@@ -14882,14 +16203,14 @@ impl IslandDemo {
                             .child(format!(
                                 "{}  -  {}",
                                 sc.title,
-                                plural(sc.steps.len(), "step")
+                                plural(step_count, "step")
                             )),
                     ),
             );
             if !open {
                 continue;
             }
-            if sc.steps.is_empty() {
+            if sc.steps.is_empty() && staged_steps.is_empty() {
                 col = col.child(
                     div()
                         .text_size(px(view::LABEL_PT))
@@ -14942,13 +16263,37 @@ impl IslandDemo {
                     );
                 // The relate count, when the fan-out read this step: the
                 // console's `{n} post(s)` tail. Absent is unreadable, and an
-                // unreadable step claims no count rather than zero.
-                if let Some(r) = self.related_for(sc.id, step.id) {
+                // unreadable step claims no count rather than zero. A staged
+                // list is the draft's own, and it counts too.
+                match self.book.related(sc.id, step.id) {
+                    Some(refs) => {
+                        row = row.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgba(ALERT_YELLOW))
+                                .child(format!("{} post(s) staged", refs.len())),
+                        );
+                    }
+                    None => {
+                        if let Some(r) = self.related_for(sc.id, step.id) {
+                            row = row.child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                                    .child(format!("{} post(s)", r.posts.len())),
+                            );
+                        }
+                    }
+                }
+                // A step staged for removal stands, marked, until the
+                // advance cuts it: vanishing before the write would hide the
+                // operator's own decision back at them.
+                if self.book.is_cut(sc.id, step.id) {
                     row = row.child(
                         div()
                             .text_size(px(view::LABEL_PT))
-                            .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                            .child(plural(r.posts.len(), "post")),
+                            .text_color(rgba(ALERT_YELLOW))
+                            .child("staged to leave".to_string()),
                     );
                 }
                 row = row
@@ -14977,8 +16322,172 @@ impl IslandDemo {
                     col = col.child(self.relate_editor(sc.id, step.id, cx));
                 }
             }
-            // The new-step row: content plus the window, both ends or
-            // neither — the console's row, with its hint and its aside.
+            // The steps this draft has added to a scenario the server holds.
+            // They stand in the book now, marked, because a step the
+            // operator can only see in a counter is a step they cannot
+            // check before the advance writes it.
+            for (k, staged) in staged_steps.iter().enumerate() {
+                let text = if staged.content.is_empty() {
+                    "(not written yet)".to_string()
+                } else {
+                    staged.content.clone()
+                };
+                let window = staged
+                    .start
+                    .clone()
+                    .zip(staged.end.clone())
+                    .map(|(a, b)| format!("{a}\u{2013}{b}"))
+                    .unwrap_or_else(|| "\u{2014}".to_string());
+                let step_id = staged.local_id;
+                let scenario_id = sc.id;
+                let row = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .font_family(view::FACE_MACHINE)
+                            .text_size(px(11.0))
+                            .text_color(rgba(BODY_SILVER))
+                            .child(format!("{:>2}", sc.steps.len() + k + 1)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgba(if staged.content.is_empty() {
+                                BODY_SILVER.with_alpha(204)
+                            } else {
+                                MAP_INK
+                            }))
+                            .child(text),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .font_family(view::FACE_MACHINE)
+                            .text_size(px(10.0))
+                            .text_color(rgba(BODY_SILVER))
+                            .child(window),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgba(ALERT_YELLOW))
+                            .child("staged".to_string()),
+                    )
+                    .child(
+                        div()
+                            .id(("book-remove-step", step_id as usize))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.remove_step(scenario_id, step_id, cx);
+                            }))
+                            .child(button("remove", true, false, false)),
+                    );
+                col = col.child(row);
+            }
+        }
+
+        // The scenarios this draft is about to create. They stand in the book
+        // now, marked, because a scenario the operator can only see in a
+        // counter is one they cannot check before the advance writes it.
+        for news in self.book.staged_news().cloned().collect::<Vec<_>>() {
+            let open = Some(news.local_id) == open_id;
+            col = col.child(
+                div()
+                    .id(("book-scenario-new", news.local_id as usize))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.book_open_scenario = Some(news.local_id);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgba(if open { RADAR_CYAN } else { MAP_INK }))
+                            .child(format!("{}  -  {} step(s)", news.title, news.steps.len())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgba(ALERT_YELLOW))
+                            .child("staged".to_string()),
+                    ),
+            );
+            if !open {
+                continue;
+            }
+            for (n, step) in news.steps.iter().enumerate() {
+                let text = if step.content.is_empty() {
+                    "(not written yet)".to_string()
+                } else {
+                    step.content.clone()
+                };
+                let window = step
+                    .start
+                    .clone()
+                    .zip(step.end.clone())
+                    .map(|(a, b)| format!("{a}\u{2013}{b}"))
+                    .unwrap_or_else(|| "\u{2014}".to_string());
+                let step_id = step.local_id;
+                let scenario_id = news.local_id;
+                col = col.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .font_family(view::FACE_MACHINE)
+                                .text_size(px(11.0))
+                                .text_color(rgba(BODY_SILVER))
+                                .child(format!("{:>2}", n + 1)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgba(if step.content.is_empty() {
+                                    BODY_SILVER.with_alpha(204)
+                                } else {
+                                    MAP_INK
+                                }))
+                                .child(text),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .font_family(view::FACE_MACHINE)
+                                .text_size(px(10.0))
+                                .text_color(rgba(BODY_SILVER))
+                                .child(window),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgba(ALERT_YELLOW))
+                                .child("staged".to_string()),
+                        )
+                        .child(
+                            div()
+                                .id(("book-remove-step", step_id as usize))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.remove_step(scenario_id, step_id, cx);
+                                }))
+                                .child(button("remove", true, false, false)),
+                        ),
+                );
+            }
+        }
+
+        // The new-step row: content plus the window, both ends or
+        // neither — the console's row, with its hint and its aside. It
+        // belongs to the OPEN scenario, live or staged, so it is drawn
+        // only when there is one: a step needs a scenario to belong to.
+        if open_id.is_some() {
             col = col.child(
                 div()
                     .text_size(px(view::DENSE_PT))
@@ -15059,7 +16568,11 @@ impl IslandDemo {
                     div()
                         .text_size(px(view::LABEL_PT))
                         .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                        .child("adds and removes post at once — the console stages and syncs on advance"),
+                        .child(if self.staging() {
+                            "edits are staged here and written through at the advance"
+                        } else {
+                            "adds and removes post at once — the console stages and syncs on advance"
+                        }),
                 )
                 .child(
                     div()
@@ -16728,42 +18241,85 @@ impl Render for IslandDemo {
             // The console's own pair: sand while the step waits on this
             // caller, signal green once declared or when only naming play.
             let dot = if rem.needs_you { WARNING_SAND } else { SIGNAL_GREEN };
-            root = root.child(
-                div()
-                    .absolute()
-                    .top(px(34.0))
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .h(px(22.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(10.0))
-                    .overflow_hidden()
-                    .bg(rgba(CONSOLE_NIGHT))
-                    .id("step-reminder")
-                    .on_scroll_wheel(swallow_wheel)
-                    .cursor_pointer()
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.open_board(cx);
-                    }))
-                    .child(
-                        div()
-                            .w(px(8.0))
-                            .h(px(8.0))
-                            .rounded(px(4.0))
-                            .bg(rgba(dot))
-                            .flex_shrink_0(),
+            // THE COMMANDER'S STEP VERB, ON THE STRIP THAT ASKS FOR IT
+            // (ADR-0021). The strip says what this caller owes, so the
+            // answer belongs on the strip: a commander who has to open the
+            // board to declare readiness has been asked a question the
+            // screen did not let them answer.
+            //
+            // The label NAMES THE STEP, because the game-level readiness
+            // ("ready to start") is a different fact and the two must not
+            // read as one.
+            let step_verb = if self.step_declare_offered()
+                && self.scenario_audience() == ScenarioAudience::Commander
+            {
+                self.asking_step().map(|(scenario_id, step_id, you_ready)| {
+                    (
+                        scenario_id,
+                        step_id,
+                        if you_ready { "WITHDRAW" } else { "READY FOR THIS STEP" },
+                        !you_ready,
                     )
-                    .child(
-                        div()
-                            .font_family(view::FACE_HUMAN)
-                            .text_size(px(view::DENSE_PT))
-                            .text_color(rgba(MAP_INK))
-                            .child(rem.text),
-                    ),
-            );
+                })
+            } else {
+                None
+            };
+            let mut strip = div()
+                .absolute()
+                .top(px(34.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                // The strip grows by the verb's own height: a pill clipped by
+                // the band that carries it is a control the operator cannot
+                // read, and the band is the only place the question is asked.
+                .h(px(if step_verb.is_some() { 28.0 } else { 22.0 }))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(10.0))
+                .overflow_hidden()
+                .bg(rgba(CONSOLE_NIGHT))
+                .id("step-reminder")
+                // The strip is over the map, so a wheel over it is a wheel
+                // over the console and not a zoom of the map.
+                .on_scroll_wheel(swallow_wheel)
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.open_board(cx);
+                }))
+                .child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(dot))
+                        .flex_shrink_0(),
+                )
+                .child(
+                    div()
+                        .font_family(view::FACE_HUMAN)
+                        .text_size(px(view::DENSE_PT))
+                        .text_color(rgba(MAP_INK))
+                        .child(rem.text),
+                );
+            if let Some((scenario_id, step_id, label, ready)) = step_verb {
+                strip = strip.child(
+                    div()
+                        .id("step-reminder-declare")
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            // The strip's own click opens the board; this one
+                            // answers the question, so the board does not
+                            // open under it.
+                            cx.stop_propagation();
+                            view.send_step_declare(scenario_id, step_id, ready, cx);
+                        }))
+                        .child(button(label, true, self.step_declare_busy, false)),
+                );
+            }
+            root = root.child(strip);
         }
         // THE ARMED PIN. One line, where the reminder rides, because it is
         // the same kind of thing: the console telling the operator what the
@@ -18194,6 +19750,15 @@ pub struct SessionView {
     /// The pieces of the exercise: hulls assigned to the held game, the
     /// relate editor's checkbox list. Best-effort like the book.
     pub pieces: Vec<PieceView>,
+    /// Which piece is aboard which: the child unit id and the host unit id.
+    ///
+    /// A hull's EMBARKATION HOST is on no piece row — the server publishes
+    /// it as the CONTENTS of the host, one read per piece — so the mirror
+    /// has to be built from those reads. Without it the diff cannot see that
+    /// a hull is already aboard, and every advance re-embarks it: the
+    /// attach endpoint refuses a unit that is "already inside something",
+    /// and the whole advance stops there.
+    pub hosts: HashMap<i64, i64>,
     /// The task organisation as Minos last held it: the forest of groups with
     /// their commanders and member hulls. Best-effort like the book; the
     /// shell drafts against it locally and writes the whole draft through at
@@ -18284,7 +19849,14 @@ pub struct RoleRow {
 #[derive(Clone, Debug, Default)]
 pub struct GameFacts {
     /// `scenario` in the seed. The server's word, shown as read.
-    pub mode: String,
+    ///
+    /// PARSED ONCE, WHERE THE SESSION IS READ, into the mode the rules
+    /// speak of: every rule about a mode is a function of this value, and a
+    /// rule that compared the spelling at each site would be a rule that
+    /// could be spelled two ways. `Unknown` is the default, so a session
+    /// read that failed leaves the exercise with no mode at all — and no
+    /// mode means no helm, no scenario surface and no clock verb.
+    pub mode: crate::gamestate::GameMode,
     /// The pace as the operator reads it: `standard`, `fast`, or the raw
     /// token when the server names one this build does not know. An
     /// unrecognised pace is NOT a pace — it keeps its ceremony, which is the
@@ -18432,10 +20004,22 @@ impl SessionDraft {
 
 /// The three modes the server documents, in the console's order, with the
 /// console's own one-line meanings.
+///
+/// ADR-0021: the `scenario` line used to say that "personnel steer like
+/// maneuver", which was the SERVER's rule and not the console's. The
+/// console offers no free-standing helm in a scenario exercise at all: the
+/// exercise is played through its steps, and the commander's verb on the
+/// current step is to declare readiness for it.
 pub const SESSION_MODES: [(&str, &str); 3] = [
     ("maneuver", "the exercise integrates helm orders"),
-    ("scenario", "personnel steer like maneuver; the Game Master plays steps around them"),
-    ("static", "positions are set by hand — helm orders are refused"),
+    (
+        "scenario",
+        "steps are played by the Game Master; the commander declares readiness",
+    ),
+    (
+        "static",
+        "the positions are set by hand — drag a hull on the map; orders are refused",
+    ),
 ];
 
 /// Which compose field has the keystrokes: the judgement score or the
@@ -18488,6 +20072,24 @@ pub enum ToBinary {
     /// mercator. The answer is a re-read session on `create_feed`, like every
     /// other write here.
     DeployUnit { unit_id: i64, fx: f64, fy: f64 },
+    /// Put a hull where the pointer says, in an exercise whose positions are
+    /// SET BY HAND.
+    ///
+    /// ADR-0021. The same fractions the deploy names, and the same
+    /// unprojection, but the route is a different one: no heading, no speed
+    /// and no instant of the client's own — the server stamps the jump from
+    /// the exercise's clock, because a hull that is set is stationary until
+    /// somebody sets it again. The answer is a re-read session, like every
+    /// other write here.
+    SetPosition { unit_id: i64, fx: f64, fy: f64 },
+    /// ONE FRAME of a drag, published to the other participants' boards and
+    /// recorded nowhere.
+    ///
+    /// The preview route exists because a commit per pointer movement would
+    /// put a row in the chain for every frame, and a jump per frame is not
+    /// a track. The frames go out while the drag is in the air; the commit
+    /// is the release.
+    PreviewPosition { unit_id: i64, fx: f64, fy: f64 },
     /// Assign a register hull and deploy it, in one gesture: the drop of a
     /// hull the exercise does not hold yet. The commander is the
     /// operator's own seat (the shell refuses seatless first); the binary
@@ -18570,16 +20172,53 @@ pub enum ToBinary {
     /// shell diffed against, at the moment of the advance.
     ///
     /// The binary plans the force first; a `ForceGap` refuses the move WHOLE
-    /// and posts nothing. Otherwise it posts the force, then the roster, then
-    /// the task organisation — each whole, the first refusal stopping the
-    /// rest — and only then transitions the game, answering with the re-read
-    /// session.
+        /// and posts nothing. Otherwise it posts the seats, then the force,
+        /// then the unseats, then the task organisation, then the BOOK — each
+        /// whole, the first refusal stopping the rest — and only then
+        /// transitions the game, answering with the re-read session.
+        ///
+        /// THE WINDOW RIDES ALONG, because the exercise's terms are part of the
+        /// plan and Minos accepts a change to them only while the game is in
+        /// `planning` — so a window written after the move would be refused. It
+        /// goes with the drafts rather than being written on its own, for the
+        /// same reason the drafts are not written on their own: one decision,
+        /// one flush, one answer.
+        ///
+        /// THE BOOK GOES LAST, and the order is the server's: a step's related
+        /// list names hulls and task-organisation nodes, so the force and the
+        /// groups have to exist before it is posted; a new scenario's steps have
+        /// to come after the scenario; and a removed step has to come after the
+        /// scenario it is removed from exists.
     AdvancePreparation {
         force: crate::force::ForceDraft,
         live_hulls: Vec<crate::force::LiveHull>,
         roster: crate::roster::RosterDraft,
         live_seats: Vec<crate::roster::LiveSeat>,
         groups: Vec<crate::groups::GroupWrite>,
+            /// The staged planned window: the real clock's day and two ends, and
+            /// the exercise clock's two ends.
+            window: crate::window::WindowDraft,
+            book: crate::book::BookDraft,
+            live_scenarios: Vec<crate::book::LiveScenario>,
+        },
+        /// WRITE THE STAGED WRITES THROUGH, and change nothing else.
+        ///
+        /// The one exception to local-first planning: the operator asks for the
+        /// staged force, roster, task organisation and book to reach the server
+        /// now, and the exercise's PHASE does not move. It is the same flush the
+        /// advance runs, in the same order, minus the transition.
+        ///
+        /// The drafts and their live mirrors travel together for the same
+        /// reason the advance's do: the binary plans them against the same read
+        /// the shell diffed against.
+        SyncStaged {
+            force: crate::force::ForceDraft,
+            live_hulls: Vec<crate::force::LiveHull>,
+            roster: crate::roster::RosterDraft,
+            live_seats: Vec<crate::roster::LiveSeat>,
+            groups: Vec<crate::groups::GroupWrite>,
+            book: crate::book::BookDraft,
+            live_scenarios: Vec<crate::book::LiveScenario>,
     },
     /// The game clock's multiplier, from Control's Apply. One field, one
     /// endpoint (`PATCH /games/{id}/time-factor`), and the answer is a re-read
@@ -18729,6 +20368,78 @@ pub struct CreatedSession {
     /// entitled to be told so rather than left with "replayed". Empty is the
     /// ordinary answer — most of these writes say nothing beyond "read back".
     pub note: String,
+        /// The refusal, when the write was REFUSED. `None` is the ordinary
+        /// answer.
+        ///
+        /// A REFUSED WRITE STILL ANSWERS WITH THE SESSION, and that is the whole
+        /// reason this field exists. The server may have taken part of the write
+        /// before it refused the rest, so the exercise is read back and the
+        /// answer carries it: the console's mirror becomes the truth, and the
+        /// next attempt diffs against it instead of re-issuing what the server
+        /// already took. A refusal that arrives with no session leaves the
+        /// console holding a frame the server has already moved past.
+        ///
+        /// The drafts are NOT re-seeded from that session — the operator's
+        /// staged work is theirs, and a refusal is not a reason to throw it
+        /// away. The pane that answers this is the one that knows the
+        /// difference.
+        pub refusal: Option<String>,
+        /// WHICH WRITE this answer belongs to.
+        ///
+        /// The drain used to dispatch by FLAG ORDER: the first answer matched
+        /// whichever latch was set and cleared it, so a second answer in flight
+        /// fell through to the catch-all and was applied as somebody else's. Two
+        /// book writes were enough — the second wiped the session composer's
+        /// draft and re-seeded the force draft underneath the operator. The
+        /// answer now says who asked, and the drain reads that rather than
+        /// guessing from latches.
+        pub write: WriteId,
+    }
+
+    /// Which write an answer belongs to.
+    ///
+    /// One name per write the shell can have in flight, because "one answer may
+    /// never be applied as another's" is a property of the SEAM: the write says
+    /// what it was, and the drain hands the answer to that write's handler.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WriteId {
+        /// A new scenario in the book.
+        Book,
+        /// A step added to, or cut from, a scenario.
+        Step,
+        /// A step's related list.
+        Relate,
+        /// This seat's readiness.
+        Readiness,
+        /// This seat's declaration on the asking step.
+        StepDeclare,
+        /// A Game Master verb at a step.
+        StepVerb,
+        /// A telegram broadcast.
+        Message,
+        /// The roster draft written through.
+        Roster,
+        /// The force draft written through.
+        Force,
+        /// A hull placed or embarked outside planning.
+        Deploy,
+        /// A hull's position set by hand, in a static exercise.
+        Position,
+        /// The staged draft written through and the game moved on.
+        Prepare,
+        /// The staged draft written through, phase unchanged.
+        Sync,
+        /// The game clock's multiplier.
+        Factor,
+        /// The move into execution.
+        Advance,
+        /// The end of the session.
+        End,
+        /// A hold of another game.
+        Hold,
+        /// A new session. The catch-all's own name, for the one write that
+        /// really is "a new hold".
+        Session,
 }
 
 impl CreatedSession {
@@ -18737,7 +20448,37 @@ impl CreatedSession {
         Self {
             session,
             note: String::new(),
+            refusal: None,
+            write: WriteId::Session,
         }
+    }
+
+    /// A write that answered with the re-read session, and says which write
+    /// it was.
+    pub fn for_write(session: SessionView, write: WriteId) -> Self {
+        Self {
+            session,
+            note: String::new(),
+            refusal: None,
+            write,
+        }
+    }
+}
+
+/// A refusal, and the write it belongs to.
+///
+/// The refusal travels WITH the write's name, because a refusal must land
+/// on the panel the request left. Two writes in flight must not have the
+/// second refusal read as the first's — the same rule the answer follows.
+#[derive(Clone, Debug)]
+pub struct WriteRefusal {
+    pub write: WriteId,
+    pub why: String,
+}
+
+impl WriteRefusal {
+    pub fn new(write: WriteId, why: String) -> Self {
+        Self { write, why }
     }
 }
 
@@ -18749,9 +20490,10 @@ pub type SignInFeed =
 
 /// The create answer, drained like every other feed. `Err` carries what to
 /// put on the form — a refusal the operator can act on, never a swallowed
-/// failure.
-pub type CreateFeed =
-    std::boxed::Box<dyn FnMut() -> Option<Result<CreatedSession, String>> + Send + 'static>;
+/// failure — and the write the refusal belongs to.
+pub type CreateFeed = std::boxed::Box<
+    dyn FnMut() -> Option<Result<CreatedSession, WriteRefusal>> + Send + 'static,
+>;
 
 /// The shell's sink: the binary owns the other end and every effect.
 pub type OrderSink = std::sync::mpsc::Sender<ToBinary>;
@@ -18878,6 +20620,7 @@ impl Default for SessionView {
             judgements: Vec::new(),
             reviews: Vec::new(),
             pieces: Vec::new(),
+            hosts: HashMap::new(),
             groups: Vec::new(),
             echelons: Vec::new(),
             related: Vec::new(),
@@ -18910,6 +20653,11 @@ pub struct SessionRow {
     pub state: String,
     pub my_role: String,
     pub judge: bool,
+    /// The exercise's mode, as the server states it. The picker shows it,
+    /// because the mode decides what the console may offer and an operator
+    /// holding several exercises cannot tell a scenario exercise from a
+    /// maneuver one by its name.
+    pub mode: String,
 }
 
 /// One piece of the exercise: a hull assigned to the held game. The server's
@@ -20610,120 +22358,22 @@ pub fn run(
                 // A created session is HELD, the console's `apply_created_game`:
                 // the new game arrives read back rather than assumed, the form
                 // clears, and the panel closes. Failure goes back on the form.
-                // The busy flags say which panel asked: the composer holds a
-                // new game and closes; the book, its steps and its relate
-                // editor, and the readiness row hold the same game and stay
-                // open — each answer is consumed once, so the flags cannot
-                // cross even with two writes in flight. Step and relate
-                // writes share the book's apply: they return the same re-read
-                // session.
+                // The create answer, and the drain that applies it.
+                //
+                // THE ANSWER SAYS WHICH WRITE IT IS. The drain used to
+                // dispatch by FLAG ORDER: the first answer matched whichever
+                // latch was set and cleared it, so a second answer in flight
+                // matched nothing and fell through to the catch-all — which
+                // wiped the session composer's draft and re-seeded the force
+                // draft underneath the operator. Two book writes were enough.
+                // Now the write's name travels with the answer and the
+                // drain hands it to that write's own handler.
                 if let Some(outcome) = create_feed() {
                     let _ = cx.update(|app| {
                         create_drain.update(app, |root: &mut IslandDemo, cx| {
                             match outcome {
-                                Ok(created) => {
-                                    if root.book_busy || root.step_busy {
-                                        root.apply_book(created.session);
-                                    } else if root.relate_busy {
-                                        root.apply_relate(created.session);
-                                    } else if root.readiness_busy {
-                                        root.apply_readiness(created.session);
-                                    } else if root.step_declare_busy {
-                                        root.apply_step_declare(created.session);
-                                    } else if root.step_verb_busy {
-                                        root.apply_step_verb(created.session, created.note);
-                                    } else if root.msg_busy {
-                                        root.apply_message(created.session);
-                                    } else if root.roster_busy {
-                                        root.roster_busy = false;
-                                        root.roster_status.clear();
-                                        root.reseed_drafts();
-                                        root.session = created.session;
-                                    } else if root.force_busy {
-                                        root.force_busy = false;
-                                        root.force_status.clear();
-                                        root.reseed_drafts();
-                                        root.session = created.session;
-                                    } else if root.deploy_busy {
-                                        root.deploy_busy = false;
-                                        root.force_status.clear();
-                                        root.reseed_drafts();
-                                        root.session = created.session;
-                                    } else if root.prepare_busy {
-                                        // The advance wrote the staged draft
-                                        // through and moved the game on. The
-                                        // re-read session REPLACES the held
-                                        // one first: `reseed_drafts` reads it,
-                                        // and the drafts it seeds are now the
-                                        // record the server just took, so the
-                                        // staging latches clear with them.
-                                        root.prepare_busy = false;
-                                        root.prepare_status.clear();
-                                        root.session = created.session;
-                                        root.reseed_drafts();
-                                    } else if root.factor_busy {
-                                        root.apply_factor(created.session);
-                                    } else if root.advance_busy {
-                                        root.advance_busy = false;
-                                        root.advance_status.clear();
-                                        root.session = created.session;
-                                    } else if root.end_busy {
-                                        root.apply_end(created.session);
-                                    } else if root.hold_busy {
-                                        root.apply_hold(created.session);
-                                    } else {
-                                        root.apply_created(created.session);
-                                    }
-                                }
-                                Err(why) => {
-                                    if root.book_busy || root.step_busy {
-                                        root.book_busy = false;
-                                        root.step_busy = false;
-                                        root.book_status = Status::bad(why);
-                                    } else if root.relate_busy {
-                                        root.relate_busy = false;
-                                        root.book_status = Status::bad(why);
-                                    } else if root.readiness_busy {
-                                        root.readiness_busy = false;
-                                        root.readiness_status = Status::bad(why);
-                                    } else if root.step_declare_busy {
-                                        root.step_declare_busy = false;
-                                        root.step_declare_status = Status::bad(why);
-                                    } else if root.step_verb_busy {
-                                        root.step_verb_busy = false;
-                                        root.step_verb_status = Status::bad(why);
-                                    } else if root.msg_busy {
-                                        root.msg_busy = false;
-                                        root.msg_status = Status::bad(why);
-                                    } else if root.roster_busy {
-                                        root.roster_busy = false;
-                                        root.roster_status = Status::bad(why);
-                                    } else if root.force_busy {
-                                        root.force_busy = false;
-                                        root.force_status = Status::bad(why);
-                                    } else if root.deploy_busy {
-                                        root.deploy_busy = false;
-                                        root.force_status = Status::bad(why);
-                                    } else if root.prepare_busy {
-                                        root.prepare_busy = false;
-                                        root.prepare_status = Status::bad(why);
-                                    } else if root.factor_busy {
-                                        root.factor_busy = false;
-                                        root.factor_status = Status::bad(why);
-                                    } else if root.advance_busy {
-                                        root.advance_busy = false;
-                                        root.advance_status = Status::bad(why);
-                                    } else if root.end_busy {
-                                        root.end_busy = false;
-                                        root.end_status = Status::bad(why);
-                                    } else if root.hold_busy {
-                                        root.hold_busy = false;
-                                        root.hold_status = Status::bad(why);
-                                    } else {
-                                        root.compose_busy = false;
-                                        root.compose_status = Status::bad(why);
-                                    }
-                                }
+                                    Ok(created) => root.apply_answer(created),
+                                    Err(refusal) => root.apply_refusal(refusal),
                             }
                             cx.notify();
                         })
@@ -21616,6 +23266,9 @@ mod tests {
                 roster: _,
                 live_seats,
                 groups: _,
+                window: _,
+                book: _,
+                live_scenarios: _,
             } => {
                 assert!(force.contains(1), "the staged hull crossed");
                 assert!(
@@ -21634,6 +23287,83 @@ mod tests {
             !cx.update(|_window, app| view.update(app, |demo, cx| demo.prepare_advance(cx))),
             "an advance in flight sends nothing more"
         );
+    }
+
+    /// The planned window rides with the advance, because Minos accepts a
+    /// change to the exercise's terms only while the game is in `planning`
+    /// — so the advance is the last moment the window can be written, and a
+    /// window written on its own would be a second way to reach the same
+    /// record.
+    #[gpui::test]
+    fn the_advance_carries_the_staged_window(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                // The draft AND the game it was seeded for: the editor
+                // re-seeds from the server's read when the game changes, and
+                // a window staged for THIS game has to survive that.
+                demo.window_draft = Some(crate::window::WindowDraft {
+                    actual_date: "2026-11-01".into(),
+                    actual_start: "0800".into(),
+                    actual_end: "1600".into(),
+                    assumed_start: "0800".into(),
+                    assumed_end: "1600".into(),
+                });
+                demo.window_seeded_for = 45;
+            })
+        });
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.prepare_advance(cx)));
+        match rx.try_recv().expect("the advance reached the sink") {
+            ToBinary::AdvancePreparation { window, .. } => {
+                assert_eq!(window.actual_date, "2026-11-01");
+                assert_eq!(window.actual_start, "0800");
+                assert_eq!(window.assumed_end, "1600");
+            }
+            other => panic!("expected an advance, got {other:?}"),
+        }
+    }
+
+    /// THE EDITOR STARTS FROM THE WINDOW THE EXERCISE ALREADY HOLDS. The
+    /// operator edits the terms the server gave, not five empty fields: a
+    /// form that starts blank invites a second, different window.
+    #[gpui::test]
+    fn the_window_editor_starts_from_the_window_the_server_holds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut facts = GameFacts::default();
+        facts.actual_start = "2026-11-01T08:00:00Z".to_string();
+        facts.actual_end = "2026-11-01T16:00:00Z".to_string();
+        facts.assumed_start = "2000-01-01T08:00:00Z".to_string();
+        facts.assumed_end = "2000-01-01T16:00:00Z".to_string();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            facts,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        let draft = cx.update(|_window, app| view.update(app, |demo, _| demo.window_draft()));
+        assert_eq!(draft.actual_date, "2026-11-01");
+        assert_eq!(draft.actual_start, "0800");
+        assert_eq!(draft.actual_end, "1600");
+        assert_eq!(draft.assumed_start, "0800");
+        assert_eq!(draft.assumed_end, "1600");
+        assert_eq!(draft.problem(), None, "the server's own window is a window");
     }
 
     /// A drop on bare water while planning unprojects the drop point LOCALLY
@@ -22685,6 +24415,13 @@ mod tests {
         let session = SessionView {
             execution: true,
             my_role: "Commando".to_string(),
+            // A MANEUVER EXERCISE (ADR-0021): the helm belongs to that mode
+            // alone, so a session that named no mode would have no helm to
+            // send with.
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
             mine: vec![MyShip {
                 id: "8".to_string(),
                 label: "KRI Test (KRI-1)".to_string(),
@@ -24223,6 +25960,7 @@ mod tests {
                     id: 44,
                     name: "GPUI step proof".to_string(),
                     state: "execution".to_string(),
+            mode: String::new(),
                     my_role: "Commando".to_string(),
                     judge: false,
                 },
@@ -24230,6 +25968,7 @@ mod tests {
                     id: 9,
                     name: "Game 8".to_string(),
                     state: "planning".to_string(),
+            mode: String::new(),
                     my_role: String::new(),
                     judge: false,
                 },
@@ -24307,6 +26046,7 @@ mod tests {
                     id: 44,
                     name: "GPUI step proof".to_string(),
                     state: "execution".to_string(),
+            mode: String::new(),
                     my_role: "Commando".to_string(),
                     judge: false,
                 },
@@ -24314,6 +26054,7 @@ mod tests {
                     id: 9,
                     name: "Game 8".to_string(),
                     state: "planning".to_string(),
+            mode: String::new(),
                     my_role: String::new(),
                     judge: false,
                 },
@@ -25189,7 +26930,15 @@ mod tests {
                 fixture_roster(),
                 8,
                 0,
-                SessionView::default(),
+                SessionView {
+                    // A MANEUVER EXERCISE (ADR-0021): the clock's pair stays
+                    // as it is there, and the verb follows the last answer.
+                    facts: GameFacts {
+                        mode: crate::gamestate::GameMode::Maneuver,
+                        ..GameFacts::default()
+                    },
+                    ..SessionView::default()
+                },
                 tx,
             );
             demo.session.game_id = 5;
@@ -25489,6 +27238,10 @@ mod tests {
         let session = SessionView {
             execution: true,
             my_role: "Commando".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
             mine: vec![
                 MyShip { id: "8".to_string(), label: "KRI First (KRI-1)".to_string() },
                 MyShip { id: "9".to_string(), label: "KRI Second (KRI-2)".to_string() },
@@ -25536,6 +27289,10 @@ mod tests {
         let session = SessionView {
             execution: true,
             my_role: "Commando".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
             mine: vec![MyShip { id: "8".to_string(), label: "KRI First".to_string() }],
             ..SessionView::default()
         };
@@ -25797,6 +27554,450 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing reached the sink");
     }
 
+    /// The helm is SILENT in a scenario exercise: no order, no message, no
+    /// sink.
+    ///
+    /// ADR-0021. The SERVER would take an order here and HOLD it until a
+    /// step released it, so a helm that posted one would be offering a verb
+    /// whose every answer is "held" — and the operator would learn what
+    /// that means from the server rather than from the screen. The
+    /// console's own verb on the current step is the declaration.
+    #[gpui::test]
+    fn the_helm_is_silent_in_a_scenario_exercise(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            my_role: "Commando".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Scenario,
+                ..GameFacts::default()
+            },
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Test (KRI-1)".to_string(),
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.helm_heading = Some(90.0);
+            demo.helm_speed = Some(12.0);
+            demo
+        });
+        let sent = cx.update(|_window, app| view.update(app, |demo, _| demo.send_helm()));
+        assert!(!sent, "a scenario exercise has no helm to send with");
+        assert!(rx.try_recv().is_err(), "nothing reached the sink");
+    }
+
+    /// And the helm is SILENT in a static exercise: the server refuses every
+    /// order there with a 409, and a static exercise's positions are set by
+    /// hand instead.
+    #[gpui::test]
+    fn the_helm_is_silent_in_a_static_exercise(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            my_role: "Commando".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Static,
+                ..GameFacts::default()
+            },
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Test (KRI-1)".to_string(),
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.helm_heading = Some(90.0);
+            demo.helm_speed = Some(12.0);
+            demo
+        });
+        let sent = cx.update(|_window, app| view.update(app, |demo, _| demo.send_helm()));
+        assert!(!sent, "a static exercise refuses every order");
+        assert!(rx.try_recv().is_err(), "nothing reached the sink");
+    }
+
+    /// And the helm is SILENT when the mode is UNKNOWN: the mode the server
+    /// did not say, or a word this build has not heard of, is not a mode
+    /// that may steer. It fails closed.
+    #[gpui::test]
+    fn the_helm_is_silent_when_the_mode_is_unknown(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            my_role: "Commando".to_string(),
+            // No mode at all: the read of the session's terms failed, or the
+            // server named a mode this build does not know.
+            facts: GameFacts::default(),
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Test (KRI-1)".to_string(),
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.helm_heading = Some(90.0);
+            demo.helm_speed = Some(12.0);
+            demo
+        });
+        let sent = cx.update(|_window, app| view.update(app, |demo, _| demo.send_helm()));
+        assert!(!sent, "an unknown mode is not a mode that may steer");
+        assert!(rx.try_recv().is_err(), "nothing reached the sink");
+    }
+
+    /// And the helm DOES order in a maneuver exercise: the same call, the
+    /// same draft, and the order goes out. A rule that silenced the helm
+    /// everywhere would pass the three refusals above and leave the
+    /// console with no instrument at all.
+    #[gpui::test]
+    fn the_helm_orders_in_a_maneuver_exercise(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            my_role: "Commando".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Test (KRI-1)".to_string(),
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.helm_heading = Some(90.0);
+            demo.helm_speed = Some(12.0);
+            demo
+        });
+        let sent = cx.update(|_window, app| view.update(app, |demo, _| demo.send_helm()));
+        assert!(sent, "a maneuver exercise orders");
+        match rx.try_recv().expect("the order reached the sink") {
+            ToBinary::Helm(order) => assert_eq!(order.unit_id, "8"),
+            other => panic!("expected a helm order, got {other:?}"),
+        }
+    }
+
+    /// The RAIL draws no helm outside a maneuver exercise: the channel
+    /// carries the mode's sentence where the instruments were.
+    ///
+    /// ADR-0021. NOT a greyed-out compass — an instrument that cannot be
+    /// used reads as a control that failed — and not an empty channel,
+    /// which reads as nothing at all. The sentence names the remedy the
+    /// mode has: the step for a scenario exercise, the hand for a static
+    /// one.
+    #[gpui::test]
+    fn the_rail_draws_no_helm_outside_maneuver(cx: &mut gpui::TestAppContext) {
+        for (mode, expected) in [
+            (
+                crate::gamestate::GameMode::Scenario,
+                RailHelm::Sentence(crate::mode_rules::helm_sentence(
+                    crate::gamestate::GameMode::Scenario,
+                )),
+            ),
+            (
+                crate::gamestate::GameMode::Static,
+                RailHelm::SetByHand {
+                    sentence: crate::mode_rules::helm_sentence(
+                        crate::gamestate::GameMode::Static,
+                    ),
+                },
+            ),
+            (
+                crate::gamestate::GameMode::Unknown,
+                RailHelm::Sentence(crate::mode_rules::helm_sentence(
+                    crate::gamestate::GameMode::Unknown,
+                )),
+            ),
+        ] {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let session = SessionView {
+                execution: true,
+                facts: GameFacts {
+                    mode,
+                    ..GameFacts::default()
+                },
+                ..SessionView::default()
+            };
+            let (view, cx) = cx.add_window_view(|_, _| {
+                IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+            });
+            let rail = cx.update(|_window, app| view.read(app).rail_helm());
+            assert_eq!(rail, expected, "{mode:?} drew the wrong channel");
+        }
+        // And the maneuver exercise draws the instruments.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let rail = cx.update(|_window, app| view.read(app).rail_helm());
+        assert_eq!(rail, RailHelm::Instruments, "a maneuver exercise steers");
+    }
+
+    /// The step's DECLARATION is a scenario exercise's verb, and it is
+    /// absent outside one.
+    ///
+    /// ADR-0021: the pill is not drawn and the write refuses. Both halves
+    /// matter — a drawn button over a refused write is a lie about what the
+    /// console does, and a refusing button nobody can see is a mystery.
+    #[gpui::test]
+    fn the_step_declare_is_absent_outside_a_scenario_exercise(cx: &mut gpui::TestAppContext) {
+        for mode in [
+            crate::gamestate::GameMode::Maneuver,
+            crate::gamestate::GameMode::Static,
+            crate::gamestate::GameMode::Unknown,
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let session = SessionView {
+                execution: true,
+                facts: GameFacts {
+                    mode,
+                    ..GameFacts::default()
+                },
+                step: Some(StepView {
+                    assumed_time: "2000-01-01T10:00:00+07:00".to_string(),
+                    playing: None,
+                    asking: Some(StepAsk {
+                        scenario_id: 12,
+                        step_id: 16,
+                        scenario: "First move".to_string(),
+                        content: "Take station east of the buoy".to_string(),
+                        required: 1,
+                        outstanding: 1,
+                        you_ready: false,
+                    }),
+                }),
+                ..SessionView::default()
+            };
+            let (view, cx) = cx.add_window_view(|_, _| {
+                IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+            });
+            let offered = cx.update(|_window, app| view.read(app).step_declare_offered());
+            assert!(!offered, "{mode:?} has no step to declare for");
+            let sent = cx.update(|_window, app| {
+                view.update(app, |demo, cx| demo.send_step_declare(12, 16, true, cx))
+            });
+            assert!(!sent, "{mode:?} refuses the declaration");
+            assert!(rx.try_recv().is_err(), "nothing reached the sink");
+        }
+        // And in a scenario exercise it is there, and it declares.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Scenario,
+                ..GameFacts::default()
+            },
+            step: Some(StepView {
+                assumed_time: "2000-01-01T10:00:00+07:00".to_string(),
+                playing: None,
+                asking: Some(StepAsk {
+                    scenario_id: 12,
+                    step_id: 16,
+                    scenario: "First move".to_string(),
+                    content: "Take station east of the buoy".to_string(),
+                    required: 1,
+                    outstanding: 1,
+                    you_ready: false,
+                }),
+            }),
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let offered = cx.update(|_window, app| view.read(app).step_declare_offered());
+        assert!(offered, "a scenario exercise asks for readiness");
+        let sent = cx.update(|_window, app| {
+            view.update(app, |demo, cx| demo.send_step_declare(12, 16, true, cx))
+        });
+        assert!(sent, "the asking step declares");
+        match rx.try_recv().expect("the declaration reached the sink") {
+            ToBinary::DeclareStep { scenario_id, step_id, ready } => {
+                assert_eq!((scenario_id, step_id, ready), (12, 16, true));
+            }
+            other => panic!("expected a declaration, got {other:?}"),
+        }
+    }
+
+    /// A scenario exercise offers NO RESUME between the beats, and a
+    /// maneuver exercise offers the pair it always had.
+    ///
+    /// ADR-0021: in a scenario exercise the clock runs inside a step, the
+    /// server refuses a resume between the beats with a 409, and the
+    /// exercise opens stopped — so the console's verb is a pause and only
+    /// a pause. The rule is ONE predicate, and the button's label reads it
+    /// as well as the write does.
+    #[gpui::test]
+    fn a_scenario_exercise_offers_no_resume_between_beats(cx: &mut gpui::TestAppContext) {
+        for (mode, expect_pause) in [
+            (crate::gamestate::GameMode::Scenario, true),
+            (crate::gamestate::GameMode::Maneuver, false),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let session = SessionView {
+                execution: true,
+                facts: GameFacts {
+                    mode,
+                    ..GameFacts::default()
+                },
+                game_id: 5,
+                ..SessionView::default()
+            };
+            let (view, cx) = cx.add_window_view(|_, _| {
+                let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+                // The clock is HELD, so the maneuver pair would resume.
+                demo.clock_running = Some(false);
+                demo
+            });
+            let sent =
+                cx.update(|_window, app| view.update(app, |demo, cx| demo.send_set_paused(cx)));
+            assert!(sent, "{mode:?} offers the clock's verb");
+            match rx.try_recv().expect("the clock write reached the sink") {
+                ToBinary::SetPaused { paused } => {
+                    assert_eq!(paused, expect_pause, "{mode:?} chose the wrong verb");
+                }
+                other => panic!("expected a clock write, got {other:?}"),
+            }
+        }
+    }
+
+    /// The SCENARIO WIDGET is absent outside a scenario exercise.
+    ///
+    /// ADR-0021: a widget that says "no steps" over an exercise that was
+    /// never going to have any reads as a broken surface rather than as an
+    /// absence. The rail's widgets are a value, so the set is read here
+    /// rather than inferred from a rendered frame.
+    #[gpui::test]
+    fn the_scenario_widget_is_absent_outside_a_scenario_exercise(cx: &mut gpui::TestAppContext) {
+        for (mode, present) in [
+            (crate::gamestate::GameMode::Scenario, true),
+            (crate::gamestate::GameMode::Maneuver, false),
+            (crate::gamestate::GameMode::Static, false),
+            (crate::gamestate::GameMode::Unknown, false),
+        ] {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let session = SessionView {
+                execution: true,
+                facts: GameFacts {
+                    mode,
+                    ..GameFacts::default()
+                },
+                ..SessionView::default()
+            };
+            let (view, cx) = cx.add_window_view(|_, _| {
+                IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+            });
+            let widgets = cx.update(|_window, app| view.read(app).execution_widget_set());
+            let drawn = widgets.iter().any(|w| w.id == "widget-scenario");
+            assert_eq!(drawn, present, "{mode:?} drew the wrong widgets");
+            // The other three are always there.
+            assert_eq!(widgets.len(), if present { 4 } else { 3 }, "{mode:?}");
+        }
+    }
+
+    /// A STATIC EXERCISE'S POSITIONS ARE SET BY HAND: the drop is a position
+    /// write, and no order goes out with it.
+    ///
+    /// ADR-0021. The server refuses every order in a static exercise with a
+    /// 409, so a helm order from a drag would be a request the server
+    /// answers with a refusal; the position route takes the same ground and
+    /// answers with a jump.
+    #[gpui::test]
+    fn a_static_drag_emits_a_position_write_and_no_order(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            state: "execution".to_string(),
+            game_id: 7,
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Static,
+                ..GameFacts::default()
+            },
+            me: 2,
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Test (KRI-1)".to_string(),
+            }],
+            pieces: vec![PieceView {
+                id: 8,
+                label: "KRI Test (KRI-1)".to_string(),
+                commander_id: Some(2),
+                ..PieceView::default()
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        // The shell asks about the embark composition on its own account, and
+        // that question is not this test's: drain it, and read what the
+        // DRAG said.
+        while rx.try_recv().is_ok() {}
+        let sent = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(8, "KRI Test (KRI-1)", 0.25, 0.75, None, cx)
+            })
+        });
+        assert!(sent, "the drop lands");
+        match rx.try_recv().expect("the position write reached the sink") {
+            ToBinary::SetPosition { unit_id, fx, fy } => {
+                assert_eq!(unit_id, 8, "the dragged hull is the one that moved");
+                assert!((fx - 0.25).abs() < 1e-9 && (fy - 0.75).abs() < 1e-9);
+            }
+            other => panic!("expected a position write, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "and no order went with it");
+    }
+
+    /// The capture seed FORCES the mode, the way `TFG_PHASE` forces the
+    /// phase.
+    ///
+    /// A capture cannot photograph a mode without three live exercises, and
+    /// the console's seeds are read at boot — so the seed is one field, and
+    /// every rule reads it in place of the session's own mode. A seed that
+    /// names a mode this build does not know is no seed at all: the
+    /// exercise keeps the mode the server gave it.
+    #[gpui::test]
+    fn the_mode_seed_forces_the_mode(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.mode_seed = Some(crate::gamestate::GameMode::Static);
+            demo
+        });
+        let mode = cx.update(|_window, app| view.read(app).mode());
+        assert_eq!(mode, crate::gamestate::GameMode::Static, "the seed wins");
+        let helm = cx.update(|_window, app| view.read(app).helm_offered());
+        assert!(!helm, "and the rules read the seed, not the session");
+        // The seed's own vocabulary is the server's.
+        assert_eq!(
+            seeded_mode("scenario"),
+            Some(crate::gamestate::GameMode::Scenario)
+        );
+        assert_eq!(seeded_mode("dynamic"), None, "a mode this build does not know");
+    }
+
     /// The composer row is the shell's second WRITE, so its contract is pinned
     /// here like the helm's: the drafted content goes out as ONE telegram
     /// broadcast, and it is the same `send_telegram` the SEND button calls —
@@ -25861,6 +28062,13 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let session = SessionView {
             execution: true,
+            // A SCENARIO EXERCISE (ADR-0021): the step's declaration is
+            // that mode's verb, and outside one there is no step to declare
+            // for.
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Scenario,
+                ..GameFacts::default()
+            },
             step: Some(StepView {
                 assumed_time: "2000-01-01T10:00:00+07:00".to_string(),
                 playing: None,
@@ -25945,6 +28153,15 @@ mod tests {
             state: "execution".to_string(),
             execution: true,
             game_id: 1,
+            // A SCENARIO EXERCISE (ADR-0021). The board's steps and the
+            // Game Master's verbs belong to that mode alone, so a board
+            // session that named no mode would be a board with no verbs on
+            // it — and the test would be asserting a surface the console
+            // does not draw.
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Scenario,
+                ..GameFacts::default()
+            },
             step,
             book: vec![
                 BookScenario {
@@ -27866,6 +30083,465 @@ mod tests {
         // `asked` list, not the cache, is the gate.
         cx.update(|_window, app| view.update(app, |demo, _| demo.ensure_commander_embark()));
         assert!(rx.try_recv().is_err(), "nothing new reached the sink");
+    }
+
+    // -- the book is local-first, like the force and the roster ------------
+    //
+    // Planning is local-first: every edit is staged and written through when
+    // the Game Master moves the exercise to preparation. The book was the
+    // exception, and it was the wrong exception — the server only takes
+    // pages in planning, so a book write fired the moment the operator
+    // clicked it refused against a game whose roles could not yet write.
+
+    /// A book edit made while planning STAGES and posts nothing. The book
+    /// panel says so on its own line, and the sink stays empty.
+    #[gpui::test]
+    fn a_planning_book_edit_stages_and_posts_nothing(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.book_title = "First light".to_string();
+                demo.submit_book(cx);
+            })
+        });
+        assert!(
+            rx.try_recv().is_err(),
+            "a planning book edit posts nothing: the advance writes it"
+        );
+        cx.update(|_window, app| {
+            let demo = view.read(app);
+            assert_eq!(
+                demo.book.staged_news().count(),
+                1,
+                "the scenario joined the book draft"
+            );
+        });
+    }
+
+    /// The staged book CROSSES the wire with the advance, whole: the binary
+    /// holds the token and cannot see the shell's draft, so the draft
+    /// travels with the message.
+    #[gpui::test]
+    fn the_staged_book_reaches_the_advance(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.book_title = "First light".to_string();
+                demo.submit_book(cx);
+                let local = demo.book.staged_news().next().map(|s| s.local_id).unwrap();
+                demo.book.stage_step_new(local, "sweep north", None);
+            })
+        });
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.prepare_advance(cx)));
+        match rx.try_recv().expect("the advance reached the sink") {
+            ToBinary::AdvancePreparation {
+                book,
+                live_scenarios,
+                ..
+            } => {
+                assert_eq!(book.staged_news().count(), 1, "the scenario crossed");
+                assert_eq!(
+                    book.staged_news().next().map(|s| s.steps.len()),
+                    Some(1),
+                    "and its step with it"
+                );
+                assert!(live_scenarios.is_empty(), "the server holds no scenario yet");
+            }
+            other => panic!("expected an advance, got {other:?}"),
+        }
+    }
+
+    /// Two book writes in flight must not be confused with each other. The
+    /// drain used to dispatch by flag order, so the second answer matched no
+    /// flag, fell through to the catch-all, and re-seeded the force draft
+    /// underneath the operator.
+    #[gpui::test]
+    fn two_book_writes_in_flight_do_not_confuse_the_drain(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            people: vec![PersonView {
+                id: 2,
+                name: "Super User".to_string(),
+                call_sign: "SUPERUSER".to_string(),
+                role: "Commando".to_string(),
+                role_id: 19,
+                judge: false,
+                ready: false,
+                present: true,
+            }],
+            pieces: vec![PieceView {
+                id: 8,
+                label: "KRI Ahmad Yani (KRI-1)".to_string(),
+                class_name: String::new(),
+                commander_id: Some(2),
+                commander_name: String::new(),
+                hierarchy_node: None,
+                start: None,
+                placed: true,
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.stage_assign(8, "KRI Ahmad Yani (KRI-1)", 2)
+                    .expect("a seated pick is assignable");
+                // Two book writes in flight: the scenario add and the step
+                // add. Both latches are set, exactly as they were when the
+                // drain matched the first answer and cleared them both.
+                demo.book_busy = true;
+                demo.step_busy = true;
+            })
+        });
+        // The first answer: the scenario add.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                let session = demo.session.clone();
+                demo.apply_answer(CreatedSession::for_write(session, WriteId::Book));
+            })
+        });
+        // The second answer: the step add. It is the step write's, and it
+        // must not be applied as a catch-all that re-seeds the drafts.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                let session = demo.session.clone();
+                demo.apply_answer(CreatedSession::for_write(session, WriteId::Step));
+            })
+        });
+        cx.update(|_window, app| {
+            let demo = view.read(app);
+            assert!(
+                demo.force.contains(8),
+                "the staged force draft survived both answers"
+            );
+            assert_eq!(
+                demo.force.get(8).and_then(|h| h.commander_id),
+                Some(2),
+                "and the staged commander with it"
+            );
+        });
+    }
+
+    /// A re-read must not discard the operator's staged work. Every write
+    /// triggers a re-read, so a re-seed that overwrote the draft threw the
+    /// operator's plan away on the strength of a write they had already
+    /// made.
+    #[gpui::test]
+    fn a_re_read_keeps_the_staged_force_and_roster_drafts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            people: vec![PersonView {
+                id: 2,
+                name: "Super User".to_string(),
+                call_sign: "SUPERUSER".to_string(),
+                role: "Commando".to_string(),
+                role_id: 19,
+                judge: false,
+                ready: false,
+                present: true,
+            }],
+            pieces: vec![PieceView {
+                id: 8,
+                label: "KRI Ahmad Yani (KRI-1)".to_string(),
+                class_name: String::new(),
+                commander_id: Some(2),
+                commander_name: String::new(),
+                hierarchy_node: None,
+                start: None,
+                placed: true,
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        let judge_role = RoleRow { id: 20, name: "Penyelenggara".to_string(), judge: true };
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.reseed_drafts();
+                demo.stage_assign(8, "KRI Ahmad Yani (KRI-1)", 2)
+                    .expect("a seated pick is assignable");
+                demo.stage_seat(6, "Budi Santoso", &judge_role)
+                    .expect("a directory account stages a seat");
+            })
+        });
+        // The re-read: the session comes back and the drafts are re-seeded.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| demo.reseed_drafts())
+        });
+        cx.update(|_window, app| {
+            let demo = view.read(app);
+            assert_eq!(
+                demo.force.get(8).and_then(|h| h.commander_id),
+                Some(2),
+                "the staged commander survived the re-read"
+            );
+            assert!(
+                demo.roster_draft.contains(6),
+                "and so did the staged seat"
+            );
+        });
+    }
+
+    /// The live mirror carries the server's PLACEMENT. Without it the diff
+    /// could not see that the server had already placed a hull, so every
+    /// advance re-placed it — one redundant write per hull, every time.
+    #[gpui::test]
+    fn the_live_mirror_carries_the_servers_placement(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            pieces: vec![PieceView {
+                id: 8,
+                label: "KRI Ahmad Yani (KRI-1)".to_string(),
+                class_name: String::new(),
+                commander_id: Some(2),
+                commander_name: String::new(),
+                hierarchy_node: None,
+                start: Some((-5.4, 106.2)),
+                placed: true,
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            let demo = view.read(app);
+            let live = demo.live_hulls();
+            let hull = live.iter().find(|h| h.unit_id == 8).expect("the hull");
+            assert_eq!(
+                hull.start,
+                Some(crate::force::Start {
+                    lat: -5.4,
+                    lon: 106.2
+                }),
+                "the mirror carries where the server put it"
+            );
+            assert_eq!(
+                demo.force.get(8).and_then(|h| h.start),
+                Some(crate::force::Start {
+                    lat: -5.4,
+                    lon: 106.2
+                }),
+                "and the draft is seeded with it, so the diff converges"
+            );
+        });
+    }
+
+    /// The live mirror carries a group's MEMBER HULLS. The server publishes
+    /// a unit's group on the unit's own row, so without the join every
+    /// group read as "0 hulls" and the diff could not see that a unit was
+    /// already placed in a node.
+    #[gpui::test]
+    fn the_live_mirror_carries_a_groups_member_hulls(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            pieces: vec![PieceView {
+                id: 8,
+                label: "KRI Ahmad Yani (KRI-1)".to_string(),
+                class_name: String::new(),
+                commander_id: Some(2),
+                commander_name: String::new(),
+                hierarchy_node: Some(2),
+                start: None,
+                placed: false,
+            }],
+            groups: vec![crate::groups::LiveGroup {
+                group_id: 2,
+                name: "Satgas A".to_string(),
+                kind: crate::groups::GroupKind::SatuanTugas,
+                parent: None,
+                commander_id: None,
+                units: vec![8],
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            let demo = view.read(app);
+            let live = demo.live_groups();
+            let group = live.iter().find(|g| g.group_id == 2).expect("the group");
+            assert_eq!(group.units, vec![8], "the group carries its member hull");
+        });
+    }
+
+    /// The pending count NAMES what is staged. A bare total hid the one
+    /// thing the operator could not see otherwise: which draft was holding
+    /// the advance up.
+    #[gpui::test]
+    fn the_pending_count_names_the_groups_and_the_book(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.book_title = "First light".to_string();
+                demo.submit_book(cx);
+                demo.groups
+                    .stage_group(
+                        20,
+                        "Satgas A",
+                        crate::groups::GroupKind::SatuanTugas,
+                        None,
+                        None,
+                        vec![],
+                    )
+                    .expect("a bare root stages");
+            })
+        });
+        cx.update(|_window, app| {
+            let demo = view.read(app);
+            let counts = demo.staged_counts();
+            assert_eq!(counts.groups, 1, "the group owes a create");
+            assert_eq!(counts.book, 1, "the book owes a scenario");
+            let sentence = counts.sentence();
+            assert!(sentence.contains("group"), "{sentence}");
+            assert!(sentence.contains("book"), "{sentence}");
+        });
+    }
+
+    /// The SYNC control writes the staged writes through and changes
+    /// NOTHING else: the exercise's phase does not move. It is the one
+    /// exception to local-first planning, and the operator asked for it by
+    /// name.
+    #[gpui::test]
+    fn the_sync_control_writes_the_staged_writes_without_moving_the_phase(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.book_title = "First light".to_string();
+                demo.submit_book(cx);
+                demo.groups
+                    .stage_group(
+                        20,
+                        "Satgas A",
+                        crate::groups::GroupKind::SatuanTugas,
+                        None,
+                        None,
+                        vec![],
+                    )
+                    .expect("a bare root stages");
+                assert!(demo.sync_staged(cx), "the sync goes out");
+            })
+        });
+        match rx.try_recv().expect("the sync reached the sink") {
+            ToBinary::SyncStaged { book, groups, .. } => {
+                assert_eq!(book.staged_news().count(), 1, "the book crossed");
+                assert_eq!(groups.len(), 1, "and the task organisation with it");
+            }
+            other => panic!("expected a sync, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "and nothing else: the phase does not move"
+        );
+    }
+
+    /// The Players band counts the DRAFT's seats, like the Fleet band counts
+    /// the draft's pieces. A band that counted the server's seats
+    /// contradicted the room list under it, which merges the draft.
+    #[gpui::test]
+    fn the_bands_seat_count_is_the_drafts_count(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            seats: 1,
+            people: vec![PersonView {
+                id: 2,
+                name: "Super User".to_string(),
+                call_sign: "SUPERUSER".to_string(),
+                role: "Commando".to_string(),
+                role_id: 19,
+                judge: false,
+                ready: false,
+                present: true,
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 2, 0, session, tx)
+        });
+        let role = RoleRow { id: 19, name: "Commando".to_string(), judge: false };
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.reseed_drafts();
+                demo.stage_seat(6, "Budi Santoso", &role)
+                    .expect("a directory account stages a seat");
+            })
+        });
+        cx.update(|_window, app| {
+            let demo = view.read(app);
+            assert_eq!(
+                demo.island_trailing(view::IslandKey::Players),
+                "2 SEATED",
+                "the band counts the seat the operator just staged"
+            );
+        });
     }
 
     /// A click near a hull picks that hull, and a click on open water picks

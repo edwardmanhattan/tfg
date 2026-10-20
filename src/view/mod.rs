@@ -1118,14 +1118,22 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
         // named: `z.groups`, the task organisation, which is the console's
         // own local scratch authoring and has no read route at all.
         crate::gamestate::GameState::Planning => {
-            out.push(slot(IslandKey::Essentials, 470.0));
-            // 210, not the console's 182: the hold joined the pace here —
-            // SCENARIO CLOCK plus its pill cost ~30pt — and at 182 the pill
-            // painted half below the island's own box, the silent-clip
-            // defect `docs/ui-overhaul-status.md` records. The fix is the
-            // box, not the content: the body fits at 210 with room to spare
-            // and reports no scroll honestly.
-            out.push(slot(IslandKey::Control, 210.0));
+                out.push(slot(IslandKey::Essentials, 470.0));
+                // 320, not the console's 182 and not the 210 this island grew
+                // to: the hold joined the pace here (SCENARIO CLOCK plus its
+                // pill cost ~30pt), and the PLANNED WINDOW joined it after that
+                // (five fields in two rows, the label, and the note that says
+                // who may write them). At 182 the pill painted half below the
+                // island's own box, the silent-clip defect
+                // `docs/ui-overhaul-status.md` records, and the fix for that
+                // was the box and not the content. The same fix, twice.
+                //
+                // AND 320, NOT 210: at 210 the window's note — the line that
+                // says the window is STAGED and that writing it needs the
+                // administrator's ticket — painted below the island's own box,
+                // which is the same silent clip at the same place. A capture
+                // showed it: the fields were there and the note was not.
+                out.push(slot(IslandKey::Control, 320.0));
             out.push(slot(IslandKey::Fleet, 320.0));
             out.push(slot(IslandKey::Players, 300.0));
             out.push(slot(IslandKey::Groups, 280.0));
@@ -1923,11 +1931,11 @@ mod tests {
             zone_stack_height(&slots),
             sum + ZONE_ISLAND_GAP * slots.len() as f32
         );
-        // Seven islands: the console's planning heights, and — because the
-        // fields are joined — no gaps between them.
-        assert_eq!(
-            zone_stack_height(&slots),
-            172.0 + 470.0 + 210.0 + 320.0 + 300.0 + 280.0 + 380.0
+            // Seven islands: the console's planning heights, and — because the
+            // fields are joined — no gaps between them.
+            assert_eq!(
+                zone_stack_height(&slots),
+                172.0 + 470.0 + 320.0 + 320.0 + 300.0 + 280.0 + 380.0
         );
     }
 
@@ -1953,7 +1961,7 @@ mod tests {
     #[test]
     fn the_column_scrolls_only_by_what_it_overflows() {
         let band = (376.0, 56.0, 736.0, 596.0);
-        // A 540-tall band against the 1754-tall planning stack. That the
+        // A 540-tall band against the 2146-tall planning stack. That the
         // planning column overflows is not incidental: six islands of the
         // console's own heights cannot fit any window this console runs in,
         // which is WHY the column scrolls at all — and why
@@ -1961,9 +1969,9 @@ mod tests {
         let slots = zone_islands(GameState::Planning, false);
         assert_eq!(
             zone_stack_height(&slots),
-            172.0 + 470.0 + 210.0 + 320.0 + 300.0 + 280.0 + 380.0
-        );
-        assert_eq!(zone_overflow(zone_stack_height(&slots), band), 1592.0);
+                172.0 + 470.0 + 320.0 + 320.0 + 300.0 + 280.0 + 380.0
+            );
+            assert_eq!(zone_overflow(zone_stack_height(&slots), band), 1702.0);
         // A short stack in a tall band scrolls not at all.
         assert_eq!(zone_overflow(100.0, band), 0.0);
     }

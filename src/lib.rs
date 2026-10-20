@@ -10,9 +10,13 @@
 //!   in them. This is the seam the shell migration turns on: egui and GPUI
 //!   both read it, and the chrome geometry is testable with no display.
 //! - [`gamestate`]: the exercise lifecycle as one axis. Leaf: no tfg types.
+//! - [`mode_rules`]: the console's own rules about a mode — which verbs each
+//!   mode earns, and why they are not the server's. Leaf: no tfg types.
 //! - [`gamefeed`]: the authoritative movement of a Minos exercise — the
 //!   plot read, the order publications, and the game fixes they become.
 //!   Leaf: no GPUI, no shell.
+//! - [`advance`]: the stage advance as a plan — the order the server takes
+//!   the writes in, and the rules that refuse it whole.
 //! - [`force`]: the operator's force before Minos hears of it, and the diff a stage advance writes.
 //! - [`embark`]: the embark rule — what may go aboard what, decided against
 //!   the spec the server published. Leaf: no GPUI, no draft, no network.
@@ -40,12 +44,15 @@
 //!   off `egui::Context::default()`.
 //! - [`readiness`]: the execution gate's unknown states — why the last read
 //!   produced no verdict, and what to say while it has not. Toolkit-free.
+//! - [`window`]: the exercise's planned window and the one rule that says
+//!   what a window is — shared with the scenario composer. Toolkit-free.
 //! - [`visuals`]: every hull's picture state — the versioned visual cache and
 //!   what still has to be fetched. The decoded texture is a shell-minted
 //!   handle here, not a toolkit type.
 //!
 //! Module list is alphabetical after `assets`.
 
+pub mod advance;
 pub mod assets;
 pub mod backend;
 pub mod book;
@@ -68,6 +75,7 @@ pub mod map_gate;
 pub mod map_geometry;
 pub mod map_render;
 pub mod markers;
+pub mod mode_rules;
 pub mod overlay;
 pub mod paths;
 pub mod phase;
@@ -82,3 +90,4 @@ pub mod store;
 pub mod symbology;
 pub mod view;
 pub mod visuals;
+pub mod window;

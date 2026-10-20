@@ -321,7 +321,8 @@ fn main() {
     let (order_tx, order_rx) = mpsc::channel::<tfg::shell_gpui::ToBinary>();
     let (status_tx, status_rx) = mpsc::channel::<tfg::shell_gpui::HelmStatus>();
     let (signin_tx, signin_rx) = mpsc::channel::<Result<tfg::shell_gpui::SignedIn, String>>();
-    let (create_tx, create_rx) = mpsc::channel::<Result<tfg::shell_gpui::CreatedSession, String>>();
+    let (create_tx, create_rx) =
+        mpsc::channel::<Result<tfg::shell_gpui::CreatedSession, tfg::shell_gpui::WriteRefusal>>();
     let (timeline_tx, timeline_rx) =
         mpsc::channel::<Result<(tfg::backend::TimelinePage, bool), String>>();
     let (judgements_tx, judgements_rx) =
@@ -429,7 +430,7 @@ fn main() {
                             f64::from(order.speed_kn),
                             None,
                         ) {
-                            Ok(fix) => {
+                            Ok(tfg::backend::OrderOutcome::Applied(fix)) => {
                                 // The order's ANSWER is a position: the hull
                                 // is here, on a new leg, at the scenario's
                                 // instant. It is ingested on the game path, so
@@ -452,6 +453,23 @@ fn main() {
                                         fix.heading,
                                         fix.speed,
                                         if fix.clamped { " (clamped)" } else { "" }
+                                    ),
+                                }
+                            }
+                            // A HELD ORDER HAS NO FIX, so there is nothing to
+                            // ingest and nothing to draw: the hull has not
+                            // moved. The panel says so, and says what will
+                            // release it.
+                            Ok(tfg::backend::OrderOutcome::Staged(held)) => {
+                                tfg::shell_gpui::HelmStatus {
+                                    unit_id: order.unit_id.clone(),
+                                    ok: true,
+                                    text: format!(
+                                        "staged {:.0}\u{00b0} / {:.1} kn{} \u{2014} {}",
+                                        held.heading_deg,
+                                        held.speed_kn,
+                                        if held.clamped { " (clamped)" } else { "" },
+                                        held.released_by
                                     ),
                                 }
                             }
@@ -550,7 +568,10 @@ fn main() {
                                     eprintln!("placed {unit_id} at {lat:.4}, {lon:.4}");
                                     match fetch_session(&host2, &token2, Some(game_id)) {
                                         Some(s) => {
-                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
+                                            Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Deploy,
+                                            ))
                                         }
                                         None => Err(
                                             "the hull was placed, but the session could not be read"
@@ -561,8 +582,104 @@ fn main() {
                                 Err(e) => Err(format!("not placed: {e}")),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Deploy, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
+                        }
+                    }
+                    tfg::shell_gpui::ToBinary::SetPosition { unit_id, fx, fy } => {
+                        // A HULL'S POSITION, SET BY HAND (ADR-0021). The
+                        // static exercise's only verb: the server refuses
+                        // every order there with a 409, so the position is the
+                        // input, and the route takes a latitude and a
+                        // longitude and nothing else — no course, no speed,
+                        // and no instant of the client's own, because the
+                        // exercise's clock stamps the jump.
+                        //
+                        // The same unproject the deploy does, at the same
+                        // camera: the frames of the drag that led here were
+                        // unprojected here too, and a commit that landed
+                        // somewhere else would put the hull somewhere the
+                        // operator never pointed at.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to set a position".to_string())
+                        } else if game_id == 0 {
+                            Err("hold a session before setting a position".to_string())
+                        } else if !fx.is_finite() || !fy.is_finite() {
+                            Err("that drop point is nowhere".to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            let Some((lat, lon)) = unproject_at(&camera2, fx, fy) else {
+                                return;
+                            };
+                            match master.set_unit_position(&token2, game_id, unit_id, lat, lon) {
+                                Ok(set) => {
+                                    eprintln!(
+                                        "unit {unit_id} set at {lat:.4}, {lon:.4} ({})",
+                                        set.assumed_time
+                                    );
+                                    match fetch_session(&host2, &token2, Some(game_id)) {
+                                        Some(s) => {
+                                            Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Position,
+                                            ))
+                                        }
+                                        None => Err(
+                                            "the position was set, but the session could not be read"
+                                                .to_string(),
+                                        ),
+                                    }
+                                }
+                                Err(e) => Err(format!("not set: {e}")),
+                            }
+                        };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Position,
+                                why,
+                            )
+                        });
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
+                    tfg::shell_gpui::ToBinary::PreviewPosition { unit_id, fx, fy } => {
+                        // ONE FRAME of a drag. It records nothing and it
+                        // changes nothing, so there is no session to re-read
+                        // and nothing to refuse on the console's own lines:
+                        // the frame is published to the other participants'
+                        // boards and the answer is the server's echo of it.
+                        //
+                        // The frames go out while the drag is in the air, and
+                        // the COMMIT is the release — a commit per pointer
+                        // movement would put a row in the chain for every
+                        // frame, which is exactly what this route exists to
+                        // avoid.
+                        if token2.is_empty() || game_id == 0 {
+                            continue;
+                        }
+                        if !fx.is_finite() || !fy.is_finite() {
+                            continue;
+                        }
+                        let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                            continue;
+                        };
+                        let Some((lat, lon)) = unproject_at(&camera2, fx, fy) else {
+                            continue;
+                        };
+                        match master.preview_unit_position(&token2, game_id, unit_id, lat, lon) {
+                            Ok(frame) => {
+                                eprintln!(
+                                    "drag frame for unit {unit_id} at {lat:.4}, {lon:.4} ({})",
+                                    frame.assumed_time
+                                );
+                            }
+                            Err(e) => eprintln!("drag frame refused: {e}"),
                         }
                     }
                     tfg::shell_gpui::ToBinary::DeployAssign {
@@ -618,7 +735,10 @@ fn main() {
                                             );
                                             match fetch_session(&host2, &token2, Some(game_id)) {
                                                 Some(s) => Ok(
-                                                    tfg::shell_gpui::CreatedSession::held(s),
+                                                    tfg::shell_gpui::CreatedSession::for_write(
+                                                        s,
+                                                        tfg::shell_gpui::WriteId::Deploy,
+                                                    ),
                                                 ),
                                                 None => Err(
                                                     "the hull was placed, but the session could not be read"
@@ -633,6 +753,9 @@ fn main() {
                                 }
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Deploy, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -746,11 +869,17 @@ fn main() {
                                     // the plot reader starts reading it.
                                     sync_session(&hold2, &live_ctl2, &token2, game_id, &state2);
                                     eprintln!("holding {} ({})", s.game, s.state);
-                                    Ok(tfg::shell_gpui::CreatedSession::held(s))
+                                    Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                        s,
+                                        tfg::shell_gpui::WriteId::Hold,
+                                    ))
                                 }
                                 None => Err("could not hold that session".to_string()),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Hold, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -798,7 +927,10 @@ fn main() {
                                                 game_id,
                                                 &state2,
                                             );
-                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
+                                            Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Session,
+                                            ))
                                         }
                                         None => Err(
                                             "created, but the session could not be read"
@@ -809,6 +941,9 @@ fn main() {
                                 Err(e) => Err(format!("create failed: {e}")),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Session, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -833,7 +968,10 @@ fn main() {
                                 Ok(sc) => {
                                     eprintln!("added scenario {} {:?}", sc.id, sc.title);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Book,
+                                            )),
                                         None => Err(
                                             "added, but the book could not be read".to_string(),
                                         ),
@@ -842,6 +980,9 @@ fn main() {
                                 Err(e) => Err(format!("add failed: {e}")),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Book, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -879,7 +1020,10 @@ fn main() {
                                         eprintln!("added a step to scenario {}", sc.id);
                                         match fetch_session(&host2, &token2, Some(game_id)) {
                                             Some(s) => {
-                                                Ok(tfg::shell_gpui::CreatedSession::held(s))
+                                                Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                    s,
+                                                    tfg::shell_gpui::WriteId::Step,
+                                                ))
                                             }
                                             None => Err(
                                                 "added, but the book could not be read".to_string(),
@@ -890,6 +1034,9 @@ fn main() {
                                 }
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Step, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -909,7 +1056,10 @@ fn main() {
                                     eprintln!("removed step {step_id} from scenario {}", sc.id);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
                                         Some(s) => {
-                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
+                                            Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Step,
+                                            ))
                                         }
                                         None => Err(
                                             "removed, but the book could not be read".to_string(),
@@ -919,6 +1069,9 @@ fn main() {
                                 Err(e) => Err(format!("remove failed: {e}")),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Step, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -949,7 +1102,10 @@ fn main() {
                                         }
                                     );
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Readiness,
+                                            )),
                                         None => Err(
                                             "declared, but the session could not be read"
                                                 .to_string(),
@@ -959,6 +1115,9 @@ fn main() {
                                 Err(e) => Err(format!("readiness failed: {e}")),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Readiness, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -979,7 +1138,10 @@ fn main() {
                                 Ok(()) => {
                                     eprintln!("roster synced: {} write(s)", writes.len());
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Roster,
+                                            )),
                                         None => Err(
                                             "the room was written, but the session could not be read"
                                                 .to_string(),
@@ -988,6 +1150,9 @@ fn main() {
                                 }
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Roster, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -1016,7 +1181,10 @@ fn main() {
                                 Ok(()) => {
                                     eprintln!("force synced: {} write(s)", writes.len());
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Force,
+                                            )),
                                         None => Err(
                                             "the force was written, but the session could not be read"
                                                 .to_string(),
@@ -1025,6 +1193,9 @@ fn main() {
                                 }
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Force, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -1035,26 +1206,31 @@ fn main() {
                         roster,
                         live_seats,
                         groups,
+                            window,
+                            book,
+                            live_scenarios,
                     } => {
                         // LEAVE PLANNING. The drafts cross whole because the
                         // token lives HERE and the drafts live THERE: the
                         // shell cannot compute the writes and this side cannot
-                        // see the drafts. The force is PLANNED first, and a
-                        // `ForceGap` refuses the move WHOLE — nothing is
-                        // posted, because issuing the rest would half-commit
-                        // the very draft the advance exists to record.
+                        // see the drafts.
                         //
-                        // The FLUSH order is the order the server accepts,
-                        // and seats come before hulls: a commander write names
-                        // a participant, and the picker's whole flow is
-                        // local-first — a player staged a minute ago commands
-                        // a hull staged a minute ago, and neither exists on
-                        // the server until this moment. Unseats land AFTER the
-                        // force, so nobody is briefly seatless while their
-                        // hull is still being handed over. The first refusal
-                        // stops the rest, and only a clean flush transitions
-                        // the game to preparation. The answer is the re-read
-                        // session.
+                        // `tfg::advance::plan` lays the steps out in the order
+                        // the server takes them and refuses the WHOLE move on
+                        // any rule it breaks — the force's, the room's and
+                        // the roster's. Nothing is posted, because issuing
+                        // the rest would half-commit the very draft the
+                        // advance exists to record.
+                        //
+                        // THE ORDER IS THE PLAN'S, not this arm's: the
+                        // window (the exercise's own terms, and the one write
+                        // that needs the administrator's ticket) first, then
+                        // the seats a commander write names, then the force,
+                        // then the role changes — a role change onto the
+                        // judge side RELEASES the hulls that seat commands,
+                        // so it lands after the force has given those
+                        // commands away — then the unseats, the task
+                        // organisation, and the transition last.
                         let outcome = if token2.is_empty() {
                             Err("signed out \u{2014} sign in to move the plan to preparation"
                                 .to_string())
@@ -1062,99 +1238,122 @@ fn main() {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
-                            match tfg::force::plan(&force, &live_hulls) {
-                                Err(gap) => Err(gap.to_string()),
-                                Ok(force_writes) => {
-                                    let roster_writes = tfg::roster::plan(&roster, &live_seats);
-                                    let (seat_writes, unseat_writes): (
-                                        Vec<_>,
-                                        Vec<_>,
-                                    ) = roster_writes
-                                        .iter()
-                                        .cloned()
-                                        .partition(|w| {
-                                            !matches!(
-                                                w,
-                                                tfg::roster::RosterWrite::Unseat { .. }
-                                            )
-                                        });
-                                    // The shell now carries the real draft and
-                                    // computes the writes; the server's live
-                                    // frame travels inside the draft's seed,
-                                    // so the plan diffs against what Minos
-                                    // holds.
-                                    let groups_writes = groups;
-                                    let flush = flush_roster(
+                                advance_to_preparation(
+                                    &master,
+                                    &host2,
+                                    &token2,
+                                    game_id,
+                                    force,
+                                    live_hulls,
+                                    roster,
+                                    live_seats,
+                                    groups,
+                                    window,
+                                    book,
+                                    live_scenarios,
+                                )
+                        };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Prepare, why)
+                        });
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
+                    tfg::shell_gpui::ToBinary::SyncStaged {
+                        force,
+                        live_hulls,
+                        roster,
+                        live_seats,
+                        groups,
+                        book,
+                        live_scenarios,
+                    } => {
+                        // THE SYNC. The staged writes reach the server and
+                        // the exercise's PHASE does not move — the one
+                        // exception to local-first planning, and the one the
+                        // operator asked for.
+                        //
+                        // It is the advance's flush without the transition,
+                        // in the same order, so the two cannot disagree
+                        // about what the server accepts and in what order:
+                        // seats, then the force, then the unseats, then the
+                        // task organisation, then the book. It is the same
+                        // PLAN, too — the same rules, checked before the
+                        // first write, because a sync that half-commits a
+                        // force is the same fault as an advance that does.
+                        //
+                        // THE WINDOW IS NOT PART OF IT. The terms are the
+                        // administrator's ticket, and a sync that asked for
+                        // them would fail for a Game Master who holds
+                        // everything else; the terms ride the advance, which
+                        // is where the exercise moves on.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to sync the staged writes"
+                                .to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            // THE SERVER'S FRAME, re-read: the same reason the
+                            // advance re-reads it. A diff against a stale frame
+                            // re-issues the writes the server already took.
+                            let live_seats = read_live_seats(&master, &token2, game_id, live_seats);
+                            let live_hulls = read_live_hulls(&master, &token2, game_id, live_hulls);
+                            let book_writes = tfg::book::plan(&book, &live_scenarios);
+                            let steps = tfg::advance::plan(
+                                &force,
+                                &live_hulls,
+                                &roster,
+                                &live_seats,
+                                &groups,
+                                &book_writes,
+                                None,
+                            );
+                            match steps {
+                                Err(refusal) => Err(refusal.to_string()),
+                                Ok(steps) => {
+                                    match run_plan(
                                         &master,
                                         &token2,
                                         game_id,
-                                        &seat_writes,
-                                    )
-                                    .and_then(|()| {
-                                        flush_force(
-                                            &master,
-                                            &token2,
-                                            game_id,
-                                            &force_writes,
-                                        )
-                                    })
-                                    .and_then(|()| {
-                                        flush_roster(
-                                            &master,
-                                            &token2,
-                                            game_id,
-                                            &unseat_writes,
-                                        )
-                                    })
-                                    .and_then(|()| {
-                                        flush_groups(
-                                            &master,
-                                            &token2,
-                                            game_id,
-                                            &groups_writes,
-                                        )
-                                    });
-                                    match flush {
+                                        &steps,
+                                        &live_scenarios,
+                                        false,
+                                    ) {
                                         Err(why) => Err(why),
-                                        Ok(()) => {
-                                            match master.transition_game(
+                                        Ok(written) => {
+                                            eprintln!(
+                                                "staged writes synced ({written} write(s), phase unchanged)"
+                                            );
+                                            match fetch_session(
+                                                &host2,
                                                 &token2,
-                                                game_id,
-                                                "preparation",
+                                                Some(game_id),
                                             ) {
-                                                Ok(g) => {
-                                                    eprintln!(
-                                                        "{} moved to preparation \
-                                                         ({} force, {} roster, {} group write(s))",
-                                                        g.name,
-                                                        force_writes.len(),
-                                                        roster_writes.len(),
-                                                        groups_writes.len()
-                                                    );
-                                                    match fetch_session(
-                                                        &host2,
-                                                        &token2,
-                                                        Some(game_id),
-                                                    ) {
-                                                        Some(s) => {
-                                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
-                                                        }
-                                                        None => Err(
-                                                            "moved to preparation, but the session \
-                                                             could not be read"
-                                                                .to_string(),
+                                                Some(s) => {
+                                                    Ok(tfg::shell_gpui::CreatedSession {
+                                                        session: s,
+                                                        note: format!(
+                                                            "{written} write(s) sent \u{2014} the phase did not move"
                                                         ),
-                                                    }
+                                                        refusal: None,
+                                                        write: tfg::shell_gpui::WriteId::Sync,
+                                                    })
                                                 }
-                                                Err(e) => Err(format!(
-                                                    "move to preparation refused: {e}"
-                                                )),
+                                                None => Err(
+                                                    "the writes were sent, but the session could not be read"
+                                                        .to_string(),
+                                                ),
                                             }
                                         }
                                     }
                                 }
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Sync, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -1175,7 +1374,10 @@ fn main() {
                                 Ok(_) => {
                                     eprintln!("time factor set to {factor:.0}\u{00d7}");
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Factor,
+                                            )),
                                         None => Err(
                                             "pace set, but the session could not be read"
                                                 .to_string(),
@@ -1191,6 +1393,9 @@ fn main() {
                                 Err(e) => Err(format!("pace refused: {e}")),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Factor, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -1222,7 +1427,10 @@ fn main() {
                                                 game_id,
                                                 &state2,
                                             );
-                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
+                                            Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Advance,
+                                            ))
                                         }
                                         None => Err(
                                             "advanced, but the session could not be read"
@@ -1233,6 +1441,9 @@ fn main() {
                                 Err(e) => Err(format!("advance refused: {e}")),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Advance, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -1266,7 +1477,10 @@ fn main() {
                                                 game_id,
                                                 &state2,
                                             );
-                                            Ok(tfg::shell_gpui::CreatedSession::held(s))
+                                            Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::End,
+                                            ))
                                         }
                                         None => Err(
                                             "ended, but the session could not be read"
@@ -1277,6 +1491,9 @@ fn main() {
                                 Err(e) => Err(format!("end refused: {e}")),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::End, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -1633,7 +1850,10 @@ fn main() {
                                         r.posts.len()
                                     );
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Relate,
+                                            )),
                                         None => Err(
                                             "saved, but the book could not be read".to_string(),
                                         ),
@@ -1642,6 +1862,9 @@ fn main() {
                                 Err(e) => Err(format!("save failed: {e}")),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Relate, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -1675,7 +1898,10 @@ fn main() {
                                         }
                                     );
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::StepDeclare,
+                                            )),
                                         None => Err(
                                             "declared, but the session could not be read"
                                                 .to_string(),
@@ -1685,6 +1911,9 @@ fn main() {
                                 Err(e) => Err(format!("step declaration failed: {e}")),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::StepDeclare, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -1753,6 +1982,8 @@ fn main() {
                                         Some(s) => Ok(tfg::shell_gpui::CreatedSession {
                                             session: s,
                                             note: note.unwrap_or_default(),
+                                            refusal: None,
+                                            write: tfg::shell_gpui::WriteId::StepVerb,
                                         }),
                                         None => Err(
                                             "the step moved, but the session could not be read"
@@ -1763,6 +1994,9 @@ fn main() {
                                 Err(e) => Err(format!("step {} refused: {e}", verb.label().to_lowercase())),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::StepVerb, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -1803,7 +2037,10 @@ fn main() {
                                 Ok(m) => {
                                     eprintln!("sent telegram #{} (broadcast)", m.id);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::held(s)),
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Message,
+                                            )),
                                         None => Err(
                                             "sent, but the thread could not be read".to_string(),
                                         ),
@@ -1812,6 +2049,9 @@ fn main() {
                                 Err(e) => Err(format!("send failed: {e}")),
                             }
                         };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Message, why)
+                        });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
@@ -2604,6 +2844,47 @@ fn sync_session(
 /// side, empty/false when watching). One participants read per game — the
 /// same fan-out `fetch_session` already pays to choose the hold — so the
 /// picker and the hold never disagree about where this account sits.
+/// The ground under a map fraction, unprojected at the camera the map
+/// thread is drawing at.
+///
+/// The shell has no mercator, so the unprojection is the binary's — and
+/// the drag's FRAMES and the drag's COMMIT must agree on it, so they
+/// share this one: a commit that landed somewhere else would put the hull
+/// somewhere the operator never pointed at.
+fn unproject_at(
+    camera: &std::sync::Arc<std::sync::Mutex<(f64, f64, f64, u32, u32)>>,
+    fx: f64,
+    fy: f64,
+) -> Option<(f64, f64)> {
+    // The camera is the shell's, and it carries the picture's own size: the
+    // unprojection must be at the camera AND at the frame the operator is
+    // looking at, or the drag's frames and its commit would disagree — the
+    // same arithmetic the deploy beside it does.
+    let (clat, clon, zoom, mw, mh) = camera
+        .lock()
+        .map(|c| (c.0, c.1, c.2, c.3 as f64, c.4 as f64))
+        .unwrap_or((
+            tfg::map_geometry::MAP_CENTER.0,
+            tfg::map_geometry::MAP_CENTER.1,
+            tfg::map_geometry::MAP_ZOOM,
+            tfg::map_geometry::MAP_W,
+            tfg::map_geometry::MAP_H,
+        ));
+    let (lat, lon) = tfg::map_geometry::unproject_mercator(
+        fx.clamp(0.0, 1.0) * mw,
+        fy.clamp(0.0, 1.0) * mh,
+        (clat, clon),
+        zoom,
+        mw,
+        mh,
+    );
+    if lat.is_finite() && lon.is_finite() {
+        Some((lat, lon))
+    } else {
+        None
+    }
+}
+
 fn fetch_session_rows(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::SessionRow>> {
     let master = tfg::backend::MinosMaster::new(host).ok()?;
     let (me, _name) = master.me(token).ok()?;
@@ -2623,6 +2904,7 @@ fn fetch_session_rows(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::Se
             state: g.state.clone(),
             my_role: role,
             judge,
+            mode: g.mode.clone(),
         });
     }
     Some(rows)
@@ -2685,7 +2967,14 @@ fn fetch_session(
     // Essentials says which it is looking at.
     let facts = match master.game_detail(token, game_id) {
         Ok(d) => tfg::shell_gpui::GameFacts {
-            mode: d.mode,
+            // The mode is PARSED HERE, ONCE, WHERE THE SESSION IS READ.
+            // Every rule about a mode is a function of this value, and a
+            // rule that compared the mode's spelling at each site would be
+            // a rule that could be spelled two ways. A mode the server
+            // named and this build has not heard of reads as `Unknown`,
+            // which fails closed: no helm, no scenario surface, no clock
+            // verb.
+            mode: tfg::gamestate::GameMode::from_wire(&d.mode),
             // An unrecognised pace keeps its own token AND its ceremony: the
             // server's word is shown as read, and nothing is inferred from it.
             pace: match d.pace {
@@ -2746,7 +3035,7 @@ fn fetch_session(
                 .collect()
         })
         .unwrap_or_default();
-    let pieces = units
+    let pieces: Vec<tfg::shell_gpui::PieceView> = units
         .iter()
         .map(|u| {
             let start = placements
@@ -2772,6 +3061,12 @@ fn fetch_session(
     // commander's task group beneath their seat. Member hulls arrive on the
     // pieces (each carries its `hierarchy_node`), so the draft adds them
     // from there rather than from this tree.
+    //
+    // THE MEMBERSHIP IS JOINED HERE, from the pieces read above: the server
+    // publishes a unit's group on the unit's own row and nowhere else, so
+    // the join is one map away. Without it every group reads as "0 hulls"
+    // and the group diff cannot see a unit that is in a node the server
+    // holds — which is what makes an un-place unreachable.
     fn flatten_groups(
         nodes: &[tfg::backend::HierarchyNode],
         out: &mut Vec<tfg::groups::LiveGroup>,
@@ -2790,7 +3085,7 @@ fn fetch_session(
             flatten_groups(&n.children, out);
         }
     }
-    let groups = master
+    let mut groups = master
         .game_hierarchy(token, game_id)
         .map(|forest| {
             let mut out = Vec::new();
@@ -2798,6 +3093,30 @@ fn fetch_session(
             out
         })
         .unwrap_or_default();
+    // The membership, joined: the unit rows carry the node they sit in, so
+    // the hulls of a node are the rows that name it.
+    let members: Vec<(i64, i64)> = pieces
+        .iter()
+        .filter_map(|p| p.hierarchy_node.map(|node| (p.id, node)))
+        .collect();
+    tfg::groups::join_members(&mut groups, &members);
+    // WHICH PIECE IS ABOARD WHICH. A hull's host is on no piece row: the
+    // server publishes it as the CONTENTS of the host, and the only route
+    // is `GET /games/{id}/units/{unit_id}/embarkations`. So this is one
+    // read per piece in the exercise — the same fan-out the related read
+    // already makes per step, and paid for ONCE per session read.
+    //
+    // A refused read means "this piece carries nothing", not a broken
+    // session: the route 404s for a piece that was never a host, and the
+    // answer we want for such a piece is exactly "no contents".
+    let mut hosts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for piece in &pieces {
+        if let Ok(contents) = master.game_embarkations(token, game_id, piece.id) {
+            for child in contents {
+                hosts.insert(child.id, piece.id);
+            }
+        }
+    }
     let echelons = master.echelon_levels(token).unwrap_or_default();
     // The game's own roles, as the seat form offers them. Read rather than
     // hardcoded: a deployment that relabels a seat keeps working, and the
@@ -3028,6 +3347,7 @@ fn fetch_session(
         // step counts all drink from it.
         book,
         pieces,
+        hosts,
         groups,
         echelons,
         related,
@@ -3037,6 +3357,383 @@ fn fetch_session(
         directory,
         roles,
     })
+}
+
+/// LEAVE PLANNING: write the whole staged draft through, then move the
+/// exercise to preparation.
+///
+/// The plan is `tfg::advance::plan`'s, and this function only executes it:
+/// the order, the rules and the reasons all live there, where they can be
+/// read and tested without a session. What lives HERE is the three things
+/// only this side can do — ask the server whether this seat may drive the
+/// exercise at all, read the server's own frame so the diff is against the
+/// truth, and name the server's refusals in the console's words.
+///
+/// THE THREE READS, AND WHY THE FIRST ONE COMES FIRST.
+///
+/// - THE AUTHORITY. `GET /game-roles/{id}/permissions` is the only read
+///   that carries a role's grants, and it is gated on the ADMINISTRATOR's
+///   grant — so an administrator learns the answer and a Game Master
+///   participant cannot. The console does not guess on the participant's
+///   behalf: an answer it cannot have is an answer it does not have, and
+///   the server's own refusal is the one that counts.
+/// - THE LIVE FRAME. The server holds whatever the last attempt managed to
+///   write, and a diff against the truth is what makes a retry emit NOTHING
+///   for it instead of re-issuing a write the server answers 409.
+/// - THE TERMS. The planned window is written against the window the server
+///   holds, so only the clock keys that changed go on the wire.
+fn advance_to_preparation(
+    master: &tfg::backend::MinosMaster,
+    host: &str,
+    token: &str,
+    game_id: i64,
+    force: tfg::force::ForceDraft,
+    live_hulls: Vec<tfg::force::LiveHull>,
+    roster: tfg::roster::RosterDraft,
+    live_seats: Vec<tfg::roster::LiveSeat>,
+    groups: Vec<tfg::groups::GroupWrite>,
+    window: tfg::window::WindowDraft,
+    book: tfg::book::BookDraft,
+    live_scenarios: Vec<tfg::book::LiveScenario>,
+) -> Result<tfg::shell_gpui::CreatedSession, String> {
+    // THE AUTHORITY, before anything is written. `Some(false)` is a seat
+    // that KNOWS it may not drive the exercise; `None` is a seat that cannot
+    // find out, and the server decides for it.
+    match may_run_the_exercise(master, host, token, game_id) {
+        Some(false) => {
+            return Err(
+                "this seat does not run the exercise \u{2014} the Game Master drives it, \
+                 so nothing was written"
+                    .to_string(),
+            )
+        }
+        None => eprintln!(
+            "advance: this seat's grants are not knowable to the console \
+             (the permission matrix is the administrator's read), so the server decides"
+        ),
+        Some(true) => {}
+    }
+
+    // THE SERVER'S FRAME, re-read. The mirror that crossed with the drafts
+    // is the console's last word about the server; after a failed attempt
+    // it is a stale one, and a diff against a stale frame re-issues the
+    // writes the server already took.
+    let live_seats = read_live_seats(master, token, game_id, live_seats);
+    let live_hulls = read_live_hulls(master, token, game_id, live_hulls);
+
+    // THE TERMS. The window is written only against the window the server
+    // holds: a window the console could not compare would be a stale copy
+    // of somebody else's plan, and the terms are not the console's to
+    // overwrite.
+    let window_write = match master.game_detail(token, game_id) {
+        Ok(detail) => tfg::advance::window_update(&window, &detail.window),
+        Err(e) => {
+            eprintln!("advance: the exercise's terms could not be read ({e}); the window is left alone");
+            Ok(None)
+        }
+    };
+    let window_write = match window_write {
+        Ok(write) => write,
+        Err(why) => return Err(why),
+    };
+
+    // THE BOOK, planned against the book's own live frame. The book is
+    // written through LAST, and the order is the server's: a step's related
+    // list names hulls and task-organisation nodes, so the force and the
+    // groups have to exist before it is posted, and a new scenario's steps
+    // have to come after the scenario.
+    let book_writes = tfg::book::plan(&book, &live_scenarios);
+
+    // THE PLAN. Every rule is checked here, before the first write.
+    let steps = match tfg::advance::plan(
+        &force,
+        &live_hulls,
+        &roster,
+        &live_seats,
+        &groups,
+        &book_writes,
+        window_write,
+    ) {
+        Ok(steps) => steps,
+        Err(refusal) => return Err(refusal.to_string()),
+    };
+
+    // THE WRITES, in the plan's order. The first refusal stops the rest.
+    //
+    // THE CREATED NODES TRAVEL FROM THE GROUPS TO THE BOOK, because a step's
+    // related list may name a node this same flush created, and the node has
+    // no server id until the flush that created it has made one.
+    match run_plan(
+        master,
+        token,
+        game_id,
+        &steps,
+        &live_scenarios,
+        true,
+    ) {
+        Ok(written) => {
+            eprintln!("advance: {written} write(s) and the exercise moved to preparation");
+            match fetch_session(host, token, Some(game_id)) {
+                Some(session) => Ok(tfg::shell_gpui::CreatedSession::held(session)),
+                None => Err("moved to preparation, but the session could not be read".to_string()),
+            }
+        }
+        Err(why) => {
+            // THE SERVER TOOK PART OF THE DRAFT. The exercise is re-read so
+            // the operator sees the truth, and the answer carries it: the
+            // next attempt diffs against what the server holds, not against
+            // what it held before. The operator's staged work is theirs and
+            // is not touched here.
+            match fetch_session(host, token, Some(game_id)) {
+                Some(session) => Ok(tfg::shell_gpui::CreatedSession {
+                    session,
+                    note: why.clone(),
+                    refusal: Some(why),
+                    write: tfg::shell_gpui::WriteId::Prepare,
+                }),
+                None => Err(why),
+            }
+        }
+    }
+}
+
+/// Run a plan's steps, in the plan's order, and report how many writes
+/// landed.
+///
+/// `transition` says whether the plan's last step — the move to preparation
+/// — is part of this run. It is not the same run for the advance and for the
+/// sync: the advance moves the exercise on, and the sync writes the same
+/// staged records and leaves the exercise where it is. The two share the
+/// order because they share the server's rules, and a console that wrote the
+/// records in two orders would be two answers to one question.
+///
+/// THE CREATED NODES TRAVEL FROM THE GROUPS TO THE BOOK inside this
+/// function, because a step's related list may name a node this same flush
+/// created, and the node has no server id until the flush that created it
+/// has made one.
+fn run_plan(
+    master: &tfg::backend::MinosMaster,
+    token: &str,
+    game_id: i64,
+    steps: &[tfg::advance::Step],
+    live_scenarios: &[tfg::book::LiveScenario],
+    transition: bool,
+) -> Result<usize, String> {
+    let mut created: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    let mut written = 0;
+    for step in steps {
+        if !transition && matches!(step, tfg::advance::Step::Transition) {
+            continue;
+        }
+        let outcome: Result<(), String> = match step {
+            // THE TERMS. The window is the exercise's own terms, and the
+            // ticket for them is the ADMINISTRATOR's — a different grant
+            // from the one that moves the exercise, which is the Game
+            // Master's. So a refusal here stops the run BEFORE anything is
+            // written: the seats, the force and the groups are untouched,
+            // the game is still in `planning` (so the terms can still be
+            // written by somebody who holds the ticket), and the operator's
+            // staged work is theirs.
+            tfg::advance::Step::Window(update) => master
+                .update_game(token, game_id, update)
+                .map(|_| ())
+                .map_err(|e| window_refusal(&e)),
+            tfg::advance::Step::Seat(write)
+            | tfg::advance::Step::Role(write)
+            | tfg::advance::Step::Unseat(write) => {
+                flush_roster(master, token, game_id, std::slice::from_ref(write))
+            }
+            tfg::advance::Step::Force(write) => {
+                flush_force(master, token, game_id, std::slice::from_ref(write))
+            }
+            tfg::advance::Step::Groups(writes) => {
+                flush_groups(master, token, game_id, writes).map(|made| {
+                    created = made;
+                })
+            }
+            tfg::advance::Step::Book(writes) => {
+                flush_book(master, token, game_id, writes, live_scenarios, &created)
+            }
+            tfg::advance::Step::Transition => master
+                .transition_game(token, game_id, "preparation")
+                .map(|_| ())
+                .map_err(|e| transition_refusal(&e)),
+        };
+        match outcome {
+            Ok(()) => written += 1,
+            Err(why) => return Err(why),
+        }
+    }
+    Ok(written)
+}
+
+/// Whether this seat may move the exercise on, as far as the console can
+/// know.
+///
+/// THE ONLY READ THAT CARRIES A ROLE'S GRANTS IS THE ADMINISTRATOR'S.
+/// `GET /game-roles/{id}/permissions` answers with a role's whole matrix,
+/// and it is gated on the application-level role-vocabulary read — so an
+/// administrator learns the answer and a Game Master participant cannot.
+/// `None` means "not knowable", and the console says so rather than
+/// guessing: a participant's refusal is the server's to make, and the
+/// console's job is to name it when it comes.
+///
+/// The grant itself is `/games/transitions` with the action `transition` —
+/// "Drive the exercise" in the vocabulary the server publishes.
+fn may_run_the_exercise(
+    master: &tfg::backend::MinosMaster,
+    host: &str,
+    token: &str,
+    game_id: i64,
+) -> Option<bool> {
+    let (me, _name) = master.me(token).ok()?;
+    let parts = master.game_participants(token, game_id).ok()?;
+    let role_id = parts.iter().find(|p| p.user_id == me)?.role_id;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let response = client
+        .get(&format!("{host}/game-roles/{role_id}/permissions"))
+        .bearer_auth(token)
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = response.json().ok()?;
+    let permissions = body["data"]["permissions"].as_array()?;
+    Some(permissions.iter().any(|p| {
+        p["object"].as_str() == Some("/games/transitions")
+            && p["action"].as_str() == Some("transition")
+    }))
+}
+
+/// The seats as the server holds them NOW, or the ones that crossed if the
+/// read failed.
+///
+/// The read is what makes a retry honest: the server answers 409 to a
+/// second `POST /games/{id}/participants`, so a diff against a stale frame
+/// would die on the first seat the last attempt had already taken.
+fn read_live_seats(
+    master: &tfg::backend::MinosMaster,
+    token: &str,
+    game_id: i64,
+    carried: Vec<tfg::roster::LiveSeat>,
+) -> Vec<tfg::roster::LiveSeat> {
+    match master.game_participants(token, game_id) {
+        Ok(parts) => live_seats_from(&parts),
+        Err(_) => carried,
+    }
+}
+
+/// The roster's mirror, from the server's own participants answer.
+///
+/// A free function so the rule can be tested without a session: what the
+/// re-read believes about the room is the whole of the retry's honesty, and
+/// a claim about the retry deserves a test that does not need a server.
+fn live_seats_from(parts: &[tfg::backend::Participant]) -> Vec<tfg::roster::LiveSeat> {
+    parts
+        .iter()
+        .map(|p| tfg::roster::LiveSeat {
+            user_id: p.user_id,
+            user_name: p.user_name.clone(),
+            role_id: p.role_id,
+            role_name: p.role_name.clone(),
+            call_sign: p.call_sign.clone(),
+            judge: p.judge,
+        })
+        .collect()
+}
+
+/// The hulls as the server holds them NOW, or the ones that crossed if the
+/// read failed.
+///
+/// The fresh read says WHICH HULLS EXIST and WHO COMMANDS THEM; the
+/// placements read says where they sit. Neither says what a hull is aboard:
+/// no single read carries the embarkation links, so those ride in from the
+/// mirror that crossed — the console's own last word about them.
+fn read_live_hulls(
+    master: &tfg::backend::MinosMaster,
+    token: &str,
+    game_id: i64,
+    carried: Vec<tfg::force::LiveHull>,
+) -> Vec<tfg::force::LiveHull> {
+    let Ok(units) = master.game_units_list(token, game_id) else {
+        return carried;
+    };
+    let placements: Vec<(i64, f64, f64)> = master
+        .placements_list(token, game_id)
+        .map(|p| {
+            p.placements
+                .iter()
+                .map(|g| (g.unit_id, g.latitude, g.longitude))
+                .collect()
+        })
+        .unwrap_or_default();
+    live_hulls_from(&units, &placements, &carried)
+}
+
+/// The force's mirror, from the server's own units and placements.
+///
+/// The commander and the hull's own existence come from the server, because
+/// those are the two facts a re-issued write would be refused for: a second
+/// `POST /games/{id}/units` answers 409, and a second assignment for a
+/// commander the server already has answers "One person commands one thing".
+fn live_hulls_from(
+    units: &[tfg::backend::GameUnit],
+    placements: &[(i64, f64, f64)],
+    carried: &[tfg::force::LiveHull],
+) -> Vec<tfg::force::LiveHull> {
+    units
+        .iter()
+        .map(|u| {
+            let carried_hull = carried.iter().find(|c| c.unit_id == u.unit_id);
+            let start = placements
+                .iter()
+                .find(|(id, _, _)| *id == u.unit_id)
+                .map(|(_, lat, lon)| tfg::force::Start { lat: *lat, lon: *lon });
+            tfg::force::LiveHull {
+                unit_id: u.unit_id,
+                name: u.unit_name.clone(),
+                commander_id: u.commander_id,
+                start: start.or_else(|| carried_hull.and_then(|c| c.start)),
+                host: carried_hull.and_then(|c| c.host),
+            }
+        })
+        .collect()
+}
+
+/// The console's sentence for a refusal of the exercise's own terms.
+///
+/// The server says "Forbidden" and leaves the reason to the reader, and
+/// "forbidden: Forbidden" is not an answer an operator can act on. The
+/// window is the ADMINISTRATOR's ticket — `PATCH /games/{id}` is
+/// `administer(ActionUpdate)` — so the console names that.
+fn window_refusal(e: &tfg::backend::BackendError) -> String {
+    match e {
+        tfg::backend::BackendError::Forbidden { message, .. } => format!(
+            "the planned window is the administrator's to write, and this seat does not \
+             hold that ticket (the server said: {message}) \u{2014} the exercise's terms \
+             were not written"
+        ),
+        other => format!("the planned window was refused: {other}"),
+    }
+}
+
+/// The console's sentence for a refusal of the move itself.
+///
+/// The transition is the Game Master's — `POST /games/{id}/transitions` asks
+/// whether the caller's ROLE may drive the exercise — so the console names
+/// that rather than the server's status word.
+fn transition_refusal(e: &tfg::backend::BackendError) -> String {
+    match e {
+        tfg::backend::BackendError::Forbidden { message, .. } => format!(
+            "this seat does not run the exercise \u{2014} the Game Master drives it \
+             (the server said: {message})"
+        ),
+        other => format!("move to preparation refused: {other}"),
+    }
 }
 
 /// Write a force plan through, one write per endpoint, in `force::plan`'s
@@ -3132,34 +3829,63 @@ fn flush_roster(
 /// Write a task-organisation plan through, one write per endpoint, in
 /// `groups::plan`'s order.
 ///
-/// A write that names a node created in the SAME flush (`GroupRef::New`) is
-/// refused rather than guessed at: resolving a staged id to the server id a
-/// create answers with is work this advance does not do. The draft the
-/// advance flushes is always empty, so the case cannot arise — refusing
-/// loudly keeps it from arising silently if that ever changes.
+/// A node the draft is about to CREATE is created here, and the answer —
+/// the whole forest — says which id the server gave it. That answer is the
+/// map the later writes resolve through: a write that names a node created
+/// a moment earlier is written against the server's id, not the draft's
+/// negative local one.
+///
+/// The order is the plan's, and it is load-bearing: creates land parents
+/// first (a child's create names a parent the server has to hold), then a
+/// created node's commander, then the edits to held nodes, then the units
+/// leaving a node, then the units placed, then the removals. A placement
+/// may therefore name a node the same flush just made.
+///
+/// The map is returned because the BOOK's flush needs it: a step's related
+/// list names task-organisation nodes, and one of them may be a node this
+/// flush is creating.
 fn flush_groups(
     master: &tfg::backend::MinosMaster,
     token: &str,
     game_id: i64,
     writes: &[tfg::groups::GroupWrite],
-) -> Result<(), String> {
-    let resolve = |group: &tfg::groups::GroupRef| -> Result<i64, String> {
-        match group {
-            tfg::groups::GroupRef::Live(id) => Ok(*id),
-            tfg::groups::GroupRef::New(id) => Err(format!(
-                "node staged as {id} names a node this same flush creates, \
-                 which the advance cannot resolve"
-            )),
-        }
-    };
+) -> Result<std::collections::BTreeMap<i64, i64>, String> {
+    // The draft's negative local id to the server's id, for the nodes this
+    // flush creates.
+    let mut created: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
     for w in writes {
         let step: Result<(), tfg::backend::BackendError> = match w {
-            // The advance never flushes a draft that creates nodes: the shell
-            // holds no task-organisation draft, and the empty one it sends
-            // plans nothing. Refused rather than half-built if that changes.
-            tfg::groups::GroupWrite::CreateNode { .. } => Err(tfg::backend::BackendError::Other(
-                "this advance does not create task-organisation nodes".to_string(),
-            )),
+            tfg::groups::GroupWrite::CreateNode {
+                local_id,
+                name,
+                echelon_id,
+                parent,
+            } => {
+                let parent_id = match parent {
+                    Some(p) => Some(resolve_group(&created, p)?),
+                    None => None,
+                };
+                match master.hierarchy_create_node(
+                    token,
+                    game_id,
+                    *echelon_id,
+                    name,
+                    parent_id,
+                    "",
+                    "",
+                ) {
+                    Ok(forest) => match find_created(&forest, name, parent_id) {
+                        Some(id) => {
+                            created.insert(*local_id, id);
+                            Ok(())
+                        }
+                        None => Err(tfg::backend::BackendError::Other(format!(
+                            "the server created node {name:?} but did not say which one it was"
+                        ))),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
             tfg::groups::GroupWrite::Rename { group_id, name } => {
                 master.hierarchy_update_node(token, game_id, *group_id, Some(name.as_str()))
             }
@@ -3167,21 +3893,21 @@ fn flush_groups(
                 master.hierarchy_delete_node(token, game_id, *group_id)
             }
             tfg::groups::GroupWrite::MoveNode { group_id, parent } => {
-                let parent = resolve(parent)?;
+                let parent = resolve_group(&created, parent)?;
                 master.hierarchy_move_node(token, game_id, *group_id, parent)
             }
             tfg::groups::GroupWrite::ClearParent { group_id } => {
                 master.hierarchy_detach_node(token, game_id, *group_id)
             }
             tfg::groups::GroupWrite::SetCommander { group, user_id } => {
-                let group = resolve(group)?;
+                let group = resolve_group(&created, group)?;
                 master.hierarchy_set_commander(token, game_id, group, *user_id)
             }
             tfg::groups::GroupWrite::ClearCommander { group_id } => {
                 master.hierarchy_clear_commander(token, game_id, *group_id)
             }
             tfg::groups::GroupWrite::PlaceUnit { group, unit_id } => {
-                let group = resolve(group)?;
+                let group = resolve_group(&created, group)?;
                 master.game_unit_place(token, game_id, *unit_id, group)
             }
             tfg::groups::GroupWrite::UnplaceUnit { unit_id } => {
@@ -3192,9 +3918,304 @@ fn flush_groups(
             return Err(format!("{} refused: {e}", w.label()));
         }
     }
+    Ok(created)
+}
+
+/// The server's id for a node a write names: one the server holds, or one
+/// this same flush created.
+fn resolve_group(
+    created: &std::collections::BTreeMap<i64, i64>,
+    group: &tfg::groups::GroupRef,
+) -> Result<i64, String> {
+    match group {
+        tfg::groups::GroupRef::Live(id) => Ok(*id),
+        tfg::groups::GroupRef::New(id) => created.get(id).copied().ok_or_else(|| {
+            format!("node staged as {id} names a node this flush did not create")
+        }),
+    }
+}
+
+/// The id of the node a create just made, out of the forest the server
+/// answered with.
+///
+/// The answer is the WHOLE forest, so the created node is found by what it
+/// was asked for: its name and its parent. Two nodes that answer to that
+/// are ambiguous, and an ambiguous answer is refused rather than guessed
+/// at — a placement written against the wrong node is a placement nobody
+/// can undo by looking at the map.
+fn find_created(
+    forest: &[tfg::backend::HierarchyNode],
+    name: &str,
+    parent: Option<i64>,
+) -> Option<i64> {
+    let mut found: Option<i64> = None;
+    fn walk(
+        nodes: &[tfg::backend::HierarchyNode],
+        name: &str,
+        parent: Option<i64>,
+        found: &mut Option<i64>,
+    ) {
+        for n in nodes {
+            if n.name == name && n.parent_id == parent {
+                if found.is_some() {
+                    // Ambiguous: a second node answers to the same question.
+                    *found = None;
+                    return;
+                }
+                *found = Some(n.id);
+            }
+            walk(&n.children, name, parent, found);
+        }
+    }
+    walk(forest, name, parent, &mut found);
+    found
+}
+
+/// Write a book plan through, one write per endpoint, in `book::plan`'s
+/// order.
+///
+/// THE ORDER IS THE SERVER'S. A scenario is created before its steps,
+/// because a step belongs to a scenario the server has to hold first; a
+/// removed step comes after the scenario it is removed from exists; and the
+/// related lists come LAST, because every row they name — the scenario, the
+/// step, the hulls, the task-organisation nodes — has to exist by then.
+///
+/// A scenario or a step this flush creates is resolved from the answer, not
+/// guessed at: the create answers with the server's id, and a step-add
+/// answers with the whole scenario, so the new step is the one the answer
+/// holds that was not there before. An answer that does not single one out
+/// is refused rather than guessed at.
+///
+/// The task-organisation nodes a related list may name are resolved through
+/// the map the groups flush returned, because the flush that creates a node
+/// runs BEFORE this one.
+fn flush_book(
+    master: &tfg::backend::MinosMaster,
+    token: &str,
+    game_id: i64,
+    writes: &[tfg::book::BookWrite],
+    live: &[tfg::book::LiveScenario],
+    nodes: &std::collections::BTreeMap<i64, i64>,
+) -> Result<(), String> {
+    // The draft's scenario local id to the server's id.
+    let mut scenarios: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    // The draft's step local id to the server's id.
+    let mut steps: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    // The step ids each scenario is known to hold, so a step-add's answer can
+    // be diffed against them.
+    let mut held: std::collections::BTreeMap<i64, Vec<i64>> = live
+        .iter()
+        .map(|l| (l.id, l.steps.clone()))
+        .collect();
+    for w in writes {
+        let step: Result<(), String> = match w {
+            tfg::book::BookWrite::Create { local_id, title } => {
+                match master.create_game_scenario(token, game_id, title, "") {
+                    Ok(sc) => {
+                        scenarios.insert(*local_id, sc.id);
+                        held.insert(sc.id, Vec::new());
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("create scenario {title:?} refused: {e}")),
+                }
+            }
+            tfg::book::BookWrite::AddStep {
+                scenario,
+                step: draft_step,
+                content,
+                window,
+            } => {
+                let sid = resolve_scenario(&scenarios, scenario)?;
+                let before = held.get(&sid).cloned().unwrap_or_default();
+                let w = window.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+                match master.add_scenario_step(token, game_id, sid, content, w) {
+                    Ok(sc) => {
+                        let fresh: Vec<i64> = sc
+                            .steps
+                            .iter()
+                            .map(|s| s.id)
+                            .filter(|id| !before.contains(id))
+                            .collect();
+                        let [id] = fresh.as_slice() else {
+                            return Err(format!(
+                                "the server added a step to scenario {sid} but did not say which one it was"
+                            ));
+                        };
+                        steps.insert(draft_step_local(draft_step), *id);
+                        held.entry(sid).or_default().push(*id);
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("add step refused: {e}")),
+                }
+            }
+            tfg::book::BookWrite::RemoveStep {
+                scenario_id,
+                step_id,
+            } => master
+                .delete_scenario_step(token, game_id, *scenario_id, *step_id)
+                .map(|_| ())
+                .map_err(|e| format!("remove step {step_id} refused: {e}")),
+            tfg::book::BookWrite::SetRelated {
+                scenario,
+                step,
+                refs,
+            } => {
+                let sid = resolve_scenario(&scenarios, scenario)?;
+                let stid = resolve_step(&steps, step)?;
+                // A ref with a NEGATIVE id names a node this plan is about to
+                // create; the groups flush is what creates it, and it hands
+                // the map over.
+                let mut resolved: Vec<(String, i64)> = Vec::with_capacity(refs.len());
+                for (kind, id) in refs {
+                    let id = if *id < 0 {
+                        nodes.get(id).copied().ok_or_else(|| {
+                            format!("related list names node {id}, which this flush did not create")
+                        })?
+                    } else {
+                        *id
+                    };
+                    resolved.push((kind.clone(), id));
+                }
+                master
+                    .set_step_related(token, game_id, sid, stid, &resolved)
+                    .map(|_| ())
+                    .map_err(|e| format!("related list refused: {e}"))
+            }
+        };
+        if let Err(why) = step {
+            return Err(why);
+        }
+    }
     Ok(())
 }
 
+/// The server's id for a scenario a write names: one the server holds, or
+/// one this same flush created.
+fn resolve_scenario(
+    scenarios: &std::collections::BTreeMap<i64, i64>,
+    scenario: &tfg::book::ScenarioRef,
+) -> Result<i64, String> {
+    match scenario {
+        tfg::book::ScenarioRef::Live(id) => Ok(*id),
+        tfg::book::ScenarioRef::New(id) => scenarios.get(id).copied().ok_or_else(|| {
+            format!("scenario staged as {id} names a scenario this flush did not create")
+        }),
+    }
+}
+
+/// The server's id for a step a write names: one the server holds, or one
+/// this same flush added.
+fn resolve_step(
+    steps: &std::collections::BTreeMap<i64, i64>,
+    step: &tfg::book::StepRef,
+) -> Result<i64, String> {
+    match step {
+        tfg::book::StepRef::Live(id) => Ok(*id),
+        tfg::book::StepRef::New(id) => steps.get(id).copied().ok_or_else(|| {
+            format!("step staged as {id} names a step this flush did not add")
+        }),
+    }
+}
+
+/// The draft's own id for a step, whichever way the write names it.
+fn draft_step_local(step: &tfg::book::StepRef) -> i64 {
+    match step {
+        tfg::book::StepRef::Live(id) => *id,
+        tfg::book::StepRef::New(id) => *id,
+    }
+}
+
+/// How many extra frames to ask for after the first, so MapLibre's tiles have
+/// time to arrive before a capture. A stand-in for the camera.
+const WARMUP_FRAMES: u64 = 24;
+
+#[cfg(test)]
+mod advance_tests {
+    use super::*;
+
+    fn participant(user_id: i64, name: &str, role_id: i64) -> tfg::backend::Participant {
+        tfg::backend::Participant {
+            user_id,
+            user_name: name.into(),
+            role_id,
+            role_name: format!("role-{role_id}"),
+            judge: false,
+            ready: false,
+            joined_at: None,
+            call_sign: name.to_uppercase(),
+        }
+    }
+
+    fn unit(unit_id: i64, name: &str, commander: Option<i64>) -> tfg::backend::GameUnit {
+        tfg::backend::GameUnit {
+            unit_id,
+            unit_name: name.into(),
+            hull_number: format!("h{unit_id}"),
+            class_name: String::new(),
+            commander_id: commander,
+            commander_name: String::new(),
+            hierarchy_node: None,
+        }
+    }
+
+    /// A FAILED ADVANCE LEAVES THE SERVER HOLDING PART OF THE DRAFT, and a
+    /// retry that diffs against a stale frame re-issues the write the
+    /// server already took — `POST /games/{id}/participants` answers 409 to
+    /// a second seat, so the advance would die on the first seat it had
+    /// already taken. The re-read is what makes the retry honest, and this
+    /// is the claim it makes: against the server's own frame, the retry
+    /// writes NOTHING for what the server already holds.
+    #[test]
+    fn a_re_read_after_a_failed_advance_plans_nothing_for_what_the_server_took() {
+        let mut draft = tfg::roster::RosterDraft::new();
+        draft.stage(tfg::roster::StagedSeat {
+            user_id: 6,
+            user_name: "Budi".into(),
+            role_id: 1,
+            role_name: "role-1".into(),
+            call_sign: "BUDI".into(),
+            judge: false,
+        });
+        // The server took the seat before it refused the rest.
+        let taken = vec![participant(6, "Budi", 1)];
+        let live = live_seats_from(&taken);
+        assert_eq!(
+            tfg::roster::plan(&draft, &live),
+            Vec::new(),
+            "the retry writes nothing for the seat the server already took"
+        );
+    }
+
+    /// The same claim about the force: the hull the server already holds,
+    /// with the commander it already has, is not assigned again — a second
+    /// `POST /games/{id}/units` answers 409, and a second hull for the same
+    /// commander answers "One person commands one thing".
+    #[test]
+    fn a_re_read_after_a_failed_advance_plans_nothing_for_the_hull_it_took() {
+        let mut draft = tfg::force::ForceDraft::new();
+        let mut hull = tfg::force::DraftHull::new(7, "KRI Nanggala".into(), "h7".into(), "c".into());
+        hull.commander_id = Some(3);
+        draft.upsert(hull);
+        let taken = vec![unit(7, "KRI Nanggala", Some(3))];
+        let live = live_hulls_from(&taken, &[], &[]);
+        assert_eq!(
+            tfg::force::plan(&draft, &live),
+            Ok(Vec::new()),
+            "the retry writes nothing for the hull the server already took"
+        );
+    }
+
+    /// The mirror the re-read builds carries the JUDGE side, because a
+    /// judge-side seat may not command and the advance has to see that
+    /// before it writes the force rather than after the server refuses it.
+    #[test]
+    fn the_re_read_carries_the_judge_side() {
+        let mut judge = participant(6, "Budi", 2);
+        judge.judge = true;
+        let live = live_seats_from(&[judge]);
+        assert!(live[0].judge, "the judge side is the mirror's to carry");
+    }
+}
 
 #[cfg(test)]
 mod picture_tests {

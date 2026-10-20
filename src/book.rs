@@ -43,24 +43,13 @@ impl ComposerDraft {
     /// Half a window is the case that matters: the backend refuses it, and
     /// the refusal arrives after the author has finished typing rather than
     /// while they are still in the field.
+    ///
+    /// THE RULE IS NOT HERE. It is `crate::window::window_problem` — one
+    /// rule for every window in this console, because the exercise's own
+    /// window is the same shape and the two answers could otherwise drift
+    /// apart. This method names the window ("a window") and asks.
     pub fn problem(&self) -> Option<String> {
-        match (self.start_hour.is_empty(), self.end_hour.is_empty()) {
-            (false, true) => Some("a window needs an end as well as a start".into()),
-            (true, false) => Some("a window needs a start as well as an end".into()),
-            (false, false) => {
-                if !crate::view::hhmm_ok(&self.start_hour) {
-                    return Some(format!("{} is not a military time like 1000", self.start_hour));
-                }
-                if !crate::view::hhmm_ok(&self.end_hour) {
-                    return Some(format!("{} is not a military time like 1030", self.end_hour));
-                }
-                if !crate::view::hhmm_window_ok(&self.start_hour, &self.end_hour) {
-                    return Some("a window's end must be after its start".into());
-                }
-                None
-            }
-            (true, true) => None,
-        }
+        crate::window::window_problem("a window", &self.start_hour, &self.end_hour)
     }
 }
 
@@ -310,10 +299,15 @@ impl BookDraft {
 /// One scenario as Minos holds it: the last thing the sync left behind.
 ///
 /// The plan only needs ids — steps of a live scenario are addressed
-/// directly, and titles are never rewritten by the flush.
+/// directly, and titles are never rewritten by the flush. The step ids ride
+/// along because the FLUSH needs them: a step-add answers with the whole
+/// scenario, and the only way to tell which of its steps is the new one is
+/// to know which ones were already there.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveScenario {
     pub id: i64,
+    /// The step ids the server holds, in book order.
+    pub steps: Vec<i64>,
 }
 
 /// Which scenario a staged step is posted to: one the server holds, or
@@ -447,7 +441,7 @@ mod tests {
     use super::*;
 
     fn live(id: i64) -> LiveScenario {
-        LiveScenario { id }
+        LiveScenario { id, steps: Vec::new() }
     }
 
     #[test]
@@ -626,14 +620,31 @@ mod tests {
         assert_eq!(plan(&draft, &[live(11)]).len(), 1);
     }
 
+    /// A relation against a scenario the server no longer lists is dropped:
+    /// posting a link for a row that is not there would 404.
     #[test]
-    fn prune_drops_relations_for_vanished_drafts() {
+    fn prune_drops_relations_for_vanished_scenarios() {
+        let mut draft = BookDraft::new();
+        draft.stage_relations(11, 3, vec![("hull".into(), 13)]);
+        draft.prune(&[]);
+        assert!(draft.step_relations.is_empty());
+    }
+
+    /// A relation on a scenario the DRAFT is about to create is kept: the
+    /// scenario is not vanished, it is not on the server YET, and the flush
+    /// posts the links right behind it.
+    #[test]
+    fn prune_keeps_relations_for_a_staged_scenario() {
         let mut draft = BookDraft::new();
         let local = draft.stage_scenario("Temp");
         let step = draft.stage_step_new(local, "x", None).unwrap();
         draft.stage_relations(local, step, vec![("hull".into(), 13)]);
         draft.prune(&[]);
-        assert!(draft.step_relations.is_empty());
+        assert_eq!(
+            draft.step_relations.len(),
+            1,
+            "the link rides the scenario the flush is about to create"
+        );
     }
 
     // -- the composer's draft ---------------------------------------------
@@ -642,76 +653,19 @@ mod tests {
     // a step BEFORE the round trip, so its rules are worth pinning: a
     // refusal that only arrives as a 400 from the field is a refusal the
     // author has to guess the cause of.
+    //
+    // The WINDOW's rules are not here: they are `crate::window`'s, because
+    // the exercise's own window is the same shape and one rule answers both.
+    // What is here is the composer's half of it — the pair the request
+    // takes, and the delegation that keeps the two answers from drifting.
 
-    /// No window is the default and is always fine. Both ends empty is what
-    /// an unauthored window looks like, and it is what the backend takes.
+    /// An empty step is a legitimate authoring state, not something the
+    /// draft refuses. The backend says so explicitly, and a client that
+    /// insisted on text would block an author from saving a skeleton.
     #[test]
-    fn a_draft_with_no_window_is_valid() {
-        let d = ComposerDraft {
-            content: "sweep north".into(),
-            ..Default::default()
-        };
-        assert_eq!(d.window(), None);
-        assert_eq!(d.problem(), None);
-    }
-
-    /// Half a window is the case that bites: the backend refuses it, so the
-    /// author is told now rather than after finishing the form.
-    #[test]
-    fn half_a_window_is_refused_before_the_request() {
-        let half_start = ComposerDraft {
-            start_hour: "1000".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            half_start.problem().as_deref(),
-            Some("a window needs an end as well as a start")
-        );
-
-        let half_end = ComposerDraft {
-            end_hour: "1030".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            half_end.problem().as_deref(),
-            Some("a window needs a start as well as an end")
-        );
-    }
-
-    /// Malformed and backwards windows are named as such, and the message
-    /// quotes what was typed, because "not a military time" without the
-    /// offending value leaves the author hunting.
-    #[test]
-    fn a_bad_window_says_which_value_is_bad() {
-        let bad_start = ComposerDraft {
-            start_hour: "900".into(),
-            end_hour: "1030".into(),
-            ..Default::default()
-        };
-        assert!(bad_start
-            .problem()
-            .unwrap()
-            .starts_with("900 is not a military time"));
-
-        let bad_end = ComposerDraft {
-            start_hour: "1000".into(),
-            end_hour: "25:00".into(),
-            ..Default::default()
-        };
-        assert!(bad_end
-            .problem()
-            .unwrap()
-            .starts_with("25:00 is not a military time"));
-
-        let backwards = ComposerDraft {
-            start_hour: "1030".into(),
-            end_hour: "1000".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            backwards.problem().as_deref(),
-            Some("a window's end must be after its start")
-        );
+    fn an_empty_step_is_not_the_drafts_business() {
+        let d = ComposerDraft::default();
+        assert_eq!(d.problem(), None, "content is the server's rule, not the draft's");
     }
 
     /// A good window comes through as the pair the request expects, not as
@@ -727,12 +681,21 @@ mod tests {
         assert_eq!(d.window(), Some(("1000", "1030")));
     }
 
-    /// An empty step is a legitimate authoring state, not something the
-    /// draft refuses. The backend says so explicitly, and a client that
-    /// insisted on text would block an author from saving a skeleton.
+    /// A half window is refused by the ONE rule, and the composer's own
+    /// sentence is the rule's sentence with the window's name in it.
     #[test]
-    fn an_empty_step_is_not_the_drafts_business() {
-        let d = ComposerDraft::default();
-        assert_eq!(d.problem(), None, "content is the server's rule, not the draft's");
+    fn the_composer_asks_the_shared_window_rule() {
+        let half = ComposerDraft {
+            start_hour: "1000".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            half.problem().as_deref(),
+            crate::window::window_problem("a window", "1000", "").as_deref()
+        );
+        assert_eq!(
+            half.problem().as_deref(),
+            Some("a window needs an end as well as a start")
+        );
     }
 }

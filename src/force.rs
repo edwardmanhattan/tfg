@@ -128,9 +128,22 @@ pub struct LiveHull {
 
 /// The operator's force, keyed by unit id so every read is a lookup and the
 /// order a list is drawn in never depends on insertion.
+///
+/// THE FRAME IS WHAT THE SERVER LAST SAID, and it is what tells the
+/// operator's edit from the server's row. A re-read happens while the
+/// operator is still authoring — every write triggers one — so a re-seed
+/// that simply overwrote the draft would throw away work the flush has not
+/// written. An entry that still matches the frame is the server's, and one
+/// that differs is the operator's; the frame is replaced, the edits are
+/// kept.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ForceDraft {
     hulls: BTreeMap<i64, DraftHull>,
+    /// What the server last said, per hull. The reference the merge reads.
+    frame: BTreeMap<i64, DraftHull>,
+    /// Hulls the operator has taken out of the exercise. A mark rather than
+    /// an absence, because a re-read would otherwise put the hull back.
+    removed: BTreeSet<i64>,
 }
 
 impl ForceDraft {
@@ -164,19 +177,76 @@ impl ForceDraft {
     /// saying where it sits now, and everything else about it is still what
     /// they said before.
     pub fn upsert(&mut self, hull: DraftHull) {
+        self.removed.remove(&hull.unit_id);
         self.hulls.insert(hull.unit_id, hull);
     }
 
     /// Take a hull out of the exercise. Returns it so the caller can drop the
     /// local half of it — the sim ship, the labels, the selection.
+    ///
+    /// The removal is MARKED, not merely an absence: a re-read replaces the
+    /// draft from the server's frame, and a hull the server still holds
+    /// would come back with it.
     pub fn remove(&mut self, unit_id: i64) -> Option<DraftHull> {
+        self.removed.insert(unit_id);
         self.hulls.remove(&unit_id)
+    }
+
+    /// Set the frame from a read and KEEP the operator's edits.
+    ///
+    /// The merge is the rule, not a convenience: the session read happens
+    /// after every write, so a re-seed that overwrote the draft would
+    /// discard an operator's half-finished plan on the strength of a write
+    /// they had already made. An entry that no longer matches the frame is
+    /// the operator's own statement and survives; one that matches it is
+    /// the server's, and the server's newer word wins.
+    ///
+    /// A hull the operator took out of the exercise stays out while the
+    /// server still holds it — that removal is a statement too.
+    pub fn seed(&mut self, live: &[LiveHull]) {
+        let mut frame: BTreeMap<i64, DraftHull> = BTreeMap::new();
+        for l in live {
+            frame.insert(
+                l.unit_id,
+                DraftHull {
+                    unit_id: l.unit_id,
+                    name: l.name.clone(),
+                    hull_number: String::new(),
+                    class_id: String::new(),
+                    start: l.start,
+                    commander_id: l.commander_id,
+                    host: l.host,
+                },
+            );
+        }
+        let kept: Vec<DraftHull> = self
+            .hulls()
+            .filter(|hull| self.frame.get(&hull.unit_id) != Some(hull))
+            .cloned()
+            .collect();
+        let removals: BTreeSet<i64> = self
+            .removed
+            .iter()
+            .copied()
+            .filter(|id| frame.contains_key(id))
+            .collect();
+        self.hulls = frame.clone();
+        for hull in kept {
+            self.hulls.insert(hull.unit_id, hull);
+        }
+        for id in &removals {
+            self.hulls.remove(id);
+        }
+        self.frame = frame;
+        self.removed = removals;
     }
 
     /// Empty the draft: a released hold, a closed session, a hold that moved
     /// to another game.
     pub fn clear(&mut self) {
         self.hulls.clear();
+        self.frame.clear();
+        self.removed.clear();
     }
 
     /// Say where a hull starts. `None` lifts it off the map without taking it
@@ -307,22 +377,28 @@ impl ForceWrite {
 /// that cannot be written refuses WHOLE and names the hulls: issuing the rest
 /// would half-commit a force the operator cannot see.
 ///
-/// Three states refuse, and all three are Minos's rules rather than this
+/// Four states refuse, and all four are Minos's rules rather than this
 /// module's. A hull in the exercise with nobody to steer it is the first:
 /// `game_units.id_commander` is NOT NULL and the assignment endpoint says so
 /// in as many words. The draft tolerates the state so the operator can work;
 /// the sync refuses it, because handing a piece to whoever happened to be
-/// seated first is the one answer nobody can undo by looking at the map. A
-/// hull told to ride itself, and a ring of hulls that carry each other, are
-/// the next two: the attach endpoint refuses both outright ("putting the
-/// group inside the carrier is a ring"), and they are the states a drag can
-/// build, so catching them here is the point of this module rather than a
-/// courtesy.
+/// seated first is the one answer nobody can undo by looking at the map. One
+/// person commanding two hulls is the second: the server says "That person
+/// already commands the unit ... One person commands one thing", and a
+/// second hull for the same commander is refused as a conflict rather than
+/// as a duplicate. A hull told to ride itself, and a ring of hulls that
+/// carry each other, are the next two: the attach endpoint refuses both
+/// outright ("putting the group inside the carrier is a ring"), and they are
+/// the states a drag can build, so catching them here is the point of this
+/// module rather than a courtesy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForceGap {
     pub reason: GapReason,
     /// The hulls the sentence names, in unit-id order.
     pub hulls: Vec<String>,
+    /// The person the sentence is about, when the rule is about a person.
+    /// `None` for the rules that are about hulls alone.
+    pub who: Option<String>,
 }
 
 /// Which rule refused the draft. The reason is what keeps [`ForceGap`]'s
@@ -332,6 +408,10 @@ pub struct ForceGap {
 pub enum GapReason {
     /// A hull the server does not hold has nobody to command it.
     Uncommanded,
+    /// One person is given two hulls.
+    TwoCommands,
+    /// A hull is given to a seat that may not command.
+    JudgeSideCommander,
     /// A hull is its own host.
     SelfHost,
     /// Hulls that carry each other, transitively.
@@ -346,6 +426,18 @@ impl std::fmt::Display for ForceGap {
                 f,
                 "{hulls} — Minos gives every piece a commander, so name one on the Player picker first"
             ),
+            GapReason::TwoCommands => write!(
+                f,
+                "{hulls} — one person commands one thing, so the second hull needs a second commander"
+            ),
+            GapReason::JudgeSideCommander => {
+                let who = self.who.as_deref().unwrap_or("that seat");
+                write!(
+                    f,
+                    "{hulls} — {who} is on the judge side, and a judge directs rather \
+                     than commands, so give the hull a player-side commander"
+                )
+            }
             GapReason::SelfHost => write!(
                 f,
                 "{hulls} — a hull cannot ride itself, so drop it on open water or on another hull"
@@ -373,6 +465,24 @@ fn gap(draft: &ForceDraft, live: &[LiveHull]) -> Option<ForceGap> {
         return Some(ForceGap {
             reason: GapReason::Uncommanded,
             hulls: uncommanded,
+            who: None,
+        });
+    }
+
+    // ONE PERSON, ONE THING. The server refuses a second hull for a
+    // commander who already has one ("That person already commands the unit
+    // ... One person commands one thing — a unit or a task group"), so a
+    // draft that hands the same person two hulls is a draft the server will
+    // refuse halfway through the write. The count is over the DRAFT, which
+    // is the whole force as it will be: a hull the server already holds and
+    // the draft leaves alone still counts, because the draft is what the
+    // command will be.
+    let doubled = doubled_hulls(draft);
+    if !doubled.is_empty() {
+        return Some(ForceGap {
+            reason: GapReason::TwoCommands,
+            hulls: doubled,
+            who: None,
         });
     }
 
@@ -385,6 +495,7 @@ fn gap(draft: &ForceDraft, live: &[LiveHull]) -> Option<ForceGap> {
         return Some(ForceGap {
             reason: GapReason::SelfHost,
             hulls: self_hosted,
+            who: None,
         });
     }
 
@@ -393,9 +504,65 @@ fn gap(draft: &ForceDraft, live: &[LiveHull]) -> Option<ForceGap> {
         return Some(ForceGap {
             reason: GapReason::Ring,
             hulls: ring,
+            who: None,
         });
     }
 
+    None
+}
+
+/// The hulls a draft gives to a commander who already has one.
+///
+/// Every hull a commander holds more than one of, in unit-id order. The
+/// names are the hulls, not the commander: the hull is what the operator
+/// has to change, and the commander is a name the console may not know.
+fn doubled_hulls(draft: &ForceDraft) -> Vec<String> {
+    let mut by_commander: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    for hull in draft.hulls() {
+        if let Some(commander) = hull.commander_id {
+            by_commander
+                .entry(commander)
+                .or_default()
+                .push(hull.name.clone());
+        }
+    }
+    by_commander
+        .values()
+        .filter(|hulls| hulls.len() > 1)
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+/// The hull a draft gives to a seat that may not command, or `None`.
+///
+/// THE JUDGE SIDE DOES NOT COMMAND. The server refuses a judge-side
+/// commander outright ("a judge-side participant does not command units or
+/// task groups"), so the console refuses it before the write rather than
+/// after it. `judges` is the room's judge-side seats by id and by name —
+/// the staged role wins over the live one, because the staged role is what
+/// the advance is about to write.
+///
+/// This is a rule about the ROOM, so it is not in [`gap`]: the draft alone
+/// does not say who is judge-side, and the shell's own door to the plan
+/// does not carry the room either. The advance carries both and asks.
+pub fn judge_side_gap(
+    draft: &ForceDraft,
+    judges: &BTreeMap<i64, String>,
+) -> Option<ForceGap> {
+    for hull in draft.hulls() {
+        let Some(commander) = hull.commander_id else {
+            continue;
+        };
+        let Some(who) = judges.get(&commander) else {
+            continue;
+        };
+        return Some(ForceGap {
+            reason: GapReason::JudgeSideCommander,
+            hulls: vec![hull.name.clone()],
+            who: Some(who.clone()),
+        });
+    }
     None
 }
 
@@ -619,7 +786,8 @@ mod tests {
             plan(&draft, &[]),
             Err(ForceGap {
                 reason: GapReason::Uncommanded,
-                hulls: vec!["KRI Nanggala".into(), "KRI Rangsat".into()]
+                hulls: vec!["KRI Nanggala".into(), "KRI Rangsat".into()],
+                who: None,
             })
         );
     }
@@ -728,9 +896,13 @@ mod tests {
     fn a_new_assignment_is_ordered_before_its_placement() {
         // The position endpoint 404s on a hull the server has never heard of,
         // so the order is load-bearing rather than tidy.
+        //
+        // TWO COMMANDERS, because one person commands one thing: the two
+        // hulls here are two people, and a force that gave them both to the
+        // same person would be refused before it was written.
         let mut draft = ForceDraft::new();
         let mut assigned = hull(8, "KRI Rangsat", None);
-        assigned.commander_id = Some(3);
+        assigned.commander_id = Some(4);
         draft.upsert(assigned);
         let mut placed = hull(7, "KRI Nanggala", Some((-5.4, 106.2)));
         placed.commander_id = Some(3);
@@ -740,7 +912,7 @@ mod tests {
             Ok(vec![
                 ForceWrite::Assign { unit_id: 7, name: "KRI Nanggala".into(), commander_id: 3 },
                 ForceWrite::Place { unit_id: 7, name: "KRI Nanggala".into(), lat: -5.4, lon: 106.2 },
-                ForceWrite::Assign { unit_id: 8, name: "KRI Rangsat".into(), commander_id: 3 },
+                ForceWrite::Assign { unit_id: 8, name: "KRI Rangsat".into(), commander_id: 4 },
             ])
         );
     }
@@ -820,6 +992,10 @@ mod tests {
 
     /// A hull already in the exercise on both sides has nothing to assign,
     /// so putting it aboard names no assignment: the link is the whole edit.
+    ///
+    /// A CARRIER AND ITS CHILD HAVE TWO COMMANDERS: one person commands one
+    /// thing, so the two hulls here are two people. A force that gave them
+    /// both to one commander would be refused before it was written.
     #[test]
     fn a_fresh_embark_is_one_write() {
         let mut draft = ForceDraft::new();
@@ -827,12 +1003,12 @@ mod tests {
         host.commander_id = Some(3);
         draft.upsert(host);
         let mut child = hull(7, "KRI Nanggala", None);
-        child.commander_id = Some(3);
+        child.commander_id = Some(4);
         draft.upsert(child);
         assert!(draft.set_host(7, Some(5)), "the child is in the draft");
         let server = vec![
             live(5, "KRI Ahmad Yani", Some(3), None),
-            live(7, "KRI Nanggala", Some(3), None),
+            live(7, "KRI Nanggala", Some(4), None),
         ];
         assert_eq!(
             plan(&draft, &server),
@@ -853,12 +1029,12 @@ mod tests {
         host.commander_id = Some(3);
         draft.upsert(host);
         let mut child = hull(7, "KRI Nanggala", None);
-        child.commander_id = Some(3);
+        child.commander_id = Some(4);
         draft.upsert(child);
         assert!(draft.set_host(7, None), "clearing the link disembarks");
         let server = vec![
             live(5, "KRI Ahmad Yani", Some(3), None),
-            aboard(live(7, "KRI Nanggala", Some(3), None), 5),
+            aboard(live(7, "KRI Nanggala", Some(4), None), 5),
         ];
         assert_eq!(
             plan(&draft, &server),
@@ -876,16 +1052,22 @@ mod tests {
     #[test]
     fn a_re_host_detaches_before_it_attaches() {
         let mut draft = ForceDraft::new();
-        for (id, name) in [(5, "KRI Ahmad Yani"), (7, "KRI Nanggala"), (9, "KRI Sultan")] {
+        // THREE COMMANDERS: one person commands one thing, so three hulls
+        // are three people.
+        for (id, name, commander) in [
+            (5, "KRI Ahmad Yani", 3),
+            (7, "KRI Nanggala", 4),
+            (9, "KRI Sultan", 5),
+        ] {
             let mut h = hull(id, name, None);
-            h.commander_id = Some(3);
+            h.commander_id = Some(commander);
             draft.upsert(h);
         }
         assert!(draft.set_host(7, Some(9)), "re-dropped on a new host");
         let server = vec![
-            aboard(live(7, "KRI Nanggala", Some(3), None), 5),
+            aboard(live(7, "KRI Nanggala", Some(4), None), 5),
             live(5, "KRI Ahmad Yani", Some(3), None),
-            live(9, "KRI Sultan", Some(3), None),
+            live(9, "KRI Sultan", Some(5), None),
         ];
         assert_eq!(
             plan(&draft, &server),
@@ -914,14 +1096,14 @@ mod tests {
         host.commander_id = Some(3);
         draft.upsert(host);
         let mut child = hull(7, "KRI Nanggala", None);
-        child.commander_id = Some(3);
+        child.commander_id = Some(4);
         draft.upsert(child);
         assert!(draft.set_host(7, Some(5)));
         assert_eq!(
             plan(&draft, &[]),
             Ok(vec![
                 ForceWrite::Assign { unit_id: 5, name: "KRI Ahmad Yani".into(), commander_id: 3 },
-                ForceWrite::Assign { unit_id: 7, name: "KRI Nanggala".into(), commander_id: 3 },
+                ForceWrite::Assign { unit_id: 7, name: "KRI Nanggala".into(), commander_id: 4 },
                 ForceWrite::Embark { host: 5, child: 7, name: "KRI Nanggala".into() },
             ])
         );
@@ -937,12 +1119,12 @@ mod tests {
         host.commander_id = Some(3);
         draft.upsert(host);
         let mut child = hull(7, "KRI Nanggala", None);
-        child.commander_id = Some(3);
+        child.commander_id = Some(4);
         child.host = Some(5);
         draft.upsert(child);
         let server = vec![
             live(5, "KRI Ahmad Yani", Some(3), None),
-            aboard(live(7, "KRI Nanggala", Some(3), None), 5),
+            aboard(live(7, "KRI Nanggala", Some(4), None), 5),
         ];
         assert_eq!(plan(&draft, &server), Ok(Vec::new()));
     }
@@ -962,6 +1144,7 @@ mod tests {
             Err(ForceGap {
                 reason: GapReason::SelfHost,
                 hulls: vec!["KRI Nanggala".into()],
+                who: None,
             })
         );
     }
@@ -977,7 +1160,7 @@ mod tests {
         a.host = Some(8);
         draft.upsert(a);
         let mut b = hull(8, "KRI Rangsat", None);
-        b.commander_id = Some(3);
+        b.commander_id = Some(4);
         b.host = Some(7);
         draft.upsert(b);
         assert_eq!(
@@ -985,6 +1168,7 @@ mod tests {
             Err(ForceGap {
                 reason: GapReason::Ring,
                 hulls: vec!["KRI Nanggala".into(), "KRI Rangsat".into()],
+                who: None,
             })
         );
     }
@@ -999,13 +1183,174 @@ mod tests {
         host.commander_id = Some(3);
         draft.upsert(host);
         let mut child = hull(7, "KRI Nanggala", None);
-        child.commander_id = Some(3);
+        child.commander_id = Some(4);
         draft.upsert(child);
         assert!(draft.set_host(7, Some(5)));
         let server = vec![
             live(5, "KRI Ahmad Yani", Some(3), None),
-            live(7, "KRI Nanggala", Some(3), None),
+            live(7, "KRI Nanggala", Some(4), None),
         ];
         assert_eq!(draft.pending(&server), 1);
+    }
+
+    // -- the commander rules -----------------------------------------------
+    //
+    // Two rules about WHO holds a command, and both are the server's:
+    // one person commands one thing, and a judge-side seat commands
+    // nothing. The first is about the draft alone and lives in `gap`; the
+    // second is about the room and is asked with the room in hand.
+
+    /// One person, two hulls. The server refuses the second assignment
+    /// ("That person already commands the unit ... One person commands one
+    /// thing"), so the plan refuses the whole thing and names both hulls.
+    #[test]
+    fn a_commander_given_two_hulls_refuses_the_whole_plan() {
+        let mut draft = ForceDraft::new();
+        let mut first = hull(7, "KRI Nanggala", Some((-5.4, 106.2)));
+        first.commander_id = Some(3);
+        draft.upsert(first);
+        let mut second = hull(8, "KRI Rangsat", Some((-5.1, 106.9)));
+        second.commander_id = Some(3);
+        draft.upsert(second);
+        assert_eq!(
+            plan(&draft, &[]),
+            Err(ForceGap {
+                reason: GapReason::TwoCommands,
+                hulls: vec!["KRI Nanggala".into(), "KRI Rangsat".into()],
+                who: None,
+            })
+        );
+    }
+
+    /// The same rule about a hull the server already holds: the draft keeps
+    /// the commander it has and adds a second hull for them, and the server
+    /// would refuse the second write.
+    #[test]
+    fn a_second_hull_for_a_commander_already_holding_one_refuses() {
+        let mut draft = ForceDraft::new();
+        let mut held = hull(7, "KRI Nanggala", Some((-5.4, 106.2)));
+        held.commander_id = Some(3);
+        draft.upsert(held);
+        let mut second = hull(8, "KRI Rangsat", Some((-5.1, 106.9)));
+        second.commander_id = Some(3);
+        draft.upsert(second);
+        let server = vec![live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))];
+        assert_eq!(
+            plan(&draft, &server),
+            Err(ForceGap {
+                reason: GapReason::TwoCommands,
+                hulls: vec!["KRI Nanggala".into(), "KRI Rangsat".into()],
+                who: None,
+            })
+        );
+    }
+
+    /// A judge-side seat may not command. The server refuses the assignment
+    /// outright, so the console refuses it before the write and names the
+    /// person, because "a judge-side seat may not command" is a rule the
+    /// operator cannot act on without knowing WHICH seat.
+    #[test]
+    fn a_judge_side_commander_refuses_the_whole_plan() {
+        let mut draft = ForceDraft::new();
+        let mut h = hull(7, "KRI Nanggala", Some((-5.4, 106.2)));
+        h.commander_id = Some(3);
+        draft.upsert(h);
+        let judges = BTreeMap::from([(3, "Budi".to_string())]);
+        let gap = judge_side_gap(&draft, &judges).expect("a judge commands nothing");
+        assert_eq!(gap.reason, GapReason::JudgeSideCommander);
+        assert_eq!(gap.hulls, vec!["KRI Nanggala".to_string()]);
+        assert_eq!(gap.who.as_deref(), Some("Budi"));
+        assert!(
+            gap.to_string().contains("Budi"),
+            "the sentence names the seat: {gap}"
+        );
+    }
+
+    /// A player-side commander is not a gap, and the room's judge seats are
+    /// about OTHER people.
+    #[test]
+    fn a_player_side_commander_is_no_gap() {
+        let mut draft = ForceDraft::new();
+        let mut h = hull(7, "KRI Nanggala", Some((-5.4, 106.2)));
+        h.commander_id = Some(3);
+        draft.upsert(h);
+        let judges = BTreeMap::from([(9, "Referee".to_string())]);
+        assert_eq!(judge_side_gap(&draft, &judges), None);
+    }
+
+    // -- the merge --------------------------------------------------------
+    //
+    // A re-read happens after every write, so the draft is re-seeded while
+    // the operator is still authoring. The merge is what keeps that from
+    // throwing the operator's work away.
+
+    /// The operator's placement survives a re-read: the frame is replaced
+    /// and the edit on top of it is not.
+    #[test]
+    fn a_re_read_keeps_a_staged_placement() {
+        let mut draft = ForceDraft::new();
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        draft.set_start(7, Some(Start { lat: -5.0, lon: 107.0 }));
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        assert_eq!(
+            draft.get(7).and_then(|h| h.start),
+            Some(Start { lat: -5.0, lon: 107.0 }),
+            "the operator's placement is the operator's"
+        );
+    }
+
+    /// A hull the operator dropped on the water survives a re-read: the
+    /// server does not hold it, so the merge has nothing to adopt over it.
+    #[test]
+    fn a_re_read_keeps_a_staged_newcomer() {
+        let mut draft = ForceDraft::new();
+        draft.seed(&[]);
+        let mut h = hull(9, "KRI Sultan", Some((-5.0, 107.0)));
+        h.commander_id = Some(3);
+        draft.upsert(h);
+        draft.seed(&[]);
+        assert!(draft.contains(9), "the staged hull survives the re-read");
+    }
+
+    /// A removal survives a re-read: the server still holds the hull, so
+    /// the merge has to keep it out rather than put it back.
+    #[test]
+    fn a_re_read_keeps_a_staged_removal() {
+        let mut draft = ForceDraft::new();
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        assert!(draft.remove(7).is_some(), "the hull leaves the exercise");
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        assert!(!draft.contains(7), "and it does not come back");
+        assert_eq!(
+            plan(&draft, &[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]),
+            Ok(vec![ForceWrite::Remove {
+                unit_id: 7,
+                name: "KRI Nanggala".into()
+            }]),
+            "the removal is still owed"
+        );
+    }
+
+    /// A hull the operator never touched is the server's, so the server's
+    /// newer word wins: that is the whole point of a re-read.
+    #[test]
+    fn a_re_read_adopts_the_servers_newer_placement() {
+        let mut draft = ForceDraft::new();
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-6.0, 108.0)))]);
+        assert_eq!(
+            draft.get(7).and_then(|h| h.start),
+            Some(Start { lat: -6.0, lon: 108.0 }),
+            "the server's placement is the newer word"
+        );
+    }
+
+    /// A hull the server dropped is gone: it was not the operator's to keep.
+    #[test]
+    fn a_re_read_forgets_a_hull_the_server_dropped() {
+        let mut draft = ForceDraft::new();
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        draft.seed(&[]);
+        assert!(!draft.contains(7));
     }
 }
