@@ -1339,3 +1339,198 @@ is "the feature is broken" rather than "the picture is old".
 `map_render::quad_bow_follows_the_compass`,
 `roster::seats_come_before_roles_before_unseats`,
 `sim::order_move_applies_then_higher_overrides_loudly`).
+
+## The sign-in, and the theatre behind it
+
+The signed-out surface was the last thing in this console still wearing the
+old world: a rounded card inset 24pt on two sides, floating on a flat
+`CONSOLE_NIGHT` void, with a web form's hint words inside its boxes. It was
+also the first thing every operator saw, which made it the one surface the
+overhaul could not leave alone and call the console finished.
+
+**THE THEATRE.** The console's own map, live, under a flat night scrim. The
+map thread runs from the launch, so the picture is already on screen when
+the operator arrives: the sign-in happens over the water the exercise will
+be fought on. The scrim is flat `CONSOLE_NIGHT` at 0.86 — no gradient, no
+blur, no glass — so the map is a GHOST under the console's own night.
+Measured on the capture: the ghosted land reads `(47,53,69)` and the panel's
+own body `(15,23,42)`, so the chrome is darker than the map under it, which
+is the relationship every panel in this console has over the live map.
+
+**And it ARRIVES.** The console opens on a flat night field and the
+coastline resolves out of it: the scrim lifts from opaque night to the ghost
+over 0.9s on an exponential ease-out. The clock is tied to the PICTURE and
+not to a timer — it starts when the first frame lands — so the theatre
+never fades into a map that is not there. Verified from the run log rather
+than by the eye: the alpha walks 255 → 219 over 93 frames and settles, and
+the scrim only ever lifts.
+
+**THE INSTRUMENT.** The card is a MODAL of this console, centred on the
+window, over the theatre: square, flat, one 1px `CUT_GREY` edge, a
+tracked-caps title on a `PANEL_SLATE` band over a body on `CONSOLE_NIGHT`.
+It was docked to the window's top-left corner; the operator called it too
+much, and they were right — a door is a door, and a door is in the middle
+of the wall it is in. The credential fields are the console's form order —
+tracked-caps label over a well, the value in the MACHINE face because a
+credential is an id, an empty field carrying the console's dash rather than
+a hint word. The submit stays a full-width graphite slab and is SQUARE now,
+and it brightens to `MAP_INK` when both credentials are typed: the verb is
+ready, and it says so with ink rather than with the accent, because the one
+cyan edge on this surface is the field that owns the keyboard.
+
+**THE SCOPE, INSTEAD OF THE READINGS.** The PRE-FLIGHT is gone — a clock, a
+frame count, a camera and a picture size are a DIAGNOSTICS panel, and an
+operator who has to type a username does not need a stopwatch and a frame
+size before the door opens. In its place, under the form, is a **scope**:
+the console's own compass face (rim, two rings, twelve graduations, a north
+wedge, a needle) drawn in greys, because the one accent on this surface
+belongs to the field that owns the keyboard. There is no figure on it and
+nothing to read off it: it is decoration, and it is decoration of the
+console's own kind — a chart room's door has a scope on it, and the water
+the exercise will be fought on is right there under the card. The title
+row's far end carries the other ornament, nine hairlines of graded length,
+the way a chart's margin is graduated.
+
+**And the surface got smaller in every other way.** The clock is gone, and
+with it the sign-in's own repaint drain: the map renders on a gesture, so a
+clock driven by the map's frames would have needed its own drain to keep
+ticking past the theatre's settling. A surface with no clock has no reason
+to ask for frames.
+
+**ONE THING SAID ONCE.** The slab carries the STATE (`signing in…`) and the
+status line carries the EVENT only, so the busy line is suppressed (the slab
+already says it). The status slot is RESERVED rather than conditional: a
+card that grows a line when the server answers moves the scope under the
+operator's hands, and decoration that moves is a bug in the decoration.
+
+**`TFG_SIGNIN=busy|refused`** stages the card's own state for a headless
+capture, the same seed-the-state precedent as `TFG_SETTINGS`.
+
+Captures: `.impeccable/review/signin-2026-10-20/` — `signin-resting.png`,
+`signin-credentials-ready.png`, `signin-busy.png`, `signin-refused.png`,
+`signin-signed-in-console.png`. One new test (`theatre_alpha`); the two
+readings that the pre-flight had are gone with it.
+
+`cargo test --lib`: 621 pass, the same four pre-existing failures
+(`book::prune_drops_relations_for_vanished_drafts`,
+`map_render::quad_bow_follows_the_compass`,
+`roster::seats_come_before_roles_before_unseats`,
+`sim::order_move_applies_then_higher_overrides_loudly`).
+
+**The signed-in console, photographed afterwards.** The hosted API did not
+answer during the pass above, so every launch fell back to the fixture
+roster and the console never left the card. That was transient. With the
+API up, the signed-in console is
+`.impeccable/review/signin-2026-10-20/signed-in-console.png`, and the
+whole signed-in surface was re-shot — five phases and three modals — with
+`scripts/gpui-sweep.sh` running the pixel assertions over each one. The
+column's edges, the owned field's cyan perimeter and the one-rule-between-
+fields all still hold, so rewriting the signed-OUT surface did not disturb
+the console that comes after it. The harness also learned to say out loud
+when a capture fell back to the fixture: a picture of the fixture is not a
+picture of the deployment, and it used to pass as one.
+
+## The unit details panel: point at a ship, learn what it is
+
+The Game Master's question had no answer in the console. The Inspector dock
+existed — a panel of readouts that only a capture could open — and there was
+no way to select a hull from the MAP: the markers are painted into a
+canvas, so they carry no hitbox, and a press on a ship landed on the map
+surface and panned the chart.
+
+**THE CLICK.** A press on the map resolves the hull under it and the release
+opens the panel on it. The pick is decided at the PRESS and undone if the
+press turns into a pan: GPUI delivers the release to whatever is under the
+pointer, so a release that lands on a panel never reaches the map at all —
+a release-time pick would be a pick nobody made. The radius is 30 WINDOW
+points, converted through the frame's own scale, so a hull is as easy to
+point at at one zoom as at another.
+
+**THE PANEL.** Three ladders in one dock: what it is (type, class,
+commander, embarkation), where it is (position, course, speed, state,
+trail), and the figures the register published for it (length, beam, draft,
+displacement, speed max, cruise, range, turn rate). The console never
+guesses: a hull with no published specification says so, a hull nobody asked
+about says `—` for its embarkation rather than claiming it is on the
+water, and a hull with no wire fix says `no fix` rather than drawing a
+position.
+
+**WHERE THE FACTS COME FROM.** The register names the hull and its class;
+the exercise's piece says who commands it — and, since this pass, what class
+the server published for it (the backend used to DROP `unit_class_name`, and
+a dropped class is a class the console can only guess at); the wire says
+where it is and how fast; the store's spec mirror holds the published
+figures, read once at boot — and the figures are asked for again on demand,
+below. The embark read names a HOST's passengers, so
+the link is read the other way round.
+
+**THE DOCK HOLDS THE POINTER.** The map surface is a full-window hitbox, so
+a press on the panel's CENTRE would also reach the map: it would pan the
+chart and pick whatever hull was under the button. The dock truncates the
+hover path below it, the way the column's islands do.
+
+**ONE ORDER LOOP BUG FIXED ON THE WAY.** The embark-spec read returned from
+the order loop when the server could not be reached, which dropped every
+LATER order on the floor. A console that stops listening looks exactly like
+a console that has nothing to say.
+
+Captures: `.impeccable/review/unit-details-2026-10-20/` — `unit-details.png`
+and its crop, against the hosted API. Three new tests: the hit test, the
+click end to end through GPUI's own event path, and the drag that starts on
+a hull and selects nothing while still panning the chart. `cargo test
+--lib`: 622 pass, the same four pre-existing failures.
+
+### The figures were behind the boot, and the type was never on the wire
+
+**The defect.** The panel's published figures and its TYPE both came from
+the LOCAL STORE, and the store is synced only at BOOT. An operator who
+signed in through the console's own card — rather than with credentials on
+the command line — got a dash for every figure and no type at all, until
+the next launch. The panel was honest about what it did not hold, and it
+held nothing. The class, the commander and the embarkation never had this
+problem: they come off the wire.
+
+**The figures are now asked for.** When a unit is selected the shell asks the
+binary for that hull's published specification (`ToBinary::ReadSpec
+{ unit }`), the binary calls `GET /units/{id}`, and the answer comes back on
+its own feed; the panel fills in when it lands. The store's mirror is still
+read at boot — a launch with credentials on the command line shows the
+figures immediately — and the API's answer is authoritative and overwrites
+it. A hull with no published specification still says so: the console does
+not invent a figure.
+
+**The type comes off the wire too.** The register's own read (`GET /units`)
+publishes each hull's class summary, and that summary carries the class's
+TYPE (`unit_class.unit_type.name`). The backend used to drop that field, so
+the console could only guess the type from the local taxonomy. The roster
+row carries the type name now, and the panel reads it from there when the
+drill tree does not know the unit.
+
+**And the embark read is asked for.** The panel asks the binary for the
+selected unit's EMBARK READ — the server's per-host passenger list — when
+it opens, so "carrying N" is known rather than a dash. The passenger
+DIRECTION — a hull that is ABOARD some host — still needs that host's own
+read, and stays a dash when the host has not been read. The console says
+"on the water" only when it has actually asked.
+
+### And the embark read is per HOST
+
+The embark read answers "who is inside X", so the panel asks for every host
+in the exercise — not only for the hull that was pointed at. Reading one
+hull tells the console nothing about whether that hull is aboard another
+one; reading every host gives both directions, "carrying N" and "aboard X".
+
+**And "on the water" waits for the reads.** A hull that is aboard a carrier
+the console never read is not a hull on the water, so the console says a
+dash until every host in the composition has been read. A Game Master has no
+seat and commands no group, so the commander's own read never runs for one:
+the panel's read is the panel's claim, and the claim is the console's to
+keep honest.
+
+### What is still owed
+
+- The figures come from the API's CURRENT specification version, so a
+  specification version pinned by a game being judged is not what the panel
+  shows — and the panel does not say which version it read, because the
+  dock has no room for it.
+

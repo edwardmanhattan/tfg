@@ -556,10 +556,387 @@ seat this rail is built for is the seat that cannot get in. The answer is a
 product decision about what a non-administrator's sign-in shows, so it is
 recorded rather than changed.
 
+## The visual integrity pass (2026-10-20)
+
+The direction above was written and unit-tested and never audited against
+the running console. An audit of all 26 surfaces — by capture, against the
+real binary on the compositor, with the pixel values measured rather than
+eyeballed — found that the console had drifted away from its own contract
+in two directions at once, and that the token layer was the only thing
+holding.
+
+**The finding, stated once.** The console drew **two design systems in one
+window**: the islands and the modals in the instrument language, and the
+execution widgets, the sign-in card, the top band and the two island bodies
+that had no padding in the old floating-card language. Everything else —
+fourteen text sizes, ten corner radii, three body paddings, a status line
+in body silver where the comment above it said "this is exactly the line
+that must never be grey on grey" — was drift on top of that.
+
+**The audit** is `docs/visual-integrity-audit.md`. **The fixes** are its
+"what was fixed" table. The parts of it that are worth carrying into the
+next slice:
+
+- **The token layer was sound; the drawing was not.** Nine of `view`'s
+  values were defined and never used (`PANEL_GAP`, `DATA_AMBER`,
+  `ROW_TRACKING`, `ZONE_W`, `ISLAND_PAD`, …), and the shell hardcoded its
+  own versions of the rest. So the fix was never "add a token" — it was
+  "draw with the tokens".
+- **A type scale needs a role for the dense tier.** The scale is now
+  `LABEL_PT` 10, `DENSE_PT` 11, `MACHINE_PT` 12, `BODY_PT` 13,
+  `READOUT_SM_PT` 18, `READOUT_LG_PT` 30. `DENSE_PT` is new: the side zone
+  is 320pt wide, and a row that holds a call sign, a name, a role and a
+  state does not fit at 13pt. A console that has no dense tier invents
+  one, and this one had invented nine.
+- **A status line needs to carry its KIND, not its words.** `Status` is the
+  words plus a kind, and the kind decides the ink: red for a refusal,
+  green for a write that landed, sand for one in flight, silver for a fact.
+  The kind is set where the write happens, because that is where the truth
+  is. Guessing it from the words at the far end of the file is what left
+  every refusal in this console drawn in body silver.
+- **One selection treatment.** A chosen item is a 1px cyan edge and the
+  bright ink. Never a filled slab: the drill tabs were a full cyan pill and
+  the role pills were a cyan outline, and a console with two selection
+  languages is a console where the operator cannot predict what a thing
+  does.
+- **The accent is one thing.** It is live-or-yours and nothing else: the
+  link state, the focused field, the panel that owns input, the operator's
+  own pick, the live needle on the dial. It is out of "SEATED", the role
+  labels, the row wash, the wordmark, the sign-in button and the step
+  card's bar.
+- **A panel is a panel.** The modal lost the chamfer, the execution
+  widgets lost the translucency (the map's place names were legible
+  through them), the sign-in card lost its radius, and the top band is
+  opaque `CONSOLE_NIGHT` instead of a 47% black scrim over the map.
+- **The dead control.** The Command island's course and speed steppers
+  were drawn and pointed at ids nothing listened to. They now write the
+  same draft the rail's compass writes, and the same `SET HELM` sends. A
+  control that looks live and is not is a lie about the console.
+
+Two items were left, both named in the audit: the **basemap** (a daylight
+`liberty` style under a night console — a product answer, not a patch) and
+the rail's **empty picture channel** where a hull has no photograph.
+
+**And one correction to the method, which is worth more than the fixes.**
+The first pass of the audit ran against the LOCAL Minos stack, and the
+local stack is a throwaway database with a fixture in it: hull names of 20
+characters, one exercise, one room. It made the console look tidier than
+it is. Re-run against the **hosted dev API** — the deployment the operator
+actually uses — two more defects appeared, both invisible in the fixture's
+data and plain in the real one:
+
+- the **rail's picture channel** printed the register's whole label, name
+  AND hull number, while the identity channel one to the right already
+  states the hull number on its own row. With a 31-character name the
+  channel overran its own edge. It now prints the name alone.
+- the **Command island's HULLS row** was one line — name, course, speed,
+  state — in a fixed 318pt budget that was the column's old 360pt width
+  minus a guess, so a real hull name was cut in half. And this toolkit's
+  `truncate` clips a div-wrapped string **without an ellipsis** (measured:
+  a 60pt probe clipped "KRI Abdul Halim Perdanakusuma" at "KRI Abdul Ha"
+  and drew no "…"), so a name can never be shrunk into a fixed column
+  here. The name has a line of its own now, at the panel's full width, and
+  the three readings keep their columns beneath it.
+
+The lesson is the harness's: `scripts/gpui-capture.sh` already exported the
+hosted superuser's credentials, so the hosted API was always the default
+and the local stack was an override in the sweep. A fixture is a fixture —
+it answers "does this code draw" and not "does this console survive the
+data it will actually be given".
+
+`DESIGN.md` is now marked superseded at the top, with a pointer here and to
+`src/view/mod.rs`: it is the egui-era document, and it disagrees with the
+console about the chamfer, the typeface, the radius, the panel language and
+the meaning of the accent.
+
+## The docked sidebar (2026-10-20)
+
+The column was a stack of cards floating over the map, and the operator
+said the thing it was: *make the left islands sidebar docked on the left,
+and connected with each other.* Three changes, and each one is the
+direction above taken literally rather than a new idea.
+
+**DOCKED, not floating.** The column now starts at the window's left edge
+and runs to its bottom edge — flush the way the top band is flush, with no
+margin of map above it or under it. It was inset 24pt on the outer edge
+and 22pt under the band, and it was inset under the band in the three
+phases with no strip to put there, which is the tell: that gap was not a
+margin, it was a leftover. A sidebar that stops 24pt short of the window's
+bottom is a card that happens to be tall. The right dock mirrors it.
+
+**CONNECTED, not stacked.** The fields touch and share a rule. Every field
+draws the rule BELOW it and only the first draws the one above, so the
+rule between two fields is one line and the column reads as one surface
+with fields in it. The 2pt gap it used to carry put the MAP between two
+fields of the same panel, and a map-coloured hairline under a field is not
+a divider, it is a mistake.
+
+**The outlines are drawn in a second pass, over the whole stack.** The
+first version of this drew the rule with the field, under its own
+content, and the pixels said otherwise: the edge measured 40% of its
+strength on the right and NOTHING along the bottom, because the next
+field's band painted over it. A 1px rule that is 40% grey is not a rule,
+and a rule that is invisible is not the state language either. So the
+column paints the fields first and the outlines after, over the whole
+stack, and the rule between two fields is drawn once, by the field above.
+What is left under the content is the field's hitbox — the shield that
+stops the map behind the panel taking the pointer — and a shield is not
+supposed to be seen.
+
+The token layer's own note on `PANEL_GAP` had argued the other way — that
+flat panels 2px apart read as ONE panel with a seam in it — and it was
+right about the seam and wrong about the fix. The seam was never the gap;
+the seam was two 1px edges with map between them. Close the gap and the
+two edges become ONE rule.
+
+**The owned field still closes.** In a joined column a field's top edge is
+not its own — the rule above it belongs to the field above, and that field
+is not the one that owns the input. So an owned field that is not first
+draws its own 1px cyan line over that rule, and its perimeter closes
+instead of reading as a "U". The lid is painted in the same second pass,
+after the rule it covers: the field that owns the pointer is always BELOW
+the field whose rule it takes, so a lid painted in the field's own pass
+would be covered by the field above.
+
+**And the wheel belongs to the chrome.** The map's surface is a
+full-window hitbox, and GPUI's scroll hit test collects EVERY hitbox under
+the pointer rather than the path to it — so a wheel over the column, the
+top band, the rail, the widgets or a modal reached the map's handler and
+ZOOMED the map while the operator was scrolling a panel. The map answers
+gestures made over the map; the chrome swallows its own. Every piece of
+chrome now stops the propagation, and the column's handler claims the
+gesture for the column.
+
+That one is a regression test, and it is the kind that had to be: the
+console's own test suite passed while the map was zooming under the
+operator's hand, because every test of it called `zoom_by_wheel` directly
+and never went through the dispatch that decides WHO gets the wheel.
+
+**And the pixels are asserted, not looked at.** `scripts/shot-assert.sh`
+answers "is there one rule between these fields" with a number, reading
+the console's palette out of the token layer so an ink that moves cannot
+leave the assertion quietly asserting about the old colour.
+`scripts/gpui-sweep.sh` runs those assertions after each capture and
+exits non-zero when one fails, so a sweep is a test rather than a folder
+of pictures. The same harness reports what reached the console while the
+picture was being taken, because a capture that caught the operator's own
+wheel is a photograph of a state nobody asked for — and, on 2026-10-20,
+that is exactly what one of them was.
+
+## The sign-in, overdriven (2026-10-20)
+
+The signed-out surface was the one thing in this console that was not an
+instrument: a rounded card inset 24pt on two sides, floating on a flat
+`CONSOLE_NIGHT` void, with the old world's furniture still on it (a radius,
+a shadow-less bevel, a web form's hint words inside its boxes). It was also
+the FIRST thing every operator saw. Everything below is the same decision
+taken twice — the theatre, and the instrument — and the two are one change.
+
+**THE THEATRE. The console's own map, live, under a flat night scrim.** The
+map thread runs from the launch, so the picture is already on screen when
+the operator arrives: the sign-in happens over the water the exercise will
+be fought on. The scrim is flat `CONSOLE_NIGHT` at 0.86 — no gradient, no
+blur, no glass — because the map is a GHOST under the console's own night,
+and a ghost that competes with the panel in front of it is noise wearing a
+costume. Measured: the ghosted land reads `(47,53,69)`, the panel's own
+`CONSOLE_NIGHT` body reads `(15,23,42)` — the chrome is DARKER than the
+map under it, which is the same relationship the console's panels have over
+the live map.
+
+**And the theatre ARRIVES.** The console opens on a flat night field and the
+coastline resolves out of it: the scrim lifts from opaque night to the
+ghost over 0.9s, on an exponential ease-out (the same curve the helm's
+instruments use). It is tied to the PICTURE and not to a timer — the clock
+starts when the first frame lands — so the theatre never fades into a map
+that is not there. Verified by the log, not by the eye: the alpha walks
+255 → 219 over 93 frames and settles. The scrim only ever LIFTS; a scrim
+that fell back would be the map going dark under the operator's hands, and
+that is now a test (`the_theatre_arrives_from_night_and_settles_on_the_ghost`).
+
+**THE INSTRUMENT. The sign-in is a MODAL of this console, centred on the
+window, over the theatre.** Square, flat, one 1px `CUT_GREY` edge, a
+tracked-caps title on a `PANEL_SLATE` band over a body on `CONSOLE_NIGHT`,
+and the console's own form grammar inside it: two credential fields, the
+verb, a status line. It was a panel docked to the window's top-left corner,
+and the operator called it too much, and they were right — a door is a door,
+and a door is in the middle of the wall it is in. A card in the corner is a
+card that happens to be tall.
+
+**The credential fields are the console's own form order**: a tracked-caps
+label over a well (the composer's fields are label-above-input too), the
+value in the MACHINE face because a credential is an id and an id is a
+machine value in this console, and an empty field carrying the console's
+dash for an absent value rather than a hint word — the label above already
+says what the field wants. The submit stays a full-width graphite slab (the
+one place a console control is allowed to be a slab) but is SQUARE now, and
+it BRIGHTENS to `MAP_INK` when both credentials are there: the verb is ready
+to be sent, and the console says so with ink rather than with the accent,
+because the one cyan edge on this surface is the field that owns the
+keyboard.
+
+**THE SCOPE. The space the readouts took is decoration now.** The
+PRE-FLIGHT is gone — a clock, a frame count, a camera and a picture size are
+a DIAGNOSTICS panel, and an operator who has to type a username does not
+need a stopwatch, a camera bearing and a frame size before the door opens.
+In its place, under the form, is a **scope**: the console's own compass face
+(rim, two rings inside it, twelve graduations, a north wedge, a needle) drawn
+in greys, because the one accent on this surface belongs to the field that
+owns the keyboard. There is no figure on it and nothing to read off it. It
+is decoration, and it is decoration of the console's own kind: a chart
+room's door has a scope on it, and the water the exercise will be fought on
+is right there under the card. The title row's far end carries the other
+ornament — nine hairlines of graded length, the way a chart's margin is
+graduated.
+
+**And the surface got smaller in every other way.** The clock is gone, and
+with it the sign-in's own repaint: the map renders on a gesture, so a clock
+driven by the map's frames would have needed its own drain to keep ticking
+past the theatre's settling. A surface with no clock has no reason to ask
+for frames, and the drain loop is gone with it.
+
+**And the console says one thing once.** The slab carries the STATE
+(`signing in…`) and the line under it carries the EVENT, and only one of them
+is ever talking: the busy status line is suppressed, because the slab
+already says it. The status slot is RESERVED rather than conditional — a card
+that grows a line when the server answers moves the scope under the
+operator's hands, and decoration that moves is a bug in the decoration.
+
+**`TFG_SIGNIN=busy|refused`** stages the card's own state for a headless
+capture, the same seed-the-state precedent as `TFG_SETTINGS`. Both are
+states the operator sees and neither can be reached by a launch that never
+presses the verb.
+
+Verified by capture over the real binary on the compositor, against the
+hosted map:
+`.impeccable/review/signin-2026-10-20/signin-resting.png`,
+`-credentials-ready.png`, `-busy.png`, `-refused.png`, `-signed-in-console.png`.
+`cargo test --lib`: 619 pass, the same four pre-existing failures. The
+mechanical detector over the changed file: no findings.
+
+**The signed-in console, photographed afterwards.** The hosted API did not
+answer during the pass above, so every launch fell back to the fixture
+roster and the console never left the card. That was transient: with the
+API up, the signed-in console is
+`.impeccable/review/signin-2026-10-20/signed-in-console.png`, and the
+whole signed-in surface was re-shot — the five phases and the three
+modals — with `scripts/gpui-sweep.sh` running the pixel assertions over
+each one. The column's edges, the owned field's cyan perimeter and the
+one-rule-between-fields all still hold, so the rewrite of the signed-OUT
+surface did not disturb the console that comes after it. The one thing
+this pass learned about the harness: a capture whose log says the console
+fell back to its fixture is a picture of the FIXTURE, and the harness now
+says so out loud instead of letting it pass as a picture of the
+deployment.
+
+## The unit details panel (2026-10-20)
+
+**THE ASK.** As a Game Master and an observer, point at a hull and see what
+it is. The console had an Inspector dock — a panel of readouts that only a
+capture could open, showing the selected row's class, id, position, course,
+speed, trail and state, and nothing else. There was no way to select a
+hull from the MAP: the markers are painted into a canvas, so they have no
+hitbox, and a press on a ship landed on the map surface and panned the
+chart.
+
+**THE CLICK.** A press on the map resolves the hull under it. The pick is
+decided at the PRESS and undone if the press turns into a pan, because GPUI
+delivers the release to whatever is under the pointer: a release that lands
+on a panel never reaches the map, so a release-time pick would be a pick
+nobody made. The radius is 30 WINDOW points, converted through the frame's
+own scale, so a hull is as easy to point at at one zoom as at another. A
+press on open water picks nothing; a press on a hull selects it by its own
+id — an id and not a roster index, because the roster changes under the
+panel — and the release opens the panel on it.
+
+**THE PANEL.** Three ladders in one dock: what it is (type, class,
+commander, embarkation), where it is (position, course, speed, state,
+trail), and the figures the register published for it (length, beam, draft,
+displacement, speed max, cruise, range, turn rate). Every figure is a fact
+the console already holds and every fact it does not hold is a DASH. The
+console never guesses: a hull with no published specification says so, a
+hull nobody asked about says `—` for its embarkation rather than claiming
+it is on the water, and a hull with no wire fix says `no fix` rather than
+drawing a position.
+
+**WHERE THE FACTS COME FROM.** The register names the hull and its class;
+the exercise's piece says who commands it and what class the server
+published for it (the backend used to DROP that field, and a dropped class
+is a class the console can only guess at); the wire says where it is and
+how fast; the store's spec mirror holds the published figures, read once at
+boot — and the figures are asked for again, on demand, in the section below.
+The embark read names a HOST's passengers, so the link is read the
+other way round — the panel walks the hosts it knows and finds the one
+carrying this hull.
+
+**THE DOCK HOLDS THE POINTER.** The map surface is a full-window hitbox,
+so a press on the panel's CENTRE would also reach the map: it would pan
+the chart and pick whatever hull was under the button. The dock truncates
+the hover path below it, the same way the column's islands do.
+
+Verified by capture over the real binary against the hosted API:
+`.impeccable/review/unit-details-2026-10-20/unit-details.png`.
+`cargo test --lib`: 622 pass, the same four pre-existing failures. Three
+new tests: the hit test, the click end to end through GPUI's own event
+path, and the drag that starts on a hull and selects nothing.
+
+## The figures come off the wire (2026-10-20)
+
+**THE GAP.** The panel's figures and its TYPE came from the LOCAL STORE, and
+the store is synced only at BOOT. So an operator who signs in through the
+console's own card — rather than with credentials on the command line — saw
+a dash for every figure and no type at all, until the next launch. The
+class, the commander and the embarkation were never affected: those come off
+the wire.
+
+**THE FIGURES ARE ASKED FOR.** When a unit is selected the shell asks the
+binary for that hull's published specification (`ToBinary::ReadSpec
+{ unit }`), the binary calls `GET /units/{id}`, and the answer comes back on
+its own feed. The panel fills in when it lands. The store's mirror is still
+read at boot, so a launch with credentials on the command line shows the
+figures immediately, and the API's answer is authoritative and overwrites
+it. The console still never invents a figure: a hull with no published
+specification says so.
+
+**THE TYPE COMES OFF THE WIRE TOO.** The register's own read (`GET /units`)
+publishes each hull's class summary, and that summary carries the class's
+TYPE (`unit_class.unit_type.name`). The backend used to drop it, so the
+console could only guess the type from the local taxonomy. The roster row
+carries the type name now, and the panel reads it from there when the drill
+tree does not know the unit.
+
+**AND THE EMBARK READ IS ASKED FOR — OF EVERY HOST.** The embark read is per
+HOST: it answers "who is inside X". So the panel asks for every host in the
+exercise, not only for the hull that was pointed at, and both directions
+follow: "carrying N" is the hull's own read, and "aboard X" is the read of
+the host carrying it.
+
+**"ON THE WATER" IS A CLAIM, AND THE CLAIM WAITS.** A hull that is aboard a
+carrier the console never read is not a hull on the water. The console says
+"on the water" only once every host in the composition has been read, and
+says a dash before that. A Game Master has no seat and commands no group, so
+the commander's own read never runs for one: the panel's read is the panel's
+claim, and the claim is the console's to keep honest.
+
 ## Unresolved
 
+- The details panel's figures and its type no longer wait on the boot-time
+  store sync: both come off the wire, and the panel asks for them itself.
+  One gap remains. The figures come from the API's CURRENT specification
+  version, so a version pinned by a game being judged is not what the panel
+  shows — and the panel says which version it read nowhere, because the
+  dock has no room for it.
 - Whether the bottom instrument row survives contact with a 1040x640 window,
   which is the app's hardcoded launch size. Measured, not assumed.
+- The sign-in's theatre is the basemap at the console's DEFAULT camera (the
+  map's own `MAP_CENTER`, at `MAP_ZOOM`), not at a session's camera — there
+  is no session before the sign-in, so there is nothing to aim it at. An
+  operator who signs in somewhere else finds the theatre was Jakarta all
+  along. Whether the sign-in should aim at the last session's ground is a
+  product answer, not a drawing one.
+- The basemap under the theatre is still the DAYLIGHT `liberty` style the
+  visual-integrity audit named as a product answer rather than a patch. The
+  scrim makes it a night map at 0.86, which is a surface answer, and the
+  audit's answer is still owed.
 - `FontFeatures` reaches the shaper on Linux through
   `load_family → load_font → LoadedFont.features → layout_line`. Verified by
   source. Not yet verified by pixels — that is slice 3.

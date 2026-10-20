@@ -3630,6 +3630,87 @@ harness); what is now proven is that the MODAL bodies are scrollers at all and
 that their content is reachable. The trailing-glyph notdef is still parked at
 the owner's request.
 
+## The Player picker, in two sections (2026-10-20)
+
+The picker was one column with three stacked lists — the room, the seats that
+needed a command, and the directory — and the directory carried a row of role
+pills for every account in it. Eight accounts and eight roles is sixty-four
+pills, and the answer the picker exists to give (who is in the room, as what,
+commanding what) was under all of them.
+
+It is two sections now. **The left one is the app's own account list and a row
+in it is a DRAG SOURCE and nothing else. The right one is the room, and it is
+the drop target: a person carried onto it takes a seat.** The row they land in
+carries the two decisions the seat needs — the ROLE, and for a role that may
+command, the HULL.
+
+**A drag between two sections is a new row of the drop matrix.**
+`DropTarget::Roster` is the list itself, beside `DropTarget::Player` (a row in
+it): a person onto the roster is `DropVerdict::Seat { user_id }`, a hull onto it
+is refused with the sentence that says where a hull does belong, and a group
+onto it is refused the same way. The verdict names the PERSON and not a role,
+because a drop says "in the room" and the seat they hold is the operator's next
+click on the row — the same division the `plan` in `tfg::roster` already draws
+between a seat and a role change.
+
+**The roster takes a PERSON and nothing else, so the seat rows inside it are
+not targets.** `take_entity_drop` became `take_drag_source` and
+`take_drop_target`, and the target half carries a `Takes` filter. A row that
+took both would answer the release of the wrong thing: the roster's `can_drop`
+is false for a hull, so the release falls through the seat rows to the list,
+and the operator gets a seat instead of a refusal with a sentence.
+
+**A seat that is already in the room is not seated twice.** The refusal names
+the row where the choice lives: `Super User is already seated — pick a role on
+their row`. Re-seating would have moved the person to the default role, which
+is exactly the decision this picker asks the operator to make out loud.
+
+**A judge-side seat shows no hull, and a commander cannot take the judge side
+while holding one.** The server refuses it outright ("a judge-side participant
+does not command units"), and the hull cannot simply be taken back, because
+Minos has no commanderless piece — so the move is refused AT THE CLICK, with
+the hull named: `Laksamana commands KRI Ahmad Yani (DD-1002) — hand the hull
+back before taking the judge side`. Which roles may command is
+`roster::role_may_need_command`, the schema's own `is_judge_side` and nothing
+else.
+
+### A GPUI trap worth its own entry: the card grows to fit its content
+
+The card is `700×580`, and the two lists inside it are longer than that. A
+flex item's automatic minimum size is its content's, so the card grew to the
+length of the seat list and the second section ran off the bottom of the
+window. The fix is the minimums — `min_h_0()` on the row, the two sections and
+both scrollers, and `min_w_0()` on the room — so the lists scroll and the card
+keeps its footprint.
+
+**And the card is never bigger than the window it is opened in.** A fixed 700
+is wider than the viewport on a scaled X11 display (this log's captures run on
+one: 640 points of viewport at a 1.5 scale), and a card the window cannot hold
+is a card whose second section is off the edge — the very thing the
+two-section layout exists to prevent. So the card is `700×580` with
+`max_w`/`max_h` at 94% of the parent.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| a person carried onto the roster takes a seat | `a_drop_on_the_roster_seats_the_person` (asserts the staged seat, its default role and the line) |
+| a person already in the room is refused | `a_drop_on_the_roster_refuses_a_seated_person` (the seat keeps its role) |
+| a commander cannot take the judge side | `a_commander_cannot_take_the_judge_side` (the sentence names the hull) |
+| the matrix answers the new rows | `dnd::tests`: `a_person_on_the_roster_is_seated`, `only_a_person_belongs_on_the_roster` |
+| the drag seats somebody, on screen | capture `/tmp/opencode/shots/p10.png`: the line reads `System seated as Commando`, the account row gains `SEATED`, the header reads `PLAYERS — 8 seated · 2 need a hull` |
+| the drop target says it will land | capture `/tmp/opencode/shots/p14.png`, photographed MID-DRAG: the room section is outlined green and the ghost carries `Super User` |
+| the role picker works | capture `/tmp/opencode/shots/p16.png`: `System → Referee`, `REFEREE` lit, and the `HULL` row is GONE for a judge-side seat |
+| the hull picker works | capture `/tmp/opencode/shots/p13.png`: `Letnan commands KRI Bung Tomo (DD-1006)`, and the chip lights on that seat's row |
+| the judge-side refusal is a sentence, not a shrug | capture `/tmp/opencode/shots/p11.png`: `Laksamana commands KRI Ahmad Yani (DD-1002) — hand the hull back before taking the judge side`, and the seat keeps `Commando` |
+| no regressions | `cargo test --lib` **617 pass**, the same 4 pre-existing failures (`book`, `map_render`, `roster`, `sim` — all in files this change does not touch) |
+
+**The captures are X11, on the real display.** The console is a Vulkan app
+(blade) and Xvfb has no DRI3, so the surface creation fails there — `scripts/ui-shoot/gpu-capture.sh`
+photographs the running window on the compositor instead, which is also what
+made the mid-drag capture possible: the existing `gpui-capture.sh` relaunches
+the app, and a gesture cannot be photographed by a script that kills it.
+
 ## The three columns nobody had looked at (2026-10-13)
 
 The Planning column was built and captured island by island. The other three
@@ -5323,3 +5404,200 @@ deploy." Clicking the pill re-seats the operator into the player role
 | the lib holds | `cargo test --lib`: 493 pass, same 4 pre-existing failures |
 | `own_steers` reads the seat | `own_steers_reads_the_operators_seat`: None unseated, Some(true) player, Some(false) judge |
 | it draws | `/tmp/gpui_judge_pill.png` (`TFG_GAME=18 TFG_FLEET=1`, clean run, log checked): the Penyelenggara operator gets the "SEAT ME AS COMMANDO" pill and the judge-side hint |
+
+## The map moves with the pointer again (2026-10-20)
+
+The egui console's map was SEAMLESS: the wheel zoomed it continuously under
+the pointer, and the picture kept up with the hand. The GPUI map was laggy
+and soft, and the cause was not the map engine — `map_render` and
+`shell_threads` are shared and unchanged. It was three things the port left
+behind, all of them in the shell.
+
+**One: the picture was a fixed 800x600 texture, stretched over the window.**
+The egui console asked the renderer for the canvas's own size
+(`avail * pixels_per_point`); the GPUI shell asked for a constant, and the
+picture was then COVER-placed into the window — a 1.03x stretch at the
+default 760x620 window and 2.4x on a 1920x1080 one. That stretch is the
+blur. The shell now measures the window's own device pixels and asks the map
+thread for a picture that size; the map thread rebuilds its scene when the
+size changes, so the size follows the window only once the window has
+settled (600ms), and the scene is built LAZILY at the size the first
+request asks for rather than at a default nobody wanted.
+
+**Two: the camera only moved when the map thread answered.** A wheel or a
+drag asked the binary for a new frame, and the picture changed when that
+frame arrived. The round trip was measured on this machine: 271ms for a
+frame at a new camera (the software rasteriser rasterises the tiles
+inline), 62-91ms for one at the same camera, of which 50ms was the pump's
+own sleep. So the map trailed the pointer by a quarter of a second and
+moved in jerks.
+
+The shell now OWNS the camera. A gesture moves it locally, the picture on
+screen is the LAST frame PLACED by that camera
+(`map_geometry::place_frame`: a uniform scale and a translation, because the
+frame's pixels and the live camera's pixels are the same ground at two
+zooms), and the map thread is asked for a picture at most every 250ms —
+the egui console's own throttle. The wheel zooms continuously
+(`WHEEL_ZOOM_STEP`, anchored under the pointer with `anchor_center`), the
+drag pans the camera, and the focus door centres it. The picture's bands —
+where the live camera has moved off the frame's own coverage — are filled
+with the frame's own edge, stretched: GPUI paints an image into a
+rectangle and cannot sample a piece of one, so each edge is its own small
+image (`map_gate::edge_strips`).
+
+**Three: there was no wheel zoom at all.** The shell had one
+`on_scroll_wheel`, on the island column. The map surface had none, so the
+wheel over the map did nothing; the zoom buttons were ±1.0 zoom levels per
+click, each a full round trip.
+
+The camera also became a MESSAGE rather than three: `ToBinary::Zoom`,
+`Pan` and `Jump` are gone, and the shell sends `Camera { center, zoom,
+size, render }`. The camera rides along on every tick, so the binary's own
+arithmetic — a drop's unprojection — is at the camera the operator is
+looking at; `render` says whether this tick also asks for a picture.
+
+**And the geometry moved out of the engine.** The projection, the ground
+resolution and the picture's placement are arithmetic and never touch a
+tile, so they are now `map_geometry` — a module of their own that
+`map_render` re-exports and that `proto/gpui-island` compiles by path, the
+way it compiles `view` and `map_gate`. The proto's "NO `map_render` shim,
+deliberately" still holds: it does not build MapLibre, and the shell no
+longer needs it to draw a map.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 596 pass, same 4 pre-existing failures |
+| the placement is one transform of the ground | `map_geometry::tests::the_picture_and_the_markers_are_one_transform`: the picture's pixel of a ground point and the marker's pixel of it land on the same window point, with the live camera a zoom ahead of the frame's |
+| the ground under the pointer does not move | `the_ground_under_the_cursor_stays_put_across_a_zoom` (the anchor), `a_wheel_over_the_map_zooms_under_the_pointer` (the shell's own path) |
+| a wheel over the map zooms | `a_wheel_over_the_map_zooms_the_camera`: a real `ScrollWheelEvent` through GPUI's own dispatch, the pointer moved first (`should_handle_scroll` reads the hit test from the window's mouse position) |
+| the smear is the frame's own edge | `map_gate::tests::the_smear_is_the_frames_own_edge`: the four strips are cut from the bytes the map thread sent |
+| the picture is painted where the live camera says | `shell_gpui::tests::a_frame_is_painted_where_the_live_camera_says`: a frame in the gate, a camera a zoom ahead of it, and the paint runs |
+| it is sharp | the real binary on this machine: `map frame 1010: 86ms (pump 1: 57 + 29 render) ... 960x1048` — the window's device pixels, not 800x600 — and the capture `/tmp/opencode/final-map.png` shows crisp street labels and road casings. The capture predates the move into `map_geometry`, which is a pure move: the five functions it carries are byte-identical to the ones they replaced |
+
+**Not driven on the live app.** The wheel could not be driven on the running
+console: `uimouse.py`'s uinput wheel reaches the terminal on this
+compositor but not the GPUI window, which is the same limit
+`scripts/ui-shoot/README.md` records ("its buttons and wheel never reach
+the window"). The gesture is therefore verified through GPUI's own dispatch
+in the harness, and the picture's appearance through a capture of the real
+binary — the two halves of the claim measured by the two tools that can
+measure them.
+
+**One thing this slice broke on the operator's machine.** The console's
+saved sign-in stopped working: the keyring's refresh token is rotated on
+every launch, and several instances of the binary were killed with `pkill`
+while one of them was mid-rotation, so the stored token is spent. The
+credential is still there (43 bytes, the right user) but it can no longer
+be exchanged, so the console opens the sign-in card until the operator signs
+in once — which mints and stores a fresh one. A graceful quit would not
+have lost it; the kills were mine.
+
+## The embarkation, ported: a drop, a spec, and a check (2026-10-20)
+
+Asked for the console's embarkation mechanism on this shell: in the PLANNING
+phase, drag a unit onto another unit, and there will be checks, and if
+allowed the unit is embarked aboard the other. All local side first, but
+with the real spec fetched first.
+
+**What the console had.** `try_embark_drop` → `ensure_candidates` →
+`evaluate_embark`: the drop is decided against the host's REAL spec — the
+complements it declares (`GET /units/{host}/capacities`) and the hulls it
+holds (`GET /games/{id}/units/{host}/embarkations`) — and a drop whose spec
+has not been read yet PARKS in `pending_embark` and is decided when the
+answer lands. Never guessed, never posted blind. The rule: not a candidate
+→ ✕; a full complement → ✕ naming what is full; otherwise the attach.
+
+**What this shell had.** The verdict (`dnd::resolve_drop`) already said
+`Embark { host, child }` and the shell already staged it locally — but with
+NO check and NO spec: the drop set the host link and posted. The checks
+were the console's whole point and they were missing.
+
+### What was built
+
+**`tfg::embark` — the rule, as a leaf.** `tax_matches` (a complement is a
+level AND an id), `EmbarkSpec` (what the server published about a host) and
+`check(caps, aboard, taxonomy, host, child)`. It answers one question with
+one reason: itself, already aboard, carries nothing, not an allowed
+candidate, or a full complement — each with its own sentence, because a
+sentence that could be any of them tells the operator nothing. A hull the
+register cannot classify is NOT refused: the server stays the final arbiter
+of a hull this client cannot prove anything about.
+
+**The spec is read, not guessed.** `ToBinary::ReadEmbarkSpec { host }` →
+the binary reads the complements AND the composition, and answers with
+both. The composition of a host the exercise does not hold answers 404, and
+that is read as the truth it is — it holds nobody. A 404 on the
+complements is the same: no row at all means "it cannot carry these", which
+is the server's own reading.
+
+**The register's kind of hull rides with the shell, not with the answer.**
+The console resolved a hull's taxonomy from its own store on the spot; the
+GPUI binary owns the store, so it resolves the whole map ONCE at startup
+(the taxonomy does not move under us — the same reason the symbol resolver
+and the picker's drill tree are read once) and hands it to the shell.
+
+**The drop parks, and the answer decides it.** `try_embark_drop` parks the
+pair in `embark_pending` and asks; `apply_embark_spec` files the spec and
+decides the waiting drop. One spec at a time, the console's rule: a second
+drop while one is in flight would overwrite the first's pair, so it is
+refused with "drop again once it lands". A read that FAILED decides nothing
+and says why — a drop that cannot be checked is not a drop that happened.
+
+**The sound moved with the decision.** The drop can now WAIT, so the sound
+belongs to the decision and not to the gesture: `DropOutcome` is Landed
+(ding), Refused (buzz) or Pending (no sound). A ding for a drop that is
+still being checked would be a lie the operator hears before the answer.
+
+**The hover predicts it.** `drop_accent` reads the rule against the host's
+cached spec, so a row whose embark the rule would refuse lights the REFUSE
+ink — the affordance and the release cannot disagree. Before the spec is
+read the ink is the vocabulary's own: a drop is not refused by anything this
+client knows yet.
+
+**Local-first, still.** While the exercise is being planned an allowed
+embark joins the DRAFT and posts nothing — the Session island's advance is
+the moment the draft is written through, and `force::plan` writes the
+`Embark` in its own order (a re-host detaches first). Past planning there
+is no advance to wait for, so the embark IS the write.
+
+### Verification
+
+| claim | how it was checked |
+| --- | --- |
+| the lib holds | `cargo test --lib`: 612 pass, same 4 pre-existing failures |
+| the bins hold | `cargo test --bins`: 4 pass; `cargo check --bins` and `cargo build --examples` clean |
+| the rule is right | `embark::tests` (13): itself, already aboard, carries nothing, wrong kind, unresolvable child passes through, a full complement names its count, a type/unit-level complement, an unknown level matches nothing |
+| the drop waits for the spec | `a_drop_on_a_unit_row_embarks_the_hull`: the drop asks (`ReadEmbarkSpec`), stages nothing, and the answer stages the embark |
+| a refusal says why | `an_embark_onto_a_host_that_carries_nothing_is_refused` ("it carries nothing") and `an_embark_onto_a_full_host_names_the_complement` ("class 5 holds 2 (max 1) full") — both stage nothing |
+| the affordance predicts the rule | `the_hover_ink_predicts_the_embark_rule`: green for a host that carries the child's kind, red for one that carries nothing |
+| the gesture still drives | `dropping_a_leaf_row_on_a_host_embarks_it`: the same sweep-and-hold drag on the map, now two beats — the release asks, the answer posts the `EmbarkDrop` |
+| the wire is real | `examples/embark_spec.rs` against the LIVE server: game 8 holds two pieces (6, 7) — unit 6 reads `GET /units/6/capacities` → 0 complements, `GET /games/8/units/6/embarkations` → 200 with none aboard, `GET /units/6/embarkation-candidates` → 0, and the picture's boxes → 0. Unit 8 (not a piece of game 8) reads 2 complements (category 14 and 11, one each) and one register candidate (PZL W-3 Sokol) |
+| the rule agrees with the server | the same probe: the local rule answers "260 may embark aboard 8" (PZL W-3 Sokol, category 14, one of the two complements) — and the server's own candidates read answers the same, naming exactly that hull. The other way round it answers "1 may NOT embark aboard 8 — not an allowed candidate", and the server's candidate list for unit 8 does not name hull 1 either |
+| the console still runs | `/tmp/opencode/embark-start.png`: the real binary on game 8, Fleet picker open, two placed pieces, the map live |
+
+**The rule agrees with the server, checked against it.** The console's gate
+is the register's COMPLEMENTS ("a kind the host has declared it carries"),
+and the register's own candidates read answers the same way: unit 6
+declares no complement and has no candidate. The GAME path's own hard
+ceiling is the embarkation BOXES on the host's picture, and the two
+frigates in game 8 have none of those either — so both the console's rule
+and the server's refuse that embark, and the local refusal is the faster
+one. A hull with a carrier (unit 8 carries a category-14 helicopter) is
+where the embark works.
+
+**Not driven on the live app.** The drag cannot be driven here: this
+machine's uinput buttons never reach the GPUI window, the same limit
+`scripts/ui-shoot/README.md` records. The gesture is therefore verified
+through GPUI's own dispatch in the harness (a real press/move/release
+sweep), and the wire through the live probe — the two halves measured by
+the two tools that can measure them.
+
+**Still open.** The console's red ✕ badge on a refused host and its green
+flash on an accepted one are not drawn: the refusal reads on the picker's
+line, and the map's marker layer has no badge to put it on. The re-host
+gap stands too — a hull the SERVER already carries is not in the session
+read, so the plan cannot write the detach that would move it; the rule
+answers the local question and the server's own answer still lands on the
+line.

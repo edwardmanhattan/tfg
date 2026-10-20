@@ -28,6 +28,13 @@ mod book;
 mod symbology;
 #[path = "../../../src/map_gate.rs"]
 mod map_gate;
+// The map's GEOMETRY — the Web Mercator projection, the ground resolution
+// and where the picture goes in the window — is arithmetic and never
+// touches a tile, so the proto compiles the same file the crate does. It
+// is NOT the map ENGINE: that is `map_render`, which carries MapLibre and
+// which the proto deliberately does not have.
+#[path = "../../../src/map_geometry.rs"]
+mod map_geometry;
 // `force` and `roster` are the console's own staging, toolkit-free, so the
 // shell can name them and the proto compiles the same files. `force` reaches
 // `geo::coordinates` for `GeoPosition`; the proto shims only that leaf and
@@ -50,6 +57,10 @@ mod roster;
 // cascade, so the shell never names it.
 #[path = "../../../src/dnd.rs"]
 mod dnd;
+// The embark rule is a leaf too: no toolkit, no kernel, no network — the
+// plain data the shell checks a drop against.
+#[path = "../../../src/embark.rs"]
+mod embark;
 // `command` is a near-leaf (only `geo::coordinates`, already shimmed
 // above) and `groups` depends on it alone — so the shell may now name
 // `crate::groups`, which it needs for the task-organisation island.
@@ -144,6 +155,15 @@ mod backend {
         pub id_level: i64,
         pub max_aboard: i64,
         pub would_hold: i64,
+    }
+
+    /// What a hull carries, and how many: the complement a host declares.
+    /// The embark rule reads it, so the proto carries the shape.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct UnitCapacity {
+        pub level: String,
+        pub id_level: i64,
+        pub max_aboard: i64,
     }
 
     #[derive(Debug, Clone, PartialEq)]

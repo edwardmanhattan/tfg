@@ -26,6 +26,20 @@ use maplibre_native::{
     CameraUpdate, Continuous, ImageRenderer, ImageRendererBuilder, LatLng, ResourceOptions,
 };
 
+/// The map's GEOMETRY, re-exported from [`crate::map_geometry`].
+///
+/// The projection, the ground resolution and the picture's placement are
+/// arithmetic and never touch a tile, so they live in a module of their own
+/// that the parity proto can compile without MapLibre. They are re-exported
+/// here because this is where the rest of the map's plumbing reaches for
+/// them, and one definition has to serve both shells.
+pub use crate::map_geometry::{
+    anchor_center, meters_per_pixel, pan_center, project_mercator, unproject_mercator, Rect,
+    EARTH_EQUATOR_M, GESTURE_PUMP, JUMP_PUMP, MAP_CENTER, MAP_FRAME_INTERVAL, MAP_H,
+    MAP_RESIZE_SETTLE, MAP_STYLE, MAP_W, MAP_ZOOM, MAX_MERCATOR_LAT, WHEEL_ZOOM_STEP,
+    WORLD_BASE_PX,
+};
+
 /// Pixel layout of [`LiveMap::frame_rgba`]. Flip if the map renders washed.
 const PREMULTIPLIED: bool = true;
 
@@ -227,64 +241,6 @@ impl LiveMap {
         (self.w, self.h)
     }
 }
-
-/// The console's base map geometry, shared by both shells.
-///
-/// One definition rather than two: the GPUI shell and the egui shell must open
-/// on the same place at the same size, or every capture comparison between
-/// them is a comparison of two different maps. The egui shell keeps its own
-/// names as aliases so its call sites are untouched.
-pub const MAP_W: f64 = 800.0;
-pub const MAP_H: f64 = 600.0;
-pub const MAP_CENTER: (f64, f64) = (-6.108, 106.910);
-pub const MAP_ZOOM: f64 = 11.0;
-pub const MAP_STYLE: &str = "https://tiles.openfreemap.org/styles/liberty";
-/// Pumps for a jump (a recentre); an ordinary gesture spends fewer.
-pub const JUMP_PUMP: u32 = 6;
-/// Pumps for a pan or zoom step mid-gesture: one render plus one 50ms
-/// grace for tiles. Network tiles take longer than any sleep budget when
-/// the ground is new, and the cache answers warm ground inside the
-/// render — so further sleeps buy almost nothing on fresh ground while
-/// each one costs the drag ~60ms of staleness. Jumps and warm-ups keep
-/// the full budget: a recentre should land complete, and startup is not
-/// latency-sensitive the way a held drag is.
-pub const GESTURE_PUMP: u32 = 1;
-
-/// World-size base in px at zoom 0 for the overlay math. Calibrated
-/// against the renderer (task #42, `examples/calibrate_projection.rs`):
-/// a +0.02° latitude pan at zoom 11 moves content 59.0px on the frame
-/// vs 29.3px under a 256 base (ratio 2.014) — the MapLibre world is
-/// 512-based, so the overlay must be too, or units drift with zoom.
-const WORLD_BASE_PX: f64 = 512.0;
-
-/// Earth's equatorial circumference, metres. The numerator of the
-/// ground resolution below, kept as a named constant because a second
-/// copy of this number is how a scale drifts by a factor of two.
-const EARTH_EQUATOR_M: f64 = 40_075_016.686;
-
-/// Ground resolution at a latitude and zoom, metres per pixel.
-///
-/// The inverse of `project_mercator`'s scale: the world is
-/// `WORLD_BASE_PX * 2^zoom` pixels wide and one full turn of
-/// longitude is `EARTH_EQUATOR_M` metres, with the Mercator
-/// stretch's `cos(latitude)` on top. Both constants are the ones the
-/// projection above already uses, so the two cannot disagree.
-///
-/// This is the ONLY conversion from real-world metres to map pixels in
-/// the client. Nothing else may scale a hull: an image's aspect ratio
-/// is a property of a photograph, not a measurement of a ship.
-pub fn meters_per_pixel(latitude: f64, zoom: f64) -> f64 {
-    // Mercator diverges at the poles; clamping to the Web Mercator
-    // limit keeps a hull at 89.999° finite rather than dividing by a
-    // vanishing cosine.
-    let lat = latitude.clamp(-MAX_MERCATOR_LAT, MAX_MERCATOR_LAT);
-    EARTH_EQUATOR_M * lat.to_radians().cos() / (WORLD_BASE_PX * 2f64.powf(zoom))
-}
-
-/// The Web Mercator cut-off latitude. Mercator is defined to ±85.0511°;
-/// past it the projection is clamped by every renderer, and this
-/// client follows rather than producing infinities.
-const MAX_MERCATOR_LAT: f64 = 85.051_128_78;
 
 /// A hull's on-screen footprint, in pixels, from Minos' measurements.
 ///
@@ -1056,101 +1012,6 @@ pub fn rotated_unit_quad_with_forward_heading(
     })
 }
 
-/// Project lat/lon to window pixels for a `w` x `h` viewport centered on
-/// `center` at `zoom`.
-pub fn project_mercator(
-    lat: f64,
-    lon: f64,
-    center: (f64, f64),
-    zoom: f64,
-    w: f64,
-    h: f64,
-) -> (f64, f64) {
-    fn world(lat: f64, lon: f64, zoom: f64) -> (f64, f64) {
-        let scale = WORLD_BASE_PX * 2f64.powf(zoom);
-        let x = (lon + 180.0) / 360.0 * scale;
-        let s = (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln();
-        let y = (1.0 - s / std::f64::consts::PI) / 2.0 * scale;
-        (x, y)
-    }
-    let (x, y) = world(lat, lon, zoom);
-    let (cx, cy) = world(center.0, center.1, zoom);
-    (x - cx + w / 2.0, y - cy + h / 2.0)
-}
-
-/// The centre a pan drag asks for.
-///
-/// A drag points at the map pixel under the cursor and asks for THAT GROUND to
-/// stay there, so the centre becomes that pixel — which is why the sign lives
-/// here and not at the call site: dragging the picture right moves the centre
-/// LEFT, and writing that arithmetic twice is how the two directions come to
-/// disagree.
-pub fn pan_center(
-    center: (f64, f64),
-    zoom: f64,
-    dx: f64,
-    dy: f64,
-    w: f64,
-    h: f64,
-) -> (f64, f64) {
-    unproject_mercator(w / 2.0 - dx, h / 2.0 - dy, center, zoom, w, h)
-}
-
-/// Keep the point under the cursor fixed across a zoom step (task #43):
-/// the new center puts the cursor's geographic point back under it.
-/// Exact inverse of the forward path by construction (see test).
-#[allow(clippy::too_many_arguments)]
-pub fn anchor_center(
-    px: f64,
-    py: f64,
-    center: (f64, f64),
-    zoom: f64,
-    new_zoom: f64,
-    w: f64,
-    h: f64,
-) -> (f64, f64) {
-    use std::f64::consts::PI;
-    let (gla, glo) = unproject_mercator(px, py, center, zoom, w, h);
-    let scale = WORLD_BASE_PX * 2f64.powf(new_zoom);
-    let gx = (glo + 180.0) / 360.0 * scale;
-    let s = (gla.to_radians().tan() + 1.0 / gla.to_radians().cos()).ln();
-    let gy = (1.0 - s / PI) / 2.0 * scale;
-    let cx = gx - (px - w / 2.0);
-    let cy = gy - (py - h / 2.0);
-    let lon = cx / scale * 360.0 - 180.0;
-    let s2 = (1.0 - 2.0 * cy / scale) * PI;
-    let lat = s2.sinh().atan().to_degrees();
-    (lat, lon)
-}
-
-/// Inverse of [`project_mercator`]: window pixels back to lat/lon.
-/// Used for click-to-order waypoints; exact round-trip of the forward path.
-#[allow(clippy::too_many_arguments)]
-pub fn unproject_mercator(
-    px: f64,
-    py: f64,
-    center: (f64, f64),
-    zoom: f64,
-    w: f64,
-    h: f64,
-) -> (f64, f64) {
-    use std::f64::consts::PI;
-    fn world(lat: f64, lon: f64, zoom: f64) -> (f64, f64) {
-        let scale = WORLD_BASE_PX * 2f64.powf(zoom);
-        let x = (lon + 180.0) / 360.0 * scale;
-        let s = (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln();
-        let y = (1.0 - s / PI) / 2.0 * scale;
-        (x, y)
-    }
-    let scale = WORLD_BASE_PX * 2f64.powf(zoom);
-    let (cx, cy) = world(center.0, center.1, zoom);
-    let x = px - w / 2.0 + cx;
-    let y = py - h / 2.0 + cy;
-    let lon = x / scale * 360.0 - 180.0;
-    let s = (1.0 - 2.0 * y / scale) * PI;
-    let lat = s.sinh().atan().to_degrees();
-    (lat, lon)
-}
 
 /// Click a Zone's OUTLINE, or the name written on it — never its
 /// interior. The interior of a Zone is ground: in a client where
@@ -2379,7 +2240,7 @@ mod tests {
         );
     }
 
-    /// A Zone is picked by its outline and its name, never by its
+    /// A ZONE is picked by its outline and its name, never by its
     /// interior: the middle of a translucent ground overlay is still map.
     /// Moved off the console binary with the function (U8 step 1).
     #[test]

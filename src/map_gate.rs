@@ -156,16 +156,34 @@ impl FrameGate {
 /// hold — `ImageSource::Render` resolves on the spot, so the frame is
 /// paintable in the frame it arrives. What remains is the atlas tile, which
 /// is still minted per `ImageId` and still has to be retired by hand.
+///
+/// It also brings the SMEAR: a picture that has fallen behind the camera
+/// does not reach the whole window, and the band it misses is filled with
+/// the frame's own edge, stretched. GPUI paints an image into a rectangle
+/// and cannot sample a piece of one, so each edge is its own small image.
 pub struct FrameSlot {
     displayed: Option<Arc<RenderImage>>,
+    /// The frame's edges, in the order [`FrameEdge`] numbers them: the
+    /// smear for the band the picture does not reach.
+    edges: [Option<Arc<RenderImage>>; 4],
     shown: u64,
     retired: u64,
+}
+
+/// Which edge of the frame a smear belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameEdge {
+    Left = 0,
+    Right = 1,
+    Top = 2,
+    Bottom = 3,
 }
 
 impl FrameSlot {
     pub fn new() -> Self {
         Self {
             displayed: None,
+            edges: [None, None, None, None],
             shown: 0,
             retired: 0,
         }
@@ -182,6 +200,10 @@ impl FrameSlot {
         size: (u32, u32),
         bgra: Vec<u8>,
     ) {
+        // The edges are cut from the same bytes, before they are handed to
+        // the frame: the smear has to be the picture's own edge, not a
+        // colour guessed from it.
+        let edges = edge_strips(size.0, size.1, &bgra);
         let Some(buffer) = ImageBuffer::<Rgba<u8>, _>::from_raw(size.0, size.1, bgra) else {
             return; // wrong byte count; nothing to show
         };
@@ -190,11 +212,23 @@ impl FrameSlot {
             app.drop_image(old, Some(window));
             self.retired += 1;
         }
+        for (slot, edge) in self.edges.iter_mut().zip(edges) {
+            if let Some(old) = std::mem::replace(slot, edge) {
+                app.drop_image(old, Some(window));
+                self.retired += 1;
+            }
+        }
         self.shown = no;
     }
 
     pub fn image(&self) -> Option<Arc<RenderImage>> {
         self.displayed.clone()
+    }
+
+    /// The smear for one edge: the frame's own border, stretched across the
+    /// band the picture does not reach.
+    pub fn edge(&self, edge: FrameEdge) -> Option<Arc<RenderImage>> {
+        self.edges[edge as usize].clone()
     }
 
     pub fn shown(&self) -> u64 {
@@ -204,6 +238,48 @@ impl FrameSlot {
     pub fn retired(&self) -> u64 {
         self.retired
     }
+}
+
+/// The frame's outermost two columns and rows, as four small images.
+///
+/// Two pixels and not one: the atlas packs a tile with no padding, so a
+/// one-pixel strip has nothing but its neighbour's tile to sample at the
+/// edge, and the seam shows as a line of the wrong colour. Two pixels give
+/// the sampler a neighbour inside the tile, and the difference between one
+/// and two pixels of smear is a difference nobody can see.
+fn edge_strips(w: u32, h: u32, bgra: &[u8]) -> [Option<Arc<RenderImage>>; 4] {
+    let (w, h) = (w as usize, h as usize);
+    let stride = w * 4;
+    if w < 2 || h < 2 || bgra.len() < stride * h {
+        return [None, None, None, None];
+    }
+    // Two columns of every row: the frame's left or right edge.
+    let columns = |x0: usize| -> Option<Arc<RenderImage>> {
+        let mut buf = Vec::with_capacity(2 * h * 4);
+        for y in 0..h {
+            let at = y * stride + x0 * 4;
+            buf.extend_from_slice(&bgra[at..at + 8]);
+        }
+        Some(Arc::new(RenderImage::new([Frame::new(
+            ImageBuffer::<Rgba<u8>, _>::from_raw(2, h as u32, buf)?,
+        )])))
+    };
+    // Two rows of every column: the frame's top or bottom edge.
+    let rows = |y0: usize| -> Option<Arc<RenderImage>> {
+        let mut buf = Vec::with_capacity(w * 2 * 4);
+        for y in y0..y0 + 2 {
+            buf.extend_from_slice(&bgra[y * stride..(y + 1) * stride]);
+        }
+        Some(Arc::new(RenderImage::new([Frame::new(
+            ImageBuffer::<Rgba<u8>, _>::from_raw(w as u32, 2, buf)?,
+        )])))
+    };
+    [
+        columns(0),
+        columns(w - 2),
+        rows(0),
+        rows(h - 2),
+    ]
 }
 
 /// Replays PNG frames from a directory the way the map thread sends them:/// in order, newest-wins to the consumer, `burst_ms` apart. Frames come
@@ -341,5 +417,74 @@ impl RawReplay {
 pub fn swizzle_rgba_to_bgra(bytes: &mut [u8]) {
     for px in bytes.chunks_exact_mut(4) {
         px.swap(0, 2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The smear is the frame's OWN edge: the first two columns, the last
+    /// two columns, the first two rows and the last two rows, cut from the
+    /// bytes the map thread sent.
+    ///
+    /// A smear that was a guess — a colour, a fill, a gradient of nothing —
+    /// would put a different map at the edge of the picture, and the edge is
+    /// where the operator is looking when they are dragging.
+    #[test]
+    fn the_smear_is_the_frames_own_edge() {
+        // A 4x3 frame, every pixel distinct.
+        let (w, h) = (4u32, 3u32);
+        let mut bytes = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                bytes.extend_from_slice(&[(x * 10) as u8, (y * 10) as u8, 7, 255]);
+            }
+        }
+        let strips = edge_strips(w, h, &bytes);
+
+        // The left edge: the first two columns of every row.
+        let left = strips[0].as_ref().expect("the left edge");
+        assert_eq!(left.size(0).width.0, 2, "two columns");
+        assert_eq!(left.size(0).height.0, 3, "every row");
+        let raw = left.as_bytes(0).expect("the strip's bytes");
+        assert_eq!(&raw[0..4], &[0, 0, 7, 255], "column 0, row 0");
+        assert_eq!(&raw[4..8], &[10, 0, 7, 255], "column 1, row 0");
+        assert_eq!(&raw[16..20], &[0, 20, 7, 255], "column 0, row 2");
+
+        // The right edge: the last two columns.
+        let right = strips[1].as_ref().expect("the right edge");
+        let raw = right.as_bytes(0).expect("the strip's bytes");
+        assert_eq!(&raw[0..4], &[20, 0, 7, 255], "column 2, row 0");
+        assert_eq!(&raw[4..8], &[30, 0, 7, 255], "column 3, row 0");
+
+        // The top edge: the first two rows, every column.
+        let top = strips[2].as_ref().expect("the top edge");
+        assert_eq!(top.size(0).width.0, 4, "every column");
+        assert_eq!(top.size(0).height.0, 2, "two rows");
+        let raw = top.as_bytes(0).expect("the strip's bytes");
+        assert_eq!(&raw[0..4], &[0, 0, 7, 255], "column 0, row 0");
+        assert_eq!(&raw[12..16], &[30, 0, 7, 255], "column 3, row 0");
+
+        // The bottom edge: the last two rows.
+        let bottom = strips[3].as_ref().expect("the bottom edge");
+        let raw = bottom.as_bytes(0).expect("the strip's bytes");
+        assert_eq!(&raw[0..4], &[0, 10, 7, 255], "column 0, row 1");
+        assert_eq!(&raw[12..16], &[30, 10, 7, 255], "column 3, row 1");
+        assert_eq!(&raw[28..32], &[30, 20, 7, 255], "column 3, row 2");
+    }
+
+    /// A frame too small to have an edge is no smear at all, and a frame
+    /// whose bytes do not match its size is nothing to smear.
+    #[test]
+    fn a_frame_too_small_to_smear_has_no_edges() {
+        let bytes = vec![0u8; 4 * 4 * 2 * 2];
+        let strips = edge_strips(1, 4, &bytes);
+        assert!(strips.iter().all(|s| s.is_none()), "a one-pixel frame has no edge");
+        let strips = edge_strips(4, 4, &bytes[..8]);
+        assert!(
+            strips.iter().all(|s| s.is_none()),
+            "a frame whose bytes do not match its size is nothing to smear"
+        );
     }
 }

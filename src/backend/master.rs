@@ -37,6 +37,14 @@ pub struct UnitNamed {
     pub hull_number: String,
     pub class_name: String,
     pub category_name: String,
+    /// The hull's TYPE, as the register's class summary names it.
+    ///
+    /// The summary carries it (`unit_class.unit_type.name`) and the parser
+    /// used to throw it away, so the console could only know a hull's type
+    /// from its own local taxonomy — a table that is empty on a machine
+    /// whose store never synced. The type is what an observer reads first,
+    /// so it comes off the wire now.
+    pub type_name: String,
 }
 
 pub struct TableData {
@@ -321,6 +329,10 @@ impl MinosMaster {
                 class_name: Self::str_of(&u["unit_class"], "name").unwrap_or_else(|| "—".to_string()),
                 category_name: Self::str_of(&u["unit_class"]["category"], "name")
                     .unwrap_or_else(|| "—".to_string()),
+                // Empty and not a dash: "the register did not name a type"
+                // and "the type is a dash" are different answers, and only
+                // the first one may reach the panel as a dash.
+                type_name: Self::str_of(&u["unit_class"]["unit_type"], "name").unwrap_or_default(),
             })
             .collect())
     }
@@ -613,6 +625,7 @@ impl MinosMaster {
                     unit_id: u["id_unit"].as_i64()?,
                     unit_name: u["unit_name"].as_str().unwrap_or("").to_string(),
                     hull_number: u["hull_number"].as_str().unwrap_or("").to_string(),
+                    class_name: u["unit_class_name"].as_str().unwrap_or("").to_string(),
                     commander_id: u["id_commander"].as_i64(),
                     commander_name: u["commander_name"].as_str().unwrap_or("").to_string(),
                     hierarchy_node: u["id_hierarchy_node"].as_i64(),
@@ -3651,6 +3664,12 @@ pub struct GameUnit {
     pub unit_id: i64,
     pub unit_name: String,
     pub hull_number: String,
+    /// The hull's CLASS, as the server names it on every piece row.
+    ///
+    /// It used to be dropped here, and a dropped class is a class the
+    /// console can only guess at: the details panel then had to say "no
+    /// class" for a hull whose class the server published on every row.
+    pub class_name: String,
     pub commander_id: Option<i64>,
     pub commander_name: String,
     /// Task-organisation node the piece sits under, if any. Omitted

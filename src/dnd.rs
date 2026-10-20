@@ -54,6 +54,13 @@ pub enum DropTarget {
     Group { group_id: i64 },
     /// A person — a directory row, or a seated participant's row.
     Player { user_id: i64 },
+    /// The players list ITSELF: the roster of seats, and the place a person
+    /// is SEATED.
+    ///
+    /// Not a person. A person is a ROW in this list, and dropping a person on
+    /// a person is the gesture that means nothing — so the list is its own
+    /// target, and a person carried onto it takes a seat.
+    Roster,
 }
 
 /// What a drop means, decided without touching anything.
@@ -79,6 +86,14 @@ pub enum DropVerdict {
     NestGroup { child: i64, parent: i64 },
     /// Hand a group to a person as its commander.
     CommandGroup { group_id: i64, user_id: i64 },
+    /// Put a person in the room: the roster takes a row for them.
+    ///
+    /// The ROLE is not named here, because the role a seat takes is the
+    /// operator's decision, made on the row the person lands in. A drop says
+    /// "this person is in the room", and which seat they hold is the next
+    /// click — so the verdict carries the person and the shell picks the
+    /// default role, the same way a seat form does.
+    Seat { user_id: i64 },
     /// The client refused the gesture, with the sentence to say out loud.
     Refused { why: String },
 }
@@ -137,6 +152,10 @@ pub fn resolve_drop(entity: &DragEntity, target: &DropTarget) -> DropVerdict {
             group_id: *group_id,
             unit_id: *unit_id,
         },
+        (DragEntity::Unit { .. }, DropTarget::Roster) => DropVerdict::Refused {
+            why: "a hull is not a seat \u{2014} drop it on a player to make them its commander"
+                .to_string(),
+        },
 
         // ── A person ──────────────────────────────────────────────────────
         (DragEntity::Player { user_id, .. }, DropTarget::Unit { unit_id }) => {
@@ -157,6 +176,9 @@ pub fn resolve_drop(entity: &DragEntity, target: &DropTarget) -> DropVerdict {
         },
         (DragEntity::Player { .. }, DropTarget::Player { .. }) => DropVerdict::Refused {
             why: "a person commands pieces, not people".to_string(),
+        },
+        (DragEntity::Player { user_id, .. }, DropTarget::Roster) => DropVerdict::Seat {
+            user_id: *user_id,
         },
 
         // ── A group ───────────────────────────────────────────────────────
@@ -180,6 +202,9 @@ pub fn resolve_drop(entity: &DragEntity, target: &DropTarget) -> DropVerdict {
         },
         (DragEntity::Group { .. }, DropTarget::Map { .. }) => DropVerdict::Refused {
             why: "a group has no map position \u{2014} it lives in the task organisation".to_string(),
+        },
+        (DragEntity::Group { .. }, DropTarget::Roster) => DropVerdict::Refused {
+            why: "a group is not a seat \u{2014} it lives in the task organisation".to_string(),
         },
     }
 }
@@ -293,6 +318,32 @@ mod tests {
         assert!(v.refusal().unwrap().contains("inside itself"));
     }
 
+    /// A person carried onto the roster takes a seat. The verdict names the
+    /// person and NOT a role: which seat they hold is the operator's next
+    /// click, on the row they land in.
+    #[test]
+    fn a_person_on_the_roster_is_seated() {
+        assert_eq!(
+            resolve_drop(&player(3), &DropTarget::Roster),
+            DropVerdict::Seat { user_id: 3 }
+        );
+    }
+
+    /// The roster is a list of seats, not a place a hull or a group belongs:
+    /// the two refusals say what to do instead, because a gesture that ends
+    /// in silence is the failure this vocabulary exists to remove.
+    #[test]
+    fn only_a_person_belongs_on_the_roster() {
+        for e in [unit(7), group(5)] {
+            let v = resolve_drop(&e, &DropTarget::Roster);
+            assert!(!v.accepted(), "{e:?} on the roster was accepted");
+            assert!(
+                v.refusal().is_some_and(|w| !w.is_empty()),
+                "{e:?} on the roster refused with no sentence"
+            );
+        }
+    }
+
     /// The refusals that keep the buzz honest: every gesture that has no
     /// meaning in this world says so rather than landing somewhere by
     /// accident. A test per row of the matrix, because a hole here is a drop
@@ -305,6 +356,8 @@ mod tests {
             (group(1), DropTarget::Unit { unit_id: 7 }),
             (group(1), DropTarget::Player { user_id: 1 }),
             (group(1), DropTarget::Map { fx: 0.5, fy: 0.5 }),
+            (group(1), DropTarget::Roster),
+            (unit(7), DropTarget::Roster),
         ];
         for (e, t) in rows {
             let v = resolve_drop(&e, &t);

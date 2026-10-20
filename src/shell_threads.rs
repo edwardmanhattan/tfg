@@ -223,8 +223,16 @@ pub fn spawn_map_thread(config: MapConfig) -> (Sender<MapReq>, Receiver<MapResp>
     let (resp_tx, resp_rx) = mpsc::channel::<MapResp>();
     let handle = std::thread::spawn(move || {
         use crate::map_render::LiveMap;
-        let mut size = (config.width, config.height);
-        let mut scene = LiveMap::new(config.center, config.zoom, size.0, size.1, &config.style, config.cache.clone());
+        // The scene is built LAZILY, at the size the first request asks for.
+        // The map thread's own default (800x600) is not the console's: the
+        // console asks for the window's own device pixels, so a map drawn
+        // at the default and then stretched over the window is a soft map.
+        // And a scene is EXPENSIVE to build — the style loads and the tile
+        // pipeline warms — so building one at the default and then another
+        // at the size that was wanted is a minute of startup nobody asked
+        // for.
+        let mut size = (0u32, 0u32);
+        let mut scene: Option<LiveMap> = None;
         while let Ok(first) = req_rx.recv() {
             // Newest-wins: a burst of scroll-zoom requests renders once, so
             // the texture never lags seconds behind.
@@ -233,11 +241,19 @@ pub fn spawn_map_thread(config: MapConfig) -> (Sender<MapReq>, Receiver<MapResp>
                 latest = newer;
             }
             let (seq, at, zoom, px, pump) = latest;
-            if px != size {
+            if scene.is_none() || px != size {
                 // Window resize: rebuild the scene once at the new size.
-                scene = LiveMap::new(at, zoom, px.0.max(1), px.1.max(1), &config.style, config.cache.clone());
+                scene = Some(LiveMap::new(
+                    at,
+                    zoom,
+                    px.0.max(1),
+                    px.1.max(1),
+                    &config.style,
+                    config.cache.clone(),
+                ));
                 size = px;
             }
+            let scene = scene.as_mut().expect("built just above");
             scene.set_center(at, zoom);
             // Smoothness measurement: round-trip cost per frame, split so
             // tile lag can be told apart from pump sleeps and readback.

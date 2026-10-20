@@ -14,6 +14,8 @@
 //!   plot read, the order publications, and the game fixes they become.
 //!   Leaf: no GPUI, no shell.
 //! - [`force`]: the operator's force before Minos hears of it, and the diff a stage advance writes.
+//! - [`embark`]: the embark rule — what may go aboard what, decided against
+//!   the spec the server published. Leaf: no GPUI, no draft, no network.
 //! - [`dnd`]: entity-to-entity drag and drop — what a drop on a hull, a person
 //!   or a group means. Leaf: no GPUI, no draft, no network.
 //! - [`backend`]: v0 poll contract: `PollSource`, file replay, HTTP stub.
@@ -24,6 +26,9 @@
 //! - [`markers`]: the map's marker model — one hull on the map, its
 //!   affiliation vocabulary and the pick order. Toolkit-free; the painters
 //!   stay per-shell (U8 step 4).
+//! - [`map_geometry`]: the map's arithmetic — the Web Mercator projection,
+//!   the ground resolution, and where the map's picture goes in the window.
+//!   No MapLibre, so the parity proto can compile it.
 //! - [`map_gate`]: the map frame handoff — newest-wins queue, hold-until-ready
 //!   promotion, and the retirement that keeps the atlas bounded. GPUI-typed by
 //!   design (U6); this is the file U8 moved out of `proto/gpui-map` so the
@@ -48,6 +53,7 @@ pub mod catalog;
 pub mod clock;
 pub mod command;
 pub mod dnd;
+pub mod embark;
 pub mod fleet;
 pub mod force;
 pub mod gamestate;
@@ -59,6 +65,7 @@ pub mod geo;
 pub mod land;
 pub mod log;
 pub mod map_gate;
+pub mod map_geometry;
 pub mod map_render;
 pub mod markers;
 pub mod overlay;

@@ -112,6 +112,27 @@ components:
 
 # Design System: Tactical Floor Game
 
+> **SUPERSEDED — this is the egui-era document.** The console was cut over
+> to GPUI (ADR-0020) and the visual world changed with it: the floating
+> chamfered island, the bevelled casing, the cast shadow and the lit rim are
+> gone, and so are Ubuntu Light and Hack. What the console draws now is
+> described in **`.impeccable/surfaces/gpui-console.md`** (the direction) and
+> **owned by `src/view/mod.rs`** (the tokens: the palette, the metrics and
+> the type scale, each one named and tested).
+>
+> Read this file for the palette's names, the product's register and the
+> reasoning that survived. Do **not** read it for the current look: the
+> chamfer, the 8px island radius, the cast shadow, the two typefaces and the
+> "lit rim" are all history. A component checked against this file will
+> disagree with the console on the chamfer, the typeface, the radius, the
+> panel language and the meaning of the accent.
+>
+> The parts of this document that still bind are the ones the GPUI world
+> kept: the palette's names and hexes, the two-face rule (now Saira Condensed
+> and PT Mono), the one-signal rule, the never-gray-on-gray rule, the
+> hairline rule and the depth order (Console Night → Panel Slate → Deep
+> Well).
+
 ## Overview
 
 **Creative North Star: "The Lit Console"**

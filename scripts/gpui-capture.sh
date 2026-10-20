@@ -6,7 +6,7 @@
 # step — including the `pkill` that was supposed to clean up — never ran, the
 # app stayed alive, and the command only ended when the harness aborted it.
 #
-# Four rules, and each one is the fix for a piece of that:
+# Five rules, and each one is the fix for a piece of that:
 #
 #   1. EVERY external call has a `timeout`. A blocked tool is a fast, named
 #      error here, never an unbounded wait.
@@ -22,16 +22,27 @@
 #      looks like a plausible but wrong picture. That cost a whole debugging
 #      pass: the shell was drawing the sign-in card while the crops showed the
 #      console.
-#   5. The window must be on the ACTIVE workspace. `grim -o eDP-1` screencopies
-#      the composited output, which is the active workspace only — a window on
-#      another workspace is not merely mis-cropped, it is absent, and whatever
-#      is on top at those coordinates gets written instead. This bit on
-#      2026-10-13: three captures of a fullscreen video while the app drew
-#      perfectly on `special:scratchpad`. It cannot be worked around —
-#      `hyprctl dispatch` is broken in this build (its Lua wrapper cannot parse
-#      a multi-word argument, over the CLI or the raw socket), so the workspace
-#      cannot be switched to. REFUSE instead: a named error is recoverable, a
-#      wrong PNG is not.
+#   5. The window must be on the ACTIVE workspace, and it must be RAISED.
+#      `grim -o eDP-1` screencopies the composited output, which is the active
+#      workspace only — a window on another workspace is not merely
+#      mis-cropped, it is absent, and whatever is on top at those coordinates
+#      gets written instead. This bit on 2026-10-13: three captures of a
+#      fullscreen video while the app drew perfectly on
+#      `special:scratchpad`. It cannot be worked around — `hyprctl dispatch`
+#      is broken in this build (its Lua wrapper cannot parse a multi-word
+#      argument, over the CLI and the raw socket), so the workspace cannot be
+#      switched to. REFUSE instead: a named error is recoverable, a wrong PNG
+#      is not.
+#
+#      And grim copies the COMPOSITED output, so whatever is on top of the
+#      app at its rect is what the crop contains: a window that opened
+#      behind a browser is a crop of the browser, with the console's own top
+#      band showing and everything under it being somebody else's page. This
+#      bit on 2026-10-20, during a sweep against the hosted dev API, when a
+#      full-screen browser had the app's rect. The raise is
+#      `hyprctl eval 'hl.dsp.window.bring_to_top(<address>)'` — the same
+#      dispatcher `hyprctl dispatch` would have reached, through the new
+#      API, because the old CLI cannot parse a multi-word argument here.
 #
 # Usage: gpui-capture.sh [RUN_SECS] [OUT] [extra tfg env, e.g. "TFG_COMMS=1"]
 set -euo pipefail
@@ -39,6 +50,11 @@ cd "$(dirname "$0")/.."
 
 export TFG_API_USER="${TFG_API_USER:-superuser}"
 export TFG_API_PASS="${TFG_API_PASS:-nasipadangudawandi}"
+# The console traces live gestures into the run log while this is set, and
+# the tally is reported below. A capture that caught the operator's own
+# wheel is a photograph of a state nobody asked for, and it must say so
+# rather than be argued about afterwards.
+export TFG_TRACE_INPUT=1
 RUN_SECS="${1:-14}"
 OUT="${2:-/tmp/gpui_shot.png}"
 EXTRA_ENV="${3:-}"
@@ -86,19 +102,36 @@ rows=json.load(sys.stdin)
 for c in rows:
     if c.get('class','')=='tfg-gpui':
         a,s=c['at'],c['size']
-        print(a[0],a[1],s[0],s[1],c.get('workspace',{}).get('name','')); break
+        print(a[0],a[1],s[0],s[1],c.get('workspace',{}).get('name',''),c.get('address','')); break
 else:
     for c in rows:
         if pid and c.get('pid')==pid:
             a,s=c['at'],c['size']
-            print(a[0],a[1],s[0],s[1],c.get('workspace',{}).get('name','')); break
+            print(a[0],a[1],s[0],s[1],c.get('workspace',{}).get('name',''),c.get('address','')); break
 " || true)
 if [ -z "$RECT" ]; then
     echo "no tfg-gpui window (did it exit? see /tmp/gpui_run.log)" >&2
     exit 4
 fi
-read -r X Y W H WWS <<< "$RECT"
+read -r X Y W H WWS WADDR <<< "$RECT"
 echo "window rect (logical): $X $Y $W $H  on workspace '$WWS'"
+
+# 6. RAISE THE WINDOW before the pixels are read. grim screencopies the
+# COMPOSITED output, so whatever is on top of the app at its rect is what
+# the crop contains. A window that opened behind a browser is a crop of the
+# browser: the console's own top band showed, and everything under it was
+# somebody else's page. This bit on 2026-10-20 during a sweep against the
+# hosted dev API, when a full-screen browser had the app's rect.
+#
+# `hyprctl dispatch` cannot do it on this build (its Lua wrapper rejects a
+# multi-word argument), but `hyprctl eval` reaches the same dispatcher
+# through the new API: `hl.dsp.window.bring_to_top(<address>)`. It raises
+# the window in its current workspace without moving it, which is exactly
+# what a capture needs and nothing more.
+if [ -n "$WADDR" ]; then
+    timeout "$T" hyprctl eval "hl.dsp.window.bring_to_top(\"$WADDR\")" >/dev/null 2>&1 || true
+    sleep 1
+fi
 
 # 5. The window has to be on the workspace grim will screencopy. Being on
 # another one means it is not in the image at all, and the pixels at its rect
@@ -120,3 +153,58 @@ PW=$(python3 -c "print(round($W*1.25))"); PH=$(python3 -c "print(round($H*1.25))
 timeout "$T" grim -o eDP-1 /tmp/gpui_full.png
 timeout "$T" magick /tmp/gpui_full.png -crop "${PW}x${PH}+${PX}+${PY}" +repage "$OUT"
 echo "captured $OUT  ($(stat -c%s "$OUT") bytes)"
+
+# 7. WAS THE CONSOLE LEFT ALONE? A capture is a photograph of a state, and
+#    a state the operator's own hand changed is not the state the capture
+#    was asked for. On 2026-10-20 a sweep's captures came back with the
+#    column scrolled and the hunt went looking for a layout fault, when
+#    the truth was a wheel turning under the operator's hand. The console
+#    traces the gestures it received; the tally is printed here, and a
+#    non-zero one is a tainted capture.
+# The console fell back to its FIXTURE roster: the hosted API did not
+# answer. The picture is then of a DIFFERENT console — the fixture's
+# game, the fixture's hulls — and it is not the state the capture was
+# seeded for. This happened on 2026-10-20 during a sweep: a transient
+# fetch failure, and the capture came back as a console nobody asked
+# about.
+if grep -q 'falling back to the fixture' /tmp/gpui_run.log 2>/dev/null; then
+  echo "TAINTED: the hosted API did not answer and the console fell back to" >&2
+  echo "its fixture roster. This picture is of the FIXTURE, not the hosted" >&2
+  echo "deployment. Re-run it when the API is up." >&2
+fi
+
+WHEELS=$(grep -c 'TFG_INPUT wheel' /tmp/gpui_run.log 2>/dev/null || true)
+CLICKS=$(grep -c 'TFG_INPUT click' /tmp/gpui_run.log 2>/dev/null || true)
+WHEELS=${WHEELS:-0}; CLICKS=${CLICKS:-0}
+echo "input during capture: $WHEELS wheel, $CLICKS click"
+# WHERE the wheels landed: over the column they scroll it, over the map
+# they zoom it, over the chrome they do neither. The tally by place is
+# the diagnosis, and it costs one more grep.
+for place in wheel-column wheel-map wheel-chrome; do
+  n=$(grep -c "TFG_INPUT $place" /tmp/gpui_run.log 2>/dev/null || true)
+  n=${n:-0}
+  [ "$n" -gt 0 ] && echo "  $n $place"
+done
+grep 'TFG_INPUT wheel' /tmp/gpui_run.log 2>/dev/null | tail -3 | sed 's/^/  last: /' || true
+if [ "$WHEELS" -gt 0 ] || [ "$CLICKS" -gt 0 ]; then
+  echo "TAINTED: the operator touched the console while this capture ran." >&2
+  echo "The picture is a real state of the console, but not the state the" >&2
+  echo "capture was seeded for. Re-run it with the mouse away from the app." >&2
+fi
+
+# The pointer's place is the other half of the same question: hover states
+# and the owned edge follow it, and it is not a gesture, so the console
+# cannot report it. The compositor knows where it is.
+CURSOR=$(timeout "$T" hyprctl cursorpos 2>/dev/null | tr -d ' ' || true)
+if [ -n "$CURSOR" ]; then
+  CX=${CURSOR%%,*}; CY=${CURSOR##*,}
+  case "$CX" in ''|*[!0-9-]*) CX="" ;; esac
+  case "$CY" in ''|*[!0-9-]*) CY="" ;; esac
+  if [ -n "$CX" ] && [ -n "$CY" ]; then
+    if [ "$CX" -ge "$X" ] && [ "$CX" -lt $((X+W)) ] && [ "$CY" -ge "$Y" ] && [ "$CY" -lt $((Y+H)) ]; then
+      echo "pointer: ($CX,$CY) — OVER the app window, so hover states are live"
+    else
+      echo "pointer: ($CX,$CY) — outside the app window"
+    fi
+  fi
+fi

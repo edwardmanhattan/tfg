@@ -321,21 +321,44 @@ pub const TITLE_TRACKING: f32 = 1.8;
 // is one where the type is small enough to hold a column of quantities and
 // clear enough to read across a room in glare.
 //
-// Two faces, two jobs, no third. Everything a human wrote is Saira Condensed.
-// Everything a machine produced is PT Mono. `tnum` on the figure styles is
-// what stops a count reflowing the row around it as the number changes —
-// see `TABULAR` below.
+// Two TEXT faces, two jobs, no third. Everything a human wrote is Saira
+// Condensed. Everything a machine produced is PT Mono. `tnum` on the figure
+// styles is what stops a count reflowing the row around it as the number
+// changes — see `TABULAR` below.
+//
+// And ONE mark face, used once. The wordmark is not body text: it is a
+// name, and a name wants letterforms with more character than a label
+// carries. It is a third face on the console, and it is spent on six
+// letters.
 // ---------------------------------------------------------------------------
 
 /// The human face: labels, body, and every quantity a human reads.
 pub const FACE_HUMAN: &str = "Saira Condensed";
 /// The machine face: ids, timestamps, wire values, the log.
 pub const FACE_MACHINE: &str = "PT Mono";
+/// The mark face: the wordmark, and nothing else.
+///
+/// Cinzel — a Roman-capital inscriptional serif, the letterforms of an
+/// engraved plate. A console that names itself in a label face names itself
+/// like a form field; this one names itself like a ship.
+pub const FACE_MARK: &str = "Cinzel";
 
 /// A tracked-caps label: a panel's title, a field's key, a section marker.
 /// Small and tracked, because a label that is the same size as the body is
 /// not a label, it is a second body.
 pub const LABEL_PT: f32 = 10.0;
+/// The dense tier: a small body line in a narrow column.
+///
+/// The side zone is 320pt wide by default, and a row has to hold a call
+/// sign, a name, a role and a state. At `BODY_PT` those four do not fit and
+/// the console has no 480pt column to grow into, so a dense surface needs
+/// one smaller tier — a hint, a field value, a plan line.
+///
+/// It is one point under `BODY_PT` and one point over `LABEL_PT`: a ladder,
+/// not a spread. It exists so that a panel cannot invent a tenth size of
+/// its own, which is what the console did — 14 sizes across one app, nine of
+/// them named by no one.
+pub const DENSE_PT: f32 = 11.0;
 /// Body text in a converted panel.
 pub const BODY_PT: f32 = 13.0;
 /// A readout that sits inside a row of them.
@@ -348,6 +371,17 @@ pub const MACHINE_PT: f32 = 12.0;
 /// Tracking on a tracked-caps label, in px at `LABEL_PT`. 12% of the size,
 /// which is where caps stop reading as a word and start reading as a stamp.
 pub const LABEL_TRACKING: f32 = 1.2;
+
+/// The wordmark's size, and its tracking.
+///
+/// The mark is the one thing on this console allowed to be large: it is
+/// read once, at the door, and it is the only text a visitor sees before
+/// they have any reason to read anything else.
+pub const WORDMARK_PT: f32 = 22.0;
+/// Tracking on the wordmark, in px. A sixth of the size — the gap a
+/// stone-cutter leaves between letters, which is what makes an inscription
+/// read as an inscription rather than as a word.
+pub const WORDMARK_TRACKING: f32 = 3.4;
 /// Tracking on a machine row. A mono face is already even; a third of a pixel
 /// is enough to keep a long id from looking cramped.
 pub const ROW_TRACKING: f32 = 0.3;
@@ -390,26 +424,14 @@ pub fn readout_size(leads_panel: bool) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Text sizes
+// The Settings scale
 //
-// Mirrored from `tokens.rs` (`TEXT_*_PT`), plain f32s so both shells read
-// the same numbers. The rationale lives there and is not repeated here;
-// the short version: these are the BASE the app lays out in (read across
-// a room, in glare), the Settings scale multiplies on top, and the five
-// move together as one proportion. Body == button on purpose. The island
-// title band is absent on purpose (set against `TITLE_H`, not free text).
+// The one multiplier the operator's own settings row carries. Everything
+// else in the type scale is absolute: the sizes above are what the console
+// draws at, and this multiplies them together as one proportion so that
+// "Larger" moves the whole instrument rather than one row of it.
 // ---------------------------------------------------------------------------
 
-/// Hints and asides.
-pub const TEXT_SMALL_PT: f32 = 10.5;
-/// What plain body text draws in.
-pub const TEXT_BODY_PT: f32 = 15.0;
-/// Equal to `TEXT_BODY_PT` on purpose: a button is a pressable label.
-pub const TEXT_BUTTON_PT: f32 = 15.0;
-/// Modal and section headings.
-pub const TEXT_HEADING_PT: f32 = 21.0;
-/// Readouts and code, in the monospace family.
-pub const TEXT_MONO_PT: f32 = 15.0;
 /// The Settings row's "Larger" step, which is also what the app boots at.
 pub const TEXT_SCALE_LARGER: f32 = 1.15;
 
@@ -455,12 +477,35 @@ pub const ZONE_W: f32 = 320.0;
 pub const ZONE_MIN_W: f32 = 240.0;
 pub const ZONE_MAX_W: f32 = 600.0;
 pub const ZONE_GRIP_W: f32 = 10.0;
-/// The gap between the zone's outer edge and the window edge.
-pub const ZONE_EDGE_GAP: f32 = 24.0;
+/// The top band's own height, and the column's ceiling under it.
+///
+/// The band is full-width and flush to the window's top, so the column
+/// starts where the band ends and the two are one piece of chrome.
+pub const TOP_BAND_H: f32 = 34.0;
 /// The gap between stacked islands in the column.
-pub const ZONE_ISLAND_GAP: f32 = 2.0;
-/// How far below the top band the column starts.
-pub const ZONE_TOP_GAP: f32 = 56.0;
+///
+/// ZERO, and that is a decision rather than a rounding. The column is one
+/// surface with fields in it, so the fields touch and share a rule — the
+/// way a rack of instruments shares a rail. The 2pt this used to carry
+/// put the MAP between two fields of the same panel, and a map-coloured
+/// hairline 2pt under a field is not a divider, it is a mistake: the
+/// column stopped reading as one thing and became a stack of cards that
+/// happened to be near each other.
+///
+/// The token layer's own note on `PANEL_GAP` argued the other way — that
+/// flat panels 2px apart read as ONE panel with a seam in it — and it was
+/// right about the SEAM and wrong about the fix. The seam was not the
+/// gap; the seam was two 1px edges with map between them. Close the gap
+/// and the two edges become ONE shared rule, and the column is joined.
+pub const ZONE_ISLAND_GAP: f32 = 0.0;
+/// How far below the window's top the column starts: under the top band.
+///
+/// It used to clear the band AND the step-reminder strip that rides below
+/// it, and so the column left a 22pt band of map under the band in every
+/// phase — including the three phases with no strip to put there. A
+/// sidebar with a stripe of map above it is a card on a map; a sidebar
+/// that starts under the band is chrome.
+pub const ZONE_TOP_GAP: f32 = TOP_BAND_H;
 /// The Inspector image preview's width range and height cap: a tall source
 /// must not consume the whole island, and the requested width yields to the
 /// panel actually available.
@@ -761,14 +806,21 @@ pub fn clamp_zone_width(w: f32, viewport_w: f32) -> f32 {
     w.clamp(ZONE_MIN_W, ZONE_MAX_W).min(viewport_w * 0.8)
 }
 
-/// The band the column lives in: below the top band, full height to the
-/// bottom edge gap.
+/// The band the column lives in: under the top band, down to the window's
+/// bottom edge, and against the edge it is docked to.
+///
+/// A FULL-HEIGHT sidebar. It is chrome, so it is flush the way the top
+/// band is flush: it starts under the band and it runs to the window's
+/// edge, with no margin of map showing under it. The margin it used to
+/// keep was the console's old floating-card furniture, and a column that
+/// stops 24pt short of the window's bottom is a card that happens to be
+/// tall.
 pub fn zone_band(viewport: Box, zone_w: f32) -> Box {
     (
-        viewport.2 - zone_w - ZONE_EDGE_GAP,
+        viewport.2 - zone_w,
         viewport.1 + ZONE_TOP_GAP,
-        viewport.2 - ZONE_EDGE_GAP,
-        viewport.3 - ZONE_EDGE_GAP,
+        viewport.2,
+        viewport.3,
     )
 }
 
@@ -1066,7 +1118,7 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
         // named: `z.groups`, the task organisation, which is the console's
         // own local scratch authoring and has no read route at all.
         crate::gamestate::GameState::Planning => {
-            out.push(slot(IslandKey::Essentials, 380.0));
+            out.push(slot(IslandKey::Essentials, 470.0));
             // 210, not the console's 182: the hold joined the pace here —
             // SCENARIO CLOCK plus its pill cost ~30pt — and at 182 the pill
             // painted half below the island's own box, the silent-clip
@@ -1075,7 +1127,7 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
             // and reports no scroll honestly.
             out.push(slot(IslandKey::Control, 210.0));
             out.push(slot(IslandKey::Fleet, 320.0));
-            out.push(slot(IslandKey::Players, 280.0));
+            out.push(slot(IslandKey::Players, 300.0));
             out.push(slot(IslandKey::Groups, 280.0));
             out.push(slot(IslandKey::Review, 380.0));
         }
@@ -1096,7 +1148,7 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
         // described a column that was never built.)
         crate::gamestate::GameState::Preparation => {
             out.push(slot(IslandKey::Command, 360.0));
-            out.push(slot(IslandKey::Crew, 280.0));
+            out.push(slot(IslandKey::Crew, 330.0));
         }
         // Execution is the state the console spends its life in, so the
         // column is a working surface rather than a summary: what you can
@@ -1142,7 +1194,11 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
         crate::gamestate::GameState::Closure => {
             out.push(slot(IslandKey::Assessment, 420.0));
             out.push(slot(IslandKey::Log, 260.0));
-            out.push(slot(IslandKey::Crew, 240.0));
+            // The crew list is the same list the Preparation phase carries,
+            // and it is the same size: five people, a section, a hint and
+            // five rows. At 240 the last row was cut by the panel's own
+            // edge, and a row cut in half is a row nobody can read.
+            out.push(slot(IslandKey::Crew, 330.0));
         }
     }
     out
@@ -1551,10 +1607,10 @@ pub const AUTH_FIELD_H: f32 = 30.0;
 pub fn zone_band_at(viewport: Box, zone_w: f32, left: bool) -> Box {
     if left {
         (
-            viewport.0 + ZONE_EDGE_GAP,
+            viewport.0,
             viewport.1 + ZONE_TOP_GAP,
-            viewport.0 + ZONE_EDGE_GAP + zone_w,
-            viewport.3 - ZONE_EDGE_GAP,
+            viewport.0 + zone_w,
+            viewport.3,
         )
     } else {
         zone_band(viewport, zone_w)
@@ -1854,6 +1910,11 @@ mod tests {
     /// own arithmetic, over-measuring by one gap on purpose (see
     /// `zone_stack_height`). Pinned so a "fix" to the off-by-one does not
     /// land silently and strand a row below the band.
+    ///
+    /// The gap is ZERO now: the column is one surface and its fields share
+    /// their rules, so there is nothing between them to measure. The
+    /// arithmetic is kept, because a gap that is zero today may not be one
+    /// tomorrow, and the ceiling must follow the column's own shape.
     #[test]
     fn the_stack_height_counts_a_gap_per_island() {
         let slots = zone_islands(GameState::Planning, false);
@@ -1862,11 +1923,11 @@ mod tests {
             zone_stack_height(&slots),
             sum + ZONE_ISLAND_GAP * slots.len() as f32
         );
-        // Six islands: the console's planning heights plus six gaps, with
-        // Control at 210 for the hold (see the Planning arm).
+        // Seven islands: the console's planning heights, and — because the
+        // fields are joined — no gaps between them.
         assert_eq!(
             zone_stack_height(&slots),
-            172.0 + 380.0 + 210.0 + 320.0 + 280.0 + 280.0 + 380.0 + 14.0
+            172.0 + 470.0 + 210.0 + 320.0 + 300.0 + 280.0 + 380.0
         );
     }
 
@@ -1900,9 +1961,9 @@ mod tests {
         let slots = zone_islands(GameState::Planning, false);
         assert_eq!(
             zone_stack_height(&slots),
-            172.0 + 380.0 + 210.0 + 320.0 + 280.0 + 280.0 + 380.0 + 14.0
+            172.0 + 470.0 + 210.0 + 320.0 + 300.0 + 280.0 + 380.0
         );
-        assert_eq!(zone_overflow(zone_stack_height(&slots), band), 1496.0);
+        assert_eq!(zone_overflow(zone_stack_height(&slots), band), 1592.0);
         // A short stack in a tall band scrolls not at all.
         assert_eq!(zone_overflow(100.0, band), 0.0);
     }
@@ -1923,11 +1984,17 @@ mod tests {
         // after that module goes with the egui console (U8 prep A). A drift
         // here is a silent two-size UI, so it stays pinned either way.
         // (Only the f32s are read; no egui type crosses the seam.)
-        assert_eq!(TEXT_SMALL_PT, 10.5);
-        assert_eq!(TEXT_BODY_PT, 15.0);
-        assert_eq!(TEXT_BUTTON_PT, 15.0);
-        assert_eq!(TEXT_HEADING_PT, 21.0);
-        assert_eq!(TEXT_MONO_PT, 15.0);
+        //
+        // The instrument scale is pinned here too, and the ladder is the
+        // point: LABEL, DENSE, MACHINE, BODY, then the two readouts. A
+        // console that drew at fourteen unnamed sizes was a console nobody
+        // could keep consistent, and this is the test that says so.
+        assert_eq!(LABEL_PT, 10.0);
+        assert_eq!(DENSE_PT, 11.0);
+        assert_eq!(MACHINE_PT, 12.0);
+        assert_eq!(BODY_PT, 13.0);
+        assert_eq!(READOUT_SM_PT, 18.0);
+        assert_eq!(READOUT_LG_PT, 30.0);
         assert_eq!(TEXT_SCALE_LARGER, 1.15);
         assert_eq!(CONTROL_RADIUS, 6.0);
         assert_eq!(BUTTON_PADDING.0, 12.0);
@@ -2116,10 +2183,16 @@ mod tests {
     }
 
     #[test]
-    fn two_faces_do_two_jobs_and_there_is_no_third() {
+    fn two_text_faces_do_two_jobs_and_the_mark_has_a_third() {
         assert_eq!(FACE_HUMAN, "Saira Condensed");
         assert_eq!(FACE_MACHINE, "PT Mono");
         assert_ne!(FACE_HUMAN, FACE_MACHINE);
+        // The mark face is a third face, and it is spent on the wordmark
+        // alone. It must not be the same face as either text face, or the
+        // third face is not a third face at all.
+        assert_eq!(FACE_MARK, "Cinzel");
+        assert_ne!(FACE_MARK, FACE_HUMAN);
+        assert_ne!(FACE_MARK, FACE_MACHINE);
     }
 
     #[test]
@@ -2335,7 +2408,7 @@ mod tests {
     fn the_band_sits_below_the_top_band() {
         let band = zone_band((0.0, 0.0, 1920.0, 1080.0), 320.0);
         assert_eq!(band.1, ZONE_TOP_GAP);
-        assert_eq!(band.3, 1080.0 - ZONE_EDGE_GAP);
+        assert_eq!(band.3, 1080.0, "the column runs to the window's bottom edge");
         assert!((box_w(band) - 320.0).abs() < 0.001);
     }
 }

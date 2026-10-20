@@ -52,16 +52,15 @@ fn main() {
     // handoff, which is the whole point of the seam.
     let (req_tx, resp_rx, _handle) = tfg::shell_threads::spawn_map_thread(
         tfg::shell_threads::MapConfig {
-            center: tfg::map_render::MAP_CENTER,
-            zoom: tfg::map_render::MAP_ZOOM,
-            width: tfg::map_render::MAP_W as u32,
-            height: tfg::map_render::MAP_H as u32,
-            style: tfg::map_render::MAP_STYLE.to_string(),
+            center: tfg::map_geometry::MAP_CENTER,
+            zoom: tfg::map_geometry::MAP_ZOOM,
+            width: tfg::map_geometry::MAP_W as u32,
+            height: tfg::map_geometry::MAP_H as u32,
+            style: tfg::map_geometry::MAP_STYLE.to_string(),
             cache,
-            jump_pump: tfg::map_render::JUMP_PUMP,
+            jump_pump: tfg::map_geometry::JUMP_PUMP,
         },
     );
-    let mut warmups: u64 = 0;
 
     // U8 step 4's first panel: the roster sheet's rows are the real hull
     // register. Credentials from the environment, never from the source —
@@ -134,7 +133,7 @@ fn main() {
         };
         // The camera's opening zoom comes from the MAP's own constant, not the
         // shell's: the shell shows what it asked for, and this is the ask.
-        s.zoom = tfg::map_render::MAP_ZOOM;
+        s.zoom = tfg::map_geometry::MAP_ZOOM;
         // No token means no session was ever established — the shell shows the
         // sign-in card rather than the console, which is the honest state and
         // the one a shipped build starts in.
@@ -208,6 +207,36 @@ fn main() {
             .collect();
         (resolver, affiliations, tax)
     });
+
+    // The register's read of every hull's place in the taxonomy, by unit id.
+    //
+    // The embark rule asks what KIND of hull a child is — a host carries
+    // "four helicopters", and a frigate is not one — and the answer is the
+    // store's. It is resolved HERE, once, because the store does not move
+    // under us and the order loop cannot hold a sqlite connection: the
+    // console read it on the spot, this reads it at boot and hands the
+    // answer over.
+    let taxonomies: std::collections::BTreeMap<i64, tfg::embark::HullTaxonomy> = store
+        .as_ref()
+        .map(|conn| {
+            tfg::store::fleet_units(conn)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|u| {
+                    u.id.parse::<i64>().ok().map(|id| {
+                        (
+                            id,
+                            tfg::embark::HullTaxonomy {
+                                class_id: u.class_id,
+                                type_id: u.type_id,
+                                category_id: u.category_id,
+                            },
+                        )
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     // The poll thread and the live wire (U8 step 4). The registry is the
     // console's own: the poll thread only produces fixes, and staleness is
@@ -307,16 +336,34 @@ fn main() {
         mpsc::channel::<Result<tfg::backend::GameClock, tfg::shell_gpui::ClockError>>();
     let (embarked_tx, embarked_rx) =
         mpsc::channel::<Result<(i64, Vec<tfg::backend::EmbarkedUnit>), String>>();
+    // One hull's published FIGURES, read when the details panel points at
+    // it. Its own channel, because the answer is a read with no error
+    // shape of its own: a hull with no published specification is not a
+    // failure, it is a hull the register has not measured.
+    let (spec_tx, spec_rx) = mpsc::channel::<tfg::shell_gpui::SpecAnswer>();
     let (embark_write_tx, embark_write_rx) = mpsc::channel::<
         Result<(i64, tfg::backend::EmbarkationResult), String>,
     >();
+    // A host's REAL SPEC — the complements it declares and the hulls it
+    // holds — for the embark rule. Its own channel, because it is a READ
+    // with a different answer shape from the embarked read: this one carries
+    // the caps and the register's taxonomy as well as the passengers.
+    let (embark_spec_tx, embark_spec_rx) =
+        mpsc::channel::<Result<tfg::embark::EmbarkSpec, String>>();
     // The camera, SHARED with the frame and fix feeds: the map thread renders
     // at it and the fix feed projects at it, so a zoom or a pan moves the
     // picture and the markers together instead of decoupling them.
+    //
+    // The frame's SIZE rides with it, because the frame's pixels are the
+    // space the camera is expressed in: a drop's fractions are unprojected
+    // against a viewport of that size, and a viewport of the wrong size
+    // puts a hull in the wrong water.
     let camera = std::sync::Arc::new(std::sync::Mutex::new((
-        tfg::map_render::MAP_CENTER.0,
-        tfg::map_render::MAP_CENTER.1,
-        tfg::map_render::MAP_ZOOM,
+        tfg::map_geometry::MAP_CENTER.0,
+        tfg::map_geometry::MAP_CENTER.1,
+        tfg::map_geometry::MAP_ZOOM,
+        tfg::map_geometry::MAP_W as u32,
+        tfg::map_geometry::MAP_H as u32,
     )));
     // Hull photographs ride their own channel: the send end is cloned
     // into the order loop (every card sign-in fetches on the new token)
@@ -418,80 +465,39 @@ fn main() {
                             return;
                         }
                     }
-                    tfg::shell_gpui::ToBinary::Zoom(z) => {
-                        let mut at = tfg::map_render::MAP_CENTER;
+                    tfg::shell_gpui::ToBinary::Camera {
+                        center,
+                        zoom,
+                        size,
+                        render,
+                    } => {
+                        // The camera, as the operator has it. The shell owns
+                        // it — a gesture moves it locally and the picture is
+                        // placed by it — and the binary keeps it so that its
+                        // own arithmetic is at the camera the operator is
+                        // looking at: the drop's unprojection is the one
+                        // that has to be exact.
                         if let Ok(mut cam) = camera2.lock() {
-                            cam.2 = z;
-                            at = (cam.0, cam.1);
+                            *cam = (center.0, center.1, zoom, size.0, size.1);
                         }
-                        seq += 1;
-                        let _ = req_tx2.send((
-                            seq,
-                            at,
-                            z,
-                            (
-                                tfg::map_render::MAP_W as u32,
-                                tfg::map_render::MAP_H as u32,
-                            ),
-                            // A zoom step is an ordinary gesture: spend
-                            // GESTURE_PUMP, not the jump budget. The view
-                            // updates at motion speed and the tiles catch
-                            // up on the following frames.
-                            tfg::map_render::GESTURE_PUMP,
-                        ));
-                    }
-                    tfg::shell_gpui::ToBinary::Jump { lat, lon, shift_px } => {
-                        // The console's `request_frame`, without the glide:
-                        // the shell named the GROUND and the chrome's shift,
-                        // and the visible centre is unprojected here because
-                        // only this side has the mercator. A centred hull
-                        // lands on the visible middle, not under the zone.
-                        let (mw, mh) = (tfg::map_render::MAP_W, tfg::map_render::MAP_H);
-                        let zoom = camera2.lock().map(|c| c.2).unwrap_or(tfg::map_render::MAP_ZOOM);
-                        let goal = jump_goal(lat, lon, shift_px, zoom, mw, mh);
-                        if let Ok(mut cam) = camera2.lock() {
-                            *cam = (goal.0, goal.1, zoom);
+                        if !render {
+                            continue;
                         }
-                        eprintln!("centering on {lat:.4}, {lon:.4} (shift {shift_px}px)");
+                        // A picture, at the map thread's pace: the shell
+                        // throttles these, and a frame the map thread cannot
+                        // draw in a quarter of a second is a frame nobody
+                        // sees.
                         seq += 1;
                         let _ = req_tx2.send((
                             seq,
-                            goal,
+                            center,
                             zoom,
-                            (mw as u32, mh as u32),
-                            tfg::map_render::JUMP_PUMP,
-                        ));
-                    }
-                    tfg::shell_gpui::ToBinary::Pan { dx, dy } => {
-                        // The drag pointed at a map pixel; that pixel becomes
-                        // the new centre, unprojected. The SIGN lives here and
-                        // not in the shell: dragging the picture right asks
-                        // for the ground under the cursor to stay put, which
-                        // moves the centre LEFT, and the unprojection is the
-                        // binary's to do because the shell has no mercator.
-                        let (mw, mh) = (tfg::map_render::MAP_W, tfg::map_render::MAP_H);
-                        let moved = camera2.lock().ok().map(|cam| {
-                            tfg::map_render::pan_center((cam.0, cam.1), cam.2, dx, dy, mw, mh)
-                        });
-                        let Some((lat, lon)) = moved else {
-                            continue;
-                        };
-                        let zoom = if let Ok(mut cam) = camera2.lock() {
-                            *cam = (lat, lon, cam.2);
-                            cam.2
-                        } else {
-                            continue;
-                        };
-                        seq += 1;
-                        let _ = req_tx2.send((
-                            seq,
-                            (lat, lon),
-                            zoom,
-                            (mw as u32, mh as u32),
-                            // A drag step is an ordinary gesture: spend
-                            // GESTURE_PUMP, not the jump budget, for the
-                            // same motion-speed reason as the zoom step.
-                            tfg::map_render::GESTURE_PUMP,
+                            size,
+                            // A gesture step: spend GESTURE_PUMP, not the
+                            // jump budget. The view updates at motion speed
+                            // and the tiles catch up on the following
+                            // frames.
+                            tfg::map_geometry::GESTURE_PUMP,
                         ));
                     }
                     tfg::shell_gpui::ToBinary::DeployUnit { unit_id, fx, fy } => {
@@ -510,18 +516,28 @@ fn main() {
                             Err("that drop point is nowhere".to_string())
                         } else {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
-                                return;
+                                // The order loop answers ONE order and then
+                                // waits for the next: returning here would
+                                // drop every later order on the floor, and a
+                                // console that stops listening looks exactly
+                                // like a console that has nothing to say.
+                                let outcome = Err("could not reach the server".to_string());
+                                if embark_spec_tx.send(outcome).is_err() {
+                                    return;
+                                }
+                                continue;
                             };
-                            let (mw, mh) = (tfg::map_render::MAP_W, tfg::map_render::MAP_H);
-                            let (clat, clon, zoom) = camera2
+                            let (clat, clon, zoom, mw, mh) = camera2
                                 .lock()
-                                .map(|c| (c.0, c.1, c.2))
+                                .map(|c| (c.0, c.1, c.2, c.3 as f64, c.4 as f64))
                                 .unwrap_or((
-                                    tfg::map_render::MAP_CENTER.0,
-                                    tfg::map_render::MAP_CENTER.1,
-                                    tfg::map_render::MAP_ZOOM,
+                                    tfg::map_geometry::MAP_CENTER.0,
+                                    tfg::map_geometry::MAP_CENTER.1,
+                                    tfg::map_geometry::MAP_ZOOM,
+                                    tfg::map_geometry::MAP_W,
+                                    tfg::map_geometry::MAP_H,
                                 ));
-                            let (lat, lon) = tfg::map_render::unproject_mercator(
+                            let (lat, lon) = tfg::map_geometry::unproject_mercator(
                                 fx.clamp(0.0, 1.0) * mw,
                                 fy.clamp(0.0, 1.0) * mh,
                                 (clat, clon),
@@ -575,16 +591,17 @@ fn main() {
                             match master.assign_unit(&token2, game_id, unit_id, commander_id) {
                                 Err(e) => Err(format!("not assigned: {e}")),
                                 Ok(_) => {
-                                    let (mw, mh) = (tfg::map_render::MAP_W, tfg::map_render::MAP_H);
-                                    let (clat, clon, zoom) = camera2
+                                    let (clat, clon, zoom, mw, mh) = camera2
                                         .lock()
-                                        .map(|c| (c.0, c.1, c.2))
+                                        .map(|c| (c.0, c.1, c.2, c.3 as f64, c.4 as f64))
                                         .unwrap_or((
-                                            tfg::map_render::MAP_CENTER.0,
-                                            tfg::map_render::MAP_CENTER.1,
-                                            tfg::map_render::MAP_ZOOM,
+                                            tfg::map_geometry::MAP_CENTER.0,
+                                            tfg::map_geometry::MAP_CENTER.1,
+                                            tfg::map_geometry::MAP_ZOOM,
+                                            tfg::map_geometry::MAP_W,
+                                            tfg::map_geometry::MAP_H,
                                         ));
-                                    let (lat, lon) = tfg::map_render::unproject_mercator(
+                                    let (lat, lon) = tfg::map_geometry::unproject_mercator(
                                         fx.clamp(0.0, 1.0) * mw,
                                         fy.clamp(0.0, 1.0) * mh,
                                         (clat, clon),
@@ -722,7 +739,7 @@ fn main() {
                             match fetch_session(&host2, &token2, Some(hold)) {
                                 Some(mut s) => {
                                     s.signed_in = true;
-                                    s.zoom = tfg::map_render::MAP_ZOOM;
+                                    s.zoom = tfg::map_geometry::MAP_ZOOM;
                                     game_id = s.game_id;
                                     state2 = s.state.clone();
                                     // The watches follow the held game, and
@@ -771,7 +788,7 @@ fn main() {
                                             s.zoom = camera2
                                                 .lock()
                                                 .map(|c| c.2)
-                                                .unwrap_or(tfg::map_render::MAP_ZOOM);
+                                                .unwrap_or(tfg::map_geometry::MAP_ZOOM);
                                             game_id = s.game_id;
                                             state2 = s.state.clone();
                                             sync_session(
@@ -1330,6 +1347,138 @@ fn main() {
                             return;
                         }
                     }
+                    tfg::shell_gpui::ToBinary::ReadSpec { unit } => {
+                        // One hull's published figures, as the server holds
+                        // them NOW.
+                        //
+                        // The store's mirror of these is filled at boot, so
+                        // a launch with credentials on the command line
+                        // already knows them; a console that signed in
+                        // through its own card does not, and the panel
+                        // would read a dash for every figure until the
+                        // next launch. So the server is asked, and its
+                        // answer wins.
+                        //
+                        // A hull with no published specification is NOT an
+                        // error: the register has not measured it, and the
+                        // panel says so with a dash.
+                        //
+                        // The read happens OFF this loop. This loop answers
+                        // the operator's ORDERS — a helm order, a sign-in —
+                        // and a click that queued an HTTP round trip in
+                        // front of them would make the chart feel broken
+                        // for the length of the request.
+                        let host = host2.clone();
+                        let token = token2.clone();
+                        let tx = spec_tx.clone();
+                        std::thread::spawn(move || {
+                            if token.is_empty() {
+                                return;
+                            }
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host) else {
+                                eprintln!("spec for hull {unit}: no server");
+                                return;
+                            };
+                            match master.hull_spec(&token, unit) {
+                                Ok(spec) => {
+                                    eprintln!("spec for hull {unit}: published");
+                                    let _ = tx.send(tfg::shell_gpui::SpecAnswer {
+                                        unit,
+                                        figures: tfg::shell_gpui::UnitFigures::from(spec),
+                                    });
+                                }
+                                Err(e) => {
+                                    eprintln!("spec for hull {unit} not published ({e})");
+                                }
+                            }
+                        });
+                    }
+                    tfg::shell_gpui::ToBinary::ReadEmbarkSpec { host } => {
+                        // One host's REAL SPEC, for the embark rule: the
+                        // complements it declares and the hulls it holds.
+                        // The console read these as two calls and decided
+                        // the drop between them; here they are one read, and
+                        // the shell decides the drop when the answer lands.
+                        //
+                        // What KIND of hull the child is is NOT read here:
+                        // that is the register's, and the binary owns the
+                        // store — so the taxonomy rides with the shell from
+                        // startup instead.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to embark".to_string())
+                        } else if game_id == 0 {
+                            Err("no held game \u{2014} there is no exercise to embark in".to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                // The order loop answers ONE order and then
+                                // waits for the next: returning here would
+                                // drop every later order on the floor, and a
+                                // console that stops listening looks exactly
+                                // like a console that has nothing to say.
+                                let outcome = Err("could not reach the server".to_string());
+                                if embark_spec_tx.send(outcome).is_err() {
+                                    return;
+                                }
+                                continue;
+                            };
+                            // The complements the host declares. A hull that
+                            // declares none carries nothing, and a collection
+                            // with no rows is a 404 on this server — so a 404
+                            // is read as the truth it is: no complements.
+                            let caps = match master.unit_capacities(&token2, host) {
+                                Ok(caps) => caps,
+                                Err(tfg::backend::BackendError::Api { status: 404, .. }) => {
+                                    eprintln!("embark spec for {host}: no complements declared");
+                                    Vec::new()
+                                }
+                                Err(e) => {
+                                    let outcome =
+                                        Err(format!("could not read what {host} carries: {e}"));
+                                    if embark_spec_tx.send(outcome).is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            };
+                            // The hulls already in the host, in the
+                            // exercise's own composition.
+                            let aboard = match master.game_embarkations(&token2, game_id, host) {
+                                Ok(aboard) => aboard,
+                                // A host the exercise does not hold has no
+                                // composition to read — and an empty one is the
+                                // truth: it holds nobody. This is the locally
+                                // staged host, the hull the operator has
+                                // dropped but not yet written through.
+                                // Anything else is a failure, and a failure
+                                // is a refusal.
+                                Err(tfg::backend::BackendError::Api { status: 404, .. }) => {
+                                    eprintln!("embark spec for {host}: no composition yet");
+                                    Vec::new()
+                                }
+                                Err(e) => {
+                                    let outcome =
+                                        Err(format!("could not read who is aboard {host}: {e}"));
+                                    if embark_spec_tx.send(outcome).is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            };
+                            eprintln!(
+                                "embark spec for {host}: {} complement(s), {} aboard",
+                                caps.len(),
+                                aboard.len()
+                            );
+                            Ok(tfg::embark::EmbarkSpec {
+                                host,
+                                caps,
+                                aboard,
+                            })
+                        };
+                        if embark_spec_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
                     tfg::shell_gpui::ToBinary::UnembarkUnit { host, unit } => {
                         // The console's `unembark`, as a message: one piece
                         // out of its host, and the host's remaining contents
@@ -1354,11 +1503,12 @@ fn main() {
                         }
                     }
                     tfg::shell_gpui::ToBinary::EmbarkDrop { host, child } => {
-                        // The picker's drop onto a placed host: one hull
-                        // aboard another, through `game_attach_units`. The
-                        // console's `try_embark_drop`, as a message, without
-                        // its capacity pre-checks — the server evaluates and
-                        // the answer carries what it said.
+                        // The attach itself, in the exercise's own
+                        // composition. The console's `try_embark_drop` as a
+                        // message — but the pre-checks it did are the
+                        // SHELL's now: the drop was decided against the
+                        // host's real spec before this was ever sent, and
+                        // the server's verdict still lands on the line.
                         let outcome = if token2.is_empty() {
                             Err("signed out \u{2014} sign in to embark".to_string())
                         } else if game_id == 0 {
@@ -1856,11 +2006,14 @@ fn main() {
         std::boxed::Box::new(move || clock_rx.try_recv().ok());
     let embarked_feed: tfg::shell_gpui::EmbarkedFeed =
         std::boxed::Box::new(move || embarked_rx.try_recv().ok());
+    let spec_feed: tfg::shell_gpui::SpecFeed =
+        std::boxed::Box::new(move || spec_rx.try_recv().ok());
     let embark_write_feed: tfg::shell_gpui::EmbarkWriteFeed =
         std::boxed::Box::new(move || embark_write_rx.try_recv().ok());
+    let embark_spec_feed: tfg::shell_gpui::EmbarkSpecFeed =
+        std::boxed::Box::new(move || embark_spec_rx.try_recv().ok());
     // One clone per feed: both closures are `move`, and each needs the camera
     // it renders or projects at.
-    let camera_frame = camera.clone();
     let camera_fix = camera.clone();
     // The socket's own log cadence: one line every ten publications, so
     // the wire says what it is carrying without drowning the plot's line.
@@ -1873,6 +2026,21 @@ fn main() {
     let fleet_tax = store.as_ref().map(|conn| {
         build_fleet_taxonomy(conn, |id| resolve_symbol(id, &store_ctx, &classes))
     }).unwrap_or_default();
+
+    // The published figures per hull, read once off the same mirror: the
+    // details panel shows them when the operator points at a hull, and a
+    // panel that asked the server per frame would be a fan-out for a table
+    // that does not move. Empty when the store never synced — the panel
+    // says a dash for a figure it does not have.
+    let unit_specs: std::collections::BTreeMap<i64, tfg::shell_gpui::UnitFigures> = store
+        .as_ref()
+        .and_then(|conn| tfg::store::current_figures(conn).ok())
+        .map(|rows| {
+            rows.into_iter()
+                .map(|f| (f.unit_id, tfg::shell_gpui::UnitFigures::from(f)))
+                .collect()
+        })
+        .unwrap_or_default();
 
 
     // The photo channel lives as long as the shell: startup fetches when
@@ -1899,25 +2067,10 @@ fn main() {
                 tfg::map_gate::swizzle_rgba_to_bgra(&mut rgba);
                 newest = Some((no, w, h, rgba, at, zoom));
             }
-            // A WARM-UP BURST, not camera behaviour: this shell has no camera
-            // yet, so it asks on a timer until the tiles have had time to
-            // arrive. The console's per-gesture requests are the next step —
-            // same channel, same spawn.
-            warmups += 1;
-            if warmups <= WARMUP_FRAMES {
-                let (clat, clon, zoom) = camera_frame.lock().map(|c| *c).unwrap_or((
-                    tfg::map_render::MAP_CENTER.0,
-                    tfg::map_render::MAP_CENTER.1,
-                    tfg::map_render::MAP_ZOOM,
-                ));
-                let _ = req_tx.send((
-                    warmups,
-                    (clat, clon),
-                    zoom,
-                    (tfg::map_render::MAP_W as u32, tfg::map_render::MAP_H as u32),
-                    4,
-                ));
-            }
+            // The WARM-UP lives in the shell, which owns the camera and the
+            // size: the map thread is not asked for a frame before the
+            // shell has named both, because the size is part of the ask and
+            // the map thread REBUILDS its scene when the size changes.
             newest
         }),
         Box::new(move || {
@@ -1999,18 +2152,20 @@ fn main() {
                 registry.poll(fixes);
             }
             for view in registry.ships() {
-                let (clat, clon, zoom) = camera_fix.lock().map(|c| *c).unwrap_or((
-                    tfg::map_render::MAP_CENTER.0,
-                    tfg::map_render::MAP_CENTER.1,
-                    tfg::map_render::MAP_ZOOM,
+                let (clat, clon, zoom, mw, mh) = camera_fix.lock().map(|c| *c).unwrap_or((
+                    tfg::map_geometry::MAP_CENTER.0,
+                    tfg::map_geometry::MAP_CENTER.1,
+                    tfg::map_geometry::MAP_ZOOM,
+                    tfg::map_geometry::MAP_W as u32,
+                    tfg::map_geometry::MAP_H as u32,
                 ));
-                let (x, y) = tfg::map_render::project_mercator(
+                let (x, y) = tfg::map_geometry::project_mercator(
                     view.latest.position.latitude,
                     view.latest.position.longitude,
                     (clat, clon),
                     zoom,
-                    tfg::map_render::MAP_W,
-                    tfg::map_render::MAP_H,
+                    mw as f64,
+                    mh as f64,
                 );
                 let symbol = resolve_symbol(&view.ship_id, &store_ctx, &classes);
                 let affiliation = resolve_affiliation(&view.ship_id, &store_ctx);
@@ -2041,12 +2196,16 @@ fn main() {
         clock_feed,
         embarked_feed,
         embark_write_feed,
+        embark_spec_feed,
         thumb_feed,
+        spec_feed,
         order_tx,
         roster,
         roster_total,
         session,
         fleet_tax,
+        taxonomies,
+        unit_specs,
     );
 }
 
@@ -2090,16 +2249,6 @@ fn decode_picture(bytes: &[u8]) -> Option<image::DynamicImage> {
 /// which is exactly the half of the frame the shift exists to clear; that sign
 /// error made the Inspector's `Centre` and the Fleet row's focus door look like
 /// they did nothing at all, when both were centring the hull behind the column.
-fn jump_goal(lat: f64, lon: f64, shift_px: f32, zoom: f64, w: f64, h: f64) -> (f64, f64) {
-    tfg::map_render::unproject_mercator(
-        w / 2.0 - f64::from(shift_px),
-        h / 2.0,
-        (lat, lon),
-        zoom,
-        w,
-        h,
-    )
-}
 
 /// Hull photographs, fetched off-thread: the manifest says which hulls
 /// have pictures, one presigned URL per hull resolves the bytes, and each
@@ -2285,6 +2434,11 @@ fn roster_with_token(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::Ros
                 name: u.name,
                 hull: u.hull_number,
                 class: format!("{} · {}", u.class_name, u.category_name),
+                // The register names the type as well as the class, and the
+                // panel reads it: a console that could only read its own
+                // local taxonomy had no type for any hull whose store had
+                // never synced.
+                kind: u.type_name,
                 stale: false,
             })
             .collect(),
@@ -2602,6 +2756,7 @@ fn fetch_session(
             tfg::shell_gpui::PieceView {
                 id: u.unit_id,
                 label: format!("{} ({})", u.unit_name, u.hull_number),
+                class_name: u.class_name.clone(),
                 commander_id: u.commander_id,
                 commander_name: u.commander_name.clone(),
                 hierarchy_node: u.hierarchy_node,
@@ -3040,9 +3195,6 @@ fn flush_groups(
     Ok(())
 }
 
-/// How many extra frames to ask for after the first, so MapLibre's tiles have
-/// time to arrive before a capture. A stand-in for the camera.
-const WARMUP_FRAMES: u64 = 24;
 
 #[cfg(test)]
 mod picture_tests {
@@ -3116,34 +3268,6 @@ mod picture_tests {
     }
 }
 
-#[cfg(test)]
-mod camera_tests {
-    use super::*;
-
-    /// A jump puts the hull on the VISIBLE centre, not merely on the frame's.
-    ///
-    /// The shell's shift says how far the content moves to clear the floating
-    /// zone (positive = right for a left dock), so this is the one assertion
-    /// that can catch the sign: project the hull back through the goal and it
-    /// must land `shift` pixels to the right of the frame centre — the half of
-    /// the frame the zone is not covering.
-    #[test]
-    fn a_jump_puts_the_hull_on_the_visible_centre() {
-        let (lat, lon) = (-6.108, 106.9237);
-        let (w, h) = (800.0, 600.0);
-        let zoom = 14.0;
-        for shift in [180.0f32, -180.0, 0.0] {
-            let goal = jump_goal(lat, lon, shift, zoom, w, h);
-            let (x, y) = tfg::map_render::project_mercator(lat, lon, goal, zoom, w, h);
-            assert!(
-                (x - (w / 2.0 + f64::from(shift))).abs() < 1e-6,
-                "shift {shift}: the hull projects to {x}, wanted {}",
-                w / 2.0 + f64::from(shift)
-            );
-            assert!((y - h / 2.0).abs() < 1e-6, "shift {shift}: vertical centre");
-        }
-    }
-}
 
 #[cfg(test)]
 mod fleet_taxonomy_tests {
