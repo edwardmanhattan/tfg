@@ -29593,6 +29593,153 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing was sent");
     }
 
+    /// The scope is the VERB: pressing it sends the credentials, and the
+    /// plain SIGN IN slab is gone from the card.
+    ///
+    /// The card's whole grammar is one instrument and one verb, so the
+    /// scope has to be the thing that submits — and a card with no
+    /// pressable verb is a card that cannot be signed in on.
+    #[gpui::test]
+    fn the_scope_is_the_sign_in_verb(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            signed_in: false,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.login_identifier = "superuser".to_string();
+                demo.login_password = "secret".to_string();
+                // The verb is the scope: this is what the radar's click
+                // handler calls.
+                demo.submit_login(cx);
+            })
+        });
+        match rx.try_recv().expect("the credentials reached the sink") {
+            ToBinary::SignIn {
+                identifier,
+                password,
+            } => {
+                assert_eq!(identifier, "superuser");
+                assert_eq!(password, "secret");
+            }
+            other => panic!("expected a sign-in, got {other:?}"),
+        }
+    }
+
+    /// The scope's two channels say two different things.
+    ///
+    /// `lit` is the link being out, and `bright` is the door being armed.
+    /// They are separate because they are separate facts: a console that
+    /// spends one colour on two states spends the colour on neither, and an
+    /// operator who cannot tell "armed" from "waiting" cannot tell whether
+    /// the press will do anything.
+    #[test]
+    fn the_scope_says_armed_and_out_as_two_things() {
+        let tx = std::sync::mpsc::channel().0;
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            SessionView::default(),
+            tx,
+        );
+        // The TARGETS are the contract: where the scope is going. The
+        // level it is at this instant is the ease, and a test that read
+        // the ease would be testing the clock, not the statement.
+        let targets = |demo: &IslandDemo| {
+            demo.scope_anim
+                .as_ref()
+                .map(|a| (a.to_lit, a.to_bright))
+                .unwrap_or((demo.scope_lit, demo.scope_bright))
+        };
+
+        // Nothing typed: the door is not armed, and the link is not out.
+        demo.scope_ease_to();
+        assert_eq!(targets(&demo), (0.0, 0.0), "neither armed nor out");
+
+        // Both credentials: armed, and still not out.
+        demo.login_identifier = "superuser".to_string();
+        demo.login_password = "secret".to_string();
+        demo.scope_ease_to();
+        assert_eq!(
+            targets(&demo),
+            (0.0, 1.0),
+            "the door is armed, and the link is still down"
+        );
+
+        // The round trip is out: lit, and the armed state is unchanged.
+        demo.login_busy = true;
+        demo.scope_ease_to();
+        assert_eq!(
+            targets(&demo),
+            (1.0, 1.0),
+            "the link is out, and the door is still armed"
+        );
+
+        // The link comes down: the radar goes dark whatever the answer
+        // was, because a scope still lit after a refusal is lying about
+        // the state of the wire.
+        demo.login_busy = false;
+        demo.scope_ease_to();
+        assert_eq!(targets(&demo), (0.0, 1.0), "the link is down again");
+    }
+
+    /// The scope's change is a MOVEMENT, not a swap.
+    ///
+    /// A radar that jumps from grey to lit reads as a different picture
+    /// rather than as the same instrument changing state, and the operator
+    /// watching for the link to come up misses the moment it does.
+    #[test]
+    fn the_scope_eases_to_its_new_level() {
+        let tx = std::sync::mpsc::channel().0;
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            SessionView::default(),
+            tx,
+        );
+        demo.login_busy = true;
+        demo.scope_ease_to();
+        // The ease starts where the scope IS, so the first frame is the
+        // resting grey and the lit cyan is somewhere ahead of it.
+        let (lit, _) = demo.scope_levels();
+        assert!(lit < 1.0, "the scope has not arrived yet");
+        assert!(lit > 0.0, "but it has begun to move");
+    }
+
+    /// The caret belongs to the field that owns the keyboard, and to no
+    /// other field.
+    ///
+    /// The fields are hand-rolled — GPUI 0.2.2 ships no text field — so
+    /// the console draws the cursor too, and a cursor in a field nobody is
+    /// typing in is a lie about where the keyboard is.
+    #[gpui::test]
+    fn the_caret_follows_the_focused_field(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            signed_in: false,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let (focus, lit) = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                // The field takes the keyboard: the caret's clock starts.
+                demo.login_focus = Cred::Identifier;
+                demo.caret_restart(cx);
+                (demo.login_focus, demo.login_caret)
+            })
+        });
+        assert_eq!(focus, Cred::Identifier, "the identifier field has the keyboard");
+        assert!(lit, "the caret is lit the moment the field is taken");
+    }
+
     // -----------------------------------------------------------------------
     // The commander dashboard: the execution phase's own instrument.
     // -----------------------------------------------------------------------

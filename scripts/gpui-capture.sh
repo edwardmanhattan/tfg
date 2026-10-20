@@ -180,6 +180,56 @@ timeout "$T" grim -o eDP-1 /tmp/gpui_full.png
 timeout "$T" magick /tmp/gpui_full.png -crop "${PW}x${PH}+${PX}+${PY}" +repage "$OUT"
 echo "captured $OUT  ($(stat -c%s "$OUT") bytes)"
 
+# WHOSE CONSOLE IS THAT? The pixels are the compositor's, and the
+# compositor shows whatever is on TOP at this rect. Two agents running
+# this console at once put two windows at the same place, and a raise
+# only wins until the other agent's window is raised too.
+#
+# The console says which build it is, and the picture can be asked. The
+# sign-in card's wordmark is set in the MARK face, and that face is in
+# the binary and nowhere else — so the binary is asked what it has, and
+# the PICTURE is asked whether it shows the mark's letterforms (a
+# serif's ink at the wordmark's baseline), and if the two disagree the
+# picture is of somebody else's console and is REFUSED.
+#
+# A refused capture is a named error the operator can act on. A wrong
+# PNG is not: it looks like a real state, and the hunt goes looking for
+# a layout fault that is not there.
+#
+# The mark's own ink is `MAP_INK` (#E2E8F0). The wordmark sits at the
+# card's top-left, so a run of near-white pixels in the card's title
+# band is the wordmark — and the OTHER agent's card says `ARCONS` in a
+# condensed sans, which is a different shape but the same colour, so the
+# check is the SHAPE: a serif's vertical stems are thinner and its
+# letterforms are wider.
+#
+# The check that actually distinguishes them is the FONT: the mark face
+# is a third face, and it is in ONE build. So the capture reports which
+# build it photographed, and says so when the picture is not the build
+# that was launched.
+MARK_FACE="Cinzel"
+if [ -x ./target/debug/tfg ]; then
+    # `grep -q` exits at the first match, which SIGPIPEs `strings`, and
+    # `pipefail` then reports the PIPELINE as failed — so the check said
+    # "no mark face" on a binary that has one. The match is written to a
+    # file and read after, and the pipeline's own status is not consulted.
+    timeout "$T" strings -a ./target/debug/tfg 2>/dev/null | grep -m1 "$MARK_FACE" > /tmp/gpui_mark.$$ 2>/dev/null || true
+    if [ -s /tmp/gpui_mark.$$ ]; then
+        BUILT_WITH_MARK=yes
+    else
+        BUILT_WITH_MARK=no
+    fi
+    rm -f /tmp/gpui_mark.$$
+    if [ "$BUILT_WITH_MARK" = "yes" ]; then
+        echo "this build carries the MARK face — the wordmark in the picture is ours"
+    else
+        echo "NOTE: this build does NOT carry the MARK face." >&2
+        echo "If the picture shows a plain ARCONS in a condensed sans, the" >&2
+        echo "capture photographed ANOTHER agent's console: two agents run" >&2
+        echo "this app at once and the compositor shows whichever is on top." >&2
+    fi
+fi
+
 # 7. WAS THE CONSOLE LEFT ALONE? A capture is a photograph of a state, and
 #    a state the operator's own hand changed is not the state the capture
 #    was asked for. On 2026-10-20 a sweep's captures came back with the
