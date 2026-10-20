@@ -573,6 +573,99 @@ fn main() {
                             return;
                         }
                     }
+                    tfg::shell_gpui::ToBinary::SetPosition { unit_id, fx, fy } => {
+                        // A HULL'S POSITION, SET BY HAND (ADR-0021). The
+                        // static exercise's only verb: the server refuses
+                        // every order there with a 409, so the position is the
+                        // input, and the route takes a latitude and a
+                        // longitude and nothing else — no course, no speed,
+                        // and no instant of the client's own, because the
+                        // exercise's clock stamps the jump.
+                        //
+                        // The same unproject the deploy does, at the same
+                        // camera: the frames of the drag that led here were
+                        // unprojected here too, and a commit that landed
+                        // somewhere else would put the hull somewhere the
+                        // operator never pointed at.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to set a position".to_string())
+                        } else if game_id == 0 {
+                            Err("hold a session before setting a position".to_string())
+                        } else if !fx.is_finite() || !fy.is_finite() {
+                            Err("that drop point is nowhere".to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            let Some((lat, lon)) = unproject_at(&camera2, fx, fy) else {
+                                return;
+                            };
+                            match master.set_unit_position(&token2, game_id, unit_id, lat, lon) {
+                                Ok(set) => {
+                                    eprintln!(
+                                        "unit {unit_id} set at {lat:.4}, {lon:.4} ({})",
+                                        set.assumed_time
+                                    );
+                                    match fetch_session(&host2, &token2, Some(game_id)) {
+                                        Some(s) => {
+                                            Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Position,
+                                            ))
+                                        }
+                                        None => Err(
+                                            "the position was set, but the session could not be read"
+                                                .to_string(),
+                                        ),
+                                    }
+                                }
+                                Err(e) => Err(format!("not set: {e}")),
+                            }
+                        };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Position,
+                                why,
+                            )
+                        });
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
+                    tfg::shell_gpui::ToBinary::PreviewPosition { unit_id, fx, fy } => {
+                        // ONE FRAME of a drag. It records nothing and it
+                        // changes nothing, so there is no session to re-read
+                        // and nothing to refuse on the console's own lines:
+                        // the frame is published to the other participants'
+                        // boards and the answer is the server's echo of it.
+                        //
+                        // The frames go out while the drag is in the air, and
+                        // the COMMIT is the release — a commit per pointer
+                        // movement would put a row in the chain for every
+                        // frame, which is exactly what this route exists to
+                        // avoid.
+                        if token2.is_empty() || game_id == 0 {
+                            continue;
+                        }
+                        if !fx.is_finite() || !fy.is_finite() {
+                            continue;
+                        }
+                        let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                            continue;
+                        };
+                        let Some((lat, lon)) = unproject_at(&camera2, fx, fy) else {
+                            continue;
+                        };
+                        match master.preview_unit_position(&token2, game_id, unit_id, lat, lon) {
+                            Ok(frame) => {
+                                eprintln!(
+                                    "drag frame for unit {unit_id} at {lat:.4}, {lon:.4} ({})",
+                                    frame.assumed_time
+                                );
+                            }
+                            Err(e) => eprintln!("drag frame refused: {e}"),
+                        }
+                    }
                     tfg::shell_gpui::ToBinary::DeployAssign {
                         unit_id,
                         commander_id,
@@ -2597,6 +2690,42 @@ fn sync_session(
 /// side, empty/false when watching). One participants read per game — the
 /// same fan-out `fetch_session` already pays to choose the hold — so the
 /// picker and the hold never disagree about where this account sits.
+/// The ground under a map fraction, unprojected at the camera the map
+/// thread is drawing at.
+///
+/// The shell has no mercator, so the unprojection is the binary's — and
+/// the drag's FRAMES and the drag's COMMIT must agree on it, so they
+/// share this one: a commit that landed somewhere else would put the hull
+/// somewhere the operator never pointed at.
+fn unproject_at(
+    camera: &std::sync::Arc<std::sync::Mutex<(f64, f64, f64)>>,
+    fx: f64,
+    fy: f64,
+) -> Option<(f64, f64)> {
+    let (mw, mh) = (tfg::map_render::MAP_W, tfg::map_render::MAP_H);
+    let (clat, clon, zoom) = camera
+        .lock()
+        .map(|c| (c.0, c.1, c.2))
+        .unwrap_or((
+            tfg::map_render::MAP_CENTER.0,
+            tfg::map_render::MAP_CENTER.1,
+            tfg::map_render::MAP_ZOOM,
+        ));
+    let (lat, lon) = tfg::map_render::unproject_mercator(
+        fx.clamp(0.0, 1.0) * mw,
+        fy.clamp(0.0, 1.0) * mh,
+        (clat, clon),
+        zoom,
+        mw,
+        mh,
+    );
+    if lat.is_finite() && lon.is_finite() {
+        Some((lat, lon))
+    } else {
+        None
+    }
+}
+
 fn fetch_session_rows(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::SessionRow>> {
     let master = tfg::backend::MinosMaster::new(host).ok()?;
     let (me, _name) = master.me(token).ok()?;
@@ -2678,7 +2807,14 @@ fn fetch_session(
     // Essentials says which it is looking at.
     let facts = match master.game_detail(token, game_id) {
         Ok(d) => tfg::shell_gpui::GameFacts {
-            mode: d.mode,
+            // The mode is PARSED HERE, ONCE, WHERE THE SESSION IS READ.
+            // Every rule about a mode is a function of this value, and a
+            // rule that compared the mode's spelling at each site would be
+            // a rule that could be spelled two ways. A mode the server
+            // named and this build has not heard of reads as `Unknown`,
+            // which fails closed: no helm, no scenario surface, no clock
+            // verb.
+            mode: tfg::gamestate::GameMode::from_wire(&d.mode),
             // An unrecognised pace keeps its own token AND its ceremony: the
             // server's word is shown as read, and nothing is inferred from it.
             pace: match d.pace {
