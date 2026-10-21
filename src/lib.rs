@@ -88,6 +88,7 @@ pub mod shell_threads;
 pub mod sim;
 pub mod store;
 pub mod symbology;
+pub mod thumb_rotate;
 pub mod view;
 pub mod visuals;
 pub mod window;

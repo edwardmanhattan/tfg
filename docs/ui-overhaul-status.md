@@ -835,19 +835,27 @@ hand-built EXIF block (`Orientation = 6`) and asserts the decoded dimensions are
 the quarter-turned pair, plus the no-tag and "orientation 1" cases that must be
 no-ops.
 
-**Rotation to the hull's course is NOT implemented, and this is why.** The egui
+**Rotation to the hull's course is now implemented, on the CPU.** The egui
 client rotated the photograph to the hull's heading through `rotated_unit_quad`.
 GPUI 0.2.2 offers no equivalent at paint time: `Window::paint_image` takes only
 `bounds`, `corner_radii`, the image and a frame index — the scene's
 `PolychromeSprite` has no transformation field, and the only element that can
-rotate is `svg` (`with_rotation`). So the map draws each picture on the asset's
-own axis, and a hull whose course is not that axis is drawn the wrong way round.
-Doing it properly means rotating the raster on the CPU into an axis-aligned
-bounding-box sprite and caching it per hull and course bucket — real work, and
-unverifiable on this machine, because the fix feed is empty here (no live wire)
-and a staged hull carries no heading at all. `IMAGE_FORWARD_HEADING_DEG` (bow to
-the right) is the axis convention it would have to honour. Left for a decision
-rather than done half-way.
+rotate is `svg` (`with_rotation`). So the map turns the RASTER instead, in
+`thumb_rotate::turn_to_size`: the picture is sampled with an inverse map
+straight into the box it is drawn in, so the console never holds a turned
+picture bigger than the box it goes into, and the turning is a sampling
+rather than a rotate-and-resize. `IMAGE_FORWARD_HEADING_DEG` (bow to the
+right) is the axis convention it honours: the picture is turned by the course
+less a quarter turn, so a hull on 090 is drawn exactly as the asset arrives.
+
+The turned pictures are cached per hull, per box and per whole degree, and
+emptied past a byte budget — a drag across a course is a turn a degree at a
+time, and the sprite atlas would otherwise keep every one of them.
+
+**And the NATO symbol is NOT turned.** The affiliation frame and the taxonomy
+glyph are the console's own symbology and they stay on the axes: the frame
+says which side the hull is on, and a frame that turned with the hull would be
+a frame saying which way the hull points, which is the needle's job.
 
 **The fleet row's focus door.** Each piece row now carries a reticle at the row's
 right end (between the name and the placed/unplaced word) that asks the camera to
