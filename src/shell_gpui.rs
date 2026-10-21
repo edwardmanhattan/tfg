@@ -3687,6 +3687,26 @@ impl IslandDemo {
         // seeded here rather than hard-coded: a deployment that renumbers
         // its degrees keeps working.
         demo.seed_msg_degree();
+        // `TFG_COMPOSER` seeds the scenario composer for a headless capture:
+        // a named plan with its window, a step, and the mini-calendar OPEN
+        // on the start. The same precedent as `TFG_BOOK` and `TFG_COURSE` —
+        // pin the state, never the gesture — because a calendar that can only
+        // be photographed after a click is a calendar nobody can photograph.
+        if std::env::var("TFG_COMPOSER").as_deref() == Ok("1") {
+            demo.composer.title = "First light".to_string();
+            demo.composer.description = "The river crossing, at dawn.".to_string();
+            demo.composer.start = "2026-10-22T08:00".to_string();
+            demo.composer.end = "2026-10-22T12:00".to_string();
+            demo.composer.steps = vec![crate::library::SavedStep {
+                content: "sweep north at -6.2000, 106.8000".to_string(),
+                start_hour: Some("0800".to_string()),
+                end_hour: Some("0900".to_string()),
+                location: Some(crate::library::Place { lat: -6.2, lon: 106.8 }),
+                related: Vec::new(),
+            }];
+            demo.cal_month = crate::calendar::Month::new(2026, 10);
+            demo.cal_field = Some(CalField::Start);
+        }
         demo
     }
 
@@ -19177,9 +19197,27 @@ impl IslandDemo {
             let id = scenario.id.clone();
             let title = scenario.title.clone();
             let window = match (scenario.start.as_deref(), scenario.end.as_deref()) {
-                (Some(s), Some(e)) => format!("{s} \u{2192} {e}"),
-                (Some(s), None) => format!("from {s}"),
-                (None, Some(e)) => format!("until {e}"),
+                (Some(s), Some(e)) => {
+                    // The same day twice is one day and two hours, not two
+                    // dates: a plan's window is a shape, and a list that
+                    // repeats the date makes the operator read it twice.
+                    let brief = crate::calendar::brief(s).zip(crate::calendar::brief(e));
+                    match brief {
+                        Some(((a, b), (c, d))) if a == c => {
+                            format!("{a} {b} \u{2192} {d}")
+                        }
+                        Some(((a, b), (c, d))) => format!("{a} {b} \u{2192} {c} {d}"),
+                        None => format!("{s} \u{2192} {e}"),
+                    }
+                }
+                (Some(s), None) => match crate::calendar::brief(s) {
+                    Some((day, hour)) => format!("from {day} {hour}"),
+                    None => format!("from {s}"),
+                },
+                (None, Some(e)) => match crate::calendar::brief(e) {
+                    Some((day, hour)) => format!("until {day} {hour}"),
+                    None => format!("until {e}"),
+                },
                 (None, None) => "no window".to_string(),
             };
             let steps = scenario.steps.len();

@@ -342,6 +342,21 @@ pub fn hhmm_of(s: &str) -> Option<String> {
     parse(s).map(|dt| dt.format("%H%M").to_string())
 }
 
+/// A local datetime, briefly: the day and the hour, as two parts.
+///
+/// The library's list is a list of plans, and a plan's window is not a
+/// timestamp but a shape — `("22 Oct", "08:00")` — so a list can say
+/// "22 Oct 08:00 → 12:00" instead of repeating the date on both ends. `None`
+/// for anything unreadable, so a row never shows a half-read date.
+pub fn brief(s: &str) -> Option<(String, String)> {
+    parse(s).map(|dt| {
+        (
+            dt.format("%d %b").to_string(),
+            dt.format("%H:%M").to_string(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
