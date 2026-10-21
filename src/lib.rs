@@ -46,6 +46,8 @@
 //!   produced no verdict, and what to say while it has not. Toolkit-free.
 //! - [`window`]: the exercise's planned window and the one rule that says
 //!   what a window is — shared with the scenario composer. Toolkit-free.
+//! - [`calendar`]: the month as six weeks of days, and the local datetimes a
+//!   scenario's window is written in. Toolkit-free; the console draws it.
 //! - [`visuals`]: every hull's picture state — the versioned visual cache and
 //!   what still has to be fetched. The decoded texture is a shell-minted
 //!   handle here, not a toolkit type.
