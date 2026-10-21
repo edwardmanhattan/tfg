@@ -1480,6 +1480,12 @@ const SETTINGS_H: f32 = 380.0;
 const FORM_W: f32 = 520.0;
 const FORM_H: f32 = 580.0;
 
+/// The scenario composer's card height: taller than the other authoring
+/// cards, because it carries three sections — the composer, the library and
+/// the game's own book — and a card that clips its own tail is a form whose
+/// last verb cannot be reached. The window's own height caps it.
+const BOOK_H: f32 = 720.0;
+
 /// The comms island's width.
 ///
 /// **WIDER than the execution rail** (196pt), because the rail is a card
@@ -18385,11 +18391,30 @@ impl IslandDemo {
         let mut saved = self.composer.to_saved();
         saved.title = title;
         self.window_onto_steps(&mut saved);
+        // A related hull is named by the exercise it belongs to, so a plan
+        // carried from another game keeps only the hulls THIS game holds. The
+        // step still obliges whoever picks it up here; the plan does not carry
+        // a hull the server has never heard of, and a relation naming one
+        // would be refused at the advance — after the operator had already
+        // said yes to the whole plan.
+        let known: Vec<i64> = self.session.pieces.iter().map(|p| p.id).collect();
+        let mut left_out = 0usize;
+        for step in saved.steps.iter_mut() {
+            let before = step.related.len();
+            step.related
+                .retain(|(kind, id)| kind != "hull" || known.contains(id));
+            left_out += before - step.related.len();
+        }
         let local = crate::library::stage_into(&mut self.book, &saved);
         self.book.set_description(local, &saved.description);
         self.composer_staged = Some(local);
-        self.composer_status =
-            Status::good("staged \u{2014} the advance writes it".to_string());
+        self.composer_status = if left_out == 0 {
+            Status::good("staged \u{2014} the advance writes it".to_string())
+        } else {
+            Status::good(format!(
+                "staged \u{2014} {left_out} hull(s) are not in this exercise and were left out"
+            ))
+        };
         cx.notify();
     }
 
@@ -18755,15 +18780,30 @@ impl IslandDemo {
                         .child(crate::library::place_text(&place)),
                 );
             }
-            // The hulls the step obliges. A step that names none obliges
-            // nobody, which is legal — and the count says so either way.
+            // The hulls the step obliges, by name. A step that names none
+            // obliges nobody, which is legal — and the count says so either
+            // way. A hull this exercise does not hold is shown as its id,
+            // because a name the operator cannot check is worse than a
+            // number they can.
             if !step.related.is_empty() {
+                let names: Vec<String> = step
+                    .related
+                    .iter()
+                    .map(|(_, id)| {
+                        self.session
+                            .pieces
+                            .iter()
+                            .find(|p| p.id == *id)
+                            .map(|p| p.label.clone())
+                            .unwrap_or_else(|| format!("hull {id}"))
+                    })
+                    .collect();
                 row = row.child(
                     div()
                         .font_family(view::FACE_MACHINE)
                         .text_size(px(view::LABEL_PT))
                         .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                        .child(format!("{} hull(s)", step.related.len())),
+                        .child(names.join(", ")),
                 );
             }
             row = row.child(
@@ -19053,13 +19093,14 @@ impl IslandDemo {
     /// so rather than faking a staging. Steps are numbered in order with
     /// their windows; empty content reads weak, because unwritten is an
     /// authoring state, not an error.
+    /// The composer's header: the title band, the rule, and the line that
+    /// says which game's book this is.
+    ///
+    /// It is SEPARATE from the body because the body scrolls and the header
+    /// does not: a card whose title scrolls out of sight is a card the
+    /// operator has to scroll back up to close.
     fn book_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let rule = || div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE));
-        // Content-sized, not `size_full`: this column is an ISLAND body now,
-        // and the island's own scroll viewport does the measuring. A
-        // `size_full` child inside a scroll viewport sizes to the viewport
-        // and then clips its own overflow, which is a body that silently
-        // loses its tail instead of scrolling to it.
         let mut col = div()
             .flex()
             .flex_col()
@@ -19103,6 +19144,28 @@ impl IslandDemo {
                     self.session.book.len() + self.book.staged_news().count()
                 )),
         );
+        col.into_any_element()
+    }
+
+    /// The composer's body: the scenario being authored, the library, and
+    /// the game's own book.
+    ///
+    /// IT SCROLLS. The composer's three sections are taller than the
+    /// authoring card, and a card that clips its own tail is a form whose
+    /// last verb cannot be reached — the defect the console has already paid
+    /// for once, in Settings.
+    ///
+    /// Content-sized, not `size_full`: this column sits inside a scroll
+    /// viewport, and a `size_full` child inside one sizes to the viewport
+    /// and then clips its own overflow, which is a body that silently loses
+    /// its tail instead of scrolling to it.
+    fn book_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let rule = || div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE));
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(view::PANEL_GAP))
+            .p(px(view::PANEL_PAD));
         col = col.child(rule());
         // The composer comes FIRST: it is what the operator came here to do,
         // and the book it writes into is below it. A panel that opens on the
@@ -21961,6 +22024,14 @@ impl Render for IslandDemo {
             // and a modal over the map is a form with nothing to click. The
             // arm comes from the Book, so the flag that shut it is the one
             // that brings it back (`place_pin`).
+            //
+            // The card is TALLER than the other authoring cards, because the
+            // composer's three sections need the room, and never taller than
+            // the window it is opened in: a card the window cannot hold is a
+            // card whose last section is off the edge.
+            let book_h = BOOK_H
+                .min(f32::from(window.viewport_size().height) - 64.0)
+                .max(320.0);
             Some(
                 div()
                     .absolute()
@@ -21978,7 +22049,7 @@ impl Render for IslandDemo {
                         div()
                             .relative()
                             .w(px(FORM_W))
-                            .h(px(FORM_H))
+                            .h(px(book_h))
                             // The card truncates hover, the way the fleet
                             // picker does: GPUI delivers a press to EVERY
                             // hovered hitbox down the chain, so a press inside
@@ -21989,8 +22060,26 @@ impl Render for IslandDemo {
                             // PIN, dragged out) started life with a pan
                             // attached, and the map followed the drag.
                             .block_mouse_except_scroll()
-                            .child(modal_silhouette_at(FORM_W, FORM_H))
-                            .child(self.book_body(cx)),
+                            .child(modal_silhouette_at(FORM_W, book_h))
+                            // The header stays put and the body scrolls: the
+                            // composer's three sections are taller than the
+                            // card, and a card that clips its own tail is a
+                            // form whose last verb cannot be reached.
+                            .child(
+                                div()
+                                    .w(px(FORM_W))
+                                    .h(px(book_h))
+                                    .flex()
+                                    .flex_col()
+                                    .child(self.book_body(cx))
+                                    .child(
+                                        div()
+                                            .id("book-scroll")
+                                            .flex_1()
+                                            .overflow_y_scroll()
+                                            .child(self.book_content(cx)),
+                                    ),
+                            ),
                     )
                     .into_any_element(),
             )
