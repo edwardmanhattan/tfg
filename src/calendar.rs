@@ -361,6 +361,19 @@ pub fn brief(s: &str) -> Option<(String, String)> {
 mod tests {
     use super::*;
 
+    /// A plan's window is a shape, not a timestamp: the day and the hour,
+    /// apart, so a list can say "22 Oct 08:00 → 12:00" without repeating the
+    /// date. Anything unreadable is refused rather than half-shown.
+    #[test]
+    fn a_brief_datetime_is_a_day_and_an_hour() {
+        assert_eq!(
+            brief("2026-10-22T08:00"),
+            Some(("22 Oct".to_string(), "08:00".to_string()))
+        );
+        assert_eq!(brief("2026-10-22T08:00:00"), None);
+        assert_eq!(brief("not a datetime"), None);
+    }
+
     /// The month as the calendar counts it, for a test to check the grid
     /// against.
     fn days_in(year: i32, month: u32) -> u32 {
