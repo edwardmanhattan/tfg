@@ -519,30 +519,40 @@ named on the adjacent control.
 
 ### The scenario composer
 
-The composer is the one modal that is a page rather than a form: three
-sections, in the order the operator thinks in.
+The composer is one modal with three sections, in the order the operator
+works in — and the third is empty until one of the first two has given it
+something.
 
-1. **Compose a scenario.** The name, the description, the window, and the
-   steps. The name comes first because a plan without a name is a plan the
-   operator cannot pick out of a list of plans; the description is a second
-   line of the same field's kind, not a modal of its own; the window is two
-   datetime rows; the steps are the composer's own list, and the step maker
-   is the row that adds one.
+1. **New scenario.** The name, the description, and the window as a date and
+   a time for each end. The name comes first because a plan without a name
+   is a plan the operator cannot pick out of a list of plans. The button that
+   creates it is at the end of the section, because creating is a separate
+   act from typing: a scenario is what the steps belong to, and it does not
+   exist until the operator says so.
 2. **Saved scenarios.** The library, with the window and the step count of
    each, and two verbs: *use* and *delete*. A pick opens the scenario in the
-   composer above and writes nothing.
-3. **This game's book.** What Minos holds, plus the rows the draft has
-   staged, plus the step row that adds a step to a scenario already in the
-   book.
+   third section and writes nothing. This is the picker Minos cannot offer:
+   a game has exactly ONE book, and there is no catalog of scenarios
+   anywhere in the contract.
+3. **Steps.** The steps of whichever scenario is open — the one just created
+   or the one just picked — with the scenario's own name and window at the
+   top, the step list, and the row that adds a step: its words, a pin, its
+   window, and the hulls it obliges.
 
-**The date is chosen, the time is typed.** A minute is a keystroke and a
-month is a shape, so the mini-calendar takes the day and the field takes the
-whole datetime, and the calendar writes into the same field the keyboard
-writes into. The calendar is drawn INLINE, under the field it fills: GPUI has
-no popover, and a floating layer over the map is a layer the map's own
-gestures would fight with. Its grid is always six weeks, so the control's
-height never changes from month to month — a control that grows under the
-pointer is a control nobody trusts.
+**The third section is the conditional one, and that is the point.** A step
+belongs to a scenario, so a step composer with nothing above it is a list of
+orphans. A section that is only there when it means something is a section
+the operator can read at a glance.
+
+**The date is chosen and the time is chosen too, but they are not the same
+control.** A day is a shape and an hour is a number, so the calendar takes
+the day — a month grid, always six weeks, so the control's height never
+changes from month to month — and the time grid takes the hour and the
+minute: twenty-four hours six to a row, and the minutes in fives. Both are
+drawn INLINE, under the field they fill: GPUI has no popover, and a floating
+layer over the map is a layer the map's own gestures would fight with. Each
+grid writes into the same field the keyboard writes into, so the two can
+never disagree.
 
 **The window says where it lands.** A scenario has no datetime in Minos, so
 the plan's window becomes the first step's start and the last step's end, on

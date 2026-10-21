@@ -187,29 +187,40 @@ pub fn at_day(dt: &NaiveDateTime, day: u32) -> Option<NaiveDateTime>;
 ## The console surface
 
 The composer's island is the Book panel (the door already says "Scenario
-composer"). It grows three sections, in this order:
+composer"). It carries three sections, in the order the operator works in,
+and the third is empty until one of the first two has given it a scenario.
 
-1. **The composer** — the scenario being authored: name, description, start and
-   end datetimes, its steps, and the row that adds a step (words, a pin, the
-   hulls the step obliges).
+1. **New scenario** — the form that creates one: the name, the description,
+   and the window as a DATE and a TIME for each end. The button that creates
+   it is at the end of the section: creating is a separate act from typing,
+   because a scenario is what the steps belong to.
 2. **Saved scenarios** — the library: each saved scenario with its window and
-   its step count, and two verbs: *use* (open it in the composer) and
-   *delete*.
-3. **This game's book** — what Minos holds, plus the staged rows, as it is
-   today.
+   its step count, and two verbs: *use* (open it in the third section) and
+   *delete* (take it out of the library).
+3. **Steps** — the steps of the scenario being worked on: its name and
+   window at the top, the step list, and the row that adds a step. It is
+   only there when a scenario is open, because a step belongs to a scenario
+   and a step list with nothing above it is a list of orphans.
 
-### The datetimes, and why a mini-calendar
+### The datetimes, and why a mini-calendar and a time grid
 
 Typing `2026-10-22 08:00` is a test of memory, and a typo in a date is a
 silent wrong answer — the console would take it and the operator would not see
-it for a week. The field takes the typing, and a mini-calendar takes the
-choosing: a month grid beside the field, the days one click each, the time
-still typed. The two agree, and the field always shows what the calendar
-picked.
+it for a week. The fields take the typing, and two grids take the choosing:
+a **month grid** for the day, and an **hour-and-minute grid** for the time.
 
-Rules the field obeys:
+Rules the fields obey:
 
-- The date part comes from the calendar; the time part from the keyboard.
+- The date and the time are SEPARATE fields. A day is a shape and is
+  chosen; an hour is a number and is typed. One field for both would ask the
+  operator to remember a choice they had already made.
+- The grids write into the same fields the keyboard writes into, so the two
+  can never disagree.
+- The month grid is always six weeks, so the control's height never changes
+  from month to month.
+- The hour grid is twenty-four hours six to a row; the minutes are in fives,
+  because the quarter-hour is what an exercise is timed on — and the field
+  still takes any minute the operator types.
 - An end that is not after its start is refused in the FIELD, in the
   composer's own sentence — not after the round trip.
 - A scenario may have a start and no end, or neither.
@@ -230,9 +241,10 @@ A step is three things, and the composer shows all three:
 
 | Verb | What it does |
 | --- | --- |
-| **Save to library** | Writes the composer into the library, under its id (a new one if it has none). Answers "saved". |
-| **Use** | Opens a saved scenario in the composer. Nothing is written: the operator edits it and saves it, or adds it to the game. |
-| **Add to this game** | Stages the composer into the game's book: a scenario, its steps, its relations. Written through at the advance. |
+| **Create scenario** | Makes the scenario the form describes. Nothing is written: the scenario is the operator's own until it is saved or added to a game. |
+| **Save to library** | Writes the open scenario into the library, under its id (a new one if it has none). Answers "saved". |
+| **Use** | Opens a saved scenario in the steps section. Nothing is written: the operator edits it and saves it, or adds it to the game. |
+| **Add to this game** | Stages the open scenario into the game's book: a scenario, its steps, its relations. Written through at the advance. |
 | **Delete** | Takes a saved scenario out of the library. The library only — a scenario already pushed into a game is the server's, and this verb does not touch it. |
 
 ## The rules that hold everywhere
