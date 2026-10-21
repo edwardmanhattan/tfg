@@ -965,6 +965,68 @@ says a dash before that. A Game Master has no seat and commands no group, so
 the commander's own read never runs for one: the panel's read is the panel's
 claim, and the claim is the console's to keep honest.
 
+## The scenario composer, in the console's own grammar (2026-10-21)
+
+The composer was a modal that read like a web form: a box that said
+"Scenario name" INSIDE it, a label beside the date field with the calendar
+button jammed against the input, a sentence under the pin explaining how to
+drag it, and a card 250pt taller than anything in it. None of that was the
+console's grammar, and the console's grammar was already written down.
+
+**THE FIELDS ARE LABEL OVER WELL.** The sign-in's rule, applied to the
+composer's fields: a tracked-caps label over the well, and an empty well
+carrying the console's dash rather than a hint word. The label above
+already says what the field wants, and a hint inside the box repeats it —
+so "Scenario name" inside the box and nothing above it was a form the
+operator had to read twice. The dash is `IDLE_GREY`, the sign-in's own
+absent-value ink.
+
+**THE VERB RIDES THE LABEL ROW.** The calendar and the time grid open from
+the right of their label, across a hairline — the console puts a verb there
+(the STEPS section carries CLOSE on its rule), and a verb beside the well
+crowds the value it fills. The pin rides the step maker's label row for the
+same reason.
+
+**THE PROSE WENT.** "A pin quotes the map: DRAG it onto the water…", "HHMM,
+or leave both empty" and "posts at once — the composer's own scenarios are
+staged" are hints about controls, and the controls now SAY what they are:
+the pin is a pin, the window's label carries its format, and the row that
+posts at once says so in its own title. What stayed is the one sentence
+that carries a RULE rather than a hint — the window's landing on the first
+step's start and the last step's end — and it lost the echo of the times
+the operator had just typed.
+
+**THE CARD IS AS TALL AS ITS CONTENT, AND THE COLUMNS FILL IT.** The card
+was 720pt with 470pt of content and a hole under it. Now the card's body
+is a row that fills: the left column scrolls the form and the scenario
+list, and the right column's step list scrolls while the maker stays pinned
+at the bottom. The card's height is still a number, because a card that
+clips its own tail is a form whose last verb cannot be reached — but the
+number is the FORM's height now, not a number that suits one state and
+wastes the rest.
+
+**THE LISTS ARE RULED.** A scenario row is its name on top and its figures
+under it — where it came from, how many steps it has, its window — with a
+hairline under the pair. A step is the same shape. The rule is what makes a
+list a list; without it the rows are a stack of lines.
+
+**AND THE TAG STOPPED SPENDING AN ACCENT.** "this game", "saved" and
+"draft" were the console's yellow — an alert ink on a label, beside a
+scenario name that was already cyan. They are the label ink now, and the
+cyan is on the name alone.
+
+**THE PICKER LANDS IN ONE PLACE.** It opens under the window's four fields,
+whichever field it fills, so the operator never hunts for the grid they
+just opened. It is inline because GPUI 0.2.2 has no popover, and inline
+because a floating layer over the map is a layer the map's own gestures
+would fight with.
+
+Verified by capture over the real binary: `scenario-list.png` (the form and
+the list), `scenario-game.png` (a scenario this game holds, open in the
+steps column), `scenario-date.png` and `scenario-time.png` (the two grids
+inline), `scenario-empty.png` (nothing open). `cargo test --lib`: 780 pass,
+the same two pre-existing failures.
+
 ## Unresolved
 
 - The details panel's figures and its type no longer wait on the boot-time

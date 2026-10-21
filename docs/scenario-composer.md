@@ -206,7 +206,23 @@ column, where they can be read, related and added to. The column shows one
 scenario at a time, and closing it puts it down without throwing the work
 away — the draft stays in the list.
 
-Each column scrolls on its own.
+Each column fills the card, and scrolls what grows: the left column scrolls
+the form and the scenario list, the right column's step list scrolls while
+the maker stays pinned at the bottom of the card.
+
+**The form is the console's own form order.** Every field is a tracked-caps
+label over a well, and an empty well carries the console's dash rather than
+a hint word — the label above already says what the field wants. The
+calendar and the time grid open from the right of the label, across a
+hairline.
+
+**The picker opens under the window's fields, always.** It is drawn inline
+(GPUI 0.2.2 has no popover), and it lands in the one place it always lands,
+so the operator never has to hunt for the grid they just opened.
+
+**Every row is ruled.** A scenario row is its name on top and its figures
+under it — where it came from, how many steps it has, its window — with a
+hairline under the pair. A step is the same shape.
 
 ### The datetimes, and why a mini-calendar and a time grid
 

@@ -557,11 +557,35 @@ to a scenario, so the column says so, and names the ways out of it (*create
 one on the left, or open one of the scenarios listed there*). A step composer
 with nothing above it is a list of orphans.
 
-**Each column scrolls on its own.** One scroll for the pair would mean that
-working on a long list of steps dragged the form away with it. A step's
-words take what is left of their row and truncate; the place, the hulls and
-the window sit on the line below, because a column this narrow has room for
-one line of text and one line of figures, not for three.
+**Each column fills the card and scrolls what grows.** The card's height is
+the form's height, and the columns are as tall as it: the left column
+scrolls the form and the scenario list, the right column's STEP LIST
+scrolls while the maker stays pinned at the bottom. One scroll for the pair
+would mean that working on a long list of steps dragged the form away with
+it, and a card taller than its content is a panel with a hole in it.
+
+**Every field is a LABEL over a WELL.** That is the console's own form order
+(the sign-in uses it, and the composer's fields were MEANT to use it), and an
+empty well carries the console's dash for an absent value rather than a hint
+word — the label above already says what the field wants, and a hint inside
+the box repeats it. A field that says "Scenario name" inside it, under a
+panel that says nothing above it, is a form the operator has to read twice.
+
+**A verb rides the field's label row.** The calendar and the time grid open
+from the right of the label, across a hairline, because that is where the
+console puts a verb (the STEPS section carries CLOSE on its rule) and
+because a verb beside the well crowds the value it fills.
+
+**Every list is a ruled grid.** A scenario row is its name on top, its
+figures under it — where it came from, how many steps it has, its window —
+and a hairline under the pair. A step is the same shape: the words on top,
+the place and the window under them. The rule is what makes a list a list;
+without it the rows are a stack of lines.
+
+**The picker opens UNDER the window's fields, always.** GPUI 0.2.2 has no
+popover, so the grid is drawn inline, and it lands in the one place it
+always lands — whichever of the four fields it fills — so the operator
+never has to hunt for the grid they just opened.
 
 **Creating is a separate act from typing.** The form describes a scenario;
 the button at the end of it makes one. A scenario is what the steps belong

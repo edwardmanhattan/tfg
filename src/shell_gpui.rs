@@ -1632,11 +1632,13 @@ const SETTINGS_H: f32 = 380.0;
 const FORM_W: f32 = 520.0;
 const FORM_H: f32 = 580.0;
 
-/// The scenario composer's card height: taller than the other authoring
-/// cards, because it carries three sections — the composer, the library and
-/// the game's own book — and a card that clips its own tail is a form whose
-/// last verb cannot be reached. The window's own height caps it.
-const BOOK_H: f32 = 720.0;
+/// The scenario composer's card height.
+///
+/// It carries the form, the scenario list and the steps — and the form is
+/// the tall one, because every field has a label above it. A card that
+/// clips its own tail is a form whose last verb cannot be reached, so the
+/// height is generous; the window's own height caps it.
+const BOOK_H: f32 = 660.0;
 
 /// The scenario composer's card width: WIDE, because the panel is two
 /// columns — the lists and the form on the left, the steps on the right.
@@ -14430,7 +14432,10 @@ impl IslandDemo {
         // edge. It says what the half below it is.
         col = col.child(section("compose"));
         col = col.child(self.comms_pickers(cx));
-        col = col.child(self.compose_field(12, "message text\u{2026}", cx));
+        // The message field, with the label above it: the same form order
+        // every other field on this console uses.
+        col = col.child(tracked("message", view::LABEL_PT, CUT_GREY));
+        col = col.child(self.compose_field(12, cx));
         col = col.child(
             div()
                 .flex()
@@ -17698,13 +17703,9 @@ impl IslandDemo {
     /// server has the last word — which is stated here, not hidden.
     fn composer_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let rule = || div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE));
-        let label = |text: &'static str| {
-            div()
-                .text_size(px(view::DENSE_PT))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgba(MAP_INK))
-                .child(text)
-        };
+        // The console's label: tracked caps in the label ink. A field's
+        // label is a LABEL, and the console labels things the one way.
+        let label = |text: &'static str| tracked(text, view::LABEL_PT, CUT_GREY);
         // Content-sized, not `size_full`: this column is an ISLAND body now,
         // and the island's own scroll viewport does the measuring. A
         // `size_full` child inside a scroll viewport sizes to the viewport
@@ -17746,7 +17747,7 @@ impl IslandDemo {
                 .child("A session is a plan the Game Master authors: a force, a roster and a window."),
         );
         col = col.child(label("Name *"));
-        col = col.child(self.compose_field(0, "e.g. Latihan Armada 2026", cx));
+        col = col.child(self.compose_field(0, cx));
         if !self.draft.name_ok() {
             col = col.child(
                 div()
@@ -17783,7 +17784,7 @@ impl IslandDemo {
                         .unwrap_or(""),
                 ),
         );
-        for (idx, (name, hint)) in [
+        for (idx, (name, _)) in [
             (1usize, ("Description", "what this exercise is about")),
             (2, ("Purpose", "what it must achieve")),
             (3, ("Target", "who or what is exercised")),
@@ -17791,7 +17792,7 @@ impl IslandDemo {
             (5, ("Map tag", "which chart backbone to load")),
         ] {
             col = col.child(label(name));
-            col = col.child(self.compose_field(idx, hint, cx));
+            col = col.child(self.compose_field(idx, cx));
         }
         let name_ok = self.draft.name_ok();
         let busy = self.compose_busy;
@@ -17898,10 +17899,12 @@ impl IslandDemo {
         }
     }
 
-    /// One composer field. Hand-rolled, like the sign-in card's: GPUI ships
-    /// the input plumbing and no widget, so a field is a focus handle, a
-    /// keystroke handler and a value.
-    fn compose_field(&mut self, idx: usize, hint: &'static str, cx: &mut Context<Self>) -> AnyElement {
+    /// One composer field: the WELL.
+    ///
+    /// Hand-rolled, like the sign-in card's: GPUI ships the input plumbing
+    /// and no widget, so a field is a focus handle, a keystroke handler and
+    /// a value. The label above it is `field_block`'s job.
+    fn compose_field(&mut self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
         let handle = match self.compose_handles[idx].clone() {
             Some(h) => h,
             None => {
@@ -17912,7 +17915,17 @@ impl IslandDemo {
         };
         let text = self.draft_field(idx);
         let empty = text.is_empty();
-        let shown = if empty { hint.to_string() } else { text.to_string() };
+        // The console's dash for an absent value, not a hint word: the LABEL
+        // above the well already says what the field wants, and a hint
+        // inside the box repeats it. That is the sign-in's rule, and the
+        // composer's fields were the wrong shape because of it — a box that
+        // says "Scenario name" inside it, under a panel that says nothing
+        // above it, is a form the operator has to read twice.
+        let shown = if empty {
+            "\u{2014}".to_string()
+        } else {
+            text.to_string()
+        };
         let focused = self.compose_focus == idx;
         div()
             .id(("compose-field", idx))
@@ -17929,7 +17942,7 @@ impl IslandDemo {
             .items_center()
             .font_family(view::FACE_HUMAN)
             .text_size(px(view::BODY_PT))
-            .text_color(rgba(if empty { BODY_SILVER } else { MAP_INK }))
+            .text_color(rgba(if empty { IDLE_GREY } else { MAP_INK }))
             .on_mouse_down(MouseButton::Left, cx.listener(move |view, _, window, cx| {
                 window.focus(&handle);
                 view.compose_focus = idx;
@@ -18976,23 +18989,26 @@ impl IslandDemo {
     fn new_scenario_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
         col = col.child(section("new scenario"));
-        col = col.child(self.compose_field(6, "Scenario name", cx));
-        col = col.child(self.compose_field(7, "What this scenario is for", cx));
+        col = col.child(self.field_block(6, "name", cx));
+        col = col.child(self.field_block(7, "description", cx));
         col = col.child(self.date_row(CalField::Start, cx));
         col = col.child(self.time_row(CalField::Start, cx));
         col = col.child(self.date_row(CalField::End, cx));
         col = col.child(self.time_row(CalField::End, cx));
-        // What the window MEANS on the game clock, said out loud: Minos has
-        // no datetime on a scenario, so the plan's window becomes the first
-        // step's start and the last step's end.
-        if let Some(line) = self.form_window_line() {
-            col = col.child(note(line));
-        }
-        // The picker that is open, drawn under the rows it belongs to.
+        // The picker that is open, under the window's own fields — the one
+        // place it always lands, whichever field it fills, so the operator
+        // never has to hunt for the grid they just opened.
         match self.picker {
             Some(Picker::Date(_)) => col = col.child(self.mini_calendar(cx)),
             Some(Picker::Time(_)) => col = col.child(self.time_picker(cx)),
             None => {}
+        }
+        // What the window MEANS on the game clock, said once: Minos has no
+        // datetime on a scenario, so the plan's window becomes the first
+        // step's start and the last step's end. The RULE, not the times —
+        // the times are in the fields the operator just typed them into.
+        if let Some(line) = self.form_window_line() {
+            col = col.child(note(line));
         }
         col = col.child(
             div()
@@ -19023,7 +19039,14 @@ impl IslandDemo {
     /// and the operator has to be able to see WHICH plan they are editing
     /// without scrolling back up to the form.
     fn working_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
+        // The column FILLS the card: the steps list takes the room that is
+        // left over, and the maker below it keeps its place at the bottom.
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(view::PANEL_GAP));
         let (title, window) = match self.working.as_ref() {
             Some(w) => (
                 w.title.clone(),
@@ -19034,6 +19057,7 @@ impl IslandDemo {
             ),
             None => (String::new(), String::new()),
         };
+        let steps_count = self.working.as_ref().map(|w| w.steps.len()).unwrap_or(0);
         col = col.child(self.steps_header(cx));
         col = col.child(
             div()
@@ -19057,12 +19081,26 @@ impl IslandDemo {
                         .text_size(px(view::LABEL_PT))
                         .text_color(rgba(BODY_SILVER.with_alpha(178)))
                         .child(window),
+                )
+                .child(
+                    div()
+                        .font_family(view::FACE_MACHINE)
+                        .text_size(px(view::LABEL_PT))
+                        .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                        .child(format!("{steps_count} step(s)")),
                 ),
         );
-        if let Some(line) = self.working_window_line() {
-            col = col.child(note(line));
-        }
-        col = col.child(self.composer_steps(cx));
+        // The steps, in the room that grows. The list scrolls; the maker
+        // below it stays put, so adding a step does not move the control
+        // the operator is reaching for.
+        col = col.child(
+            div()
+                .id("composer-steps")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(self.composer_steps(cx)),
+        );
         col = col.child(self.composer_step_maker(cx));
         col = col.child(self.composer_verbs(cx));
         // The composer's own status, said where the composing happens. It
@@ -19084,23 +19122,10 @@ impl IslandDemo {
     /// cannot check, so the sentence says where it lands: the first step
     /// starts at it, the last ends at it.
     fn window_line_of(&self, start: &str, end: &str) -> Option<String> {
-        let start = start.trim();
-        let end = end.trim();
-        if start.is_empty() && end.is_empty() {
+        if start.trim().is_empty() && end.trim().is_empty() {
             return None;
         }
-        let start_hhmm = crate::calendar::hhmm_of(start);
-        let end_hhmm = crate::calendar::hhmm_of(end);
-        let mut line = String::from("on the assumed clock: ");
-        match (start_hhmm, end_hhmm) {
-            (Some(s), Some(e)) => {
-                line.push_str(&format!("the first step starts at {s} and the last ends at {e}"));
-            }
-            (Some(s), None) => line.push_str(&format!("the first step starts at {s}")),
-            (None, Some(e)) => line.push_str(&format!("the last step ends at {e}")),
-            (None, None) => return None,
-        }
-        Some(line)
+        Some(Self::WINDOW_RULE.to_string())
     }
 
     /// The window the FORM describes, said out loud.
@@ -19109,12 +19134,30 @@ impl IslandDemo {
         self.window_line_of(&start, &end)
     }
 
-    /// The window the WORKING scenario carries, said out loud.
-    fn working_window_line(&self) -> Option<String> {
-        let Some(working) = self.working.as_ref() else {
-            return None;
-        };
-        self.window_line_of(&working.start, &working.end)
+    /// The window's rule, in the console's own sentence.
+    ///
+    /// A window that is typed and never explained is a window the operator
+    /// cannot check, so the sentence says where it lands: the first step
+    /// starts at it, the last ends at it. It does NOT repeat the times —
+    /// they are in the fields the operator just typed them into, and a
+    /// sentence that says the same thing twice says it once.
+    const WINDOW_RULE: &'static str =
+        "the window becomes the first step's start and the last step's end";
+
+    /// A composer field: a tracked-caps label over a well.
+    ///
+    /// The console's own form order — the one the sign-in uses, and the one
+    /// the composer's fields are MEANT to use. A label above the well says
+    /// what the field wants; the well itself carries the console's dash
+    /// until there is something in it.
+    fn field_block(&mut self, idx: usize, label: &str, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(tracked(label, view::LABEL_PT, CUT_GREY))
+            .child(self.compose_field(idx, cx))
+            .into_any_element()
     }
 
     /// One DATE row: the label, the field, and the calendar that picks the
@@ -19140,20 +19183,31 @@ impl IslandDemo {
         };
         div()
             .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(tracked(label, view::LABEL_PT, CUT_GREY))
-            .child(div().flex_1().child(self.compose_field(idx, "2026-10-22", cx)))
+            .flex_col()
+            .gap(px(4.0))
+            // The label row carries the VERB, on the far side of a hairline:
+            // the console puts a verb there (the STEPS section carries CLOSE
+            // on its rule), and a verb beside the well would crowd the value
+            // it fills.
             .child(
                 div()
-                    .id(toggle_id)
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.toggle_picker(Picker::Date(field), cx);
-                    }))
-                    .child(button("calendar", true, false, open)),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(tracked(label, view::LABEL_PT, CUT_GREY))
+                    .child(div().flex_1().h(px(1.0)).bg(rgba(HAIRLINE_SLATE)))
+                    .child(
+                        div()
+                            .id(toggle_id)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.toggle_picker(Picker::Date(field), cx);
+                            }))
+                            .child(button("calendar", true, false, open)),
+                    ),
             )
+            .child(self.compose_field(idx, cx))
             .into_any_element()
     }
 
@@ -19180,20 +19234,27 @@ impl IslandDemo {
         };
         div()
             .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(tracked(label, view::LABEL_PT, CUT_GREY))
-            .child(div().flex_1().child(self.compose_field(idx, "08:00", cx)))
+            .flex_col()
+            .gap(px(4.0))
             .child(
                 div()
-                    .id(toggle_id)
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.toggle_picker(Picker::Time(field), cx);
-                    }))
-                    .child(button("time", true, false, open)),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(tracked(label, view::LABEL_PT, CUT_GREY))
+                    .child(div().flex_1().h(px(1.0)).bg(rgba(HAIRLINE_SLATE)))
+                    .child(
+                        div()
+                            .id(toggle_id)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.toggle_picker(Picker::Time(field), cx);
+                            }))
+                            .child(button("time", true, false, open)),
+                    ),
             )
+            .child(self.compose_field(idx, cx))
             .into_any_element()
     }
 
@@ -19434,13 +19495,10 @@ impl IslandDemo {
             );
             return col.into_any_element();
         }
-        col = col.child(
-            div()
-                .text_size(px(view::DENSE_PT))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgba(MAP_INK))
-                .child(format!("Steps ({})", steps.len())),
-        );
+        // The list has no header of its own: the column is already called
+        // STEPS, and the count rides the scenario's name above it. Two
+        // headers saying the same thing is a heading and its shadow.
+
         for (n, step) in steps.iter().enumerate() {
             let text = if step.content.is_empty() {
                 "(not written yet)".to_string()
@@ -19492,7 +19550,17 @@ impl IslandDemo {
                     }))
                     .child(button("remove", true, false, false)),
             );
-            col = col.child(row);
+            // The step is a RULED row: the words on top, the figures under
+            // them, and a hairline under the pair. The rule is what makes a
+            // list a list — without it the steps are a stack of lines.
+            let mut step_block = div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .pb(px(5.0))
+                .border_b(px(view::PANEL_EDGE))
+                .border_color(rgba(HAIRLINE_SLATE))
+                .child(row);
             // The step's FACTS, under its words: the place it points at, the
             // hulls it obliges, and its window.
             //
@@ -19550,7 +19618,8 @@ impl IslandDemo {
                     .text_color(rgba(BODY_SILVER))
                     .child(window),
             );
-            col = col.child(meta);
+            step_block = step_block.child(meta);
+            col = col.child(step_block);
         }
         col.into_any_element()
     }
@@ -19562,23 +19631,22 @@ impl IslandDemo {
     /// in — and keeps the place beside it, so a step that points somewhere
     /// says where in a shape as well as in a sentence.
     fn composer_step_maker(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let mut col = div().flex().flex_col().gap(px(6.0));
-        col = col.child(
-            div()
-                .text_size(px(view::DENSE_PT))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgba(MAP_INK))
-                .child("New step"),
-        );
+        let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
+        col = col.child(section("new step"));
+        // The words, and the pin that fills them, on ONE row: the pin
+        // writes INTO this field, so the two are drawn as what they are —
+        // a field with a way of quoting a place into it.
         col = col.child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(6.0))
-                .child(div().flex_1().child(self.compose_field(16, "What must happen", cx)))
+                .gap(px(8.0))
+                .child(tracked("what must happen", view::LABEL_PT, CUT_GREY))
+                .child(div().flex_1().h(px(1.0)).bg(rgba(HAIRLINE_SLATE)))
                 .child(self.pin_control(PinTarget::Composer, cx)),
         );
+        col = col.child(self.compose_field(16, cx));
         // The place the pin dropped, said back. A pin that vanishes into the
         // sentence is a pin the operator cannot check.
         if let Some(place) = self.composer_step_place {
@@ -19590,26 +19658,19 @@ impl IslandDemo {
                     .child(crate::library::place_text(&place)),
             );
         }
+        // The window: both ends or neither, in the console's own label
+        // style. The label carries the FORMAT, so the fields do not have to
+        // carry a hint inside them.
         col = col.child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(8.0))
-                .child(
-                    div()
-                        .text_size(px(view::DENSE_PT))
-                        .text_color(rgba(BODY_SILVER))
-                        .child("window"),
-                )
-                .child(div().flex_1().child(self.compose_field(17, "1000", cx)))
-                .child(div().flex_1().child(self.compose_field(18, "1030", cx)))
-                .child(
-                    div()
-                        .text_size(px(view::LABEL_PT))
-                        .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                        .child("HHMM, or leave both empty"),
-                ),
+                .child(tracked("window HHMM", view::LABEL_PT, CUT_GREY))
+                .child(div().flex_1())
+                .child(div().w(px(64.0)).child(self.compose_field(17, cx)))
+                .child(div().w(px(64.0)).child(self.compose_field(18, cx))),
         );
         col = col.child(self.composer_hull_picker(cx));
         col = col.child(
@@ -19861,6 +19922,11 @@ impl IslandDemo {
         verb: ScenarioVerb,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The row is two lines, in the console's own order: the thing on
+        // top, the figures under it. The tag is a LABEL and it wears the
+        // label ink — it used to be the console's yellow, which spent an
+        // accent on the difference between two kinds of scenario while the
+        // scenario's own name was already cyan.
         let mut row = div()
             .flex()
             .flex_row()
@@ -19875,20 +19941,6 @@ impl IslandDemo {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgba(if open { RADAR_CYAN } else { MAP_INK }))
                     .child(title.to_string()),
-            )
-            .child(
-                div()
-                    .font_family(view::FACE_MACHINE)
-                    .text_size(px(view::LABEL_PT))
-                    .text_color(rgba(ALERT_YELLOW))
-                    .child(tag.to_string()),
-            )
-            .child(
-                div()
-                    .font_family(view::FACE_MACHINE)
-                    .text_size(px(view::LABEL_PT))
-                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                    .child(format!("{steps} step(s)")),
             );
         match verb {
             ScenarioVerb::Draft => {
@@ -19943,17 +19995,31 @@ impl IslandDemo {
                     );
             }
         }
-        let mut col = div().flex().flex_col().gap(px(2.0)).child(row);
+        // The figures under the name: where it came from, how many steps it
+        // has, and its window.
+        let mut figures = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .font_family(view::FACE_MACHINE)
+            .text_size(px(view::LABEL_PT))
+            .text_color(rgba(BODY_SILVER.with_alpha(178)))
+            .child(tag.to_string())
+            .child(format!("{steps} step(s)"));
         if !window.is_empty() {
-            col = col.child(
-                div()
-                    .font_family(view::FACE_MACHINE)
-                    .text_size(px(view::LABEL_PT))
-                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                    .child(window.to_string()),
-            );
+            figures = figures.child(window.to_string());
         }
-        col.into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .pb(px(5.0))
+            .border_b(px(view::PANEL_EDGE))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .child(row)
+            .child(figures)
+            .into_any_element()
     }
 
     /// The composer's header: the title band, the rule, and the line that
@@ -20027,9 +20093,14 @@ impl IslandDemo {
     /// Each column SCROLLS on its own. One scroll for the pair would mean
     /// that working on a long list of steps dragged the form away with it.
     fn book_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // The row FILLS the card's body: the columns are as tall as the
+        // card, each one scrolls what grows, and the card's height never
+        // has to be guessed at twice.
         div()
             .flex()
             .flex_row()
+            .flex_1()
+            .min_h_0()
             .gap(px(16.0))
             .p(px(view::PANEL_PAD))
             .child(
@@ -20045,12 +20116,17 @@ impl IslandDemo {
                     .overflow_y_scroll()
                     .child(self.book_left_column(cx)),
             )
+            // The RIGHT column is NOT a scroll area: its own column gives
+            // the steps list the room that grows and keeps the maker at the
+            // bottom of the card. One scroll for the pair would mean that
+            // working on a long list of steps dragged the form away with it.
             .child(
                 div()
                     .id("book-right")
                     .flex_1()
                     .min_w_0()
-                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
                     .child(self.book_right_column(cx)),
             )
             .into_any_element()
@@ -20165,14 +20241,33 @@ impl IslandDemo {
     /// scenario they belong to. They are here now, because this column is
     /// where a scenario is worked on.
     fn game_scenario_section(&mut self, sc_id: i64, cx: &mut Context<Self>) -> AnyElement {
-        let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(view::PANEL_GAP));
         col = col.child(self.steps_header(cx));
         if let Some(sc) = self.session.book.iter().find(|s| s.id == sc_id).cloned() {
             col = col.child(self.scenario_head(&sc.title, sc.steps.len(), "this game"));
-            col = col.child(self.server_scenario_steps(&sc, cx));
+            col = col.child(
+                div()
+                    .id("game-steps")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(self.server_scenario_steps(&sc, cx)),
+            );
         } else if let Some(news) = self.book.get_new(sc_id).cloned() {
             col = col.child(self.scenario_head(&news.title, news.steps.len(), "staged"));
-            col = col.child(self.staged_scenario_steps(&news, cx));
+            col = col.child(
+                div()
+                    .id("staged-steps")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(self.staged_scenario_steps(&news, cx)),
+            );
         } else {
             col = col.child(note("This scenario is no longer in the book."));
             return col.into_any_element();
@@ -20206,11 +20301,14 @@ impl IslandDemo {
                     .text_color(rgba(RADAR_CYAN))
                     .child(title.to_string()),
             )
+            // The tag is a LABEL: the label ink, not an accent. The
+            // scenario's own name is the one thing on this row that earns
+            // the cyan.
             .child(
                 div()
                     .font_family(view::FACE_MACHINE)
                     .text_size(px(view::LABEL_PT))
-                    .text_color(rgba(ALERT_YELLOW))
+                    .text_color(rgba(CUT_GREY))
                     .child(tag.to_string()),
             )
             .child(
@@ -20359,8 +20457,19 @@ impl IslandDemo {
                         }))
                         .child(button("remove", true, self.step_busy, false)),
                 );
-            col = col.child(row);
-            col = col.child(meta);
+            // A RULED row: the words on top, the figures under them, and a
+            // hairline under the pair.
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .pb(px(5.0))
+                    .border_b(px(view::PANEL_EDGE))
+                    .border_color(rgba(HAIRLINE_SLATE))
+                    .child(row)
+                    .child(meta),
+            );
             // The relate editor, inline under its step — the console's
             // `relate_editor_ui` under the row, without the staging.
             if self.relate_open == Some((sc.id, step.id)) {
@@ -20417,27 +20526,37 @@ impl IslandDemo {
                         }))
                         .child(button("remove", true, false, false)),
                 );
-            col = col.child(row);
-            // The figures under the words, as in the server's own rows.
+            // The figures under the words, as in the server's own rows, and
+            // the same hairline under the pair.
             col = col.child(
                 div()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .pl(px(20.0))
+                    .flex_col()
+                    .gap(px(2.0))
+                    .pb(px(5.0))
+                    .border_b(px(view::PANEL_EDGE))
+                    .border_color(rgba(HAIRLINE_SLATE))
+                    .child(row)
                     .child(
                         div()
-                            .font_family(view::FACE_MACHINE)
-                            .text_size(px(10.0))
-                            .text_color(rgba(BODY_SILVER))
-                            .child(window),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgba(ALERT_YELLOW))
-                            .child("staged".to_string()),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .pl(px(20.0))
+                            .child(
+                                div()
+                                    .font_family(view::FACE_MACHINE)
+                                    .text_size(px(10.0))
+                                    .text_color(rgba(BODY_SILVER))
+                                    .child(window),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(rgba(ALERT_YELLOW))
+                                    .child("staged".to_string()),
+                            ),
                     ),
             );
         }
@@ -20469,64 +20588,73 @@ impl IslandDemo {
                 .unwrap_or_else(|| "\u{2014}".to_string());
             let step_id = step.local_id;
             let scenario_id = news.local_id;
+            let row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .font_family(view::FACE_MACHINE)
+                        .text_size(px(11.0))
+                        .text_color(rgba(BODY_SILVER))
+                        .child(format!("{:>2}", n + 1)),
+                )
+                // The words take what is left of the row and TRUNCATE.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.0))
+                        .text_color(rgba(if step.content.is_empty() {
+                            BODY_SILVER.with_alpha(204)
+                        } else {
+                            MAP_INK
+                        }))
+                        .child(text),
+                )
+                .child(
+                    div()
+                        .id(("book-remove-step", step_id as usize))
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.remove_step(scenario_id, step_id, cx);
+                        }))
+                        .child(button("remove", true, false, false)),
+                );
+            // The figures under the words, as in the server's own rows, and
+            // the same hairline under the pair.
             col = col.child(
                 div()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
+                    .flex_col()
+                    .gap(px(2.0))
+                    .pb(px(5.0))
+                    .border_b(px(view::PANEL_EDGE))
+                    .border_color(rgba(HAIRLINE_SLATE))
+                    .child(row)
                     .child(
                         div()
-                            .font_family(view::FACE_MACHINE)
-                            .text_size(px(11.0))
-                            .text_color(rgba(BODY_SILVER))
-                            .child(format!("{:>2}", n + 1)),
-                    )
-                    // The words take what is left of the row and TRUNCATE.
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(11.0))
-                            .text_color(rgba(if step.content.is_empty() {
-                                BODY_SILVER.with_alpha(204)
-                            } else {
-                                MAP_INK
-                            }))
-                            .child(text),
-                    )
-                    .child(
-                        div()
-                            .id(("book-remove-step", step_id as usize))
-                            .flex_shrink_0()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.remove_step(scenario_id, step_id, cx);
-                            }))
-                            .child(button("remove", true, false, false)),
-                    ),
-            );
-            // The figures under the words, as in the server's own rows.
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .pl(px(20.0))
-                    .child(
-                        div()
-                            .font_family(view::FACE_MACHINE)
-                            .text_size(px(10.0))
-                            .text_color(rgba(BODY_SILVER))
-                            .child(window),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgba(ALERT_YELLOW))
-                            .child("staged".to_string()),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .pl(px(20.0))
+                            .child(
+                                div()
+                                    .font_family(view::FACE_MACHINE)
+                                    .text_size(px(10.0))
+                                    .text_color(rgba(BODY_SILVER))
+                                    .child(window),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(rgba(ALERT_YELLOW))
+                                    .child("staged".to_string()),
+                            ),
                     ),
             );
         }
@@ -20540,50 +20668,33 @@ impl IslandDemo {
     /// one: a step needs a scenario to belong to.
     fn book_step_maker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
-        col = col.child(
-            div()
-                .text_size(px(view::DENSE_PT))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgba(MAP_INK))
-                .child("New step"),
-        );
-        // The content field and its PIN, on one row: the pin writes INTO
-        // this field, so the two are drawn as what they are — one field
-        // with a way of quoting a place into it.
-        col = col.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .child(div().flex_1().child(self.compose_field(13, "What must happen", cx)))
-                .child(self.pin_control(PinTarget::Book, cx)),
-        );
-        col = col.child(note(
-            "A pin quotes the map: DRAG it onto the water, or click it and then \
-             click the map. The coordinate lands in the step's words, and the \
-             Book stands aside for the gesture.",
-        ));
+        col = col.child(section("new step"));
+        // The words, and the pin that fills them, on ONE row: the pin
+        // writes INTO this field, so the two are drawn as what they are —
+        // a field with a way of quoting a place into it.
         col = col.child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(8.0))
-                .child(
-                    div()
-                        .text_size(px(view::DENSE_PT))
-                        .text_color(rgba(BODY_SILVER))
-                        .child("window"),
-                )
-                .child(div().flex_1().child(self.compose_field(14, "1000", cx)))
-                .child(div().flex_1().child(self.compose_field(15, "1030", cx)))
-                .child(
-                    div()
-                        .text_size(px(view::LABEL_PT))
-                        .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                        .child("HHMM, or leave both empty"),
-                ),
+                .child(tracked("what must happen", view::LABEL_PT, CUT_GREY))
+                .child(div().flex_1().h(px(1.0)).bg(rgba(HAIRLINE_SLATE)))
+                .child(self.pin_control(PinTarget::Book, cx)),
+        );
+        col = col.child(self.compose_field(13, cx));
+        // The window: both ends or neither. The label carries the FORMAT, so
+        // the fields do not have to carry a hint inside them.
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(tracked("window HHMM", view::LABEL_PT, CUT_GREY))
+                .child(div().flex_1())
+                .child(div().w(px(64.0)).child(self.compose_field(14, cx)))
+                .child(div().w(px(64.0)).child(self.compose_field(15, cx))),
         );
         col = col.child(
             div()
@@ -20611,24 +20722,16 @@ impl IslandDemo {
     /// is a stage to wait for.
     fn book_direct_add(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
-        col = col.child(
-            div()
-                .text_size(px(view::DENSE_PT))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgba(MAP_INK))
-                .child("Add a scenario straight to this game"),
-        );
-        col = col.child(self.compose_field(19, "Scenario title", cx));
+        col = col.child(tracked(
+            "add a scenario straight to this game",
+            view::LABEL_PT,
+            CUT_GREY,
+        ));
+        col = col.child(self.compose_field(19, cx));
         let title_ok = !self.book_title.trim().is_empty();
-        col = col.child(
-            div()
-                .text_size(px(view::LABEL_PT))
-                .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                .child("posts at once — the composer's own scenarios are staged"),
-        );
-        // The button on its OWN line: the note and the button do not fit
-        // side by side in a column this narrow, and a button clipped by the
-        // panel's edge is a button nobody can press.
+        // The button on its OWN line: it does not fit beside the field in a
+        // column this narrow, and a button clipped by the panel's edge is a
+        // button nobody can press.
         col = col.child(
             div()
                 .flex()
@@ -23178,9 +23281,11 @@ impl Render for IslandDemo {
                                     .child(self.book_body(cx))
                                     .child(
                                         div()
-                                            .id("book-scroll")
+                                            .id("book-body")
                                             .flex_1()
-                                            .overflow_y_scroll()
+                                            .min_h_0()
+                                            .flex()
+                                            .flex_col()
                                             .child(self.book_content(cx)),
                                     ),
                             ),
