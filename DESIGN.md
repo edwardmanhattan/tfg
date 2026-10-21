@@ -519,30 +519,36 @@ named on the adjacent control.
 
 ### The scenario composer
 
-The composer is one modal with three sections, in the order the operator
-works in — and the third is empty until one of the first two has given it
-something.
+The composer is one modal, and it is TWO COLUMNS.
 
-1. **New scenario.** The name, the description, and the window as a date and
-   a time for each end. The name comes first because a plan without a name
-   is a plan the operator cannot pick out of a list of plans. The button that
-   creates it is at the end of the section, because creating is a separate
-   act from typing: a scenario is what the steps belong to, and it does not
-   exist until the operator says so.
-2. **Saved scenarios.** The library, with the window and the step count of
-   each, and two verbs: *use* and *delete*. A pick opens the scenario in the
-   third section and writes nothing. This is the picker Minos cannot offer:
-   a game has exactly ONE book, and there is no catalog of scenarios
-   anywhere in the contract.
-3. **Steps.** The steps of whichever scenario is open — the one just created
-   or the one just picked — with the scenario's own name and window at the
-   top, the step list, and the row that adds a step: its words, a pin, its
-   window, and the hulls it obliges.
+**Left column — where a scenario comes from.** The form that creates one at
+the top (name, description, and the window as a date and a time for each
+end), the saved scenarios to pick below it, and the game's own book under
+those. **Right column — where a scenario goes.** The steps of the scenario
+being worked on: its name and window at the top, the step list, and the row
+that adds a step — its words, a pin, its window, and the hulls it obliges.
 
-**The third section is the conditional one, and that is the point.** A step
-belongs to a scenario, so a step composer with nothing above it is a list of
-orphans. A section that is only there when it means something is a section
-the operator can read at a glance.
+The split is the arrangement the operator asked for, and it is the right one:
+the left column is a set of LISTS and a form, and the right column is the
+work. A scenario's steps belong to the scenario above them, so a panel that
+stacks the form, the library and the steps pushes the steps away from the
+thing they belong to — and the operator has to scroll to find out which
+scenario they are writing.
+
+**The right column is empty until there is something in it.** A step belongs
+to a scenario, so the column says so, and names the two ways out of it
+(*create one above, or pick a saved one*). A step composer with nothing
+above it is a list of orphans.
+
+**Each column scrolls on its own.** One scroll for the pair would mean that
+working on a long list of steps dragged the form away with it. A step's
+words take what is left of their row and truncate; the place, the hulls and
+the window sit on the line below, because a column this narrow has room for
+one line of text and one line of figures, not for three.
+
+**Creating is a separate act from typing.** The form describes a scenario;
+the button at the end of it makes one. A scenario is what the steps belong
+to, and it does not exist until the operator says so.
 
 **The date is chosen and the time is chosen too, but they are not the same
 control.** A day is a shape and an hour is a number, so the calendar takes

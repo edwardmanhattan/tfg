@@ -1569,6 +1569,15 @@ const FORM_H: f32 = 580.0;
 /// last verb cannot be reached. The window's own height caps it.
 const BOOK_H: f32 = 720.0;
 
+/// The scenario composer's card width: WIDE, because the panel is two
+/// columns — the lists and the form on the left, the steps on the right.
+/// One column of this much material is a page of scrolling, and the steps
+/// would sit a screen away from the scenario they belong to.
+///
+/// It is in the same family as the other authoring cards (700, 720), so the
+/// modal zone does not sprout a width of its own.
+const BOOK_W: f32 = 760.0;
+
 /// The comms island's width.
 ///
 /// **WIDER than the execution rail** (196pt), because the rail is a card
@@ -18860,39 +18869,6 @@ impl IslandDemo {
         }
     }
 
-    /// The composer's own body: three sections, in the order the operator
-    /// works in.
-    ///
-    /// **One** — the form that creates a new scenario. **Two** — the saved
-    /// scenarios, to be picked. **Three** — the steps of whichever of the
-    /// first two the operator is working on, and it is EMPTY until one of
-    /// them has given it a scenario.
-    ///
-    /// The third section is the one that is conditional, and that is the whole
-    /// point of the arrangement: a step belongs to a scenario, so a step
-    /// composer with nothing above it is a list of orphans. A section that
-    /// is only there when it means something is a section the operator can
-    /// read at a glance.
-    fn scenario_composer_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let rule = || div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE));
-        let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
-        col = col.child(self.new_scenario_section(cx));
-        col = col.child(rule());
-        col = col.child(self.library_body(cx));
-        if self.working.is_some() {
-            col = col.child(rule());
-            col = col.child(self.working_section(cx));
-        }
-        if !self.composer_status.is_empty() {
-            col = col.child(
-                div()
-                    .text_size(px(view::DENSE_PT))
-                    .child(status_line(&self.composer_status)),
-            );
-        }
-        col.into_any_element()
-    }
-
     /// Section one: the form that creates a new scenario.
     ///
     /// The NAME says what the plan is, the DESCRIPTION says what it is for,
@@ -19393,8 +19369,15 @@ impl IslandDemo {
                         .text_color(rgba(BODY_SILVER))
                         .child(format!("{:>2}", n + 1)),
                 )
+                // The words take what is left of the row and TRUNCATE: a step
+                // whose text is clipped by the panel's edge is a step the
+                // operator cannot read, and the whole of it is on the next
+                // line under the row.
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
                         .text_size(px(view::DENSE_PT))
                         .text_color(rgba(if step.content.is_empty() {
                             BODY_SILVER.with_alpha(204)
@@ -19402,12 +19385,34 @@ impl IslandDemo {
                             MAP_INK
                         }))
                         .child(text),
-                )
-                .child(div().flex_1());
+                );
+            row = row.child(
+                div()
+                    .id(("composer-step-remove", n))
+                    .flex_shrink_0()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.remove_composer_step(n, cx);
+                    }))
+                    .child(button("remove", true, false, false)),
+            );
+            col = col.child(row);
+            // The step's FACTS, under its words: the place it points at, the
+            // hulls it obliges, and its window.
+            //
+            // They are under the words because they are the reading of the
+            // words, and a column this narrow has room for one line of text
+            // and one line of figures — not for three.
+            let mut meta = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .pl(px(20.0));
             // The place, when the step points at one. It is shown as the
             // coordinates the words carry, so the two can be compared.
             if let Some(place) = step.location {
-                row = row.child(
+                meta = meta.child(
                     div()
                         .font_family(view::FACE_MACHINE)
                         .text_size(px(view::LABEL_PT))
@@ -19433,7 +19438,7 @@ impl IslandDemo {
                             .unwrap_or_else(|| format!("hull {id}"))
                     })
                     .collect();
-                row = row.child(
+                meta = meta.child(
                     div()
                         .font_family(view::FACE_MACHINE)
                         .text_size(px(view::LABEL_PT))
@@ -19441,23 +19446,15 @@ impl IslandDemo {
                         .child(names.join(", ")),
                 );
             }
-            row = row.child(
+            meta = meta.child(div().flex_1());
+            meta = meta.child(
                 div()
                     .font_family(view::FACE_MACHINE)
                     .text_size(px(view::LABEL_PT))
                     .text_color(rgba(BODY_SILVER))
                     .child(window),
             );
-            row = row.child(
-                div()
-                    .id(("composer-step-remove", n))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.remove_composer_step(n, cx);
-                    }))
-                    .child(button("remove", true, false, false)),
-            );
-            col = col.child(row);
+            col = col.child(meta);
         }
         col.into_any_element()
     }
@@ -19777,31 +19774,63 @@ impl IslandDemo {
         col.into_any_element()
     }
 
-    /// The composer's body: the scenario being authored, the library, and
-    /// the game's own book.
+    /// The composer's body: TWO COLUMNS.
     ///
-    /// IT SCROLLS. The composer's three sections are taller than the
-    /// authoring card, and a card that clips its own tail is a form whose
-    /// last verb cannot be reached — the defect the console has already paid
-    /// for once, in Settings.
+    /// The left column is where a scenario COMES FROM — the form that creates
+    /// one, the saved ones to pick, and the game's own book underneath them.
+    /// The right column is where a scenario GOES: the steps of the one being
+    /// worked on.
     ///
-    /// Content-sized, not `size_full`: this column sits inside a scroll
-    /// viewport, and a `size_full` child inside one sizes to the viewport
-    /// and then clips its own overflow, which is a body that silently loses
-    /// its tail instead of scrolling to it.
+    /// The split is the arrangement the operator asked for, and it is the
+    /// right one: the left column is a set of LISTS and a form, and the right
+    /// column is the work. A scenario's steps belong to the scenario above
+    /// them, so a panel that stacks the form, the library and the steps
+    /// pushes the steps away from the thing they belong to — and the
+    /// operator has to scroll to find out which scenario they are writing.
+    ///
+    /// Each column SCROLLS on its own. One scroll for the pair would mean
+    /// that working on a long list of steps dragged the form away with it.
     fn book_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(16.0))
+            .p(px(view::PANEL_PAD))
+            .child(
+                div()
+                    .id("book-left")
+                    .flex_1()
+                    // The minimums, and they are the whole trick: a flex
+                    // item's automatic minimum size is its CONTENT's, so
+                    // without these the left column — which holds a form and
+                    // two lists — refuses to shrink and swallows the card.
+                    // The player picker pays the same lesson.
+                    .min_w_0()
+                    .overflow_y_scroll()
+                    .child(self.book_left_column(cx)),
+            )
+            .child(
+                div()
+                    .id("book-right")
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_y_scroll()
+                    .child(self.book_right_column(cx)),
+            )
+            .into_any_element()
+    }
+
+    /// The LEFT column: the form that creates a scenario, the saved ones to
+    /// pick, and the game's own book.
+    fn book_left_column(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let rule = || div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE));
         let mut col = div()
             .flex()
             .flex_col()
-            .gap(px(view::PANEL_GAP))
-            .p(px(view::PANEL_PAD));
+            .gap(px(view::PANEL_GAP));
+        col = col.child(self.new_scenario_section(cx));
         col = col.child(rule());
-        // The composer comes FIRST: it is what the operator came here to do,
-        // and the book it writes into is below it. A panel that opens on the
-        // read and hides the writing behind a scroll is a panel that reads
-        // like a report.
-        col = col.child(self.scenario_composer_body(cx));
+        col = col.child(self.library_body(cx));
         col = col.child(rule());
         col = col.child(
             div()
@@ -19898,8 +19927,14 @@ impl IslandDemo {
                             .text_color(rgba(BODY_SILVER))
                             .child(format!("{:>2}", n + 1)),
                     )
+                    // The words take what is left of the row and TRUNCATE:
+                    // the column is narrow, and a step's text clipped by the
+                    // panel's edge is a step the operator cannot read.
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_size(px(view::DENSE_PT))
                             .text_color(rgba(if step.content.is_empty() {
                                 BODY_SILVER.with_alpha(204)
@@ -19908,7 +19943,6 @@ impl IslandDemo {
                             }))
                             .child(text),
                     )
-                    .child(div().flex_1())
                     .child(
                         div()
                             .font_family(view::FACE_MACHINE)
@@ -19955,6 +19989,7 @@ impl IslandDemo {
                     .child(
                         div()
                             .id(("book-relate", step_id as usize))
+                            .flex_shrink_0()
                             .cursor_pointer()
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 view.toggle_relate(scenario_id, step_id, cx);
@@ -19964,6 +19999,7 @@ impl IslandDemo {
                     .child(
                         div()
                             .id(("book-remove-step", step_id as usize))
+                            .flex_shrink_0()
                             .cursor_pointer()
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 view.remove_step(scenario_id, step_id, cx);
@@ -20249,6 +20285,27 @@ impl IslandDemo {
             );
         }
         col.into_any_element()
+    }
+
+    /// The RIGHT column: the steps of the scenario being worked on, and
+    /// nothing else.
+    ///
+    /// It is the WORK column, and it says so when there is no work: a step
+    /// belongs to a scenario, so the column is empty until the form has
+    /// made one or the library has given one. The empty state names the two
+    /// ways out of it, because a blank column is a question and the console
+    /// answers questions.
+    fn book_right_column(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.working.is_none() {
+            let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
+            col = col.child(section("steps"));
+            col = col.child(note(
+                "No scenario open. Create one above, or pick a saved one, and its steps \
+                 are written here.",
+            ));
+            return col.into_any_element();
+        }
+        self.working_section(cx)
     }
 
     /// The marker layer, now live: one ring per tracked hull, at its
@@ -22738,6 +22795,10 @@ impl Render for IslandDemo {
             let book_h = BOOK_H
                 .min(f32::from(window.viewport_size().height) - 64.0)
                 .max(320.0);
+            // The card is never WIDER than the window it is opened in: a
+            // card the window cannot hold is a card whose second column is
+            // off the edge.
+            let book_w = BOOK_W.min(f32::from(window.viewport_size().width) - 64.0);
             Some(
                 div()
                     .absolute()
@@ -22754,7 +22815,7 @@ impl Render for IslandDemo {
                     .child(
                         div()
                             .relative()
-                            .w(px(FORM_W))
+                            .w(px(book_w))
                             .h(px(book_h))
                             // The card truncates hover, the way the fleet
                             // picker does: GPUI delivers a press to EVERY
@@ -22766,14 +22827,14 @@ impl Render for IslandDemo {
                             // PIN, dragged out) started life with a pan
                             // attached, and the map followed the drag.
                             .block_mouse_except_scroll()
-                            .child(modal_silhouette_at(FORM_W, book_h))
+                            .child(modal_silhouette_at(book_w, book_h))
                             // The header stays put and the body scrolls: the
                             // composer's three sections are taller than the
                             // card, and a card that clips its own tail is a
                             // form whose last verb cannot be reached.
                             .child(
                                 div()
-                                    .w(px(FORM_W))
+                                    .w(px(book_w))
                                     .h(px(book_h))
                                     .flex()
                                     .flex_col()

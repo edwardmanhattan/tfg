@@ -187,20 +187,18 @@ pub fn at_day(dt: &NaiveDateTime, day: u32) -> Option<NaiveDateTime>;
 ## The console surface
 
 The composer's island is the Book panel (the door already says "Scenario
-composer"). It carries three sections, in the order the operator works in,
-and the third is empty until one of the first two has given it a scenario.
+composer"). It is **two columns**, and the split is the arrangement the
+operator asked for.
 
-1. **New scenario** — the form that creates one: the name, the description,
-   and the window as a DATE and a TIME for each end. The button that creates
-   it is at the end of the section: creating is a separate act from typing,
-   because a scenario is what the steps belong to.
-2. **Saved scenarios** — the library: each saved scenario with its window and
-   its step count, and two verbs: *use* (open it in the third section) and
-   *delete* (take it out of the library).
-3. **Steps** — the steps of the scenario being worked on: its name and
-   window at the top, the step list, and the row that adds a step. It is
-   only there when a scenario is open, because a step belongs to a scenario
-   and a step list with nothing above it is a list of orphans.
+- **Left column — where a scenario comes from.** The form that creates one
+  (name, description, and the window as a DATE and a TIME for each end), the
+  saved scenarios to pick, and the game's own book under those.
+- **Right column — where a scenario goes.** The steps of the scenario being
+  worked on: its name and window at the top, the step list, and the row that
+  adds a step. It is empty until a scenario is open, because a step belongs
+  to a scenario and a step list with nothing above it is a list of orphans.
+
+Each column scrolls on its own.
 
 ### The datetimes, and why a mini-calendar and a time grid
 
