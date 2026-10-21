@@ -49,6 +49,9 @@
 //! - [`visuals`]: every hull's picture state — the versioned visual cache and
 //!   what still has to be fetched. The decoded texture is a shell-minted
 //!   handle here, not a toolkit type.
+//! - [`library`]: the scenario library — the operator's own saved scenarios,
+//!   kept whole on this machine, with the plan and the book kept apart.
+//!   Toolkit-free.
 //!
 //! Module list is alphabetical after `assets`.
 
@@ -70,6 +73,7 @@ pub mod groups;
 pub mod halo;
 pub mod geo;
 pub mod land;
+pub mod library;
 pub mod log;
 pub mod map_gate;
 pub mod map_geometry;
