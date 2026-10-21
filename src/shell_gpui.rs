@@ -51,6 +51,7 @@ use crate::map_geometry::{self, MAP_FRAME_INTERVAL, MAP_RESIZE_SETTLE, WHEEL_ZOO
 use crate::book::ComposerDraft;
 use crate::symbology;
 use crate::symbology::frame::{frame_for, frame_polygon, frame_strokes};
+use crate::thumb_rotate;
 use crate::view::{self as view, *};
 use std::sync::Arc;
 
@@ -1352,6 +1353,25 @@ struct IslandDemo {
     /// and a hull whose published speed the console has not read yet waits
     /// here until the read lands.
     staged_courses_pending: BTreeMap<i64, f32>,
+    /// The pictures the map has TURNED, keyed by the hull, the box they were
+    /// turned into and the course they were turned to.
+    ///
+    /// GPUI 0.2.2 cannot turn a picture, so the console turns the pixels
+    /// itself — and a turn is work, so the turned pictures are kept: a
+    /// picture turned on a course that has not changed is the same picture,
+    /// and the map redraws many times a second.
+    ///
+    /// The key carries the box because the picture is turned STRAIGHT INTO
+    /// the box it is drawn in, so a picture turned for one zoom is not the
+    /// picture for another.
+    turned_pics: HashMap<(i64, u32, u32, u16), Arc<gpui::RenderImage>>,
+    /// How many bytes the turned pictures are holding, so the cache can be
+    /// emptied before it grows into the machine's memory.
+    turned_bytes: usize,
+    /// The turned pictures the cache has given up, retired at the top of the
+    /// next frame — retiring a picture needs the window, and the cache is
+    /// emptied in the middle of a paint.
+    turned_retired: Vec<Arc<gpui::RenderImage>>,
     /// Whether the ROSTER SHEET is the subject instead of the console.
     ///
     /// A field, not `std::env::var("SHEET")` read in `render`. The env read
@@ -3167,6 +3187,20 @@ impl IslandDemo {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(session.zoom)
             .clamp(ZOOM_MIN, ZOOM_MAX);
+        // The camera's opening CENTRE, the other half of `TFG_ZOOM`. The
+        // console opens on one place, and a capture of a hull somewhere else
+        // is a capture of the water: the centre is pinned so the picture is
+        // of the thing the seed named.
+        let map_center = std::env::var("TFG_CENTER")
+            .ok()
+            .and_then(|v| {
+                let (lat, lon) = v.trim().split_once(',')?;
+                Some((
+                    lat.trim().parse::<f64>().ok()?,
+                    lon.trim().parse::<f64>().ok()?,
+                ))
+            })
+            .unwrap_or(map_geometry::MAP_CENTER);
         // Seeded relate-open for a headless capture, with the working set the
         // open would have built from the session's read. Same precedent as
         // the panels: pin the state, never the gesture.
@@ -3342,8 +3376,8 @@ impl IslandDemo {
             // the map's own centre and zoom, the same numbers the binary
             // hands the map thread. The first frame replaces these with
             // what it was actually rendered at.
-            map_center: (map_geometry::MAP_CENTER.0, map_geometry::MAP_CENTER.1),
-            map_render_center: (map_geometry::MAP_CENTER.0, map_geometry::MAP_CENTER.1),
+            map_center: (map_center.0, map_center.1),
+            map_render_center: (map_center.0, map_center.1),
             map_render_zoom: map_geometry::MAP_ZOOM,
             map_req_at: std::time::Instant::now(),
             map_req_pending: false,
@@ -3565,6 +3599,9 @@ impl IslandDemo {
             unit_drag: None,
             course_turn: None,
             staged_courses_pending: BTreeMap::new(),
+            turned_pics: HashMap::new(),
+            turned_bytes: 0,
+            turned_retired: Vec::new(),
             // The seeded pointer, which two comments in this file already
             // promised and nothing ever read. It exists because the lit edge
             // is the whole state language of the new panel silhouette, and a
@@ -16215,16 +16252,135 @@ impl IslandDemo {
 
     /// How far a hull's own ink reaches from its centre, in window pixels.
     ///
-    /// The picture's own length when it has one — a ship is as long as it is
-    /// long — and the symbol box when it does not.
+    /// The picture's own DIAGONAL when it has one — a ship is as long as it
+    /// is long, and it is as wide as it is wide — and the symbol box when it
+    /// does not.
     fn mark_reach(&self, lat: f64, unit_id: i64, s: f32) -> f32 {
-        if let Some((_, (loa, _))) = portrait(&self.thumbs, &self.hull_sizes, unit_id, self.map_zoom)
+        if let Some((_, (loa, beam))) =
+            portrait(&self.thumbs, &self.hull_sizes, unit_id, self.map_zoom)
         {
             let mpp = map_geometry::meters_per_pixel(lat, self.map_zoom);
             let length_px = (loa / mpp) as f32 * s;
-            return (length_px / 2.0).max(MARK_BOX_PX / 2.0);
+            let beam_px = (beam / mpp) as f32 * s;
+            // The picture's DIAGONAL, halved. A picture turned on a course
+            // keeps its diagonal, so the ring the map draws around a hull is
+            // the same size whichever way the hull points — an instrument
+            // that breathed with the course would be an instrument the
+            // operator could not trust.
+            return 0.5 * length_px.hypot(beam_px).max(MARK_BOX_PX / 2.0);
         }
         MARK_BOX_PX / 2.0
+    }
+
+    /// The pictures the map draws this frame, TURNED on their courses.
+    ///
+    /// A hull's photograph points east as it arrives, and a hull on a course
+    /// points where it is going: the picture is turned, and the turning
+    /// happens here — in the shell, which owns the cache — because the
+    /// canvas closure cannot reach the console's state.
+    ///
+    /// The turned picture is drawn into the box the turn opens up, so the
+    /// map says where the hull IS rather than where it was. The NATO symbol
+    /// is not touched: the frame and the glyph are the console's own
+    /// symbology and they stay on the axes, because a frame that turned with
+    /// the hull would be a frame saying which way the hull points, and the
+    /// frame says which side it is on.
+    fn turned_pictures(
+        &mut self,
+        s: f32,
+        zoom: f64,
+    ) -> HashMap<i64, (Arc<gpui::RenderImage>, f32, f32)> {
+        let mut wanted: Vec<(i64, Option<f32>, f64)> = Vec::new();
+        for m in &self.live {
+            let Ok(uid) = m.id.parse::<i64>() else { continue };
+            wanted.push((uid, m.heading_deg, m.latitude));
+        }
+        for mark in self.planned_marks() {
+            wanted.push((mark.unit_id, mark.course_deg, mark.lat));
+        }
+        let mut turned = HashMap::new();
+        for (uid, course, lat) in wanted {
+            // No course, no turn: a hull nobody has given a heading to is
+            // drawn on the asset's own axis, because an unknown heading is
+            // not north.
+            let Some(course) = course else { continue };
+            let Some((loa, beam)) = self.hull_sizes.get(&uid).copied() else {
+                continue;
+            };
+            let mpp = map_geometry::meters_per_pixel(lat, zoom);
+            let length_px = (loa / mpp) as f32 * s;
+            let beam_px = (beam / mpp) as f32 * s;
+            if let Some(picture) = self.turned_picture(uid, course, length_px, beam_px) {
+                turned.insert(uid, picture);
+            }
+        }
+        // The cache is a CACHE. When it grows past its budget it is emptied,
+        // and the pictures it held are retired — an atlas that kept every
+        // turn of every hull would be the console's largest memory by far.
+        // The retirement itself needs the window, so the pictures are handed
+        // over and given up at the top of the next frame.
+        if self.turned_bytes > TURNED_BYTES_MAX {
+            let old: Vec<Arc<gpui::RenderImage>> =
+                self.turned_pics.drain().map(|(_, image)| image).collect();
+            self.turned_bytes = 0;
+            self.turned_retired.extend(old);
+        }
+        turned
+    }
+
+    /// One hull's picture, turned on its course.
+    ///
+    /// The turn is by the course less a quarter turn, because the asset's
+    /// bow points to the image's +X edge: a hull on 090 is drawn exactly as
+    /// the picture arrives.
+    ///
+    /// The picture is turned STRAIGHT INTO the size it is seen, so the
+    /// console never holds a turned picture bigger than the box it goes
+    /// into, and the turning is a sampling rather than a rotate-and-resize.
+    fn turned_picture(
+        &mut self,
+        unit_id: i64,
+        course: f32,
+        length_px: f32,
+        beam_px: f32,
+    ) -> Option<(Arc<gpui::RenderImage>, f32, f32)> {
+        let photo = self.thumbs.get(&unit_id)?.clone();
+        let (w, h) = (photo.size(0).width.0 as u32, photo.size(0).height.0 as u32);
+        // A degree is a degree: the picture is turned on the whole degree
+        // the course names, and a picture a third of a degree off the
+        // needle is a picture nobody can see the difference in.
+        let degree = course.round().rem_euclid(360.0) as u16;
+        let theta = degree as f32 - 90.0;
+        // The box the turn opens up, on the screen.
+        let (tw, th) = thumb_rotate::turned_size(length_px, beam_px, theta);
+        // The raster: turned straight into the size it is seen, and capped,
+        // so a hull a kilometre long does not cost a megabyte of pixels.
+        let fit = (TURNED_RASTER_MAX / tw.max(th)).min(1.0);
+        let (rw, rh) = (
+            (tw * fit).round().max(1.0) as u32,
+            (th * fit).round().max(1.0) as u32,
+        );
+        let key = (unit_id, rw, rh, degree);
+        let image = match self.turned_pics.get(&key) {
+            Some(image) => image.clone(),
+            None => {
+                let src = photo.as_bytes(0)?;
+                // The picture's own scale: how many of the picture's pixels
+                // cover one screen pixel. They differ when the picture's
+                // proportions differ from the hull's published ones, and the
+                // map draws the hull at the published size, so the picture
+                // is stretched to those proportions BEFORE it is turned.
+                let kx = w as f32 / length_px;
+                let ky = h as f32 / beam_px;
+                let pixels = thumb_rotate::turn_to_size(src, w, h, theta, rw, rh, kx, ky)?;
+                let buffer = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(rw, rh, pixels)?;
+                let image = Arc::new(gpui::RenderImage::new([image::Frame::new(buffer)]));
+                self.turned_bytes += (rw as usize) * (rh as usize) * 4;
+                self.turned_pics.insert(key, image.clone());
+                image
+            }
+        };
+        Some((image, tw, th))
     }
 
     /// The frame fractions a window position points at.
@@ -19665,6 +19821,10 @@ impl IslandDemo {
         // The rotator belongs to the DRAFT: a staged hull is the operator's
         // own mark, and a course is a thing a draft can carry.
         let staging = self.staging();
+        // The pictures, TURNED on their courses. Prepared in the shell,
+        // because the canvas closure cannot reach the console's state and
+        // the turning needs it.
+        let turned = self.turned_pictures(s, self.map_zoom);
         // Cloned out of `self`: the canvas closure is `move`, and holding a
         // borrow of the live list across the paint pass would fight the
         // element build. Each marker is projected HERE, in the shell, from
@@ -19746,22 +19906,36 @@ impl IslandDemo {
                             let mpp = map_geometry::meters_per_pixel(m.latitude, zoom);
                             let length_px = (loa / mpp) as f32 * s;
                             let beam_px = (beam / mpp) as f32 * s;
+                            // THE PICTURE FOLLOWS THE COURSE. A hull's
+                            // photograph points east as it arrives, and a
+                            // hull on a course points where it is going, so
+                            // the picture is turned on the heading — and it
+                            // is drawn into the box the turn opens up, so
+                            // the ship is where it says it is.
+                            let (image, w, h) = match turned.get(&uid) {
+                                Some((image, w, h)) => (image.clone(), *w, *h),
+                                None => (photo.clone(), length_px, beam_px),
+                            };
                             let b = Bounds::new(
-                                point(px(cx - length_px / 2.0), px(cy - beam_px / 2.0)),
-                                size(px(length_px), px(beam_px)),
+                                point(px(cx - w / 2.0), px(cy - h / 2.0)),
+                                size(px(w), px(h)),
                             );
                             // The corner radius scales with the photograph: a
                             // fixed 4 px on a 3 px-tall ship would round it
                             // into a capsule.
-                            let r = px(length_px.min(beam_px).min(8.0) / 2.0);
+                            let r = px(w.min(h).min(8.0) / 2.0);
                             let _ = window.paint_image(
                                 b,
                                 Corners::all(r),
-                                photo.clone(),
+                                image,
                                 0,
                                 false,
                             );
-                            reach = (length_px / 2.0).max(MARK_BOX_PX / 2.0);
+                            // The picture's DIAGONAL, halved: a picture
+                            // turned on a course keeps its diagonal, so the
+                            // ring the map draws around the hull is the
+                            // same size whichever way the hull points.
+                            reach = 0.5 * length_px.hypot(beam_px).max(MARK_BOX_PX / 2.0);
                             pictured = true;
                         }
                     }
@@ -19812,21 +19986,27 @@ impl IslandDemo {
                         let mpp = map_geometry::meters_per_pixel(mark.lat, zoom);
                         let length_px = (loa / mpp) as f32 * s;
                         let beam_px = (beam / mpp) as f32 * s;
+                        // The picture follows the staged course, as a live
+                        // hull's picture follows the wire's heading.
+                        let (image, w, h) = match turned.get(&mark.unit_id) {
+                            Some((image, w, h)) => (image.clone(), *w, *h),
+                            None => (photo.clone(), length_px, beam_px),
+                        };
                         let b = Bounds::new(
-                            point(px(cx - length_px / 2.0), px(cy - beam_px / 2.0)),
-                            size(px(length_px), px(beam_px)),
+                            point(px(cx - w / 2.0), px(cy - h / 2.0)),
+                            size(px(w), px(h)),
                         );
                         // The radius scales with the picture, as a live
                         // hull's does — see the live site above.
-                        let r = px(length_px.min(beam_px).min(8.0) / 2.0);
+                        let r = px(w.min(h).min(8.0) / 2.0);
                         let _ = window.paint_image(
                             b,
                             Corners::all(r),
-                            photo.clone(),
+                            image,
                             0,
                             false,
                         );
-                        reach = (length_px / 2.0).max(MARK_BOX_PX / 2.0);
+                        reach = 0.5 * length_px.hypot(beam_px).max(MARK_BOX_PX / 2.0);
                     } else {
                         paint_frame(
                             window,
@@ -19915,6 +20095,23 @@ const ROTATOR_KNOB_INSET: f32 = 6.0;
 /// degrees away from the one it meant, and a hull that snaps to a course
 /// nobody chose is worse than a hull that does not turn at all.
 const COURSE_DEAD_PX: f32 = 4.0;
+
+/// The longest side of a turned picture's raster, in pixels.
+///
+/// The picture is turned straight into the size it is seen, so the raster is
+/// the size it is drawn at — and a hull a kilometre long at the console's
+/// deepest zoom would be a million pixels of picture for a mark a few
+/// hundred across. The cap costs sharpness on a hull that size and nothing
+/// else.
+const TURNED_RASTER_MAX: f32 = 512.0;
+
+/// How many bytes the turned pictures may hold before the cache is emptied.
+///
+/// A turn is a new picture, and a drag across a course is a turn a degree
+/// at a time, so the cache grows while the operator works. It is a cache:
+/// past its budget it is emptied, and the pictures it held give their
+/// sprite-atlas tiles back.
+const TURNED_BYTES_MAX: usize = 4 * 1024 * 1024;
 
 /// A hull the operator has placed on the map and the wire has not named yet.
 ///
@@ -20168,10 +20365,13 @@ fn paint_rotator(
         return;
     }
     let (cx, cy) = center;
+    // THE GOLD, not the cyan. The cyan is the console's only accent and it
+    // means "live or yours"; a course being turned is the operator's DRAFT
+    // and it is an INSTRUMENT, not a state. The map's own ink for it.
     let face = if armed {
-        RADAR_CYAN.with_alpha(210)
+        INSTRUMENT_GOLD.with_alpha(235)
     } else {
-        RADAR_CYAN.with_alpha(140)
+        INSTRUMENT_GOLD.with_alpha(165)
     };
     // The rim: a hairline, the same weight as the rail's own rules.
     let mut ring = PathBuilder::stroke(px(1.0));
@@ -20230,13 +20430,13 @@ fn paint_rotator(
             window,
             (cx, cy - r + ROTATOR_KNOB_INSET),
             4.5,
-            RADAR_CYAN.with_alpha(90),
+            INSTRUMENT_GOLD.with_alpha(110),
         );
         return;
     };
     let screen = (course - 90.0).to_radians();
     let (dx, dy) = (screen.cos(), screen.sin());
-    let needle = if armed { RADAR_CYAN } else { RADAR_CYAN.with_alpha(190) };
+    let needle = if armed { INSTRUMENT_GOLD } else { INSTRUMENT_GOLD.with_alpha(215) };
     let mut shaft = PathBuilder::stroke(px(2.0));
     shaft.move_to(point(px(cx), px(cy)));
     shaft.line_to(point(px(cx + dx * (r - 4.0)), px(cy + dy * (r - 4.0))));
@@ -20593,6 +20793,12 @@ impl Render for IslandDemo {
     // rather than by boxing at every return site.
     #[allow(refining_impl_trait)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // The turned pictures the cache has given up are retired HERE, at
+        // the top of the frame: retiring a picture needs the window, and the
+        // cache is emptied in the middle of a paint.
+        for image in std::mem::take(&mut self.turned_retired) {
+            cx.drop_image(image, Some(window));
+        }
         // The helm's instruments settle on their own clock, not on the map's:
         // the map's frame is a frame every half second on a software
         // rasteriser, and a needle that moves in half-second steps is not

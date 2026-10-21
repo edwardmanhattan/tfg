@@ -135,6 +135,17 @@ pub const IDLE_GREY: Rgba = Rgba::rgb(0x80, 0x80, 0x80);
 pub const DATA_AMBER: Rgba = Rgba::rgb(0xF5, 0x9E, 0x0B);
 /// Attention without fault.
 pub const ALERT_YELLOW: Rgba = Rgba::rgb(0xFF, 0xFF, 0x00);
+/// The map's own INSTRUMENT: a course the operator is turning.
+///
+/// NOT the cyan. The cyan is the console's only accent and it means "live
+/// or yours" (the One Signal Rule), and a course being set is neither: it
+/// is the operator's DRAFT, drawn as an instrument rather than as a state.
+/// A warm gold says "this is yours, and it is not yet an order", and it is
+/// the one ink on the map that says so.
+///
+/// It is not a status ink and it is not a rank: nothing reports state in it
+/// and no group wears it.
+pub const INSTRUMENT_GOLD: Rgba = Rgba::rgb(0xF2, 0xC1, 0x4C);
 
 /// The group-rank palette. Categorical, map-only, barred from chrome: a rank
 /// colour on a panel is a bug, not a style.

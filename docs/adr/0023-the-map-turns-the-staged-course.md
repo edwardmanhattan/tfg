@@ -66,6 +66,18 @@ hull the hand is on.**
   can read the other without being told which is which. No needle means no
   course: an unknown heading is not north, and a needle pointing up would say
   it was.
+- **THE ROTATOR IS GOLD, and the picture turns with the course.** The cyan
+  is the console's only accent and it means "live or yours" (the One Signal
+  Rule); a course being turned is the operator's DRAFT, so the instrument
+  wears the map's own gold (`INSTRUMENT_GOLD`) — a colour that says "yours,
+  and not yet an order".
+  - The hull's photograph FOLLOWS the course: a hull on 115 is drawn on
+    115. GPUI 0.2.2 cannot turn a picture at paint time, so the console
+    turns the raster (`thumb_rotate`), straight into the box it is drawn in.
+  - The NATO symbol does NOT turn. The affiliation frame and the taxonomy
+    glyph stay on the axes: the frame says which SIDE the hull is on, and a
+    frame that turned with the hull would be a frame saying which way the
+    hull points, which is the needle's job.
 - **A drag on a staged hull is a LOCAL act** while planning, like every
   other draft edit (ADR-0017): the hull's staged position moves in the
   draft and nothing is posted. In a static exercise the same gesture
@@ -100,7 +112,9 @@ hull the hand is on.**
   there are three seeds: `TFG_MAP_HOVER` names the hull the pointer is over,
   `TFG_MAP_PRESS` the hull it is holding, and `TFG_COURSE` ("<unit
   id>:<degrees>") stages a course. The same precedent as `TFG_POINTER` and
-  `TFG_SEL`: pin the state, never the gesture.
+  `TFG_SEL`: pin the state, never the gesture. `TFG_CENTER` ("<lat>,<lon>")
+  pins the camera beside `TFG_ZOOM`, because a capture of a hull somewhere
+  else is a capture of the water.
 
 ## Verified
 
@@ -109,10 +123,16 @@ hull placed:
 
 - The staged position is in the draft and in the Inspector: "POSITION
   -6.0800, 106.9000 (staged)".
-- The rotator is drawn around the selected staged hull, with the north
-  wedge, the cardinal graduations, the needle and the knob at its tip; the
-  knob sits at the rim's top when no course is staged, because the knob is
-  the handle and a handle nobody can see is a handle nobody grabs.
+- The rotator is drawn around the selected staged hull, in the gold, with the
+  north wedge, the cardinal graduations, the needle and the knob at its tip;
+  the knob sits at the rim's top when no course is staged, because the knob
+  is the handle and a handle nobody can see is a handle nobody grabs.
+- The staged course turns the PHOTOGRAPH: at a staged 115 the KRI Ahmad
+  Yani is drawn on 115, its bow along the needle, and the Inspector reads
+  "COURSE 115° (staged)".
+- A LIVE hull's photograph follows the WIRE's heading: a hull whose fix
+  reads 336 is drawn on 336, and the selection reticle around it stays on
+  the axes.
 - The hover ink is a dim ring on the hull under the pointer, the press ink
   a bright one on the hull the hand is holding, and the rotator's rim
   stands clear of both, so the three never read as one thing said twice.

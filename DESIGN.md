@@ -351,6 +351,10 @@ from chrome.
 - **Gugus Purple** (#9333EA): rank 3 zone.
 - **Operasi Gabungan Orange** (#EA580C): rank 4 zone. Zones paint highest
   rank first so lower ranks layer over them.
+- **Instrument Gold** (#F2C14C): the map's own instrument — the compass that
+  turns a hull's course. It is not the cyan, because the cyan means "live or
+  yours" and a course being set is a draft, not a state. It is not a status
+  ink and not a rank.
 
 ### Status & Signal
 Every state line routes through one function, so state is never gray on gray.
