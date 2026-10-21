@@ -277,6 +277,43 @@ fn plural(n: usize, noun: &str) -> String {
     }
 }
 
+/// The course a pointer names, read from the hub of a hull's rotator.
+///
+/// The compass convention, unchanged: 0° is UP, 90° is RIGHT, and the
+/// reading is the pointer's angle plus a quarter turn — the same arithmetic
+/// the rail's dial reads a drag with.
+///
+/// `None` inside the dead zone: a pointer a pixel off the hub names a course
+/// a hundred degrees away from the one it meant, and a hull that snaps to a
+/// course nobody chose is worse than a hull that does not turn at all.
+fn course_at(hub: (f32, f32), at: (f32, f32)) -> Option<f32> {
+    let (dx, dy) = (at.0 - hub.0, at.1 - hub.1);
+    if dx.hypot(dy) < COURSE_DEAD_PX {
+        return None;
+    }
+    Some((dy.atan2(dx).to_degrees() + 90.0).rem_euclid(360.0))
+}
+
+/// The sentence the console says about the staged courses it has just sent.
+///
+/// It says what went out AND what did not: a course the server will not
+/// take is a PLAN, and a plan the operator cannot see is a plan they will
+/// believe is an order.
+fn course_sentence(posted: usize, unplanned: &[String]) -> String {
+    let mut sentence = match posted {
+        0 => "no staged course went out".to_string(),
+        n => format!("{} went out", plural(n, "staged course")),
+    };
+    if !unplanned.is_empty() {
+        let names = unplanned.join(", ");
+        let them = if unplanned.len() == 1 { "it" } else { "them" };
+        sentence.push_str(&format!(
+            " \u{2014} {names} stay in the plan: you do not command {them}"
+        ));
+    }
+    sentence
+}
+
 /// The server's own timestamp, trimmed to what an operator reads at a
 /// glance.
 ///
@@ -1151,6 +1188,41 @@ struct IslandDemo {
     /// because a drag that starts on a hull must not change what the
     /// operator has selected.
     pick_made: Option<Option<String>>,
+    /// The hull the pointer is over, for the map's own ink.
+    ///
+    /// The map has no per-hull elements — the marks are painted into one
+    /// canvas — so the console answers "what is under the pointer" with the
+    /// same geometry the painter used, and this is where that answer is
+    /// kept. It is a CLAIM about the pointer, so it is cleared the moment
+    /// the pointer leaves the map.
+    map_hover: Option<String>,
+    /// Whether the pointer is over the map at all.
+    ///
+    /// The map surface is a full-window hitbox, so "over the map" is not the
+    /// same question as "over the map surface": a panel drawn on top takes
+    /// the pointer, and a hull under that panel is not under the pointer.
+    map_hot: bool,
+    /// The hull a press landed on.
+    ///
+    /// The press's own answer, and the reason the map says a hull is being
+    /// clicked: a hull that is under a held button is a hull the operator
+    /// has their hand on, and the map says so in ink.
+    press_unit: Option<String>,
+    /// The hull a press is dragging across the map.
+    ///
+    /// `moved` is whether the press has travelled far enough to be a drag
+    /// rather than a click: a click on a hull selects it and nothing else.
+    unit_drag: Option<UnitDrag>,
+    /// The hull whose staged course is being turned.
+    course_turn: Option<i64>,
+    /// The staged courses that are waiting for a SPEED to be posted with.
+    ///
+    /// A helm order is a heading AND a speed, and a speed of zero is Hold
+    /// position: it keeps the last accepted heading rather than taking the
+    /// one asked for. So a course cannot go out without a speed to carry it,
+    /// and a hull whose published speed the console has not read yet waits
+    /// here until the read lands.
+    staged_courses_pending: BTreeMap<i64, f32>,
     /// Whether the ROSTER SHEET is the subject instead of the console.
     ///
     /// A field, not `std::env::var("SHEET")` read in `render`. The env read
@@ -3302,6 +3374,12 @@ impl IslandDemo {
             spec_asked: Vec::new(),
             press_at: None,
             pick_made: None,
+            map_hover: None,
+            map_hot: false,
+            press_unit: None,
+            unit_drag: None,
+            course_turn: None,
+            staged_courses_pending: BTreeMap::new(),
             // The seeded pointer, which two comments in this file already
             // promised and nothing ever read. It exists because the lit edge
             // is the whole state language of the new panel silhouette, and a
@@ -3354,6 +3432,35 @@ impl IslandDemo {
         // plan was made. Nothing is staged at construction, so this discards
         // nothing — see `reseed_drafts`.
         demo.reseed_drafts();
+        // The map's own ink, seeded for a headless capture: `TFG_MAP_HOVER`
+        // names the hull the pointer is over and `TFG_MAP_PRESS` the hull it
+        // is holding. The same precedent as `TFG_POINTER` — pin the state,
+        // never the gesture — because the compositor's synthetic pointer is
+        // not reliable here, and a photograph of a console that is not
+        // saying which hull the hand is on is not evidence about the ink
+        // that says it.
+        let seeded_hover = std::env::var("TFG_MAP_HOVER")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let seeded_press = std::env::var("TFG_MAP_PRESS")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        // `TFG_COURSE` is "<unit id>:<degrees>" — the staged course a
+        // capture is photographing, so the rotator can be seen with its
+        // needle on it.
+        let seeded_course = std::env::var("TFG_COURSE").ok().and_then(|v| {
+            let (id, deg) = v.trim().split_once(':')?;
+            let id: i64 = id.trim().parse().ok()?;
+            let deg: f32 = deg.trim().parse().ok()?;
+            Some((id, deg))
+        });
+        if let Some((id, deg)) = seeded_course {
+            demo.force.set_course(id, Some(deg));
+        }
+        demo.map_hover = seeded_hover;
+        demo.press_unit = seeded_press;
         // The composer's degree comes from the server's catalogue, so it is
         // seeded here rather than hard-coded: a deployment that renumbers
         // its degrees keeps working.
@@ -7910,6 +8017,89 @@ impl IslandDemo {
         self.session.mine.first()
     }
 
+    /// Post the staged courses, now that the exercise is playing.
+    ///
+    /// Minos's PLACEMENT write takes a latitude and a longitude and nothing
+    /// else, so a course staged on the map has no write of its own: a helm
+    /// order is the only thing the server accepts that carries one, and the
+    /// server refuses helm orders until the exercise is playing. The advance
+    /// into execution is that moment.
+    ///
+    /// WHO IT REACHES. A helm order is refused for a hull the caller does
+    /// not command, and the Game Master who runs the exercise commands no
+    /// ship in it — so the staged course of somebody else's hull is a PLAN,
+    /// and the console names it rather than letting the map claim a course
+    /// the exercise does not carry.
+    ///
+    /// THE SPEED. A helm order is a heading AND a speed, and a speed of zero
+    /// is Hold position: it keeps the last accepted heading rather than
+    /// taking the one asked for. So a course goes out with the hull's own
+    /// published speed, and a hull whose speed the console has not read yet
+    /// WAITS — the read is asked for, and the course goes out when it lands.
+    fn post_staged_courses(&mut self) {
+        let staged: Vec<(i64, String, f32)> = self
+            .force
+            .hulls()
+            .filter_map(|h| h.course_deg.map(|c| (h.unit_id, h.name.clone(), c)))
+            .collect();
+        if staged.is_empty() {
+            return;
+        }
+        if !self.helm_offered() {
+            self.staged_courses_pending.clear();
+            self.force_status = Status::bad(
+                "the staged courses stay in the plan \u{2014} this exercise takes no helm orders"
+                    .to_string(),
+            );
+            return;
+        }
+        let own = self.own_unit_ids();
+        let mut waiting: BTreeMap<i64, f32> = BTreeMap::new();
+        let mut unplanned: Vec<String> = Vec::new();
+        let mut posted = 0usize;
+        for (unit_id, name, course) in staged {
+            if !own.contains(&unit_id) {
+                unplanned.push(name);
+                continue;
+            }
+            match self.published_speed_kn(unit_id) {
+                Some(speed) => {
+                    let _ = self.order_tx.send(ToBinary::Helm(HelmOrder {
+                        unit_id: unit_id.to_string(),
+                        heading_deg: course,
+                        speed_kn: speed,
+                    }));
+                    posted += 1;
+                }
+                None => {
+                    // The speed is not known yet: the read is asked for, and
+                    // the course waits for the answer.
+                    self.ask_about_unit(&unit_id.to_string());
+                    waiting.insert(unit_id, course);
+                }
+            }
+        }
+        self.staged_courses_pending = waiting;
+        self.force_status = Status::good(course_sentence(posted, &unplanned));
+    }
+
+    /// A hull's published speed, in knots — the speed a course can be posted
+    /// with.
+    ///
+    /// The cruise figure when the register published one, and the maximum
+    /// when it published only that: the server clamps the speed to the
+    /// hull's own maximum anyway, so a figure within the range is enough.
+    /// `None` is a real answer — a hull nothing has published a speed for
+    /// cannot carry a course, and a course posted with an invented speed
+    /// would be a lie about the hull.
+    fn published_speed_kn(&self, unit_id: i64) -> Option<f32> {
+        let spec = self.unit_specs.get(&unit_id)?;
+        spec.cruise_kn
+            .or(spec.speed_kn)
+            .filter(|s| *s > 0.0)
+            .map(|s| s as f32)
+    }
+
     /// Send the drafted helm order for the commanded hull — the shell's one
     /// WRITE.
     ///
@@ -8184,6 +8374,7 @@ impl IslandDemo {
                 start: None,
                 commander_id: Some(commander_id),
                 host: None,
+                course_deg: None,
             });
             self.force = draft;
         }
@@ -8487,6 +8678,7 @@ impl IslandDemo {
                 // limitation belongs: at the sync, not in the draft.
                 commander_id: None,
                 host: None,
+                course_deg: None,
             });
             self.force = draft;
         }
@@ -8520,6 +8712,7 @@ impl IslandDemo {
                 // later; the advance is where the backend's rule applies.
                 commander_id: None,
                 host: None,
+                course_deg: None,
             });
             self.force = draft;
         }
@@ -8804,7 +8997,7 @@ impl IslandDemo {
     /// A hull whose fix is already on the wire is SKIPPED: the live marker is
     /// the truth about where it is, and two frames over one hull would be two
     /// answers.
-    fn planned_marks(&self) -> Vec<(f64, f64, MapSymbolShape, i64, f64)> {
+    fn planned_marks(&self) -> Vec<PlannedMark> {
         let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
         if mw <= 0.0 || mh <= 0.0 {
             return Vec::new();
@@ -8824,7 +9017,17 @@ impl IslandDemo {
                     mw,
                     mh,
                 );
-                Some((x, y, self.fleet_symbol(h.unit_id), h.unit_id, lat))
+                Some(PlannedMark {
+                    x,
+                    y,
+                    shape: self.fleet_symbol(h.unit_id),
+                    unit_id: h.unit_id,
+                    lat,
+                    // The course the operator staged for this hull, if they
+                    // have turned one. The draft's own value: the wire has
+                    // never heard of this hull.
+                    course_deg: h.course_deg,
+                })
             })
             .collect()
     }
@@ -15592,8 +15795,8 @@ impl IslandDemo {
             let (mx, my) = self.marker_frame_px(m);
             take(&mut best, mx, my, m.id.clone());
         }
-        for (x, y, _shape, unit_id, _lat) in self.planned_marks() {
-            take(&mut best, x, y, unit_id.to_string());
+        for mark in self.planned_marks() {
+            take(&mut best, mark.x, mark.y, mark.unit_id.to_string());
         }
         best.map(|(_, id)| id)
     }
@@ -15636,6 +15839,339 @@ impl IslandDemo {
             self.selected = i;
         }
         cx.notify();
+    }
+
+    /// The unit under a window position, if any — WITHOUT selecting it.
+    ///
+    /// The same geometry the press uses to select, so the map's hover ink and
+    /// the map's pick can never disagree about which hull is under the
+    /// pointer: one hit test, two callers.
+    fn unit_under_pointer(&self, x: f32, y: f32, win_w: f32, win_h: f32) -> Option<String> {
+        if win_w <= 0.0 || win_h <= 0.0 {
+            return None;
+        }
+        let (fx, fy) = window_fraction_to_frame(
+            f64::from(x / win_w),
+            f64::from(y / win_h),
+            f64::from(self.map_dims.0),
+            f64::from(self.map_dims.1),
+            f64::from(win_w),
+            f64::from(win_h),
+        );
+        // The pick radius is a distance on the SCREEN, so it is converted
+        // into the frame's own pixels: a hull is as easy to point at at one
+        // zoom as at another.
+        let (s, _, _) = map_view(
+            f64::from(self.map_dims.0),
+            f64::from(self.map_dims.1),
+            f64::from(win_w),
+            f64::from(win_h),
+        );
+        let radius = if s > 0.0 { f64::from(UNIT_PICK_PT) / s } else { 0.0 };
+        self.unit_at(fx, fy, radius)
+    }
+
+    /// The hull a press may DRAG, if the pointer is on one.
+    ///
+    /// TWO KINDS OF HULL, AND THE RULES ARE DIFFERENT.
+    ///
+    /// While PLANNING the hull is the operator's own draft mark: dragging it
+    /// moves the staged position, and the draft is local, so nothing is
+    /// posted until the advance writes it through.
+    ///
+    /// In a STATIC EXERCISE the hull is on the wire and its position is set
+    /// by hand (ADR-0021): dragging it previews the position to the other
+    /// boards and commits it on the release. The gate is the HULL'S OWN, the
+    /// same gate the write clears: a commander moves the hulls they command.
+    ///
+    /// Anywhere else a hull is not something a pointer moves: in a maneuver
+    /// exercise a position is the result of an order, not of a drag, and a
+    /// map that let a drag move a hull would say a thing the server will
+    /// refuse.
+    fn draggable_at(&self, x: f32, y: f32, win_w: f32, win_h: f32) -> Option<i64> {
+        let (fx, fy) = self.frame_at(x, y, win_w, win_h);
+        let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
+        let (px, py) = (fx * mw, fy * mh);
+        // The pick radius is a distance on the SCREEN, so it is converted
+        // into the frame's own pixels: a hull is as easy to point at at one
+        // zoom as at another.
+        let (s, _, _) = map_view(
+            mw,
+            mh,
+            f64::from(win_w),
+            f64::from(win_h),
+        );
+        let radius = if s > 0.0 { f64::from(UNIT_PICK_PT) / s } else { 0.0 };
+        let nearest = |candidates: Vec<(f64, f64, i64)>| {
+            let mut best: Option<(f64, i64)> = None;
+            for (cx, cy, id) in candidates {
+                let d = (cx - px).hypot(cy - py);
+                if d <= radius && best.as_ref().map_or(true, |(bd, _)| d < *bd) {
+                    best = Some((d, id));
+                }
+            }
+            best.map(|(_, id)| id)
+        };
+        if self.staging() {
+            // The operator's own marks. A staged hull is a draft entry with a
+            // position, so the draft is the list to ask.
+            return nearest(
+                self.planned_marks()
+                    .into_iter()
+                    .map(|m| (m.x, m.y, m.unit_id))
+                    .collect(),
+            );
+        }
+        if self.positions_set_by_hand() {
+            // The hulls this seat commands, on the wire.
+            let own = self.own_unit_ids();
+            return nearest(
+                self.live
+                    .iter()
+                    .filter_map(|m| {
+                        let uid = m.id.parse::<i64>().ok()?;
+                        if !own.contains(&uid) {
+                            return None;
+                        }
+                        let (mx, my) = self.marker_frame_px(m);
+                        Some((mx, my, uid))
+                    })
+                    .collect(),
+            );
+        }
+        None
+    }
+
+    /// The hull whose ROTATOR KNOB the pointer is on, if any.
+    ///
+    /// The knob stands clear of the hull's own body, so it is tested FIRST:
+    /// a press on the knob is a press on the handle, and reading it as a
+    /// press on the hull would start a move where a turn was meant.
+    fn rotator_grab_at(&self, x: f32, y: f32, win_w: f32, win_h: f32) -> Option<i64> {
+        if !self.staging() {
+            return None;
+        }
+        let selected = self.selected_unit.as_deref()?;
+        let hull = self.map_hulls(win_w, win_h).into_iter().find(|h| {
+            h.staged && h.unit_id.to_string() == selected
+        })?;
+        let (kx, ky) = self.rotator_knob(&hull);
+        if (x - kx).hypot(y - ky) <= ROTATOR_GRAB_PX {
+            Some(hull.unit_id)
+        } else {
+            None
+        }
+    }
+
+    /// The knob of a hull's rotator, in window pixels: the handle at the
+    /// needle's tip.
+    ///
+    /// A hull with no staged course has no needle, and its knob sits at the
+    /// top of the rim — the handle's home, and not a claim that the hull
+    /// points north.
+    fn rotator_knob(&self, hull: &MapHull) -> (f32, f32) {
+        let r = hull.reach + ROTATOR_CLEAR_PX - ROTATOR_KNOB_INSET;
+        let course = hull.course_deg.unwrap_or(0.0);
+        let screen = (course - 90.0).to_radians();
+        (
+            hull.x + screen.cos() * r,
+            hull.y + screen.sin() * r,
+        )
+    }
+
+    /// Every hull the map draws, in WINDOW pixels.
+    ///
+    /// ONE list, read by the painter and by the pointer's hit tests, so the
+    /// ring the map draws around a hull and the ring the press finds are
+    /// the same ring.
+    fn map_hulls(&self, win_w: f32, win_h: f32) -> Vec<MapHull> {
+        let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
+        if mw <= 0.0 || mh <= 0.0 || win_w <= 0.0 || win_h <= 0.0 {
+            return Vec::new();
+        }
+        let (s, ox, oy) = map_view(mw, mh, f64::from(win_w), f64::from(win_h));
+        let s = s as f32;
+        let (ox, oy) = (ox as f32, oy as f32);
+        let mut hulls = Vec::new();
+        for m in &self.live {
+            let (mx, my) = self.marker_frame_px(m);
+            let uid = m.id.parse::<i64>().unwrap_or_default();
+            hulls.push(MapHull {
+                unit_id: uid,
+                x: ox + mx as f32 * s,
+                y: oy + my as f32 * s,
+                reach: self.mark_reach(m.latitude, uid, s),
+                staged: false,
+                course_deg: m.heading_deg,
+            });
+        }
+        for mark in self.planned_marks() {
+            hulls.push(MapHull {
+                unit_id: mark.unit_id,
+                x: ox + mark.x as f32 * s,
+                y: oy + mark.y as f32 * s,
+                reach: self.mark_reach(mark.lat, mark.unit_id, s),
+                staged: true,
+                course_deg: mark.course_deg,
+            });
+        }
+        hulls
+    }
+
+    /// How far a hull's own ink reaches from its centre, in window pixels.
+    ///
+    /// The picture's own length when it has one — a ship is as long as it is
+    /// long — and the symbol box when it does not.
+    fn mark_reach(&self, lat: f64, unit_id: i64, s: f32) -> f32 {
+        if let Some((_, (loa, _))) = portrait(&self.thumbs, &self.hull_sizes, unit_id, self.map_zoom)
+        {
+            let mpp = map_geometry::meters_per_pixel(lat, self.map_zoom);
+            let length_px = (loa / mpp) as f32 * s;
+            return (length_px / 2.0).max(MARK_BOX_PX / 2.0);
+        }
+        MARK_BOX_PX / 2.0
+    }
+
+    /// The frame fractions a window position points at.
+    fn frame_at(&self, x: f32, y: f32, win_w: f32, win_h: f32) -> (f64, f64) {
+        if win_w <= 0.0 || win_h <= 0.0 {
+            return (0.0, 0.0);
+        }
+        window_fraction_to_frame(
+            f64::from(x / win_w),
+            f64::from(y / win_h),
+            f64::from(self.map_dims.0),
+            f64::from(self.map_dims.1),
+            f64::from(win_w),
+            f64::from(win_h),
+        )
+    }
+
+    /// Move a dragged hull to where the pointer is.
+    ///
+    /// WHILE PLANNING this is a LOCAL act: the hull's staged position moves
+    /// in the draft and nothing is posted, because the draft is what the
+    /// advance writes through. In a STATIC EXERCISE the hull is on the wire,
+    /// and the frame is a PREVIEW — the commit is the release, and only the
+    /// release, because a commit per pointer movement would put a row in the
+    /// chain for every frame.
+    fn drag_unit_to(
+        &mut self,
+        unit_id: i64,
+        at: (f32, f32),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.staging() {
+            let vp = viewport(window);
+            if self.stage_start_to(unit_id, at, vp.2, vp.3) {
+                cx.notify();
+            }
+            return;
+        }
+        if self.positions_set_by_hand() {
+            self.drag_preview_frame(unit_id, point(px(at.0), px(at.1)), window, cx);
+        }
+    }
+
+    /// Put a staged hull where the pointer is: the DRAFT's own position, and
+    /// no post.
+    ///
+    /// The draft is the record while planning, and the advance is what
+    /// writes it through. A hull that is put on the water is also taken off
+    /// whatever carried it: a hull with a position AND a host is a state
+    /// the server refuses.
+    fn stage_start_to(&mut self, unit_id: i64, at: (f32, f32), win_w: f32, win_h: f32) -> bool {
+        let (fx, fy) = self.frame_at(at.0, at.1, win_w, win_h);
+        let (lat, lon) = self.frame_unproject(fx, fy);
+        if !self.force.set_start(unit_id, Some(crate::force::Start { lat, lon })) {
+            return false;
+        }
+        self.force.set_host(unit_id, None);
+        true
+    }
+
+    /// Commit a drag that TRAVELLED: the hull is where the pointer let go.
+    ///
+    /// WHILE PLANNING the draft already holds the position — the drag moved
+    /// the staged mark as it went — so the commit is the sentence that says
+    /// so, and the advance is what writes it through.
+    ///
+    /// In a STATIC EXERCISE the commit is a WRITE: the position is set by
+    /// hand, and one release is one write, because a write per pointer
+    /// movement would put a row in the chain for every frame.
+    fn commit_unit_drag(
+        &mut self,
+        unit_id: i64,
+        at: (f32, f32),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.staging() {
+            let Some(hull) = self.force.get(unit_id) else {
+                return;
+            };
+            let (name, start) = (hull.name.clone(), hull.start);
+            let Some(start) = start else {
+                return;
+            };
+            self.force_status = Status::good(format!(
+                "{name} staged at {:.4}, {:.4} \u{2014} the advance writes it",
+                start.lat, start.lon
+            ));
+            cx.notify();
+            return;
+        }
+        if self.positions_set_by_hand() {
+            let vp = viewport(window);
+            let (fx, fy) = self.frame_at(at.0, at.1, vp.2, vp.3);
+            let name = self
+                .piece_name(unit_id)
+                .unwrap_or_else(|| format!("piece {unit_id}"));
+            self.send_set_position(unit_id, &name, fx, fy, cx);
+        }
+    }
+
+    /// Turn a hull's staged course to where the pointer is.
+    ///
+    /// The course is the DRAFT's: the hull is the operator's own mark, and a
+    /// course is a thing a draft carries. The write through happens when the
+    /// exercise starts playing — see `post_staged_courses`.
+    fn turn_course_to(
+        &mut self,
+        unit_id: i64,
+        at: (f32, f32),
+        win_w: f32,
+        win_h: f32,
+    ) -> bool {
+        if !self.staging() {
+            return false;
+        }
+        let Some(hull) = self
+            .map_hulls(win_w, win_h)
+            .into_iter()
+            .find(|h| h.staged && h.unit_id == unit_id)
+        else {
+            return false;
+        };
+        let Some(course) = course_at((hull.x, hull.y), at) else {
+            return false;
+        };
+        if !self.force.set_course(unit_id, Some(course)) {
+            return false;
+        }
+        // The console says what it staged: a course is a number an operator
+        // can check against the compass they just turned, and a needle that
+        // moved silently is a needle nobody trusts.
+        let name = self
+            .force
+            .get(unit_id)
+            .map(|h| h.name.clone())
+            .unwrap_or_else(|| format!("piece {unit_id}"));
+        self.force_status = Status::good(format!(
+            "{name} staged on {course:.0}\u{00b0} \u{2014} the start of play sends it"
+        ));
+        true
     }
 
     /// The taxonomy path of a unit: its type, its class and its category.
@@ -15746,6 +16282,23 @@ impl IslandDemo {
             None => answer.figures,
         };
         self.unit_specs.insert(answer.unit, merged);
+        // A staged course may have been WAITING for exactly this answer: a
+        // helm order needs a speed to carry the heading, and the speed is
+        // what the register publishes.
+        if let Some(course) = self.staged_courses_pending.get(&answer.unit).copied() {
+            if let Some(speed) = self.published_speed_kn(answer.unit) {
+                self.staged_courses_pending.remove(&answer.unit);
+                let _ = self.order_tx.send(ToBinary::Helm(HelmOrder {
+                    unit_id: answer.unit.to_string(),
+                    heading_deg: course,
+                    speed_kn: speed,
+                }));
+                self.feed(format!(
+                    "staged course sent \u{2014} {}",
+                    self.unit_name_of(&answer.unit.to_string())
+                ));
+            }
+        }
     }
 
     /// A unit's name, by its id: the register's row, else the exercise's own
@@ -15831,6 +16384,17 @@ impl IslandDemo {
             .parse::<i64>()
             .ok()
             .and_then(|id| self.unit_specs.get(&id));
+        // The DRAFT's own statement about a hull the wire has not named: the
+        // position the operator put it at and the course they turned it to.
+        // Both are staged values, and the panel says which they are — a
+        // staged course is a plan, and a plan the panel reads as a fact is a
+        // plan the operator will believe the exercise carries.
+        let staged = unit_id
+            .parse::<i64>()
+            .ok()
+            .and_then(|id| self.force.get(id));
+        let staged_start = staged.and_then(|h| h.start);
+        let staged_course = staged.and_then(|h| h.course_deg);
 
         let (name, hull) = match row {
             Some(r) => (r.name.clone(), r.hull.clone()),
@@ -15899,12 +16463,16 @@ impl IslandDemo {
             // ONE string for one place.
             position: match fix {
                 Some(m) => format!("{:.4}, {:.4}", m.latitude, m.longitude),
-                None => dash.clone(),
+                None => staged_start
+                    .map(|s| format!("{:.4}, {:.4} (staged)", s.lat, s.lon))
+                    .unwrap_or_else(|| dash.clone()),
             },
-            course: fix
-                .and_then(|m| m.heading_deg)
-                .map(|h| format!("{h:.0}\u{00b0}"))
-                .unwrap_or_else(|| dash.clone()),
+            course: match fix.and_then(|m| m.heading_deg) {
+                Some(h) => format!("{h:.0}\u{00b0}"),
+                None => staged_course
+                    .map(|c| format!("{c:.0}\u{00b0} (staged)"))
+                    .unwrap_or_else(|| dash.clone()),
+            },
             speed: fix
                 .and_then(|m| m.speed_kn)
                 .map(|s| format!("{s:.1} kn"))
@@ -17018,6 +17586,12 @@ impl IslandDemo {
                 self.advance_busy = false;
                 self.advance_status.clear();
                 self.session = session;
+                // THE EXERCISE IS PLAYING. A staged course has no write of
+                // its own — Minos's placement takes a position and nothing
+                // else — so the course the operator turned on the map goes
+                // out now, as a helm order, which is the only thing the
+                // server takes that carries one.
+                self.post_staged_courses();
             }
             WriteId::End => self.apply_end(session),
             WriteId::Hold => self.apply_hold(session),
@@ -17924,10 +18498,8 @@ impl IslandDemo {
     /// and ADR-0019 records what source-over costs. The ring is the channel
     /// either way, which ADR-0015 already said the Low tier is.
     fn markers(&mut self, win_w: f32, win_h: f32) -> impl IntoElement {
-        // The symbol box the frame is drawn in, the glyph's reach as a
-        // multiple of its authored radius-8 reference, and the selection
-        // ring's radius (outside the frame).
-        const BOX_PX: f32 = 20.0;
+        // The glyph's reach as a multiple of its authored radius-8 reference,
+        // and the selection reticle's radius (outside the frame).
         const GLYPH_SCALE: f32 = 1.35;
         const SELECT_R: f32 = 15.0;
         let (mw, mh) = self.map_dims;
@@ -17947,6 +18519,14 @@ impl IslandDemo {
             .selected_unit
             .clone()
             .or_else(|| self.roster.get(self.selected).map(|r| r.unit_id.clone()));
+        // The pointer's two claims about the map, and the gesture in flight.
+        // Cloned for the same reason `live` is: the paint closure is `move`.
+        let hover = self.map_hover.clone();
+        let press = self.press_unit.clone();
+        let turning = self.course_turn;
+        // The rotator belongs to the DRAFT: a staged hull is the operator's
+        // own mark, and a course is a thing a draft can carry.
+        let staging = self.staging();
         // Cloned out of `self`: the canvas closure is `move`, and holding a
         // borrow of the live list across the paint pass would fight the
         // element build. Each marker is projected HERE, in the shell, from
@@ -18013,6 +18593,8 @@ impl IslandDemo {
                     // that is a lie about its proportions. A hull with no
                     // published dimensions, or with no picture, falls through
                     // to the glyph, the shape it can always name.
+                    let mut reach = MARK_BOX_PX / 2.0;
+                    let mut pictured = false;
                     if let Some(uid) = m.id.parse::<i64>().ok() {
                         if let Some((photo, (loa, beam))) =
                             portrait(&thumbs, &sizes, uid, zoom)
@@ -18041,17 +18623,34 @@ impl IslandDemo {
                                 0,
                                 false,
                             );
-                            continue;
+                            reach = (length_px / 2.0).max(MARK_BOX_PX / 2.0);
+                            pictured = true;
                         }
                     }
-                    paint_frame(window, (cx, cy), m.affiliation, false, m.stale, BOX_PX);
-                    paint_glyph(
-                        window,
-                        (cx, cy),
-                        m.symbol,
-                        map_symbol_fill(m.symbol, m.stale),
-                        GLYPH_SCALE,
-                    );
+                    if !pictured {
+                        paint_frame(
+                            window,
+                            (cx, cy),
+                            m.affiliation,
+                            false,
+                            m.stale,
+                            MARK_BOX_PX,
+                        );
+                        paint_glyph(
+                            window,
+                            (cx, cy),
+                            m.symbol,
+                            map_symbol_fill(m.symbol, m.stale),
+                            GLYPH_SCALE,
+                        );
+                    }
+                    // The pointer's ink: over the hull, and then held.
+                    let id = m.id.as_str();
+                    if press.as_deref() == Some(id) {
+                        paint_grasp_ink(window, (cx, cy), reach, true);
+                    } else if hover.as_deref() == Some(id) {
+                        paint_grasp_ink(window, (cx, cy), reach, false);
+                    }
                 }
                 // PLANNED hulls: a position the operator set while planning,
                 // drawn before the advance writes it. Dashed and dimmed, and
@@ -18059,18 +18658,20 @@ impl IslandDemo {
                 // affiliation source (the binary resolves the LIVE markers'
                 // from the store), so a planned hull says "nobody has said"
                 // rather than borrowing a side it cannot prove.
-                for (x, y, shape, uid, lat) in &planned {
-                    let cx = ox + (*x as f32) * s;
-                    let cy = oy + (*y as f32) * s;
+                for mark in &planned {
+                    let cx = ox + (mark.x as f32) * s;
+                    let cy = oy + (mark.y as f32) * s;
+                    let id = mark.unit_id.to_string();
                     // At the photograph's zoom, the staged hull's own picture
                     // replaces the glyph, exactly as a live hull's does —
                     // sized by its published dimensions, for the same reason.
+                    let mut reach = MARK_BOX_PX / 2.0;
                     if let Some((photo, (loa, beam))) =
-                        portrait(&thumbs, &sizes, *uid, zoom)
+                        portrait(&thumbs, &sizes, mark.unit_id, zoom)
                     {
                         // The cover scale is the ground's scale, as at the
                         // live site above.
-                        let mpp = map_geometry::meters_per_pixel(*lat, zoom);
+                        let mpp = map_geometry::meters_per_pixel(mark.lat, zoom);
                         let length_px = (loa / mpp) as f32 * s;
                         let beam_px = (beam / mpp) as f32 * s;
                         let b = Bounds::new(
@@ -18087,23 +18688,44 @@ impl IslandDemo {
                             0,
                             false,
                         );
-                        continue;
+                        reach = (length_px / 2.0).max(MARK_BOX_PX / 2.0);
+                    } else {
+                        paint_frame(
+                            window,
+                            (cx, cy),
+                            symbology::Affiliation::Unknown,
+                            true,
+                            true,
+                            MARK_BOX_PX,
+                        );
+                        paint_glyph(
+                            window,
+                            (cx, cy),
+                            mark.shape,
+                            map_symbol_fill(mark.shape, true),
+                            GLYPH_SCALE,
+                        );
                     }
-                    paint_frame(
-                        window,
-                        (cx, cy),
-                        symbology::Affiliation::Unknown,
-                        true,
-                        true,
-                        BOX_PX,
-                    );
-                    paint_glyph(
-                        window,
-                        (cx, cy),
-                        *shape,
-                        map_symbol_fill(*shape, true),
-                        GLYPH_SCALE,
-                    );
+                    // The pointer's ink, as for a live hull.
+                    if press.as_deref() == Some(id.as_str()) {
+                        paint_grasp_ink(window, (cx, cy), reach, true);
+                    } else if hover.as_deref() == Some(id.as_str()) {
+                        paint_grasp_ink(window, (cx, cy), reach, false);
+                    }
+                    // THE ROTATOR: the compass that turns this hull's course.
+                    // Drawn for the selected hull only, and only while the
+                    // draft is the operator's to edit — a course is a thing a
+                    // draft carries, and a live hull's course belongs to the
+                    // helm in the rail.
+                    if staging && selected_id.as_deref() == Some(id.as_str()) {
+                        paint_rotator(
+                            window,
+                            (cx, cy),
+                            reach + ROTATOR_CLEAR_PX,
+                            mark.course_deg,
+                            turning == Some(mark.unit_id),
+                        );
+                    }
                 }
             },
         ))
@@ -18120,6 +18742,88 @@ impl IslandDemo {
 /// symbol box (20 px at this shell's marker layer) is the larger mark and the
 /// honest one, so the glyph stays.
 const PHOTO_ZOOM: f64 = 14.0;
+
+/// The symbol box a hull's mark is drawn in, in window pixels.
+///
+/// The frame, the glyph and the mark's own reach all measure against it, so
+/// the ring the map draws around a hull clears the same box the hull is drawn
+/// in.
+const MARK_BOX_PX: f32 = 20.0;
+
+/// How far the rotator's rim stands clear of the mark it rings.
+///
+/// The needle has to live between the hull and the rim, and the knob at its
+/// tip has to be big enough to be pointed at. It also has to clear the map's
+/// own "your hand is on this one" ring, or the two would read as one thing
+/// said twice.
+const ROTATOR_CLEAR_PX: f32 = 15.0;
+
+/// How close the pointer has to be to the rotator's knob to grab it.
+///
+/// Wider than the knob's own radius, because a knob you have to hit exactly
+/// is a knob nobody grabs.
+const ROTATOR_GRAB_PX: f32 = 14.0;
+
+/// How far inside the rim the knob's CENTRE sits.
+///
+/// The knob is a disc, so its centre has to be far enough in that the disc
+/// itself stays inside the rim: a handle that pokes through the edge of its
+/// own instrument reads as a mistake.
+const ROTATOR_KNOB_INSET: f32 = 6.0;
+
+/// How far the pointer has to be from the hub before the course turns.
+///
+/// The dead zone: a pointer a pixel off the hub names a course a hundred
+/// degrees away from the one it meant, and a hull that snaps to a course
+/// nobody chose is worse than a hull that does not turn at all.
+const COURSE_DEAD_PX: f32 = 4.0;
+
+/// A hull the operator has placed on the map and the wire has not named yet.
+///
+/// The map's own draft mark: dashed, dimmed, and carrying whatever the
+/// operator has staged about it — a position, and a course if they have
+/// turned one.
+struct PlannedMark {
+    /// The mark's position in FRAME pixels.
+    x: f64,
+    y: f64,
+    shape: MapSymbolShape,
+    unit_id: i64,
+    lat: f64,
+    course_deg: Option<f32>,
+}
+
+/// A hull being dragged across the map.
+///
+/// The hull and whether the press has travelled far enough to be a drag: a
+/// press that has not moved is a click, and a click on a hull selects it.
+#[derive(Debug, Clone, Copy)]
+struct UnitDrag {
+    unit_id: i64,
+    moved: bool,
+}
+
+/// A hull on the map, in WINDOW pixels.
+///
+/// The map draws its marks from the frame's own coordinates and the picture
+/// is placed by the cover transform, so the shell keeps ONE list of where the
+/// hulls are on the SCREEN: the painter draws it, the press tests it, and the
+/// rotator rings it — and they cannot disagree about which hull is where.
+struct MapHull {
+    unit_id: i64,
+    /// The hull's centre on screen.
+    x: f32,
+    y: f32,
+    /// How far the mark's own ink reaches from the centre.
+    reach: f32,
+    /// Whether this mark is the operator's own draft mark — a hull placed on
+    /// the water while planning, dashed and dimmed, as opposed to a hull the
+    /// wire has named.
+    staged: bool,
+    /// The course the hull carries: the wire's for a live hull, the staged
+    /// one for a draft mark.
+    course_deg: Option<f32>,
+}
 
 /// A hull's published length and beam, or nothing.
 ///
@@ -18256,6 +18960,178 @@ fn paint_reticle(window: &mut Window, center: (f32, f32), r: f32, ink: Rgba) {
             }
         }
     }
+}
+
+/// The ink that says a hull is UNDER THE POINTER, and the ink that says it
+/// is being HELD.
+///
+/// Two states and two inks, because they are two different facts: the first
+/// says "this one can be pointed at", the second says "your hand is on it".
+/// A hull that only ever showed the second would look broken whenever the
+/// pointer merely passed over it.
+fn paint_grasp_ink(window: &mut Window, center: (f32, f32), reach: f32, held: bool) {
+    // The ring stands CLEAR of the mark: the hull's own frame says what it
+    // is, and this says the pointer is on it. A ring drawn over the mark
+    // would say the hull itself is the pointer's target, which is the same
+    // thing said louder and less well.
+    let r = reach + 4.0;
+    let mut p = PathBuilder::stroke(px(if held { 1.8 } else { 1.0 }));
+    p.move_to(point(px(center.0 + r), px(center.1)));
+    p.arc_to(
+        point(px(r), px(r)),
+        px(0.0),
+        false,
+        true,
+        point(px(center.0 - r), px(center.1)),
+    );
+    p.arc_to(
+        point(px(r), px(r)),
+        px(0.0),
+        false,
+        true,
+        point(px(center.0 + r), px(center.1)),
+    );
+    if let Ok(path) = p.build() {
+        window.paint_path(
+            path,
+            rgba(if held {
+                RADAR_CYAN
+            } else {
+                RADAR_CYAN.with_alpha(110)
+            }),
+        );
+    }
+}
+
+/// The course rotator: the compass that turns a hull's course, drawn around
+/// the hull it belongs to.
+///
+/// IT IS THE RAIL'S OWN COMPASS, at the scale of a map mark: the same rim,
+/// the same north wedge, the same needle, so an operator who has learned to
+/// read the dial in the commander's rail can read this one without being
+/// told which is which.
+///
+/// THE KNOB IS THE HANDLE. It sits at the needle's tip, and it is the only
+/// part of the instrument that is grabbed — the needle is read, not dragged,
+/// and a needle you had to catch by its point would be a needle nobody
+/// turned.
+///
+/// NO NEEDLE, NO COURSE. A hull whose course nobody has stated is drawn with
+/// the rim and the knob alone: an unknown heading is not north, and a needle
+/// pointing up would say it was.
+fn paint_rotator(
+    window: &mut Window,
+    center: (f32, f32),
+    r: f32,
+    course_deg: Option<f32>,
+    armed: bool,
+) {
+    if r <= 0.0 {
+        return;
+    }
+    let (cx, cy) = center;
+    let face = if armed {
+        RADAR_CYAN.with_alpha(210)
+    } else {
+        RADAR_CYAN.with_alpha(140)
+    };
+    // The rim: a hairline, the same weight as the rail's own rules.
+    let mut ring = PathBuilder::stroke(px(1.0));
+    ring.move_to(point(px(cx + r), px(cy)));
+    ring.arc_to(
+        point(px(r), px(r)),
+        px(0.0),
+        false,
+        true,
+        point(px(cx - r), px(cy)),
+    );
+    ring.arc_to(
+        point(px(r), px(r)),
+        px(0.0),
+        false,
+        true,
+        point(px(cx + r), px(cy)),
+    );
+    if let Ok(path) = ring.build() {
+        window.paint_path(path, rgba(face));
+    }
+    // The cardinal graduations, so the course can be READ off the face and
+    // not only off the inspector. Four of them, not twelve: the rim is a
+    // hand's width across here, and twelve ticks on a circle that small are
+    // a smudge rather than a scale.
+    for (i, len) in [(0usize, 7.0f32), (1, 4.5), (2, 4.5), (3, 4.5)] {
+        let screen = (i as f32 * 90.0 - 90.0).to_radians();
+        let (dx, dy) = (screen.cos(), screen.sin());
+        let inner = r - len;
+        let outer = r - 1.5;
+        let mut tick = PathBuilder::stroke(px(1.0));
+        tick.move_to(point(px(cx + dx * inner), px(cy + dy * inner)));
+        tick.line_to(point(px(cx + dx * outer), px(cy + dy * outer)));
+        if let Ok(path) = tick.build() {
+            window.paint_path(path, rgba(face));
+        }
+    }
+    // North: a wedge at the top of the rim, so "up is north" is a thing the
+    // operator can see rather than a rule they have to remember.
+    let nw = 3.5;
+    let nh = 6.0;
+    let mut north = PathBuilder::fill();
+    north.move_to(point(px(cx - nw), px(cy - r + 1.0)));
+    north.line_to(point(px(cx + nw), px(cy - r + 1.0)));
+    north.line_to(point(px(cx), px(cy - r + nh)));
+    if let Ok(path) = north.build() {
+        window.paint_path(path, rgba(face));
+    }
+    // The needle, when there is a course to point at.
+    let Some(course) = course_deg else {
+        // NO COURSE, NO NEEDLE — but the KNOB is still drawn, at the top of
+        // the rim. The knob is the handle, and a handle nobody can see is a
+        // handle nobody grabs; it sits at its home until the hand takes it,
+        // and its home says nothing about which way the hull points.
+        paint_disc(
+            window,
+            (cx, cy - r + ROTATOR_KNOB_INSET),
+            4.5,
+            RADAR_CYAN.with_alpha(90),
+        );
+        return;
+    };
+    let screen = (course - 90.0).to_radians();
+    let (dx, dy) = (screen.cos(), screen.sin());
+    let needle = if armed { RADAR_CYAN } else { RADAR_CYAN.with_alpha(190) };
+    let mut shaft = PathBuilder::stroke(px(2.0));
+    shaft.move_to(point(px(cx), px(cy)));
+    shaft.line_to(point(px(cx + dx * (r - 4.0)), px(cy + dy * (r - 4.0))));
+    if let Ok(path) = shaft.build() {
+        window.paint_path(path, rgba(needle));
+    }
+    // A short tail, so the hub reads as a pivot and not as a stray dot.
+    let mut tail = PathBuilder::stroke(px(2.0));
+    tail.move_to(point(px(cx), px(cy)));
+    tail.line_to(point(px(cx - dx * 6.0), px(cy - dy * 6.0)));
+    if let Ok(path) = tail.build() {
+        window.paint_path(path, rgba(needle));
+    }
+    // The knob at the tip: the handle, and the one part of the instrument
+    // the pointer is asked to catch. A DISC, because a square knob reads as
+    // a block of pixels and a disc reads as something a hand takes hold of.
+    let tip = (cx + dx * (r - ROTATOR_KNOB_INSET), cy + dy * (r - ROTATOR_KNOB_INSET));
+    paint_disc(window, tip, 4.5, needle);
+    // The hub.
+    paint_disc(window, (cx, cy), 2.0, needle);
+}
+
+/// A filled disc, in the one ink.
+///
+/// The path builder has no circle, and a disc drawn as a square with round
+/// corners is a disc only when the corner radius is half the box — which is
+/// how it is drawn here.
+fn paint_disc(window: &mut Window, at: (f32, f32), r: f32, ink: Rgba) {
+    let b = Bounds::new(
+        point(px(at.0 - r), px(at.1 - r)),
+        size(px(r * 2.0), px(r * 2.0)),
+    );
+    window.paint_quad(fill(b, rgba(ink)).corner_radii(px(r)));
 }
 
 /// One taxonomy glyph, the port of the console's `paint_map_symbol`.
@@ -19091,12 +19967,35 @@ impl Render for IslandDemo {
                     .id("map-surface")
                     // Armed, the surface shows it: a crosshair where a pan
                     // would be, because the next click that stays put places
-                    // instead of panning.
+                    // instead of panning. Over a hull the pointer may move,
+                    // the hand says so; over a hull it is already moving, the
+                    // closed hand says that.
                     .cursor(if self.pending_place.is_some() || self.pin_arm {
                         CursorStyle::Crosshair
+                    } else if self.unit_drag.is_some() || self.course_turn.is_some() {
+                        CursorStyle::ClosedHand
+                    } else if self.map_hover.is_some() {
+                        CursorStyle::PointingHand
                     } else {
                         CursorStyle::Arrow
                     })
+                    // Whether the pointer is over the MAP. The surface is a
+                    // full-window hitbox, so this is not the same question as
+                    // "over the surface": a panel drawn on top takes the
+                    // pointer, and a hull under that panel is not under the
+                    // pointer. The hover path stops at the first blocking
+                    // panel, which is exactly this answer.
+                    .on_hover(cx.listener(|view, hot: &bool, _, cx| {
+                        if view.map_hot != *hot {
+                            view.map_hot = *hot;
+                            if !hot {
+                                // The pointer has left the map: the claim it
+                                // made about a hull is over.
+                                view.map_hover = None;
+                            }
+                            cx.notify();
+                        }
+                    }))
                     .on_mouse_down(MouseButton::Left, cx.listener(|view, ev: &MouseDownEvent, window, cx| {
                         let at = (f32::from(ev.position.x), f32::from(ev.position.y));
                         // Armed, the press anchors instead of panning: only a
@@ -19104,10 +20003,29 @@ impl Render for IslandDemo {
                         // past 6px becomes a pan like any other.
                         view.press_at = Some(at);
                         view.pick_made = None;
+                        view.press_unit = None;
+                        view.unit_drag = None;
+                        view.course_turn = None;
                         if view.pending_place.is_some() || view.pin_arm {
                             view.place_down = Some(at);
                         } else {
-                            view.pan = Some(at);
+                            let vp = viewport(window);
+                            // The hull under the press, if any. This is what
+                            // the map's ink answers to: a hull under a held
+                            // button is a hull the operator has their hand on.
+                            view.press_unit = view.unit_under_pointer(at.0, at.1, vp.2, vp.3);
+                            // THE KNOB FIRST. The rotator's knob stands clear
+                            // of the hull's own body, so a press on the knob
+                            // is a press on the handle and not on the hull.
+                            if let Some(uid) = view.rotator_grab_at(at.0, at.1, vp.2, vp.3) {
+                                view.course_turn = Some(uid);
+                            } else if let Some(uid) =
+                                view.draggable_at(at.0, at.1, vp.2, vp.3)
+                            {
+                                view.unit_drag = Some(UnitDrag { unit_id: uid, moved: false });
+                            } else {
+                                view.pan = Some(at);
+                            }
                             // The unit under the press, if any. The pick is
                             // made HERE and undone if the press turns into
                             // a pan, because a release is delivered to
@@ -19115,6 +20033,7 @@ impl Render for IslandDemo {
                             // that lands on a panel never reaches the map.
                             view.pick_unit_at(at.0, at.1, window, cx);
                         }
+                        cx.notify();
                     }))
                     .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, window, cx| {
                         let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
@@ -19128,6 +20047,25 @@ impl Render for IslandDemo {
                             view.pan = None;
                             view.press_at = None;
                             view.pick_made = None;
+                            // The gesture is over — or was never one: the
+                            // release may have landed on a panel the map
+                            // never hears about.
+                            view.press_unit = None;
+                            view.unit_drag = None;
+                            view.course_turn = None;
+                            // The hover: the hull under the pointer, for the
+                            // map's own ink. It is a claim about a pointer
+                            // that is moving, so it is made on every move and
+                            // dropped the moment the pointer leaves the map.
+                            let vp = viewport(window);
+                            if view.map_hot {
+                                let hover =
+                                    view.unit_under_pointer(x, y, vp.2, vp.3);
+                                if view.map_hover != hover {
+                                    view.map_hover = hover;
+                                    cx.notify();
+                                }
+                            }
                             return;
                         }
                         if let Some((ax, ay)) = view.place_down {
@@ -19138,14 +20076,40 @@ impl Render for IslandDemo {
                                 return;
                             }
                         }
-                        // A press that has MOVED is a pan, and a pan undoes
-                        // the pick: a drag that starts on a hull must not
-                        // change what the operator has selected.
-                        if let Some((ax, ay)) = view.press_at {
-                            if (x - ax).hypot(y - ay) > 6.0 {
-                                if let Some(previous) = view.pick_made.take() {
-                                    view.selected_unit = previous;
+                        // A press that has MOVED is a drag, and what it drags
+                        // depends on what it started on.
+                        let moved = view
+                            .press_at
+                            .map(|(ax, ay)| (x - ax).hypot(y - ay) > 6.0)
+                            .unwrap_or(false);
+                        if moved {
+                            // THE ROTATOR FIRST, AND IT KEEPS THE
+                            // SELECTION. The rotator is the instrument being
+                            // turned, and an instrument that vanishes under
+                            // the hand is not an instrument.
+                            if let Some(uid) = view.course_turn {
+                                let vp = viewport(window);
+                                if view.turn_course_to(uid, (x, y), vp.2, vp.3) {
+                                    cx.notify();
                                 }
+                                return;
+                            }
+                            // A drag that starts on a HULL moves the hull,
+                            // and it KEEPS the selection: the hull is the
+                            // subject of the gesture. It does not pan the
+                            // map either — the ground the gesture names would
+                            // slide away under the pointer.
+                            if let Some(drag) = view.unit_drag {
+                                view.unit_drag = Some(UnitDrag { moved: true, ..drag });
+                                view.drag_unit_to(drag.unit_id, (x, y), window, cx);
+                                return;
+                            }
+                            // A PAN undoes the pick. A drag that starts on a
+                            // hull and turns out to be a pan of the chart
+                            // must not change what the operator has
+                            // selected.
+                            if let Some(previous) = view.pick_made.take() {
+                                view.selected_unit = previous;
                             }
                         }
                         let Some((lx, ly)) = view.pan else {
@@ -19194,6 +20158,23 @@ impl Render for IslandDemo {
                         view.zoom_by_wheel(f64::from(dy), at, window, cx);
                     }))
                     .on_mouse_up(MouseButton::Left, cx.listener(|view, ev: &MouseUpEvent, window, cx| {
+                        // THE PRESS IS OVER, and whatever it was doing ends
+                        // here. A drag that TRAVELLED commits; a press that
+                        // stayed put was a click, and a click on a hull
+                        // selects it and says so in the panel.
+                        let drag = view.unit_drag.take();
+                        view.course_turn = None;
+                        view.press_unit = None;
+                        if let Some(drag) = drag {
+                            if drag.moved {
+                                view.commit_unit_drag(
+                                    drag.unit_id,
+                                    (f32::from(ev.position.x), f32::from(ev.position.y)),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
                         // The armed click: a press that never became a pan
                         // deploys the armed hull at the release fractions.
                         //
@@ -24750,6 +25731,7 @@ mod tests {
                     start: None,
                     commander_id: None,
                     host: None,
+                    course_deg: None,
                 });
                 demo.sync_force()
                     .expect_err("an uncommanded piece is not writable")
@@ -26100,6 +27082,203 @@ mod tests {
         assert!(!drops_on_itself(&unit, &other));
     }
 
+    /// A demo holding a PLANNING session with one hull staged on the water,
+    /// and the window the map is looked at in.
+    /// The frame and the window are the same size, so a frame pixel is a
+    /// window pixel and the tests can say where the pointer is in the same
+    /// numbers the map does.
+    fn planning_demo_with_a_staged_hull() -> IslandDemo {
+        let mut session = SessionView::default();
+        session.state = "planning".to_string();
+        session.game_id = 45;
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        demo.map_dims = (1000.0, 1000.0);
+        demo.map_center = (0.0, 0.0);
+        demo.map_zoom = 4.0;
+        demo.force.upsert(crate::force::DraftHull {
+            unit_id: 1,
+            name: "staged".to_string(),
+            hull_number: String::new(),
+            class_id: String::new(),
+            start: Some(crate::force::Start { lat: 0.0, lon: 0.0 }),
+            commander_id: Some(2),
+            host: None,
+            course_deg: None,
+        });
+        demo
+    }
+
+    /// A HULL THE EXERCISE PLACED IS IN THE DRAFT, and the panel says where
+    /// it is. The placements read is the only ground the console holds before
+    /// any fix arrives, and a panel that said "—" for a hull standing on the
+    /// water would be a panel about a hull that is nowhere.
+    #[test]
+    fn a_placed_hull_is_in_the_draft_and_in_the_panel() {
+        let mut session = SessionView::default();
+        session.state = "planning".to_string();
+        session.game_id = 45;
+        session.pieces = vec![PieceView {
+            id: 262,
+            label: "Anka-S (D-0000)".to_string(),
+            start: Some((-6.08, 106.90)),
+            placed: true,
+            ..PieceView::default()
+        }];
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        demo.reseed_drafts();
+        let start = demo
+            .force
+            .get(262)
+            .and_then(|h| h.start)
+            .expect("the placement is in the draft");
+        assert_eq!(
+            (start.lat, start.lon),
+            (-6.08, 106.90),
+            "the draft holds where the exercise put the hull"
+        );
+        let facts = demo.unit_facts("262");
+        assert!(
+            facts.position.contains("-6.0800"),
+            "the panel says where the hull is: {}",
+            facts.position
+        );
+    }
+
+    /// THE POINTER READS THE COMPASS. Up is north, right is east, and the
+    /// four quarters are the four quarters — the same convention the rail's
+    /// dial reads a drag with, and the one the map's needle is drawn under.
+    #[test]
+    fn the_pointer_reads_the_compass() {
+        let hub = (500.0, 500.0);
+        for (at, want) in [
+            ((500.0, 460.0), 0.0),
+            ((540.0, 500.0), 90.0),
+            ((500.0, 540.0), 180.0),
+            ((460.0, 500.0), 270.0),
+        ] {
+            let got = course_at(hub, at).expect("a pointer away from the hub names a course");
+            assert!(
+                (got - want).abs() < 0.5,
+                "the pointer at {at:?} named {got}, wanted {want}"
+            );
+        }
+    }
+
+    /// A POINTER ON THE HUB NAMES NOTHING. A pixel off the hub is a course a
+    /// hundred degrees from the one the hand meant, and a hull that snaps to
+    /// a course nobody chose is worse than a hull that does not turn.
+    #[test]
+    fn a_pointer_on_the_hub_names_no_course() {
+        assert!(
+            course_at((500.0, 500.0), (501.0, 500.0)).is_none(),
+            "inside the dead zone there is no course"
+        );
+    }
+
+    /// A STAGED HULL IS DRAGGABLE WHILE PLANNING, and nowhere else. The
+    /// draft is the operator's own while the exercise is being planned; in
+    /// a maneuver exercise a position is the result of an order, and a map
+    /// that let a drag move a hull would say a thing the server refuses.
+    #[test]
+    fn a_staged_hull_is_draggable_while_planning_and_nowhere_else() {
+        let mut demo = planning_demo_with_a_staged_hull();
+        let at = (500.0, 500.0);
+        assert_eq!(
+            demo.draggable_at(at.0, at.1, 1000.0, 1000.0),
+            Some(1),
+            "the staged hull is under the pointer"
+        );
+        demo.session.state = "execution".to_string();
+        assert_eq!(
+            demo.draggable_at(at.0, at.1, 1000.0, 1000.0),
+            None,
+            "an executing hull is not something a pointer moves"
+        );
+    }
+
+    /// A DRAG MOVES THE STAGED HULL, in the DRAFT, and posts nothing. The
+    /// hull's own ground is what the drag says, and the draft is where a
+    /// staged position lives until the advance writes it through.
+    #[test]
+    fn a_drag_moves_the_staged_hull_in_the_draft() {
+        let mut demo = planning_demo_with_a_staged_hull();
+        assert!(demo.stage_start_to(1, (600.0, 500.0), 1000.0, 1000.0));
+        let start = demo.force.get(1).and_then(|h| h.start).expect("a start");
+        assert!(
+            start.lon > 0.0,
+            "the hull moved east: the draft holds lon {}",
+            start.lon
+        );
+        assert_eq!(start.lat, 0.0, "and it stayed on the equator");
+    }
+
+    /// THE ROTATOR TURNS THE STAGED COURSE, and the course lands in the
+    /// draft. It is the draft's value: the wire has never heard of this
+    /// hull, and the course goes out when the exercise starts playing.
+    #[test]
+    fn the_rotator_stages_the_course_in_the_draft() {
+        let mut demo = planning_demo_with_a_staged_hull();
+        demo.selected_unit = Some("1".to_string());
+        // A pointer due east of the hub names 090.
+        assert!(demo.turn_course_to(1, (540.0, 500.0), 1000.0, 1000.0));
+        let course = demo
+            .force
+            .get(1)
+            .and_then(|h| h.course_deg)
+            .expect("a staged course");
+        assert!(
+            (course - 90.0).abs() < 0.5,
+            "the pointer east of the hub named {course}, wanted 090"
+        );
+    }
+
+    /// A COURSE IS NOT TURNED OUTSIDE PLANNING. The rotator belongs to the
+    /// draft, and outside planning a live hull's course belongs to the helm
+    /// in the rail.
+    #[test]
+    fn a_course_is_not_turned_outside_planning() {
+        let mut demo = planning_demo_with_a_staged_hull();
+        demo.session.state = "execution".to_string();
+        assert!(
+            !demo.turn_course_to(1, (540.0, 500.0), 1000.0, 1000.0),
+            "an executing hull's course is not the map's to turn"
+        );
+        assert_eq!(
+            demo.force.get(1).and_then(|h| h.course_deg),
+            None,
+            "and the draft holds no course for it"
+        );
+    }
+
+    /// THE CONSOLE SAYS WHAT DID NOT GO OUT. A course the server will not
+    /// take is a plan, and a plan the operator cannot see is a plan they
+    /// will believe is an order.
+    #[test]
+    fn the_course_sentence_names_what_did_not_go_out() {
+        assert_eq!(
+            course_sentence(2, &[]),
+            "2 staged courses went out",
+            "what went out is said plainly"
+        );
+        assert_eq!(
+            course_sentence(0, &["KRI Nanggala".to_string()]),
+            "no staged course went out \u{2014} KRI Nanggala stay in the plan: you do not command it",
+            "and what stayed in the plan is named"
+        );
+    }
+
     /// A staged start becomes a planned marker: projected from the draft's own
     /// lat/lon at the frame's camera, and SKIPPED once the hull is on the wire
     /// — two frames over one hull would be two answers.
@@ -26126,16 +27305,17 @@ mod tests {
             start: Some(crate::force::Start { lat: 0.0, lon: 0.0 }),
             commander_id: Some(2),
             host: None,
+            course_deg: None,
         });
         let marks = demo.planned_marks();
         assert_eq!(marks.len(), 1, "one staged hull with a fix is one planned mark");
         assert_eq!(
-            (marks[0].0, marks[0].1),
+            (marks[0].x, marks[0].y),
             map_geometry::project_mercator(0.0, 0.0, (0.0, 0.0), 4.0, 1000.0, 1000.0),
             "projected from the draft start at the frame camera"
         );
         assert_eq!(
-            marks[0].2,
+            marks[0].shape,
             MapSymbolShape::Dot,
             "no taxonomy names it, so the unknown-ship fallback"
         );
@@ -26536,6 +27716,7 @@ mod tests {
                 }),
                 commander_id: None,
                 host: None,
+                course_deg: None,
             });
             demo
         });
@@ -32041,9 +33222,9 @@ mod tests {
             1,
             "the placed hull is drawn before the wire names it"
         );
-        assert_eq!(marks[0].3, 3, "the mark is the commanded hull");
+        assert_eq!(marks[0].unit_id, 3, "the mark is the commanded hull");
         assert_eq!(
-            (marks[0].0, marks[0].1),
+            (marks[0].x, marks[0].y),
             map_geometry::project_mercator(-7.88, 112.54, (0.0, 0.0), 11.0, 1000.0, 1000.0),
             "projected from the exercise's placement"
         );

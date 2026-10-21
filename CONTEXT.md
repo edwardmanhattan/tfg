@@ -169,8 +169,12 @@ The force as the operator has it on the client, before Minos has been told any o
 _Avoid_: staged force (that is not a state Minos has either), local force (every force on screen is local until it is not), unsaved force
 _A Force draft tolerates a hull with no commander, which Minos does not: `game_units.id_commander` is NOT NULL, so the advance refuses and names the hulls rather than seating whoever happened to be free._
 
-**Roster draft**:
-The roster as the operator has it on the client, before Minos has been told any of it: who is seated, as what, under which call sign, and who is leaving. Staging a seat, changing a role and unseating are all draft edits and none of them is a backend write. A Roster draft is written through in one ordered diff at a stage advance — seats before force assigns, because a piece IS a hull commanded by a participant, and unseats after the force, so nobody goes seatless while their hull is still being handed over.
+**Staged course**:
+The course a hull is to START on, as the operator has said it while planning: the bearing the map's rotator was turned to, held in the Force draft beside the hull's position. Minos has no write for a course — a placement carries a latitude and a longitude and nothing else — so a Staged course is a PLAN, and it goes out as a Helm order when the exercise starts playing, for the hulls the operator's own seat commands. The rest stay in the plan, and the console names them.
+_Avoid_: heading (that is a fix's own figure), planned course, draft heading
+_A Staged course is not a Helm order: it is the plan of one, and the server takes it only once the exercise is playing._
+
+**Roster draft**:The roster as the operator has it on the client, before Minos has been told any of it: who is seated, as what, under which call sign, and who is leaving. Staging a seat, changing a role and unseating are all draft edits and none of them is a backend write. A Roster draft is written through in one ordered diff at a stage advance — seats before force assigns, because a piece IS a hull commanded by a participant, and unseats after the force, so nobody goes seatless while their hull is still being handed over.
 _Avoid_: staged roster, local roster, unsaved roster_
 
 **Helm order**:

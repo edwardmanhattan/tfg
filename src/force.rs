@@ -88,6 +88,21 @@ pub struct DraftHull {
     /// checked for rings in [`plan`], because Minos refuses one and the
     /// operator can build one by dragging.
     pub host: Option<i64>,
+    /// The course this hull starts on, in degrees, as the operator has said
+    /// it — `None` for a hull whose course nobody has stated.
+    ///
+    /// NOT A PLACEMENT. Minos's placement write takes a latitude and a
+    /// longitude and nothing else, so a course is not a thing the advance can
+    /// write through: the hull's first course is whatever the server's own
+    /// materialisation of the placement makes it. This is therefore a STAGED
+    /// course — the console's own statement of the course the hull should
+    /// start on, held in the draft and posted as a helm order when the
+    /// exercise starts playing and the server will take one.
+    ///
+    /// It is deliberately NOT part of the diff [`plan`] takes: a course
+    /// changed and a placement changed are different edits, and the plan's
+    /// writes are the ones the server accepts.
+    pub course_deg: Option<f32>,
 }
 
 impl DraftHull {
@@ -105,6 +120,7 @@ impl DraftHull {
             start: None,
             commander_id: None,
             host: None,
+            course_deg: None,
         }
     }
 }
@@ -216,6 +232,11 @@ impl ForceDraft {
                     start: l.start,
                     commander_id: l.commander_id,
                     host: l.host,
+                    // The server holds no course for a hull, so the frame's
+                    // is none — and an operator's staged course differs from
+                    // it, which is what keeps the staged course through a
+                    // re-seed.
+                    course_deg: None,
                 },
             );
         }
@@ -255,6 +276,21 @@ impl ForceDraft {
         match self.hulls.get_mut(&unit_id) {
             Some(hull) => {
                 hull.start = start;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Say what course a hull starts on. `None` says nothing about it.
+    ///
+    /// A STAGED course, and not a write: the placement endpoint takes a
+    /// position and nothing else, so the course is held here until the
+    /// exercise is playing and a helm order can carry it.
+    pub fn set_course(&mut self, unit_id: i64, course_deg: Option<f32>) -> bool {
+        match self.hulls.get_mut(&unit_id) {
+            Some(hull) => {
+                hull.course_deg = course_deg.map(|c| c.rem_euclid(360.0));
                 true
             }
             None => false,
@@ -774,6 +810,73 @@ mod tests {
                     lon: 106.2
                 },
             ]
+        );
+    }
+
+    /// A STAGED COURSE SURVIVES A RE-SEED. The session read happens after
+    /// every write, and a re-seed that overwrote the draft would throw the
+    /// operator's course away on the strength of a write they had already
+    /// made. The course is an entry that no longer matches the frame, and
+    /// an entry that no longer matches the frame is the operator's.
+    #[test]
+    fn a_staged_course_survives_a_reseed() {
+        let mut draft = ForceDraft::new();
+        let mut h = hull(7, "KRI Nanggala", Some((-5.4, 106.2)));
+        h.commander_id = Some(3);
+        draft.upsert(h);
+        draft.set_course(7, Some(90.0));
+        // The server re-read: it holds the hull, at the same place, and it
+        // holds no course for it — it has no course to hold.
+        draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
+        assert_eq!(
+            draft.get(7).and_then(|h| h.course_deg),
+            Some(90.0),
+            "the staged course is the operator's own statement and it survives"
+        );
+    }
+
+    /// A COURSE IS NOT A WRITE. Minos's placement takes a position and
+    /// nothing else, so a course changed and a placement changed are
+    /// different edits — and the plan's writes are the ones the server
+    /// accepts. A plan that carried the course would either post a field
+    /// the endpoint refuses or, worse, re-post the placement on every
+    /// re-seed because the two would never match.
+    #[test]
+    fn a_course_is_not_a_write() {
+        let mut draft = ForceDraft::new();
+        let mut h = hull(7, "KRI Nanggala", Some((-5.4, 106.2)));
+        h.commander_id = Some(3);
+        draft.upsert(h);
+        draft.set_course(7, Some(90.0));
+        let writes = plan(
+            &draft,
+            &[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))],
+        )
+        .expect("the plan holds");
+        assert!(
+            writes.is_empty(),
+            "the server holds the hull where it is and no course of its own: {writes:?}"
+        );
+    }
+
+    /// A COURSE IS STATED IN DEGREES, AND A DEGREE IS A DEGREE. The
+    /// rotator's needle can point anywhere, and the draft says the same
+    /// thing whichever way the operator turned it.
+    #[test]
+    fn a_course_is_stored_as_a_bearing() {
+        let mut draft = ForceDraft::new();
+        draft.upsert(hull(7, "KRI Nanggala", Some((-5.4, 106.2))));
+        assert!(draft.set_course(7, Some(450.0)));
+        assert_eq!(
+            draft.get(7).and_then(|h| h.course_deg),
+            Some(90.0),
+            "450 degrees is 90 degrees, and the draft says so"
+        );
+        assert!(draft.set_course(7, None));
+        assert_eq!(
+            draft.get(7).and_then(|h| h.course_deg),
+            None,
+            "no course is no course"
         );
     }
 
