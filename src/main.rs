@@ -2661,6 +2661,7 @@ fn main() {
         fleet_tax,
         taxonomies,
         unit_specs,
+        paths.scenario_library.clone(),
     );
 }
 
@@ -4325,8 +4326,12 @@ fn flush_book(
         .collect();
     for w in writes {
         let step: Result<(), String> = match w {
-            tfg::book::BookWrite::Create { local_id, title } => {
-                match master.create_game_scenario(token, game_id, title, "") {
+            tfg::book::BookWrite::Create {
+                local_id,
+                title,
+                description,
+            } => {
+                match master.create_game_scenario(token, game_id, title, description) {
                     Ok(sc) => {
                         scenarios.insert(*local_id, sc.id);
                         held.insert(sc.id, Vec::new());

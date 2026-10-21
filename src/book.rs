@@ -72,6 +72,9 @@ pub struct StagedScenario {
     /// Negative while staged: never collides with a server id.
     pub local_id: i64,
     pub title: String,
+    /// The scenario's own text. Minos holds a description beside the title,
+    /// so a plan that says more than its title carries it here.
+    pub description: String,
     pub steps: Vec<StagedStep>,
 }
 
@@ -105,12 +108,35 @@ impl BookDraft {
     /// Stage a new scenario. Answers its local id (negative) so the
     /// composer can open it like any other row in the book.
     pub fn stage_scenario(&mut self, title: &str) -> i64 {
+        self.stage_scenario_named(title, "")
+    }
+
+    /// Stage a new scenario WITH its description. The description is the
+    /// scenario's own prose — the thing a plan says beyond its title — and
+    /// Minos holds it beside the title, so it travels with the create.
+    pub fn stage_scenario_named(&mut self, title: &str, description: &str) -> i64 {
         let local_id = self.fresh_local();
         self.news.insert(
             local_id,
-            StagedScenario { local_id, title: title.to_string(), steps: Vec::new() },
+            StagedScenario {
+                local_id,
+                title: title.to_string(),
+                description: description.to_string(),
+                steps: Vec::new(),
+            },
         );
         local_id
+    }
+
+    /// Set a staged scenario's description, after it was staged.
+    pub fn set_description(&mut self, local_id: i64, description: &str) -> bool {
+        match self.news.get_mut(&local_id) {
+            Some(slot) => {
+                slot.description = description.to_string();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Abandon a staged-new scenario outright. Server-held scenarios are
@@ -334,7 +360,12 @@ pub enum StepRef {
 pub enum BookWrite {
     /// Append a scenario to the book's end. The answer carries the
     /// server id the staged steps resolve against.
-    Create { local_id: i64, title: String },
+    Create {
+        local_id: i64,
+        title: String,
+        /// The scenario's prose, empty when the author wrote none.
+        description: String,
+    },
     /// Append a step to the end of a scenario. `step` is always staged
     /// (live steps are never added) and resolves like the scenario.
     AddStep {
@@ -384,7 +415,11 @@ pub fn plan(draft: &BookDraft, live: &[LiveScenario]) -> Vec<BookWrite> {
     // `news` iterates local-id-ascending: -3, -2, -1 — oldest staged
     // first, so the book order matches the authoring order.
     for news in draft.staged_news() {
-        writes.push(BookWrite::Create { local_id: news.local_id, title: news.title.clone() });
+        writes.push(BookWrite::Create {
+            local_id: news.local_id,
+            title: news.title.clone(),
+            description: news.description.clone(),
+        });
         for step in &news.steps {
             writes.push(BookWrite::AddStep {
                 scenario: ScenarioRef::New(news.local_id),
@@ -458,7 +493,11 @@ mod tests {
         assert_eq!(
             plan(&draft, &[]),
             vec![
-                BookWrite::Create { local_id: local, title: "First light".into() },
+                BookWrite::Create {
+                    local_id: local,
+                    title: "First light".into(),
+                    description: String::new(),
+                },
                 BookWrite::AddStep {
                     scenario: ScenarioRef::New(local),
                     step: StepRef::New(draft
@@ -487,6 +526,37 @@ mod tests {
         let a = draft.stage_scenario("A");
         let b = draft.stage_scenario("B");
         assert!(a < 0 && b < 0 && a != b, "never collide with server ids");
+    }
+
+    /// The description travels with the CREATE, because Minos holds a
+    /// description beside the title and a plan that says more than its title
+    /// would lose the rest of itself on the way.
+    #[test]
+    fn a_staged_scenario_carries_its_description_into_the_create() {
+        let mut draft = BookDraft::new();
+        let local = draft.stage_scenario_named("First light", "The river crossing, at dawn.");
+        assert_eq!(
+            plan(&draft, &[]),
+            vec![BookWrite::Create {
+                local_id: local,
+                title: "First light".into(),
+                description: "The river crossing, at dawn.".into(),
+            }]
+        );
+    }
+
+    /// A description set AFTER the scenario was staged still travels: the
+    /// composer writes the name first and the prose second.
+    #[test]
+    fn a_description_set_after_staging_still_travels() {
+        let mut draft = BookDraft::new();
+        let local = draft.stage_scenario("First light");
+        assert!(draft.set_description(local, "At dawn."));
+        let writes = plan(&draft, &[]);
+        assert!(matches!(
+            &writes[0],
+            BookWrite::Create { description, .. } if description == "At dawn."
+        ));
     }
 
     #[test]

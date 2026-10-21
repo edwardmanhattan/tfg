@@ -513,6 +513,44 @@ named on the adjacent control.
   app role as a small mono tag. It is the only surface in the app that is
   about a person rather than about state.
 
+### The scenario composer
+
+The composer is the one modal that is a page rather than a form: three
+sections, in the order the operator thinks in.
+
+1. **Compose a scenario.** The name, the description, the window, and the
+   steps. The name comes first because a plan without a name is a plan the
+   operator cannot pick out of a list of plans; the description is a second
+   line of the same field's kind, not a modal of its own; the window is two
+   datetime rows; the steps are the composer's own list, and the step maker
+   is the row that adds one.
+2. **Saved scenarios.** The library, with the window and the step count of
+   each, and two verbs: *use* and *delete*. A pick opens the scenario in the
+   composer above and writes nothing.
+3. **This game's book.** What Minos holds, plus the rows the draft has
+   staged, plus the step row that adds a step to a scenario already in the
+   book.
+
+**The date is chosen, the time is typed.** A minute is a keystroke and a
+month is a shape, so the mini-calendar takes the day and the field takes the
+whole datetime, and the calendar writes into the same field the keyboard
+writes into. The calendar is drawn INLINE, under the field it fills: GPUI has
+no popover, and a floating layer over the map is a layer the map's own
+gestures would fight with. Its grid is always six weeks, so the control's
+height never changes from month to month — a control that grows under the
+pointer is a control nobody trusts.
+
+**The window says where it lands.** A scenario has no datetime in Minos, so
+the plan's window becomes the first step's start and the last step's end, on
+the assumed clock. The composer says that in a line under the fields rather
+than doing it quietly, because a window that landed somewhere else is a
+window nobody can plan around.
+
+**The pin is one pin.** It writes `at {lat}, {lon}` into the step's words —
+the same four decimals the Inspector reads a fix back with — and keeps the
+place beside it as a number. The words are the record; the number is what
+makes the place findable again.
+
 ## Motion
 
 The governing idea: **motion tells the operator the interface heard them,

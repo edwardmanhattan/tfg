@@ -15,6 +15,11 @@ pub struct AppPaths {
     pub map_cache: PathBuf,
     pub log_dir: PathBuf,
     pub initial_log: PathBuf,
+    /// The saved-scenario library: the operator's own scenarios, kept across
+    /// games. It lives beside the local store because it is the same kind of
+    /// thing — this machine's own record — and Minos has no catalog of
+    /// scenarios to keep it in.
+    pub scenario_library: PathBuf,
 }
 
 impl AppPaths {
@@ -42,6 +47,7 @@ impl AppPaths {
             last_user: data_dir.join("tfg-last-user"),
             map_cache: map_dir.join("tfg-tiles-cache.sqlite"),
             initial_log: log_dir.join("tfg-session-log.jsonl"),
+            scenario_library: data_dir.join("scenarios.json"),
             log_dir,
             data_dir,
         })
@@ -196,6 +202,7 @@ mod tests {
         assert_eq!(paths.last_user, root.join("tfg-last-user"));
         assert_eq!(paths.map_cache, root.join("maps/tfg-tiles-cache.sqlite"));
         assert_eq!(paths.initial_log, root.join("logs/tfg-session-log.jsonl"));
+        assert_eq!(paths.scenario_library, root.join("scenarios.json"));
         assert!(paths.log_dir.is_dir());
         assert!(paths.map_cache.parent().is_some_and(Path::is_dir));
         std::fs::remove_dir_all(root).ok();

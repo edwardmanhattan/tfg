@@ -434,6 +434,92 @@ enum WhichPanel {
     Embarked,
 }
 
+/// Which step row the pin writes its coordinates into.
+///
+/// One pin, one target. A pin that could land in either of two fields would
+/// quote two different numbers for the same water, and an exercise authored
+/// against one position and reviewed against another is a scenario nobody can
+/// trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinTarget {
+    /// The book's own step row — a step added straight to the game.
+    Book,
+    /// The composer's step row — a step of the scenario being authored.
+    Composer,
+}
+
+/// Which datetime the mini-calendar is filling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalField {
+    /// The scenario's start.
+    Start,
+    /// The scenario's end.
+    End,
+}
+
+/// The scenario being composed, as the FORM holds it.
+///
+/// The datetimes are plain strings because they are TYPED: the form's field
+/// plumbing is a string, and a window is optional only once it is saved. The
+/// library's own form is the saved one, and the two are converted at the
+/// boundary — a copy in, a copy out — so neither has to hold the other's
+/// optionality.
+#[derive(Default, Clone)]
+struct ComposerScenario {
+    /// The library's key. Empty for a scenario that was never saved: an
+    /// unsaved scenario has no key to overwrite.
+    id: String,
+    title: String,
+    description: String,
+    /// `YYYY-MM-DDTHH:MM`. Empty when unset.
+    start: String,
+    /// `YYYY-MM-DDTHH:MM`. Empty when unset.
+    end: String,
+    steps: Vec<crate::library::SavedStep>,
+}
+
+impl ComposerScenario {
+    /// The saved form: what the library keeps.
+    fn to_saved(&self) -> crate::library::SavedScenario {
+        crate::library::SavedScenario {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            start: (!self.start.is_empty()).then(|| self.start.clone()),
+            end: (!self.end.is_empty()).then(|| self.end.clone()),
+            steps: self.steps.clone(),
+        }
+    }
+
+    /// The form's form: what the operator is looking at.
+    fn from_saved(saved: &crate::library::SavedScenario) -> ComposerScenario {
+        ComposerScenario {
+            id: saved.id.clone(),
+            title: saved.title.clone(),
+            description: saved.description.clone(),
+            start: saved.start.clone().unwrap_or_default(),
+            end: saved.end.clone().unwrap_or_default(),
+            steps: saved.steps.clone(),
+        }
+    }
+
+    /// The window's problem, in the console's own sentence.
+    ///
+    /// The rule is the shared one — `crate::calendar::window_ok` — because the
+    /// exercise's own window is the same shape and two answers could drift
+    /// apart. A window whose end is not after its start is refused HERE, in
+    /// the field, rather than after a round trip.
+    fn window_problem(&self) -> Option<String> {
+        if !crate::calendar::window_ok(
+            (!self.start.is_empty()).then_some(self.start.as_str()),
+            (!self.end.is_empty()).then_some(self.end.as_str()),
+        ) {
+            return Some("the end must come after the start".to_string());
+        }
+        None
+    }
+}
+
 struct IslandState {
     key: view::IslandKey,
     close_hot: bool,
@@ -857,7 +943,7 @@ struct IslandDemo {
     composer_open: bool,
     draft: SessionDraft,
     compose_focus: usize,
-    compose_handles: [Option<gpui::FocusHandle>; 11],
+    compose_handles: [Option<gpui::FocusHandle>; 18],
     compose_busy: bool,
     compose_status: Status,
     /// The Book panel: the held game's scenarios and their steps (read), plus
@@ -942,6 +1028,49 @@ struct IslandDemo {
     /// post nothing; outside planning they post at once, because there is no
     /// stage left to wait for.
     book: crate::book::BookDraft,
+    /// The saved-scenario library: the operator's own scenarios, kept on
+    /// this machine and offered in every game's planning.
+    ///
+    /// Minos has no catalog of scenarios — a game has exactly ONE book, and
+    /// the book is its ordered scenarios — so a scenario meant for another
+    /// game has nowhere to live but here. The library is the PLAN; the book's
+    /// scenario is a deployment of it, and the two are deliberately not the
+    /// same thing.
+    library: crate::library::Library,
+    /// Where the library is kept: one file under the data dir, beside the
+    /// local store, because it is this machine's own record in the same way.
+    library_path: std::path::PathBuf,
+    /// The scenario being composed right now: its name, its description, its
+    /// window and its steps. It is a library entry in the making, so saving it
+    /// is a copy rather than a translation.
+    composer: ComposerScenario,
+    /// The step being written into the composer: its words and its window.
+    /// The place and the hulls ride beside it, because neither is a field:
+    /// the place is a pin and the hulls are a pick.
+    composer_step: ComposerDraft,
+    /// The place the composer step points at, when the author dropped a pin.
+    composer_step_place: Option<crate::library::Place>,
+    /// The hulls the composer step obliges, in the book's own shape.
+    composer_step_related: Vec<(String, i64)>,
+    /// Whether the hull picker is open. Closed by default, because the step
+    /// maker is three rows of text and a list of hulls would push the
+    /// scenario's own steps off the panel.
+    composer_hulls_open: bool,
+    /// The staged copy of the composed scenario, once it was added to this
+    /// game's book. Kept so a second add REPLACES the first: a plan added
+    /// twice is two plans in the book, and the operator asked for one.
+    composer_staged: Option<i64>,
+    /// The composer's own verdict line: what was saved, what was refused,
+    /// and why.
+    composer_status: Status,
+    /// Which step row the pin writes its coordinates into: the composer's own
+    /// row, or the book's. One pin, one target, because a pin that could land
+    /// in two places would quote two different numbers for the same water.
+    pin_target: PinTarget,
+    /// The mini-calendar: the month it shows, and the field it is filling.
+    /// `None` for the field means the calendar is shut.
+    cal_month: crate::calendar::Month,
+    cal_field: Option<CalField>,
     /// Control's draft: the game-time multiplier being adjusted, and the
     /// latch on the write. `None` means "not touched yet", which is how the
     /// draft picks up Minos's own value on the first frame the island draws
@@ -1329,6 +1458,11 @@ const SCOPE_EASE_S: f32 = 0.34;
 /// period is a beat a reader can follow — the blink of a terminal cursor,
 /// not a strobe.
 const CARET_BLINK_MS: u128 = 530;
+
+/// The mini-calendar's day cell: a square, so the month reads as a grid and
+/// not as a column of words.
+const CAL_CELL_W: f32 = 26.0;
+const CAL_CELL_H: f32 = 20.0;
 
 /// The Settings card's height, which is not the readout card's.
 ///
@@ -2985,6 +3119,34 @@ impl IslandDemo {
         session: SessionView,
         order_tx: OrderSink,
     ) -> Self {
+        // A library path of last resort, for the headless tests and for a
+        // shell built without one. The console's own path is the data dir's,
+        // and it is handed in by `new_with_library`.
+        let path = std::env::temp_dir().join("tfg-scenario-library.json");
+        Self::new_with_library(
+            roster,
+            roster_total,
+            selected,
+            session,
+            order_tx,
+            path,
+        )
+    }
+
+    /// The shell's state, with the library's own path.
+    ///
+    /// The library is this machine's file, so the path is the app's to give:
+    /// the data dir's `scenarios.json`, beside the local store. A shell built
+    /// without one (the tests) reads an empty library from a temp path,
+    /// because a missing file is an empty library and never an error.
+    fn new_with_library(
+        roster: Vec<RosterRow>,
+        roster_total: usize,
+        selected: usize,
+        session: SessionView,
+        order_tx: OrderSink,
+        library_path: std::path::PathBuf,
+    ) -> Self {
         // The column's islands, one entry each, in a fixed order. The
         // ORDER here is not the render order — that is `view::zone_islands`'
         // job and it changes with the exercise's state. What lives here is
@@ -3262,7 +3424,10 @@ impl IslandDemo {
             composer_open: std::env::var("TFG_COMPOSE").as_deref() == Ok("1"),
             draft: SessionDraft::default(),
             compose_focus: 0,
-            compose_handles: [None, None, None, None, None, None, None, None, None, None, None],
+            compose_handles: [
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None,
+            ],
             compose_busy: false,
             compose_status: Status::empty(),
             // `TFG_BOOK` opens the book for a headless capture; `TFG_GAME`
@@ -3345,6 +3510,20 @@ impl IslandDemo {
             roster_draft: crate::roster::RosterDraft::new(),
             groups: crate::groups::GroupsDraft::new(),
             book: crate::book::BookDraft::new(),
+            // The library is read once, at boot: it is this machine's own
+            // file, and nothing else writes it while the console runs.
+            library: crate::library::Library::load(&library_path),
+            library_path,
+            composer: ComposerScenario::default(),
+            composer_step: ComposerDraft::default(),
+            composer_step_place: None,
+            composer_step_related: Vec::new(),
+            composer_hulls_open: false,
+            composer_staged: None,
+            composer_status: Status::empty(),
+            pin_target: PinTarget::Book,
+            cal_month: crate::calendar::Month::now(),
+            cal_field: None,
             force_busy: false,
             force_status: Status::empty(),
             deploy_busy: false,
@@ -12948,8 +13127,9 @@ impl IslandDemo {
     /// The Book shuts while it is armed, and that is not a trick — a modal
     /// covers the map, so an author who keeps the form open has nothing to
     /// click. The re-open on the way back is the same argument in reverse.
-    fn arm_pin(&mut self, cx: &mut Context<Self>) {
+    fn arm_pin(&mut self, target: PinTarget, cx: &mut Context<Self>) {
         self.pin_arm = true;
+        self.pin_target = target;
         self.book_open = false;
         cx.notify();
     }
@@ -13002,7 +13182,16 @@ impl IslandDemo {
         }
         let (lat, lon) = self.frame_unproject(fx, fy);
         let text = pin_text(lat, lon);
-        let content = &mut self.step_draft.content;
+        // The place is kept BESIDE the words when the composer is the target:
+        // the sentence says where, and the record says where in numbers, so a
+        // step that points somewhere can be found again without parsing prose.
+        if self.pin_target == PinTarget::Composer {
+            self.composer_step_place = Some(crate::library::Place { lat, lon });
+        }
+        let content = match self.pin_target {
+            PinTarget::Book => &mut self.step_draft.content,
+            PinTarget::Composer => &mut self.composer_step.content,
+        };
         if !content.is_empty() {
             content.push(' ');
         }
@@ -13023,7 +13212,7 @@ impl IslandDemo {
     /// unprojects the release — and for a pointer that cannot drag (or a
     /// harness) a CLICK arms the same mechanism and the next map click places
     /// it. They differ only in who reads the point.
-    fn pin_control(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn pin_control(&mut self, target: PinTarget, cx: &mut Context<Self>) -> impl IntoElement {
         // The mark's ink is its whole state: full yellow at rest, dimmed while
         // a click has already been armed (the next click is the map's, not
         // this control's), and its border lifts while the pointer is on it.
@@ -13040,7 +13229,7 @@ impl IslandDemo {
             } else {
                 CursorStyle::PointingHand
             })
-            .on_click(cx.listener(|view, _, _, cx| view.arm_pin(cx)))
+            .on_click(cx.listener(move |view, _, _, cx| view.arm_pin(target, cx)))
             // The drag arms nothing: the release is the gesture's whole
             // statement, and the map's own drop listener reads it.
             .on_drag(PinDragPayload, |_, _, _, app| app.new(|_| PinGhost))
@@ -17294,11 +17483,15 @@ impl IslandDemo {
 
     /// The draft field a composer row edits, by tab order: name, description,
     /// purpose, target, area, map tag. One place, so the six rows cannot drift
-    /// apart — the sign-in card's `cred`/`cred_mut`, indexed. Index 6 is the
-    /// BOOK panel's title row, 7-9 are its step row (content, window
-    /// start, window end), and 10 is the comms panel's telegram row: they
-    /// share the field implementation, and the tab handler keeps each form
-    /// inside its own cycle.
+    /// apart — the sign-in card's `cred`/`cred_mut`, indexed.
+    ///
+    /// The rest of the console's forms ride the same implementation, because
+    /// GPUI ships no text field and one hand-rolled field is cheaper than
+    /// five: 6-9 are the scenario composer's name, description and two
+    /// datetimes; 10 is the comms panel's telegram; 11-13 are the book's own
+    /// step row (its words and its window); 14-16 are the composer's step row,
+    /// which is a different draft with the same shape; 17 is the book's
+    /// straight-to-the-server title row.
     fn draft_field(&self, idx: usize) -> &String {
         match idx {
             0 => &self.draft.name,
@@ -17307,11 +17500,18 @@ impl IslandDemo {
             3 => &self.draft.target,
             4 => &self.draft.area,
             5 => &self.draft.map_tag,
-            6 => &self.book_title,
-            7 => &self.step_draft.content,
-            8 => &self.step_draft.start_hour,
-            9 => &self.step_draft.end_hour,
-            _ => &self.msg_draft.content,
+            6 => &self.composer.title,
+            7 => &self.composer.description,
+            8 => &self.composer.start,
+            9 => &self.composer.end,
+            10 => &self.msg_draft.content,
+            11 => &self.step_draft.content,
+            12 => &self.step_draft.start_hour,
+            13 => &self.step_draft.end_hour,
+            14 => &self.composer_step.content,
+            15 => &self.composer_step.start_hour,
+            16 => &self.composer_step.end_hour,
+            _ => &self.book_title,
         }
     }
 
@@ -17323,11 +17523,18 @@ impl IslandDemo {
             3 => &mut self.draft.target,
             4 => &mut self.draft.area,
             5 => &mut self.draft.map_tag,
-            6 => &mut self.book_title,
-            7 => &mut self.step_draft.content,
-            8 => &mut self.step_draft.start_hour,
-            9 => &mut self.step_draft.end_hour,
-            _ => &mut self.msg_draft.content,
+            6 => &mut self.composer.title,
+            7 => &mut self.composer.description,
+            8 => &mut self.composer.start,
+            9 => &mut self.composer.end,
+            10 => &mut self.msg_draft.content,
+            11 => &mut self.step_draft.content,
+            12 => &mut self.step_draft.start_hour,
+            13 => &mut self.step_draft.end_hour,
+            14 => &mut self.composer_step.content,
+            15 => &mut self.composer_step.start_hour,
+            16 => &mut self.composer_step.end_hour,
+            _ => &mut self.book_title,
         }
     }
 
@@ -17387,15 +17594,20 @@ impl IslandDemo {
         match k.key.as_str() {
             "enter" => {
                 // The row decides the verb: the draft submits the session,
-                // the book's title row adds its scenario, its step row adds
-                // its step, the comms row sends its telegram.
+                // the book's step row adds its step, the telegram row sends
+                // its telegram, and the composer's rows save the scenario or
+                // add its step.
                 if idx == 10 {
                     self.submit_telegram(cx);
-                } else if idx >= 7 {
+                } else if idx >= 14 && idx <= 16 {
+                    self.add_composer_step(cx);
+                } else if idx >= 11 && idx <= 13 {
                     self.submit_step(cx);
                 } else if idx == 6 {
+                    self.save_composer(cx);
+                } else if idx == 17 {
                     self.submit_book(cx);
-                } else {
+                } else if idx == 0 {
                     self.submit_compose(cx);
                 }
                 return;
@@ -17405,14 +17617,17 @@ impl IslandDemo {
             }
             "tab" => {
                 // Each form cycles inside itself: the draft its six, the
-                // book's title row to itself, the step row its three, the
-                // telegram row to itself. A tab that jumped panels would
-                // land in a closed form's fields.
+                // composer's details their four, the telegram row to itself,
+                // the book's step row its three, the composer's step row its
+                // three. A tab that jumped panels would land in a closed
+                // form's fields.
                 let next = match idx {
                     0..=5 => (idx + 1) % 6,
-                    6 => 6,
+                    6..=9 => 6 + (idx - 6 + 1) % 4,
                     10 => 10,
-                    _ => 7 + (idx - 7 + 1) % 3,
+                    11..=13 => 11 + (idx - 11 + 1) % 3,
+                    14..=16 => 14 + (idx - 14 + 1) % 3,
+                    _ => 17,
                 };
                 self.compose_focus = next;
                 if let Some(h) = self.compose_handles[next].clone() {
@@ -17986,6 +18201,847 @@ impl IslandDemo {
         ed.into_any_element()
     }
 
+    // -- the scenario composer --------------------------------------------
+    //
+    // The composer is the operator's own scenario: a name, a description, a
+    // window, and its steps. It is NOT the game's scenario — it is the PLAN,
+    // and the library keeps it so that another game can be planned from it.
+    // Minos has no catalog of scenarios (a game has exactly ONE book, and
+    // the book is its ordered scenarios), so the plan has to live here.
+
+    /// Save the composed scenario into the library.
+    ///
+    /// The library is this machine's file, and the save is a local write: no
+    /// POST, no session, no game. A scenario the operator keeps is the
+    /// operator's own, and Minos is not told about it until it is added to a
+    /// game.
+    fn save_composer(&mut self, cx: &mut Context<Self>) {
+        let title = self.composer.title.trim().to_string();
+        if title.is_empty() {
+            self.composer_status = Status::bad("a scenario needs a name".to_string());
+            cx.notify();
+            return;
+        }
+        if let Some(problem) = self.composer.window_problem() {
+            self.composer_status = Status::bad(problem);
+            cx.notify();
+            return;
+        }
+        let mut saved = self.composer.to_saved();
+        saved.title = title;
+        let id = self.library.upsert(saved);
+        self.composer.id = id;
+        match self.library.save(&self.library_path) {
+            Ok(()) => {
+                self.composer_status =
+                    Status::good("saved to the library \u{2014} it is yours now".to_string())
+            }
+            Err(e) => self.composer_status =
+                Status::bad(format!("the library could not be written: {e}")),
+        }
+        cx.notify();
+    }
+
+    /// Open a saved scenario in the composer.
+    ///
+    /// Nothing is written: the operator edits what they opened and saves it,
+    /// or adds it to the game. A pick is not a change, and a pick that
+    /// silently rewrote the library would be a pick nobody could trust.
+    fn use_saved(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(saved) = self.library.get(id).cloned() else {
+            return;
+        };
+        self.composer = ComposerScenario::from_saved(&saved);
+        self.composer_step = ComposerDraft::default();
+        self.composer_step_place = None;
+        self.composer_step_related.clear();
+        self.composer_status = Status::good(format!("{} is in the composer", saved.title));
+        cx.notify();
+    }
+
+    /// Take a saved scenario out of the library.
+    ///
+    /// The library only. A scenario already added to a game is the server's,
+    /// and this verb does not touch it: the plan and the deployment are two
+    /// things, and deleting one does not delete the other.
+    fn delete_saved(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.library.remove(id) {
+            return;
+        }
+        if self.composer.id == id {
+            // The composer was showing the scenario that is now gone. It
+            // keeps the words — the operator may be mid-edit — but it is no
+            // longer a saved thing, so saving it again would make a new one.
+            self.composer.id.clear();
+        }
+        match self.library.save(&self.library_path) {
+            Ok(()) => self.composer_status =
+                Status::good("removed from the library".to_string()),
+            Err(e) => self.composer_status =
+                Status::bad(format!("the library could not be written: {e}")),
+        }
+        cx.notify();
+    }
+
+    /// Empty the composer: a new scenario, and nothing carried over.
+    fn new_composer(&mut self, cx: &mut Context<Self>) {
+        self.composer = ComposerScenario::default();
+        self.composer_step = ComposerDraft::default();
+        self.composer_step_place = None;
+        self.composer_step_related.clear();
+        self.composer_staged = None;
+        self.composer_status = Status::empty();
+        cx.notify();
+    }
+
+    /// Add the drafted step to the composer.
+    ///
+    /// The step's words, its window, the place the pin dropped and the hulls
+    /// it obliges all travel together: a step that names a place but not the
+    /// hulls is half a step, and the operator would have to remember which
+    /// half they had written.
+    fn add_composer_step(&mut self, cx: &mut Context<Self>) {
+        if let Some(problem) = self.composer_step.problem() {
+            self.composer_status = Status::bad(problem);
+            cx.notify();
+            return;
+        }
+        let window = self
+            .composer_step
+            .window()
+            .map(|(a, b)| (a.to_string(), b.to_string()));
+        self.composer.steps.push(crate::library::SavedStep {
+            content: self.composer_step.content.clone(),
+            start_hour: window.as_ref().map(|(a, _)| a.clone()),
+            end_hour: window.as_ref().map(|(_, b)| b.clone()),
+            location: self.composer_step_place,
+            related: self.composer_step_related.clone(),
+        });
+        self.composer_step = ComposerDraft::default();
+        self.composer_step_place = None;
+        self.composer_step_related.clear();
+        self.composer_status = Status::good("step added".to_string());
+        cx.notify();
+    }
+
+    /// Take a step out of the composer.
+    fn remove_composer_step(&mut self, n: usize, cx: &mut Context<Self>) {
+        if n >= self.composer.steps.len() {
+            return;
+        }
+        self.composer.steps.remove(n);
+        self.composer_status = Status::good("step removed".to_string());
+        cx.notify();
+    }
+
+    /// Check or uncheck a hull on the step being written.
+    fn toggle_composer_hull(&mut self, id: i64, cx: &mut Context<Self>) {
+        let key = ("hull".to_string(), id);
+        match self
+            .composer_step_related
+            .iter()
+            .position(|r| *r == key)
+        {
+            Some(at) => {
+                self.composer_step_related.remove(at);
+            }
+            None => self.composer_step_related.push(key),
+        }
+        cx.notify();
+    }
+
+    /// Add the composed scenario to THIS game's book.
+    ///
+    /// A draft edit, like every other authoring act in the console: it stages
+    /// into the book draft and the stage advance writes it through. The
+    /// scenario's window goes with it, and Minos has no datetime on a
+    /// scenario — so the plan's window becomes the FIRST step's start and the
+    /// LAST step's end, on the assumed clock, which is the only timing the
+    /// server holds. The operator sees that said out loud, because a window
+    /// that quietly landed somewhere else is a window nobody can plan around.
+    fn add_to_game(&mut self, cx: &mut Context<Self>) {
+        if !self.staging() {
+            self.composer_status =
+                Status::bad("a scenario joins a game while planning".to_string());
+            cx.notify();
+            return;
+        }
+        let title = self.composer.title.trim().to_string();
+        if title.is_empty() {
+            self.composer_status = Status::bad("a scenario needs a name".to_string());
+            cx.notify();
+            return;
+        }
+        if let Some(problem) = self.composer.window_problem() {
+            self.composer_status = Status::bad(problem);
+            cx.notify();
+            return;
+        }
+        // A second add REPLACES the first. The same plan twice in one book is
+        // two plans, and the operator asked for one.
+        if let Some(previous) = self.composer_staged.take() {
+            self.book.drop_scenario(previous);
+        }
+        let mut saved = self.composer.to_saved();
+        saved.title = title;
+        self.window_onto_steps(&mut saved);
+        let local = crate::library::stage_into(&mut self.book, &saved);
+        self.book.set_description(local, &saved.description);
+        self.composer_staged = Some(local);
+        self.composer_status =
+            Status::good("staged \u{2014} the advance writes it".to_string());
+        cx.notify();
+    }
+
+    /// The plan's window, put where the server can hold it: the first step's
+    /// start and the last step's end, on the assumed clock.
+    ///
+    /// A step that carries a window of its own keeps it — the author's own
+    /// timing is more precise than the scenario's, and a scenario's window is
+    /// the envelope rather than the timetable.
+    fn window_onto_steps(&self, saved: &mut crate::library::SavedScenario) {
+        let Some(start) = saved.start.as_deref().and_then(crate::calendar::hhmm_of) else {
+            return;
+        };
+        let end = saved.end.as_deref().and_then(crate::calendar::hhmm_of);
+        if let Some(first) = saved.steps.first_mut() {
+            if first.start_hour.is_none() {
+                first.start_hour = Some(start.to_string());
+            }
+        }
+        if let Some(end) = end {
+            if let Some(last) = saved.steps.last_mut() {
+                if last.end_hour.is_none() {
+                    last.end_hour = Some(end.to_string());
+                }
+            }
+        }
+    }
+
+    /// Open or shut the mini-calendar on one of the two datetimes.
+    fn toggle_calendar(&mut self, field: CalField, cx: &mut Context<Self>) {
+        if self.cal_field == Some(field) {
+            self.cal_field = None;
+            cx.notify();
+            return;
+        }
+        // The calendar opens on the month the field is in, so an operator
+        // editing a date in March is not shown February.
+        let current = match field {
+            CalField::Start => self.composer.start.clone(),
+            CalField::End => self.composer.end.clone(),
+        };
+        self.cal_month = crate::calendar::parse(&current)
+            .map(|dt| crate::calendar::Month::of(&dt))
+            .unwrap_or_else(crate::calendar::Month::now);
+        self.cal_field = Some(field);
+        cx.notify();
+    }
+
+    /// The calendar's month, one step back or forward.
+    fn cal_shift(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.cal_month = if forward {
+            self.cal_month.next()
+        } else {
+            self.cal_month.prev()
+        };
+        cx.notify();
+    }
+
+    /// A day picked in the calendar: the field takes that day and keeps the
+    /// time it already had.
+    ///
+    /// The time is typed and the date is chosen, because that is the split
+    /// the two controls are good at: a minute is a keystroke and a month is a
+    /// shape. An empty field takes 08:00 — the exercise's morning, and the
+    /// hour the console's own windows use.
+    fn cal_pick(&mut self, day: u32, cx: &mut Context<Self>) {
+        let Some(field) = self.cal_field else {
+            return;
+        };
+        let current = match field {
+            CalField::Start => self.composer.start.clone(),
+            CalField::End => self.composer.end.clone(),
+        };
+        let base = crate::calendar::parse(&current)
+            .unwrap_or_else(|| crate::calendar::at_hour(&crate::calendar::now(), 8));
+        let Some(dt) = crate::calendar::at_day(&base, day) else {
+            return;
+        };
+        let text = crate::calendar::format(&dt);
+        match field {
+            CalField::Start => self.composer.start = text,
+            CalField::End => self.composer.end = text,
+        }
+        cx.notify();
+    }
+
+    /// The composer's own body: the scenario being authored, whole.
+    ///
+    /// Three things and a row of verbs. The NAME and the DESCRIPTION say what
+    /// the plan is; the WINDOW says when it runs; the STEPS say what happens.
+    /// They are in that order because it is the order the author thinks in,
+    /// and a form that asks for the steps before the name makes the author
+    /// name a thing they have not decided what to call yet.
+    fn scenario_composer_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
+        col = col.child(section("compose a scenario"));
+        col = col.child(self.compose_field(6, "Scenario name", cx));
+        col = col.child(self.compose_field(7, "What this scenario is for", cx));
+        col = col.child(self.datetime_row(CalField::Start, cx));
+        col = col.child(self.datetime_row(CalField::End, cx));
+        // What the window MEANS on the game clock, said out loud: Minos has
+        // no datetime on a scenario, so the plan's window becomes the first
+        // step's start and the last step's end.
+        if let Some(line) = self.window_line() {
+            col = col.child(note(line));
+        }
+        if self.cal_field.is_some() {
+            col = col.child(self.mini_calendar(cx));
+        }
+        col = col.child(self.composer_steps(cx));
+        col = col.child(self.composer_step_maker(cx));
+        col = col.child(self.composer_verbs(cx));
+        if !self.composer_status.is_empty() {
+            col = col.child(
+                div()
+                    .text_size(px(view::DENSE_PT))
+                    .child(status_line(&self.composer_status)),
+            );
+        }
+        col.into_any_element()
+    }
+
+    /// The plan's window, said in the console's own words.
+    ///
+    /// A window that is typed and never explained is a window the operator
+    /// cannot check, so the sentence says where it lands: the first step
+    /// starts at it, the last ends at it.
+    fn window_line(&self) -> Option<String> {
+        let start = self.composer.start.trim();
+        let end = self.composer.end.trim();
+        if start.is_empty() && end.is_empty() {
+            return None;
+        }
+        let start_hhmm = crate::calendar::hhmm_of(start);
+        let end_hhmm = crate::calendar::hhmm_of(end);
+        let mut line = String::from("on the assumed clock: ");
+        match (start_hhmm, end_hhmm) {
+            (Some(s), Some(e)) => {
+                line.push_str(&format!("the first step starts at {s} and the last ends at {e}"));
+            }
+            (Some(s), None) => line.push_str(&format!("the first step starts at {s}")),
+            (None, Some(e)) => line.push_str(&format!("the last step ends at {e}")),
+            (None, None) => return None,
+        }
+        Some(line)
+    }
+
+    /// One datetime row: the label, the field, and the calendar that picks
+    /// the date.
+    ///
+    /// The field takes the whole datetime, because an operator who knows the
+    /// date should be able to type it; the calendar is there for the ones who
+    /// do not, and it writes into the same field rather than into a second
+    /// place the two could disagree about.
+    fn datetime_row(&mut self, field: CalField, cx: &mut Context<Self>) -> AnyElement {
+        let idx = match field {
+            CalField::Start => 8,
+            CalField::End => 9,
+        };
+        let open = self.cal_field == Some(field);
+        let label = match field {
+            CalField::Start => "start",
+            CalField::End => "end",
+        };
+        let toggle_id = match field {
+            CalField::Start => "cal-start",
+            CalField::End => "cal-end",
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(tracked(label, view::LABEL_PT, CUT_GREY))
+            .child(div().flex_1().child(self.compose_field(idx, "2026-10-22 08:00", cx)))
+            .child(
+                div()
+                    .id(toggle_id)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.toggle_calendar(field, cx);
+                    }))
+                    .child(button("calendar", true, false, open)),
+            )
+            .into_any_element()
+    }
+
+    /// The mini-calendar: a month, six weeks, seven days.
+    ///
+    /// It is drawn INLINE, under the field it fills, because GPUI 0.2.2 has no
+    /// popover and a floating layer over the map is a layer the map's own
+    /// gestures would fight with. An inline calendar pushes the rest of the
+    /// panel down, which is a small price for a control that cannot land
+    /// somewhere the operator did not put it.
+    fn mini_calendar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let month = self.cal_month;
+        let grid = month.grid();
+        let selected = self
+            .cal_field
+            .and_then(|f| match f {
+                CalField::Start => crate::calendar::parse(&self.composer.start),
+                CalField::End => crate::calendar::parse(&self.composer.end),
+            })
+            .map(|dt| crate::calendar::day_of(&dt));
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .p(px(6.0))
+            .rounded(px(CONTROL_RADIUS))
+            .border(px(1.0))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .bg(rgba(DEEP_WELL));
+        // The month, and the two arrows that walk it.
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .id("cal-prev")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _, _, cx| view.cal_shift(false, cx)))
+                        .child(button("\u{2039}", true, false, false)),
+                )
+                .child(
+                    div()
+                        .font_family(view::FACE_HUMAN)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(view::DENSE_PT))
+                        .text_color(rgba(MAP_INK))
+                        .child(month.label()),
+                )
+                .child(
+                    div()
+                        .id("cal-next")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _, _, cx| view.cal_shift(true, cx)))
+                        .child(button("\u{203a}", true, false, false)),
+                ),
+        );
+        // The weekday heads. Monday first: the console's weeks run that way
+        // everywhere else, and a calendar that starts on Sunday is a second
+        // thing to learn.
+        let heads = ["M", "T", "W", "T", "F", "S", "S"];
+        let mut head = div().flex().flex_row().gap(px(2.0));
+        for h in heads {
+            head = head.child(
+                div()
+                    .w(px(CAL_CELL_W))
+                    .flex()
+                    .justify_center()
+                    .font_family(view::FACE_MACHINE)
+                    .text_size(px(9.0))
+                    .text_color(rgba(CUT_GREY))
+                    .child(h.to_string()),
+            );
+        }
+        col = col.child(head);
+        for week in &grid.weeks {
+            let mut row = div().flex().flex_row().gap(px(2.0));
+            for cell in week {
+                match cell {
+                    Some(day) => {
+                        let on = selected == Some(*day);
+                        let day = *day;
+                        row = row.child(
+                            div()
+                                .id(("cal-day", day as usize))
+                                .w(px(CAL_CELL_W))
+                                .h(px(CAL_CELL_H))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(2.0))
+                                .border(px(1.0))
+                                .border_color(rgba(if on { RADAR_CYAN } else { HAIRLINE_SLATE }))
+                                .font_family(view::FACE_MACHINE)
+                                .text_size(px(10.0))
+                                .text_color(rgba(if on { MAP_INK } else { BODY_SILVER }))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.cal_pick(day, cx);
+                                }))
+                                .child(format!("{day}")),
+                        );
+                    }
+                    None => {
+                        row = row.child(div().w(px(CAL_CELL_W)).h(px(CAL_CELL_H)));
+                    }
+                }
+            }
+            col = col.child(row);
+        }
+        col.into_any_element()
+    }
+
+    /// The steps of the scenario being composed.
+    fn composer_steps(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(4.0));
+        if self.composer.steps.is_empty() {
+            col = col.child(
+                div()
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(BODY_SILVER.with_alpha(204)))
+                    .child("No steps yet. A scenario may be authored while it is written."),
+            );
+            return col.into_any_element();
+        }
+        col = col.child(
+            div()
+                .text_size(px(view::DENSE_PT))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgba(MAP_INK))
+                .child(format!("Steps ({})", self.composer.steps.len())),
+        );
+        let steps = self.composer.steps.clone();
+        for (n, step) in steps.iter().enumerate() {
+            let text = if step.content.is_empty() {
+                "(not written yet)".to_string()
+            } else {
+                step.content.clone()
+            };
+            let window = step
+                .start_hour
+                .clone()
+                .zip(step.end_hour.clone())
+                .map(|(a, b)| format!("{a}\u{2013}{b}"))
+                .unwrap_or_else(|| "\u{2014}".to_string());
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .font_family(view::FACE_MACHINE)
+                        .text_size(px(view::DENSE_PT))
+                        .text_color(rgba(BODY_SILVER))
+                        .child(format!("{:>2}", n + 1)),
+                )
+                .child(
+                    div()
+                        .text_size(px(view::DENSE_PT))
+                        .text_color(rgba(if step.content.is_empty() {
+                            BODY_SILVER.with_alpha(204)
+                        } else {
+                            MAP_INK
+                        }))
+                        .child(text),
+                )
+                .child(div().flex_1());
+            // The place, when the step points at one. It is shown as the
+            // coordinates the words carry, so the two can be compared.
+            if let Some(place) = step.location {
+                row = row.child(
+                    div()
+                        .font_family(view::FACE_MACHINE)
+                        .text_size(px(view::LABEL_PT))
+                        .text_color(rgba(ALERT_YELLOW))
+                        .child(crate::library::place_text(&place)),
+                );
+            }
+            // The hulls the step obliges. A step that names none obliges
+            // nobody, which is legal — and the count says so either way.
+            if !step.related.is_empty() {
+                row = row.child(
+                    div()
+                        .font_family(view::FACE_MACHINE)
+                        .text_size(px(view::LABEL_PT))
+                        .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                        .child(format!("{} hull(s)", step.related.len())),
+                );
+            }
+            row = row.child(
+                div()
+                    .font_family(view::FACE_MACHINE)
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(BODY_SILVER))
+                    .child(window),
+            );
+            row = row.child(
+                div()
+                    .id(("composer-step-remove", n))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.remove_composer_step(n, cx);
+                    }))
+                    .child(button("remove", true, false, false)),
+            );
+            col = col.child(row);
+        }
+        col.into_any_element()
+    }
+
+    /// The step maker: the words, the place, the window and the hulls.
+    ///
+    /// All four, in that order, because they are the four things a step is.
+    /// The PIN writes into the words — the same words the operator is typing
+    /// in — and keeps the place beside it, so a step that points somewhere
+    /// says where in a shape as well as in a sentence.
+    fn composer_step_maker(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(6.0));
+        col = col.child(
+            div()
+                .text_size(px(view::DENSE_PT))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgba(MAP_INK))
+                .child("New step"),
+        );
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .child(div().flex_1().child(self.compose_field(14, "What must happen", cx)))
+                .child(self.pin_control(PinTarget::Composer, cx)),
+        );
+        // The place the pin dropped, said back. A pin that vanishes into the
+        // sentence is a pin the operator cannot check.
+        if let Some(place) = self.composer_step_place {
+            col = col.child(
+                div()
+                    .font_family(view::FACE_MACHINE)
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(ALERT_YELLOW))
+                    .child(crate::library::place_text(&place)),
+            );
+        }
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(view::DENSE_PT))
+                        .text_color(rgba(BODY_SILVER))
+                        .child("window"),
+                )
+                .child(div().flex_1().child(self.compose_field(15, "1000", cx)))
+                .child(div().flex_1().child(self.compose_field(16, "1030", cx)))
+                .child(
+                    div()
+                        .text_size(px(view::LABEL_PT))
+                        .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                        .child("HHMM, or leave both empty"),
+                ),
+        );
+        col = col.child(self.composer_hull_picker(cx));
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .child(
+                    div()
+                        .id("composer-add-step")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _, _, cx| view.add_composer_step(cx)))
+                        .child(button("Add step", true, false, false)),
+                ),
+        );
+        col.into_any_element()
+    }
+
+    /// The hulls a step obliges: the exercise's own hulls, checked.
+    ///
+    /// A step that names no hull obliges nobody, and that is legal — the
+    /// picker says so rather than pretending the list is missing. The hulls
+    /// are the ones in THIS exercise, because a step's obligations are about
+    /// the pieces that will carry them out.
+    fn composer_hull_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(4.0));
+        let count = self.composer_step_related.len();
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .id("composer-hulls-toggle")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.composer_hulls_open = !view.composer_hulls_open;
+                            cx.notify();
+                        }))
+                        .child(button(
+                            if count == 0 {
+                                "hulls".to_string()
+                            } else {
+                                format!("hulls ({count})")
+                            },
+                            true,
+                            false,
+                            self.composer_hulls_open,
+                        )),
+                ),
+        );
+        if !self.composer_hulls_open {
+            return col.into_any_element();
+        }
+        if self.session.pieces.is_empty() {
+            col = col.child(
+                div()
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(BODY_SILVER.with_alpha(204)))
+                    .child("no hulls in the exercise yet \u{2014} assign some in Fleet first"),
+            );
+            return col.into_any_element();
+        }
+        for piece in &self.session.pieces {
+            let on = self
+                .composer_step_related
+                .contains(&("hull".to_string(), piece.id));
+            let id = piece.id;
+            let label_text = piece.label.clone();
+            col = col.child(
+                div()
+                    .id(("composer-hull", id as usize))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.toggle_composer_hull(id, cx);
+                    }))
+                    .child(checkbox(on, false, label_text)),
+            );
+        }
+        col.into_any_element()
+    }
+
+    /// The composer's verbs: save it, add it to this game, or start again.
+    fn composer_verbs(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let named = !self.composer.title.trim().is_empty();
+        let planning = self.staging();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .id("composer-new")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _, _, cx| view.new_composer(cx)))
+                    .child(button("new", true, false, false)),
+            )
+            .child(
+                div()
+                    .id("composer-save")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _, _, cx| view.save_composer(cx)))
+                    .child(button("save to library", true, !named, false)),
+            )
+            .child(
+                div()
+                    .id("composer-add-to-game")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _, _, cx| view.add_to_game(cx)))
+                    .child(button("add to this game", true, !named || !planning, false)),
+            )
+            .into_any_element()
+    }
+
+    /// The library: the operator's own scenarios, kept across games.
+    ///
+    /// The list is the PICKER the composer could not otherwise have: Minos
+    /// holds one book per game and no catalog at all, so a scenario meant
+    /// for another game is picked from here.
+    fn library_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
+        col = col.child(section("saved scenarios"));
+        let saved: Vec<crate::library::SavedScenario> =
+            self.library.sorted().into_iter().cloned().collect();
+        if saved.is_empty() {
+            col = col.child(note(
+                "Nothing saved yet. A scenario composed here can be saved and used in another game.",
+            ));
+            return col.into_any_element();
+        }
+        for (n, scenario) in saved.into_iter().enumerate() {
+            let id = scenario.id.clone();
+            let title = scenario.title.clone();
+            let window = match (scenario.start.as_deref(), scenario.end.as_deref()) {
+                (Some(s), Some(e)) => format!("{s} \u{2192} {e}"),
+                (Some(s), None) => format!("from {s}"),
+                (None, Some(e)) => format!("until {e}"),
+                (None, None) => "no window".to_string(),
+            };
+            let steps = scenario.steps.len();
+            let in_composer = self.composer.id == id;
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(view::DENSE_PT))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgba(if in_composer { RADAR_CYAN } else { MAP_INK }))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .font_family(view::FACE_MACHINE)
+                            .text_size(px(view::LABEL_PT))
+                            .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                            .child(format!("{steps} step(s)")),
+                    )
+                    .child(
+                        div()
+                            .id(("library-use", n))
+                            .cursor_pointer()
+                            .on_click(cx.listener({
+                                let id = id.clone();
+                                move |view, _, _, cx| {
+                                    view.use_saved(&id, cx);
+                                }
+                            }))
+                            .child(button("use", true, false, in_composer)),
+                    )
+                    .child(
+                        div()
+                            .id(("library-delete", n))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.delete_saved(&id, cx);
+                            }))
+                            .child(button("delete", true, false, false)),
+                    ),
+            );
+            col = col.child(
+                div()
+                    .font_family(view::FACE_MACHINE)
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                    .child(window),
+            );
+        }
+        col.into_any_element()
+    }
+
     /// The Book panel: the held game's scenarios with their steps (read),
     /// plus the new-scenario title row and the staged rows the draft holds.
     ///
@@ -18017,7 +19073,7 @@ impl IslandDemo {
                 .justify_between()
                 .h(px(TITLE_H))
                 .child(
-                    panel_title("Book", MAP_INK),
+                    panel_title("Scenario composer", MAP_INK),
                 )
                 .child(
                     div()
@@ -18048,6 +19104,21 @@ impl IslandDemo {
                 )),
         );
         col = col.child(rule());
+        // The composer comes FIRST: it is what the operator came here to do,
+        // and the book it writes into is below it. A panel that opens on the
+        // read and hides the writing behind a scroll is a panel that reads
+        // like a report.
+        col = col.child(self.scenario_composer_body(cx));
+        col = col.child(rule());
+        col = col.child(self.library_body(cx));
+        col = col.child(rule());
+        col = col.child(
+            div()
+                .text_size(px(view::DENSE_PT))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgba(MAP_INK))
+                .child("This game's book"),
+        );
         if self.session.book.is_empty() {
             col = col.child(
                 div()
@@ -18386,7 +19457,7 @@ impl IslandDemo {
                     .text_size(px(view::DENSE_PT))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgba(MAP_INK))
-                    .child("New step"),
+                    .child("New step in this book"),
             );
             // The content field and its PIN, on one row: the pin writes INTO
             // this field, so the two are drawn as what they are — one field
@@ -18397,8 +19468,8 @@ impl IslandDemo {
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
-                    .child(div().flex_1().child(self.compose_field(7, "What must happen", cx)))
-                    .child(self.pin_control(cx)),
+                    .child(div().flex_1().child(self.compose_field(11, "What must happen", cx)))
+                    .child(self.pin_control(PinTarget::Book, cx)),
             );
             col = col.child(note(
                 "A pin quotes the map: DRAG it onto the water, or click it and then \
@@ -18417,8 +19488,8 @@ impl IslandDemo {
                             .text_color(rgba(BODY_SILVER))
                             .child("window"),
                     )
-                    .child(div().flex_1().child(self.compose_field(8, "1000", cx)))
-                    .child(div().flex_1().child(self.compose_field(9, "1030", cx)))
+                    .child(div().flex_1().child(self.compose_field(12, "1000", cx)))
+                    .child(div().flex_1().child(self.compose_field(13, "1030", cx)))
                     .child(
                         div()
                             .text_size(px(view::LABEL_PT))
@@ -18442,39 +19513,43 @@ impl IslandDemo {
             );
         }
         col = col.child(rule());
-        col = col.child(
-            div()
-                .text_size(px(view::DENSE_PT))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgba(MAP_INK))
-                .child("New scenario"),
-        );
-        col = col.child(self.compose_field(6, "New scenario title", cx));
-        let title_ok = !self.book_title.trim().is_empty();
-        col = col.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .text_size(px(view::LABEL_PT))
-                        .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                        .child(if self.staging() {
-                            "edits are staged here and written through at the advance"
-                        } else {
-                            "adds and removes post at once — the console stages and syncs on advance"
-                        }),
-                )
-                .child(
-                    div()
-                        .id("submit-book")
-                        .cursor_pointer()
-                        .on_click(cx.listener(|view, _, _, cx| view.submit_book(cx)))
-                        .child(button("Add scenario", true, !title_ok || self.book_busy, false)),
-                ),
-        );
+        // A scenario may still be added straight to the game, with no steps
+        // and no window — the old row, and the only one that posts at once.
+        // While PLANNING the composer above is the way: a scenario joins the
+        // book as a draft, and the advance writes it. Two rows that both
+        // said "add scenario" would be one too many, so this one stands
+        // down while there is a stage to wait for.
+        if !self.staging() {
+            col = col.child(
+                div()
+                    .text_size(px(view::DENSE_PT))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgba(MAP_INK))
+                    .child("Add a scenario straight to this game"),
+            );
+            col = col.child(self.compose_field(17, "Scenario title", cx));
+            let title_ok = !self.book_title.trim().is_empty();
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(view::LABEL_PT))
+                            .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                            .child("posts at once — the composer's own scenarios are staged"),
+                    )
+                    .child(
+                        div()
+                            .id("submit-book")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|view, _, _, cx| view.submit_book(cx)))
+                            .child(button("Add scenario", true, !title_ok || self.book_busy, false)),
+                    ),
+            );
+        }
         if !self.book_status.is_empty() {
             col = col.child(
                 div()
@@ -24967,6 +26042,7 @@ pub fn run_replay(dir: String, burst_ms: u64, looping: bool) {
         FleetTaxonomy::default(),
         BTreeMap::new(),
         BTreeMap::new(),
+        std::env::temp_dir().join("tfg-scenario-library.json"),
     );
 }
 
@@ -24999,6 +26075,7 @@ pub fn run(
     fleet_tax: FleetTaxonomy,
     unit_taxonomy: BTreeMap<i64, crate::embark::HullTaxonomy>,
     unit_specs: BTreeMap<i64, UnitFigures>,
+    library_path: std::path::PathBuf,
 ) {
     // The SVG icon source, and the only one the app needs: the hull
     // photographs are `RenderImage`s the binary hands over, so nothing else
@@ -25070,7 +26147,14 @@ pub fn run(
         // zoom click — a map whose scale is not the scale it claims.
         let opening_zoom_tx = order_tx.clone();
         let entity = cx.new(|_| {
-            let mut demo = IslandDemo::new(roster, roster_total, selected, session, order_tx);
+            let mut demo = IslandDemo::new_with_library(
+                roster,
+                roster_total,
+                selected,
+                session,
+                order_tx,
+                library_path,
+            );
             // The published figures, read once off the store's mirror. The
             // details panel shows them, and a panel that asked the server
             // per frame would be a fan-out for a table that does not move.
@@ -27949,6 +29033,207 @@ mod tests {
         });
         assert!(!status.is_empty(), "the row says what is missing");
         assert!(rx.try_recv().is_err(), "nothing was sent");
+    }
+
+    /// A shell with a library of its own, in a temp file, so a test that
+    /// saves a scenario never touches the operator's own library.
+    fn demo_with_library(tx: OrderSink) -> IslandDemo {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "tfg-library-test-{}-{n}.json",
+            std::process::id()
+        ));
+        IslandDemo::new_with_library(
+            fixture_roster(),
+            8,
+            0,
+            SessionView::default(),
+            tx,
+            path,
+        )
+    }
+
+    /// A scenario with no name is not saved. The library would take it, and
+    /// the operator would find it again as an unnamed row they cannot pick
+    /// out of a list of plans.
+    #[gpui::test]
+    fn a_nameless_scenario_is_not_saved(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| demo_with_library(tx));
+        let (status, count) = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.composer.title = "   ".to_string();
+                demo.save_composer(cx);
+                (demo.composer_status.clone(), demo.library.scenarios.len())
+            })
+        });
+        assert!(!status.is_empty(), "the composer says what is missing");
+        assert_eq!(count, 0, "nothing was saved");
+    }
+
+    /// A named scenario IS saved, and it is on disk — the library is this
+    /// machine's file, and a save that only lived in memory would be a save
+    /// the operator loses by closing the console.
+    #[gpui::test]
+    fn a_saved_scenario_is_on_disk(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| demo_with_library(tx));
+        let (count, path) = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.composer.title = "First light".to_string();
+                demo.composer.description = "The river crossing".to_string();
+                demo.save_composer(cx);
+                (demo.library.scenarios.len(), demo.library_path.clone())
+            })
+        });
+        assert_eq!(count, 1, "the library holds the scenario");
+        let read_back = crate::library::Library::load(&path);
+        assert_eq!(read_back.scenarios.len(), 1, "and it is on disk");
+        assert_eq!(read_back.scenarios[0].title, "First light");
+        std::fs::remove_file(path).ok();
+    }
+
+    /// A window whose end is not after its start is refused IN THE FIELD.
+    /// The rule is the shared one, so the exercise's own window and this one
+    /// cannot drift apart.
+    #[gpui::test]
+    fn a_window_that_ends_before_it_starts_is_refused(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| demo_with_library(tx));
+        let (status, count) = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.composer.title = "First light".to_string();
+                demo.composer.start = "2026-10-22T12:00".to_string();
+                demo.composer.end = "2026-10-22T08:00".to_string();
+                demo.save_composer(cx);
+                (demo.composer_status.clone(), demo.library.scenarios.len())
+            })
+        });
+        assert!(!status.is_empty(), "the composer says what is wrong");
+        assert_eq!(count, 0, "and nothing was saved");
+    }
+
+    /// A pick opens the scenario in the composer and writes nothing: a pick
+    /// that silently rewrote the library would be a pick nobody could trust.
+    #[gpui::test]
+    fn a_picked_scenario_opens_in_the_composer(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| demo_with_library(tx));
+        let (title, count) = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.composer.title = "First light".to_string();
+                demo.save_composer(cx);
+                let id = demo.library.scenarios[0].id.clone();
+                demo.new_composer(cx);
+                demo.use_saved(&id, cx);
+                (demo.composer.title.clone(), demo.library.scenarios.len())
+            })
+        });
+        assert_eq!(title, "First light", "the scenario is in the composer");
+        assert_eq!(count, 1, "and the library is untouched");
+    }
+
+    /// A step carries its words, its window, its place and its hulls
+    /// together: a step that names a place but not the hulls is half a step.
+    #[gpui::test]
+    fn a_composer_step_carries_its_place_and_its_hulls(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| demo_with_library(tx));
+        let (words, window, place, hulls) = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.composer_step.content = "cross the river".to_string();
+                demo.composer_step.start_hour = "1000".to_string();
+                demo.composer_step.end_hour = "1030".to_string();
+                demo.composer_step_place = Some(crate::library::Place {
+                    lat: -6.2,
+                    lon: 106.8,
+                });
+                demo.toggle_composer_hull(13, cx);
+                demo.add_composer_step(cx);
+                let step = &demo.composer.steps[0];
+                (
+                    step.content.clone(),
+                    step.start_hour.clone(),
+                    step.location,
+                    step.related.len(),
+                )
+            })
+        });
+        assert_eq!(words, "cross the river");
+        assert_eq!(window.as_deref(), Some("1000"));
+        assert!(place.is_some(), "the place travels with the step");
+        assert_eq!(hulls, 1, "the hull it obliges travels with it");
+    }
+
+    /// Adding a scenario to the game STAGES it — a draft edit, like every
+    /// other authoring act — and the plan the advance writes comes out
+    /// scenario first, steps after.
+    #[gpui::test]
+    fn a_scenario_added_to_the_game_is_staged(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut session = SessionView::default();
+            session.state = "planning".to_string();
+            IslandDemo::new_with_library(
+                fixture_roster(),
+                8,
+                0,
+                session,
+                tx,
+                std::env::temp_dir().join("tfg-library-test-staged.json"),
+            )
+        });
+        let writes = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.composer.title = "First light".to_string();
+                demo.composer_step.content = "sweep north".to_string();
+                demo.add_composer_step(cx);
+                demo.add_to_game(cx);
+                crate::book::plan(&demo.book, &[])
+            })
+        });
+        let kinds: Vec<&str> = writes
+            .iter()
+            .map(|w| match w {
+                crate::book::BookWrite::Create { .. } => "create",
+                crate::book::BookWrite::AddStep { .. } => "addstep",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["create", "addstep"], "the scenario, then its step");
+    }
+
+    /// A second add REPLACES the first. The same plan twice in one book is
+    /// two plans, and the operator asked for one.
+    #[gpui::test]
+    fn adding_a_scenario_twice_leaves_one(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut session = SessionView::default();
+            session.state = "planning".to_string();
+            IslandDemo::new_with_library(
+                fixture_roster(),
+                8,
+                0,
+                session,
+                tx,
+                std::env::temp_dir().join("tfg-library-test-twice.json"),
+            )
+        });
+        let (staged, writes) = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.composer.title = "First light".to_string();
+                demo.add_to_game(cx);
+                demo.add_to_game(cx);
+                (
+                    demo.book.staged_news().count(),
+                    crate::book::plan(&demo.book, &[]).len(),
+                )
+            })
+        });
+        assert_eq!(staged, 1, "one scenario stands in the book");
+        assert_eq!(writes, 1, "and one write is planned");
     }
 
     /// A titled row sends the title trimmed — the server refuses blanks, so
@@ -32379,7 +33664,7 @@ mod tests {
         cx.update(|_window, app| {
             view.update(app, |demo, cx| {
                 demo.step_draft.content.clear();
-                demo.arm_pin(cx);
+                demo.arm_pin(PinTarget::Book, cx);
             })
         });
         let clicked = cx.update(|_window, app| {
@@ -32702,7 +33987,7 @@ mod tests {
         assert_eq!(text, "Take station", "and leaves the words alone");
 
 
-        cx.update(|_window, app| view.update(app, |demo, cx| demo.arm_pin(cx)));
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.arm_pin(PinTarget::Book, cx)));
         let (shut, armed) = cx.update(|_window, app| {
             let d = view.read(app);
             (d.book_open, d.pin_arm)
@@ -32730,7 +34015,7 @@ mod tests {
 
         // A second pin appends rather than replacing: an instruction can name
         // two places.
-        cx.update(|_window, app| view.update(app, |demo, cx| demo.arm_pin(cx)));
+        cx.update(|_window, app| view.update(app, |demo, cx| demo.arm_pin(PinTarget::Book, cx)));
         cx.update(|_window, app| {
             view.update(app, |demo, cx| demo.place_pin(0.5, 0.5, cx))
         });
@@ -32745,7 +34030,7 @@ mod tests {
         // next click lands.
         cx.update(|_window, app| {
             view.update(app, |demo, cx| {
-                demo.arm_pin(cx);
+                demo.arm_pin(PinTarget::Book, cx);
                 demo.map_dims = (0.0, 0.0);
                 demo.step_draft.content = "Take station".to_string();
             })

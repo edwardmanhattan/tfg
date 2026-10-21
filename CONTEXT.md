@@ -190,6 +190,22 @@ _Avoid_: ready (unqualified — two different declarations share the server's on
 The scenario book as the operator has it on the client, before Minos has been told any of it: brand-new scenarios with their steps, plus step adds and step cuts against scenarios Minos already holds. Authoring a scenario or a step is a draft edit, never a backend write. A Book draft is written through in one ordered diff at a stage advance — creates before their steps, because a step belongs to a scenario the server has to hold first — and always before the transition, because the server only takes pages in planning.
 _Avoid_: staged book, local book, unsaved book_
 
+**Saved scenario**:
+A whole scenario the operator authored and kept on this machine: its name, its description, its window, its steps, and each step's place and its related hulls. A saved scenario outlives every game it was ever deployed into, and it is a PLAN — the game's own scenario is a deployment of it, and the two are not the same thing.
+_Avoid_: template, preset, scenario library entry, draft scenario_
+
+**Library**:
+The file of saved scenarios, kept under the data dir and shared by every game this machine opens. Minos holds no catalog of scenarios — a game has exactly ONE book — so the catalog is the client's. It never writes to the network.
+_Avoid_: catalog, store, scenario bank, database_
+
+**Composer**:
+The surface where a scenario is authored: its name, its description, its window, and its steps. The composer's scenario is a saved scenario in the making, and adding it to a game stages it into the Book draft.
+_Avoid_: editor, builder, form, scenario maker_
+
+**Step place**:
+Where a step points, as a number: a latitude and a longitude. A step's words carry the same place in text, and the two are the same digits, because an exercise authored against one position and reviewed against another is a scenario nobody can trust.
+_Avoid_: pin, marker, waypoint, target
+
 **Setup**:
 The session phase for windows, roster, placements, and seats. Nothing moves, nothing is ordered; booting into Setup is the lobby.
 _Avoid_: lobby (that's Setup with defaults), staging
