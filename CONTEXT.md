@@ -202,6 +202,10 @@ _Avoid_: catalog, store, scenario bank, database_
 The surface where a scenario is authored: its name, its description, its window, and its steps. The composer's scenario is a saved scenario in the making, and adding it to a game stages it into the Book draft.
 _Avoid_: editor, builder, form, scenario maker_
 
+**Scenario list**:
+The one list of scenarios the composer offers: the draft being written, the scenarios the held game holds, and the ones saved on this machine. Each row says which of the three it is, because a scenario in the game and a scenario in the library are different things. Opening one puts its steps in the composer's steps column, which shows one scenario at a time.
+_Avoid_: library list, scenario picker, scenario browser_
+
 **Step place**:
 Where a step points, as a number: a latitude and a longitude. A step's words carry the same place in text, and the two are the same digits, because an exercise authored against one position and reviewed against another is a scenario nobody can trust.
 _Avoid_: pin, marker, waypoint, target

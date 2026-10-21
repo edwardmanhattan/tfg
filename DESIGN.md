@@ -523,12 +523,29 @@ The composer is one modal, and it is TWO COLUMNS.
 
 **Left column — where a scenario comes from.** The form that creates one at
 the top (name, description, and the window as a date and a time for each
-end), the saved scenarios to pick below it, and the game's own book under
-those. **Right column — where a scenario goes.** The steps of the scenario
-being worked on: its name and window at the top, the step list, and the row
-that adds a step — its words, a pin, its window, and the hulls it obliges.
+end), and below it ONE list of scenarios: the draft being written, the
+scenarios this game holds, and the operator's own saved ones. **Right column
+— where a scenario goes.** The steps of the scenario being worked on: its
+name and window at the top, the step list, and the row that adds a step — its
+words, a pin, its window, and the hulls it obliges.
 
-The split is the arrangement the operator asked for, and it is the right one:
+**The list is one list, and it says where each scenario comes from.** The
+game's own scenarios are in it, tagged *this game*, beside the ones saved on
+this machine, tagged *saved*, and the draft, tagged *draft*. A scenario in
+the game and a scenario in the library are different things — one is the
+server's, the other is the operator's — and a list that does not say which is
+which is a list the operator has to guess at. The game's scenarios used to
+have a section of their own with their steps drawn under them: the same
+scenario in two places at once, and a column that was a book inside a list.
+
+**Opening a scenario loads its steps into the right column.** A game
+scenario's steps are the game's own, and they are worked on where a scenario
+is worked on. The column shows ONE scenario at a time, because a column that
+showed two would not say which of them the words below belonged to. Closing
+the column puts it down and keeps the work: the draft stays in the list, and
+the *open* verb brings it back.
+
+**The split is the arrangement the operator asked for, and it is the right one:**
 the left column is a set of LISTS and a form, and the right column is the
 work. A scenario's steps belong to the scenario above them, so a panel that
 stacks the form, the library and the steps pushes the steps away from the
@@ -536,9 +553,9 @@ thing they belong to — and the operator has to scroll to find out which
 scenario they are writing.
 
 **The right column is empty until there is something in it.** A step belongs
-to a scenario, so the column says so, and names the two ways out of it
-(*create one above, or pick a saved one*). A step composer with nothing
-above it is a list of orphans.
+to a scenario, so the column says so, and names the ways out of it (*create
+one on the left, or open one of the scenarios listed there*). A step composer
+with nothing above it is a list of orphans.
 
 **Each column scrolls on its own.** One scroll for the pair would mean that
 working on a long list of steps dragged the form away with it. A step's

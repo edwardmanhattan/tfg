@@ -535,6 +535,13 @@ struct ComposerScenario {
     /// `YYYY-MM-DDTHH:MM`. Empty when unset.
     end: String,
     steps: Vec<crate::library::SavedStep>,
+    /// The local id of this scenario's copy in the Book draft, when it has
+    /// been staged into the game.
+    ///
+    /// It is what keeps the SCENARIOS list from showing the same scenario
+    /// twice: the draft and the staged copy are one scenario, and the list
+    /// draws it once, tagged "staged".
+    staged: Option<i64>,
 }
 
 impl ComposerScenario {
@@ -559,6 +566,7 @@ impl ComposerScenario {
             start: saved.start.clone().unwrap_or_default(),
             end: saved.end.clone().unwrap_or_default(),
             steps: saved.steps.clone(),
+            staged: None,
         }
     }
 
@@ -577,6 +585,66 @@ impl ComposerScenario {
         }
         None
     }
+}
+
+/// What the STEPS column is showing.
+///
+/// One scenario at a time, because a column that showed two would not say
+/// which of them the words below belonged to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StepsPane {
+    /// Nothing is open.
+    None,
+    /// The composer's draft.
+    Composer,
+    /// A scenario this game holds — by the id the book knows it by, which is
+    /// negative for one this draft is about to create.
+    Game(i64),
+}
+
+/// What a row of the SCENARIOS list can do.
+///
+/// The list holds three kinds of scenario and they do not do the same
+/// things: a game scenario opens its steps, a saved one opens in the
+/// composer and can be taken out of the library, and the draft opens in the
+/// composer too.
+enum ScenarioVerb {
+    /// The draft being written: open it in the composer.
+    Draft,
+    /// A scenario this game holds: open its steps.
+    Game(i64),
+    /// A scenario the operator saved: open it, or take it out.
+    Saved(String),
+}
+
+/// A window for a list row: empty when the scenario has none.
+///
+/// `window_brief` says "no window", which is right for a full stop and
+/// wrong for a list row — a row with no window should say nothing, not
+/// carry the same phrase on every line.
+fn row_window(start: Option<&str>, end: Option<&str>) -> String {
+    let brief = window_brief(start, end);
+    if brief == "no window" {
+        String::new()
+    } else {
+        brief
+    }
+}
+
+/// The window a scenario THIS GAME holds carries: the first step's start
+/// and the last step's end.
+///
+/// That is where the plan's window landed — Minos holds no datetime on a
+/// scenario — so it is the only window the book has to give.
+fn game_window(steps: &[BookStep]) -> (Option<String>, Option<String>) {
+    let start = steps
+        .iter()
+        .find_map(|s| s.window.as_ref().map(|(a, _)| a.clone()));
+    let end = steps
+        .iter()
+        .rev()
+        .find_map(|s| s.window.as_ref().map(|(_, b)| b.clone()));
+    (start, end)
 }
 
 struct IslandState {
@@ -1022,7 +1090,8 @@ struct IslandDemo {
     /// it would be a second answer waiting to disagree. `step_busy` latches
     /// the step writes apart from the title-row write on the shared answer
     /// feed.
-    book_open_scenario: Option<i64>,
+    /// What the STEPS column is showing.
+    steps_pane: StepsPane,
     step_draft: ComposerDraft,
     step_busy: bool,
     /// Readiness: the caller's declare/withdraw on the held game. Its own
@@ -3549,7 +3618,7 @@ impl IslandDemo {
             book_title: String::new(),
             book_busy: false,
             book_status: Status::empty(),
-            book_open_scenario: None,
+            steps_pane: StepsPane::None,
             step_draft: ComposerDraft::default(),
             step_busy: false,
             readiness_busy: false,
@@ -3789,13 +3858,27 @@ impl IslandDemo {
                         location: Some(crate::library::Place { lat: -6.2, lon: 106.8 }),
                         related: Vec::new(),
                     }],
+                    staged: None,
                 });
                 demo.cal_month = crate::calendar::Month::new(2026, 10);
                 demo.picker = match seed.as_str() {
                     "time" => Some(Picker::Time(CalField::Start)),
-                    "none" => None,
+                    "none" | "game" => None,
                     _ => Some(Picker::Date(CalField::Start)),
                 };
+                // The draft is the scenario the STEPS column shows, and the
+                // column shows ONE scenario at a time.
+                demo.steps_pane = StepsPane::Composer;
+            }
+            // "game" seeds the OTHER state of the STEPS column: one of the
+            // scenarios this game holds, opened out of the list. It is the
+            // state the list's OPEN verb reaches, and a picture of it is the
+            // only way to see that the game's steps load into the column
+            // rather than into a section of their own.
+            if seed == "game" {
+                if let Some(sc) = demo.session.book.first() {
+                    demo.steps_pane = StepsPane::Game(sc.id);
+                }
             }
         }
         demo
@@ -14347,7 +14430,7 @@ impl IslandDemo {
         // edge. It says what the half below it is.
         col = col.child(section("compose"));
         col = col.child(self.comms_pickers(cx));
-        col = col.child(self.compose_field(10, "message text\u{2026}", cx));
+        col = col.child(self.compose_field(12, "message text\u{2026}", cx));
         col = col.child(
             div()
                 .flex()
@@ -18274,17 +18357,17 @@ impl IslandDemo {
     /// to create. Either way nothing posts, and the flush orders the step
     /// behind the scenario it belongs to.
     fn submit_step(&mut self, cx: &mut Context<Self>) {
-        let open = self
-            .book_open_scenario
+        let open = match self.steps_pane {
+            StepsPane::Game(id) => Some(id),
             // A scenario this draft is about to create is the likeliest
             // target: the author has just written it, and the steps they
             // add next belong to it.
-            .or_else(|| {
-                self.staging()
-                    .then(|| self.book.staged_news().last().map(|s| s.local_id))
-                    .flatten()
-            })
-            .or_else(|| self.session.book.first().map(|s| s.id));
+            _ => self
+                .staging()
+                .then(|| self.book.staged_news().last().map(|s| s.local_id))
+                .flatten()
+                .or_else(|| self.session.book.first().map(|s| s.id)),
+        };
         let Some(scenario_id) = open else {
             self.book_status = Status::bad("add a scenario first".to_string());
             cx.notify();
@@ -18522,7 +18605,12 @@ impl IslandDemo {
             start,
             end,
             steps: Vec::new(),
+            staged: None,
         });
+        // The STEPS column shows ONE scenario, and it is the one just made:
+        // a game's scenario cannot stay open underneath it, or the column
+        // would show two scenarios at once.
+        self.steps_pane = StepsPane::Composer;
         // The form is emptied for the next scenario, and the picker is shut:
         // a form that still holds the scenario just created would invite the
         // operator to create it twice.
@@ -18578,6 +18666,9 @@ impl IslandDemo {
             return;
         };
         self.working = Some(ComposerScenario::from_saved(&saved));
+        // The composer's scenario is the one now open in the STEPS column;
+        // a game's scenario cannot stay open underneath it.
+        self.steps_pane = StepsPane::Composer;
         self.composer_step = ComposerDraft::default();
         self.composer_step_place = None;
         self.composer_step_related.clear();
@@ -18611,15 +18702,17 @@ impl IslandDemo {
         cx.notify();
     }
 
-    /// Close the working scenario: nothing is open, and the third section
-    /// goes away with it.
+    /// Close the composer's pane: the STEPS column empties, and the draft
+    /// is KEPT.
+    ///
+    /// It is kept because a draft that vanishes when the operator puts the
+    /// pane down is a draft that vanishes by accident. It stays in the
+    /// list, tagged "draft", and the OPEN verb brings it back.
     fn close_working(&mut self, cx: &mut Context<Self>) {
-        self.working = None;
+        self.steps_pane = StepsPane::None;
         self.composer_step = ComposerDraft::default();
         self.composer_step_place = None;
         self.composer_step_related.clear();
-        self.composer_staged = None;
-        self.composer_status = Status::empty();
         cx.notify();
     }
 
@@ -18749,6 +18842,11 @@ impl IslandDemo {
         let local = crate::library::stage_into(&mut self.book, &saved);
         self.book.set_description(local, &saved.description);
         self.composer_staged = Some(local);
+        // The draft remembers its copy, so the list can draw the scenario
+        // once and tag it "staged" rather than twice.
+        if let Some(working) = self.working.as_mut() {
+            working.staged = Some(local);
+        }
         self.composer_status = if left_out == 0 {
             Status::good("staged \u{2014} the advance writes it".to_string())
         } else {
@@ -18936,21 +19034,7 @@ impl IslandDemo {
             ),
             None => (String::new(), String::new()),
         };
-        col = col.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .child(section("steps"))
-                .child(
-                    div()
-                        .id("close-working")
-                        .cursor_pointer()
-                        .on_click(cx.listener(|view, _, _, cx| view.close_working(cx)))
-                        .child(button("close", true, false, false)),
-                ),
-        );
+        col = col.child(self.steps_header(cx));
         col = col.child(
             div()
                 .flex()
@@ -18960,6 +19044,8 @@ impl IslandDemo {
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
+                        .truncate()
                         .text_size(px(view::DENSE_PT))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgba(RADAR_CYAN))
@@ -18979,6 +19065,16 @@ impl IslandDemo {
         col = col.child(self.composer_steps(cx));
         col = col.child(self.composer_step_maker(cx));
         col = col.child(self.composer_verbs(cx));
+        // The composer's own status, said where the composing happens. It
+        // used to be set and never shown, so "scenario created" and "step
+        // added" happened in silence.
+        if !self.composer_status.is_empty() {
+            col = col.child(
+                div()
+                    .text_size(px(view::DENSE_PT))
+                    .child(status_line(&self.composer_status)),
+            );
+        }
         col.into_any_element()
     }
 
@@ -19633,93 +19729,233 @@ impl IslandDemo {
             .into_any_element()
     }
 
-    /// The library: the operator's own scenarios, kept across games.
+    /// The SCENARIOS list: the draft being written, the scenarios THIS game
+    /// holds, and the operator's own saved ones.
     ///
-    /// The list is the PICKER the composer could not otherwise have: Minos
-    /// holds one book per game and no catalog at all, so a scenario meant
-    /// for another game is picked from here.
-    fn library_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// One list, because they are one kind of thing — scenarios that can be
+    /// OPENED. The list is also the picker the composer could not otherwise
+    /// have: Minos holds one book per game and no catalog at all, so a
+    /// scenario meant for another game is picked from here.
+    fn scenario_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
-        col = col.child(section("saved scenarios"));
+        col = col.child(section("scenarios"));
+        let mut any = false;
+        let mut ix = 0usize;
+
+        // The draft: the scenario being written, before it is saved. It is
+        // in the list so that it can be come back to after another scenario
+        // has been opened. Once it has been staged into the game, the
+        // game's own copy stands for it and there is no second row.
+        if let Some(w) = self.working.clone() {
+            if w.id.is_empty() {
+                any = true;
+                ix += 1;
+                let window = row_window(
+                    (!w.start.trim().is_empty()).then_some(w.start.as_str()),
+                    (!w.end.trim().is_empty()).then_some(w.end.as_str()),
+                );
+                let open = self.steps_pane == StepsPane::Composer;
+                col = col.child(self.scenario_row(
+                    &w.title,
+                    if w.staged.is_some() { "staged" } else { "draft" },
+                    &window,
+                    w.steps.len(),
+                    open,
+                    ix,
+                    ScenarioVerb::Draft,
+                    cx,
+                ));
+            }
+        }
+
+        // The scenarios THIS GAME holds. They are the server's own, and
+        // their steps are the game's; opening one shows those steps in the
+        // STEPS column, where a step belongs to the scenario it belongs to.
+        for sc in self.session.book.clone() {
+            any = true;
+            ix += 1;
+            let open = self.steps_pane == StepsPane::Game(sc.id);
+            let (start, end) = game_window(&sc.steps);
+            let window = row_window(start.as_deref(), end.as_deref());
+            col = col.child(self.scenario_row(
+                &sc.title,
+                "this game",
+                &window,
+                sc.steps.len(),
+                open,
+                ix,
+                ScenarioVerb::Game(sc.id),
+                cx,
+            ));
+        }
+
+        // The scenarios this draft is about to create. They stand in the
+        // book now, marked, because a scenario the operator can only see in
+        // a counter is one they cannot check before the advance writes it.
+        for news in self.book.staged_news().cloned().collect::<Vec<_>>() {
+            // The draft's own staged copy is that draft, and the draft is
+            // already in this list.
+            if self.working.as_ref().and_then(|w| w.staged) == Some(news.local_id) {
+                continue;
+            }
+            any = true;
+            ix += 1;
+            let open = self.steps_pane == StepsPane::Game(news.local_id);
+            col = col.child(self.scenario_row(
+                &news.title,
+                "staged",
+                "",
+                news.steps.len(),
+                open,
+                ix,
+                ScenarioVerb::Game(news.local_id),
+                cx,
+            ));
+        }
+
+        // The operator's own saved scenarios.
         let saved: Vec<crate::library::SavedScenario> =
             self.library.sorted().into_iter().cloned().collect();
-        if saved.is_empty() {
-            col = col.child(note(
-                "Nothing saved yet. A scenario composed here can be saved and used in another game.",
-            ));
-            return col.into_any_element();
-        }
-        for (n, scenario) in saved.into_iter().enumerate() {
+        for scenario in saved {
+            any = true;
+            ix += 1;
             let id = scenario.id.clone();
-            let title = scenario.title.clone();
-            let window = window_brief(scenario.start.as_deref(), scenario.end.as_deref());
-            let steps = scenario.steps.len();
-            let in_composer = self.working.as_ref().is_some_and(|w| w.id == id);
-            col = col.child(
+            let open = self.steps_pane == StepsPane::Composer
+                && self.working.as_ref().is_some_and(|w| w.id == id);
+            let window = row_window(scenario.start.as_deref(), scenario.end.as_deref());
+            col = col.child(self.scenario_row(
+                &scenario.title,
+                "saved",
+                &window,
+                scenario.steps.len(),
+                open,
+                ix,
+                ScenarioVerb::Saved(id),
+                cx,
+            ));
+        }
+        if !any {
+            col = col.child(note(
+                "No scenarios yet. Create one above, or open one of the scenarios this \
+                 game holds.",
+            ));
+        }
+        col.into_any_element()
+    }
+
+    /// One row of the SCENARIOS list: the title, where it came from, how
+    /// many steps it has, and the verbs that act on it.
+    ///
+    /// The row says WHERE the scenario comes from, because a scenario in
+    /// this game and a scenario on this machine are different things, and a
+    /// list that does not say which is which is a list the operator has to
+    /// guess at.
+    fn scenario_row(
+        &mut self,
+        title: &str,
+        tag: &str,
+        window: &str,
+        steps: usize,
+        open: bool,
+        row_ix: usize,
+        verb: ScenarioVerb,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(view::DENSE_PT))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgba(if open { RADAR_CYAN } else { MAP_INK }))
+                    .child(title.to_string()),
+            )
+            .child(
+                div()
+                    .font_family(view::FACE_MACHINE)
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(ALERT_YELLOW))
+                    .child(tag.to_string()),
+            )
+            .child(
+                div()
+                    .font_family(view::FACE_MACHINE)
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                    .child(format!("{steps} step(s)")),
+            );
+        match verb {
+            ScenarioVerb::Draft => {
+                row = row.child(
+                    div()
+                        .id(("scenario-open", row_ix))
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.steps_pane = StepsPane::Composer;
+                            cx.notify();
+                        }))
+                        .child(button("open", true, false, open)),
+                );
+            }
+            ScenarioVerb::Game(id) => {
+                let id = id;
+                row = row.child(
+                    div()
+                        .id(("scenario-open", row_ix))
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.steps_pane = StepsPane::Game(id);
+                            cx.notify();
+                        }))
+                        .child(button("open", true, false, open)),
+                );
+            }
+            ScenarioVerb::Saved(id) => {
+                let id_use = id.clone();
+                row = row
                     .child(
                         div()
-                            .flex_1()
-                            .text_size(px(view::DENSE_PT))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgba(if in_composer { RADAR_CYAN } else { MAP_INK }))
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .font_family(view::FACE_MACHINE)
-                            .text_size(px(view::LABEL_PT))
-                            .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                            .child(format!("{steps} step(s)")),
-                    )
-                    .child(
-                        div()
-                            .id(("library-use", n))
+                            .id(("scenario-use", row_ix))
+                            .flex_shrink_0()
                             .cursor_pointer()
-                            .on_click(cx.listener({
-                                let id = id.clone();
-                                move |view, _, _, cx| {
-                                    view.use_saved(&id, cx);
-                                }
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.use_saved(&id_use, cx);
                             }))
-                            .child(button("use", true, false, in_composer)),
+                            .child(button("use", true, false, open)),
                     )
                     .child(
                         div()
-                            .id(("library-delete", n))
+                            .id(("scenario-delete", row_ix))
+                            .flex_shrink_0()
                             .cursor_pointer()
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 view.delete_saved(&id, cx);
                             }))
                             .child(button("delete", true, false, false)),
-                    ),
-            );
+                    );
+            }
+        }
+        let mut col = div().flex().flex_col().gap(px(2.0)).child(row);
+        if !window.is_empty() {
             col = col.child(
                 div()
                     .font_family(view::FACE_MACHINE)
                     .text_size(px(view::LABEL_PT))
                     .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                    .child(window),
+                    .child(window.to_string()),
             );
         }
         col.into_any_element()
     }
 
-    /// The Book panel: the held game's scenarios with their steps (read),
-    /// plus the new-scenario title row and the staged rows the draft holds.
-    ///
-    /// The read is the console's `book_view` WITH the staging: server
-    /// scenarios in book order, the steps this draft is about to add
-    /// appended and marked, the steps it is about to cut marked, and the
-    /// scenarios it is about to create drawn after the server's. Outside
-    /// planning there is nothing staged to draw, and the aside below says
-    /// so rather than faking a staging. Steps are numbered in order with
-    /// their windows; empty content reads weak, because unwritten is an
-    /// authoring state, not an error.
     /// The composer's header: the title band, the rule, and the line that
     /// says which game's book this is.
     ///
@@ -19822,6 +20058,13 @@ impl IslandDemo {
 
     /// The LEFT column: the form that creates a scenario, the saved ones to
     /// pick, and the game's own book.
+    /// The LEFT column: the form that creates a scenario, and the list of
+    /// scenarios that can be opened.
+    ///
+    /// The game used to have a section of its own here, with its steps
+    /// drawn under them: the same scenario in two places at once, and a
+    /// column that was a book inside a list. The game's scenarios are in
+    /// the LIST now, tagged, and their steps load into the STEPS column.
     fn book_left_column(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let rule = || div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE));
         let mut col = div()
@@ -19830,453 +20073,111 @@ impl IslandDemo {
             .gap(px(view::PANEL_GAP));
         col = col.child(self.new_scenario_section(cx));
         col = col.child(rule());
-        col = col.child(self.library_body(cx));
-        col = col.child(rule());
-        col = col.child(
-            div()
-                .text_size(px(view::DENSE_PT))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgba(MAP_INK))
-                .child("This game's book"),
-        );
-        if self.session.book.is_empty() {
-            col = col.child(
-                div()
-                    .text_size(px(view::DENSE_PT))
-                    .text_color(rgba(BODY_SILVER.with_alpha(204)))
-                    .child("No scenarios yet. One game has one book."),
-            );
-        }
-        // The open scenario's id: the tapped one, else the book's first —
-        // the console's landing rule for an author reopening to keep working.
-        let open_id = self
-            .book_open_scenario
-            .or_else(|| {
-                self.staging()
-                    .then(|| self.book.staged_news().last().map(|s| s.local_id))
-                    .flatten()
-            })
-            .or_else(|| self.session.book.first().map(|s| s.id));
-        for sc in self.session.book.clone() {
-            let open = Some(sc.id) == open_id;
-            // The steps this scenario will HAVE, which is the server's plus
-            // the ones this draft is about to add: a scenario's step count
-            // that ignored the staged steps would say "2 step(s)" about a
-            // scenario the operator has just given a third.
-            let staged_steps: Vec<crate::book::StagedStep> =
-                self.book.added_steps(sc.id).cloned().collect();
-            let cuts = sc
-                .steps
-                .iter()
-                .filter(|st| self.book.is_cut(sc.id, st.id))
-                .count();
-            let step_count = sc.steps.len() + staged_steps.len() - cuts;
-            col = col.child(
-                div()
-                    .id(("book-scenario", sc.id as usize))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.book_open_scenario = Some(sc.id);
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .text_size(px(view::DENSE_PT))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgba(if open { RADAR_CYAN } else { MAP_INK }))
-                            .child(format!(
-                                "{}  -  {}",
-                                sc.title,
-                                plural(step_count, "step")
-                            )),
-                    ),
-            );
-            if !open {
-                continue;
-            }
-            if sc.steps.is_empty() && staged_steps.is_empty() {
-                col = col.child(
-                    div()
-                        .text_size(px(view::LABEL_PT))
-                        .text_color(rgba(BODY_SILVER.with_alpha(204)))
-                        .child("No steps yet. A plan may be authored while it is written."),
-                );
-            }
-            for (n, step) in sc.steps.iter().enumerate() {
-                let text = if step.content.is_empty() {
-                    "(not written yet)".to_string()
-                } else {
-                    step.content.clone()
-                };
-                let window = step
-                    .window
-                    .as_ref()
-                    .map(|(a, b)| format!("{a}\u{2013}{b}"))
-                    .unwrap_or_else(|| "\u{2014}".to_string());
-                let step_id = step.id;
-                let scenario_id = sc.id;
-                let mut row = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .font_family(view::FACE_MACHINE)
-                            .text_size(px(view::DENSE_PT))
-                            .text_color(rgba(BODY_SILVER))
-                            .child(format!("{:>2}", n + 1)),
-                    )
-                    // The words take what is left of the row and TRUNCATE:
-                    // the column is narrow, and a step's text clipped by the
-                    // panel's edge is a step the operator cannot read.
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(view::DENSE_PT))
-                            .text_color(rgba(if step.content.is_empty() {
-                                BODY_SILVER.with_alpha(204)
-                            } else {
-                                MAP_INK
-                            }))
-                            .child(text),
-                    )
-                    .child(
-                        div()
-                            .font_family(view::FACE_MACHINE)
-                            .text_size(px(view::LABEL_PT))
-                            .text_color(rgba(BODY_SILVER))
-                            .child(window),
-                    );
-                // The relate count, when the fan-out read this step: the
-                // console's `{n} post(s)` tail. Absent is unreadable, and an
-                // unreadable step claims no count rather than zero. A staged
-                // list is the draft's own, and it counts too.
-                match self.book.related(sc.id, step.id) {
-                    Some(refs) => {
-                        row = row.child(
-                            div()
-                                .text_size(px(10.0))
-                                .text_color(rgba(ALERT_YELLOW))
-                                .child(format!("{} post(s) staged", refs.len())),
-                        );
-                    }
-                    None => {
-                        if let Some(r) = self.related_for(sc.id, step.id) {
-                            row = row.child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                                    .child(format!("{} post(s)", r.posts.len())),
-                            );
-                        }
-                    }
-                }
-                // A step staged for removal stands, marked, until the
-                // advance cuts it: vanishing before the write would hide the
-                // operator's own decision back at them.
-                if self.book.is_cut(sc.id, step.id) {
-                    row = row.child(
-                        div()
-                            .text_size(px(view::LABEL_PT))
-                            .text_color(rgba(ALERT_YELLOW))
-                            .child("staged to leave".to_string()),
-                    );
-                }
-                row = row
-                    .child(
-                        div()
-                            .id(("book-relate", step_id as usize))
-                            .flex_shrink_0()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.toggle_relate(scenario_id, step_id, cx);
-                            }))
-                            .child(button("relate", true, false, false)),
-                    )
-                    .child(
-                        div()
-                            .id(("book-remove-step", step_id as usize))
-                            .flex_shrink_0()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.remove_step(scenario_id, step_id, cx);
-                            }))
-                            .child(button("remove", true, self.step_busy, false)),
-                    );
-                col = col.child(row);
-                // The relate editor, inline under its step — the console's
-                // `relate_editor_ui` under the row, without the staging.
-                if self.relate_open == Some((sc.id, step.id)) {
-                    col = col.child(self.relate_editor(sc.id, step.id, cx));
-                }
-            }
-            // The steps this draft has added to a scenario the server holds.
-            // They stand in the book now, marked, because a step the
-            // operator can only see in a counter is a step they cannot
-            // check before the advance writes it.
-            for (k, staged) in staged_steps.iter().enumerate() {
-                let text = if staged.content.is_empty() {
-                    "(not written yet)".to_string()
-                } else {
-                    staged.content.clone()
-                };
-                let window = staged
-                    .start
-                    .clone()
-                    .zip(staged.end.clone())
-                    .map(|(a, b)| format!("{a}\u{2013}{b}"))
-                    .unwrap_or_else(|| "\u{2014}".to_string());
-                let step_id = staged.local_id;
-                let scenario_id = sc.id;
-                let row = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .font_family(view::FACE_MACHINE)
-                            .text_size(px(11.0))
-                            .text_color(rgba(BODY_SILVER))
-                            .child(format!("{:>2}", sc.steps.len() + k + 1)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(rgba(if staged.content.is_empty() {
-                                BODY_SILVER.with_alpha(204)
-                            } else {
-                                MAP_INK
-                            }))
-                            .child(text),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .font_family(view::FACE_MACHINE)
-                            .text_size(px(10.0))
-                            .text_color(rgba(BODY_SILVER))
-                            .child(window),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgba(ALERT_YELLOW))
-                            .child("staged".to_string()),
-                    )
-                    .child(
-                        div()
-                            .id(("book-remove-step", step_id as usize))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.remove_step(scenario_id, step_id, cx);
-                            }))
-                            .child(button("remove", true, false, false)),
-                    );
-                col = col.child(row);
-            }
-        }
-
-        // The scenarios this draft is about to create. They stand in the book
-        // now, marked, because a scenario the operator can only see in a
-        // counter is one they cannot check before the advance writes it.
-        for news in self.book.staged_news().cloned().collect::<Vec<_>>() {
-            let open = Some(news.local_id) == open_id;
-            col = col.child(
-                div()
-                    .id(("book-scenario-new", news.local_id as usize))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.book_open_scenario = Some(news.local_id);
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgba(if open { RADAR_CYAN } else { MAP_INK }))
-                            .child(format!("{}  -  {} step(s)", news.title, news.steps.len())),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgba(ALERT_YELLOW))
-                            .child("staged".to_string()),
-                    ),
-            );
-            if !open {
-                continue;
-            }
-            for (n, step) in news.steps.iter().enumerate() {
-                let text = if step.content.is_empty() {
-                    "(not written yet)".to_string()
-                } else {
-                    step.content.clone()
-                };
-                let window = step
-                    .start
-                    .clone()
-                    .zip(step.end.clone())
-                    .map(|(a, b)| format!("{a}\u{2013}{b}"))
-                    .unwrap_or_else(|| "\u{2014}".to_string());
-                let step_id = step.local_id;
-                let scenario_id = news.local_id;
-                col = col.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .font_family(view::FACE_MACHINE)
-                                .text_size(px(11.0))
-                                .text_color(rgba(BODY_SILVER))
-                                .child(format!("{:>2}", n + 1)),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(rgba(if step.content.is_empty() {
-                                    BODY_SILVER.with_alpha(204)
-                                } else {
-                                    MAP_INK
-                                }))
-                                .child(text),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .font_family(view::FACE_MACHINE)
-                                .text_size(px(10.0))
-                                .text_color(rgba(BODY_SILVER))
-                                .child(window),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .text_color(rgba(ALERT_YELLOW))
-                                .child("staged".to_string()),
-                        )
-                        .child(
-                            div()
-                                .id(("book-remove-step", step_id as usize))
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.remove_step(scenario_id, step_id, cx);
-                                }))
-                                .child(button("remove", true, false, false)),
-                        ),
-                );
-            }
-        }
-
-        // The new-step row: content plus the window, both ends or
-        // neither — the console's row, with its hint and its aside. It
-        // belongs to the OPEN scenario, live or staged, so it is drawn
-        // only when there is one: a step needs a scenario to belong to.
-        if open_id.is_some() {
-            col = col.child(
-                div()
-                    .text_size(px(view::DENSE_PT))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgba(MAP_INK))
-                    .child("New step in this book"),
-            );
-            // The content field and its PIN, on one row: the pin writes INTO
-            // this field, so the two are drawn as what they are — one field
-            // with a way of quoting a place into it.
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(div().flex_1().child(self.compose_field(11, "What must happen", cx)))
-                    .child(self.pin_control(PinTarget::Book, cx)),
-            );
-            col = col.child(note(
-                "A pin quotes the map: DRAG it onto the water, or click it and then \
-                 click the map. The coordinate lands in the step's words, and the \
-                 Book stands aside for the gesture.",
-            ));
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .text_size(px(view::DENSE_PT))
-                            .text_color(rgba(BODY_SILVER))
-                            .child("window"),
-                    )
-                    .child(div().flex_1().child(self.compose_field(12, "1000", cx)))
-                    .child(div().flex_1().child(self.compose_field(13, "1030", cx)))
-                    .child(
-                        div()
-                            .text_size(px(view::LABEL_PT))
-                            .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                            .child("HHMM, or leave both empty"),
-                    ),
-            );
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_end()
-                    .child(
-                        div()
-                            .id("submit-step")
-                            .cursor_pointer()
-                            .on_click(cx.listener(|view, _, _, cx| view.submit_step(cx)))
-                            .child(button("Add step", true, self.step_busy, false)),
-                    ),
-            );
-        }
-        col = col.child(rule());
-        // A scenario may still be added straight to the game, with no steps
-        // and no window — the old row, and the only one that posts at once.
-        // While PLANNING the composer above is the way: a scenario joins the
-        // book as a draft, and the advance writes it. Two rows that both
-        // said "add scenario" would be one too many, so this one stands
-        // down while there is a stage to wait for.
+        col = col.child(self.scenario_list(cx));
+        // The old row that posts at once, and only outside planning. While
+        // there is a stage to wait for, the composer's own scenario is the
+        // way in — two rows that both said "add scenario" would be one too
+        // many.
         if !self.staging() {
-            col = col.child(
-                div()
-                    .text_size(px(view::DENSE_PT))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgba(MAP_INK))
-                    .child("Add a scenario straight to this game"),
-            );
-            col = col.child(self.compose_field(17, "Scenario title", cx));
-            let title_ok = !self.book_title.trim().is_empty();
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(view::LABEL_PT))
-                            .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                            .child("posts at once — the composer's own scenarios are staged"),
-                    )
-                    .child(
-                        div()
-                            .id("submit-book")
-                            .cursor_pointer()
-                            .on_click(cx.listener(|view, _, _, cx| view.submit_book(cx)))
-                            .child(button("Add scenario", true, !title_ok || self.book_busy, false)),
-                    ),
-            );
+            col = col.child(rule());
+            col = col.child(self.book_direct_add(cx));
+            if !self.book_status.is_empty() {
+                col = col.child(
+                    div()
+                        .text_size(px(view::DENSE_PT))
+                        .child(status_line(&self.book_status)),
+                );
+            }
         }
+        col.into_any_element()
+    }
+
+    /// The RIGHT column: the steps of whichever scenario is open.
+    ///
+    /// It is the WORK column, and it says so when there is no work: a step
+    /// belongs to a scenario, so the column is empty until the form has
+    /// made one, the library has given one, or the list has opened one of
+    /// the game's own. The empty state names the ways out of it, because a
+    /// blank column is a question and the console answers questions.
+    fn book_right_column(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        match self.steps_pane {
+            StepsPane::Game(id) => return self.game_scenario_section(id, cx),
+            StepsPane::Composer => {
+                if self.working.is_some() {
+                    return self.working_section(cx);
+                }
+            }
+            StepsPane::None => {}
+        }
+        let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
+        col = col.child(self.steps_header(cx));
+        col = col.child(note(
+            "No scenario open. Create one on the left, or open one of the scenarios \
+             listed there, and its steps are written here.",
+        ));
+        col.into_any_element()
+    }
+
+    /// The STEPS column's header: the section's name, and the verb that
+    /// closes whatever is open.
+    fn steps_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .child(section("steps"))
+            .child(
+                div()
+                    .id("close-steps")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _, _, cx| view.close_steps(cx)))
+                    .child(button("close", true, false, false)),
+            )
+            .into_any_element()
+    }
+
+    /// Close whatever the STEPS column is showing.
+    ///
+    /// A scenario this game holds is only being LOOKED at, so closing it
+    /// puts the selection down and leaves the scenario exactly where it
+    /// was. The composer's draft is the operator's own work in progress, so
+    /// closing that one discards it — which is why the draft is in the list
+    /// and can be opened again.
+    fn close_steps(&mut self, cx: &mut Context<Self>) {
+        match self.steps_pane {
+            StepsPane::Game(_) => {
+                // A scenario this game holds is only being LOOKED at: closing
+                // it puts the selection down and leaves the scenario exactly
+                // where it was.
+                self.steps_pane = StepsPane::None;
+                cx.notify();
+            }
+            _ => self.close_working(cx),
+        }
+    }
+
+    /// The STEPS column showing a scenario THIS GAME holds: its steps, and
+    /// the row that adds one.
+    ///
+    /// The steps used to be drawn in the LEFT column, under a section of
+    /// their own, which is the furthest a scenario's steps can be from the
+    /// scenario they belong to. They are here now, because this column is
+    /// where a scenario is worked on.
+    fn game_scenario_section(&mut self, sc_id: i64, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
+        col = col.child(self.steps_header(cx));
+        if let Some(sc) = self.session.book.iter().find(|s| s.id == sc_id).cloned() {
+            col = col.child(self.scenario_head(&sc.title, sc.steps.len(), "this game"));
+            col = col.child(self.server_scenario_steps(&sc, cx));
+        } else if let Some(news) = self.book.get_new(sc_id).cloned() {
+            col = col.child(self.scenario_head(&news.title, news.steps.len(), "staged"));
+            col = col.child(self.staged_scenario_steps(&news, cx));
+        } else {
+            col = col.child(note("This scenario is no longer in the book."));
+            return col.into_any_element();
+        }
+        col = col.child(self.book_step_maker(cx));
         if !self.book_status.is_empty() {
             col = col.child(
                 div()
@@ -20287,25 +20188,461 @@ impl IslandDemo {
         col.into_any_element()
     }
 
-    /// The RIGHT column: the steps of the scenario being worked on, and
-    /// nothing else.
+    /// The open scenario's name, how many steps it has, and where it came
+    /// from.
+    fn scenario_head(&self, title: &str, steps: usize, tag: &str) -> AnyElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(view::DENSE_PT))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgba(RADAR_CYAN))
+                    .child(title.to_string()),
+            )
+            .child(
+                div()
+                    .font_family(view::FACE_MACHINE)
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(ALERT_YELLOW))
+                    .child(tag.to_string()),
+            )
+            .child(
+                div()
+                    .font_family(view::FACE_MACHINE)
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                    .child(format!("{steps} step(s)")),
+            )
+            .into_any_element()
+    }
+
+    /// A scenario the server holds: its steps, and the steps this draft has
+    /// added to it.
     ///
-    /// It is the WORK column, and it says so when there is no work: a step
-    /// belongs to a scenario, so the column is empty until the form has
-    /// made one or the library has given one. The empty state names the two
-    /// ways out of it, because a blank column is a question and the console
-    /// answers questions.
-    fn book_right_column(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if self.working.is_none() {
-            let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
-            col = col.child(section("steps"));
-            col = col.child(note(
-                "No scenario open. Create one above, or pick a saved one, and its steps \
-                 are written here.",
-            ));
-            return col.into_any_element();
+    /// The server's steps are numbered in order with their windows; empty
+    /// content reads weak, because unwritten is an authoring state, not an
+    /// error. A step staged for removal stands, marked, until the advance
+    /// cuts it: vanishing before the write would hide the operator's own
+    /// decision back at them.
+    fn server_scenario_steps(&mut self, sc: &BookScenario, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
+        let staged_steps: Vec<crate::book::StagedStep> =
+            self.book.added_steps(sc.id).cloned().collect();
+        if sc.steps.is_empty() && staged_steps.is_empty() {
+            col = col.child(
+                div()
+                    .text_size(px(view::LABEL_PT))
+                    .text_color(rgba(BODY_SILVER.with_alpha(204)))
+                    .child("No steps yet. A plan may be authored while it is written."),
+            );
         }
-        self.working_section(cx)
+        for (n, step) in sc.steps.iter().enumerate() {
+            let text = if step.content.is_empty() {
+                "(not written yet)".to_string()
+            } else {
+                step.content.clone()
+            };
+            let window = step
+                .window
+                .as_ref()
+                .map(|(a, b)| format!("{a}\u{2013}{b}"))
+                .unwrap_or_else(|| "\u{2014}".to_string());
+            let step_id = step.id;
+            let scenario_id = sc.id;
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .font_family(view::FACE_MACHINE)
+                        .text_size(px(view::DENSE_PT))
+                        .text_color(rgba(BODY_SILVER))
+                        .child(format!("{:>2}", n + 1)),
+                )
+                // The words take what is left of the row and TRUNCATE:
+                // the column is narrow, and a step's text clipped by the
+                // panel's edge is a step the operator cannot read.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(view::DENSE_PT))
+                        .text_color(rgba(if step.content.is_empty() {
+                            BODY_SILVER.with_alpha(204)
+                        } else {
+                            MAP_INK
+                        }))
+                        .child(text),
+                );
+            // The step's FACTS, under its words: its window, the posts it
+            // fans out to, and whether the advance will cut it.
+            //
+            // They are under the words because they are the reading of the
+            // words, and a column this narrow has room for one line of text
+            // and one line of figures — not for three.
+            let mut meta = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .pl(px(20.0))
+                .child(
+                    div()
+                        .font_family(view::FACE_MACHINE)
+                        .text_size(px(view::LABEL_PT))
+                        .text_color(rgba(BODY_SILVER))
+                        .child(window),
+                );
+            // The relate count, when the fan-out read this step: the
+            // console's `{n} post(s)` tail. Absent is unreadable, and an
+            // unreadable step claims no count rather than zero. A staged
+            // list is the draft's own, and it counts too.
+            match self.book.related(sc.id, step.id) {
+                Some(refs) => {
+                    meta = meta.child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgba(ALERT_YELLOW))
+                            .child(format!("{} post(s) staged", refs.len())),
+                    );
+                }
+                None => {
+                    if let Some(r) = self.related_for(sc.id, step.id) {
+                        meta = meta.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                                .child(format!("{} post(s)", r.posts.len())),
+                        );
+                    }
+                }
+            }
+            // A step staged for removal stands, marked, until the
+            // advance cuts it: vanishing before the write would hide the
+            // operator's own decision back at them.
+            if self.book.is_cut(sc.id, step.id) {
+                meta = meta.child(
+                    div()
+                        .text_size(px(view::LABEL_PT))
+                        .text_color(rgba(ALERT_YELLOW))
+                        .child("staged to leave".to_string()),
+                );
+            }
+            row = row
+                .child(
+                    div()
+                        .id(("book-relate", step_id as usize))
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.toggle_relate(scenario_id, step_id, cx);
+                        }))
+                        .child(button("relate", true, false, false)),
+                )
+                .child(
+                    div()
+                        .id(("book-remove-step", step_id as usize))
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.remove_step(scenario_id, step_id, cx);
+                        }))
+                        .child(button("remove", true, self.step_busy, false)),
+                );
+            col = col.child(row);
+            col = col.child(meta);
+            // The relate editor, inline under its step — the console's
+            // `relate_editor_ui` under the row, without the staging.
+            if self.relate_open == Some((sc.id, step.id)) {
+                col = col.child(self.relate_editor(sc.id, step.id, cx));
+            }
+        }
+        for (k, staged) in staged_steps.iter().enumerate() {
+            let text = if staged.content.is_empty() {
+                "(not written yet)".to_string()
+            } else {
+                staged.content.clone()
+            };
+            let window = staged
+                .start
+                .clone()
+                .zip(staged.end.clone())
+                .map(|(a, b)| format!("{a}\u{2013}{b}"))
+                .unwrap_or_else(|| "\u{2014}".to_string());
+            let step_id = staged.local_id;
+            let scenario_id = sc.id;
+            let row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .font_family(view::FACE_MACHINE)
+                        .text_size(px(11.0))
+                        .text_color(rgba(BODY_SILVER))
+                        .child(format!("{:>2}", sc.steps.len() + k + 1)),
+                )
+                // The words take what is left of the row and TRUNCATE.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.0))
+                        .text_color(rgba(if staged.content.is_empty() {
+                            BODY_SILVER.with_alpha(204)
+                        } else {
+                            MAP_INK
+                        }))
+                        .child(text),
+                )
+                .child(
+                    div()
+                        .id(("book-remove-step", step_id as usize))
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.remove_step(scenario_id, step_id, cx);
+                        }))
+                        .child(button("remove", true, false, false)),
+                );
+            col = col.child(row);
+            // The figures under the words, as in the server's own rows.
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .pl(px(20.0))
+                    .child(
+                        div()
+                            .font_family(view::FACE_MACHINE)
+                            .text_size(px(10.0))
+                            .text_color(rgba(BODY_SILVER))
+                            .child(window),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgba(ALERT_YELLOW))
+                            .child("staged".to_string()),
+                    ),
+            );
+        }
+        col.into_any_element()
+    }
+
+    /// A scenario this draft is about to create: the steps it holds.
+    ///
+    /// It stands in the book now, marked, because a scenario the operator
+    /// can only see in a counter is one they cannot check before the
+    /// advance writes it.
+    fn staged_scenario_steps(
+        &mut self,
+        news: &crate::book::StagedScenario,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
+        for (n, step) in news.steps.iter().enumerate() {
+            let text = if step.content.is_empty() {
+                "(not written yet)".to_string()
+            } else {
+                step.content.clone()
+            };
+            let window = step
+                .start
+                .clone()
+                .zip(step.end.clone())
+                .map(|(a, b)| format!("{a}\u{2013}{b}"))
+                .unwrap_or_else(|| "\u{2014}".to_string());
+            let step_id = step.local_id;
+            let scenario_id = news.local_id;
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .font_family(view::FACE_MACHINE)
+                            .text_size(px(11.0))
+                            .text_color(rgba(BODY_SILVER))
+                            .child(format!("{:>2}", n + 1)),
+                    )
+                    // The words take what is left of the row and TRUNCATE.
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(11.0))
+                            .text_color(rgba(if step.content.is_empty() {
+                                BODY_SILVER.with_alpha(204)
+                            } else {
+                                MAP_INK
+                            }))
+                            .child(text),
+                    )
+                    .child(
+                        div()
+                            .id(("book-remove-step", step_id as usize))
+                            .flex_shrink_0()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.remove_step(scenario_id, step_id, cx);
+                            }))
+                            .child(button("remove", true, false, false)),
+                    ),
+            );
+            // The figures under the words, as in the server's own rows.
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .pl(px(20.0))
+                    .child(
+                        div()
+                            .font_family(view::FACE_MACHINE)
+                            .text_size(px(10.0))
+                            .text_color(rgba(BODY_SILVER))
+                            .child(window),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgba(ALERT_YELLOW))
+                            .child("staged".to_string()),
+                    ),
+            );
+        }
+        col.into_any_element()
+    }
+
+    /// The row that adds a step to the scenario this game holds: the words,
+    /// the pin, and the window — both ends or neither.
+    ///
+    /// It belongs to the OPEN scenario, so it is drawn only where there is
+    /// one: a step needs a scenario to belong to.
+    fn book_step_maker(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
+        col = col.child(
+            div()
+                .text_size(px(view::DENSE_PT))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgba(MAP_INK))
+                .child("New step"),
+        );
+        // The content field and its PIN, on one row: the pin writes INTO
+        // this field, so the two are drawn as what they are — one field
+        // with a way of quoting a place into it.
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .child(div().flex_1().child(self.compose_field(13, "What must happen", cx)))
+                .child(self.pin_control(PinTarget::Book, cx)),
+        );
+        col = col.child(note(
+            "A pin quotes the map: DRAG it onto the water, or click it and then \
+             click the map. The coordinate lands in the step's words, and the \
+             Book stands aside for the gesture.",
+        ));
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(view::DENSE_PT))
+                        .text_color(rgba(BODY_SILVER))
+                        .child("window"),
+                )
+                .child(div().flex_1().child(self.compose_field(14, "1000", cx)))
+                .child(div().flex_1().child(self.compose_field(15, "1030", cx)))
+                .child(
+                    div()
+                        .text_size(px(view::LABEL_PT))
+                        .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                        .child("HHMM, or leave both empty"),
+                ),
+        );
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .child(
+                    div()
+                        .id("submit-step")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _, _, cx| view.submit_step(cx)))
+                        .child(button("Add step", true, self.step_busy, false)),
+                ),
+        );
+        col.into_any_element()
+    }
+
+    /// A scenario added straight to the game, with no steps and no window —
+    /// the old row, and the only one that posts at once.
+    ///
+    /// While PLANNING the composer is the way: a scenario joins the book as
+    /// a draft, and the advance writes it. Two rows that both said "add
+    /// scenario" would be one too many, so this one stands down while there
+    /// is a stage to wait for.
+    fn book_direct_add(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(view::PANEL_GAP));
+        col = col.child(
+            div()
+                .text_size(px(view::DENSE_PT))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgba(MAP_INK))
+                .child("Add a scenario straight to this game"),
+        );
+        col = col.child(self.compose_field(19, "Scenario title", cx));
+        let title_ok = !self.book_title.trim().is_empty();
+        col = col.child(
+            div()
+                .text_size(px(view::LABEL_PT))
+                .text_color(rgba(BODY_SILVER.with_alpha(178)))
+                .child("posts at once — the composer's own scenarios are staged"),
+        );
+        // The button on its OWN line: the note and the button do not fit
+        // side by side in a column this narrow, and a button clipped by the
+        // panel's edge is a button nobody can press.
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .child(
+                    div()
+                        .id("submit-book")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _, _, cx| view.submit_book(cx)))
+                        .child(button("Add scenario", true, !title_ok || self.book_busy, false)),
+                ),
+        );
+        col.into_any_element()
     }
 
     /// The marker layer, now live: one ring per tracked hull, at its
@@ -30039,6 +30376,159 @@ mod tests {
         });
         assert_eq!(title, "First light", "the scenario is open");
         assert_eq!(count, 1, "and the library is untouched");
+    }
+
+    /// A session whose game holds one scenario, for the tests that open it.
+    fn demo_with_a_game_scenario(tx: OrderSink) -> IslandDemo {
+        let mut session = SessionView::default();
+        session.book = vec![BookScenario {
+            id: 7,
+            title: "Scen 1".to_string(),
+            steps: vec![BookStep {
+                id: 1,
+                content: "Hold the river".to_string(),
+                window: Some(("1000".to_string(), "1030".to_string())),
+            }],
+        }];
+        IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+    }
+
+    /// The game's own scenario is in the LIST, and opening it puts ITS
+    /// steps in the STEPS column: one column, one scenario, and the
+    /// composer's draft still there to come back to.
+    #[gpui::test]
+    fn a_game_scenario_opens_in_the_steps_column(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| demo_with_a_game_scenario(tx));
+        let (pane, draft) = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.form.title = "First light".to_string();
+                demo.create_scenario(cx);
+                demo.steps_pane = StepsPane::Game(demo.session.book[0].id);
+                (demo.steps_pane, demo.working.is_some())
+            })
+        });
+        assert_eq!(
+            pane,
+            StepsPane::Game(7),
+            "the game's scenario is the one open"
+        );
+        assert!(draft, "and the draft is kept, not thrown away");
+    }
+
+    /// Closing the STEPS column puts the pane down; it does not throw the
+    /// draft away. A draft that vanishes because the operator put the pane
+    /// down is a draft that vanishes by accident.
+    #[gpui::test]
+    fn closing_the_steps_column_keeps_the_draft(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| demo_with_library(tx));
+        let (pane, draft) = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.form.title = "First light".to_string();
+                demo.create_scenario(cx);
+                demo.close_steps(cx);
+                (demo.steps_pane, demo.working.is_some())
+            })
+        });
+        assert_eq!(pane, StepsPane::None, "the column is empty");
+        assert!(draft, "and the draft is still there to open again");
+    }
+
+    /// A picked scenario takes the STEPS column back from the game's own:
+    /// the column shows one scenario, and it is the one just picked.
+    #[gpui::test]
+    fn a_picked_scenario_takes_the_column_back(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| demo_with_a_game_scenario(tx));
+        let pane = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.form.title = "First light".to_string();
+                demo.create_scenario(cx);
+                demo.save_working(cx);
+                let id = demo.library.scenarios[0].id.clone();
+                demo.steps_pane = StepsPane::Game(7);
+                demo.use_saved(&id, cx);
+                demo.steps_pane
+            })
+        });
+        assert_eq!(
+            pane,
+            StepsPane::Composer,
+            "the composer has the column again"
+        );
+    }
+
+    /// A scenario the game holds has no datetime of its own, so its window
+    /// is the first step's start and the last step's end: that is where the
+    /// plan's window landed.
+    #[test]
+    fn a_game_scenarios_window_is_its_steps() {
+        let steps = vec![
+            BookStep {
+                id: 1,
+                content: "Cross".to_string(),
+                window: Some(("1000".to_string(), "1030".to_string())),
+            },
+            BookStep {
+                id: 2,
+                content: "Hold".to_string(),
+                window: Some(("1100".to_string(), "1130".to_string())),
+            },
+        ];
+        let (start, end) = game_window(&steps);
+        assert_eq!(start.as_deref(), Some("1000"), "the first step starts it");
+        assert_eq!(end.as_deref(), Some("1130"), "the last step ends it");
+    }
+
+    /// Staging a draft into the game gives the draft its copy's id, so the
+    /// SCENARIOS list can draw that scenario ONCE: the draft and the copy
+    /// in the book are one scenario, not two.
+    #[gpui::test]
+    fn a_staged_draft_remembers_its_copy(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut session = SessionView::default();
+            session.state = "planning".to_string();
+            IslandDemo::new(fixture_roster(), 8, 0, session, tx)
+        });
+        let (staged, copy) = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.form.title = "First light".to_string();
+                demo.create_scenario(cx);
+                demo.add_to_game(cx);
+                let staged = demo.composer_staged;
+                let copy = demo.working.as_ref().and_then(|w| w.staged);
+                (staged, copy)
+            })
+        });
+        assert!(staged.is_some(), "the draft is staged into the book");
+        assert_eq!(copy, staged, "and the draft knows which copy is its own");
+    }
+
+    /// The fields are BOUND to their own state: the step maker's words are
+    /// the step draft's words, and the direct add's title is the book's own.
+    ///
+    /// They were bound to the new-scenario form's END TIME and to the
+    /// composer's window, so a step's words landed in a window and the
+    /// message draft's words landed in a date.
+    #[test]
+    fn the_makers_fields_are_bound_to_their_own_state() {
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            SessionView::default(),
+            std::sync::mpsc::channel().0,
+        );
+        demo.step_draft.content = "Hold the river".to_string();
+        demo.step_draft.start_hour = "1000".to_string();
+        demo.step_draft.end_hour = "1030".to_string();
+        demo.book_title = "Scen 1".to_string();
+        assert_eq!(demo.draft_field(13), "Hold the river", "the step's words");
+        assert_eq!(demo.draft_field(14), "1000", "the window's start");
+        assert_eq!(demo.draft_field(15), "1030", "the window's end");
+        assert_eq!(demo.draft_field(19), "Scen 1", "the book's own title");
     }
 
     /// A step carries its words, its window, its place and its hulls

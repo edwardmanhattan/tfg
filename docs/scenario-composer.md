@@ -191,12 +191,20 @@ composer"). It is **two columns**, and the split is the arrangement the
 operator asked for.
 
 - **Left column — where a scenario comes from.** The form that creates one
-  (name, description, and the window as a DATE and a TIME for each end), the
-  saved scenarios to pick, and the game's own book under those.
+  (name, description, and the window as a DATE and a TIME for each end), and
+  below it ONE list of scenarios: the draft being written (*draft*), the
+  scenarios this game holds (*this game*), and the operator's own saved ones
+  (*saved*). Each row carries the scenario's title, where it came from, its
+  step count, and the verbs that act on it.
 - **Right column — where a scenario goes.** The steps of the scenario being
   worked on: its name and window at the top, the step list, and the row that
   adds a step. It is empty until a scenario is open, because a step belongs
   to a scenario and a step list with nothing above it is a list of orphans.
+
+Opening one of the game's own scenarios loads ITS steps into the right
+column, where they can be read, related and added to. The column shows one
+scenario at a time, and closing it puts it down without throwing the work
+away — the draft stays in the list.
 
 Each column scrolls on its own.
 
