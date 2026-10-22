@@ -1027,6 +1027,104 @@ steps column), `scenario-date.png` and `scenario-time.png` (the two grids
 inline), `scenario-empty.png` (nothing open). `cargo test --lib`: 780 pass,
 the same two pre-existing failures.
 
+## The empty room, and the card that answers it (2026-10-21)
+
+The operator marked three things on the after-login screen: two that had no
+business being there, and one that was in the wrong place. The reading was
+that the screen was CLUTTERED — and the clutter had a shape worth naming.
+
+**THE EMPTY ROOM HAS NO COLUMN.** Three surfaces stood on the left of a map
+with no exercise on it: the account, the games to hold, and the hull
+register. All three were answers to questions the empty room does not have.
+The register belongs to PLANNING, which is the phase that assembles a
+force; the account moved to the band (below); and the games to hold became
+the card in the middle of the frame. What is left is a map with a band over
+it, and the band carries the one door the state has.
+
+**THE CARD IS TWO SECTIONS, SIDE BY SIDE.** The list of what exists on the
+left, the wizard that makes a new thing on the right. They are the two
+answers to one question — *which exercise?* — and they are side by side
+because an operator who came to make one and an operator who came to
+re-open yesterday's are looking at the same card. The card opens ITSELF
+when the console is signed in and holds nothing: a console that signs in
+and then waits to be asked is a console that has forgotten the question it
+is for.
+
+**THE WIZARD IS THREE STEPS, AND EVERY FIELD THE SERVER TAKES IS ON ONE OF
+THEM.** *The exercise* — name, mode, pace, description. *The window* — the
+real clock's day and its two ends, and the exercise clock's two ends. *The
+ground* — purpose, target, area, map tag. The order is the order of the
+decisions, not the order of the fields.
+
+**THE WINDOW IS THE POINT.** The console could not write a planned window
+at all, and the gate refuses an exercise whose window is incomplete — so a
+session made through the old form was a session that had to be repaired in
+a second panel before it could run. The wizard states the window at the
+door, in the console's own spelling (a day and two military times), and the
+server reads it back in RFC3339. The pace came with it, for the same
+reason: `fast` waives the readiness declaration, and that is a decision
+somebody takes deliberately.
+
+**THE IDENTITY IS A CHIP IN THE BAND, AND THE WAY OUT IS BEHIND IT.** The
+OPERATOR island was first in every state, because identity does not change
+with the exercise. That reason argues AGAINST a column: a column that
+changes shape with the phase has no business carrying the one fact that
+does not change with it. So the account is a chip at the band's right, and
+the chip opens a small card with the seat's role and the way out. The band
+no longer has a sign-out button of its own — one way to do one thing, in
+one place. The execution rail's account widget went with it, for the same
+reason: a console that says who you are in two places at once has two
+answers to the same question.
+
+**AND THE COMMS DOOR NEEDS AN EXERCISE.** It was on the band in every state
+but execution, which put it on the empty room: an inbox with nothing to
+receive from, answering a question the room does not have. It is gated on
+a session being held now.
+
+Verified by capture over the real binary: `final-empty-room.png` (the card
+over the empty map), `wizard-window-step.png` (the window step),
+`identity-card.png` (the chip open, with the way out under it),
+`execution-no-account.png` (the rail without the account). The create body
+was proved against the live API — `POST /games` with the pace and the four
+window instants, read back with all of them, then the session deleted.
+`cargo test --lib`: 787 pass, the same two pre-existing failures.
+
+## The window's frame (2026-10-21)
+
+The wizard's window step put the operator's wall time into the request, and
+the answer came back in the server's zone — so an operator who typed `0800`
+saw `1500`. The live API proved the rest of it: read the window back, write
+back exactly what the read gave, read again, and the window — and the
+exercise clock with it — moved SEVEN HOURS. Every time the plan was saved.
+
+**THE CAUSE IS TWO THINGS.** The console's read took the digits after the
+`T` and threw the offset away, and its write spelled those digits as UTC:
+the same wall time, two instants a zone apart. And the "did this change?"
+check was a comparison of RFC3339 STRINGS, so two spellings of one instant
+read as a change the operator never made.
+
+**THE CLIENT CAN READ ITS OWN ZONE — it always could.** `chrono` is
+already a dependency, and `chrono::Local` is already how `src/calendar.rs`
+decides what day "today" is and what time "now" is. The question was never
+whether the machine's zone is available; it is which frame an instant is
+written in.
+
+**AND NOW THE FRAME RIDES ON THE DRAFT.** `WindowDraft` carries the offset
+the server stated, learned from the same strings the digits came from, and
+a window read back is written back in the frame it was read in. A window
+NOBODY has written yet goes out in the client's own zone, because the typed
+time is the operator's wall time. And the change check is an INSTANT check
+(`backend::same_instant`), because two spellings of one instant are one
+instant.
+
+The exercise clock keeps its fixed base date — a fiction the server never
+looks at, since the exercise's clock is that instant plus the scaled
+elapsed real time.
+
+Verified against the live API: the typed `0800` comes back as `0800`, and
+the round trip moves the window by `0:00:00`. `cargo test --lib`: 791 pass,
+the same two pre-existing failures.
+
 ## Unresolved
 
 - The details panel's figures and its type no longer wait on the boot-time
@@ -1053,3 +1151,66 @@ the same two pre-existing failures.
 - The `tnum` path is keyed on `(family, features)`, so a face registered twice
   with different features gets two `LoadedFont` entries. Harmless at this scale,
   worth a glance if the type scale grows.
+
+## The type scale, the titles, and the pickers (2026-10-22)
+
+**THE TITLES WERE FIELD KEYS.** `panel_title` drew a surface's name at the
+label's size and the label's weight, so the name of a surface and the
+keys under it were one voice at two volumes. A title is now its own tier —
+three points over the body, and BOLD where a label is semibold — and the
+tracking follows the size, so a 16pt title and a 10pt label are the same
+voice at two volumes rather than two voices.
+
+**THE CONSOLE HAS A FONT-SIZE SETTING, AND IT BOOTS BIGGER.** Four named
+steps, one multiplier, and the chrome that holds the type moves with it —
+the title band, the field height, the top band and the side column. The
+size is remembered on this machine, and a settings file that cannot be read
+leaves the console at its default rather than stopping it from opening.
+
+**THE PICKERS ARE COMPONENTS AND THEY FLOAT.** The calendar and the time
+grid live in `src/pickers.rs` and know nothing about the form that uses
+them; the scenario composer and the session wizard use the same two
+controls. They open UNDER the button that opened them, right-aligned with
+it, because a calendar drawn inline pushes the panel down every time it
+opens and a panel that moves under the operator's cursor is a panel that
+has lost the field they were in.
+
+**AND THE WIZARD SAYS WHAT IT IS.** The window step is two groups — the
+real clock and the exercise clock — with a marker and one line each,
+because five labels with no grouping say "five things" and two groups say
+"two clocks, and here is which is which". A marker with air above it is a
+change of subject; a marker without is a rule.
+
+Verified by capture in `.impeccable/review/type-scale-2026-10-22/`:
+`settings-text-size.png` (the four sizes), `wizard-step-1.png`,
+`wizard-window-date-picker.png` and `wizard-window-time-picker.png` (the
+popups under their triggers), `composer-time-picker.png` (the same
+components in the other form), `sign-in-door.png`, `console-column.png`.
+`cargo test --lib`: 804 pass, the same two pre-existing failures. The
+impeccable layout detector over the changed files: no findings.
+
+## The card's padding (2026-10-22)
+
+**A CARD'S TITLE BELONGS INSET FROM THE CARD'S EDGE.** The SESSIONS card's
+title band was the one part of the card that was not inside one of its own
+columns, so it was the one part that carried no inset: the name sat on the
+border and the close cross sat in the corner, while the columns below sat
+a full inset in. The band now carries the same inset the columns carry,
+so the card's name and the column's name share one left edge.
+
+**AND A LIST'S ITEMS SHARE THE LIST'S LEFT EDGE.** The rows sat six
+further in than the list's own title, so the list read as two things
+stacked. The row keeps its trailing inset and gives up its leading one.
+
+**A CARD IS NEVER TALLER THAN THE WINDOW IT IS OPENED IN.** The card's
+minimum height was applied after the window's clamp, so on a short window
+the card overflowed and its title band was cut off by the window's own
+edge — the name of the surface, gone. The minimum is a wish; the window is
+the law. And the title states its own line height, so it can never outgrow
+the band that holds it.
+
+Verified by capture in
+`.impeccable/review/type-scale-2026-10-22/sessions-card-padding.png`, and
+by two new tests: the card fits any window it is opened in, and the title
+band holds the title at every size on the ladder. `cargo test --lib`: 806
+pass, the same two pre-existing failures.

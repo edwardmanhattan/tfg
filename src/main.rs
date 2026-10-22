@@ -939,16 +939,13 @@ fn main() {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
-                            match master.create_game(
-                                &token2,
-                                draft.name.trim(),
-                                &draft.mode,
-                                &draft.description,
-                                &draft.purpose,
-                                &draft.target,
-                                &draft.area,
-                                &draft.map_tag,
-                            ) {
+                            // The draft becomes the body the server takes,
+                            // window and all — the conversion is the
+                            // library's, so the exercise's window and the
+                            // one stated at the door cannot mean different
+                            // things.
+                            let req = draft.to_new_game();
+                            match master.create_game(&token2, &req) {
                                 Ok(g) => {
                                     eprintln!("created {} (planning)", g.name);
                                     match fetch_session(&host2, &token2, Some(g.id)) {
@@ -2662,6 +2659,7 @@ fn main() {
         taxonomies,
         unit_specs,
         paths.scenario_library.clone(),
+        Some(paths.settings.clone()),
     );
 }
 

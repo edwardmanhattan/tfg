@@ -122,6 +122,17 @@ pub struct WindowDraft {
     pub assumed_start: String,
     /// The exercise clock's end, `HHMM`.
     pub assumed_end: String,
+    /// THE FRAME the window is written in: the UTC offset the server
+    /// stated, empty when it has stated none.
+    ///
+    /// This is not a display detail — it is what makes the plan a plan.
+    /// The server renders every instant in ITS zone, so the digits the
+    /// console reads back are the server's zone's digits; writing them in
+    /// any other frame is writing a DIFFERENT instant, and a window that
+    /// round-trips through the server moves by the difference every time
+    /// it is saved. Keep the frame the server stated, and the plan is the
+    /// plan the operator typed.
+    pub offset: String,
 }
 
 impl WindowDraft {
@@ -159,6 +170,14 @@ impl WindowDraft {
             draft.assumed_start = start;
             draft.assumed_end = end;
         }
+        // THE FRAME, learned from the same strings the digits came from.
+        // The server renders every instant in its own zone, and that zone
+        // is the frame the plan is written in — so the offset is read here
+        // and carried, rather than guessed at the moment of the write.
+        draft.offset = [actual_start, actual_end, assumed_start, assumed_end]
+            .iter()
+            .find_map(|v| crate::backend::clock_offset(v))
+            .unwrap_or_default();
         draft
     }
 
@@ -331,6 +350,7 @@ mod tests {
             actual_end: "1600".into(),
             assumed_start: "1600".into(),
             assumed_end: "0800".into(),
+            offset: "+00:00".into(),
         };
         assert_eq!(
             draft.problem().as_deref(),

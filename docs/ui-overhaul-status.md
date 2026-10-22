@@ -1592,3 +1592,342 @@ keep honest.
   shows — and the panel does not say which version it read, because the
   dock has no room for it.
 
+
+## The after-login screen, rebuilt (2026-10-21)
+
+The operator marked the after-login screen and said the truth about it: two
+of the three things on the left had no business being there, and the third
+was in the wrong place. The reading was that the screen was cluttered, and
+the clutter had a shape — **the empty room was answering questions nobody
+had asked.**
+
+### The column is empty when there is no exercise
+
+`view::zone_islands` no longer seeds an OPERATOR island, and `NoSession`
+returns nothing at all. The three surfaces that stood there each MOVED:
+
+- **The account** went to the top band's right, as a chip. The island was
+  first in every state because identity does not change with the exercise,
+  and that reason argues AGAINST a column: a column that changes shape with
+  the phase has no business carrying the one fact that does not change with
+  it. The chip opens a card with the seat's role and the way out. The band
+  has no sign-out button of its own any more — one way to do one thing, in
+  one place.
+- **The games to hold** became the card in the middle of the frame.
+- **The hull register** went to PLANNING, which is the phase that assembles
+  a force. It was never a session fact; it read as one beside a session.
+
+The execution rail's ACCOUNT widget went with the account, for the same
+reason: a console that says who you are in two places at once has two
+answers to the same question.
+
+### The SESSIONS card: two sections, and it opens itself
+
+**THE CARD.** Two columns side by side, one rule between them. The left is
+the list of the games this account can see, with the state, the mode and
+this seat on each row; the row IS the verb, because a picker with a
+separate hold button would be two steps for one decision. The right is the
+wizard.
+
+**IT OPENS ITSELF.** Signed in, nothing held, the card is up. A console
+that signs in and then waits to be asked is a console that has forgotten the
+question it is for. The rule is one rule and it is applied in two places:
+`apply_signed_in` (the sign-in answer) and the shell's construction (a
+launch that restores a token and holds nothing). A hold closes it.
+
+### The wizard: three steps, and every field the server takes
+
+| step | what it asks for |
+|---|---|
+| 1 · The exercise | name, mode, pace, description |
+| 2 · The window | the real clock's day and its two ends; the exercise clock's two ends |
+| 3 · The ground | purpose, target, area, map tag |
+
+**THE WINDOW IS THE POINT, AND IT IS NEW.** The console could not write a
+planned window AT ALL: `create_game` sent a name, a mode and five optional
+strings, and the gate refuses an exercise whose window is incomplete. The
+status file's own "defect that mattered most" section says so — the client
+sent neither `POST /games`' window fields nor a `PATCH`, so a session made
+through the old form had to be repaired in a second panel before it could
+run. The wizard states the window at the door, in the console's own
+spelling (a day and two military times, the same fields the Control
+island's window editor uses), and `SessionDraft::to_new_game` converts it
+to the server's RFC3339.
+
+**THE PACE CAME WITH IT.** `POST /games` accepts `pace`, and `fast` waives
+the readiness declaration. The old form had no pace control at all.
+
+**THE ONE FIELD THE WIZARD DOES NOT ASK FOR IS `time_factor`, ON PURPOSE.**
+The server accepts it at creation, and the console does not offer it in the
+wizard — because the console already owns it, in the Control island, where
+it is written through `PATCH /games/{id}/time-factor` and stays live after
+the exercise begins. A second control for the same fact is two controls and
+one disagreement. The create body leaves the field out, so the server seeds
+its own default, and the factor is stated in the place that owns it.
+
+**THE CREATE BODY IS A PURE FUNCTION.** `backend::master::new_game_body`
+is the wire shape, and it is tested: the server's own key names, a blank
+optional OMITTED rather than sent empty (the server reads an empty string
+as "clear this field"), and the window one key at a time.
+
+**THE WIZARD REFUSES WHAT THE SERVER WOULD REFUSE.** A nameless session
+does not leave the first step; a half window does not leave the second. The
+messages are the console's own (`window::problem`, which both clocks'
+rules already lived in).
+
+### The comms door needs an exercise
+
+The COMMS chip was on the band in every state but execution, which put it on
+the empty room: an inbox with nothing to receive from. It is gated on a
+session being held now.
+
+### Verified
+
+- `cargo test --lib`: 787 pass, the same two pre-existing failures
+  (`map_render::tests::quad_bow_follows_the_compass`,
+  `sim::tests::order_move_applies_then_higher_overrides_loudly`).
+- Captures over the real binary against the hosted API:
+  `final-empty-room.png` (the card over the empty map),
+  `wizard-window-step.png` (the window step), `identity-card.png` (the chip
+  open, with the way out under it), `execution-no-account.png` (the rail
+  without the account).
+- **The create body against the LIVE API**: `POST /games` with the pace and
+  the four window instants answered 201, `GET /games/{id}` read back
+  `pace: fast` and all four instants, and the session was then DELETED — a
+  game in `planning` can be discarded, and a dev deployment should not keep
+  the evidence.
+- New tests: the identity chip's disclosure, the card opening itself on
+  sign-in, the wizard's steps and its two gates, the draft-to-create-body
+  conversion, and the create body's own wire shape.
+
+### What is still owed
+
+- The card's LEFT column is mostly empty for an account with one exercise,
+  and the right column's steps are one screen tall. Both are consequences of
+  the card being a fixed size, which is the console's rule for every card.
+
+## The window's frame (2026-10-21)
+
+The wizard's window step put the operator's wall time into the request, and
+the answer came back in the server's zone. So an operator who typed `0800`
+saw `1500` in the panel — and, worse, the panel's answer was about to be
+written back.
+
+### What the live API proved
+
+The same experiment, twice, on the hosted dev API. Create a game with a
+window, read it back, write back exactly what the read gave, read again:
+
+| | before | after |
+|---|---|---|
+| the real clock | `08:00Z` → `15:00+07:00` → `22:00+07:00` | `08:00+07:00` → `08:00+07:00` → `08:00+07:00` |
+| the exercise clock | `08:00Z` → `15:00+07:00` → `22:00+07:00` | `08:00+07:00` → `08:00+07:00` → `08:00+07:00` |
+| **moved by** | **7 hours, every round trip** | **nothing** |
+
+Seven hours, on BOTH clocks, every time the plan was saved. The exercise's
+clock is `assumed_start + the scaled elapsed real time` (`models.RunningAt`),
+so moving the assumed start moves the exercise.
+
+### The cause, and it is two things
+
+**THE CLIENT READS A WALL TIME AND THE SERVER WRITES AN INSTANT.** The
+console's read took the DIGITS after the `T` and threw the offset away; its
+write spelled those digits as UTC. Those are the same wall time and two
+instants a zone apart, so the read→write pair moved the window by the zone's
+offset — every time.
+
+**AND THE COMPARISON WAS A STRING COMPARISON.** `advance::window_update`
+decides "did this change?" by comparing the RFC3339 strings. Two spellings
+of one instant are one instant, so the string comparison reported a change
+the operator never made, and the write that followed moved the exercise
+again.
+
+### The fix
+
+- **THE FRAME RIDES ON THE DRAFT.** `WindowDraft` carries the offset the
+  server stated, learned from the same strings the digits came from
+  (`backend::clock_offset`). A window read back is written back in the frame
+  it was read in, and the round trip is the identity.
+- **A NEW WINDOW IS WRITTEN IN THE CLIENT'S OWN ZONE.** The typed time is
+  the operator's wall time, and the console CAN read its own zone:
+  `chrono` is already a dependency and `chrono::Local` is already how
+  `src/calendar.rs` decides what day "today" is. So the default frame is the
+  machine's own, and the server's frame wins as soon as the server has
+  stated one.
+- **THE COMPARISON IS AN INSTANT COMPARISON.** `backend::same_instant` reads
+  two stamps as instants and compares them. A stamp that does not parse
+  falls back to the string compare — the console has no better opinion
+  about a value it cannot read.
+
+### The exercise clock's own date
+
+The assumed clock keeps its fixed base date (`2000-01-01`), which is a
+fiction the console chose and the server never looks at: the exercise's
+clock is that instant plus the scaled elapsed real time, so only the
+TIME-OF-DAY is the plan. The base date is the same on both ends, which is
+what makes `assumed_end > assumed_start` hold, and that is the whole
+guarantee.
+
+### Verified
+
+- `cargo test --lib`: 791 pass, the same two pre-existing failures.
+- New tests: the round trip in the server's frame is the identity, two
+  spellings of one instant are one instant, the client knows its own zone,
+  and an unchanged window is not written even when the spelling differs.
+- **Against the live API**, the round trip above: the typed `0800` comes
+  back as `0800`, and the instant moves by `0:00:00`. The test sessions
+  were deleted.
+
+## The type scale, the titles, and the pickers (2026-10-22)
+
+Three asks in one pass: a font-size setting with a bigger default, titles
+that are actually titles, and the two pickers pulled out of the scenario
+composer so any form can use them — as popups, under the button that
+opened them.
+
+### The titles were the same size as the field keys
+
+`panel_title` drew a surface's name at `LABEL_PT` — 10pt, the same size as
+the field key under it, and at the same weight. A title and a field key at
+one size is not a hierarchy, it is two kinds of text shouting together, and
+the operator is left with no first thing to read.
+
+**A TITLE IS NOW ITS OWN TIER.** `view::TITLE_PT` (16) is three points
+over the body, and `panel_title` draws it BOLD where a label is
+semibold. Weight is the cheapest hierarchy there is: it costs no width,
+and the column this console draws in is narrow enough that width is
+scarce. Every surface title moves at once — `SESSIONS`, `SETTINGS`, `NEW
+SESSION`, `SCENARIO COMPOSER`, the island bands, the embark card's head.
+
+**AND THE TRACKING FOLLOWS THE SIZE.** Tracking was a fixed 1.2px, which
+is 12% of a 10pt label and 7% of a 16pt title — so the two stopped
+looking like the same voice at two volumes. `view::label_tracking(size)` is
+a ratio now, and every tracked label gets the right air for its size.
+
+### The font-size setting
+
+**ONE MULTIPLIER MOVES THE WHOLE INSTRUMENT.** `view::TEXT_SCALES` is four
+named steps (Small, Normal, Large, Largest); `view::pt(base)` is the one
+function every size on the console goes through, so a setting is a setting
+rather than a set of sizes that can drift apart. The console **boots one
+step up** from what it shipped — the operator's word on the shipped size
+was that it was too small.
+
+**AND THE CHROME MOVES WITH THE TYPE.** A band that does not grow with its
+title is a band the title is cut by, and a column that does not grow with
+its dense rows loses a column of them. So the title band, the field
+height, the top band and the side column are all read at the scale in
+force: `view::title_h()`, `view::field_h()`, `view::top_band_h()`,
+`view::zone_w()`. The kernel's geometry reads the same functions the render
+does, so the two cannot disagree about where a row is.
+
+**THE SETTING IS REMEMBERED.** `src/settings.rs` is one JSON file under the
+data dir, written when the operator changes the size and read before the
+first frame — before the layout, because the scale moves the chrome. A
+settings file that cannot be read leaves the console at its default size:
+a size the operator did not choose is better than a console that will not
+open.
+
+### The pickers are components, and they are popups
+
+**`src/pickers.rs` holds the calendar and the time grid**, and they know
+nothing about the scenario composer, the session wizard, or the shell. The
+composer grew a calendar and a time grid, and the wizard wanted the same
+two controls; a second copy of a month grid is a second thing to fix when
+the type scale moves.
+
+**THEY OPEN UNDER THE TRIGGER.** A calendar drawn inline pushes the panel
+down every time it opens, and a panel that moves under the operator's
+cursor is a panel that has lost the field they were in. The popup hangs
+under the button, right-aligned with it, and the field does not move.
+
+**AND THE POPUP KNOWS WHERE THE BUTTON IS.** GPUI 0.2.2 has no way to ask
+an element where it ended up, so the trigger measures itself: a canvas the
+size of the button writes its bounds during the layout pass, and the popup
+reads them. The measurements are keyed by the picker, because every
+trigger on the surface is measuring itself and the last one laid out is
+not the one that is open.
+
+The composer's four window fields are now FOUR targets — a day and a time
+at each end — because a day is chosen and an hour is typed, and one
+control that answered both was a button that said "calendar" on a row that
+wanted an hour.
+
+### The wizard, laid out again
+
+- **THE WINDOW IS TWO GROUPS.** Five labels with no grouping say "five
+  things"; two groups say "two clocks, and here is which is which". The
+  real clock and the exercise clock each get a marker and one line
+  saying what they are.
+- **THE MARKERS HAVE AIR ABOVE THEM.** A section marker as close to what
+  follows as to what precedes it is a rule, not a heading. A marker with
+  room above it is a change of subject.
+- **THE FIELDS ARE THE COMPOSER'S FIELDS.** The wizard now uses the same
+  row as the scenario composer — a label, a hairline, a trigger, and the
+  well — so the two forms are one form twice.
+
+### Verified
+
+- `cargo test --lib`: **804 pass**, the same two pre-existing failures.
+- New tests: the title tier is above the body, tracking is a ratio, one
+  scale moves the type and the chrome, a scale off the ladder lands on the
+  ladder, the console boots bigger than it shipped, a day takes the
+  calendar and an hour takes the time grid, every picker has its own
+  trigger id, and the wizard spells its times the way the server takes
+  them.
+- **Captures** in `.impeccable/review/type-scale-2026-10-22/`: the
+  settings row with the four sizes, the wizard's window step with the
+  date popup open, the time popup, the composer's time popup, the
+  sign-in door, and the console's column at the new scale.
+- The impeccable layout detector over the changed files: **no findings**.
+
+## The card's padding (2026-10-22)
+
+A screenshot of the SESSIONS card, and one word: *padding*.
+
+### The title was on the card's edge
+
+The card's title band is the only part of that card that is not inside one
+of its two columns — so it was the only part that carried no inset of its
+own. "SESSIONS" sat on the border and the close cross sat in the corner,
+while the two columns below sat a full inset in. The card's name and the
+column's name were on different left edges, and the eye read one surface
+as three.
+
+**THE BAND CARRIES THE SAME INSET THE COLUMNS CARRY.** The card's name
+and the column's name now share one left edge, and the cross is off the
+corner.
+
+### The list's rows were on a different edge from the list's own title
+
+The "GAMES" title sat at the column's inset and the rows sat six further
+in, so the list's name and the list's items were on two left edges. The
+row keeps its trailing inset and gives up its leading one.
+
+### The card could be taller than the window
+
+`SESSIONS_H * text_scale()` was clamped to the window and then floored at
+320 — and the floor was applied AFTER the clamp, so on a window shorter
+than the floor the card was taller than the window. A card taller than its
+window is a card whose title band is cut off by the window's own edge: the
+operator loses the name of the surface they are in, and the band exists to
+carry that name.
+
+**THE FLOOR IS A WISH, NOT A RIGHT.** The card would LIKE to be at least
+240 by 240; it may never be bigger than the window it is opened in.
+
+**AND THE TITLE STATES ITS OWN LINE HEIGHT.** The band is a fixed height
+and the title is centred in it, so the title's box has to be the title's
+own to state — at a fifth above the size, which sits inside the band at
+every rung of the ladder.
+
+### Verified
+
+- `cargo test --lib`: **806 pass**, the same two pre-existing failures.
+- New tests: the card fits any window it is opened in (six windows, from
+  1280x900 down to 240x200), and the title band holds the title at every
+  size on the ladder.
+- Capture: `.impeccable/review/type-scale-2026-10-22/sessions-card-padding.png`
+  — the card's name and the column's name on one edge, and the rows on the
+  same edge as the title.
+- The impeccable layout detector over the changed files: **no findings**.

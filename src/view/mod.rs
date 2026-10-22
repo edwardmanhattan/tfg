@@ -30,6 +30,8 @@
 //! value, it is named for the role. Do not strip these comments: they are the
 //! part that stops the next change from being wrong.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 // ---------------------------------------------------------------------------
 // Colour
 // ---------------------------------------------------------------------------
@@ -281,7 +283,22 @@ pub const STEEL_HI: Rgba = Rgba::rgb(0xE6, 0xEB, 0xF2);
 /// kept because the close button's inset is still measured from it and a
 /// test pins the relation. The modal silhouette still uses it.
 pub const CUT: f32 = 20.0;
+/// The title band's height AT THE BASE TYPE SIZE.
+///
+/// The band holds the surface's title, so its height is the title's height
+/// plus its air — and the title grows with the text scale. [`title_h`] is
+/// the number the render and the geometry both read; this is the size it
+/// is read at when the scale is one.
 pub const TITLE_H: f32 = 30.0;
+
+/// The title band's height, at the text scale in force.
+///
+/// A band that does not grow with its title is a band the title is cut by,
+/// and the cut is worse than the smallness: an operator reading a clipped
+/// title reads a word with a letter missing and does not know it.
+pub fn title_h() -> f32 {
+    TITLE_H * text_scale()
+}
 /// Generic chrome inset: modals, title-band text, miscellaneous breathing
 /// room. Islands do NOT use this for their bodies, they use `ISLAND_PAD`.
 pub const PAD: f32 = 12.0;
@@ -354,10 +371,24 @@ pub const FACE_MACHINE: &str = "PT Mono";
 /// like a form field; this one names itself like a ship.
 pub const FACE_MARK: &str = "Cinzel";
 
-/// A tracked-caps label: a panel's title, a field's key, a section marker.
+/// A tracked-caps label: a field's key, a section marker.
 /// Small and tracked, because a label that is the same size as the body is
 /// not a label, it is a second body.
 pub const LABEL_PT: f32 = 10.0;
+/// A SURFACE'S TITLE — the strip that names a panel, a modal, an island.
+///
+/// It is its own tier, and it is the answer to a complaint the console
+/// earned: the title used to be drawn at `LABEL_PT`, which made a panel's
+/// name the SAME SIZE as the field keys under it. A title and a field key
+/// at one weight is not a hierarchy, it is two kinds of text shouting
+/// together, and the operator is left with no first thing to read.
+///
+/// So the title is bigger than the body it heads — three points over
+/// `BODY_PT`, which is where a caps title starts to read as a heading
+/// rather than as a shout — and it is BOLD, where a label is semibold.
+/// Weight is the cheapest hierarchy there is: it costs no width, and the
+/// column this console draws in is narrow enough that width is scarce.
+pub const TITLE_PT: f32 = 16.0;
 /// The dense tier: a small body line in a narrow column.
 ///
 /// The side zone is 320pt wide by default, and a row has to hold a call
@@ -382,6 +413,17 @@ pub const MACHINE_PT: f32 = 12.0;
 /// Tracking on a tracked-caps label, in px at `LABEL_PT`. 12% of the size,
 /// which is where caps stop reading as a word and start reading as a stamp.
 pub const LABEL_TRACKING: f32 = 1.2;
+
+/// The tracking a tracked-caps label of `size` carries.
+///
+/// Tracking is a RATIO, not a number: 12% of the size is what makes caps
+/// read as a stamp, and 12% of a 10pt label is 1.2px while 12% of a 16pt
+/// title is 1.9px. A fixed gap would tighten the small labels and loosen
+/// the titles, and the two would stop looking like the same voice at two
+/// volumes.
+pub fn label_tracking(size: f32) -> f32 {
+    size * (LABEL_TRACKING / LABEL_PT)
+}
 
 /// The wordmark's size, and its tracking.
 ///
@@ -441,10 +483,101 @@ pub fn readout_size(leads_panel: bool) -> f32 {
 // else in the type scale is absolute: the sizes above are what the console
 // draws at, and this multiplies them together as one proportion so that
 // "Larger" moves the whole instrument rather than one row of it.
+//
+// WHY IT IS A MULTIPLIER AND NOT A SET OF SIZES. A second ladder — one
+// ladder per size, at four settings each — is sixteen numbers to keep
+// straight and a console that drifts out of proportion the moment one of
+// them is missed. One multiplier cannot drift, because every size on the
+// console is one base size times one number.
+//
+// WHY IT IS A GLOBAL AND NOT A PARAMETER. The sizes are read by free
+// functions — `note`, `tracked`, `button`, `figure` — that have no view to
+// ask. Threading a scale through every one of them would put a parameter
+// on the whole shell for the sake of one setting, and the setting would
+// still have to be threaded through every call site of those functions.
+// The console is a single-window application whose render runs on one
+// thread, so the scale is one atomic number rather than a parameter
+// forest.
 // ---------------------------------------------------------------------------
 
-/// The Settings row's "Larger" step, which is also what the app boots at.
-pub const TEXT_SCALE_LARGER: f32 = 1.15;
+/// The text sizes the settings row offers, smallest first.
+///
+/// FOUR STEPS, and the ladder is short on purpose: this is a control an
+/// operator touches once, in a room, before the exercise — not a type
+/// designer. Each step is about a seventh bigger than the one below it,
+/// which is enough to see and small enough that the next step up is never
+/// ambiguous.
+pub const TEXT_SCALES: [f32; 4] = [1.0, 1.15, 1.3, 1.45];
+
+/// The step the console boots at.
+///
+/// NOT the smallest, and not the middle: the console shipped at the
+/// smallest step and the operator's word on it was that it was too small.
+/// One step up is the compromise — every size on the console moves a
+/// fifteenth, the dense column still holds its four columns, and the
+/// setting is right there when a room wants more.
+pub const TEXT_SCALE_DEFAULT: usize = 1;
+
+/// The names the settings row shows, smallest first.
+pub const TEXT_SCALE_NAMES: [&str; 4] = ["Small", "Normal", "Large", "Largest"];
+
+/// The scale in force, as the bits of an `f32`.
+///
+/// An atomic rather than a plain `static mut`: the shell reads it on every
+/// frame and writes it from a click handler, and a plain static would be a
+/// data race the moment the console grew a second thread.
+///
+/// It boots at `TEXT_SCALE_DEFAULT`'s step — 1.15, the bits of the f32.
+static TEXT_SCALE_BITS: AtomicU32 = AtomicU32::new(0x3f93_3333);
+
+/// The scale in force.
+pub fn text_scale() -> f32 {
+    f32::from_bits(TEXT_SCALE_BITS.load(Ordering::Relaxed))
+}
+
+/// Set the scale in force.
+///
+/// A scale outside the ladder is REFUSED and the ladder's nearest step is
+/// used instead, because a scale of zero would draw nothing and a scale of
+/// ten would draw a console nobody can operate. The setting is a choice
+/// between four named sizes, not a number the operator types.
+pub fn set_text_scale(scale: f32) {
+    let mut nearest = TEXT_SCALE_DEFAULT;
+    let mut distance = f32::MAX;
+    for (i, step) in TEXT_SCALES.iter().enumerate() {
+        let away = (step - scale).abs();
+        if away < distance {
+            distance = away;
+            nearest = i;
+        }
+    }
+    TEXT_SCALE_BITS.store(TEXT_SCALES[nearest].to_bits(), Ordering::Relaxed);
+}
+
+/// The scale at a step of the ladder, clamped into it.
+pub fn text_scale_at(step: usize) -> f32 {
+    TEXT_SCALES[step.min(TEXT_SCALES.len() - 1)]
+}
+
+/// The step of the ladder the current scale is.
+pub fn text_scale_step() -> usize {
+    let scale = text_scale();
+    TEXT_SCALES
+        .iter()
+        .position(|s| (s - scale).abs() < f32::EPSILON)
+        .unwrap_or(TEXT_SCALE_DEFAULT)
+}
+
+/// A size of the console's type scale, at the scale in force.
+///
+/// EVERY size the console draws goes through this, which is what makes the
+/// setting a setting: one number moves every label, title, readout and
+/// figure on the instrument together, so the console stays one instrument
+/// at any size instead of becoming a collage of panels set at different
+/// volumes.
+pub fn pt(base: f32) -> f32 {
+    base * text_scale()
+}
 
 // ---------------------------------------------------------------------------
 // Button / control metrics
@@ -474,7 +607,10 @@ pub const ICON_SPACING: f32 = 4.0;
 /// through the rows and cost legibility on the smallest text on the panel.
 pub const BAND_SCAN_PITCH: f32 = 4.0;
 pub const BAND_SCAN_ALPHA: u8 = 9;
-pub const BAND_TEXTURE_H: f32 = TITLE_H;
+/// The texture's height, which is the band's height — at the scale in force.
+pub fn band_texture_h() -> f32 {
+    title_h()
+}
 
 // ---------------------------------------------------------------------------
 // Zone metrics
@@ -484,7 +620,18 @@ pub const BAND_TEXTURE_H: f32 = TITLE_H;
 // in one place rather than numbers at their call sites.
 // ---------------------------------------------------------------------------
 
+/// The column's width AT THE BASE TYPE SIZE.
+///
+/// The column is sized to the text it holds: a dense row has to carry a
+/// call sign, a name, a role and a state, and those four only fit because
+/// the column is as wide as the type asks for. So the width is a function
+/// of the text scale — [`zone_w`] is the number, and this is what it is at
+/// scale one.
 pub const ZONE_W: f32 = 320.0;
+/// The column's width, at the text scale in force.
+pub fn zone_w() -> f32 {
+    ZONE_W * text_scale()
+}
 pub const ZONE_MIN_W: f32 = 240.0;
 pub const ZONE_MAX_W: f32 = 600.0;
 pub const ZONE_GRIP_W: f32 = 10.0;
@@ -492,7 +639,14 @@ pub const ZONE_GRIP_W: f32 = 10.0;
 ///
 /// The band is full-width and flush to the window's top, so the column
 /// starts where the band ends and the two are one piece of chrome.
+///
+/// It holds the console's clock — a readout, and the largest type on the
+/// instrument — so it grows with the text scale like every other band.
 pub const TOP_BAND_H: f32 = 34.0;
+/// The top band's height, at the text scale in force.
+pub fn top_band_h() -> f32 {
+    TOP_BAND_H * text_scale()
+}
 /// The gap between stacked islands in the column.
 ///
 /// ZERO, and that is a decision rather than a rounding. The column is one
@@ -517,6 +671,10 @@ pub const ZONE_ISLAND_GAP: f32 = 0.0;
 /// sidebar with a stripe of map above it is a card on a map; a sidebar
 /// that starts under the band is chrome.
 pub const ZONE_TOP_GAP: f32 = TOP_BAND_H;
+/// How far below the window's top the column starts, at the scale in force.
+pub fn zone_top_gap() -> f32 {
+    top_band_h()
+}
 /// The Inspector image preview's width range and height cap: a tall source
 /// must not consume the whole island, and the requested width yields to the
 /// panel actually available.
@@ -619,23 +777,23 @@ pub const fn box_translate(b: Box, dx: f32, dy: f32) -> Box {
 
 /// Where the body content goes inside an island: below the title band,
 /// inside the pad.
-pub const fn island_content_box(island: Box) -> Box {
+pub fn island_content_box(island: Box) -> Box {
     (
         island.0 + ISLAND_PAD,
-        island.1 + TITLE_H + ISLAND_PAD,
+        island.1 + title_h() + ISLAND_PAD,
         island.2 - ISLAND_PAD,
         island.3 - ISLAND_PAD,
     )
 }
 
 /// The title band's own box, its top corners rounded with the panel.
-pub const fn island_title_box(island: Box) -> Box {
-    (island.0, island.1, island.2, island.1 + TITLE_H)
+pub fn island_title_box(island: Box) -> Box {
+    (island.0, island.1, island.2, island.1 + title_h())
 }
 
 /// The close button's centre in the band.
-pub const fn island_close_center(island: Box) -> (f32, f32) {
-    (island.2 - CLOSE_INSET, island.1 + TITLE_H * 0.5)
+pub fn island_close_center(island: Box) -> (f32, f32) {
+    (island.2 - CLOSE_INSET, island.1 + title_h() * 0.5)
 }
 
 /// The band's right padding: enough to clear the close cross where the island
@@ -829,7 +987,7 @@ pub fn clamp_zone_width(w: f32, viewport_w: f32) -> f32 {
 pub fn zone_band(viewport: Box, zone_w: f32) -> Box {
     (
         viewport.2 - zone_w,
-        viewport.1 + ZONE_TOP_GAP,
+        viewport.1 + zone_top_gap(),
         viewport.2,
         viewport.3,
     )
@@ -937,13 +1095,9 @@ pub fn zone_island_origin(band: Box, index: usize, heights: &[f32]) -> (f32, f32
 /// choice, and an index would silently re-open it under a different name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IslandKey {
-    /// Identity: who is signed in, their role, the way out. First in every
-    /// state, because identity is the one thing that does not change with
-    /// the exercise (`main.rs::side_zone`'s own comment).
-    Operator,
-    /// The hull register: what the fleet HAS. Not a session surface — the
-    /// register answers before any game is held, which is why it rides
-    /// along in `NoSession`.
+    /// The hull register: what the fleet HAS. A PLANNING surface — the
+    /// register answers what the exercise fights with, and that is a
+    /// question the plan asks, not the empty room.
     Fleet,
     /// The game's own terms: name, mode, pace, the planned window, the
     /// Game Master's prose. The console's `z.essentials`, which is where a
@@ -990,12 +1144,6 @@ pub enum IslandKey {
     /// This shell carries four of the five; only Transcript is named
     /// rather than drawn, a local trace with no route.
     Assessment,
-    /// The games to hold: every exercise this account can see, with this
-    /// seat in each. The console's `z.start`, which is a session picker
-    /// plus a create button — the create half is the band's door here, so
-    /// the island carries the picker. Last of the keys on purpose: the
-    /// key feeds stateful ids, and appending renumbers nothing.
-    Sessions,
 }
 
 impl IslandKey {
@@ -1005,7 +1153,6 @@ impl IslandKey {
     /// knows under one name must not be renamed by a port.
     pub fn title(self) -> &'static str {
         match self {
-            IslandKey::Operator => "OPERATOR",
             IslandKey::Essentials => "ESSENTIALS",
             IslandKey::Control => "CONTROL",
             IslandKey::Fleet => "FLEET",
@@ -1016,7 +1163,6 @@ impl IslandKey {
             IslandKey::Command => "COMMAND",
             IslandKey::Log => "LOG",
             IslandKey::Assessment => "ASSESSMENT",
-            IslandKey::Sessions => "SESSIONS",
         }
     }
 
@@ -1027,7 +1173,6 @@ impl IslandKey {
     /// this name is for logs and for anything a human reads.
     pub fn id(self) -> &'static str {
         match self {
-            IslandKey::Operator => "operator",
             IslandKey::Essentials => "essentials",
             IslandKey::Control => "control",
             IslandKey::Fleet => "fleet",
@@ -1038,7 +1183,6 @@ impl IslandKey {
             IslandKey::Command => "command",
             IslandKey::Log => "log",
             IslandKey::Assessment => "assessment",
-            IslandKey::Sessions => "sessions",
         }
     }
 }
@@ -1049,8 +1193,7 @@ impl IslandKey {
 /// it changes with the exercise's state. What this list fixes is the identity
 /// the operator's open/closed choice hangs off, and it is declared once so no
 /// code path can hold a subset and quietly drop one.
-pub const COLUMN_ISLANDS: [IslandKey; 12] = [
-    IslandKey::Operator,
+pub const COLUMN_ISLANDS: [IslandKey; 10] = [
     IslandKey::Essentials,
     IslandKey::Control,
     IslandKey::Fleet,
@@ -1060,7 +1203,6 @@ pub const COLUMN_ISLANDS: [IslandKey; 12] = [
     IslandKey::Command,
     IslandKey::Log,
     IslandKey::Assessment,
-    IslandKey::Sessions,
     IslandKey::Groups,
 ];
 
@@ -1085,12 +1227,12 @@ pub struct IslandSlot {
 ///
 /// The omissions are named rather than hidden:
 ///
-/// - `z.start` (NoSession) is a session PICKER plus a create button. The
-///   create half is the band's door here, and the column carries the
-///   picker as its own island beside the register — which answers even
-///   here, because what the fleet HAS is not a session fact. The picker
-///   lists what the sign-in read; holding one replaces the session whole.
-///   A signed-out shell still shows the login card, not the column.
+/// - `z.start` (NoSession) is a session PICKER plus a create button, and it
+///   is NOT a column island. The owner's direction: with no exercise held
+///   there is nothing to read beside the map — the column would be a stack of
+///   answers to questions nobody has asked yet. So the empty room is an EMPTY
+///   column, and the games to hold live in the MIDDLE of the frame, in the
+///   modal that carries the list and the wizard that makes a new one.
 /// - `z.essentials` and `z.control` (Planning) are the game's own terms and
 ///   pace. No read route exists for either here.
 /// - `z.groups` is the task organisation. It used to be omitted because
@@ -1112,16 +1254,22 @@ pub struct IslandSlot {
 ///   per-state layout a wall rather than a composition.
 pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<IslandSlot> {
     let slot = |key: IslandKey, height: f32| IslandSlot { key, height };
-    let mut out = vec![slot(IslandKey::Operator, 172.0)];
+    let mut out: Vec<IslandSlot> = Vec::new();
     match state {
-        // No held game: identity, the games to hold, and what the fleet
-        // HAS — which is not a session fact, so the register answers even
-        // here. The picker rides second because it is the state's verb:
-        // a signed-in shell with no game is here to choose one.
-        crate::gamestate::GameState::NoSession => {
-            out.push(slot(IslandKey::Sessions, 320.0));
-            out.push(slot(IslandKey::Fleet, 320.0));
-        }
+        // NO GAME HELD: the column is EMPTY, and that is the whole answer.
+        //
+        // The three surfaces this state used to carry were each moved, not
+        // dropped. Identity went to the top band's right, where it is one
+        // chip and one click (it does not change with the exercise, so it
+        // never belonged in a column that does). The games to hold went to
+        // the middle of the frame, as the modal that carries the list and
+        // the wizard. The hull register went to PLANNING, which is the phase
+        // that assembles a force.
+        //
+        // What is left is a map with a band over it, and the band's door
+        // opens the surface that answers the only question this state has:
+        // which exercise.
+        crate::gamestate::GameState::NoSession => {}
         // PLANNING is the console's column, island for island and height for
         // height (`main.rs::side_zone`): read the plan back (Essentials),
         // set the clock's pace (Control), choose what fights (Fleet), seat
@@ -1221,6 +1369,96 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// The SESSIONS card
+// ---------------------------------------------------------------------------
+
+/// The SESSIONS card's footprint: the games to hold on the left, the wizard
+/// on the right.
+///
+/// It is the same family of width as the other two-column cards (760), for
+/// the same reason: two sections side by side need the room, and a card
+/// that gives the wizard a third of the window gives the wizard's fields
+/// nowhere to put their labels.
+pub const SESSIONS_W: f32 = 760.0;
+
+/// The SESSIONS card's height. Enough for the list on the left and the
+/// wizard's longest step on the right; the window's own height caps it.
+pub const SESSIONS_H: f32 = 560.0;
+
+/// One session row's height.
+///
+/// FIXED, and that is the point: a list whose rows are content-sized is a
+/// list whose rows do not line up, and a click that lands between two rows
+/// is a click that holds the wrong exercise. The row's own height is a
+/// token, so the row a test aims at is the row that is drawn.
+pub const SESSION_ROW_H: f32 = 22.0;
+
+/// The margin between the SESSIONS card and the window's edge, on every
+/// side.
+///
+/// The card is a thing ON the console, not the console: it sits inside the
+/// window with a margin, the way every other modal sits, and the margin is
+/// what lets the operator see that the card is a card.
+pub const CARD_INSET: f32 = 32.0;
+
+/// The SESSIONS card's rectangle: centred in the window, and never bigger
+/// than the window it is opened in.
+///
+/// A card the window cannot hold is a card whose second section is off the
+/// edge, and this card's second section is the wizard — which is the half
+/// of the console that makes an exercise.
+///
+/// **THE CARD FITS THE WINDOW IN BOTH DIRECTIONS, AND THE FLOOR IS
+/// APPLIED FIRST.** The card would LIKE to be at least this big; it may
+/// never be bigger than the window. A card taller than the window is a
+/// card whose title band is cut off by the window's own edge, and the band
+/// exists to carry the name of the surface — an operator who cannot read
+/// "SESSIONS" does not know which surface they are in.
+pub fn sessions_card_rect(viewport: Box) -> Box {
+    // The room the card has, once the window's own margin is taken off.
+    let room_w = (viewport.2 - 2.0 * CARD_INSET).max(0.0);
+    let room_h = (viewport.3 - 2.0 * CARD_INSET).max(0.0);
+    let w = SESSIONS_W.min(room_w).max(240.0).min((viewport.2 - 16.0).max(0.0));
+    // The card holds the wizard, and the wizard's content grows with the
+    // text — so the card does too. A card whose last field is below its
+    // own bottom edge is a card the operator has to scroll to finish.
+    let h = (SESSIONS_H * text_scale())
+        .min(room_h)
+        .max(240.0)
+        .min((viewport.3 - 16.0).max(0.0));
+    (
+        viewport.0 + (viewport.2 - w) / 2.0,
+        viewport.1 + (viewport.3 - h) / 2.0,
+        w,
+        h,
+    )
+}
+
+/// Where the FIRST session row sits in the card: the point a click on it
+/// lands.
+///
+/// The card's own title band and the rule under it, then the column's
+/// padding, then the LIST's title band and the rule under it, then the gap,
+/// then half a row. Every term is a token, and the render draws the same
+/// terms in the same order — so the point this names is where the row is.
+///
+/// This exists because the sessions list left the column: a test that found
+/// a row by walking the column's arithmetic cannot find a row that is not
+/// in the column, and a test that cannot find the row proves nothing.
+pub fn sessions_first_row_point(card: Box) -> (f32, f32) {
+    let x = card.0 + PANEL_PAD + 60.0;
+    let y = card.1
+        + title_h()
+        + 1.0
+        + PANEL_PAD
+        + title_h()
+        + 1.0
+        + PANEL_GAP
+        + SESSION_ROW_H / 2.0;
+    (x, y)
 }
 
 /// The stack's height: every island plus the gap between each pair.
@@ -1617,6 +1855,15 @@ pub const ZOOM_MAX: f64 = 18.0;
 /// operator typed, which is the one thing a form must not do under a cursor.
 pub const AUTH_FIELD_H: f32 = 30.0;
 
+/// The height of a credential or draft field, at the text scale in force.
+///
+/// The field holds body text, and the body grows with the scale — so the
+/// field grows with it, and the card does not change height as the operator
+/// types, which is the one thing a form must not do under a cursor.
+pub fn field_h() -> f32 {
+    AUTH_FIELD_H * text_scale()
+}
+
 /// The side zone's band, docked left or right.
 ///
 /// `left` mirrors the box to the other edge with the SAME gaps, so the island
@@ -1627,7 +1874,7 @@ pub fn zone_band_at(viewport: Box, zone_w: f32, left: bool) -> Box {
     if left {
         (
             viewport.0,
-            viewport.1 + ZONE_TOP_GAP,
+            viewport.1 + zone_top_gap(),
             viewport.0 + zone_w,
             viewport.3,
         )
@@ -1674,31 +1921,27 @@ mod tests {
         assert!((narrow_panel.0 - 120.0).abs() < 0.01);
     }
 
-    /// The one invariant the whole column rests on: identity is first, in
-    /// every state. A column that led with a working surface would put the
-    /// way out below the thing you are doing, which is the arrangement a demo
-    /// has and a console does not.
+    /// The one invariant the whole column rests on: NO session state has a
+    /// column at all.
+    ///
+    /// With no exercise held there is nothing to read beside the map. The
+    /// three surfaces this state used to carry were each MOVED — identity to
+    /// the top band's right, the games to hold to the middle of the frame —
+    /// and the register went to PLANNING, which is the phase that assembles a
+    /// force. What is left is a map, and the door that opens the one question
+    /// this state asks.
     #[test]
-    fn the_operator_island_leads_in_every_state() {
-        for state in [
-            GameState::NoSession,
-            GameState::Planning,
-            GameState::Preparation,
-            GameState::Execution,
-            GameState::Closure,
-        ] {
-            for player in [false, true] {
-                assert_eq!(
-                    zone_islands(state, player).first().map(|s| s.key),
-                    Some(IslandKey::Operator),
-                    "{state:?} player={player} did not lead with identity"
-                );
-            }
+    fn an_empty_room_has_no_column() {
+        for player in [false, true] {
+            assert!(
+                zone_islands(GameState::NoSession, player).is_empty(),
+                "the empty room grew a column"
+            );
         }
     }
 
-    /// A player station sees identity and its own helm, and nothing else. A
-    /// judge commanding hulls is still a judge — the console's rule reads the
+    /// A player station sees its own helm, and nothing else. A judge
+    /// commanding hulls is still a judge — the console's rule reads the
     /// seat, not the hulls, and the hulls are the DASHBOARD's question.
     ///
     /// The helm is the part this got wrong first: the console's player column
@@ -1713,7 +1956,7 @@ mod tests {
             .iter()
             .map(|s| s.key)
             .collect();
-        assert_eq!(keys, vec![IslandKey::Operator, IslandKey::Command]);
+        assert_eq!(keys, vec![IslandKey::Command]);
     }
 
     /// An organizer's execution column is a working surface, and it is
@@ -1733,7 +1976,6 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                IslandKey::Operator,
                 IslandKey::Command,
                 IslandKey::Crew,
                 IslandKey::Log,
@@ -1754,19 +1996,15 @@ mod tests {
         let keys = |state: GameState, player: bool| -> Vec<IslandKey> {
             zone_islands(state, player).into_iter().map(|s| s.key).collect()
         };
-        // No session: identity, the games to hold, and the register —
-        // which answers before any game is held.
-        assert_eq!(
-            keys(GameState::NoSession, false),
-            [Operator_key(), Sessions_key(), Fleet_key()]
-        );
+        // No session: NOTHING. The games to hold live in the middle of the
+        // frame, and the register belongs to planning.
+        assert_eq!(keys(GameState::NoSession, false), Vec::<IslandKey>::new());
         // Planning is the console's column, island for island: read the plan
         // back, set the clock, choose what fights, seat the room, watch the
         // gate. One omission, named in `zone_islands`: `z.groups`.
         assert_eq!(
             keys(GameState::Planning, false),
             [
-                Operator_key(),
                 Essentials_key(),
                 Control_key(),
                 Fleet_key(),
@@ -1778,30 +2016,22 @@ mod tests {
         // Preparation is the gate: the seat's readiness, and who has declared.
         assert_eq!(
             keys(GameState::Preparation, false),
-            [Operator_key(), Command_key(), Crew_key()]
+            [Command_key(), Crew_key()]
         );
         // Execution is the working surface, for an organizer. The step is
         // not here: the scenario board takes the middle of the frame.
         assert_eq!(
             keys(GameState::Execution, false),
-            [Operator_key(), Command_key(), Crew_key(), IslandKey::Log]
+            [Command_key(), Crew_key(), IslandKey::Log]
         );
         // Closure is the debrief, and carries no command: nothing is ordered
         // after the fact.
         assert_eq!(
             keys(GameState::Closure, false),
-            [
-                Operator_key(),
-                IslandKey::Assessment,
-                IslandKey::Log,
-                Crew_key(),
-            ]
+            [IslandKey::Assessment, IslandKey::Log, Crew_key()]
         );
     }
 
-    fn Operator_key() -> IslandKey {
-        IslandKey::Operator
-    }
     fn Fleet_key() -> IslandKey {
         IslandKey::Fleet
     }
@@ -1825,9 +2055,6 @@ mod tests {
     }
     fn Command_key() -> IslandKey {
         IslandKey::Command
-    }
-    fn Sessions_key() -> IslandKey {
-        IslandKey::Sessions
     }
 
     /// A player station changes the column in execution and ONLY there. In
@@ -1896,7 +2123,7 @@ mod tests {
             for player in [false, true] {
                 for s in zone_islands(state, player) {
                     assert!(
-                        s.height > TITLE_H,
+                        s.height > title_h(),
                         "{:?} at {} hides its own band",
                         s.key,
                         s.height
@@ -1942,11 +2169,11 @@ mod tests {
             zone_stack_height(&slots),
             sum + ZONE_ISLAND_GAP * slots.len() as f32
         );
-            // Seven islands: the console's planning heights, and — because the
+            // Six islands: the console's planning heights, and — because the
             // fields are joined — no gaps between them.
             assert_eq!(
                 zone_stack_height(&slots),
-                172.0 + 470.0 + 320.0 + 320.0 + 300.0 + 280.0 + 380.0
+                470.0 + 320.0 + 320.0 + 300.0 + 280.0 + 380.0
         );
     }
 
@@ -1980,9 +2207,9 @@ mod tests {
         let slots = zone_islands(GameState::Planning, false);
         assert_eq!(
             zone_stack_height(&slots),
-                172.0 + 470.0 + 320.0 + 320.0 + 300.0 + 280.0 + 380.0
+                470.0 + 320.0 + 320.0 + 300.0 + 280.0 + 380.0
             );
-            assert_eq!(zone_overflow(zone_stack_height(&slots), band), 1702.0);
+            assert_eq!(zone_overflow(zone_stack_height(&slots), band), 1530.0);
         // A short stack in a tall band scrolls not at all.
         assert_eq!(zone_overflow(100.0, band), 0.0);
     }
@@ -2014,7 +2241,8 @@ mod tests {
         assert_eq!(BODY_PT, 13.0);
         assert_eq!(READOUT_SM_PT, 18.0);
         assert_eq!(READOUT_LG_PT, 30.0);
-        assert_eq!(TEXT_SCALE_LARGER, 1.15);
+        assert_eq!(TITLE_PT, 16.0);
+        assert_eq!(TEXT_SCALES[1], 1.15);
         assert_eq!(CONTROL_RADIUS, 6.0);
         assert_eq!(BUTTON_PADDING.0, 12.0);
         assert_eq!(BUTTON_PADDING.1, 8.0);
@@ -2051,6 +2279,158 @@ mod tests {
         assert!(
             (ratio - 0.12).abs() < 1e-6,
             "label tracking should be 12% of the label size, was {ratio}"
+        );
+    }
+
+    /// THE TITLE IS ITS OWN TIER, AND IT IS ABOVE THE BODY.
+    ///
+    /// The complaint this answers: a panel's name used to be set at the
+    /// label's size, so the title and the field keys under it were the same
+    /// size and the same weight — a surface and its contents drawn as one
+    /// voice. A title that is not larger than the body is not a title.
+    #[test]
+    fn a_title_sits_above_the_body_it_heads() {
+        assert!(
+            TITLE_PT > BODY_PT,
+            "a title smaller than the body is a label"
+        );
+        assert!(
+            TITLE_PT > READOUT_SM_PT - READOUT_SM_PT,
+            "and it is a heading, not a number"
+        );
+        // The ladder now has a rung between the body and the small readout
+        // would be a rung nobody asked for: the title IS that rung.
+        assert!(
+            LABEL_PT < DENSE_PT && DENSE_PT < BODY_PT && BODY_PT < TITLE_PT,
+            "the ladder still climbs"
+        );
+    }
+
+    /// TRACKING IS A RATIO, so a title tracks like a title and a label
+    /// like a label.
+    #[test]
+    fn tracking_follows_the_size_it_tracks() {
+        let label = label_tracking(LABEL_PT);
+        let title = label_tracking(TITLE_PT);
+        assert!((label - LABEL_TRACKING).abs() < 1e-6);
+        assert!(
+            title > label * 1.5,
+            "a bigger word needs more air between its letters, not the same air"
+        );
+        let ratio = title / TITLE_PT;
+        let label_ratio = label / LABEL_PT;
+        assert!((ratio - label_ratio).abs() < 1e-6, "one ratio, both sizes");
+    }
+
+    /// ONE MULTIPLIER MOVES THE WHOLE INSTRUMENT.
+    ///
+    /// The setting is a setting because every size on the console is one
+    /// base size times one number — so the type and the CHROME that holds
+    /// it move together. A band that did not grow with its title would cut
+    /// the title, and a column that did not grow with its dense rows would
+    /// lose a column of them.
+    #[test]
+    fn one_scale_moves_the_type_and_the_chrome_that_holds_it() {
+        let before = text_scale();
+        set_text_scale(TEXT_SCALES[3]);
+        assert!(text_scale() > before || before == TEXT_SCALES[3]);
+        assert!((pt(BODY_PT) - BODY_PT * text_scale()).abs() < 1e-4);
+        assert!(title_h() > TITLE_H, "the band grows with the title");
+        assert!(field_h() > AUTH_FIELD_H, "the field grows with its text");
+        assert!(top_band_h() > TOP_BAND_H, "the band grows with the clock");
+        assert!(zone_w() > ZONE_W, "the column grows with its rows");
+        assert!((zone_top_gap() - top_band_h()).abs() < 1e-6);
+        // Put it back, so a test that runs after this one sees the console
+        // as the operator would find it.
+        set_text_scale(TEXT_SCALES[TEXT_SCALE_DEFAULT]);
+    }
+
+    /// THE CARD FITS THE WINDOW IT IS OPENED IN.
+    ///
+    /// The complaint this answers: the card's title band was cut off by
+    /// the window's own edge on a short window, because the card carried a
+    /// minimum height that the window was allowed to be smaller than. A
+    /// card taller than its window is a card whose name the operator
+    /// cannot read — and the name is the one thing the band is for.
+    #[test]
+    fn the_sessions_card_fits_the_window_it_is_opened_in() {
+        for (w, h) in [
+            (1280.0, 900.0),
+            (900.0, 700.0),
+            (900.0, 360.0),
+            (600.0, 420.0),
+            (360.0, 260.0),
+            (240.0, 200.0),
+        ] {
+            let card = sessions_card_rect((0.0, 0.0, w, h));
+            assert!(
+                card.2 <= w && card.0 >= 0.0 && card.0 + card.2 <= w,
+                "the card hangs off the side of the window: {card:?} in {w}x{h}"
+            );
+            assert!(
+                card.3 <= h && card.1 >= 0.0 && card.1 + card.3 <= h,
+                "the card hangs off the top or bottom of the window: {card:?} in {w}x{h}"
+            );
+        }
+    }
+
+    /// THE TITLE BAND HOLDS THE TITLE, AT EVERY SIZE ON THE LADDER.
+    ///
+    /// The band is a fixed height and the title is centred in it, so a
+    /// title whose line box outgrows the band is a title whose top is cut
+    /// off by the card's edge. The band grows with the type, so this holds
+    /// at every rung.
+    #[test]
+    fn the_title_band_holds_the_title_at_every_size() {
+        for scale in TEXT_SCALES {
+            set_text_scale(scale);
+            assert!(
+                title_h() >= pt(TITLE_PT) * 1.2,
+                "the title does not fit its band at scale {scale}"
+            );
+        }
+        set_text_scale(TEXT_SCALES[TEXT_SCALE_DEFAULT]);
+    }
+
+    /// THE SCALE IS A CHOICE BETWEEN NAMED SIZES, not a number typed.
+    ///
+    /// A scale of zero would draw nothing and a scale of ten would draw a
+    /// console nobody can operate, so anything off the ladder lands on the
+    /// nearest rung of it.
+    #[test]
+    fn a_scale_off_the_ladder_lands_on_the_ladder() {
+        set_text_scale(0.0);
+        assert_eq!(text_scale(), TEXT_SCALES[0]);
+        set_text_scale(99.0);
+        assert_eq!(text_scale(), TEXT_SCALES[TEXT_SCALES.len() - 1]);
+        set_text_scale(TEXT_SCALES[TEXT_SCALE_DEFAULT]);
+        assert_eq!(text_scale_step(), TEXT_SCALE_DEFAULT);
+    }
+
+    /// The console boots BIGGER than it shipped.
+    ///
+    /// The operator's word on the shipped size was that it was too small,
+    /// and the fix is a default and not a suggestion — so the default is
+    /// pinned here, where a future change to the ladder has to be argued
+    /// for rather than drifted into.
+    #[test]
+    fn the_console_boots_bigger_than_it_shipped() {
+        assert!(
+            TEXT_SCALE_DEFAULT > 0,
+            "there is a default"
+        );
+        assert!(
+            TEXT_SCALES[TEXT_SCALE_DEFAULT] > TEXT_SCALES[0],
+            "and it is not the smallest rung of the ladder"
+        );
+        assert!(
+            TEXT_SCALE_DEFAULT < TEXT_SCALES.len(),
+            "and it is a rung that exists"
+        );
+        assert_eq!(
+            TEXT_SCALE_NAMES.len(),
+            TEXT_SCALES.len(),
+            "every rung has a name the operator reads"
         );
     }
 
@@ -2255,7 +2635,7 @@ mod tests {
         let island = box_at(100.0, 50.0, 320.0, 400.0);
         let c = island_content_box(island);
         assert_eq!(c.0, 100.0 + ISLAND_PAD);
-        assert_eq!(c.1, 50.0 + TITLE_H + ISLAND_PAD);
+        assert_eq!(c.1, 50.0 + title_h() + ISLAND_PAD);
         assert_eq!(c.2, 420.0 - ISLAND_PAD);
         assert_eq!(c.3, 450.0 - ISLAND_PAD);
     }
@@ -2426,7 +2806,7 @@ mod tests {
     #[test]
     fn the_band_sits_below_the_top_band() {
         let band = zone_band((0.0, 0.0, 1920.0, 1080.0), 320.0);
-        assert_eq!(band.1, ZONE_TOP_GAP);
+        assert_eq!(band.1, zone_top_gap());
         assert_eq!(band.3, 1080.0, "the column runs to the window's bottom edge");
         assert!((box_w(band) - 320.0).abs() < 0.001);
     }

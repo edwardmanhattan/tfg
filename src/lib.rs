@@ -54,6 +54,11 @@
 //! - [`library`]: the scenario library — the operator's own saved scenarios,
 //!   kept whole on this machine, with the plan and the book kept apart.
 //!   Toolkit-free.
+//! - [`settings`]: the console's own settings, remembered across launches.
+//! - [`ink`]: the palette and the icons at the toolkit boundary — the one
+//!   place `view`'s plain colours become the shell's.
+//! - [`pickers`]: the calendar and the time grid, as components any form can
+//!   use.
 //!
 //! Module list is alphabetical after `assets`.
 
@@ -75,6 +80,7 @@ pub mod gpuprobe;
 pub mod groups;
 pub mod halo;
 pub mod geo;
+pub mod ink;
 pub mod land;
 pub mod library;
 pub mod log;
@@ -86,10 +92,12 @@ pub mod mode_rules;
 pub mod overlay;
 pub mod paths;
 pub mod phase;
+pub mod pickers;
 pub mod readiness;
 pub mod roster;
 pub mod sfx;
 pub mod selfcheck;
+pub mod settings;
 pub mod shell_gpui;
 pub mod shell_threads;
 pub mod sim;

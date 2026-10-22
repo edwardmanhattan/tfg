@@ -159,28 +159,38 @@ pub fn window_update(
         // The date is the same on both ends, so "the end is after the
         // start" is still a question about the two military times — and the
         // rule that says so is `crate::window`'s.
-        let start = crate::backend::actual_to_rfc3339(date, start);
-        let end = crate::backend::actual_to_rfc3339(date, end);
+        //
+        // The FRAME is the draft's: the offset the server stated when the
+        // console read the window, or the client's own when it stated
+        // none. Writing in any other frame writes a DIFFERENT instant.
+        let start = crate::backend::actual_to_rfc3339(date, start, &draft.offset);
+        let end = crate::backend::actual_to_rfc3339(date, end, &draft.offset);
         let (Some(start), Some(end)) = (start, end) else {
             return Err(format!("{date} is not a day like 2026-11-01"));
         };
-        if live.actual_start.as_deref() != Some(start.as_str()) {
+        // COMPARED AS INSTANTS, not as strings. The server renders in its
+        // own zone and the console writes in the frame it read, so two
+        // spellings of one instant can differ as strings while being the
+        // same moment. Comparing the strings would report a change the
+        // operator never made, and the write that followed would move the
+        // exercise by the difference between the two spellings.
+        if !crate::backend::same_instant(live.actual_start.as_deref().unwrap_or(""), &start) {
             window.actual_start = Some(start);
         }
-        if live.actual_end.as_deref() != Some(end.as_str()) {
+        if !crate::backend::same_instant(live.actual_end.as_deref().unwrap_or(""), &end) {
             window.actual_end = Some(end);
         }
     }
     if let Some((start, end)) = assumed {
-        let start = crate::backend::assumed_hhmm_to_rfc3339(start);
-        let end = crate::backend::assumed_hhmm_to_rfc3339(end);
+        let start = crate::backend::assumed_hhmm_to_rfc3339(start, &draft.offset);
+        let end = crate::backend::assumed_hhmm_to_rfc3339(end, &draft.offset);
         let (Some(start), Some(end)) = (start, end) else {
             return Err("the exercise clock is not a pair of military times".to_string());
         };
-        if live.assumed_start.as_deref() != Some(start.as_str()) {
+        if !crate::backend::same_instant(live.assumed_start.as_deref().unwrap_or(""), &start) {
             window.assumed_start = Some(start);
         }
-        if live.assumed_end.as_deref() != Some(end.as_str()) {
+        if !crate::backend::same_instant(live.assumed_end.as_deref().unwrap_or(""), &end) {
             window.assumed_end = Some(end);
         }
     }
@@ -428,6 +438,7 @@ mod tests {
             actual_end: "1600".into(),
             assumed_start: "0800".into(),
             assumed_end: "1600".into(),
+            offset: "+00:00".into(),
         };
         let live = TimeWindow {
             actual_start: Some("2026-11-01T08:00:00Z".into()),
@@ -445,10 +456,63 @@ mod tests {
             .expect("the end changed");
         assert_eq!(
             update.window.assumed_end.as_deref(),
-            Some("2000-01-01T17:00:00Z")
+            Some("2000-01-01T17:00:00+00:00"),
+            "the write is in the frame the draft carries"
         );
         assert_eq!(update.window.actual_start, None, "the real clock is not restated");
         assert_eq!(update.window.assumed_start, None, "the start did not change");
+    }
+
+    /// THE WINDOW DOES NOT MOVE WHEN NOTHING CHANGED.
+    ///
+    /// The server renders in its own zone, so the strings it holds and the
+    /// strings the console writes can differ while being the same moment.
+    /// Comparing the STRINGS would report a change the operator never made,
+    /// and the write that followed would move the exercise — and its clock —
+    /// by the difference between the two spellings.
+    ///
+    /// This is the defect the live API proved: a window read back and
+    /// written back moved seven hours, on both clocks, every time.
+    #[test]
+    fn an_unchanged_window_is_not_written_even_when_the_spelling_differs() {
+        // The server's own zone, and the same instant in two spellings.
+        let draft = WindowDraft {
+            actual_date: "2026-11-01".into(),
+            actual_start: "1500".into(),
+            actual_end: "2300".into(),
+            assumed_start: "1500".into(),
+            assumed_end: "2300".into(),
+            offset: "+07:00".into(),
+        };
+        let live = TimeWindow {
+            actual_start: Some("2026-11-01T15:00:00+07:00".into()),
+            actual_end: Some("2026-11-01T23:00:00+07:00".into()),
+            assumed_start: Some("2000-01-01T15:00:00+07:00".into()),
+            assumed_end: Some("2000-01-01T23:00:00+07:00".into()),
+        };
+        assert!(
+            window_update(&draft, &live).expect("a window").is_none(),
+            "the same instant in another spelling is not a change"
+        );
+        // And the same window spelled in UTC is the same instant too.
+        let live_utc = TimeWindow {
+            actual_start: Some("2026-11-01T08:00:00Z".into()),
+            actual_end: Some("2026-11-01T16:00:00Z".into()),
+            assumed_start: Some("2000-01-01T08:00:00Z".into()),
+            assumed_end: Some("2000-01-01T16:00:00Z".into()),
+        };
+        let draft_utc = WindowDraft {
+            actual_date: "2026-11-01".into(),
+            actual_start: "0800".into(),
+            actual_end: "1600".into(),
+            assumed_start: "0800".into(),
+            assumed_end: "1600".into(),
+            offset: "+00:00".into(),
+        };
+        assert!(
+            window_update(&draft_utc, &live_utc).expect("a window").is_none(),
+            "and the same instant in the other zone is not a change either"
+        );
     }
 
     /// A draft that is not a window is refused, and the sentence names the
@@ -461,6 +525,7 @@ mod tests {
             actual_end: "1600".into(),
             assumed_start: "1600".into(),
             assumed_end: "0800".into(),
+            offset: "+00:00".into(),
         };
         let refusal = window_update(&draft, &TimeWindow::default())
             .expect_err("the exercise clock runs backwards");

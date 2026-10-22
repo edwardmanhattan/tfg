@@ -22,7 +22,7 @@ pub use error::BackendError;
 pub use auth::{AppRole, AuthenticatedUser, MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
 pub use feed::{GameMsg, MinosRest, Snapshot};
 pub use live::{LIVE_BACKOFF_BASE_SECS, LIVE_BACKOFF_CAP_SECS, LiveCmd, LiveEvent, LiveWire};
-pub use master::{AssetGroup, BackendUser, CurrentStepAsking, CurrentStepPlaying, CurrentStepScenario, CurrentStepStep, CurrentStepView, EchelonLevel, EmbarkationCandidate, EmbarkationResult, EmbarkedUnit, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePace, GameRole, GameScenario, GameScenarioStep, GameStepRun, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameReadinessView, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, OrderOutcome, OverCapacity, PositionSet, ServiceBranchCount, StagedOrder, StagedOrderList, StagedOrderScope, TimeWindow, UnitCapacity, UnitCommander, UnitSpeedEntry, UnitSpeeds, actual_to_rfc3339, assumed_hhmm_to_rfc3339, date_ok, hhmm_ok, hhmm_window_ok, MsgDraft, MsgDegree, MsgRecipient, DeleteOutcome, Participant, PlacementList, PositionList, RelatedPerson, RelatedPost, Review, ScenarioRole, StepReadiness, StepReadinessPerson, StepRelated, StepRewind, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
+pub use master::{AssetGroup, BackendUser, CurrentStepAsking, CurrentStepPlaying, CurrentStepScenario, CurrentStepStep, CurrentStepView, EchelonLevel, EmbarkationCandidate, EmbarkationResult, EmbarkedUnit, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePace, GameRole, GameScenario, GameScenarioStep, GameStepRun, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameReadinessView, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, NewGame, OrderOutcome, OverCapacity, PositionSet, ServiceBranchCount, StagedOrder, StagedOrderList, StagedOrderScope, TimeWindow, UnitCapacity, UnitCommander, UnitSpeedEntry, UnitSpeeds, actual_to_rfc3339, assumed_hhmm_to_rfc3339, clock_offset, date_ok, hhmm_ok, hhmm_window_ok, local_offset, same_instant, MsgDraft, MsgDegree, MsgRecipient, DeleteOutcome, Participant, PlacementList, PositionList, RelatedPerson, RelatedPost, Review, ScenarioRole, StepReadiness, StepReadinessPerson, StepRelated, StepRewind, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
 pub use replay::{FileReplay, now_ts};
 // Shared with live.rs and the tests below; not public API.
 pub(crate) use feed::FeedEvent;
@@ -838,7 +838,14 @@ mod tests {
         // Game lifecycle for the setup flow: create, assign, remove,
         // advance — every write answers with the collection it changed.
         let game = master
-            .create_game("AT", "Operasi Batu Malang", "maneuver", "", "", "", "", "")
+            .create_game(
+                "AT",
+                &crate::backend::master::NewGame {
+                    name: "Operasi Batu Malang".into(),
+                    mode: "maneuver".into(),
+                    ..Default::default()
+                },
+            )
             .expect("create");
         assert_eq!(game.id, 3);
         assert_eq!(game.state, "planning", "games are born in planning");

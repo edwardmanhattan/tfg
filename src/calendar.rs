@@ -25,7 +25,7 @@
 //! anything but that exact shape is refused rather than guessed at, because
 //! a wrong answer to a date is a silent one.
 
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 
 /// The month names, in the order the calendar counts them.
 ///
@@ -99,6 +99,19 @@ impl Month {
             year: normalised_year.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             month: normalised_month as u32,
         }
+    }
+
+    /// The datetime at a given day of THIS month, at the console's own hour.
+    ///
+    /// The day is a day of the month the CALENDAR IS SHOWING, not of the
+    /// month the field happens to hold: an operator who walks the calendar
+    /// forward to March and picks the 14th asked for the 14th of March, and
+    /// a picker that answered with the 14th of the field's own month would
+    /// be answering a different question.
+    pub fn at_day(&self, day: u32) -> Option<NaiveDateTime> {
+        NaiveDate::from_ymd_opt(self.year, self.month, day).map(|date| {
+            date.and_time(NaiveTime::from_hms_opt(8, 0, 0).unwrap_or_default())
+        })
     }
 
     /// The month the wall clock is in, locally.

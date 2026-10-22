@@ -20,6 +20,9 @@ pub struct AppPaths {
     /// thing — this machine's own record — and Minos has no catalog of
     /// scenarios to keep it in.
     pub scenario_library: PathBuf,
+    /// The console's own settings: the operator's text size, and whatever
+    /// else belongs to this machine rather than to the exercise.
+    pub settings: PathBuf,
 }
 
 impl AppPaths {
@@ -48,6 +51,7 @@ impl AppPaths {
             map_cache: map_dir.join("tfg-tiles-cache.sqlite"),
             initial_log: log_dir.join("tfg-session-log.jsonl"),
             scenario_library: data_dir.join("scenarios.json"),
+            settings: data_dir.join("settings.json"),
             log_dir,
             data_dir,
         })

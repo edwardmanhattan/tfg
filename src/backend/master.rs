@@ -784,30 +784,18 @@ impl MinosMaster {
     /// and `mode` are required; blank optionals are omitted, never sent
     /// empty. Mode is fixed at creation — no operation changes it after,
     /// so the picker lives on the create form and nowhere else.
+    ///
+    /// The planned window rides along because the server accepts it here and
+    /// because a game created without one cannot reach `execution`: the gate
+    /// names the missing window, and the only writers of the window are this
+    /// route and the PATCH. An exercise whose window the operator stated at
+    /// the door does not have to be repaired in a second panel afterwards.
     pub fn create_game(
         &self,
         token: &str,
-        name: &str,
-        mode: &str,
-        description: &str,
-        purpose: &str,
-        target: &str,
-        area: &str,
-        map_tag: &str,
+        req: &NewGame,
     ) -> Result<GameRow, BackendError> {
-        let mut body = serde_json::json!({ "name": name, "mode": mode });
-        for (k, v) in [
-            ("description", description),
-            ("purpose", purpose),
-            ("target", target),
-            ("area", area),
-            ("map_tag", map_tag),
-        ] {
-            if !v.trim().is_empty() {
-                body[k] = serde_json::Value::String(v.to_string());
-            }
-        }
-        let data = self.post(token, "/games", body)?;
+        let data = self.post(token, "/games", new_game_body(req))?;
         Ok(GameRow {
             id: data["id"].as_i64().unwrap_or(0),
             name: data["name"].as_str().unwrap_or("").to_string(),
@@ -3322,6 +3310,79 @@ impl GamePace {
     }
 }
 
+/// The body `POST /games` takes, from the draft the wizard states.
+///
+/// A PURE function, and that is the point: the wire shape of a create is a
+/// contract, and a contract that only exists inside a function that also
+/// does the HTTP is a contract with no test.
+///
+/// Three rules, each from the server's own schema:
+///
+/// - `name` and `mode` are always sent: they are the two required fields.
+/// - A blank optional is OMITTED, never sent empty. The server treats an
+///   empty string as "clear this field", and a create that cleared fields
+///   nobody had set would be saying something false.
+/// - The window goes one key at a time. A window is two clocks, and a clock
+///   with one end is a state the server accepts on its own — so a half
+///   window is written as a half window, and the gate, not this body, is
+///   where it is refused.
+pub fn new_game_body(req: &NewGame) -> serde_json::Value {
+    let mut body = serde_json::json!({ "name": req.name, "mode": req.mode });
+    for (k, v) in [
+        ("description", &req.description),
+        ("purpose", &req.purpose),
+        ("target", &req.target),
+        ("area", &req.area),
+        ("map_tag", &req.map_tag),
+    ] {
+        if !v.trim().is_empty() {
+            body[k] = serde_json::Value::String(v.to_string());
+        }
+    }
+    // The pace, when the operator chose one: absent leaves the server's
+    // own default alone, which is the honest reading of "not stated".
+    if let Some(pace) = req.pace {
+        body["pace"] = serde_json::Value::String(pace.wire().to_string());
+    }
+    for (k, v) in [
+        ("actual_start", &req.window.actual_start),
+        ("actual_end", &req.window.actual_end),
+        ("assumed_start", &req.window.assumed_start),
+        ("assumed_end", &req.window.assumed_end),
+    ] {
+        if let Some(v) = v {
+            body[k] = serde_json::Value::String(v.clone());
+        }
+    }
+    body
+}
+
+/// A new exercise, as the create form states it.
+///
+/// The mirror of [`GameUpdate`] with the two fields the server requires made
+/// plain: `name` and `mode`. Everything else is optional, and an empty
+/// optional is OMITTED rather than sent as an empty string — the server
+/// treats an empty string as "clear this field", and a create that cleared
+/// fields that were never set would be a create that said something false.
+///
+/// The window is here for the same reason it is on the update: the gate
+/// refuses an exercise whose window is incomplete, and the create is one of
+/// the two routes that can write it.
+#[derive(Debug, Clone, Default)]
+pub struct NewGame {
+    pub name: String,
+    pub mode: String,
+    pub description: String,
+    pub purpose: String,
+    pub target: String,
+    pub area: String,
+    pub map_tag: String,
+    /// Absent leaves the server's own pace alone.
+    pub pace: Option<GamePace>,
+    /// The planned window, both clocks.
+    pub window: TimeWindow,
+}
+
 /// Partial game edit: the six text fields the create form owns, plus pace
 /// and the planned window. None means leave alone (absent on the wire, never
 /// null).
@@ -4242,14 +4303,26 @@ const ASSUMED_CLOCK_BASE_DATE: &str = "2000-01-01";
 /// Validated with [`hhmm_ok`] rather than a second, laxer parser, so the two
 /// authoring surfaces in this console cannot disagree about what a military
 /// time is.
-pub fn assumed_hhmm_to_rfc3339(hhmm: &str) -> Option<String> {
+///
+/// THE FRAME IS THE POINT, and it is an argument, not a constant. The server
+/// renders every instant in ITS zone, so an instant the console reads back
+/// carries that zone's offset — and an instant the console writes back in a
+/// DIFFERENT zone is a DIFFERENT instant. A window written as `Z` and read
+/// back as `+07:00` is the same wall time and two instants an hour and a
+/// half apart, and a plan that round-trips through the server moves by the
+/// difference every time it is saved.
+///
+/// So the offset is an ARGUMENT: the one the server stated, or the client's
+/// own when the server has stated none.
+pub fn assumed_hhmm_to_rfc3339(hhmm: &str, offset: &str) -> Option<String> {
     if !hhmm_ok(hhmm) {
         return None;
     }
     Some(format!(
-        "{ASSUMED_CLOCK_BASE_DATE}T{}:{}:00Z",
+        "{ASSUMED_CLOCK_BASE_DATE}T{}:{}:00{}",
         &hhmm[..2],
-        &hhmm[2..]
+        &hhmm[2..],
+        frame_offset(offset)
     ))
 }
 
@@ -4258,11 +4331,88 @@ pub fn assumed_hhmm_to_rfc3339(hhmm: &str) -> Option<String> {
 /// The date is typed, not guessed: the real clock is the one an operator has
 /// to look up, and a default date would put the exercise on the wrong day
 /// while every local check passed.
-pub fn actual_to_rfc3339(date: &str, hhmm: &str) -> Option<String> {
+///
+/// The offset rides along for the reason [`assumed_hhmm_to_rfc3339`] gives.
+pub fn actual_to_rfc3339(date: &str, hhmm: &str, offset: &str) -> Option<String> {
     if !date_ok(date) || !hhmm_ok(hhmm) {
         return None;
     }
-    Some(format!("{date}T{}:{}:00Z", &hhmm[..2], &hhmm[2..]))
+    Some(format!(
+        "{date}T{}:{}:00{}",
+        &hhmm[..2],
+        &hhmm[2..],
+        frame_offset(offset)
+    ))
+}
+
+/// THE CLIENT'S OWN ZONE, as an RFC3339 offset (`+07:00`).
+///
+/// The console can read it: `chrono` is already a dependency and
+/// `chrono::Local` is already how `src/calendar.rs` decides what day
+/// "today" is and what time "now" is. So the machine's zone is a fact the
+/// console has and uses — the question is never WHETHER it can be read, but
+/// WHICH frame an instant is written in.
+///
+/// The client's zone is the DEFAULT frame, and it is right in the common
+/// case: the console runs where the exercise is fought, and the server runs
+/// in the same country. It is a default and not a rule — the server's own
+/// frame wins as soon as the server has stated one, because the server is
+/// the authority for the exercise's clock.
+pub fn local_offset() -> String {
+    chrono::Local::now().format("%:z").to_string()
+}
+
+/// The frame an instant is written in: the offset the server stated, or the
+/// client's own when it has stated none.
+///
+/// An offset that is neither empty nor a well-formed RFC3339 offset is
+/// REFUSED, and the caller's conversion fails rather than writing a stamp
+/// the server will read as a different instant.
+fn frame_offset(offset: &str) -> String {
+    let offset = offset.trim();
+    if offset.is_empty() {
+        return local_offset();
+    }
+    if offset == "Z" {
+        return "+00:00".to_string();
+    }
+    match chrono::DateTime::parse_from_rfc3339(&format!("2026-01-01T00:00:00{offset}")) {
+        Ok(at) => at.offset().to_string(),
+        Err(_) => local_offset(),
+    }
+}
+
+/// The offset a server's stamp carries — `+07:00` for a server in Jakarta,
+/// `+00:00` for one on UTC.
+///
+/// This is how the console learns the server's frame. The server renders
+/// every instant in its own zone, and that zone is the frame the plan is
+/// written in: read a window back, keep the offset, and write it in the
+/// same frame, and the plan is the plan the operator typed.
+pub fn clock_offset(value: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|at| at.offset().to_string())
+}
+
+/// Whether two RFC3339 stamps are the same INSTANT.
+///
+/// Two spellings of one instant are one instant, and the console must not
+/// call that a change. The server renders in its own zone; the console
+/// writes in the frame it read; comparing the STRINGS would report a
+/// difference where there is none, and the write that followed would move
+/// the exercise by the difference between the two spellings.
+///
+/// A stamp that does not parse falls back to the string compare, because a
+/// value the console cannot read is a value it has no better opinion about.
+pub fn same_instant(a: &str, b: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(a),
+        chrono::DateTime::parse_from_rfc3339(b),
+    ) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// Whether `s` is a calendar date the backend will accept: `YYYY-MM-DD`,
@@ -5231,6 +5381,79 @@ mod game_prose_tests {
 }
 
 #[cfg(test)]
+mod new_game_tests {
+    use super::{GamePace, NewGame, TimeWindow, new_game_body};
+
+    /// THE CREATE BODY, ON THE WIRE.
+    ///
+    /// A create is a contract with the server and this is the only place
+    /// that contract is written down. The keys are the server's names, the
+    /// window is RFC3339, and the two required fields are always there.
+    #[test]
+    fn the_create_body_is_the_servers_own_keys() {
+        let req = NewGame {
+            name: "Operasi Batu Malang".into(),
+            mode: "maneuver".into(),
+            pace: Some(GamePace::Fast),
+            description: "a trial".into(),
+            purpose: String::new(),
+            target: String::new(),
+            area: "Jakarta".into(),
+            map_tag: "jakarta".into(),
+            window: TimeWindow {
+                actual_start: Some("2026-11-01T08:00:00Z".into()),
+                actual_end: Some("2026-11-01T16:00:00Z".into()),
+                assumed_start: Some("2000-01-01T08:00:00Z".into()),
+                assumed_end: Some("2000-01-01T16:00:00Z".into()),
+            },
+        };
+        let body = new_game_body(&req);
+        assert_eq!(body["name"], "Operasi Batu Malang");
+        assert_eq!(body["mode"], "maneuver");
+        assert_eq!(body["pace"], "fast");
+        assert_eq!(body["description"], "a trial");
+        assert_eq!(body["area"], "Jakarta");
+        assert_eq!(body["map_tag"], "jakarta");
+        assert_eq!(body["actual_start"], "2026-11-01T08:00:00Z");
+        assert_eq!(body["actual_end"], "2026-11-01T16:00:00Z");
+        assert_eq!(body["assumed_start"], "2000-01-01T08:00:00Z");
+        assert_eq!(body["assumed_end"], "2000-01-01T16:00:00Z");
+    }
+
+    /// A BLANK OPTIONAL IS OMITTED, never sent empty.
+    ///
+    /// The server reads an empty string as "clear this field", and a create
+    /// that cleared fields nobody had set would be saying something false.
+    #[test]
+    fn a_blank_optional_is_omitted_rather_than_sent_empty() {
+        let req = NewGame {
+            name: "Bare".into(),
+            mode: "maneuver".into(),
+            ..Default::default()
+        };
+        let body = new_game_body(&req);
+        for absent in [
+            "description",
+            "purpose",
+            "target",
+            "area",
+            "map_tag",
+            "pace",
+            "actual_start",
+            "actual_end",
+            "assumed_start",
+            "assumed_end",
+        ] {
+            assert!(
+                body.get(absent).is_none(),
+                "{absent} was sent as {:?}",
+                body.get(absent)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod window_authoring_tests {
     use super::{
         GamePace, GameUpdate, MinosMaster, TimeWindow, actual_to_rfc3339,
@@ -5243,10 +5466,10 @@ mod window_authoring_tests {
     /// is the whole guarantee, which is why these two are asserted together.
     #[test]
     fn the_assumed_clock_uses_one_base_date_on_both_ends() {
-        let start = assumed_hhmm_to_rfc3339("0600").expect("0600 is a military time");
-        let end = assumed_hhmm_to_rfc3339("1630").expect("1630 is a military time");
-        assert_eq!(start, "2000-01-01T06:00:00Z");
-        assert_eq!(end, "2000-01-01T16:30:00Z");
+        let start = assumed_hhmm_to_rfc3339("0600", "+00:00").expect("0600 is a military time");
+        let end = assumed_hhmm_to_rfc3339("1630", "+00:00").expect("1630 is a military time");
+        assert_eq!(start, "2000-01-01T06:00:00+00:00");
+        assert_eq!(end, "2000-01-01T16:30:00+00:00");
         assert_eq!(
             start[..10],
             end[..10],
@@ -5265,11 +5488,78 @@ mod window_authoring_tests {
     fn the_assumed_clock_reuses_the_scenarios_military_time_rule() {
         for bad in ["", "900", "2400", "10:00", "1060"] {
             assert_eq!(
-                assumed_hhmm_to_rfc3339(bad),
+                assumed_hhmm_to_rfc3339(bad, "+00:00"),
                 None,
                 "{bad:?} is not a military time"
             );
         }
+    }
+
+    /// THE FRAME IS CARRIED, not assumed.
+    ///
+    /// The server renders every instant in its own zone, so a window the
+    /// console reads back carries that zone's offset; writing it in any other
+    /// frame writes a DIFFERENT instant. The round trip below is the whole
+    /// point: read the server's own string, write it back in the frame it
+    /// stated, and the instant is the instant.
+    #[test]
+    fn the_window_round_trips_in_the_frame_the_server_stated() {
+        let server = "2026-11-01T15:00:00+07:00";
+        let offset = super::clock_offset(server).expect("the server states a zone");
+        assert_eq!(offset, "+07:00");
+        // The digits the console reads are the server's digits.
+        let (date, hhmm) = crate::window::read_clock(server).expect("a clock the console can read");
+        assert_eq!((date.as_str(), hhmm.as_str()), ("2026-11-01", "1500"));
+        // And writing them back in that frame is the SAME instant.
+        let written = super::actual_to_rfc3339(&date, &hhmm, &offset).expect("a stamp");
+        assert_eq!(written, server);
+        assert!(
+            super::same_instant(&written, server),
+            "the round trip is the identity"
+        );
+    }
+
+    /// TWO SPELLINGS OF ONE INSTANT ARE ONE INSTANT.
+    ///
+    /// The server says `+07:00` and the console says `Z` for the same
+    /// moment. Comparing the STRINGS would call that a change, and the
+    /// write that followed would move the exercise by the difference.
+    #[test]
+    fn two_spellings_of_one_instant_are_one_instant() {
+        assert!(super::same_instant(
+            "2026-11-01T15:00:00+07:00",
+            "2026-11-01T08:00:00Z"
+        ));
+        assert!(super::same_instant(
+            "2026-11-01T08:00:00Z",
+            "2026-11-01T08:00:00Z"
+        ));
+        assert!(!super::same_instant(
+            "2026-11-01T15:00:00+07:00",
+            "2026-11-01T09:00:00Z"
+        ));
+        // A stamp the console cannot read falls back to the string compare:
+        // it has no better opinion, and refusing to compare is not one.
+        assert!(super::same_instant("not a stamp", "not a stamp"));
+        assert!(!super::same_instant("not a stamp", "also not a stamp"));
+    }
+
+    /// THE CLIENT'S OWN ZONE IS A FACT THE CONSOLE HAS.
+    ///
+    /// The question is never whether the machine's zone can be read — it can,
+    /// and `chrono::Local` is already how the calendar decides what day
+    /// "today" is. The question is which frame an instant is written in, and
+    /// this pins the default: the client's own zone, until the server
+    /// states one.
+    #[test]
+    fn the_client_knows_its_own_zone() {
+        let offset = super::local_offset();
+        assert!(
+            offset.len() == 6 && (offset.starts_with('+') || offset.starts_with('-')),
+            "{offset} is not an RFC3339 offset"
+        );
+        // And it is a well-formed one, so it can be written with.
+        assert!(super::actual_to_rfc3339("2026-11-01", "0800", &offset).is_some());
     }
 
     /// The real window is a date and two times, and BOTH halves are checked:
@@ -5278,8 +5568,8 @@ mod window_authoring_tests {
     #[test]
     fn the_real_window_refuses_a_bad_date_or_a_bad_time() {
         assert_eq!(
-            actual_to_rfc3339("2026-11-01", "0800").as_deref(),
-            Some("2026-11-01T08:00:00Z")
+            actual_to_rfc3339("2026-11-01", "0800", "+00:00").as_deref(),
+            Some("2026-11-01T08:00:00+00:00")
         );
         for bad_date in [
             "",
@@ -5292,20 +5582,20 @@ mod window_authoring_tests {
             "2026-11-31",
         ] {
             assert_eq!(
-                actual_to_rfc3339(bad_date, "0800"),
+                actual_to_rfc3339(bad_date, "0800", "+00:00"),
                 None,
                 "{bad_date:?} is not a calendar date"
             );
         }
         // And the leap rule is real in both directions, because a check that
         // only ever says no is indistinguishable from no check.
-        assert!(actual_to_rfc3339("2024-02-29", "0800").is_some());
-        assert!(actual_to_rfc3339("2000-02-29", "0800").is_some());
-        assert!(actual_to_rfc3339("2100-02-29", "0800").is_none());
+        assert!(actual_to_rfc3339("2024-02-29", "0800", "+00:00").is_some());
+        assert!(actual_to_rfc3339("2000-02-29", "0800", "+00:00").is_some());
+        assert!(actual_to_rfc3339("2100-02-29", "0800", "+00:00").is_none());
 
         for bad_time in ["", "800", "2400", "08:00"] {
             assert_eq!(
-                actual_to_rfc3339("2026-11-01", bad_time),
+                actual_to_rfc3339("2026-11-01", bad_time, "+00:00"),
                 None,
                 "{bad_time:?} is not a military time"
             );
