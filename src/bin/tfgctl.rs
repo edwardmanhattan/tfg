@@ -63,6 +63,10 @@ observation (what the phone and the command center see):
   panel                                   which observer windows are open
   panel crew|scenario|comms on|off        open or close one on the wall
 
+  settings                                the console's text size
+  settings font STEP|NAME                 set it: 1-4, or Small/Normal/Large/
+                                          Largest
+
   --view NAME                             which view camera/focus commands are
                                           about; `main` (default) or `observer`
 
@@ -202,6 +206,10 @@ fn run() -> Result<(), String> {
         [command, action, rest @ ..] if command == "display" => {
             let token = require_token(token)?;
             display(&server, &token, action, rest, timeout, json_out)
+        }
+        [command, rest @ ..] if command == "settings" => {
+            let token = require_token(token)?;
+            settings(&client, &server, &token, rest, json_out)
         }
         [command, rest @ ..] if command == "panel" => {
             let token = require_token(token)?;
@@ -374,6 +382,65 @@ fn command_body(view: Option<&str>, kind: &str, payload: Value) -> Value {
         body["view"] = json!(view);
     }
     body
+}
+
+/// `settings`: the console's text size. One setting, and the only one the
+/// console remembers across launches.
+fn settings(
+    client: &Client,
+    server: &str,
+    token: &str,
+    rest: &[String],
+    json_out: bool,
+) -> Result<(), String> {
+    if rest.is_empty() {
+        let response = client
+            .get(format!("{server}/v1/settings"))
+            .bearer_auth(token)
+            .send()
+            .map_err(|error| format!("request failed: {error}"))?;
+        let value = read_json(response)?;
+        if json_out {
+            println!("{value}");
+            return Ok(());
+        }
+        let names = value["names"].as_array().cloned().unwrap_or_default();
+        let step = value["step"].as_u64().unwrap_or(0) as usize;
+        let name = names
+            .get(step)
+            .and_then(|name| name.as_str())
+            .unwrap_or("?");
+        println!(
+            "font size: {name} (step {}, {:.2}x)",
+            step + 1,
+            value["text_scale"].as_f64().unwrap_or(1.0)
+        );
+        return Ok(());
+    }
+    match rest {
+        [what, value] if what == "font" => {
+            // The ladder is 1-based for a human: `settings font 2` is Normal.
+            let step = match value.to_ascii_lowercase().as_str() {
+                "small" | "1" => 0u32,
+                "normal" | "2" => 1,
+                "large" | "3" => 2,
+                "largest" | "4" => 3,
+                other => {
+                    return Err(format!(
+                        "font size must be 1-4 or Small/Normal/Large/Largest, not {other:?}"
+                    ));
+                }
+            };
+            post(
+                client,
+                server,
+                token,
+                command_body(Some("main"), "settings.font", json!({ "step": step })),
+                json_out,
+            )
+        }
+        _ => Err("settings takes `font STEP|NAME`, or nothing to read".to_string()),
+    }
 }
 
 /// `panel`: the observer's windows. With no arguments, list them; with

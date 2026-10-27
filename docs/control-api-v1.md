@@ -485,6 +485,28 @@ about (the latter rides `camera.focus`).
 - It is carried to every wall in `session.changed` (and in the snapshot), which
   is why it is one event with the session rather than a camera move.
 
+### `settings.font`
+
+The console's text size, as a step of its four-step ladder. Host-wide: it is not
+addressed to a view and needs no readiness.
+
+```json
+{ "type": "settings.font", "payload": { "step": 1 } }
+```
+
+- `step` is `0..=3` (`Small`, `Normal`, `Large`, `Largest`); anything else is
+  `422`.
+- The console applies it and remembers it in `settings.json`; a headless host
+  records it so a client can read what the wall would use.
+- It needs `control_view`.
+
+```json
+GET /v1/settings
+{ "step": 1, "text_scale": 1.15,
+  "steps": [1.0, 1.15, 1.3, 1.45],
+  "names": ["Small", "Normal", "Large", "Largest"] }
+```
+
 ### `view.report`
 
 A display says how big its viewport is, in device pixels.
@@ -772,6 +794,8 @@ cargo run --bin tfgctl -- … focus 3 [--zoom 12]
 cargo run --bin tfgctl -- … display list
 cargo run --bin tfgctl -- … display attach --id wall-1 --label wall-1 --width 1920 --height 1080
 cargo run --bin tfgctl -- … panel crew on      # also scenario, comms; `panel` lists
+cargo run --bin tfgctl -- … settings           # the console's text size
+cargo run --bin tfgctl -- … settings font 3    # 1-4, or Small/Normal/Large/Largest
 ```
 
 `session watch` polls `GET /v1/session` once a second and prints one line per

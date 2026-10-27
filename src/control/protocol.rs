@@ -496,6 +496,13 @@ pub enum Command {
     /// retry is idempotent and two toggles cannot fight over "open".
     #[serde(rename = "ui.set")]
     UiSet { panel: String, open: bool },
+    /// The console's text size, as a step of its four-step ladder.
+    ///
+    /// A preference, not a camera: it is host-wide, it needs no readiness,
+    /// and the console applies and remembers it. A headless host records it
+    /// so a client can read what the wall would use.
+    #[serde(rename = "settings.font")]
+    SettingsFont { step: u32 },
     /// The viewport the display is rendering at, in device pixels.
     ///
     /// This is a *display's* fact rather than a view's: it is sent by a client
@@ -564,6 +571,14 @@ impl Command {
                     && (!zoom.is_finite() || !(-30.0..=30.0).contains(zoom))
                 {
                     return Err("focus zoom must be finite and between -30 and 30".to_string());
+                }
+            }
+            Self::SettingsFont { step } => {
+                if *step as usize >= crate::view::TEXT_SCALES.len() {
+                    return Err(format!(
+                        "font step {step} is not one of {}",
+                        crate::view::TEXT_SCALES.len()
+                    ));
                 }
             }
             Self::UiSet { panel, .. } => {
@@ -1142,6 +1157,7 @@ mod tests {
                 panel: "crew".to_string(),
                 open: true,
             },
+            Command::SettingsFont { step: 2 },
         ];
         let schema = schema();
         let documented: Vec<&str> = schema["$defs"]["command"]["oneOf"]

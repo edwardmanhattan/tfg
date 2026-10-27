@@ -746,6 +746,12 @@ fn main() {
                             return;
                         }
                     }
+                    tfg::shell_gpui::ToBinary::TextScale(step) => {
+                        // The console's text size, for `GET /v1/settings`.
+                        // The shell applied and saved it; the control plane
+                        // only needs to record it.
+                        control_hub2.set_text_scale_step(step as usize);
+                    }
                     tfg::shell_gpui::ToBinary::Camera {
                         center,
                         zoom,
@@ -4181,6 +4187,14 @@ fn fetch_session(
                     id: st.id,
                     content: st.content,
                     window: st.start_hour.zip(st.end_hour),
+                    substeps: st
+                        .substeps
+                        .into_iter()
+                        .map(|sub| tfg::shell_gpui::BookSubstep {
+                            id: sub.id,
+                            content: sub.content,
+                        })
+                        .collect(),
                 })
                 .collect(),
         })

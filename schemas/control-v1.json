@@ -92,8 +92,31 @@
         },
         {
           "$ref": "#/$defs/command_ui_set"
+        },
+        {
+          "$ref": "#/$defs/command_settings_font"
         }
       ]
+    },
+    "command_settings_font": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "payload"],
+      "description": "The console's text size, as a step of its four-step ladder. Host-wide: it is not addressed to a view and needs no readiness.",
+      "properties": {
+        "protocol_version": {"$ref": "#/$defs/protocol_version"},
+        "client_id": {"type": "string"},
+        "command_id": {"type": "string"},
+        "type": {"const": "settings.font"},
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 0, "maximum": 3}
+          }
+        }
+      }
     },
     "command_ui_set": {
       "type": "object",

@@ -218,6 +218,7 @@ fn describe(command: &Command) -> String {
         Command::UiSet { panel, open } => {
             format!("ui.set {panel} {}", if *open { "open" } else { "close" })
         }
+        Command::SettingsFont { step } => format!("settings.font step {step}"),
     }
 }
 

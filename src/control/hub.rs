@@ -83,6 +83,8 @@ struct Shared {
     readiness: Readiness,
     /// The observer's windows and popup, as the phone set them.
     ui: ObserverUi,
+    /// The console's text size, as a step of its four-step ladder.
+    text_scale_step: usize,
     /// Hull pictures the console published, PNG-encoded, keyed by unit id.
     ///
     /// Not part of the revision: a picture is fetched by a client that wants
@@ -158,6 +160,7 @@ impl ControlHub {
                 displays: BTreeMap::new(),
                 readiness: Readiness::waiting(ReadinessReason::NoSession),
                 ui: ObserverUi::default(),
+                text_scale_step: crate::view::TEXT_SCALE_DEFAULT,
                 pictures: HashMap::new(),
                 revision: 0,
                 seen: VecDeque::new(),
@@ -199,6 +202,16 @@ impl ControlHub {
     /// readiness verdict says nobody is refreshing them.
     pub fn session(&self) -> Option<SessionState> {
         self.lock().session.as_ref().map(|record| record.state.clone())
+    }
+
+    /// The console's text size, as a step of its ladder.
+    pub fn text_scale_step(&self) -> usize {
+        self.lock().text_scale_step
+    }
+
+    /// Record the text size a client asked for (or the console reported).
+    pub fn set_text_scale_step(&self, step: usize) {
+        self.lock().text_scale_step = step.min(crate::view::TEXT_SCALES.len() - 1);
     }
 
     /// The observer's windows and popup.
@@ -419,6 +432,8 @@ impl ControlHub {
                 ..current
             }),
             Command::UiSet { .. } => unreachable!("handled above"),
+            // Host-wide, recorded by the server on the way in; not a view.
+            Command::SettingsFont { .. } => return Ok(None),
         };
         let Some(camera) = next else {
             return Ok(None);

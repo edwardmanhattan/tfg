@@ -357,6 +357,21 @@ async fn handle(
                 &serde_json::json!({ "id": view_id, "camera": camera }),
             ))
         }
+        (&Method::GET, "/v1/settings") => {
+            if let Err(response) = require(&grant, Scope::Observe) {
+                return Ok(response);
+            }
+            let step = state.hub.text_scale_step();
+            Ok(json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "step": step,
+                    "text_scale": crate::view::text_scale_at(step),
+                    "steps": crate::view::TEXT_SCALES,
+                    "names": crate::view::TEXT_SCALE_NAMES,
+                }),
+            ))
+        }
         (&Method::GET, "/v1/session") => {
             if let Err(response) = require(&grant, Scope::Observe) {
                 return Ok(response);
@@ -562,6 +577,9 @@ fn needed_scope(command: &Command) -> Scope {
         // Opening a window on the wall is the same authority a nudge needs:
         // it is observer UI, and a watch-only device does not steer it.
         Command::UiSet { .. } => Scope::ControlView,
+        // The console's own text size: a preference the operator sets from
+        // the same credential that steers it.
+        Command::SettingsFont { .. } => Scope::ControlView,
     }
 }
 
@@ -811,6 +829,13 @@ async fn submit_command(
             .hub
             .command_rejected(&command_id, error_code::FORBIDDEN, &message);
         return error_response(StatusCode::FORBIDDEN, error_code::FORBIDDEN, &message);
+    }
+
+    // THE CONSOLE'S TEXT SIZE IS HOST-WIDE, not a view. Record it here so a
+    // headless host can answer `GET /v1/settings`, then let it reach the
+    // desktop like any other command.
+    if let Command::SettingsFont { step } = &parsed.command {
+        state.hub.set_text_scale_step(*step as usize);
     }
 
     if view != MAIN_VIEW {
@@ -1573,6 +1598,36 @@ mod tests {
         let (revision, views) = last.expect("a snapshot arrived");
         assert_eq!(revision, 1);
         assert_eq!(views["main"].camera.zoom, 12.0);
+    }
+
+    /// One setting, host-wide, readable before a console has ever spoken.
+    #[test]
+    fn the_text_size_is_read_and_set() {
+        let host = FakeHost::start();
+        let read = host.get("/v1/settings");
+        assert_eq!(read.status(), 200);
+        let read: serde_json::Value = read.json().expect("json");
+        assert_eq!(read["step"], crate::view::TEXT_SCALE_DEFAULT);
+        assert_eq!(read["names"][1], "Normal");
+
+        let set = host.post(serde_json::json!({
+            "protocol_version": 2,
+            "client_id": "tfgctl",
+            "type": "settings.font",
+            "payload": { "step": 3 }
+        }));
+        assert_eq!(set.status(), 202);
+        let read: serde_json::Value = host.get("/v1/settings").json().expect("json");
+        assert_eq!(read["step"], 3);
+        assert_eq!(read["text_scale"], crate::view::TEXT_SCALES[3]);
+
+        // A step off the ladder is refused at the boundary.
+        let bad = host.post(serde_json::json!({
+            "protocol_version": 2,
+            "type": "settings.font",
+            "payload": { "step": 4 }
+        }));
+        assert_eq!(bad.status(), 422);
     }
 
     /// The phone opens a window: the observer UI is server state, so every

@@ -2026,7 +2026,7 @@ const CARET_BLINK_MS: u128 = 530;
 /// card's bottom edge — the silent-clip defect, in a surface with no
 /// scrollbar to reach the rest of the line. A card's height is its content's
 /// height: the fix is the box, not the content.
-const SETTINGS_H: f32 = 380.0;
+const SETTINGS_H: f32 = 224.0;
 /// The authoring card: taller than any readout panel, because the composer
 /// form is six fields plus a mode row and the book grows with its steps
 /// (the console's own creator is 560x620). Shrinking either form onto the
@@ -2557,7 +2557,7 @@ fn modal_silhouette_at(_w: f32, _h: f32) -> impl IntoElement {
             fill.line_to(point(x0, y1));
             fill.close();
             if let Ok(path) = fill.build() {
-                window.paint_path(path, rgba(CONSOLE_NIGHT));
+                window.paint_path(path, rgba(DEEP_WELL));
             }
             let mut edge = PathBuilder::stroke(px(view::PANEL_EDGE));
             edge.move_to(point(x0, y0));
@@ -2566,7 +2566,7 @@ fn modal_silhouette_at(_w: f32, _h: f32) -> impl IntoElement {
             edge.line_to(point(x0, y1));
             edge.close();
             if let Ok(path) = edge.build() {
-                window.paint_path(path, rgba(CUT_GREY));
+                window.paint_path(path, rgba(kit::EDGE_INK));
             }
         },
     )
@@ -4085,7 +4085,10 @@ impl IslandDemo {
             comms_latest_ink: None,
             msg_draft: MsgDraftForm::default(),
             msg_audience_target: AudienceTarget::default(),
-            crew_modal_open: false,
+            // `TFG_CREW_MODAL=1` opens the execution Crew window for a
+            // headless capture, the same seed-the-state precedent as
+            // `TFG_BOARD`.
+            crew_modal_open: std::env::var("TFG_CREW_MODAL").as_deref() == Ok("1"),
             // `TFG_UNIT` names the unit the details panel opens on, and
             // opens it. The same precedent as `TFG_SEL`: pin the state,
             // never the gesture — the compositor makes a synthetic click
@@ -4743,16 +4746,11 @@ impl IslandDemo {
     /// instrument. The close button clears the chamfer, because nothing
     /// clickable may sit on the diagonal.
     fn settings_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let small = |t: &'static str| {
-            div()
-                .font_family(view::FACE_HUMAN)
-                .text_size(px(view::pt(view::DENSE_PT)))
-                .text_color(rgba(BODY_SILVER))
-                .child(t)
-        };
-        let rule = || div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE));
-        let touch = |id: &'static str, el: AnyElement| div().id(id).cursor_pointer().child(el);
-
+        // ONE SETTING. The card used to carry the view (watch only), the side
+        // zone's dock and width, and reduced motion — four controls for a
+        // console whose only remembered preference is how large its type is.
+        // The rest are decisions about the window a person can make once, and
+        // the type is the one an operator sets from across the room.
         let mut col = div()
             .flex()
             .flex_col()
@@ -4766,21 +4764,27 @@ impl IslandDemo {
                 .items_center()
                 .justify_between()
                 .h(px(view::title_h()))
-                .child(panel_title("Settings", MAP_INK))
+                .child(kit::mono_caps(
+                    "SETTINGS",
+                    view::TITLE_PT,
+                    kit::VALUE_INK,
+                ))
                 .child(
                     div()
                         .id("close-settings")
                         .cursor_pointer()
-                        .text_size(px(view::pt(view::BODY_PT)))
-                        .text_color(rgba(BUTTON_LABEL))
                         .on_click(cx.listener(|view, _, _, cx| {
                             view.modal_open = false;
                             cx.notify();
                         }))
-                        .child("\u{00d7}"),
+                        .child(kit::mono_caps(
+                            "CLOSE",
+                            view::LABEL_PT,
+                            kit::MUTED_INK,
+                        )),
                 ),
         );
-        col = col.child(rule());
+        col = col.child(kit::edge_rule());
         // TEXT: the console's own size, in the operator's hands.
         //
         // FOUR NAMED STEPS rather than a number, because the operator is
@@ -4788,108 +4792,13 @@ impl IslandDemo {
         // point size — and a stepper that said "115%" would be asking them
         // to do arithmetic they cannot check. The chosen one is lit, so the
         // answer is visible without reading the row again.
-        col = col.child(small("TEXT"));
+        col = col.child(kit::mono_caps("TEXT SIZE", view::LABEL_PT, kit::MUTED_INK));
         col = col.child(self.text_size_row(cx));
-        col = col.child(
-            div()
-                .text_size(px(view::pt(view::LABEL_PT)))
-                .text_color(rgba(BODY_SILVER.with_alpha(204)))
-                .child(
-                    "Every size on the console moves together \u{2014} titles, labels, readouts \
-                     and the column that holds them.",
-                ),
-        );
-        col = col.child(rule());
-        // View: ONE toggle, not a mode switch — the console's own note.
-        col = col.child(small("VIEW"));
-        col = col.child(touch(
-            "set-watch",
-            checkbox(self.watching, true, "Watch only").into_any_element(),
+        col = col.child(kit::remark(
+            "Every size on the console moves together \u{2014} titles, labels, readouts \
+             and the column that holds them. Remembered across launches.",
+            kit::MUTED_INK,
         ));
-        col = col.child(
-            div()
-                .text_size(px(view::pt(view::LABEL_PT)))
-                .text_color(rgba(BODY_SILVER.with_alpha(204)))
-                .child(if self.watching {
-                    "watching \u{2014} the map follows the session and nothing here moves it."
-                } else {
-                    "running \u{2014} this machine directs the exercise."
-                }),
-        );
-        col = col.child(rule());
-        // Layout: the side zone, its dock, and its width (live in `zone_w`).
-        col = col.child(small("LAYOUT"));
-        col = col.child(touch(
-            "set-sidezone",
-            checkbox(self.show_side_zone, true, "Side zone").into_any_element(),
-        ));
-        if self.show_side_zone {
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(small("Docked"))
-                    .child(touch(
-                        "dock-left",
-                        radio(self.side_dock_left, "left").into_any_element(),
-                    ))
-                    .child(touch(
-                        "dock-right",
-                        radio(!self.side_dock_left, "right").into_any_element(),
-                    )),
-            );
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(small("Width"))
-                    .child(stepper(
-                        cx,
-                        "width-down",
-                        format!("{:.0}", self.zone_w),
-                        "width-up",
-                        false,
-                        |view, cx| {
-                            view.zone_w = (view.zone_w - 20.0).max(view::ZONE_MIN_W);
-                            cx.notify();
-                        },
-                        |view, cx| {
-                            view.zone_w = (view.zone_w + 20.0).min(view::ZONE_MAX_W);
-                            cx.notify();
-                        },
-                    ))
-                    .child(
-                        div()
-                            .id("width-reset")
-                            .cursor_pointer()
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.zone_w = view::zone_w();
-                                cx.notify();
-                            }))
-                            .child(button("reset", true, false, false)),
-                    ),
-            );
-        }
-        col = col.child(rule());
-        col = col.child(small("MOTION"));
-        col = col.child(touch(
-            "set-motion",
-            checkbox(self.reduced_motion, false, "Reduce motion").into_any_element(),
-        ));
-        col = col.child(rule());
-        col = col.child(
-            div()
-                .text_size(px(view::pt(view::LABEL_PT)))
-                .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                .child(
-                    "The geographic grid needs the map-grid slice \u{2014} not wired yet. The \
-                     text size is remembered across launches; the rest of this panel is not.",
-                ),
-        );
         col.into_any_element()
     }
 
@@ -4903,12 +4812,34 @@ impl IslandDemo {
         let mut row = div().flex().flex_row().items_center().gap(px(6.0));
         for (i, name) in view::TEXT_SCALE_NAMES.iter().enumerate() {
             let label = name.to_string();
+            // The flow's choice: a square outlined cell, the chosen one lit.
             row = row.child(
                 div()
                     .id(("text-size", i))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .flex_shrink_0()
                     .cursor_pointer()
+                    .rounded(px(kit::RADIUS))
+                    .border(px(kit::EDGE_WIDTH))
+                    .border_color(rgba(if chosen == i {
+                        kit::LIVE_INK
+                    } else {
+                        kit::EDGE_INK
+                    }))
                     .on_click(cx.listener(move |view, _, _, cx| view.set_text_size(i, cx)))
-                    .child(button(label, true, false, chosen == i)),
+                    .child(kit::mono_caps(
+                        label,
+                        view::MACHINE_PT,
+                        if chosen == i {
+                            kit::VALUE_INK
+                        } else {
+                            kit::MUTED_INK
+                        },
+                    )),
             );
         }
         row.into_any_element()
@@ -5010,6 +4941,13 @@ impl IslandDemo {
                 // The observer's windows belong to the wall, whose client
                 // applies them from the session event. The console has its own
                 // chrome and is not remoted.
+            }
+            crate::control::Command::SettingsFont { step } => {
+                // The operator's text size, from the same ladder the settings
+                // card draws. It applies and persists like the card's click;
+                // the binary hears the step so `/v1/settings` stays current.
+                self.set_text_size(step as usize, cx);
+                let _ = self.order_tx.send(ToBinary::TextScale(step));
             }
         }
         self.map_control = None;
@@ -9696,24 +9634,22 @@ impl IslandDemo {
                         .flex_row()
                         .items_center()
                         .gap(px(10.0))
-                        .child(panel_title("Crew", MAP_INK))
-                        .child(tracked(
-                            &plural(self.session.seats, "seat"),
+                        .child(kit::mono_caps("CREW", view::TITLE_PT, kit::VALUE_INK))
+                        .child(kit::mono_caps(
+                            plural(self.session.seats, "seat"),
                             view::LABEL_PT,
-                            CUT_GREY,
+                            kit::MUTED_INK,
                         )),
                 )
                 .child(
                     div()
                         .id("close-crew")
                         .cursor_pointer()
-                        .text_size(px(view::pt(view::BODY_PT)))
-                        .text_color(rgba(BUTTON_LABEL))
                         .on_click(cx.listener(|view, _, _, cx| {
                             view.crew_modal_open = false;
                             cx.notify();
                         }))
-                        .child("\u{00d7}"),
+                        .child(kit::mono_caps("CLOSE", view::LABEL_PT, kit::MUTED_INK)),
                 ),
         );
         col = col.child(separator());
@@ -9754,7 +9690,7 @@ impl IslandDemo {
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
-                    .child(tracked(&role, view::LABEL_PT, CUT_GREY))
+                    .child(kit::mono_caps(&role, view::MACHINE_PT, kit::MUTED_INK))
                     .child(div().flex_1().h(px(1.0)).bg(rgba(HAIRLINE_SLATE)))
                     .child(machine(plural(people.len(), "person"), BODY_SILVER)),
             );
@@ -9778,7 +9714,11 @@ impl IslandDemo {
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
-                    .child(tracked("unassigned hulls", view::LABEL_PT, WARNING_SAND))
+                    .child(kit::mono_caps(
+                        "unassigned hulls",
+                        view::MACHINE_PT,
+                        WARNING_SAND,
+                    ))
                     .child(div().flex_1().h(px(1.0)).bg(rgba(HAIRLINE_SLATE)))
                     .child(machine(plural(unassigned.len(), "hull"), BODY_SILVER)),
             );
@@ -9804,11 +9744,11 @@ impl IslandDemo {
             .flex()
             .flex_col()
             .gap(px(4.0))
-            .p(px(7.0))
-            .rounded(px(6.0))
-            .bg(rgba(PANEL_SLATE.with_alpha(150)))
-            .border(px(1.0))
-            .border_color(rgba(HAIRLINE_SLATE))
+            .p(px(8.0))
+            .rounded(px(kit::RADIUS))
+            .bg(rgba(DEEP_WELL.with_alpha(kit::PANEL_ALPHA)))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(kit::EDGE_INK))
             .child(
                 div()
                     .flex()
@@ -9834,7 +9774,7 @@ impl IslandDemo {
                                 person.call_sign.clone()
                             }),
                     )
-                    .child(tracked(mark, view::LABEL_PT, ink)),
+                    .child(kit::mono_caps(mark, view::LABEL_PT, ink)),
             );
         // A judge commands nothing; its row stops at the seat. Everyone else
         // gets the force they hold, even when that force is empty — "no
@@ -9875,12 +9815,15 @@ impl IslandDemo {
     /// One commanded hull in the crew modal: face, name, and the focus door.
     fn crew_hull_row(&mut self, piece: &PieceView, cx: &mut Context<Self>) -> AnyElement {
         let id = piece.id;
+        // THE UNIT'S OWN CARD: its photograph when the register has one and
+        // its NATO symbol when it does not, with the name beside it. The
+        // planning phase's fleet rows draw the same pair.
         let face = Self::thumb_box(
             self.thumbs.get(&id).cloned(),
             self.fleet_symbol(id),
-            42.0,
-            28.0,
-            0.8,
+            56.0,
+            38.0,
+            1.0,
             ObjectFit::Cover,
         );
         let ground = self.piece_ground(id).is_some();
@@ -9909,16 +9852,23 @@ impl IslandDemo {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(7.0))
-            .pl(px(6.0))
+            .gap(px(8.0))
+            .p(px(6.0))
+            .w_full()
+            .rounded(px(kit::RADIUS))
+            .bg(rgba(CONSOLE_NIGHT.with_alpha(170)))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(HAIRLINE_SLATE))
             .child(face)
             .child(
                 div()
                     .flex_1()
-                    .font_family(view::FACE_HUMAN)
-                    .text_size(px(view::pt(view::DENSE_PT)))
-                    .text_color(rgba(MAP_INK))
-                    .child(piece.label.clone()),
+                    .min_w_0()
+                    .child(kit::human(
+                        piece.label.clone(),
+                        view::BODY_PT,
+                        kit::VALUE_INK,
+                    )),
             )
             .child(focus)
             .into_any_element()
@@ -9962,11 +9912,11 @@ impl IslandDemo {
             .pl(px(6.0))
             .child(
                 div()
-                    .w(px(42.0))
-                    .h(px(28.0))
+                    .w(px(56.0))
+                    .h(px(38.0))
                     .flex_shrink_0()
-                    .rounded(px(5.0))
-                    .bg(rgba(PANEL_SLATE))
+                    .rounded(px(kit::RADIUS))
+                    .bg(rgba(DEEP_WELL))
                     .child(
                         canvas(
                             |b, _, _| b,
@@ -14967,6 +14917,7 @@ impl IslandDemo {
                 div()
                     .flex_1()
                     .min_w_0()
+                    .overflow_hidden()
                     .child(kit::mono_caps(label, view::MACHINE_PT, kit::MUTED_INK)),
             );
         if let Some(status) = status {
@@ -16167,7 +16118,7 @@ impl IslandDemo {
                     .border_color(rgba(if hot { ALERT_YELLOW } else { HAIRLINE_SLATE }))
                     .bg(rgba(BUTTON_GRAPHITE))
                     .child(div().w(px(13.0)).h(px(17.0)).child(pin_glyph(4.5, ink)))
-                    .child(tracked("pin", view::LABEL_PT, ink)),
+                    .child(kit::mono_caps("pin", view::LABEL_PT, ink)),
             )
     }
 
@@ -17143,7 +17094,7 @@ impl IslandDemo {
         col = col.child(self.comms_pickers(cx));
         // The message field, with the label above it: the same form order
         // every other field on this console uses.
-        col = col.child(tracked("message", view::LABEL_PT, CUT_GREY));
+        col = col.child(kit::mono_caps("message", view::LABEL_PT, CUT_GREY));
         col = col.child(self.compose_field(12, cx));
         col = col.child(
             div()
@@ -17313,7 +17264,7 @@ impl IslandDemo {
             .items_center()
             .gap(px(5.0))
             .flex_wrap();
-        row = row.child(tracked("kind", view::LABEL_PT, CUT_GREY));
+        row = row.child(kit::mono_caps("kind", view::LABEL_PT, CUT_GREY));
         for (i, kind) in kinds.iter().enumerate() {
             let kind = *kind;
             let on = picked == kind;
@@ -17347,7 +17298,7 @@ impl IslandDemo {
             .items_center()
             .gap(px(5.0))
             .flex_wrap();
-        row = row.child(tracked("mark", view::LABEL_PT, CUT_GREY));
+        row = row.child(kit::mono_caps("mark", view::LABEL_PT, CUT_GREY));
         for (i, mark) in marks.iter().enumerate() {
             let mark = *mark;
             let on = picked == mark;
@@ -17376,7 +17327,7 @@ impl IslandDemo {
             .items_center()
             .gap(px(5.0))
             .flex_wrap();
-        row = row.child(tracked("degree", view::LABEL_PT, CUT_GREY));
+        row = row.child(kit::mono_caps("degree", view::LABEL_PT, CUT_GREY));
         if degrees.is_empty() {
             row = row.child(
                 div()
@@ -17427,7 +17378,7 @@ impl IslandDemo {
             .items_center()
             .gap(px(5.0))
             .flex_wrap();
-        row = row.child(tracked("audience", view::LABEL_PT, CUT_GREY));
+        row = row.child(kit::mono_caps("audience", view::LABEL_PT, CUT_GREY));
         // The target: where the next pick lands.
         for (i, target) in [AudienceTarget::To, AudienceTarget::Cc].iter().enumerate() {
             let t = *target;
@@ -17517,7 +17468,7 @@ impl IslandDemo {
             .gap(px(5.0))
             .flex_wrap();
         let picked_role = self.msg_draft.assumed_role;
-        row = row.child(tracked("as", view::LABEL_PT, CUT_GREY));
+        row = row.child(kit::mono_caps("as", view::LABEL_PT, CUT_GREY));
         for (i, role) in self.session.msg_roles.clone().iter().enumerate() {
             let rid = role.id;
             let name = role.name.clone();
@@ -17534,7 +17485,7 @@ impl IslandDemo {
             );
         }
         let picked_node = self.msg_draft.hierarchy_node;
-        row = row.child(tracked("from", view::LABEL_PT, CUT_GREY));
+        row = row.child(kit::mono_caps("from", view::LABEL_PT, CUT_GREY));
         for (i, group) in self.session.groups.clone().iter().enumerate() {
             let gid = group.group_id;
             let name = group.name.clone();
@@ -17899,6 +17850,7 @@ impl IslandDemo {
                         .map(|r| r.names.clone())
                         .unwrap_or_default(),
                     verbs: Vec::new(),
+                    substeps: st.substeps.clone(),
                 });
             }
         }
@@ -18219,18 +18171,19 @@ impl IslandDemo {
                         .flex_row()
                         .items_center()
                         .gap(px(10.0))
-                        .child(panel_title("Scenario", MAP_INK))
-                        .child(tracked(
+                        .child(kit::mono_caps(
+                            "SCENARIO",
+                            view::TITLE_PT,
+                            kit::VALUE_INK,
+                        ))
+                        .child(kit::mono_caps(
                             match board.audience {
                                 ScenarioAudience::Master => "game master",
                                 ScenarioAudience::Observer => "observer",
                                 ScenarioAudience::Commander => "commander",
                             },
                             view::LABEL_PT,
-                            match board.audience {
-                                ScenarioAudience::Master => CUT_GREY,
-                                _ => CUT_GREY,
-                            },
+                            kit::MUTED_INK,
                         )),
                 )
                 .child(right)
@@ -18245,7 +18198,7 @@ impl IslandDemo {
                     view.board_open = false;
                     cx.notify();
                 }))
-                .child("\u{00d7}")
+                .child(kit::mono_caps("CLOSE", view::LABEL_PT, kit::MUTED_INK))
                 .into_any_element(),
         ));
         col = col.child(separator());
@@ -18266,7 +18219,7 @@ impl IslandDemo {
                     },
                     BODY_SILVER,
                 )))
-                .child(tracked("assumed", view::LABEL_PT, CUT_GREY))
+                .child(kit::mono_caps("assumed", view::LABEL_PT, CUT_GREY))
                 .child(machine(
                     board
                         .assumed
@@ -18338,7 +18291,7 @@ impl IslandDemo {
                         .flex_row()
                         .items_center()
                         .justify_between()
-                        .child(tracked("steps", view::LABEL_PT, CUT_GREY))
+                        .child(kit::mono_caps("steps", view::LABEL_PT, CUT_GREY))
                         .child(machine(plural(board.total as usize, "step"), BODY_SILVER)),
                 );
             let mut list = div()
@@ -18511,7 +18464,7 @@ impl IslandDemo {
                 .border_b(px(view::PANEL_EDGE))
                 .border_color(rgba(HAIRLINE_SLATE))
                 .child(panel_title("Scenario", MAP_INK))
-                .child(tracked(
+                .child(kit::mono_caps(
                     match board.audience {
                         ScenarioAudience::Master => "game master",
                         ScenarioAudience::Observer => "observer",
@@ -18528,7 +18481,7 @@ impl IslandDemo {
                     },
                     BODY_SILVER,
                 ))
-                .child(tracked("assumed", view::LABEL_PT, CUT_GREY))
+                .child(kit::mono_caps("assumed", view::LABEL_PT, CUT_GREY))
                 // The TIME, not the stamp. The full stamp is the server's
                 // `2026-10-20T20:00:00+07:00` read out in a header that also
                 // has to hold the game, the count and the way out — and at
@@ -18568,13 +18521,11 @@ impl IslandDemo {
                         .flex_shrink_0()
                         .id("close-board")
                         .cursor_pointer()
-                        .text_size(px(view::pt(view::BODY_PT)))
-                        .text_color(rgba(BUTTON_LABEL))
                         .on_click(cx.listener(|view, _, _, cx| {
                             view.board_open = false;
                             cx.notify();
                         }))
-                        .child("\u{00d7}"),
+                        .child(kit::mono_caps("CLOSE", view::LABEL_PT, kit::MUTED_INK)),
                 ),
         );
 
@@ -18609,7 +18560,7 @@ impl IslandDemo {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .child(tracked(
+                    .child(kit::mono_caps(
                         "the book \u{2014} the steps, in order",
                         view::LABEL_PT,
                         CUT_GREY,
@@ -18707,7 +18658,7 @@ impl IslandDemo {
             // No step in play: the bar says so, rather than leaving a track
             // that would read as "nothing has run" on a step that is not
             // running at all.
-            bar = bar.child(tracked("no step in play", view::LABEL_PT, CUT_GREY));
+            bar = bar.child(kit::mono_caps("no step in play", view::LABEL_PT, CUT_GREY));
         }
         bar.into_any_element()
     }
@@ -18734,7 +18685,7 @@ impl IslandDemo {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .child(tracked(
+                    .child(kit::mono_caps(
                         "the units \u{2014} the tree they sit in, and who has declared",
                         view::LABEL_PT,
                         CUT_GREY,
@@ -18915,7 +18866,7 @@ impl IslandDemo {
                 .child(
                     div()
                         .flex_shrink_0()
-                        .child(tracked(&node.name, view::LABEL_PT, MAP_INK)),
+                        .child(kit::mono_caps(&node.name, view::LABEL_PT, MAP_INK)),
                 )
                 .child(
                     div()
@@ -18948,7 +18899,22 @@ impl IslandDemo {
             // rule it was reading. The name still gives way first (it is the
             // only long field), so a narrow column truncates it rather than
             // dropping the chip.
+            // THE UNIT'S FACE, when the row is a hull: its photograph, or
+            // its NATO symbol when the register has no picture. The tree is
+            // the scenario window's roster, and a roster of names is a list.
+            let face = match node.id {
+                Some(id) => Self::thumb_box(
+                    self.thumbs.get(&id).cloned(),
+                    self.fleet_symbol(id),
+                    40.0,
+                    26.0,
+                    0.8,
+                    ObjectFit::Cover,
+                ),
+                None => div().into_any_element(),
+            };
             row = row
+                .child(face)
                 .child(
                     div()
                         .min_w_0()
@@ -19045,14 +19011,18 @@ impl IslandDemo {
             .flex_col()
             .gap(px(5.0))
             .p(px(8.0))
-            .rounded(px(6.0))
+            .rounded(px(kit::RADIUS))
             .bg(rgba(if active {
-                PANEL_SLATE
+                PANEL_SLATE.with_alpha(kit::BAND_ALPHA)
             } else {
-                PANEL_SLATE.with_alpha(150)
+                DEEP_WELL.with_alpha(kit::PANEL_ALPHA)
             }))
-            .border(px(if selected { 2.0 } else { 1.0 }))
-            .border_color(rgba(border));
+            .border(px(if selected {
+                2.0
+            } else {
+                kit::EDGE_WIDTH
+            }))
+            .border_color(rgba(if selected { kit::LIVE_INK } else { border }));
         // Selected wins the border, so the ACTIVE row keeps a mark of its own
         // even while it is the one being read: a thin cyan edge inside the
         // sand frame. Without it, opening the board would show the step in
@@ -19085,7 +19055,7 @@ impl IslandDemo {
                         .text_color(rgba(BODY_SILVER))
                         .child(format!("{:>2}", row.number)),
                 )
-                .child(div().w(px(78.0)).flex_shrink_0().child(tracked(
+                .child(div().w(px(78.0)).flex_shrink_0().child(kit::mono_caps(
                     status.label(),
                     view::LABEL_PT,
                     ink,
@@ -19127,6 +19097,42 @@ impl IslandDemo {
                     row.content.clone()
                 }),
         );
+        // THE STEP'S COMMANDS, under it, in the planning stage's own shape:
+        // a numbered row in an edged block. A step with none draws nothing —
+        // an empty rail under every step would be a column of apologies.
+        if !row.substeps.is_empty() {
+            let mut subs = div().flex().flex_col().gap(px(3.0)).pl(px(30.0));
+            for (at, sub) in row.substeps.iter().enumerate() {
+                subs = subs.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .w_full()
+                        .p(px(5.0))
+                        .border(px(kit::EDGE_WIDTH))
+                        .border_color(rgba(HAIRLINE_SLATE))
+                        .child(kit::machine(
+                            format!("{:02}", at + 1),
+                            view::LABEL_PT,
+                            kit::MUTED_INK,
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(kit::mono_caps(
+                                    sub.content.clone(),
+                                    view::MACHINE_PT,
+                                    kit::VALUE_INK,
+                                )),
+                        ),
+                );
+            }
+            card = card.child(subs);
+        }
         // The readiness gate, on the step the exercise stands on and nowhere
         // else: it is the one number the board holds that changes while it is
         // open. `required` zero is a step that asks nobody.
@@ -19137,7 +19143,7 @@ impl IslandDemo {
                 .items_baseline()
                 .gap(px(4.0))
                 .child(figure(&format!("{}", gate.ready), false, MAP_INK))
-                .child(tracked(
+                .child(kit::mono_caps(
                     &format!("of {} ready", gate.required),
                     view::LABEL_PT,
                     if gate.may_start {
@@ -19482,7 +19488,7 @@ impl IslandDemo {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .child(tracked("selected step", view::LABEL_PT, CUT_GREY))
+                    .child(kit::mono_caps("selected step", view::LABEL_PT, CUT_GREY))
                     .child(
                         div().max_w(px(220.0)).truncate().child(machine(
                             row.map(|r| format!("#{} \u{00b7} {}", r.number, r.scenario))
@@ -19516,7 +19522,7 @@ impl IslandDemo {
                         .flex_row()
                         .items_center()
                         .justify_between()
-                        .child(tracked("step instruction", view::LABEL_PT, CUT_GREY))
+                        .child(kit::mono_caps("step instruction", view::LABEL_PT, CUT_GREY))
                         .child(
                             div()
                                 .font_family(view::FACE_MACHINE)
@@ -19558,7 +19564,7 @@ impl IslandDemo {
                 .flex_row()
                 .items_center()
                 .justify_between()
-                .child(tracked("related hulls", view::LABEL_PT, CUT_GREY))
+                .child(kit::mono_caps("related hulls", view::LABEL_PT, CUT_GREY))
                 .child(machine(
                     units
                         .as_ref()
@@ -19723,10 +19729,10 @@ impl IslandDemo {
             .items_center()
             .gap(px(8.0))
             .p(px(6.0))
-            .rounded(px(6.0))
-            .bg(rgba(PANEL_SLATE.with_alpha(140)))
-            .border(px(1.0))
-            .border_color(rgba(HAIRLINE_SLATE))
+            .rounded(px(kit::RADIUS))
+            .bg(rgba(DEEP_WELL.with_alpha(kit::PANEL_ALPHA)))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(kit::EDGE_INK))
             .child(face)
             .child(
                 div()
@@ -19748,7 +19754,11 @@ impl IslandDemo {
                             .flex_row()
                             .items_baseline()
                             .gap(px(5.0))
-                            .child(tracked("cmdr", view::LABEL_PT, CUT_GREY))
+                            .child(kit::mono_caps(
+                                "CMDR",
+                                view::LABEL_PT,
+                                kit::MUTED_INK,
+                            ))
                             .child(
                                 div()
                                     .font_family(view::FACE_HUMAN)
@@ -35177,6 +35187,17 @@ pub struct BookStep {
     pub id: i64,
     pub content: String,
     pub window: Option<(String, String)>,
+    /// The commands inside the step, in the server's order. The nested read
+    /// carries the instruction; the audience is a separate route per command
+    /// and the board does not pay for it.
+    pub substeps: Vec<BookSubstep>,
+}
+
+/// One command inside a step.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BookSubstep {
+    pub id: i64,
+    pub content: String,
 }
 
 /// One helm order, from the panel to the wire. The shell's only write.
@@ -35424,6 +35445,9 @@ const MESSAGES_PUBLISHED: usize = 40;
 /// itself, it asks, and the binary is the only thing that knows how.
 #[derive(Clone, Debug)]
 pub enum ToBinary {
+    /// The console's text size, reported so the control plane can read it
+    /// (`GET /v1/settings`) and so a headless host records the choice.
+    TextScale(u32),
     /// A helm order for the commanded hull.
     Helm(HelmOrder),
     /// The camera, as the operator has it.
@@ -37093,6 +37117,10 @@ pub struct BoardStep {
     /// The hulls the step obliges, by the server's resolved names.
     pub units: Vec<String>,
     pub verbs: Vec<StepVerb>,
+    /// The step's commands. The planning stage draws them as an indented
+    /// list under the step; the board reads the same list for the exercise
+    /// that is running.
+    pub substeps: Vec<BookSubstep>,
 }
 
 /// One hull the selected step relates, as section 2 draws it: the face and
@@ -38817,6 +38845,11 @@ pub fn run(
                 // reads it: "four helicopters" is a rule about KINDS, and the
                 // store is what says what kind a hull is.
                 demo.unit_taxonomy = unit_taxonomy;
+                // The text size the settings file asked for, reported to the
+                // binary so `/v1/settings` answers with it before any command.
+                let _ = demo
+                    .order_tx
+                    .send(ToBinary::TextScale(view::text_scale_step() as u32));
                 // THE LAUNCHER'S HISTORY. The constructor cannot see it (it
                 // takes the held session, not the list), and the landing is
                 // seeded the moment the first sign-in answer lands. A launch
@@ -42033,6 +42066,7 @@ mod tests {
                 id: 1,
                 content: "Hold the river".to_string(),
                 window: Some(("1000".to_string(), "1030".to_string())),
+                substeps: Vec::new(),
             }],
         }];
         IslandDemo::new(fixture_roster(), 8, 0, session, tx)
@@ -42114,11 +42148,13 @@ mod tests {
                 id: 1,
                 content: "Cross".to_string(),
                 window: Some(("1000".to_string(), "1030".to_string())),
+                substeps: Vec::new(),
             },
             BookStep {
                 id: 2,
                 content: "Hold".to_string(),
                 window: Some(("1100".to_string(), "1130".to_string())),
+                substeps: Vec::new(),
             },
         ];
         let (start, end) = game_window(&steps);
@@ -42352,6 +42388,7 @@ mod tests {
                 id: 7,
                 content: "Do A then B".to_string(),
                 window: Some(("1000".to_string(), "1030".to_string())),
+                substeps: Vec::new(),
             }],
         }];
         cx.update(|_window, app| view.update(app, |demo, _| demo.apply_book(held)));
@@ -46885,7 +46922,8 @@ mod tests {
                     id: 7,
                     content: "Cross the river".to_string(),
                     window: None,
-                }],
+                substeps: Vec::new(),
+            }],
             }],
             pieces: vec![
                 PieceView {
@@ -48011,12 +48049,14 @@ mod tests {
                             id: 7,
                             content: "Sweep the northern approaches".to_string(),
                             window: Some(("0600".to_string(), "0700".to_string())),
-                        },
+                substeps: Vec::new(),
+            },
                         BookStep {
                             id: 8,
                             content: "Establish the barrier".to_string(),
                             window: Some(("0700".to_string(), "0930".to_string())),
-                        },
+                substeps: Vec::new(),
+            },
                     ],
                 },
                 BookScenario {
@@ -48026,7 +48066,8 @@ mod tests {
                         id: 9,
                         content: "Screen the traffic lanes".to_string(),
                         window: None,
-                    }],
+                substeps: Vec::new(),
+            }],
                 },
             ],
             related: vec![StepRelatedView {
@@ -49725,7 +49766,8 @@ mod tests {
                     id: 16,
                     content: "Take station east of the buoy".to_string(),
                     window: Some(("1000".to_string(), "1100".to_string())),
-                }],
+                substeps: Vec::new(),
+            }],
             }],
             ..SessionView::default()
         };

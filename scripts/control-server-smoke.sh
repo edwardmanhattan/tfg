@@ -238,6 +238,12 @@ done
 sleep 0.4
 "$CLI" --server "$URL" --token "$TOKEN" --json camera get --view observer >"$OUT/observer-after-focus.json" 2>&1
 "$CLI" --server "$URL" --token "$TOKEN" --json camera get >"$OUT/main-after-focus.json" 2>&1
+# The console's one remembered setting: a host-wide preference with a read.
+"$CLI" --server "$URL" --token "$TOKEN" --json settings >"$OUT/settings-before.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" settings font 4 >"$OUT/settings-set.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" --json settings >"$OUT/settings-after.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" settings font 2 >/dev/null 2>&1
+
 # The phone's windows and the hull pictures: both are server state, and both
 # are what the wall draws from. The picture is a real 1x1 PNG so the GET is
 # checked against bytes, not against a content type alone.
@@ -491,6 +497,24 @@ check(
     "steering is refused while the session is stale",
     "not_ready" in stale_text and "stale" in stale_text,
     stale_text.strip()[:120],
+)
+settings_before = json.loads((out_dir / "settings-before.json").read_text())
+check(
+    "the console's text size is readable",
+    "step" in settings_before and settings_before.get("names", [None] * 4)[1] == "Normal",
+    json.dumps(settings_before),
+)
+settings_set = json.loads((out_dir / "settings-set.json").read_text())
+check(
+    "a font step is accepted",
+    settings_set.get("status") == "accepted",
+    json.dumps(settings_set),
+)
+settings_after = json.loads((out_dir / "settings-after.json").read_text())
+check(
+    "the new size is what the host reports",
+    settings_after.get("step") == 3,
+    json.dumps(settings_after),
 )
 panels_closed = json.loads((out_dir / "panels-closed.json").read_text())
 check(
