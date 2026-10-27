@@ -12,22 +12,26 @@
 //!   safe.
 //! - [`server`] is the transport: HTTP JSON for commands and reads, one
 //!   WebSocket for events, on its own thread with its own runtime.
+//! - [`client`] is the other side of that transport: a console that follows a
+//!   host instead of hosting, applying the host's cameras and posting its own.
 //! - [`auth`] is the bearer-token check.
 //! - [`devices`] is pairing: short-lived codes, per-device tokens stored as
 //!   hashes, and the scopes that separate watching from steering.
 //!
 //! The rule the modules exist to keep: **no network thread calls GPUI**. The
-//! server sends [`AcceptedCommand`]s down a `std::sync::mpsc` channel; the
-//! shell drains that on its own tick and moves the camera with the same
-//! methods a mouse gesture uses.
+//! server and the client send [`AcceptedCommand`]s down a `std::sync::mpsc`
+//! channel; the shell drains that on its own tick and moves the camera with the
+//! same methods a mouse gesture uses.
 
 mod auth;
+mod client;
 mod devices;
 mod hub;
 mod protocol;
 mod server;
 
 pub use auth::MIN_TOKEN_LEN;
+pub use client::{ClientConfig, ClientHandle, spawn_client};
 pub use devices::{
     Credentials, DeviceView, Devices, Grant, PAIRING_ATTEMPTS, PAIRING_TTL, PairError, Paired,
     PairingOffer, Scope,

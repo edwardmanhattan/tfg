@@ -36,8 +36,13 @@ cargo run --bin tfg-server -- --listen 127.0.0.1:8787
 | Variable | Meaning |
 | --- | --- |
 | `TFG_CONTROL_LISTEN` | Address to bind. Loopback for a client on this machine; `0.0.0.0:8787` exposes it to the LAN, which is an explicit choice. |
+| `TFG_CONTROL_SERVER` | An `http://host:port` to follow instead of hosting. The console becomes a display for that host (see below). |
 | `TFG_CONTROL_TOKEN` | The operator's bearer token. At least 32 characters, or the server refuses to start. |
 | `TFG_CONTROL_DEVICES` | Where the paired-device table lives. Default `$XDG_DATA_HOME/tfg/control-devices.json`. |
+
+The two directions are exclusive. `TFG_CONTROL_SERVER` wins when both names are
+set, and the console says that it ignored `TFG_CONTROL_LISTEN`: two authorities
+over one camera would each believe they are the writer.
 
 With neither listen nor token set there is no server. With only
 `TFG_CONTROL_LISTEN` set the console says `TFG_CONTROL_TOKEN is missing` and
@@ -566,6 +571,51 @@ One host per devices file. Two processes sharing it each hold their own copy in
 memory and the last writer wins, so a console and a server should not both run
 against the same path at the same time. `--ephemeral` exists partly for that.
 
+## A console in client mode
+
+A console can be the display instead of the host:
+
+```bash
+TFG_CONTROL_SERVER=http://127.0.0.1:8787 \
+TFG_CONTROL_TOKEN="$(openssl rand -hex 32)" \
+cargo run
+```
+
+It opens no listener and reads no device table. On launch it connects to
+`/v1/ws` with the same bearer token, takes the host's snapshot, and moves the
+map to the camera in it. After that, every `camera.changed` the host publishes
+is applied through the shell's own `move_camera`, so following a remote nudge
+and dragging the map are the same code path.
+
+The console posts only its **own** camera:
+
+- A gesture (or a resize) becomes `camera.set` with the camera the shell is
+  already showing, and `view.report` when the viewport changed. A report equal
+  to the camera the host already has is dropped before it becomes a request, so
+  the host's equality coalescing is not asked to absorb a stream of no-ops.
+- A camera the host asked for is never posted back. The shell's report of that
+  move is `followed` rather than `camera` on the client side; it clears the
+  client's pending state and may correct the host's viewport, but it cannot
+  become a command.
+- Reports from a tick that predates the shell applying a remote camera are
+  discarded until the shell catches up. Otherwise a slow tick could post the old
+  camera over the move it just followed.
+- Until the first snapshot of a connection arrives, camera reports are dropped:
+  there is nothing to compare them against and no authority to tell. A snapshot
+  resets the revision; a stale `camera.changed` from before it is ignored.
+
+The client reconnects with backoff (250 ms doubling to 10 s) and resets its
+revision on every connection. A host that is not up yet is not a launch error:
+the console opens on its own camera and joins when the host answers. A malformed
+URL, or an `https://` URL (there is no TLS yet), disables the client with a
+message naming the reason; the console still opens locally, because a remote
+host is a convenience and never a reason for the map not to open.
+
+A paired device can also be a console. Following needs only `observe`;
+reporting the display's viewport and its gestures needs `control_view`, so a
+watch-only device follows the map and is refused with `403` if it tries to
+steer — the correct answer for a wall display nobody can move.
+
 ## What the desktop keeps to itself
 
 The protocol carries state, not widgets. These are never serialized and never
@@ -578,9 +628,6 @@ camera; it does not click a button.
 - **QR image files.** The offer carries a URI and a JSON payload, and
   `tfgctl pair` draws the payload as a terminal QR code for a phone to scan.
   Writing an image file (PNG/SVG) is left to a client.
-- **A console in client mode.** A desktop cannot yet follow a remote host as a
-  display (`TFG_CONTROL_SERVER`). Today a console hosts, or `tfg-server` hosts;
-  neither follows.
 - Session and marker events: `session.changed` and `marker.changed` are
   reserved, not emitted.
 - `GET /v1/commands/{id}` for polling a command's fate. The event stream is the

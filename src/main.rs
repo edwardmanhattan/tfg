@@ -20,6 +20,57 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
+/// Which side of the control plane this launch is on.
+///
+/// The two directions are exclusive. A console either hosts the shared camera
+/// (`TFG_CONTROL_LISTEN`) or follows one (`TFG_CONTROL_SERVER`), never both:
+/// two authorities over one camera would each believe they are the writer.
+enum ControlEndpoint {
+    Follow { server: String, token: String },
+    Host { listen: String, token: String },
+    Off,
+}
+
+/// Read the endpoint from the environment, with the same variables the
+/// headless host uses.
+///
+/// Following wins when both names are present. A stray `TFG_CONTROL_LISTEN`
+/// left in a shell while pointing the console at a server should not open a
+/// second authority; it should say what it ignored.
+fn control_endpoint_from_env() -> ControlEndpoint {
+    let following = std::env::var("TFG_CONTROL_SERVER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(server) = following {
+        if std::env::var("TFG_CONTROL_LISTEN").is_ok_and(|listen| !listen.trim().is_empty()) {
+            eprintln!(
+                "control client: TFG_CONTROL_SERVER wins; TFG_CONTROL_LISTEN is ignored while following a host"
+            );
+        }
+        return match std::env::var("TFG_CONTROL_TOKEN") {
+            Ok(token) if !token.is_empty() => ControlEndpoint::Follow { server, token },
+            _ => {
+                eprintln!("control client disabled: TFG_CONTROL_TOKEN is missing");
+                ControlEndpoint::Off
+            }
+        };
+    }
+    match (
+        std::env::var("TFG_CONTROL_LISTEN"),
+        std::env::var("TFG_CONTROL_TOKEN"),
+    ) {
+        (Ok(listen), Ok(token)) if !listen.trim().is_empty() && !token.is_empty() => {
+            ControlEndpoint::Host { listen, token }
+        }
+        (Ok(_), Err(_)) => {
+            eprintln!("control server disabled: TFG_CONTROL_TOKEN is missing");
+            ControlEndpoint::Off
+        }
+        _ => ControlEndpoint::Off,
+    }
+}
+
 fn main() {
     if std::env::args().any(|arg| arg == "--version") {
         println!("tfg {}", env!("CARGO_PKG_VERSION"));
@@ -407,11 +458,23 @@ fn main() {
         tfg::map_geometry::MAP_H as u32,
     )));
     let (control_tx, control_rx) = mpsc::channel::<tfg::control::AcceptedCommand>();
-    let _control_handle = match (
-        std::env::var("TFG_CONTROL_LISTEN"),
-        std::env::var("TFG_CONTROL_TOKEN"),
-    ) {
-        (Ok(listen), Ok(token)) if !listen.trim().is_empty() && !token.is_empty() => {
+    // Exactly one of these is Some. The host handle owns the listening thread;
+    // the client handle owns the one following thread and is cloned into the
+    // order loop below, because that loop is where the camera is written down.
+    let (control_client, _control_handle) = match control_endpoint_from_env() {
+        ControlEndpoint::Follow { server, token } => {
+            match tfg::control::spawn_client(
+                tfg::control::ClientConfig::new(server, token),
+                control_tx,
+            ) {
+                Ok(handle) => (Some(handle), None),
+                Err(error) => {
+                    eprintln!("control client disabled: {error}");
+                    (None, None)
+                }
+            }
+        }
+        ControlEndpoint::Host { listen, token } => {
             let mut config = tfg::control::ServerConfig::new(listen, token);
             // The same variable means the same thing in `tfg-server`, so a
             // smoke run can point both hosts at a throwaway table instead of
@@ -424,19 +487,20 @@ fn main() {
             match tfg::control::spawn_server(config, control_tx, control_hub.clone()) {
                 Ok(handle) => {
                     eprintln!("control server listening on {}", handle.url());
-                    Some(handle)
+                    (None, Some(handle))
                 }
                 Err(error) => {
                     eprintln!("control server disabled: {error}");
-                    None
+                    (None, None)
                 }
             }
         }
-        (Ok(_), Err(_)) => {
-            eprintln!("control server disabled: TFG_CONTROL_TOKEN is missing");
-            None
+        ControlEndpoint::Off => {
+            // Nobody to send to. Dropping the sender makes the shell's feed a
+            // cheap `None` instead of a channel that can never produce.
+            drop(control_tx);
+            (None, None)
         }
-        _ => None,
     };
     // Hull photographs ride their own channel: the send end is cloned
     // into the order loop (every card sign-in fetches on the new token)
@@ -447,6 +511,7 @@ fn main() {
             (host.clone(), token.clone(), session.game_id, user.clone());
         let camera2 = camera.clone();
         let control_hub2 = control_hub.clone();
+        let control_client2 = control_client.clone();
         let req_tx2 = req_tx.clone();
         // The photo channel's send end rides into the order loop: every
         // card sign-in fetches again on the new token — a launch without
@@ -573,16 +638,33 @@ fn main() {
                             *cam = (center.0, center.1, zoom, size.0, size.1);
                         }
                         // The control plane learns the same camera from the
-                        // one thread that owns it. `control` says which remote
-                        // command asked for this move, so watchers see their
-                        // own command's effect attributed to them; a gesture
-                        // arrives with none and is the desktop's own.
-                        control_hub2.report_camera(
-                            tfg::control::CameraSnapshot::from_tuple((
-                                center.0, center.1, zoom, size.0, size.1,
-                            )),
-                            control.unwrap_or_else(tfg::control::CameraSource::desktop),
-                        );
+                        // one thread that owns it.
+                        //
+                        // Hosting: `control` says which remote command asked
+                        // for this move, so watchers see their own command's
+                        // effect attributed to them; a gesture arrives with
+                        // none and is the desktop's own.
+                        //
+                        // Following: the same report goes to the client, but a
+                        // report the host asked for is a `followed` one. The
+                        // client uses it to clear its pending gate and to keep
+                        // the host's viewport honest, and never posts it as a
+                        // command — the host is where that camera came from.
+                        let snapshot = tfg::control::CameraSnapshot::from_tuple((
+                            center.0, center.1, zoom, size.0, size.1,
+                        ));
+                        match &control_client2 {
+                            Some(client) => match control {
+                                Some(_) => client.followed(snapshot),
+                                None => client.camera(snapshot),
+                            },
+                            None => {
+                                control_hub2.report_camera(
+                                    snapshot,
+                                    control.unwrap_or_else(tfg::control::CameraSource::desktop),
+                                );
+                            }
+                        }
                         if !render {
                             continue;
                         }

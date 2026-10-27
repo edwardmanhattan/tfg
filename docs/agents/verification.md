@@ -193,6 +193,26 @@ a PTY (a Python `pty.openpty()` driver is enough) and pair the device over
 `POST /v1/pair` while it waits. Redirect the same command and assert that no
 glyph appears, so a piped script's output stays parseable.
 
+## 11. A client follows a camera. Read the host's log, then the window's chrome.
+
+A console in client mode (`TFG_CONTROL_SERVER`) has two observables that do not
+depend on reading a map tile:
+
+- On its first snapshot it posts `view.report` under its own
+  `console-<pid>-<n>` client id, and the host's log names it. That proves the
+  launch wiring, the WebSocket, the snapshot, and the shell's measured size all
+  arrived.
+- A remote `camera.set` must change the window. The zoom badge in the top bar is
+  the cheapest numeric witness: two captures across a `tfgctl camera set` went
+  from `11` to `6`, and about 18,700 pixels differed across a 768×838 window.
+
+Do not assert on the host's camera for this. The host is where the camera came
+from, so its value says nothing about whether the display followed. And do not
+expect the console to post the remote camera back: it must not, and that silence
+is part of the contract. The unit tests cover the channel
+(`src/control/client.rs`), the host log covers the connection, and the capture
+covers the shell.
+
 ## The loop, in one paragraph
 
 Write the test. Run it. Make it fail for the right reason. Fix the code.

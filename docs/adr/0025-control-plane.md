@@ -13,9 +13,9 @@ This ADR fixes the seam. It does not build the final topology.
 Accepted. Carries forward ADR-0020 (the console is one GPUI shell) and
 ADR-0017 (local-first drafts, written through at an advance). Stages 0–7 of the
 migration are built: the protocol, the hub, the embedded server, device pairing
-with scopes, the toolkit-free reducer, and the headless `tfg-server`. The console
-in *client* mode — the desktop following a remote host as a display — is
-recorded here as the target and is not built.
+with scopes, the toolkit-free reducer, and the headless `tfg-server`. Stage 7b is
+also built: the console can follow a remote host as a display
+(`TFG_CONTROL_SERVER`) instead of hosting.
 
 ## Context
 
@@ -94,8 +94,8 @@ only things it shares with the desktop are the hub (read) and an
 A command is an intent on the shared state, never an input event and never a
 pixel:
 
-- `camera.set { center, zoom }` — absolute, idempotent. The desktop client
-  sends this after its own gestures, in a later stage.
+- `camera.set { center, zoom }` — absolute, idempotent. A console in client mode
+  sends this after its own gestures, and an equal camera is not sent again.
 - `camera.nudge { dx_fraction, dy_fraction }` — relative, resolved against the
   viewport the desktop last reported. Positive `dx` moves the camera west,
   positive `dy` north: the same sense as dragging the map, so an operator who
@@ -179,6 +179,40 @@ watcher therefore sees its own command's effect named, and a gesture is named
 `desktop`. Without this, two operators sharing a map cannot tell whose nudge
 moved it.
 
+### A console can follow instead of host
+
+`TFG_CONTROL_SERVER` turns the desktop into the display. The console opens no
+listener and reads no device table; it opens one WebSocket, takes a snapshot,
+and applies every published camera through the same `apply_control_command` the
+embedded server uses. The two directions are exclusive, and the client wins when
+both variables are set: two owners of one camera would each believe they are the
+writer.
+
+The outbound path is the interesting half, because a client that echoes what it
+follows is a feedback loop. `src/control/client.rs` keeps three facts — the
+camera the host is believed to have, the camera the shell was last told to show,
+and a *pending* camera the shell has not acknowledged — and uses them to answer
+one question: is this report the operator's, or the host's?
+
+- A report the operator caused becomes `camera.set`, and `view.report` when the
+  viewport changed. A report equal to the host's camera is dropped before it
+  becomes an HTTP request. This matters because the shell reports on every
+  camera message and most of those report the camera it already reported; the
+  host's equality coalescing is the backstop, not the plan.
+- A shell report caused by a remote command is `followed`, not `camera`. It
+  clears pending and keeps the viewport honest, and it is structurally unable
+  to become a command: the host is where that camera came from.
+- While a forwarded camera is pending, reports that do not match it are ticks
+  from before the shell applied it, and are dropped. Without this, a slow tick
+  can post the old camera over the remote move it just followed.
+- Reports before the first snapshot are dropped. There is no revision to
+  compare them against and no authority to tell. A reconnect resets the
+  revision and starts again from a snapshot; a gesture made while disconnected
+  is not replayed, because the host's snapshot is the truth after a gap.
+
+The network thread still never touches GPUI: it sends `AcceptedCommand`s down
+the same channel the embedded server uses.
+
 ## Consequences
 
 - **The embedded server is not the final architecture.** The console still owns
@@ -187,12 +221,12 @@ moved it.
   is stage 8: the protocol and the command ownership are proven before the
   runtime is moved, and a protocol that has never carried a real command is not a
   protocol.
-- **The desktop is not yet a network client.** It hosts, and `tfg-server` hosts;
-  neither follows. A console in client mode would open a WebSocket, feed the
-  shell through a channel, and post its own gestures as `camera.set`, with echo
-  suppressed by the hub's equality coalescing — the seam exists for it, and the
-  local gestures already produce exactly the value that command carries. Not
-  built.
+- **The desktop can host or follow, one at a time.** In client mode the console
+  opens a WebSocket, feeds the shell through the same channel, and posts its own
+  gestures as `camera.set` and `view.report`; the host's cameras come back as
+  `followed` reports that cannot be posted. A gesture made while disconnected is
+  not replayed: the next snapshot is the host's truth. Two authorities over one
+  camera are refused at launch rather than reconciled.
 - **A headless host has state and no picture.** `tfg-server` is a headless owner
   of the camera, not a renderer: no tiles, no marks, no style. A client that
   reads `camera.changed` from it learns that a camera moved, not that anything
@@ -324,3 +358,18 @@ version of the script read the camera *after* `camera.set` while asserting on th
 nudge. Both are the kind of mistake a script that never lies about its inputs
 would not have made, and both were caught by the script failing rather than by
 review.
+
+- **The client** (`client.rs`, 6 tests) is tested against a real embedded server
+  and a fake host drain: the snapshot reaches the shell; a host-side
+  `camera.set` reaches it as a `CameraSet` with the phone's source and command
+  id; a local camera is posted exactly once and its echo is not forwarded; an
+  equal camera is not posted again; a resize is a `view.report`, not a
+  `camera.set`; a stale tick cannot post the old camera over a remote move; and
+  the URL parser refuses `https://`, a path, and a missing scheme. The driven
+  check used the real binary against `tfg-server`: the console reported
+  `view.report 960x1048` from `console-<pid>` (so it synced and knew its
+  viewport), and after `tfgctl camera set --lat -6.9 --lon 110.4 --zoom 6` the
+  window's zoom badge moved from `11` to `6` and the map strip changed, with
+  about 18,700 pixels different across the 768×838 window. The before/after
+  pair was captured with the same Hyprland crop the capture harness uses; it is
+  evidence, not an artifact, and is not committed.
