@@ -3208,7 +3208,11 @@ fn status_chip(status: StepStatus) -> impl IntoElement {
                 .flex_shrink_0()
                 .bg(rgba(status.ink())),
         )
-        .child(tracked(status.label(), view::LABEL_PT, status.ink()))
+        .child(kit::mono_caps(
+            status.label(),
+            view::MACHINE_PT,
+            status.ink(),
+        ))
 }
 
 /// One unit's declaration, as a chip.
@@ -3229,7 +3233,7 @@ fn declared_chip(ready: Option<bool>) -> impl IntoElement {
         .flex_shrink_0()
         .gap(px(5.0))
         .child(div().w(px(8.0)).h(px(8.0)).flex_shrink_0().bg(rgba(ink)))
-        .child(tracked(word, view::LABEL_PT, ink))
+        .child(kit::mono_caps(word, view::MACHINE_PT, ink))
 }
 
 /// A progress track: the window's width, the run's fill, and nothing else.
@@ -5513,7 +5517,11 @@ impl IslandDemo {
         // A rule between groups, 1px in the band's own hairline. Full band
         // height minus its padding, so it reads as a divider and not a border.
         let sep = || div().w(px(1.0)).h(px(18.0)).bg(rgba(HAIRLINE_SLATE));
-        let readout = |text: String| machine(text, BODY_SILVER);
+        // The flow's voices: a label is a tracked machine caps, a value is
+        // the machine face. The console's band used a human semibold at 10
+        // for labels; the planning frames set them in PT Mono at 12, and the
+        // two phases are one product.
+        let readout = |text: String| kit::machine(text, view::MACHINE_PT, kit::MUTED_INK);
         // The link state, as a tracked-caps stamp in its own status ink:
         // the two words the band reads at a glance, and the reason the dot
         // is there at all — colour alone is not a state a room can read.
@@ -5540,7 +5548,7 @@ impl IslandDemo {
                         .rounded(px(4.0))
                         .bg(rgba(link.0)),
                 )
-                .child(tracked(link.1, view::LABEL_PT, link.0)),
+                .child(kit::mono_caps(link.1, view::MACHINE_PT, link.0)),
         );
         // The headcount and the held game only exist in a session, so their
         // separators are gated with them rather than left dangling — the
@@ -5565,14 +5573,16 @@ impl IslandDemo {
             // gets the same tracked-caps stamp the link does — and it is a
             // wire value, so it is drawn in the machine face rather than the
             // human one. `planning` is not a word anyone wrote.
-            left = left.child(tracked(&self.session.state, view::LABEL_PT, MAP_INK));
-            left = left.child(
-                div()
-                    .font_family(view::FACE_HUMAN)
-                    .text_size(px(view::pt(view::BODY_PT)))
-                    .text_color(rgba(CUT_GREY))
-                    .child(self.session.game.clone()),
-            );
+            left = left.child(kit::mono_caps(
+                &self.session.state,
+                view::MACHINE_PT,
+                kit::VALUE_INK,
+            ));
+            left = left.child(kit::human(
+                self.session.game.clone(),
+                view::BODY_PT,
+                kit::MUTED_INK,
+            ));
         }
         // The create door, where the console keeps it: among the session
         // readouts, never in a side island — the islands work the HELD
@@ -5595,7 +5605,7 @@ impl IslandDemo {
                     view.open_only(WhichPanel::Sessions);
                     cx.notify();
                 }))
-                .child(button("+ New session", true, false, false)),
+                .child(kit::verb("+ NEW SESSION", kit::VerbLook::Live)),
         );
         // The map controls, the console's own pair: zoom out, the readout,
         // zoom in. The round trip is the map thread's, not a local transform
@@ -5612,19 +5622,23 @@ impl IslandDemo {
                         .id("zoom-out")
                         .cursor_pointer()
                         .on_click(cx.listener(|view, _, _, cx| view.zoom_by(-1.0, cx)))
-                        .child(button("\u{2212}", true, false, false)),
+                        .child(kit::verb("\u{2212}", kit::VerbLook::Live)),
                 )
                 // The one figure in the band, and the reason it is a figure
                 // and not a machine row: the zoom changes under the
                 // operator's hand, so a proportional digit set would slide
                 // the `+` beside it every step. Tabular figures hold it.
-                .child(figure(&format!("z{:.0}", self.map_zoom), false, MAP_INK))
+                .child(kit::machine(
+                    format!("z{:.0}", self.map_zoom),
+                    view::MACHINE_PT,
+                    kit::VALUE_INK,
+                ))
                 .child(
                     div()
                         .id("zoom-in")
                         .cursor_pointer()
                         .on_click(cx.listener(|view, _, _, cx| view.zoom_by(1.0, cx)))
-                        .child(button("+", true, false, false)),
+                        .child(kit::verb("+", kit::VerbLook::Live)),
                 ),
         );
 
@@ -5676,7 +5690,7 @@ impl IslandDemo {
                         view.open_only(WhichPanel::Settings);
                         cx.notify();
                     }))
-                    .child(button("Settings", true, false, false)),
+                    .child(kit::verb("SETTINGS", kit::VerbLook::Live)),
             )
             .child(sep())
             // THE IDENTITY CHIP, and the way out.
@@ -6108,22 +6122,20 @@ impl IslandDemo {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .h(px(22.0))
+            .h(px(26.0))
             .px(px(8.0))
-            .rounded(px(CONTROL_RADIUS))
-            .border(px(1.0))
+            .rounded(px(kit::RADIUS))
+            .border(px(kit::EDGE_WIDTH))
             .border_color(rgba(if self.identity_open {
-                RADAR_CYAN
+                kit::LIVE_INK
             } else {
-                HAIRLINE_SLATE
+                kit::EDGE_INK
             }))
-            .child(
-                div()
-                    .font_family(view::FACE_HUMAN)
-                    .text_size(px(view::pt(view::BODY_PT)))
-                    .text_color(rgba(MAP_INK))
-                    .child(self.identity_name()),
-            )
+            .child(kit::mono_caps(
+                self.identity_name(),
+                view::MACHINE_PT,
+                kit::VALUE_INK,
+            ))
             .child(icon(
                 "icons/caret.svg",
                 9.0,
@@ -14933,54 +14945,65 @@ impl IslandDemo {
         panel: Option<WhichPanel>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // THE FLOW'S PANEL, in a rail slot. The card keeps its width and
+        // place — the execution layout is the console's — and takes the
+        // planning phase's surface, band and type: a square DEEP_WELL panel
+        // with a cut-grey edge, a tracked machine-caps band, and the value in
+        // the machine face.
+        let mut band = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(6.0))
+            .w_full()
+            .h(px(26.0))
+            .px(px(view::PANEL_PAD))
+            .flex_shrink_0()
+            .bg(rgba(PANEL_SLATE.with_alpha(kit::BAND_ALPHA)))
+            .border_b(px(kit::EDGE_WIDTH))
+            .border_color(rgba(kit::EDGE_INK))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(kit::mono_caps(label, view::MACHINE_PT, kit::MUTED_INK)),
+            );
+        if let Some(status) = status {
+            band = band.child(status_chip(status));
+        }
         let mut card = div()
             .id(id)
             .w_full()
-            .p(px(view::PANEL_PAD))
-            .rounded(px(view::PANEL_RADIUS))
-            .bg(rgba(CONSOLE_NIGHT))
-            .border(px(view::PANEL_EDGE))
-            .border_color(rgba(CUT_GREY))
+            .rounded(px(kit::RADIUS))
+            .bg(rgba(DEEP_WELL.with_alpha(kit::PANEL_ALPHA)))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(kit::EDGE_INK))
+            .overflow_hidden()
             .flex()
             .flex_col()
-            .gap(px(2.0))
-            .child({
-                // The state rides the label's row: it is the widget's
-                // SUBJECT, and a chip under the value reads as a second value
-                // rather than as what the first one is doing.
-                let mut row = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(6.0))
-                    .child(tracked(label, view::LABEL_PT, CUT_GREY));
-                if let Some(status) = status {
-                    row = row.child(status_chip(status));
-                }
-                row
-            })
+            .child(band)
             .child(
                 div()
-                    .font_family(view::FACE_HUMAN)
-                    .text_size(px(view::pt(view::BODY_PT)))
-                    .text_color(rgba(ink))
-                    .child(value),
+                    .px(px(view::PANEL_PAD))
+                    .pt(px(4.0))
+                    .pb(px(2.0))
+                    .child(kit::machine(value, view::BODY_PT, ink)),
             );
         if let Some(fraction) = progress {
-            card = card.child(div().pt(px(3.0)).child(progress_track(
-                relative(1.0),
-                fraction,
-                RADAR_CYAN,
-            )));
+            card = card.child(
+                div()
+                    .px(px(view::PANEL_PAD))
+                    .pt(px(2.0))
+                    .child(progress_track(relative(1.0), fraction, RADAR_CYAN)),
+            );
         }
         if let Some(hint) = hint {
             card = card.child(
                 div()
-                    .font_family(view::FACE_HUMAN)
-                    .text_size(px(view::pt(view::LABEL_PT)))
-                    .text_color(rgba(BODY_SILVER))
-                    .child(hint),
+                    .px(px(view::PANEL_PAD))
+                    .pb(px(6.0))
+                    .child(kit::remark(hint, kit::MUTED_INK)),
             );
         }
         if let Some(panel) = panel {
@@ -15029,9 +15052,11 @@ impl IslandDemo {
             .right(px(0.0))
             .bottom(px(0.0))
             .h(px(dash_h))
-            .bg(rgba(PANEL_SLATE))
-            .border_t(px(view::PANEL_EDGE))
-            .border_color(rgba(CUT_GREY))
+            // The flow's surface: a deep well under a cut-grey edge, the
+            // same panel the planning frames are made of.
+            .bg(rgba(DEEP_WELL.with_alpha(kit::PANEL_ALPHA)))
+            .border_t(px(kit::EDGE_WIDTH))
+            .border_color(rgba(kit::EDGE_INK))
             .flex()
             .flex_row()
             .overflow_hidden()
@@ -15387,7 +15412,11 @@ impl IslandDemo {
                             .items_center()
                             .gap(px(6.0))
                             .child(icon("icons/compass.svg", DASH_ICON, DASH_ICON, CUT_GREY))
-                            .child(tracked("course", DASH_LABEL_PT, CUT_GREY))
+                            .child(kit::mono_caps(
+                                "course",
+                                view::MACHINE_PT,
+                                kit::MUTED_INK,
+                            ))
                             .child(figure(&course, true, MAP_INK)),
                     )
                     .child(
@@ -15399,7 +15428,11 @@ impl IslandDemo {
                             .items_center()
                             .gap(px(6.0))
                             .child(icon("icons/gauge.svg", DASH_ICON, DASH_ICON, CUT_GREY))
-                            .child(tracked("speed", DASH_LABEL_PT, CUT_GREY))
+                            .child(kit::mono_caps(
+                                "speed",
+                                view::MACHINE_PT,
+                                kit::MUTED_INK,
+                            ))
                             // ONE leading figure per panel: the course
                             // keeps the 30pt, the speed drops to the
                             // readout that sits inside a row. Two 30pt
@@ -17071,18 +17104,17 @@ impl IslandDemo {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .px(px(BUTTON_PADDING.0))
-            .py(px(4.0))
-            .rounded(px(CONTROL_RADIUS))
-            .bg(rgba(BUTTON_GRAPHITE))
-            .border(px(1.0))
-            .border_color(rgba(HAIRLINE_SLATE))
-            .child(tracked("comms", view::LABEL_PT, BUTTON_LABEL))
-            .child(machine(count.to_string(), ink))
+            .h(px(26.0))
+            .px(px(8.0))
+            .rounded(px(kit::RADIUS))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(kit::EDGE_INK))
+            .child(kit::mono_caps("comms", view::MACHINE_PT, kit::MUTED_INK))
+            .child(kit::machine(count.to_string(), view::MACHINE_PT, ink))
             .when(unseen > 0, |d| {
-                d.child(tracked(
-                    &format!("{unseen} new"),
-                    view::LABEL_PT,
+                d.child(kit::mono_caps(
+                    format!("{unseen} new"),
+                    view::MACHINE_PT,
                     WARNING_SAND,
                 ))
             })
