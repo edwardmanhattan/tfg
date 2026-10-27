@@ -6,6 +6,8 @@
 //! - [`master`]: master-data reads, session-users rows, hull specs.
 //! - [`feed`]: snapshot REST, publication shapes.
 //! - [`live`]: socket actor, bridge, refusal policy.
+//! - [`press`]: the creation flow's press — `commit::Write` onto Minos, with
+//!   the role map, the staged-id resolution and the node diff it needs.
 //!
 //! The parent keeps the trait, the legacy mock clients, the shared
 //! envelope helper, and the tests. Everything else lives below.
@@ -15,18 +17,40 @@ mod error;
 mod feed;
 mod live;
 mod master;
+mod press;
 mod replay;
 
 pub use error::BackendError;
 
-pub use auth::{AppRole, AuthenticatedUser, MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save, last_user_clear, last_user_load, last_user_save};
+pub use auth::{
+    AppRole, AuthenticatedUser, MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save,
+    last_user_clear, last_user_load, last_user_save,
+};
 pub use feed::{GameMsg, MinosRest, Snapshot};
 pub use live::{LIVE_BACKOFF_BASE_SECS, LIVE_BACKOFF_CAP_SECS, LiveCmd, LiveEvent, LiveWire};
-pub use master::{AssetGroup, BackendUser, CurrentStepAsking, CurrentStepPlaying, CurrentStepScenario, CurrentStepStep, CurrentStepView, EchelonLevel, EmbarkationCandidate, EmbarkationResult, EmbarkedUnit, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos, GamePace, GameRole, GameScenario, GameScenarioStep, GameStepRun, GameOrderEvent, GamePlacement, GamePositionFix, GamePositionUpdate, GameReadinessView, GameRow, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage, JoinResult, Judgement, MinosMaster, NewGame, OrderOutcome, OverCapacity, PositionSet, ServiceBranchCount, StagedOrder, StagedOrderList, StagedOrderScope, TimeWindow, UnitCapacity, UnitCommander, UnitSpeedEntry, UnitSpeeds, actual_to_rfc3339, assumed_hhmm_to_rfc3339, clock_offset, date_ok, hhmm_ok, hhmm_window_ok, local_offset, same_instant, MsgDraft, MsgDegree, MsgRecipient, DeleteOutcome, Participant, PlacementList, PositionList, RelatedPerson, RelatedPost, Review, ScenarioRole, StepReadiness, StepReadinessPerson, StepRelated, StepRewind, TableData, TimelineEvent, TimelinePage, UnitImageEntry};
+pub use master::{
+    AssetGroup, BackendUser, CurrentStepAsking, CurrentStepPlaying, CurrentStepScenario,
+    CurrentStepStep, CurrentStepView, DeleteOutcome, EchelonLevel, EmbarkationCandidate,
+    EmbarkationResult, EmbarkedUnit, GameClock, GameClockSegment, GameDetail, GameFix, GameHullPos,
+    GameOrderEvent, GamePace, GamePlacement, GamePositionFix, GamePositionUpdate,
+    GameReadinessView, GameRole, GameRow, GameScenario, GameScenarioStep, GameScenarioSubstep,
+    GameStepRun, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage,
+    JoinResult, Judgement, MinosMaster, MissionStep, MissionSubstep, MsgDegree, MsgDraft,
+    MsgRecipient, NewGame, OrderOutcome, OverCapacity, Participant, PlacementList, PositionList,
+    PositionSet, RelatedHull, RelatedPerson, RelatedPost, Review, ScenarioMission, ScenarioRole,
+    ServiceBranchCount, StagedOrder, StagedOrderList, StagedOrderScope, StepReadiness,
+    StepReadinessPerson, StepRelated, StepRewind, TableData, TimeWindow, TimelineEvent,
+    TimelinePage, UnitCapacity, UnitCommander, UnitImageEntry, UnitSpeedEntry, UnitSpeeds,
+    actual_to_rfc3339, assumed_hhmm_to_rfc3339, clock_offset, date_ok, hhmm_ok, hhmm_window_ok,
+    local_offset, same_instant,
+};
+pub use press::MasterTransport;
 pub use replay::{FileReplay, now_ts};
 // Shared with live.rs and the tests below; not public API.
 pub(crate) use feed::FeedEvent;
-pub(crate) use feed::{parse_message_event, parse_order_event, parse_positions_event, parse_positions_event_for_game};
+pub(crate) use feed::{
+    parse_message_event, parse_order_event, parse_positions_event, parse_positions_event_for_game,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -183,6 +207,19 @@ impl InviteClient {
     }
 }
 
+/// The reporting handle a refusal carries: `X-Request-ID`.
+///
+/// THE API ASKS TO BE QUOTED THIS when a failure is reported, and a 5xx
+/// carries no envelope to put it in. It is read off the response BEFORE the
+/// body is consumed, because reading the body takes the response with it.
+pub(crate) fn request_id_of(resp: &reqwest::blocking::Response) -> Option<String> {
+    resp.headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Unwrap the Minos envelope `{status_code, message, data}`: non-2xx
 /// becomes a classified [`BackendError`] (401/403 by variant, the rest
 /// with status), success yields `data`. Shared with the submodules.
@@ -190,9 +227,10 @@ pub(crate) fn unwrap_envelope(
     resp: reqwest::blocking::Response,
 ) -> Result<serde_json::Value, BackendError> {
     let status = resp.status();
+    let request_id = request_id_of(&resp);
     let body: serde_json::Value = resp.json()?;
     if !status.is_success() {
-        return Err(BackendError::http_error(status.as_u16(), &body));
+        return Err(BackendError::http_error(status.as_u16(), &body, request_id));
     }
     Ok(body["data"].clone())
 }
@@ -204,9 +242,10 @@ pub(crate) fn unwrap_envelope_page(
     resp: reqwest::blocking::Response,
 ) -> Result<(serde_json::Value, serde_json::Value), BackendError> {
     let status = resp.status();
+    let request_id = request_id_of(&resp);
     let body: serde_json::Value = resp.json()?;
     if !status.is_success() {
-        return Err(BackendError::http_error(status.as_u16(), &body));
+        return Err(BackendError::http_error(status.as_u16(), &body, request_id));
     }
     Ok((body["data"].clone(), body["metadata"].clone()))
 }
@@ -445,8 +484,15 @@ mod tests {
         assert_eq!(pair2.access_token, "AT2");
         assert_eq!(pair2.refresh_token.as_deref(), Some("RT2"));
         let identity = auth.me("AT2").expect("gate open");
-        assert_eq!(identity.id, 7, "probe carries the caller id for readiness matching");
-        assert_eq!(identity.app_roles.len(), 1, "probe carries application roles");
+        assert_eq!(
+            identity.id, 7,
+            "probe carries the caller id for readiness matching"
+        );
+        assert_eq!(
+            identity.app_roles.len(),
+            1,
+            "probe carries application roles"
+        );
         assert!(
             identity.has_app_role(2),
             "capability asks by id, because a role may be renamed"
@@ -550,7 +596,10 @@ mod tests {
         let err = master.transition_game("AT", 3, "execution").unwrap_err();
         let text = err.to_string();
         assert!(text.contains("409"), "status kept: {text}");
-        assert!(text.contains("starting position"), "gate detail surfaces: {text}");
+        assert!(
+            text.contains("starting position"),
+            "gate detail surfaces: {text}"
+        );
         assert!(text.contains("not ready"), "every reason joins: {text}");
         assert!(
             err.detail().is_some_and(|d| d.contains("Rina Wijaya")),
@@ -573,15 +622,30 @@ mod tests {
                     assert_eq!(v["kind"].as_str(), Some("telegram"));
                     assert_eq!(v["classification"].as_str(), Some("TERBUKA"));
                     assert!(v.get("to").is_none(), "no audience sent means broadcast");
-                    (201, r#"{"status_code":201,"message":"Created","data":{"id":11,"id_game":3,"kind":"telegram","classification":{"code":"TERBUKA","label":"Terbuka"},"sender":{"assumed_role":{"id":2,"name":"Panglima"}},"recipients":[],"broadcast":true,"content":"Mulai latihan","callsign":"","created_at":"2026-11-01T02:00:00Z","assumed_at":"2026-11-01T02:00:00Z"}}"#)
+                    (
+                        201,
+                        r#"{"status_code":201,"message":"Created","data":{"id":11,"id_game":3,"kind":"telegram","classification":{"code":"TERBUKA","label":"Terbuka"},"sender":{"assumed_role":{"id":2,"name":"Panglima"}},"recipients":[],"broadcast":true,"content":"Mulai latihan","callsign":"","created_at":"2026-11-01T02:00:00Z","assumed_at":"2026-11-01T02:00:00Z"}}"#,
+                    )
                 } else if method == "GET" && url.contains("/games/3/messages") {
-                    (200, r#"{"status_code":200,"message":"Successfull","data":[{"id":11,"id_game":3,"kind":"telegram","classification":{"code":"TERBUKA","label":"Terbuka"},"sender":{"assumed_role":{"id":2,"name":"Panglima"}},"recipients":[],"broadcast":true,"content":"Mulai latihan","callsign":"","created_at":"2026-11-01T02:00:00Z","assumed_at":"2026-11-01T02:00:00Z"},{"id":12,"id_game":3,"kind":"administrative","classification":{"code":"RAHASIA","label":"Rahasia"},"sender":{"author":{"id":6,"username":"budi","name":"Budi Santoso"}},"recipients":[{"id_user":7,"kind":"to","read_at":null}],"broadcast":false,"content":"Rapat jam 3","callsign":"KRI-381","created_at":"2026-11-01T02:01:00Z","assumed_at":"2026-11-01T02:01:00Z"}]}"#)
+                    (
+                        200,
+                        r#"{"status_code":200,"message":"Successfull","data":[{"id":11,"id_game":3,"kind":"telegram","classification":{"code":"TERBUKA","label":"Terbuka"},"sender":{"assumed_role":{"id":2,"name":"Panglima"}},"recipients":[],"broadcast":true,"content":"Mulai latihan","callsign":"","created_at":"2026-11-01T02:00:00Z","assumed_at":"2026-11-01T02:00:00Z"},{"id":12,"id_game":3,"kind":"administrative","classification":{"code":"RAHASIA","label":"Rahasia"},"sender":{"author":{"id":6,"username":"budi","name":"Budi Santoso"}},"recipients":[{"id_user":7,"kind":"to","read_at":null}],"broadcast":false,"content":"Rapat jam 3","callsign":"KRI-381","created_at":"2026-11-01T02:01:00Z","assumed_at":"2026-11-01T02:01:00Z"}]}"#,
+                    )
                 } else if method == "POST" && url.ends_with("/messages/12/read") {
-                    (200, r#"{"status_code":200,"message":"Successfull","data":{"id":12,"id_game":3,"kind":"administrative","classification":{"code":"RAHASIA","label":"Rahasia"},"sender":{"author":{"id":6,"username":"budi","name":"Budi Santoso"}},"recipients":[{"id_user":7,"kind":"to","read_at":"2026-11-01T02:05:00Z"}],"broadcast":false,"content":"Rapat jam 3","callsign":"KRI-381","created_at":"2026-11-01T02:01:00Z","assumed_at":"2026-11-01T02:01:00Z"}}"#)
+                    (
+                        200,
+                        r#"{"status_code":200,"message":"Successfull","data":{"id":12,"id_game":3,"kind":"administrative","classification":{"code":"RAHASIA","label":"Rahasia"},"sender":{"author":{"id":6,"username":"budi","name":"Budi Santoso"}},"recipients":[{"id_user":7,"kind":"to","read_at":"2026-11-01T02:05:00Z"}],"broadcast":false,"content":"Rapat jam 3","callsign":"KRI-381","created_at":"2026-11-01T02:01:00Z","assumed_at":"2026-11-01T02:01:00Z"}}"#,
+                    )
                 } else if method == "GET" && url.ends_with("/scenario-roles") {
-                    (200, r#"{"status_code":200,"message":"Successfull","data":[{"id":2,"id_game":3,"name":"Panglima","created_at":"2026-11-01T01:00:00Z"}]}"#)
+                    (
+                        200,
+                        r#"{"status_code":200,"message":"Successfull","data":[{"id":2,"id_game":3,"name":"Panglima","created_at":"2026-11-01T01:00:00Z"}]}"#,
+                    )
                 } else {
-                    (404, r#"{"status_code":404,"message":"Not Found","data":null}"#)
+                    (
+                        404,
+                        r#"{"status_code":404,"message":"Not Found","data":null}"#,
+                    )
                 };
                 let resp = if status == 404 {
                     tiny_http::Response::from_string(body).with_status_code(404)
@@ -609,7 +673,13 @@ mod tests {
         let read = master.mark_read("AT", 3, 12).expect("receipt");
         assert!(read.recipients.iter().all(|r| r.read_at.is_some()));
         let roles = master.scenario_roles("AT", 3).expect("roles");
-        assert_eq!(roles, vec![ScenarioRole { id: 2, name: "Panglima".into() }]);
+        assert_eq!(
+            roles,
+            vec![ScenarioRole {
+                id: 2,
+                name: "Panglima".into()
+            }]
+        );
     }
 
     #[test]
@@ -623,10 +693,18 @@ mod tests {
                 rq.as_reader().read_to_string(&mut text).unwrap_or(0);
                 let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                 let body = match v["identifier"].as_str() {
-                    Some("full") => r#"{"status_code":200,"message":"Successfull","data":{"access_token":"AT","token_type":"Bearer","expires_in":3600,"refresh_token":"RT","must_change_password":true}}"#,
-                    Some("notoken") => r#"{"status_code":200,"message":"Successfull","data":{"token_type":"Bearer","expires_in":3600}}"#,
-                    Some("badscheme") => r#"{"status_code":200,"message":"Successfull","data":{"access_token":"AT","token_type":"MAC","expires_in":3600}}"#,
-                    _ => r#"{"status_code":200,"message":"Successfull","data":{"access_token":"AT","token_type":"Bearer"}}"#,
+                    Some("full") => {
+                        r#"{"status_code":200,"message":"Successfull","data":{"access_token":"AT","token_type":"Bearer","expires_in":3600,"refresh_token":"RT","must_change_password":true}}"#
+                    }
+                    Some("notoken") => {
+                        r#"{"status_code":200,"message":"Successfull","data":{"token_type":"Bearer","expires_in":3600}}"#
+                    }
+                    Some("badscheme") => {
+                        r#"{"status_code":200,"message":"Successfull","data":{"access_token":"AT","token_type":"MAC","expires_in":3600}}"#
+                    }
+                    _ => {
+                        r#"{"status_code":200,"message":"Successfull","data":{"access_token":"AT","token_type":"Bearer"}}"#
+                    }
                 };
                 let _ = rq.respond(tiny_http::Response::from_string(body));
             }
@@ -634,10 +712,22 @@ mod tests {
         let auth = MinosAuth::new("http://127.0.0.1:18094/api/v1").expect("client builds");
         let pair = auth.login("full", "s3cret!").expect("full pair parses");
         assert_eq!(pair.token_type, "Bearer");
-        assert!(pair.must_change_password, "courtesy flag routes to change-password");
-        assert!(auth.login("notoken", "x").is_err(), "missing token is a decode error");
-        assert!(auth.login("badscheme", "x").is_err(), "non-Bearer scheme refused");
-        assert!(auth.login("notime", "x").is_err(), "missing lifetime refused, never zero");
+        assert!(
+            pair.must_change_password,
+            "courtesy flag routes to change-password"
+        );
+        assert!(
+            auth.login("notoken", "x").is_err(),
+            "missing token is a decode error"
+        );
+        assert!(
+            auth.login("badscheme", "x").is_err(),
+            "non-Bearer scheme refused"
+        );
+        assert!(
+            auth.login("notime", "x").is_err(),
+            "missing lifetime refused, never zero"
+        );
     }
 
     #[test]
@@ -794,8 +884,7 @@ mod tests {
                 } else if method == "POST" {
                     // The roster write requires `call_sign`: a seat
                     // without one is a 400 from the server.
-                    let v: serde_json::Value =
-                        serde_json::from_str(&text).unwrap_or_default();
+                    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                     assert_eq!(v["id_user"].as_i64(), Some(6));
                     assert_eq!(v["id_game_role"].as_i64(), Some(1));
                     assert_eq!(v["call_sign"].as_str(), Some("BUDI"));
@@ -809,7 +898,9 @@ mod tests {
         let master = MinosMaster::new("http://127.0.0.1:18088/api/v1").expect("client builds");
         // The filters reach the wire: the row only parses when every
         // query param above matched.
-        let users = master.users_list("AT", "bud", Some(9), Some(7)).expect("directory");
+        let users = master
+            .users_list("AT", "bud", Some(9), Some(7))
+            .expect("directory");
         assert_eq!(
             users,
             vec![BackendUser {
@@ -853,7 +944,9 @@ mod tests {
         assert_eq!(pieces[0].commander_id, Some(6), "assign answers with units");
         let pieces = master.remove_unit("AT", 3, 13).expect("remove");
         assert!(pieces.is_empty(), "remove answers with the emptied units");
-        let moved = master.transition_game("AT", 3, "preparation").expect("advance");
+        let moved = master
+            .transition_game("AT", 3, "preparation")
+            .expect("advance");
         assert_eq!(moved.state, "preparation");
         // H1: the held game's stage derives from the detail read, so a
         // transition another client made is visible on select/refresh.
@@ -864,7 +957,10 @@ mod tests {
         // H2: the anchor rides the detail, so mid-exercise selects learn
         // the clock without moving it.
         assert_eq!(detail.time_factor, 2.0);
-        assert!(detail.window.actual_start.is_none(), "preparation has no anchor yet");
+        assert!(
+            detail.window.actual_start.is_none(),
+            "preparation has no anchor yet"
+        );
     }
 
     #[test]
@@ -912,11 +1008,15 @@ mod tests {
             }
         });
         let master = MinosMaster::new("http://127.0.0.1:18097/api/v1").expect("client builds");
-        let run = master.play_step("AT", 3, 11, 31).expect("play answers the run");
+        let run = master
+            .play_step("AT", 3, 11, 31)
+            .expect("play answers the run");
         assert_eq!(run.state, "playing");
         assert_eq!(run.step_id, 31);
         assert!(run.assumed_end.is_none(), "a playing run has no end yet");
-        let gate = master.step_readiness("AT", 3, 11, 31).expect("readiness reads");
+        let gate = master
+            .step_readiness("AT", 3, 11, 31)
+            .expect("readiness reads");
         assert!(!gate.may_start);
         assert_eq!(gate.outstanding, 2);
         assert_eq!(gate.personnel.len(), 2);
@@ -944,7 +1044,11 @@ mod tests {
         let view = master
             .set_step_related("AT", 3, 11, 31, &[("hull".to_string(), 13)])
             .expect("related writes");
-        assert_eq!(view.posts.len(), 2, "the answer is the resolved list, not the echo");
+        assert_eq!(
+            view.posts.len(),
+            2,
+            "the answer is the resolved list, not the echo"
+        );
     }
 
     #[test]
@@ -990,7 +1094,10 @@ mod tests {
         assert!(!view.ready, "two hulls still need a position");
         assert_eq!(view.placements[0].unit_id, 13);
         let view = master.placements_list("AT", 3).expect("list");
-        assert!(view.ready, "server arithmetic decides readiness, never the client");
+        assert!(
+            view.ready,
+            "server arithmetic decides readiness, never the client"
+        );
         assert_eq!(view.unplaced, 0);
         let j = master.set_readiness("AT", 3, true).expect("declare");
         assert_eq!(j.game_id, 3);
@@ -1019,11 +1126,20 @@ mod tests {
                     assert_eq!(v["heading_deg"].as_f64(), Some(45.0));
                     assert_eq!(v["speed_kn"].as_f64(), Some(20.0));
                     assert!(v.get("latitude").is_none(), "orders carry no position");
-                    (201, r#"{"status_code":201,"message":"Created","data":{"id_unit":13,"assumed_time":"2026-11-01T01:00:00Z","latitude":-6.0888,"longitude":106.9111,"heading_deg":45.0,"speed_kn":12.0,"requested_speed_kn":20.0,"clamped":true,"created_at":"2026-11-01T01:00:00Z","created_by":6}}"#)
+                    (
+                        201,
+                        r#"{"status_code":201,"message":"Created","data":{"id_unit":13,"assumed_time":"2026-11-01T01:00:00Z","latitude":-6.0888,"longitude":106.9111,"heading_deg":45.0,"speed_kn":12.0,"requested_speed_kn":20.0,"clamped":true,"created_at":"2026-11-01T01:00:00Z","created_by":6}}"#,
+                    )
                 } else if method == "GET" && url.ends_with("/positions") {
-                    (200, r#"{"status_code":200,"message":"Successfull","data":{"assumed_time":"2026-11-01T01:05:00Z","positions":[{"id_unit":13,"latitude":-6.08,"longitude":106.92,"heading_deg":45.0,"speed_kn":12.0,"clamped":false,"assumed_time":"2026-11-01T01:00:00Z"}]}}"#)
+                    (
+                        200,
+                        r#"{"status_code":200,"message":"Successfull","data":{"assumed_time":"2026-11-01T01:05:00Z","positions":[{"id_unit":13,"latitude":-6.08,"longitude":106.92,"heading_deg":45.0,"speed_kn":12.0,"clamped":false,"assumed_time":"2026-11-01T01:00:00Z"}]}}"#,
+                    )
                 } else {
-                    (404, r#"{"status_code":404,"message":"Not Found","data":null}"#)
+                    (
+                        404,
+                        r#"{"status_code":404,"message":"Not Found","data":null}"#,
+                    )
                 };
                 let resp = if status == 200 || status == 201 {
                     tiny_http::Response::from_string(body).with_status_code(status)
@@ -1034,17 +1150,26 @@ mod tests {
             }
         });
         let master = MinosMaster::new("http://127.0.0.1:18090/api/v1").expect("client builds");
-        let outcome = master.order_unit("AT", 3, 13, 45.0, 20.0, None).expect("order");
+        let outcome = master
+            .order_unit("AT", 3, 13, 45.0, 20.0, None)
+            .expect("order");
         let OrderOutcome::Applied(fix) = outcome else {
             panic!("a 201 order is applied, not held");
         };
         assert_eq!(fix.unit_id, 13);
         assert!(fix.clamped, "20 kn exceeded the hull's published max");
-        assert_eq!(fix.requested_speed, Some(20.0), "ask preserved beside the clamp");
+        assert_eq!(
+            fix.requested_speed,
+            Some(20.0),
+            "ask preserved beside the clamp"
+        );
         assert_eq!(fix.speed, 12.0, "applied speed is the clamped one");
         assert_eq!(fix.assumed_time, "2026-11-01T01:00:00Z");
         let plot = master.positions("AT", 3, None, None).expect("plot");
-        assert_eq!(plot.assumed_time, "2026-11-01T01:05:00Z", "instant echoed back");
+        assert_eq!(
+            plot.assumed_time, "2026-11-01T01:05:00Z",
+            "instant echoed back"
+        );
         assert_eq!(plot.positions.len(), 1);
         assert_eq!(plot.positions[0].heading, 45.0);
     }
@@ -1070,14 +1195,19 @@ mod tests {
             }
         });
         let master = MinosMaster::new("http://127.0.0.1:18099/api/v1").expect("client builds");
-        let outcome = master.order_unit("AT", 58, 81, 90.0, 8.0, None).expect("order");
+        let outcome = master
+            .order_unit("AT", 58, 81, 90.0, 8.0, None)
+            .expect("order");
         let OrderOutcome::Staged(held) = outcome else {
             panic!("a 202 order is held, not applied");
         };
         assert_eq!(held.unit_id, 81);
         assert_eq!(held.heading_deg, 90.0);
         assert_eq!(held.speed_kn, 8.0);
-        assert_eq!(held.requested_speed_kn, None, "an honoured order carries no ask");
+        assert_eq!(
+            held.requested_speed_kn, None,
+            "an honoured order carries no ask"
+        );
         assert!(!held.clamped);
         assert_eq!(held.staged_at, "2026-11-01T01:00:00Z");
         assert_eq!(
@@ -1103,9 +1233,7 @@ mod tests {
                     // A body that does not say it was staged.
                     r#"{"status_code":202,"message":"Successfull","data":{"id_unit":81,"heading_deg":90.0,"speed_kn":8.0,"clamped":false,"staged_at":"2026-11-01T01:00:00Z","released_by":"the next played step that releases this hull"}}"#
                 };
-                let _ = rq.respond(
-                    tiny_http::Response::from_string(body).with_status_code(202),
-                );
+                let _ = rq.respond(tiny_http::Response::from_string(body).with_status_code(202));
             }
         });
         let master = MinosMaster::new("http://127.0.0.1:18100/api/v1").expect("client builds");
@@ -1134,12 +1262,20 @@ mod tests {
                 assert_eq!(rq.method().as_str(), "PUT");
                 assert_eq!(rq.url(), "/api/v1/games/58/units/13/position");
                 let mut text = String::new();
-                rq.as_reader().read_to_string(&mut text).expect("body reads");
+                rq.as_reader()
+                    .read_to_string(&mut text)
+                    .expect("body reads");
                 let v: serde_json::Value = serde_json::from_str(&text).expect("json body");
                 assert_eq!(v["latitude"].as_f64(), Some(-6.0888));
                 assert_eq!(v["longitude"].as_f64(), Some(106.9111));
-                assert!(v.get("heading_deg").is_none(), "a set position states no course");
-                assert!(v.get("assumed_time").is_none(), "the instant is the clock's");
+                assert!(
+                    v.get("heading_deg").is_none(),
+                    "a set position states no course"
+                );
+                assert!(
+                    v.get("assumed_time").is_none(),
+                    "the instant is the clock's"
+                );
                 let _ = rq.respond(tiny_http::Response::from_string(
                     r#"{"status_code":201,"message":"Successfull","data":{"id_unit":13,"assumed_time":"2026-11-01T01:00:00Z","kind":"jump","latitude":-6.0888,"longitude":106.9111,"heading_deg":0,"speed_kn":0,"speed_ms":0,"clamped":false,"created_at":"2026-11-01T01:00:00Z","created_by":6}}"#,
                 )
@@ -1182,7 +1318,11 @@ mod tests {
         assert_eq!(held.unit_id, 81);
         assert_eq!(held.heading_deg, 90.0);
         assert_eq!(held.speed_kn, 8.0);
-        assert_eq!(held.requested_speed_kn, Some(12.0), "the ask rides beside the clamp");
+        assert_eq!(
+            held.requested_speed_kn,
+            Some(12.0),
+            "the ask rides beside the clamp"
+        );
         assert!(held.clamped);
     }
 
@@ -1198,7 +1338,9 @@ mod tests {
                 assert_eq!(rq.method().as_str(), "PATCH");
                 assert_eq!(rq.url(), "/api/v1/games/3/participants/6/call-sign");
                 let mut text = String::new();
-                rq.as_reader().read_to_string(&mut text).expect("body reads");
+                rq.as_reader()
+                    .read_to_string(&mut text)
+                    .expect("body reads");
                 let v: serde_json::Value = serde_json::from_str(&text).expect("json body");
                 assert_eq!(v["call_sign"].as_str(), Some("ALPHA-1"));
                 let _ = rq.respond(tiny_http::Response::from_string(
@@ -1250,15 +1392,24 @@ mod tests {
         let master = MinosMaster::new("http://127.0.0.1:18091/api/v1").expect("client builds");
         let held = master.pause_game("AT", 3).expect("pause");
         assert!(!held.running, "last segment is the zero one");
-        assert!(!held.accepting_actions, "pause closes the exercise to orders");
+        assert!(
+            !held.accepting_actions,
+            "pause closes the exercise to orders"
+        );
         assert_eq!(held.time_factor, 2.0, "chosen rate kept for resume");
-        assert_eq!(held.segments.last().map(|s| s.source.as_str()), Some("pause"));
+        assert_eq!(
+            held.segments.last().map(|s| s.source.as_str()),
+            Some("pause")
+        );
         let live = master.resume_game("AT", 3).expect("resume");
         assert!(live.running && live.accepting_actions);
         assert_eq!(live.time_factor, 2.0, "resume restarts at the chosen rate");
         let fast = master.set_time_factor("AT", 3, 6.0).expect("factor");
         assert_eq!(fast.time_factor, 6.0);
-        assert!(fast.assumed_now.is_some(), "writes echo the instant they built for");
+        assert!(
+            fast.assumed_now.is_some(),
+            "writes echo the instant they built for"
+        );
     }
 
     #[test]

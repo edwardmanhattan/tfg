@@ -22,13 +22,19 @@ pub enum BackendError {
 
     /// 401: no token, or an expired/invalid one. Sign in again.
     #[error("unauthorized: {message}")]
-    Unauthorized { message: String, detail: Option<String> },
+    Unauthorized {
+        message: String,
+        detail: Option<String>,
+    },
 
     /// 403: authenticated but refused. Meaning depends on the call site:
     /// the gate probe reads it as must-change-password / not Active,
     /// the user directory reads it as roster-fallback.
     #[error("forbidden: {message}")]
-    Forbidden { message: String, detail: Option<String> },
+    Forbidden {
+        message: String,
+        detail: Option<String>,
+    },
 
     /// Any other non-2xx, with its status attached. `detail` is the
     /// server's `data.errors` flattened (M1) — e.g. the execution gate
@@ -36,7 +42,16 @@ pub enum BackendError {
     /// message so every status line shows it, and kept structured for
     /// callers that render it apart.
     #[error("HTTP {status}: {message}")]
-    Api { status: u16, message: String, detail: Option<String> },
+    Api {
+        status: u16,
+        message: String,
+        detail: Option<String>,
+        /// The `X-Request-ID` header the API asks to be quoted when a failure
+        /// is reported. A 5xx carries no envelope to put it in, so the only
+        /// place it exists is here — read off the response before the body is
+        /// consumed (`backend::request_id_of`).
+        request_id: Option<String>,
+    },
 
     /// The hull has no published specification version — the API invents
     /// no speed, neither do we. Matched, never substring-searched.
@@ -62,26 +77,48 @@ impl BackendError {
         status: u16,
         message: String,
         detail: Option<String>,
+        request_id: Option<String>,
     ) -> Self {
         let message = match &detail {
             Some(d) if !d.is_empty() => format!("{message} — {d}"),
             _ => message,
         };
         match status {
+            // A 401 and a 403 are answered by the gate and the entitlement
+            // check, not by a failing write; the request id is a 5xx's
+            // reporting handle, so the two variants that never need it do not
+            // carry it.
             401 => Self::Unauthorized { message, detail },
             403 => Self::Forbidden { message, detail },
-            _ => Self::Api { status, message, detail },
+            _ => Self::Api {
+                status,
+                message,
+                detail,
+                request_id,
+            },
         }
     }
 
     /// Build the error for a non-2xx response from its body: top-level
     /// message plus flattened `data.errors` detail.
-    pub(crate) fn http_error(status: u16, body: &serde_json::Value) -> Self {
+    pub(crate) fn http_error(
+        status: u16,
+        body: &serde_json::Value,
+        request_id: Option<String>,
+    ) -> Self {
         let message = body["message"]
             .as_str()
             .unwrap_or("request failed")
             .to_string();
-        Self::status_detailed(status, message, error_detail(body))
+        Self::status_detailed(status, message, error_detail(body), request_id)
+    }
+
+    /// The reporting handle a 5xx carries, when the server sent one.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Api { request_id, .. } => request_id.as_deref(),
+            _ => None,
+        }
     }
 
     /// The structured detail, for callers that render it apart from

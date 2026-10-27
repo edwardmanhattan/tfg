@@ -1931,3 +1931,286 @@ every rung of the ladder.
   — the card's name and the column's name on one edge, and the rows on the
   same edge as the title.
 - The impeccable layout detector over the changed files: **no findings**.
+
+## The planning phase is a GRID (2026-10-22)
+
+The owner's direction: the planning phase is not a column down the side of
+the map. It is **six equal islands hovering over the map**, covering the
+frame but the top band, each a little bit transparent so the water shows
+through, with a margin between each.
+
+### The six, and what is in them
+
+| panel | what it carries |
+|---|---|
+| **ESSENTIALS** | the session's own terms, AS A FORM: the name, the mode (read back — it is fixed at creation), the pace, the plan's prose and the planned window, editable and written by one Apply; then the facts it reads — the room key, the game clock's multiplier — and, in a scenario exercise, THE BOOK: the scenario's title, its steps, and the door to the composer |
+| **EXERCISE** | the mark, the kind of game, the phase, and FINISH PLANNING — and nothing else |
+| **PLAYERS** | who is SEATED, by name and role, and the door to the player picker |
+| **FLEET** | what fights, with its commander and its placement, and the door to the fleet picker |
+| **UNIT** | the selected hull, in full |
+| **GROUPS** | the task organisation |
+
+**THE CARDS ARE CARDS.** Rounded corners (`GRID_CARD_RADIUS`), a 16pt
+margin between them and at the frame's edge (`GRID_GAP`, `GRID_INSET`),
+and a 16pt body inset (`GRID_PAD`). Twelve points of margin over dark
+water read as the six panels touching: the gap was there and the eye
+could not find it.
+
+**FIVE CARRY A TITLE BAND AND THE EXERCISE DOES NOT.** Its first line is
+the wordmark, ARCONS, which is already the name of the surface; a band
+above it saying EXERCISE would be a second heading over the loudest thing
+in the cell.
+
+**ESSENTIALS IS THE WIZARD'S FORM, AFTER THE WIZARD.** The same questions
+the creation wizard asks, asked again of the session that exists: a typo
+made at the door is fixed in the panel that shows it. The name, the pace,
+the three prose fields and the planned window are drafted and written as
+ONE partial edit (`ToBinary::SaveTerms` → `PATCH /games/{id}`), only the
+fields that moved (`crate::terms`), because Minos reads an empty string as
+"clear this" and a form that restated every field would blank what it
+never opened. The MODE is the one field the card does not offer: the
+server fixes it at creation.
+
+**PLAYERS AND FLEET ARE LISTS WITH A DOOR.** The account directory, the
+role pills, the unseat buttons and the register's ADD rows were three
+lists in a cell a third of the window wide. They live in the modals the
+column's own cards open (`WhichPanel::Player`, `WhichPanel::Fleet`), and
+the cards carry what the session HOLDS plus the one verb that opens the
+surface where it is chosen.
+
+**THE CONTROL ISLAND IS GONE.** The multiplier, the hold and the window
+are the exercise clock, and the exercise clock is part of the exercise's
+terms — so they live in the terms panel now, and the planning room does
+not say the exercise's name in one panel and its clock in another.
+
+**THE VERB MOVED TO THE PHASE'S OWN PANEL.** "Finish planning" is not a
+term; it is the end of the phase, and it belongs beside the phase's name.
+
+**THE ROLES BELONG TO THE SEAT.** The room's rows carry every role the
+game publishes, and an account in the picker is seated by a click that
+takes the game's first player-side seat — because a list of accounts with
+the whole vocabulary under every name is a wall of pills, and the pills
+were running off the panel's edge.
+
+### The grid is the kernel's
+
+`view::planning_grid` computes the six cells; the shell draws them. The
+cells are EQUAL (a grid whose cells differ is a grid whose importance is
+decided by size), they sit BELOW the top band (the band is the clock and
+the identity, and it is the same in every phase), and they carry a margin
+(`GRID_GAP`) and an inset (`GRID_INSET`).
+
+**THE COLUMNS FOLLOW THE WINDOW.** Three on a window wide enough to hold
+them, two on one that is not, one on a window too narrow even for that:
+a cell narrower than the console's own 320pt column cannot hold the
+console's own panels, and a grid of cells that cannot hold them is a grid
+of cut-off rows.
+
+**AND A PANEL'S BODY IS THE CELL'S WIDTH, STATED.** A body inside a
+scroll container has no width of its own: it is as wide as its widest
+line, and a long line is as wide as the line is long — so it ran off the
+panel's edge and took the rows beside it with it. A definite width is
+what makes the text WRAP, and a wrapped line is what makes a narrow cell
+readable.
+
+### The cards were crumpled, and the reason was a type
+
+`view::Box` is **corners** `(min_x, min_y, max_x, max_y)`. The renderer drew
+each card from `let (x, y, w, h) = cell`, which type-checks and sets the
+card's WIDTH to its own right coordinate and its HEIGHT to its bottom
+coordinate. Every card therefore ran to the far edge of the window: the six
+overlapped into one dark field, the row-two cards were drawn over the bottom
+of row one, and the "gaps" the geometry had were covered by the neighbours.
+The operator's report was "they look crumpled with each other now", and the
+stray border line crossing the chart was one of those mis-placed edges.
+
+The fix is a NAME for the other shape: `view::Rect` is `(left, top, width,
+height)` — what an element builder takes — and `view::box_rect` is the one
+conversion. `sessions_card_rect` and `sessions_first_row_point` were already
+origin-and-size while typed `Box`; they are `Rect` now, so the two shapes
+cannot be confused at a call site again. `a_grid_cell_converts_to_the_card_
+that_sits_in_it` pins the conversion against the grid the renderer draws.
+
+### A hull in the air clears the grid
+
+A drag out of the fleet picker is a drop on the WATER, and the water is under
+all six cards. With the grid drawn, every point a hull could be aimed at
+belonged to a card, so the operator could only drop on the strip of chart the
+six did not cover.
+
+`IslandDemo::grid_visible` is the one answer — planning AND no drag in
+flight — and both the render and `over_grid_panel`, the map's own gesture
+guard, read it. The cards stand aside for the gesture and come back on
+release, the same rule the picker itself follows.
+`a_hull_in_the_air_clears_the_planning_grid` drives it: a point inside the
+second cell is the card's while planning and the map's while dragging, and
+the cards return when the gesture ends.
+
+### The map is still live under the panels
+
+The grid covers the water, so the map has to know when a gesture belongs
+to a panel instead: a press on a panel is the panel's, or the operator
+would pan the chart with every click on a verb. **ARMED IS THE
+EXCEPTION**: a hull waiting to be placed is placed by clicking the map,
+and the map is under the panels — the operator can see it, and they mean
+it.
+
+The panels carry no shield for the same reason: a shield would stop the
+map's drop target, and a hull could never be placed on the water at all.
+A wheel over a panel is the panel's.
+
+### The phase is one answer
+
+`IslandDemo::phase` is where the phase is read, and the column and the
+grid both ask it. `TFG_PHASE` seeds it ONCE, at the console's
+construction, on the session's own state — so a capture of the planning
+room photographs a planning console and not an executing one with a
+planning layout laid over it.
+
+### Verified
+
+- `cargo test --lib`: **819 pass**, the same two pre-existing failures.
+- New tests: the grid is six equal cells inside the window, the columns
+  follow the window, and the planning column is EMPTY (the grid is the
+  phase); five cards carry a title band and Exercise does not; a card is
+  rounded and stands off its neighbour; the terms draft writes only the
+  changed field, refuses a nameless session, and joins the window into
+  ONE request (`crate::terms`); and the PATCH that request becomes carries
+  only what moved (`backend::master`).
+- Captures in `.impeccable/review/planning-cards-2026-10-22/`:
+  `planning-cards.png` (the six cards at 768pt wide — two columns), and
+  `player-picker-door.png` / `fleet-picker-door.png` (the two doors' modals,
+  open over the grid at 1536pt wide — three columns). The gutters show the
+  map between the cards, the cards end inside the window, and no edge is
+  drawn where a card is not.
+- The column's own tests moved to the phase that has a column: the
+  closure stack is what overflows, and the crew body is what has room.
+- Captures in `.impeccable/review/planning-grid-2026-10-22/`: the grid on
+  a wide window, the grid on a narrow one in a scenario exercise (with
+  THE BOOK and its steps), the grid with a hull selected, and the
+  preparation column unchanged.
+- The impeccable layout detector over the changed files: **no findings**.
+
+## The Scenario window, v3: two states, and steps and units as columns
+
+The v3 wireframe asks for ONE surface in TWO states, and this slice is both.
+While the map is the work, execution carries the compact widget; opening it
+takes the frame. Neither is a card over the chart while the exercise runs.
+
+**The frame.** `board_open && session.execution` is a full-frame branch: an
+absolutely positioned element from the top band's height to the bottom of
+the window, filled `CONSOLE_NIGHT`, with the map, the execution widgets, the
+comms island and the commander's rail behind it. Planning keeps the card it
+had: there the map is what the operator is working ON, and the plan is read
+beside it. The band stays above either way, because it is the console's own
+row and not the surface's.
+
+**Three columns became two.** v2 drew the steps, the step's detail, and an
+action column. The action column's only unique content was one line, so it
+is a BAR now (`scenario_action_bar`) — the line on the left, and the step in
+play's progress on the right — and the width it freed went to the units.
+The third column stays removed; it is not coming back as a rail.
+
+**Seven states, seven words.** `StepStatus` is `Idle`, `Played`, `Current`,
+`UnitReady`, `Playing`, `Halted`, `Done`, and each has its own ink and its
+own lowercase word. The derivation reads the server's own facts rather than
+the console's wishes: the pointer from `current-step`; the gate from each
+step's readiness read; the clock from the assumed stamp; and `done` from the
+step's OWN window end being behind that stamp. `halted` reads this console's
+last clock answer, because the clock has no GET — the write is the read. A
+pause pressed here turns the step to HALTED and the progress track stops
+with it; a pause pressed by somebody else's console is invisible until this
+one presses a verb. That limit is the server's, not the surface's, and it is
+said here rather than papered over.
+
+**The head is the pointer when the server names none.** A game enters
+execution with no `current` and no `asking`, and the window used to read that
+as "between steps": every row IDLE, the action bar saying nothing was owed,
+and the units column empty — over a book whose own box said "0 of 1 ready,
+held by RIZKY HI". The head (the one row the exercise can move from) is now
+the pointer while neither of the server's pointers exists: CURRENT while its
+gate is held, UNIT READY once every unit has declared. And only then — with
+a step in play or a step asking, the head is the NEXT row, and marking it
+current too would put two rows in the present tense.
+
+**The units are the tree they sit in.** The third column was removed and the
+tree took its place. Rows come from the step's related list, expanded through
+the task organisation to each hull's chain of groups, pre-order and
+deterministic (sub-formations first, then hulls, each by id). Connectors are
+drawn from the parent links, not from a depth number: a rule runs down a
+branch that has a sibling after it and elbows into the last child. A group
+row says what it holds and nothing else, because a group owns no task and
+declares nothing. A hull row says name, commander and ONE chip — READY or
+NOT READY — and `NO DECLARATION` when the step does not ask it at all. The
+readiness join is the gate's `personnel` against the unit's commander user
+id, which is a fact the server publishes.
+
+The gate's personnel are also the SECOND source of units, and that is not
+belt-and-braces: this console reads a step's related list for the step the
+server names, and a game that has not started names none — so a window that
+trusted the related list alone drew an empty column over a step two
+commanders had been asked about.
+
+**Progress is the step's own window, filled by the assumed stamp.** Not a
+client countdown, not a heartbeat: the server's stamp against the step's
+`0700–0900`, read-only, with the clock's own readout beside it. It lives in
+the action bar because the bar is the window's one live line, and on the
+step's box it would be a second copy that could disagree.
+
+**Verbs stay on the step.** `PAUSE CLOCK` sits inside the playing step's own
+box, beside `END` and `REPLAY`, and there is no footer — the design removed
+it, and the clock is the step's business. `End Session` does not exist on
+this window at all: closing it is the header's `×`, and ending the exercise
+is not a thing a scenario window offers.
+
+### Verified
+
+- `cargo test --lib shell_gpui`: **238 pass**, 0 fail. New this slice:
+  `a_book_that_has_not_started_stands_on_its_head` (the head is CURRENT, the
+  bar names who it waits on, the gate's commander puts the hull in the tree
+  with NO related list read), `a_head_whose_gate_is_met_reads_unit_ready`,
+  `the_step_states_say_what_each_step_is_doing`,
+  `a_step_in_play_inside_its_window_reads_playing`,
+  `the_gate_decides_between_current_and_unit_ready`,
+  `the_units_tree_hangs_from_the_parent_links`, and
+  `every_status_has_a_word_and_a_colour_of_its_own`.
+- Captures, over the real binary and the hosted dev API, in
+  `.impeccable/review/scenario-window-v3-2026-10-23/`:
+  `widget-current.png` (execution beside the map: the compact widget with
+  its status, `0/1 ready` and the TO DO line), `current.png` (the window at
+  768pt: CURRENT, TO DO — RIZKY HI has not declared, and the tree
+  GUGUS ALPHA → UNSUR BRAVO → KRI Abdul Halim), `unit-ready.png` (the same
+  step with its gate met: UNIT READY, `1/1 ready`, every chip READY, and the
+  bar owing nothing) and `playing.png` (`PLAYING` with the clock's 50% track
+  and `08:00 of 0700–0900`, `END` / `REPLAY` / `PAUSE CLOCK` inside the
+  step's own box).
+- The exercise photographed is a scratch book this slice authored on the
+  hosted deployment — game 81, `TGF-V3-TREE`: one scenario, three steps, two
+  hulls, and the task organisation `Gugus Alpha > Unsur Bravo / Unsur
+  Charlie` — so the capture is of server data, not of a fixture.
+
+### Gaps this slice could not close, and why
+
+- **The per-unit task.** The server publishes no task per unit and no task
+  per group: the readiness read names personnel, the related read names
+  posts, and neither carries an objective. The window says so in a note
+  above the tree rather than inventing one.
+- **A second hull under one formation in a photograph.** The book is frozen
+  once the exercise runs ("may only be written while the exercise is in
+  `planning` or `preparation`"), and a step's related list can name a node,
+  which the tree expands — but the step the window was photographing names
+  one hull, and re-relating it would have meant writing a running book. The
+  expansion is pinned by `the_units_tree_hangs_from_the_parent_links` and by
+  the node case in `a_book_that_has_not_started_stands_on_its_head`; the
+  picture shows a formation, a hull under it, and an empty sibling formation
+  the tree does not draw because it holds none of the step's units.
+- **A step this console never watched.** Minos publishes no runs read, so
+  `end` takes the pointer away and leaves a book that looks untouched. A
+  console that joins after a step has ended reads that step as the HEAD and
+  says UNIT READY — which is true of the row, and the reason it is not
+  called PLAYED is that this client never saw it play (`joined-late.png`).
+  A console that watched it reads PLAYED, and the head moves on.
+- **The faint foliage in some captures** is the desktop at Omarchy's default
+  window opacity (`0.985 0.96`), not a hole in the window: the band, the
+  panels and the fills are opaque in the app, and the same band pixels are
+  identical with the board open and closed.

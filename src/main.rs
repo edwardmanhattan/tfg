@@ -44,14 +44,14 @@ fn main() {
         }
         return;
     }
-    let cache = tfg::map_render::prepare_runtime_cache(&paths.map_cache)
-        .expect("map cache prepared");
+    let cache =
+        tfg::map_render::prepare_runtime_cache(&paths.map_cache).expect("map cache prepared");
 
     // The REAL map thread: the same spawn the egui console uses (U6). It
     // carries raw RGBA; the swizzle to BGRA happens on this side of the
     // handoff, which is the whole point of the seam.
-    let (req_tx, resp_rx, _handle) = tfg::shell_threads::spawn_map_thread(
-        tfg::shell_threads::MapConfig {
+    let (req_tx, resp_rx, _handle) =
+        tfg::shell_threads::spawn_map_thread(tfg::shell_threads::MapConfig {
             center: tfg::map_geometry::MAP_CENTER,
             zoom: tfg::map_geometry::MAP_ZOOM,
             width: tfg::map_geometry::MAP_W as u32,
@@ -59,8 +59,7 @@ fn main() {
             style: tfg::map_geometry::MAP_STYLE.to_string(),
             cache,
             jump_pump: tfg::map_geometry::JUMP_PUMP,
-        },
-    );
+        });
 
     // U8 step 4's first panel: the roster sheet's rows are the real hull
     // register. Credentials from the environment, never from the source —
@@ -74,40 +73,46 @@ fn main() {
     // superuser), then the keyring's stored refresh token (a returning
     // launch skips the card), then the card. `TFG_SIGNED_OUT` wins over
     // all of them — it forces the card for a headless capture.
-    let (roster, roster_total, token, user) = if std::env::var("TFG_SIGNED_OUT").as_deref()
-        == Ok("1")
-    {
-        eprintln!("roster: TFG_SIGNED_OUT, the card is forced");
-        (tfg::shell_gpui::fixture_roster(), 125, String::new(), String::new())
-    } else {
-        match (
-            std::env::var("TFG_API_USER"),
-            std::env::var("TFG_API_PASS"),
-        ) {
-            (Ok(user), Ok(pass)) => match fetch_roster(&host, &user, &pass) {
-                Some((rows, token, _)) => {
-                    let total = rows.len();
-                    eprintln!("roster: {total} hulls from {host}");
-                    (rows, total, token, user)
-                }
-                None => {
-                    eprintln!("roster: fetch failed, falling back to the fixture");
-                    (tfg::shell_gpui::fixture_roster(), 125, String::new(), user)
-                }
-            },
-            _ => match try_keyring_login(&host, &paths.last_user) {
-                Some((rows, token, user)) => {
-                    let total = rows.len();
-                    eprintln!("roster: keyring session for {user} from {host}");
-                    (rows, total, token, user)
-                }
-                None => {
-                    eprintln!("roster: no credentials and no keyring session, the card");
-                    (tfg::shell_gpui::fixture_roster(), 125, String::new(), String::new())
-                }
-            },
-        }
-    };
+    let (roster, roster_total, token, user) =
+        if std::env::var("TFG_SIGNED_OUT").as_deref() == Ok("1") {
+            eprintln!("roster: TFG_SIGNED_OUT, the card is forced");
+            (
+                tfg::shell_gpui::fixture_roster(),
+                125,
+                String::new(),
+                String::new(),
+            )
+        } else {
+            match (std::env::var("TFG_API_USER"), std::env::var("TFG_API_PASS")) {
+                (Ok(user), Ok(pass)) => match fetch_roster(&host, &user, &pass) {
+                    Some((rows, token, _)) => {
+                        let total = rows.len();
+                        eprintln!("roster: {total} hulls from {host}");
+                        (rows, total, token, user)
+                    }
+                    None => {
+                        eprintln!("roster: fetch failed, falling back to the fixture");
+                        (tfg::shell_gpui::fixture_roster(), 125, String::new(), user)
+                    }
+                },
+                _ => match try_keyring_login(&host, &paths.last_user) {
+                    Some((rows, token, user)) => {
+                        let total = rows.len();
+                        eprintln!("roster: keyring session for {user} from {host}");
+                        (rows, total, token, user)
+                    }
+                    None => {
+                        eprintln!("roster: no credentials and no keyring session, the card");
+                        (
+                            tfg::shell_gpui::fixture_roster(),
+                            125,
+                            String::new(),
+                            String::new(),
+                        )
+                    }
+                },
+            }
+        };
 
     // The session's READ path: the newest game and its room. Read-only on
     // purpose — `join_game` needs a room key and `set_readiness` WRITES, and
@@ -248,16 +253,17 @@ fn main() {
     let (wire_ctl_tx, wire_ctl_rx) = mpsc::channel::<tfg::shell_threads::WireKind>();
     let (wire_wake_tx, wire_wake_rx) = mpsc::channel::<()>();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let _poll_handle = tfg::shell_threads::spawn_poll_thread(tfg::shell_threads::PollThreadConfig {
-        wire_ctl_rx,
-        wire_wake_rx,
-        sim_cmd_rx,
-        sim_evt_tx,
-        poll_tx,
-        shutdown: shutdown.clone(),
-        armed: Arc::new(AtomicBool::new(false)),
-        initial_log: paths.initial_log.clone(),
-    });
+    let _poll_handle =
+        tfg::shell_threads::spawn_poll_thread(tfg::shell_threads::PollThreadConfig {
+            wire_ctl_rx,
+            wire_wake_rx,
+            sim_cmd_rx,
+            sim_evt_tx,
+            poll_tx,
+            shutdown: shutdown.clone(),
+            armed: Arc::new(AtomicBool::new(false)),
+            initial_log: paths.initial_log.clone(),
+        });
     // The GAME FEED: the authoritative movement of the held exercise.
     //
     // The socket's command channel belongs to the wire that is up NOW, and
@@ -342,12 +348,15 @@ fn main() {
     let (signin_tx, signin_rx) = mpsc::channel::<Result<tfg::shell_gpui::SignedIn, String>>();
     let (create_tx, create_rx) =
         mpsc::channel::<Result<tfg::shell_gpui::CreatedSession, tfg::shell_gpui::WriteRefusal>>();
+    // THE CREATION FLOW'S PRESS. The shell sends the draft and the verb; this
+    // side runs `commit::run` through the real transport and answers with the
+    // draft the journal grew (`docs/creation-flow-handoff.md` §9).
+    let (press_tx, press_rx) = mpsc::channel::<tfg::shell_gpui::PressAnswer>();
     let (timeline_tx, timeline_rx) =
         mpsc::channel::<Result<(tfg::backend::TimelinePage, bool), String>>();
     let (judgements_tx, judgements_rx) =
         mpsc::channel::<Result<Vec<tfg::backend::Judgement>, String>>();
-    let (reviews_tx, reviews_rx) =
-        mpsc::channel::<Result<Vec<tfg::backend::Review>, String>>();
+    let (reviews_tx, reviews_rx) = mpsc::channel::<Result<Vec<tfg::backend::Review>, String>>();
     let (judge_write_tx, judge_write_rx) =
         mpsc::channel::<Result<tfg::backend::Judgement, String>>();
     let (review_write_tx, review_write_rx) =
@@ -361,9 +370,8 @@ fn main() {
     // shape of its own: a hull with no published specification is not a
     // failure, it is a hull the register has not measured.
     let (spec_tx, spec_rx) = mpsc::channel::<tfg::shell_gpui::SpecAnswer>();
-    let (embark_write_tx, embark_write_rx) = mpsc::channel::<
-        Result<(i64, tfg::backend::EmbarkationResult), String>,
-    >();
+    let (embark_write_tx, embark_write_rx) =
+        mpsc::channel::<Result<(i64, tfg::backend::EmbarkationResult), String>>();
     // A host's REAL SPEC — the complements it declares and the hulls it
     // holds — for the embark rule. Its own channel, because it is a READ
     // with a different answer shape from the embarked read: this one carries
@@ -385,6 +393,51 @@ fn main() {
         tfg::map_geometry::MAP_W as u32,
         tfg::map_geometry::MAP_H as u32,
     )));
+    // The first control-plane slice is opt-in. Binding is disabled unless a
+    // listen address and a bearer token are both supplied, so a normal local
+    // launch does not expose a LAN endpoint accidentally.
+    //
+    // The hub is the one piece of state the server reads and the order thread
+    // writes: the camera, its revision, and the command ids already seen.
+    let control_hub = tfg::control::ControlHub::new(tfg::control::CameraSnapshot::from_tuple((
+        tfg::map_geometry::MAP_CENTER.0,
+        tfg::map_geometry::MAP_CENTER.1,
+        tfg::map_geometry::MAP_ZOOM,
+        tfg::map_geometry::MAP_W as u32,
+        tfg::map_geometry::MAP_H as u32,
+    )));
+    let (control_tx, control_rx) = mpsc::channel::<tfg::control::AcceptedCommand>();
+    let _control_handle = match (
+        std::env::var("TFG_CONTROL_LISTEN"),
+        std::env::var("TFG_CONTROL_TOKEN"),
+    ) {
+        (Ok(listen), Ok(token)) if !listen.trim().is_empty() && !token.is_empty() => {
+            let mut config = tfg::control::ServerConfig::new(listen, token);
+            // The same variable means the same thing in `tfg-server`, so a
+            // smoke run can point both hosts at a throwaway table instead of
+            // the operator's own.
+            if let Some(path) = std::env::var_os("TFG_CONTROL_DEVICES")
+                && !path.is_empty()
+            {
+                config.devices = Some(std::path::PathBuf::from(path));
+            }
+            match tfg::control::spawn_server(config, control_tx, control_hub.clone()) {
+                Ok(handle) => {
+                    eprintln!("control server listening on {}", handle.url());
+                    Some(handle)
+                }
+                Err(error) => {
+                    eprintln!("control server disabled: {error}");
+                    None
+                }
+            }
+        }
+        (Ok(_), Err(_)) => {
+            eprintln!("control server disabled: TFG_CONTROL_TOKEN is missing");
+            None
+        }
+        _ => None,
+    };
     // Hull photographs ride their own channel: the send end is cloned
     // into the order loop (every card sign-in fetches on the new token)
     // and the receive end feeds the shell below.
@@ -393,6 +446,7 @@ fn main() {
         let (host2, token2, game_id, user2) =
             (host.clone(), token.clone(), session.game_id, user.clone());
         let camera2 = camera.clone();
+        let control_hub2 = control_hub.clone();
         let req_tx2 = req_tx.clone();
         // The photo channel's send end rides into the order loop: every
         // card sign-in fetches again on the new token — a launch without
@@ -507,6 +561,7 @@ fn main() {
                         zoom,
                         size,
                         render,
+                        control,
                     } => {
                         // The camera, as the operator has it. The shell owns
                         // it — a gesture moves it locally and the picture is
@@ -517,6 +572,17 @@ fn main() {
                         if let Ok(mut cam) = camera2.lock() {
                             *cam = (center.0, center.1, zoom, size.0, size.1);
                         }
+                        // The control plane learns the same camera from the
+                        // one thread that owns it. `control` says which remote
+                        // command asked for this move, so watchers see their
+                        // own command's effect attributed to them; a gesture
+                        // arrives with none and is the desktop's own.
+                        control_hub2.report_camera(
+                            tfg::control::CameraSnapshot::from_tuple((
+                                center.0, center.1, zoom, size.0, size.1,
+                            )),
+                            control.unwrap_or_else(tfg::control::CameraSource::desktop),
+                        );
                         if !render {
                             continue;
                         }
@@ -602,7 +668,10 @@ fn main() {
                             }
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Deploy, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Deploy,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -745,9 +814,8 @@ fn main() {
                                         mw,
                                         mh,
                                     );
-                                    match master.set_placement(
-                                        &token2, game_id, unit_id, lat, lon,
-                                    ) {
+                                    match master.set_placement(&token2, game_id, unit_id, lat, lon)
+                                    {
                                         Ok(_) => {
                                             eprintln!(
                                                 "assigned and placed {unit_id} at {lat:.4}, {lon:.4}"
@@ -765,21 +833,25 @@ fn main() {
                                                 ),
                                             }
                                         }
-                                        Err(e) => Err(format!(
-                                            "assigned, but not placed: {e}"
-                                        )),
+                                        Err(e) => Err(format!("assigned, but not placed: {e}")),
                                     }
                                 }
                             }
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Deploy, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Deploy,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
                     }
-                    tfg::shell_gpui::ToBinary::SignIn { identifier, password } => {
+                    tfg::shell_gpui::ToBinary::SignIn {
+                        identifier,
+                        password,
+                    } => {
                         // Sign in, then STOP: the roster and the games list
                         // arrive together, but no game is held — holding is
                         // the picker's verb, and an auto-hold here is what
@@ -791,6 +863,17 @@ fn main() {
                                 let total = rows.len();
                                 let sessions =
                                     fetch_session_rows(&host2, &token).unwrap_or_default();
+                                // THE LANDING'S START FROM LIST, read with the
+                                // games. A failed read travels as a SENTENCE:
+                                // an empty list would say "this account has no
+                                // Saved Scenarios", which may be false.
+                                let (missions, missions_error) =
+                                    match tfg::backend::MinosMaster::new(&host2)
+                                        .and_then(|m| m.scenario_missions(&token))
+                                    {
+                                        Ok(missions) => (missions, None),
+                                        Err(e) => (Vec::new(), Some(e.to_string())),
+                                    };
                                 // The shell gets the roster and the games;
                                 // THIS side keeps the token with no game
                                 // yet, so the first hold posts as the
@@ -805,10 +888,7 @@ fn main() {
                                 user2 = identifier.clone();
                                 if let Some(rt) = refresh_token.as_deref() {
                                     let _ = tfg::backend::keyring_save(&identifier, rt);
-                                    tfg::backend::last_user_save(
-                                        &paths.last_user,
-                                        &identifier,
-                                    );
+                                    tfg::backend::last_user_save(&paths.last_user, &identifier);
                                 }
                                 spawn_thumb_fetch(
                                     host2.clone(),
@@ -828,7 +908,10 @@ fn main() {
                                     &wire_wake2,
                                 );
                                 game_id = 0;
-                                state2 = String::new();
+                                // `state2` is written by the holds and the
+                                // transitions; a fresh sign-in holds nothing, so
+                                // there is no state to name.
+
                                 // The account's own id, so the socket can
                                 // watch its PERSONAL channel: an addressed
                                 // message travels there and nowhere else.
@@ -842,13 +925,15 @@ fn main() {
                                     roster: rows,
                                     roster_total: total,
                                     sessions,
+                                    missions,
+                                    missions_error,
                                     session: tfg::shell_gpui::SessionView::default(),
                                 })
                             }
-                            None => Err(
-                                "sign-in refused \u{2014} check the identifier and password"
-                                    .to_string(),
-                            ),
+                            None => {
+                                Err("sign-in refused \u{2014} check the identifier and password"
+                                    .to_string())
+                            }
                         };
                         if signin_tx.send(outcome).is_err() {
                             return;
@@ -900,12 +985,7 @@ fn main() {
                                     // an addressed message travels there and
                                     // nowhere else.
                                     sync_session(
-                                        &hold2,
-                                        &live_ctl2,
-                                        &token2,
-                                        game_id,
-                                        &state2,
-                                        s.me,
+                                        &hold2, &live_ctl2, &token2, game_id, &state2, s.me,
                                     );
                                     eprintln!("holding {} ({})", s.game, s.state);
                                     Ok(tfg::shell_gpui::CreatedSession::for_write(
@@ -923,65 +1003,94 @@ fn main() {
                             return;
                         }
                     }
-                    tfg::shell_gpui::ToBinary::CreateSession { draft } => {
-                        // The console's `setup_create_game`, as a message: a
-                        // signed-out shell has no token to create with, and an
-                        // empty name never reaches here (the panel refuses it
-                        // locally) but is refused again anyway — the seam must
-                        // not trust the renderer. On success the new game is
-                        // HELD, the way `apply_created_game` holds it: born in
-                        // planning by contract, read back rather than assumed.
-                        let outcome = if token2.is_empty() {
-                            Err("signed out \u{2014} sign in to create a session".to_string())
-                        } else if draft.name.trim().is_empty() {
-                            Err("name the session first".to_string())
-                        } else {
-                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
-                                return;
-                            };
-                            // The draft becomes the body the server takes,
-                            // window and all — the conversion is the
-                            // library's, so the exercise's window and the
-                            // one stated at the door cannot mean different
-                            // things.
-                            let req = draft.to_new_game();
-                            match master.create_game(&token2, &req) {
-                                Ok(g) => {
-                                    eprintln!("created {} (planning)", g.name);
-                                    match fetch_session(&host2, &token2, Some(g.id)) {
-                                        Some(mut s) => {
-                                            s.zoom = camera2
-                                                .lock()
-                                                .map(|c| c.2)
-                                                .unwrap_or(tfg::map_geometry::MAP_ZOOM);
-                                            game_id = s.game_id;
-                                            state2 = s.state.clone();
-                                            sync_session(
-                                                &hold2,
-                                                &live_ctl2,
-                                                &token2,
-                                                game_id,
-                                                &state2,
-                                                s.me,
-                                            );
-                                            Ok(tfg::shell_gpui::CreatedSession::for_write(
-                                                s,
-                                                tfg::shell_gpui::WriteId::Session,
-                                            ))
-                                        }
-                                        None => Err(
-                                            "created, but the session could not be read"
-                                                .to_string(),
-                                        ),
-                                    }
-                                }
-                                Err(e) => Err(format!("create failed: {e}")),
-                            }
+                    tfg::shell_gpui::ToBinary::Press { verb, draft } => {
+                        // ONE PRESS, ONE LADDER. The engine decides what is
+                        // still owed (a resumed press diffs against the
+                        // journal and the live read), the transport turns each
+                        // write into one endpoint, and the answer carries the
+                        // draft back with its journal.
+                        let mut draft = *draft;
+                        let mut transport = match tfg::backend::MinosMaster::new(&host2) {
+                            Ok(master) => master,
+                            Err(_) => return,
                         };
-                        let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Session, why)
-                        });
-                        if create_tx.send(outcome).is_err() {
+                        let offset = tfg::backend::local_offset();
+                        // A `Reopened` draft's live frame is its game; a blank
+                        // one has none yet, and 01 is what makes it.
+                        let mut live = match draft.origin.game_id() {
+                            Some(id) => tfg::commit::Live::reopened(id),
+                            None => tfg::commit::Live::default(),
+                        };
+                        // THE PRESS'S OWN READS FILL THE FRAME: what the server
+                        // already holds is what makes the plan a diff rather
+                        // than a replay (§9.3). Only a held game has one.
+                        if let Some(game_id) = tfg::commit::game_id(&draft, &live) {
+                            live.game_id = Some(game_id);
+                            live.seats = transport
+                                .game_participants(&token2, game_id)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|p| tfg::roster::LiveSeat {
+                                    user_id: p.user_id,
+                                    user_name: p.user_name,
+                                    role_id: p.role_id,
+                                    role_name: p.role_name,
+                                    call_sign: p.call_sign,
+                                    judge: p.judge,
+                                })
+                                .collect();
+                            // The pieces and their positions are TWO reads —
+                            // the piece row carries the commander, the
+                            // placement carries the start — and the diff needs
+                            // both, keyed by unit id.
+                            let placements = transport
+                                .placements_list(&token2, game_id)
+                                .map(|list| {
+                                    list.placements
+                                        .into_iter()
+                                        .map(|p| {
+                                            (
+                                                p.unit_id,
+                                                tfg::force::Start {
+                                                    lat: p.latitude,
+                                                    lon: p.longitude,
+                                                },
+                                            )
+                                        })
+                                        .collect::<std::collections::BTreeMap<i64, tfg::force::Start>>()
+                                })
+                                .unwrap_or_default();
+                            live.units = transport
+                                .game_units_list(&token2, game_id)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|u| tfg::force::LiveHull {
+                                    unit_id: u.unit_id,
+                                    name: u.unit_name,
+                                    commander_id: u.commander_id,
+                                    start: placements.get(&u.unit_id).copied(),
+                                    // Embarkation is not this flow's business:
+                                    // its ladder has no position for a carrier,
+                                    // and a hull the flow holds is on the water.
+                                    host: None,
+                                })
+                                .collect();
+                            live.nodes = transport
+                                .game_hierarchy(&token2, game_id)
+                                .map(|tree| flatten_nodes(&tree))
+                                .unwrap_or_default();
+                        }
+                        let mut wire =
+                            tfg::backend::MasterTransport::new(&transport, &token2, verb.ladder());
+                        let outcome = tfg::commit::run(&mut draft, &live, verb, &offset, &mut wire);
+                        if press_tx
+                            .send(tfg::shell_gpui::PressAnswer {
+                                draft,
+                                verb,
+                                outcome,
+                            })
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -1006,12 +1115,12 @@ fn main() {
                                     eprintln!("added scenario {} {:?}", sc.id, sc.title);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
                                         Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
-                                                s,
-                                                tfg::shell_gpui::WriteId::Book,
-                                            )),
-                                        None => Err(
-                                            "added, but the book could not be read".to_string(),
-                                        ),
+                                            s,
+                                            tfg::shell_gpui::WriteId::Book,
+                                        )),
+                                        None => {
+                                            Err("added, but the book could not be read".to_string())
+                                        }
                                     }
                                 }
                                 Err(e) => Err(format!("add failed: {e}")),
@@ -1024,7 +1133,11 @@ fn main() {
                             return;
                         }
                     }
-                    tfg::shell_gpui::ToBinary::AddStep { scenario_id, content, window } => {
+                    tfg::shell_gpui::ToBinary::AddStep {
+                        scenario_id,
+                        content,
+                        window,
+                    } => {
                         // The composer's step row, minus the staging: the
                         // console's `stage_step_add` waits for the advance and
                         // this shell posts at once. Empty content is LEGAL —
@@ -1051,7 +1164,11 @@ fn main() {
                                 };
                                 let w = window.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
                                 match master.add_scenario_step(
-                                    &token2, game_id, scenario_id, &content, w,
+                                    &token2,
+                                    game_id,
+                                    scenario_id,
+                                    &content,
+                                    w,
                                 ) {
                                     Ok(sc) => {
                                         eprintln!("added a step to scenario {}", sc.id);
@@ -1062,9 +1179,10 @@ fn main() {
                                                     tfg::shell_gpui::WriteId::Step,
                                                 ))
                                             }
-                                            None => Err(
-                                                "added, but the book could not be read".to_string(),
-                                            ),
+                                            None => {
+                                                Err("added, but the book could not be read"
+                                                    .to_string())
+                                            }
                                         }
                                     }
                                     Err(e) => Err(format!("add failed: {e}")),
@@ -1078,7 +1196,10 @@ fn main() {
                             return;
                         }
                     }
-                    tfg::shell_gpui::ToBinary::RemoveStep { scenario_id, step_id } => {
+                    tfg::shell_gpui::ToBinary::RemoveStep {
+                        scenario_id,
+                        step_id,
+                    } => {
                         // Deletes AT ONCE — harsher than the console's staged
                         // cut, and the panel says so.
                         let outcome = if token2.is_empty() {
@@ -1087,20 +1208,23 @@ fn main() {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
-                            match master.delete_scenario_step(&token2, game_id, scenario_id, step_id)
-                            {
+                            match master.delete_scenario_step(
+                                &token2,
+                                game_id,
+                                scenario_id,
+                                step_id,
+                            ) {
                                 Ok(sc) => {
                                     eprintln!("removed step {step_id} from scenario {}", sc.id);
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => {
-                                            Ok(tfg::shell_gpui::CreatedSession::for_write(
-                                                s,
-                                                tfg::shell_gpui::WriteId::Step,
-                                            ))
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                            s,
+                                            tfg::shell_gpui::WriteId::Step,
+                                        )),
+                                        None => {
+                                            Err("removed, but the book could not be read"
+                                                .to_string())
                                         }
-                                        None => Err(
-                                            "removed, but the book could not be read".to_string(),
-                                        ),
                                     }
                                 }
                                 Err(e) => Err(format!("remove failed: {e}")),
@@ -1140,20 +1264,21 @@ fn main() {
                                     );
                                     match fetch_session(&host2, &token2, Some(game_id)) {
                                         Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
-                                                s,
-                                                tfg::shell_gpui::WriteId::Readiness,
-                                            )),
-                                        None => Err(
-                                            "declared, but the session could not be read"
-                                                .to_string(),
-                                        ),
+                                            s,
+                                            tfg::shell_gpui::WriteId::Readiness,
+                                        )),
+                                        None => Err("declared, but the session could not be read"
+                                            .to_string()),
                                     }
                                 }
                                 Err(e) => Err(format!("readiness failed: {e}")),
                             }
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Readiness, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Readiness,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -1188,7 +1313,10 @@ fn main() {
                             }
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Roster, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Roster,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -1243,9 +1371,9 @@ fn main() {
                         roster,
                         live_seats,
                         groups,
-                            window,
-                            book,
-                            live_scenarios,
+                        window,
+                        book,
+                        live_scenarios,
                     } => {
                         // LEAVE PLANNING. The drafts cross whole because the
                         // token lives HERE and the drafts live THERE: the
@@ -1269,29 +1397,34 @@ fn main() {
                         // commands away — then the unseats, the task
                         // organisation, and the transition last.
                         let outcome = if token2.is_empty() {
-                            Err("signed out \u{2014} sign in to move the plan to preparation"
-                                .to_string())
+                            Err(
+                                "signed out \u{2014} sign in to move the plan to preparation"
+                                    .to_string(),
+                            )
                         } else {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
-                                advance_to_preparation(
-                                    &master,
-                                    &host2,
-                                    &token2,
-                                    game_id,
-                                    force,
-                                    live_hulls,
-                                    roster,
-                                    live_seats,
-                                    groups,
-                                    window,
-                                    book,
-                                    live_scenarios,
-                                )
+                            advance_to_preparation(
+                                &master,
+                                &host2,
+                                &token2,
+                                game_id,
+                                force,
+                                live_hulls,
+                                roster,
+                                live_seats,
+                                groups,
+                                window,
+                                book,
+                                live_scenarios,
+                            )
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Prepare, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Prepare,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -1326,8 +1459,7 @@ fn main() {
                         // everything else; the terms ride the advance, which
                         // is where the exercise moves on.
                         let outcome = if token2.is_empty() {
-                            Err("signed out \u{2014} sign in to sync the staged writes"
-                                .to_string())
+                            Err("signed out \u{2014} sign in to sync the staged writes".to_string())
                         } else {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
@@ -1395,6 +1527,52 @@ fn main() {
                             return;
                         }
                     }
+                    tfg::shell_gpui::ToBinary::SaveTerms { update } => {
+                        // THE TERMS, from the planning panel's form. One
+                        // partial edit (`PATCH /games/{id}`), then the same
+                        // re-read every write here answers with — so the form
+                        // the operator looks at next is Minos's spelling and
+                        // not the draft's.
+                        //
+                        // A REFUSAL IS A SENTENCE, and the ticket is the
+                        // administrator's: the terms are not the Game
+                        // Master's to write, which is a different grant from
+                        // the one that moves the exercise — and a panel that
+                        // said "refused" without naming the ticket would
+                        // send the operator to the transition they do
+                        // hold.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to write the terms".to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            match master.update_game(&token2, game_id, &update) {
+                                Ok(detail) => {
+                                    eprintln!("terms written for {}", detail.name);
+                                    match fetch_session(&host2, &token2, Some(game_id)) {
+                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession {
+                                            session: s,
+                                            note: "the terms were written".to_string(),
+                                            refusal: None,
+                                            write: tfg::shell_gpui::WriteId::Terms,
+                                        }),
+                                        None => Err(
+                                            "the terms were written, but the session could not be read"
+                                                .to_string(),
+                                        ),
+                                    }
+                                }
+                                Err(e) => Err(terms_refusal(&e)),
+                            }
+                        };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Terms, why)
+                        });
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
                     tfg::shell_gpui::ToBinary::SetTimeFactor { factor } => {
                         // Control's Apply: one field, one endpoint. The answer
                         // is a re-read like every other write here, so the
@@ -1412,13 +1590,11 @@ fn main() {
                                     eprintln!("time factor set to {factor:.0}\u{00d7}");
                                     match fetch_session(&host2, &token2, Some(game_id)) {
                                         Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
-                                                s,
-                                                tfg::shell_gpui::WriteId::Factor,
-                                            )),
-                                        None => Err(
-                                            "pace set, but the session could not be read"
-                                                .to_string(),
-                                        ),
+                                            s,
+                                            tfg::shell_gpui::WriteId::Factor,
+                                        )),
+                                        None => Err("pace set, but the session could not be read"
+                                            .to_string()),
                                     }
                                 }
                                 // No grant, no pace — and the sentence is the
@@ -1431,7 +1607,10 @@ fn main() {
                             }
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Factor, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Factor,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -1458,29 +1637,25 @@ fn main() {
                                             // reading, both at once.
                                             state2 = s.state.clone();
                                             sync_session(
-                                                &hold2,
-                                                &live_ctl2,
-                                                &token2,
-                                                game_id,
-                                                &state2,
-                                                s.me,
+                                                &hold2, &live_ctl2, &token2, game_id, &state2, s.me,
                                             );
                                             Ok(tfg::shell_gpui::CreatedSession::for_write(
                                                 s,
                                                 tfg::shell_gpui::WriteId::Advance,
                                             ))
                                         }
-                                        None => Err(
-                                            "advanced, but the session could not be read"
-                                                .to_string(),
-                                        ),
+                                        None => Err("advanced, but the session could not be read"
+                                            .to_string()),
                                     }
                                 }
                                 Err(e) => Err(format!("advance refused: {e}")),
                             }
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Advance, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Advance,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -1509,22 +1684,17 @@ fn main() {
                                             // it any more.
                                             state2 = s.state.clone();
                                             sync_session(
-                                                &hold2,
-                                                &live_ctl2,
-                                                &token2,
-                                                game_id,
-                                                &state2,
-                                                s.me,
+                                                &hold2, &live_ctl2, &token2, game_id, &state2, s.me,
                                             );
                                             Ok(tfg::shell_gpui::CreatedSession::for_write(
                                                 s,
                                                 tfg::shell_gpui::WriteId::End,
                                             ))
                                         }
-                                        None => Err(
-                                            "ended, but the session could not be read"
-                                                .to_string(),
-                                        ),
+                                        None => {
+                                            Err("ended, but the session could not be read"
+                                                .to_string())
+                                        }
                                     }
                                 }
                                 Err(e) => Err(format!("end refused: {e}")),
@@ -1663,7 +1833,8 @@ fn main() {
                         let outcome = if token2.is_empty() {
                             Err("signed out \u{2014} sign in to embark".to_string())
                         } else if game_id == 0 {
-                            Err("no held game \u{2014} there is no exercise to embark in".to_string())
+                            Err("no held game \u{2014} there is no exercise to embark in"
+                                .to_string())
                         } else {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 // The order loop answers ONE order and then
@@ -1725,11 +1896,7 @@ fn main() {
                                 caps.len(),
                                 aboard.len()
                             );
-                            Ok(tfg::embark::EmbarkSpec {
-                                host,
-                                caps,
-                                aboard,
-                            })
+                            Ok(tfg::embark::EmbarkSpec { host, caps, aboard })
                         };
                         if embark_spec_tx.send(outcome).is_err() {
                             return;
@@ -1785,7 +1952,11 @@ fn main() {
                             return;
                         }
                     }
-                    tfg::shell_gpui::ToBinary::EmbarkAssign { host, child, commander_id } => {
+                    tfg::shell_gpui::ToBinary::EmbarkAssign {
+                        host,
+                        child,
+                        commander_id,
+                    } => {
                         // Embarking IS assigning, the host-side twin of the
                         // drop above: `assign_unit` first, then the attach.
                         // Answered on the embark feed like every embark
@@ -1801,14 +1972,15 @@ fn main() {
                             match master.assign_unit(&token2, game_id, child, commander_id) {
                                 Err(e) => Err(format!("not assigned: {e}")),
                                 Ok(_) => {
-                                    match master.game_attach_units(&token2, game_id, host, &[child]) {
+                                    match master.game_attach_units(&token2, game_id, host, &[child])
+                                    {
                                         Ok(result) => {
-                                            eprintln!("assigned and embarked {child} aboard {host}");
+                                            eprintln!(
+                                                "assigned and embarked {child} aboard {host}"
+                                            );
                                             Ok((host, result))
                                         }
-                                        Err(e) => Err(format!(
-                                            "assigned, but not embarked: {e}"
-                                        )),
+                                        Err(e) => Err(format!("assigned, but not embarked: {e}")),
                                     }
                                 }
                             }
@@ -1862,7 +2034,11 @@ fn main() {
                             return;
                         }
                     }
-                    tfg::shell_gpui::ToBinary::SetRelated { scenario_id, step_id, related } => {
+                    tfg::shell_gpui::ToBinary::SetRelated {
+                        scenario_id,
+                        step_id,
+                        related,
+                    } => {
                         // The relate editor's save, minus the staging: the
                         // console stages relations and syncs them on advance,
                         // and this shell posts the working set whole — empty
@@ -1884,31 +2060,35 @@ fn main() {
                                 &related,
                             ) {
                                 Ok(r) => {
-                                    eprintln!(
-                                        "related step {step_id}: {} post(s)",
-                                        r.posts.len()
-                                    );
+                                    eprintln!("related step {step_id}: {} post(s)", r.posts.len());
                                     match fetch_session(&host2, &token2, Some(game_id)) {
                                         Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
-                                                s,
-                                                tfg::shell_gpui::WriteId::Relate,
-                                            )),
-                                        None => Err(
-                                            "saved, but the book could not be read".to_string(),
-                                        ),
+                                            s,
+                                            tfg::shell_gpui::WriteId::Relate,
+                                        )),
+                                        None => {
+                                            Err("saved, but the book could not be read".to_string())
+                                        }
                                     }
                                 }
                                 Err(e) => Err(format!("save failed: {e}")),
                             }
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Relate, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Relate,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
                         }
                     }
-                    tfg::shell_gpui::ToBinary::DeclareStep { scenario_id, step_id, ready } => {
+                    tfg::shell_gpui::ToBinary::DeclareStep {
+                        scenario_id,
+                        step_id,
+                        ready,
+                    } => {
                         // The console's `declare_step`, as a message: the
                         // participant's own write on the asking step — proven
                         // on game 44 — unlike the Game Master's verbs, which
@@ -1922,9 +2102,19 @@ fn main() {
                                 return;
                             };
                             let op = if ready {
-                                master.declare_step_readiness(&token2, game_id, scenario_id, step_id)
+                                master.declare_step_readiness(
+                                    &token2,
+                                    game_id,
+                                    scenario_id,
+                                    step_id,
+                                )
                             } else {
-                                master.withdraw_step_readiness(&token2, game_id, scenario_id, step_id)
+                                master.withdraw_step_readiness(
+                                    &token2,
+                                    game_id,
+                                    scenario_id,
+                                    step_id,
+                                )
                             };
                             match op {
                                 Ok(()) => {
@@ -1938,20 +2128,21 @@ fn main() {
                                     );
                                     match fetch_session(&host2, &token2, Some(game_id)) {
                                         Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
-                                                s,
-                                                tfg::shell_gpui::WriteId::StepDeclare,
-                                            )),
-                                        None => Err(
-                                            "declared, but the session could not be read"
-                                                .to_string(),
-                                        ),
+                                            s,
+                                            tfg::shell_gpui::WriteId::StepDeclare,
+                                        )),
+                                        None => Err("declared, but the session could not be read"
+                                            .to_string()),
                                     }
                                 }
                                 Err(e) => Err(format!("step declaration failed: {e}")),
                             }
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::StepDeclare, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::StepDeclare,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -2024,17 +2215,23 @@ fn main() {
                                             refusal: None,
                                             write: tfg::shell_gpui::WriteId::StepVerb,
                                         }),
-                                        None => Err(
-                                            "the step moved, but the session could not be read"
-                                                .to_string(),
-                                        ),
+                                        None => {
+                                            Err("the step moved, but the session could not be read"
+                                                .to_string())
+                                        }
                                     }
                                 }
-                                Err(e) => Err(format!("step {} refused: {e}", verb.label().to_lowercase())),
+                                Err(e) => Err(format!(
+                                    "step {} refused: {e}",
+                                    verb.label().to_lowercase()
+                                )),
                             }
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::StepVerb, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::StepVerb,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -2088,16 +2285,20 @@ fn main() {
                                             s,
                                             tfg::shell_gpui::WriteId::Message,
                                         )),
-                                        None => Err(
-                                            "sent, but the thread could not be read".to_string(),
-                                        ),
+                                        None => {
+                                            Err("sent, but the thread could not be read"
+                                                .to_string())
+                                        }
                                     }
                                 }
                                 Err(e) => Err(format!("send failed: {e}")),
                             }
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Message, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Message,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -2145,16 +2346,20 @@ fn main() {
                                             s,
                                             tfg::shell_gpui::WriteId::Receipt,
                                         )),
-                                        None => Err(
-                                            "read, but the thread could not be read".to_string(),
-                                        ),
+                                        None => {
+                                            Err("read, but the thread could not be read"
+                                                .to_string())
+                                        }
                                     }
                                 }
                                 Err(e) => Err(format!("receipt refused: {e}")),
                             }
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Receipt, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Receipt,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -2181,9 +2386,10 @@ fn main() {
                                             s,
                                             tfg::shell_gpui::WriteId::Delete,
                                         )),
-                                        None => Err(
-                                            "removed, but the thread could not be read".to_string(),
-                                        ),
+                                        None => {
+                                            Err("removed, but the thread could not be read"
+                                                .to_string())
+                                        }
                                     }
                                 }
                                 Ok(tfg::backend::DeleteOutcome::Hidden) => {
@@ -2193,16 +2399,20 @@ fn main() {
                                             s,
                                             tfg::shell_gpui::WriteId::Delete,
                                         )),
-                                        None => Err(
-                                            "hidden, but the thread could not be read".to_string(),
-                                        ),
+                                        None => {
+                                            Err("hidden, but the thread could not be read"
+                                                .to_string())
+                                        }
                                     }
                                 }
                                 Err(e) => Err(format!("remove refused: {e}")),
                             }
                         };
                         let outcome = outcome.map_err(|why| {
-                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Delete, why)
+                            tfg::shell_gpui::WriteRefusal::new(
+                                tfg::shell_gpui::WriteId::Delete,
+                                why,
+                            )
                         });
                         if create_tx.send(outcome).is_err() {
                             return;
@@ -2303,7 +2513,10 @@ fn main() {
                             return;
                         }
                     }
-                    tfg::shell_gpui::ToBinary::RecordJudgement { personnel_id, score } => {
+                    tfg::shell_gpui::ToBinary::RecordJudgement {
+                        personnel_id,
+                        score,
+                    } => {
                         // The console's `record_judgement`, as a message: one
                         // mark POSTed, and the filed mark answered back — the
                         // shell names it on its status line and re-reads
@@ -2415,9 +2628,10 @@ fn main() {
     // symbol resolver above it: the taxonomy does not move under us, and a
     // picker that re-read sqlite per frame would be a fan-out for nothing.
     // Empty when the store never synced — the picker falls back to flat.
-    let fleet_tax = store.as_ref().map(|conn| {
-        build_fleet_taxonomy(conn, |id| resolve_symbol(id, &store_ctx, &classes))
-    }).unwrap_or_default();
+    let fleet_tax = store
+        .as_ref()
+        .map(|conn| build_fleet_taxonomy(conn, |id| resolve_symbol(id, &store_ctx, &classes)))
+        .unwrap_or_default();
 
     // The published figures per hull, read once off the same mirror: the
     // details panel shows them when the operator points at a hull, and a
@@ -2434,7 +2648,6 @@ fn main() {
         })
         .unwrap_or_default();
 
-
     // The photo channel lives as long as the shell: startup fetches when
     // it can, and every sign-in fetches again — a launch without
     // credentials must not glyph-hold the rows forever.
@@ -2446,10 +2659,15 @@ fn main() {
     // The messages that arrived, drained like every other feed.
     let live_message_feed: tfg::shell_gpui::LiveMessageFeed =
         std::boxed::Box::new(move || live_msg_rx.try_recv().ok());
+    let control_feed: tfg::control::CommandFeed =
+        std::boxed::Box::new(move || control_rx.try_recv().ok());
     // The HELD game, read live: the personal channel carries traffic for
     // every exercise this account is in, and only the held exercise's
     // traffic belongs in the held exercise's inbox.
     let hold_for_wire = hold.clone();
+    // THE PRESS'S ANSWER: the draft with its journal, and the engine's word.
+    let press_feed: tfg::shell_gpui::PressFeed =
+        std::boxed::Box::new(move || press_rx.try_recv().ok());
 
     tfg::shell_gpui::run(
         Box::new(move || {
@@ -2544,10 +2762,7 @@ fn main() {
                         // carries traffic for every exercise this account
                         // is in. Only the held exercise's traffic belongs in
                         // the held exercise's inbox.
-                        let held_game = hold_for_wire
-                            .lock()
-                            .map(|h| h.game_id)
-                            .unwrap_or_default();
+                        let held_game = hold_for_wire.lock().map(|h| h.game_id).unwrap_or_default();
                         if m.game_id != held_game {
                             eprintln!(
                                 "wire: message for game {} — not the held game ({held_game})",
@@ -2639,6 +2854,7 @@ fn main() {
         status_feed,
         signin_feed,
         create_feed,
+        press_feed,
         timeline_feed,
         judgements_feed,
         reviews_feed,
@@ -2651,6 +2867,7 @@ fn main() {
         thumb_feed,
         spec_feed,
         live_message_feed,
+        control_feed,
         order_tx,
         roster,
         roster_total,
@@ -3105,6 +3322,39 @@ fn unproject_at(
     }
 }
 
+/// A game's task organisation as the engine's diff wants it: flat, with each
+/// body's members.
+///
+/// The read is a FOREST — a node carries its children — and `groups::plan`
+/// compares flat lists, so the tree is walked once here rather than in every
+/// caller.
+fn flatten_nodes(tree: &[tfg::backend::HierarchyNode]) -> Vec<tfg::groups::LiveGroup> {
+    let mut out = Vec::new();
+    fn walk(
+        nodes: &[tfg::backend::HierarchyNode],
+        parent: Option<i64>,
+        out: &mut Vec<tfg::groups::LiveGroup>,
+    ) {
+        for node in nodes {
+            let kind = tfg::groups::GroupKind::from_echelon(&node.echelon_name)
+                .unwrap_or(tfg::groups::GroupKind::Unsur);
+            out.push(tfg::groups::LiveGroup {
+                group_id: node.id,
+                name: node.name.clone(),
+                kind,
+                parent,
+                commander_id: node.commander_id,
+                // The NODE does not carry its members: `game_units_list` says
+                // which node each piece sits under, and `commit` fills that in.
+                units: Vec::new(),
+            });
+            walk(&node.children, Some(node.id), out);
+        }
+    }
+    walk(tree, None, &mut out);
+    out
+}
+
 fn fetch_session_rows(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::SessionRow>> {
     let master = tfg::backend::MinosMaster::new(host).ok()?;
     let (me, _name) = master.me(token).ok()?;
@@ -3125,6 +3375,8 @@ fn fetch_session_rows(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::Se
             my_role: role,
             judge,
             mode: g.mode.clone(),
+            // The landing's `WHEN` column, as the server stamps it.
+            created_at: g.created_at.clone(),
         });
     }
     Some(rows)
@@ -3198,7 +3450,8 @@ fn fetch_session(
     host: &str,
     token: &str,
     pinned: Option<i64>,
-) -> Option<tfg::shell_gpui::SessionView> {    let master = tfg::backend::MinosMaster::new(host).ok()?;
+) -> Option<tfg::shell_gpui::SessionView> {
+    let master = tfg::backend::MinosMaster::new(host).ok()?;
     let (me, _name) = master.me(token).ok()?;
     let games = master.games_list(token).ok()?;
     // The newest game this account is seated in wins; the newest readable one
@@ -3280,12 +3533,14 @@ fn fetch_session(
     };
     // The published checklist. `None` for a planning room is the ordinary
     // case (the route 404s until preparation), not a failure to report.
-    let readiness = master.game_readiness(token, game_id).ok().map(|r| {
-        tfg::shell_gpui::ReadinessView {
-            can_execute: r.can_execute,
-            blockers: r.blockers,
-        }
-    });
+    let readiness =
+        master
+            .game_readiness(token, game_id)
+            .ok()
+            .map(|r| tfg::shell_gpui::ReadinessView {
+                can_execute: r.can_execute,
+                blockers: r.blockers,
+            });
     // The hulls this seat commands: `id_commander` is the same key the seat
     // carries, so the join needs no name lookup — the roster's rule again.
     let units = master.game_units_list(token, game_id).unwrap_or_default();
@@ -3410,7 +3665,11 @@ fn fetch_session(
         .into_iter()
         .map(|r| tfg::shell_gpui::RoleRow {
             id: r.id,
-            name: if r.name.is_empty() { r.id_name.clone() } else { r.name.clone() },
+            name: if r.name.is_empty() {
+                r.id_name.clone()
+            } else {
+                r.name.clone()
+            },
             judge: r.judge.unwrap_or(false),
         })
         .collect();
@@ -3424,7 +3683,11 @@ fn fetch_session(
         .into_iter()
         .map(|u| tfg::shell_gpui::DirectoryRow {
             id: u.id,
-            name: if u.name.is_empty() { u.username.clone() } else { u.name.clone() },
+            name: if u.name.is_empty() {
+                u.username.clone()
+            } else {
+                u.name.clone()
+            },
             unit: u.satuan,
             rank: u.pangkat,
             appointment: u.jabatan,
@@ -3494,6 +3757,20 @@ fn fetch_session(
                                     }
                                 })
                                 .collect(),
+                            // The people themselves, so the units tree can say
+                            // which UNIT has declared: a unit's commander is
+                            // the person who declares for it, and the counts
+                            // above cannot say that.
+                            personnel: r
+                                .personnel
+                                .iter()
+                                .map(|p| tfg::shell_gpui::StepGatePerson {
+                                    user_id: p.user_id,
+                                    call_sign: p.call_sign.clone(),
+                                    ready: p.ready,
+                                    asked: p.asked,
+                                })
+                                .collect(),
                         })
                 })
             })
@@ -3539,12 +3816,16 @@ fn fetch_session(
         (Vec::new(), None, false)
     };
     let judgements = if closed {
-        master.judgements_list(token, game_id, None).unwrap_or_default()
+        master
+            .judgements_list(token, game_id, None)
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
     let reviews = if closed {
-        master.reviews_list(token, game_id, None, None).unwrap_or_default()
+        master
+            .reviews_list(token, game_id, None, None)
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -3608,7 +3889,10 @@ fn fetch_session(
             .find(|p| p.user_id == me)
             .map(|p| p.role_name.clone())
             .unwrap_or_default(),
-        my_ready: parts.iter().find(|p| p.user_id == me).is_some_and(|p| p.ready),
+        my_ready: parts
+            .iter()
+            .find(|p| p.user_id == me)
+            .is_some_and(|p| p.ready),
         execution: state == "execution",
         mine,
         game_id,
@@ -3720,7 +4004,7 @@ fn advance_to_preparation(
                 "this seat does not run the exercise \u{2014} the Game Master drives it, \
                  so nothing was written"
                     .to_string(),
-            )
+            );
         }
         None => eprintln!(
             "advance: this seat's grants are not knowable to the console \
@@ -3743,7 +4027,9 @@ fn advance_to_preparation(
     let window_write = match master.game_detail(token, game_id) {
         Ok(detail) => tfg::advance::window_update(&window, &detail.window),
         Err(e) => {
-            eprintln!("advance: the exercise's terms could not be read ({e}); the window is left alone");
+            eprintln!(
+                "advance: the exercise's terms could not be read ({e}); the window is left alone"
+            );
             Ok(None)
         }
     };
@@ -3778,14 +4064,7 @@ fn advance_to_preparation(
     // THE CREATED NODES TRAVEL FROM THE GROUPS TO THE BOOK, because a step's
     // related list may name a node this same flush created, and the node has
     // no server id until the flush that created it has made one.
-    match run_plan(
-        master,
-        token,
-        game_id,
-        &steps,
-        &live_scenarios,
-        true,
-    ) {
+    match run_plan(master, token, game_id, &steps, &live_scenarios, true) {
         Ok(written) => {
             eprintln!("advance: {written} write(s) and the exercise moved to preparation");
             match fetch_session(host, token, Some(game_id)) {
@@ -4004,10 +4283,14 @@ fn live_hulls_from(
         .iter()
         .map(|u| {
             let carried_hull = carried.iter().find(|c| c.unit_id == u.unit_id);
-            let start = placements
-                .iter()
-                .find(|(id, _, _)| *id == u.unit_id)
-                .map(|(_, lat, lon)| tfg::force::Start { lat: *lat, lon: *lon });
+            let start =
+                placements
+                    .iter()
+                    .find(|(id, _, _)| *id == u.unit_id)
+                    .map(|(_, lat, lon)| tfg::force::Start {
+                        lat: *lat,
+                        lon: *lon,
+                    });
             tfg::force::LiveHull {
                 unit_id: u.unit_id,
                 name: u.unit_name.clone(),
@@ -4033,6 +4316,28 @@ fn window_refusal(e: &tfg::backend::BackendError) -> String {
              were not written"
         ),
         other => format!("the planned window was refused: {other}"),
+    }
+}
+
+/// The console's sentence for a refusal of the exercise's TERMS.
+///
+/// The terms are the administrator's ticket, not the Game Master's: a seat
+/// that runs the exercise still may not rename it. Naming the ticket is the
+/// whole point of the sentence — "refused" alone would send the operator to
+/// the transition they do hold.
+///
+/// A STRUCTURAL REFUSAL IS ALSO THE TERMS', and the catch-all is what
+/// carries it: Minos answers 409 to a change to an exercise's terms once it
+/// has left `planning`, and the rendered error is the server's own sentence
+/// — which names the rule that refused. Rewording it here would be a second
+/// sentence about a rule this console does not enforce itself.
+fn terms_refusal(e: &tfg::backend::BackendError) -> String {
+    match e {
+        tfg::backend::BackendError::Forbidden { message, .. } => format!(
+            "the exercise's terms are the administrator's to write, and this seat does not \
+             hold that ticket (the server said: {message}) \u{2014} nothing was written"
+        ),
+        other => format!("the exercise's terms were refused: {other}"),
     }
 }
 
@@ -4071,12 +4376,16 @@ fn flush_force(
     for w in writes {
         let step = match w {
             tfg::force::ForceWrite::Assign {
-                unit_id, commander_id, ..
+                unit_id,
+                commander_id,
+                ..
             } => master
                 .assign_unit(token, game_id, *unit_id, *commander_id)
                 .map(|_| ()),
             tfg::force::ForceWrite::HandOver {
-                unit_id, commander_id, ..
+                unit_id,
+                commander_id,
+                ..
             } => master
                 .set_unit_commander(token, game_id, *unit_id, *commander_id)
                 .map(|_| ()),
@@ -4244,9 +4553,10 @@ fn resolve_group(
 ) -> Result<i64, String> {
     match group {
         tfg::groups::GroupRef::Live(id) => Ok(*id),
-        tfg::groups::GroupRef::New(id) => created.get(id).copied().ok_or_else(|| {
-            format!("node staged as {id} names a node this flush did not create")
-        }),
+        tfg::groups::GroupRef::New(id) => created
+            .get(id)
+            .copied()
+            .ok_or_else(|| format!("node staged as {id} names a node this flush did not create")),
     }
 }
 
@@ -4318,26 +4628,22 @@ fn flush_book(
     let mut steps: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
     // The step ids each scenario is known to hold, so a step-add's answer can
     // be diffed against them.
-    let mut held: std::collections::BTreeMap<i64, Vec<i64>> = live
-        .iter()
-        .map(|l| (l.id, l.steps.clone()))
-        .collect();
+    let mut held: std::collections::BTreeMap<i64, Vec<i64>> =
+        live.iter().map(|l| (l.id, l.steps.clone())).collect();
     for w in writes {
         let step: Result<(), String> = match w {
             tfg::book::BookWrite::Create {
                 local_id,
                 title,
                 description,
-            } => {
-                match master.create_game_scenario(token, game_id, title, description) {
-                    Ok(sc) => {
-                        scenarios.insert(*local_id, sc.id);
-                        held.insert(sc.id, Vec::new());
-                        Ok(())
-                    }
-                    Err(e) => Err(format!("create scenario {title:?} refused: {e}")),
+            } => match master.create_game_scenario(token, game_id, title, description) {
+                Ok(sc) => {
+                    scenarios.insert(*local_id, sc.id);
+                    held.insert(sc.id, Vec::new());
+                    Ok(())
                 }
-            }
+                Err(e) => Err(format!("create scenario {title:?} refused: {e}")),
+            },
             tfg::book::BookWrite::AddStep {
                 scenario,
                 step: draft_step,
@@ -4366,6 +4672,17 @@ fn flush_book(
                     }
                     Err(e) => Err(format!("add step refused: {e}")),
                 }
+            }
+            // THE LIBRARY DOES NOT AUTHOR COMMANDS. Sub-steps belong to the
+            // creation flow's composer, and its press walks the ladder in
+            // `commit` instead of this flush — so a sub-step arriving here is a
+            // path that should not have made one, and it says so rather than
+            // posting a write to a route it does not resolve ids for.
+            tfg::book::BookWrite::AddSubstep { .. } | tfg::book::BookWrite::SetAudience { .. } => {
+                Err(
+                    "sub-steps are authored in the creation flow, not in the library composer"
+                        .into(),
+                )
             }
             tfg::book::BookWrite::RemoveStep {
                 scenario_id,
@@ -4430,9 +4747,10 @@ fn resolve_step(
 ) -> Result<i64, String> {
     match step {
         tfg::book::StepRef::Live(id) => Ok(*id),
-        tfg::book::StepRef::New(id) => steps.get(id).copied().ok_or_else(|| {
-            format!("step staged as {id} names a step this flush did not add")
-        }),
+        tfg::book::StepRef::New(id) => steps
+            .get(id)
+            .copied()
+            .ok_or_else(|| format!("step staged as {id} names a step this flush did not add")),
     }
 }
 
@@ -4512,7 +4830,8 @@ mod advance_tests {
     #[test]
     fn a_re_read_after_a_failed_advance_plans_nothing_for_the_hull_it_took() {
         let mut draft = tfg::force::ForceDraft::new();
-        let mut hull = tfg::force::DraftHull::new(7, "KRI Nanggala".into(), "h7".into(), "c".into());
+        let mut hull =
+            tfg::force::DraftHull::new(7, "KRI Nanggala".into(), "h7".into(), "c".into());
         hull.commander_id = Some(3);
         draft.upsert(hull);
         let taken = vec![unit(7, "KRI Nanggala", Some(3))];
@@ -4585,8 +4904,8 @@ mod picture_tests {
         let plain = decode_picture(&png_with_exif(None)).expect("a PNG with no tag decodes");
         assert_eq!((plain.width(), plain.height()), (4, 2), "no tag, no turn");
 
-        let turned =
-            decode_picture(&png_with_exif(Some(exif_orientation(6)))).expect("a tagged PNG decodes");
+        let turned = decode_picture(&png_with_exif(Some(exif_orientation(6))))
+            .expect("a tagged PNG decodes");
         assert_eq!(
             (turned.width(), turned.height()),
             (2, 4),
@@ -4607,7 +4926,6 @@ mod picture_tests {
         assert!(decode_picture(b"not an image").is_none());
     }
 }
-
 
 #[cfg(test)]
 mod fleet_taxonomy_tests {
@@ -4650,11 +4968,9 @@ mod fleet_taxonomy_tests {
 
     #[test]
     fn builder_walks_group_to_hull() {
-        let conn =
-            tfg::store::open(&std::path::PathBuf::from(":memory:")).expect("open");
+        let conn = tfg::store::open(&std::path::PathBuf::from(":memory:")).expect("open");
         seed_tree(&conn);
-        let tax =
-            build_fleet_taxonomy(&conn, |_| tfg::view::MapSymbolShape::Frigate);
+        let tax = build_fleet_taxonomy(&conn, |_| tfg::view::MapSymbolShape::Frigate);
         assert_eq!(tax.groups.len(), 2, "both groups list, even empty ones");
         let sea = tax.groups.iter().find(|g| g.id == 2).expect("sea tab");
         assert_eq!(sea.cats.len(), 1);
@@ -4671,10 +4987,8 @@ mod fleet_taxonomy_tests {
 
     #[test]
     fn builder_empty_store_is_empty_tree() {
-        let conn =
-            tfg::store::open(&std::path::PathBuf::from(":memory:")).expect("open");
-        let tax =
-            build_fleet_taxonomy(&conn, |_| tfg::view::MapSymbolShape::Dot);
+        let conn = tfg::store::open(&std::path::PathBuf::from(":memory:")).expect("open");
+        let tax = build_fleet_taxonomy(&conn, |_| tfg::view::MapSymbolShape::Dot);
         assert!(tax.groups.is_empty(), "the picker falls back to flat");
     }
 }

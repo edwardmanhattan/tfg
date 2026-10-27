@@ -326,7 +326,8 @@ impl MinosMaster {
                 id: Self::int_of(u, "id").unwrap_or(0),
                 name: u["name"].as_str().unwrap_or("").to_string(),
                 hull_number: Self::str_of(u, "hull_number").unwrap_or_else(|| "—".to_string()),
-                class_name: Self::str_of(&u["unit_class"], "name").unwrap_or_else(|| "—".to_string()),
+                class_name: Self::str_of(&u["unit_class"], "name")
+                    .unwrap_or_else(|| "—".to_string()),
                 category_name: Self::str_of(&u["unit_class"]["category"], "name")
                     .unwrap_or_else(|| "—".to_string()),
                 // Empty and not a dash: "the register did not name a type"
@@ -341,7 +342,11 @@ impl MinosMaster {
     /// ids only — the rows themselves come from categories(). Empty is
     /// a real answer (a branch owning nothing renders a zero, not an
     /// error); non-numeric ids are refused upstream with 422.
-    pub fn category_ids_for_branch(&self, token: &str, branch_id: i64) -> Result<Vec<i64>, BackendError> {
+    pub fn category_ids_for_branch(
+        &self,
+        token: &str,
+        branch_id: i64,
+    ) -> Result<Vec<i64>, BackendError> {
         let data = self.get(
             token,
             &format!("/unit-categories?id_service_branch={branch_id}"),
@@ -389,9 +394,10 @@ impl MinosMaster {
             .json(&body)
             .send()?;
         let status = response.status();
+        let request_id = crate::backend::request_id_of(&response);
         if !status.is_success() {
             let body: serde_json::Value = response.json().unwrap_or(serde_json::Value::Null);
-            return Err(BackendError::http_error(status.as_u16(), &body));
+            return Err(BackendError::http_error(status.as_u16(), &body, request_id));
         }
         if status != reqwest::StatusCode::CREATED {
             return Err(BackendError::Other(format!(
@@ -426,9 +432,10 @@ impl MinosMaster {
             .json(&body)
             .send()?;
         let status = response.status();
+        let request_id = crate::backend::request_id_of(&response);
         if !status.is_success() {
             let body: serde_json::Value = response.json().unwrap_or(serde_json::Value::Null);
-            return Err(BackendError::http_error(status.as_u16(), &body));
+            return Err(BackendError::http_error(status.as_u16(), &body, request_id));
         }
         let body: serde_json::Value = response.json()?;
         Ok((status, body["data"].clone()))
@@ -448,7 +455,6 @@ impl MinosMaster {
                 .send()?,
         )
     }
-
 
     fn delete(&self, token: &str, path: &str) -> Result<serde_json::Value, BackendError> {
         unwrap_envelope(
@@ -546,18 +552,53 @@ impl MinosMaster {
     }
 
     pub fn games_list(&self, token: &str) -> Result<Vec<GameRow>, BackendError> {
+        self.games_list_in(token, None)
+    }
+
+    /// The game list, FILTERED BY STATE where the caller asked for one.
+    ///
+    /// The landing's tabs send `state` (the handoff §3.1) and the counts come
+    /// from THIS read unfiltered and cached, because a filtered page cannot
+    /// count the tabs it filtered out. One route, two questions — which is
+    /// why the filter is a parameter rather than a second method that would
+    /// have to remember the same row shape.
+    ///
+    /// `state` is the wire word (`planning`, `preparation`, `execution`,
+    /// `closure`) and `None` is the whole list. An unrecognised word is the
+    /// server's to refuse, not this client's to correct.
+    pub fn games_list_in(
+        &self,
+        token: &str,
+        state: Option<&str>,
+    ) -> Result<Vec<GameRow>, BackendError> {
+        let path = match state {
+            Some(state) if !state.trim().is_empty() => {
+                format!("/games?state={}", Self::enc(state.trim()))
+            }
+            _ => "/games".to_string(),
+        };
         Ok(self
-            .paged(token, "/games")?
+            .paged(token, &path)?
             .iter()
-            .filter_map(|g| {
-                Some(GameRow {
-                    id: g["id"].as_i64()?,
-                    name: g["name"].as_str().unwrap_or("").to_string(),
-                    state: g["state"].as_str().unwrap_or("").to_string(),
-                    mode: g["mode"].as_str().unwrap_or("").to_string(),
-                })
-            })
+            .filter_map(Self::parse_game_row)
             .collect())
+    }
+
+    /// One row of the game list.
+    ///
+    /// `created_at` is the landing's `WHEN` column (erratum 11: the sheet's
+    /// `ORIGIN` column has no API backing and is dropped; `WHEN` is this
+    /// field). It rides as the server's own stamp — the console renders the
+    /// instant rather than re-deriving a date from it.
+    fn parse_game_row(g: &serde_json::Value) -> Option<GameRow> {
+        Some(GameRow {
+            id: g["id"].as_i64()?,
+            name: g["name"].as_str().unwrap_or("").to_string(),
+            state: g["state"].as_str().unwrap_or("").to_string(),
+            mode: g["mode"].as_str().unwrap_or("").to_string(),
+            created_at: g["created_at"].as_str().unwrap_or("").to_string(),
+            updated_at: g["updated_at"].as_str().unwrap_or("").to_string(),
+        })
     }
 
     /// Backend user directory (session-users ticket): live-read, paged,
@@ -669,7 +710,11 @@ impl MinosMaster {
     }
 
     /// One game's roster (staff-facing): exercise side first by server order.
-    pub fn game_participants(&self, token: &str, game_id: i64) -> Result<Vec<Participant>, BackendError> {
+    pub fn game_participants(
+        &self,
+        token: &str,
+        game_id: i64,
+    ) -> Result<Vec<Participant>, BackendError> {
         let data = self.get(token, &format!("/games/{game_id}/participants"))?;
         Ok(Self::parse_roster(&data))
     }
@@ -755,7 +800,11 @@ impl MinosMaster {
     }
 
     /// A game's order of battle with current commanders.
-    pub fn game_units_list(&self, token: &str, game_id: i64) -> Result<Vec<GameUnit>, BackendError> {
+    pub fn game_units_list(
+        &self,
+        token: &str,
+        game_id: i64,
+    ) -> Result<Vec<GameUnit>, BackendError> {
         let data = self.get(token, &format!("/games/{game_id}/units"))?;
         Ok(Self::parse_units(&data))
     }
@@ -790,17 +839,15 @@ impl MinosMaster {
     /// names the missing window, and the only writers of the window are this
     /// route and the PATCH. An exercise whose window the operator stated at
     /// the door does not have to be repaired in a second panel afterwards.
-    pub fn create_game(
-        &self,
-        token: &str,
-        req: &NewGame,
-    ) -> Result<GameRow, BackendError> {
+    pub fn create_game(&self, token: &str, req: &NewGame) -> Result<GameRow, BackendError> {
         let data = self.post(token, "/games", new_game_body(req))?;
         Ok(GameRow {
             id: data["id"].as_i64().unwrap_or(0),
             name: data["name"].as_str().unwrap_or("").to_string(),
             state: data["state"].as_str().unwrap_or("planning").to_string(),
-            mode: "".to_string(),
+            mode: data["mode"].as_str().unwrap_or("").to_string(),
+            created_at: data["created_at"].as_str().unwrap_or("").to_string(),
+            updated_at: data["updated_at"].as_str().unwrap_or("").to_string(),
         })
     }
 
@@ -854,7 +901,9 @@ impl MinosMaster {
             id: data["id"].as_i64().unwrap_or(game_id),
             name: data["name"].as_str().unwrap_or("").to_string(),
             state: data["state"].as_str().unwrap_or(to).to_string(),
-            mode: "".to_string(),
+            mode: data["mode"].as_str().unwrap_or("").to_string(),
+            created_at: data["created_at"].as_str().unwrap_or("").to_string(),
+            updated_at: data["updated_at"].as_str().unwrap_or("").to_string(),
         })
     }
 
@@ -863,11 +912,7 @@ impl MinosMaster {
     /// local stage derives from this, never from a local flag alone;
     /// Minos is forward-only, so this read is the only way to learn a
     /// transition another client made.
-    pub fn game_detail(
-        &self,
-        token: &str,
-        game_id: i64,
-    ) -> Result<GameDetail, BackendError> {
+    pub fn game_detail(&self, token: &str, game_id: i64) -> Result<GameDetail, BackendError> {
         let data = self.get(token, &format!("/games/{game_id}"))?;
         Ok(Self::parse_game_detail(&data, game_id))
     }
@@ -901,6 +946,7 @@ impl MinosMaster {
             window: Self::parse_window(v),
             pace: v["pace"].as_str().and_then(GamePace::parse),
             time_factor: v["time_factor"].as_f64().unwrap_or(0.0),
+            max_echelon_rank: v["max_echelon_rank"].as_i64(),
             room_key: v["room_key"].as_str().map(|s| s.to_string()),
         }
     }
@@ -1017,7 +1063,10 @@ impl MinosMaster {
         game_id: i64,
         unit_id: i64,
     ) -> Result<PlacementList, BackendError> {
-        let data = self.delete(token, &format!("/games/{game_id}/units/{unit_id}/placement"))?;
+        let data = self.delete(
+            token,
+            &format!("/games/{game_id}/units/{unit_id}/placement"),
+        )?;
         Ok(Self::parse_placements(&data))
     }
 
@@ -1131,7 +1180,10 @@ impl MinosMaster {
         game_id: i64,
         node_id: i64,
     ) -> Result<(), BackendError> {
-        self.delete(token, &format!("/games/{game_id}/hierarchy/{node_id}/parent"))?;
+        self.delete(
+            token,
+            &format!("/games/{game_id}/hierarchy/{node_id}/parent"),
+        )?;
         Ok(())
     }
 
@@ -1167,7 +1219,10 @@ impl MinosMaster {
         game_id: i64,
         node_id: i64,
     ) -> Result<(), BackendError> {
-        self.delete(token, &format!("/games/{game_id}/hierarchy/{node_id}/commander"))?;
+        self.delete(
+            token,
+            &format!("/games/{game_id}/hierarchy/{node_id}/commander"),
+        )?;
         Ok(())
     }
 
@@ -1200,7 +1255,10 @@ impl MinosMaster {
         game_id: i64,
         unit_id: i64,
     ) -> Result<(), BackendError> {
-        self.delete(token, &format!("/games/{game_id}/units/{unit_id}/hierarchy"))?;
+        self.delete(
+            token,
+            &format!("/games/{game_id}/units/{unit_id}/hierarchy"),
+        )?;
         Ok(())
     }
 
@@ -1209,11 +1267,7 @@ impl MinosMaster {
     /// plus the caller's own participant row, which also confirms the
     /// caller's user id for readiness matching. Unknown key is 404, a
     /// valid key without a seat is 403 (ask the Game Master), both loud.
-    pub fn join_game(
-        &self,
-        token: &str,
-        room_key: &str,
-    ) -> Result<JoinResult, BackendError> {
+    pub fn join_game(&self, token: &str, room_key: &str) -> Result<JoinResult, BackendError> {
         let data = self.post(
             token,
             "/games/join",
@@ -1283,7 +1337,9 @@ impl MinosMaster {
             body,
         )?;
         if status == reqwest::StatusCode::CREATED {
-            return Ok(OrderOutcome::Applied(Self::parse_order_fix(&data, unit_id)?));
+            return Ok(OrderOutcome::Applied(Self::parse_order_fix(
+                &data, unit_id,
+            )?));
         }
         if status == reqwest::StatusCode::ACCEPTED {
             return Ok(OrderOutcome::Staged(Self::parse_staged_order(
@@ -1303,16 +1359,15 @@ impl MinosMaster {
     /// the compass, a speed below nought, a coordinate off the globe,
     /// or a `clamped` flag that disagrees with the requested speed the
     /// body carries beside it.
-    fn parse_order_fix(
-        data: &serde_json::Value,
-        unit_id: i64,
-    ) -> Result<GameFix, BackendError> {
+    fn parse_order_fix(data: &serde_json::Value, unit_id: i64) -> Result<GameFix, BackendError> {
         let malformed = |field: &str| {
             BackendError::Other(format!(
                 "malformed Minos order response: missing or invalid {field}"
             ))
         };
-        let response_unit = data["id_unit"].as_i64().ok_or_else(|| malformed("id_unit"))?;
+        let response_unit = data["id_unit"]
+            .as_i64()
+            .ok_or_else(|| malformed("id_unit"))?;
         if response_unit != unit_id {
             return Err(BackendError::Other(format!(
                 "malformed Minos order response: id_unit {response_unit} does not match path {unit_id}"
@@ -1411,7 +1466,9 @@ impl MinosMaster {
         let heading_deg = v["heading_deg"]
             .as_f64()
             .ok_or_else(|| malformed("heading_deg"))?;
-        let speed_kn = v["speed_kn"].as_f64().ok_or_else(|| malformed("speed_kn"))?;
+        let speed_kn = v["speed_kn"]
+            .as_f64()
+            .ok_or_else(|| malformed("speed_kn"))?;
         let clamped = v["clamped"].as_bool().ok_or_else(|| malformed("clamped"))?;
         let requested_speed_kn = match v.get("requested_speed_kn") {
             None | Some(serde_json::Value::Null) => None,
@@ -1634,8 +1691,12 @@ impl MinosMaster {
                 "malformed Minos drag-preview response: id_unit {response_unit} does not match path {unit_id}"
             )));
         }
-        let latitude = v["latitude"].as_f64().ok_or_else(|| malformed("latitude"))?;
-        let longitude = v["longitude"].as_f64().ok_or_else(|| malformed("longitude"))?;
+        let latitude = v["latitude"]
+            .as_f64()
+            .ok_or_else(|| malformed("latitude"))?;
+        let longitude = v["longitude"]
+            .as_f64()
+            .ok_or_else(|| malformed("longitude"))?;
         if !latitude.is_finite()
             || !(-90.0..=90.0).contains(&latitude)
             || !longitude.is_finite()
@@ -1719,9 +1780,7 @@ impl MinosMaster {
             .iter()
             .map(|p| {
                 Ok(GameHullPos {
-                    unit_id: p["id_unit"]
-                        .as_i64()
-                        .ok_or_else(|| malformed("id_unit"))?,
+                    unit_id: p["id_unit"].as_i64().ok_or_else(|| malformed("id_unit"))?,
                     latitude: p["latitude"]
                         .as_f64()
                         .ok_or_else(|| malformed("latitude"))?,
@@ -1734,9 +1793,7 @@ impl MinosMaster {
                     speed: p["speed_kn"]
                         .as_f64()
                         .ok_or_else(|| malformed("speed_kn"))?,
-                    clamped: p["clamped"]
-                        .as_bool()
-                        .ok_or_else(|| malformed("clamped"))?,
+                    clamped: p["clamped"].as_bool().ok_or_else(|| malformed("clamped"))?,
                     assumed_time: p["assumed_time"]
                         .as_str()
                         .filter(|value| !value.is_empty())
@@ -1855,12 +1912,20 @@ impl MinosMaster {
         });
         if !draft.to.is_empty() {
             body["to"] = serde_json::Value::Array(
-                draft.to.iter().map(|u| serde_json::Value::from(*u)).collect(),
+                draft
+                    .to
+                    .iter()
+                    .map(|u| serde_json::Value::from(*u))
+                    .collect(),
             );
         }
         if !draft.cc.is_empty() {
             body["cc"] = serde_json::Value::Array(
-                draft.cc.iter().map(|u| serde_json::Value::from(*u)).collect(),
+                draft
+                    .cc
+                    .iter()
+                    .map(|u| serde_json::Value::from(*u))
+                    .collect(),
             );
         }
         if let Some(r) = draft.assumed_role {
@@ -1884,9 +1949,8 @@ impl MinosMaster {
             }
         }
         let data = self.post(token, &format!("/games/{game_id}/messages"), body)?;
-        Self::parse_inbox(&data).ok_or_else(|| {
-            BackendError::Other("send answer without a message".to_string())
-        })
+        Self::parse_inbox(&data)
+            .ok_or_else(|| BackendError::Other("send answer without a message".to_string()))
     }
 
     /// One inbox page (#99): the messages the caller may see, newest
@@ -1899,7 +1963,9 @@ impl MinosMaster {
         kind: Option<&str>,
         only_mine: bool,
     ) -> Result<Vec<InboxMsg>, BackendError> {
-        Ok(self.inbox_page(token, game_id, kind, only_mine, 1, 100)?.messages)
+        Ok(self
+            .inbox_page(token, game_id, kind, only_mine, 1, 100)?
+            .messages)
     }
 
     /// One inbox page (messages ticket): kind + mine narrows ride
@@ -1960,9 +2026,8 @@ impl MinosMaster {
         message_id: i64,
     ) -> Result<InboxMsg, BackendError> {
         let data = self.get(token, &format!("/games/{game_id}/messages/{message_id}"))?;
-        Self::parse_inbox(&data).ok_or_else(|| {
-            BackendError::Other(format!("message #{message_id} unreadable"))
-        })
+        Self::parse_inbox(&data)
+            .ok_or_else(|| BackendError::Other(format!("message #{message_id} unreadable")))
     }
 
     /// Delete one message (messages ticket): a sender's withdrawal
@@ -2193,10 +2258,7 @@ impl MinosMaster {
     /// picture and the content version. Manifest-first: the UI checks
     /// this before resolving any URL, so hulls without pictures cost
     /// no request. The version answers staleness without headers.
-    pub fn unit_image_manifest(
-        &self,
-        token: &str,
-    ) -> Result<ImageManifest, BackendError> {
+    pub fn unit_image_manifest(&self, token: &str) -> Result<ImageManifest, BackendError> {
         let data = self.get(token, "/assets/unit-images/manifest")?;
         Ok(Self::parse_image_manifest(&data))
     }
@@ -2242,9 +2304,7 @@ impl MinosMaster {
         ImageManifest {
             version,
             entry_count: data["entry_count"].as_i64().unwrap_or(0) as usize,
-            units_without_image: data["units_without_image_count"]
-                .as_i64()
-                .unwrap_or(0),
+            units_without_image: data["units_without_image_count"].as_i64().unwrap_or(0),
             entries,
         }
     }
@@ -2363,11 +2423,7 @@ impl MinosMaster {
             "id_personnel": personnel_id,
             "score": score,
         });
-        let data = self.post(
-            token,
-            &format!("/games/{game_id}/judgements"),
-            body,
-        )?;
+        let data = self.post(token, &format!("/games/{game_id}/judgements"), body)?;
         Ok(Judgement {
             id: data["id"].as_i64().unwrap_or(0),
             personnel_id: data["personnel"]["id"].as_i64().unwrap_or(personnel_id),
@@ -2390,10 +2446,12 @@ impl MinosMaster {
         game_id: i64,
         message_id: i64,
     ) -> Result<InboxMsg, BackendError> {
-        let data = self.post_empty(token, &format!("/games/{game_id}/messages/{message_id}/read"))?;
-        Self::parse_inbox(&data).ok_or_else(|| {
-            BackendError::Other("read answer without a message".to_string())
-        })
+        let data = self.post_empty(
+            token,
+            &format!("/games/{game_id}/messages/{message_id}/read"),
+        )?;
+        Self::parse_inbox(&data)
+            .ok_or_else(|| BackendError::Other("read answer without a message".to_string()))
     }
 
     /// Identities staff may send as (#99): per-game scenario roles.
@@ -2496,10 +2554,7 @@ impl MinosMaster {
         game_id: i64,
         scenario_id: i64,
     ) -> Result<GameScenario, BackendError> {
-        let data = self.get(
-            token,
-            &format!("/games/{game_id}/scenarios/{scenario_id}"),
-        )?;
+        let data = self.get(token, &format!("/games/{game_id}/scenarios/{scenario_id}"))?;
         Self::parse_scenario(&data, game_id)
     }
 
@@ -2536,10 +2591,7 @@ impl MinosMaster {
             body.insert("title".into(), serde_json::Value::String(t.into()));
         }
         if let Some(d) = description {
-            body.insert(
-                "description".into(),
-                serde_json::Value::String(d.into()),
-            );
+            body.insert("description".into(), serde_json::Value::String(d.into()));
         }
         let data = self.patch(
             token,
@@ -2613,7 +2665,10 @@ impl MinosMaster {
                     body.insert("end_hour".into(), serde_json::Value::String(end.into()));
                 }
                 None => {
-                    body.insert("start_hour".into(), serde_json::Value::String(String::new()));
+                    body.insert(
+                        "start_hour".into(),
+                        serde_json::Value::String(String::new()),
+                    );
                     body.insert("end_hour".into(), serde_json::Value::String(String::new()));
                 }
             }
@@ -2640,6 +2695,77 @@ impl MinosMaster {
             &format!("/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}"),
         )?;
         Self::parse_scenario(&data, game_id)
+    }
+
+    /// Add a command to a step: one instruction to one audience.
+    ///
+    /// A `beat` carries NO sub-steps — the server answers 409 — so the
+    /// composer refuses a drop on a beat locally with the server's own
+    /// sentence rather than sending this and translating a refusal. Answers
+    /// with the whole scenario, like every other step-route write.
+    pub fn add_game_substep(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+        content: &str,
+    ) -> Result<GameScenario, BackendError> {
+        let data = self.post(
+            token,
+            &format!("/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}/substeps"),
+            serde_json::json!({ "content": content }),
+        )?;
+        Self::parse_scenario(&data, game_id)
+    }
+
+    /// Replace a sub-step's whole audience: the exercise's hulls, nothing
+    /// else. THE WHOLE LIST, not a delta — an empty list clears it.
+    ///
+    /// The body is the step-level related route's own shape
+    /// (`{related:[{kind:"hull", id}]}`), which is why this takes hulls
+    /// alone: a sub-step's command is addressed to hulls, and a node is not
+    /// an audience at a command.
+    pub fn set_game_substep_related(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+        substep_id: i64,
+        hulls: &[i64],
+    ) -> Result<StepRelated, BackendError> {
+        let refs: Vec<serde_json::Value> = hulls
+            .iter()
+            .map(|id| serde_json::json!({ "kind": "hull", "id": id }))
+            .collect();
+        let data = self.put(
+            token,
+            &format!(
+                "/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}/substeps/{substep_id}/related"
+            ),
+            serde_json::json!({ "related": refs }),
+        )?;
+        Ok(Self::parse_step_related(&data))
+    }
+
+    /// A sub-step's audience, resolved — the same shape a step's related read
+    /// gives, because the server resolves both through one vocabulary.
+    pub fn game_substep_related(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+        substep_id: i64,
+    ) -> Result<StepRelated, BackendError> {
+        let data = self.get(
+            token,
+            &format!(
+                "/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}/substeps/{substep_id}/related"
+            ),
+        )?;
+        Ok(Self::parse_step_related(&data))
     }
 
     /// Read whether a step may start, and who is holding it back. Readable
@@ -2841,6 +2967,246 @@ impl MinosMaster {
         Ok(())
     }
 
+    // -- Saved Scenarios: the detached missions START FROM lists --------
+
+    /// The Saved Scenarios: `GET /scenario-missions`.
+    ///
+    /// A Saved Scenario IS a detached mission on the server — the row is
+    /// `scenario_mission` and the operator's word is scenario (`CONTEXT.md`)
+    /// — with its steps, their sub-steps, and the hulls those sub-steps
+    /// oblige by REGISTER id, no game anywhere.
+    ///
+    /// Paged like every list: a detached mission is cheap to hold and a
+    /// client that stopped at the first page would silently lose the rest.
+    pub fn scenario_missions(&self, token: &str) -> Result<Vec<ScenarioMission>, BackendError> {
+        Ok(self
+            .paged(token, "/scenario-missions")?
+            .iter()
+            .filter_map(|m| Self::parse_mission(m).ok())
+            .collect())
+    }
+
+    /// One Saved Scenario, with its steps, sub-steps and audiences.
+    pub fn scenario_mission(
+        &self,
+        token: &str,
+        mission_id: i64,
+    ) -> Result<ScenarioMission, BackendError> {
+        let data = self.get(token, &format!("/scenario-missions/{mission_id}"))?;
+        Self::parse_mission(&data)
+    }
+
+    /// Create a Saved Scenario. `code` is omitted: the server normalises it to
+    /// upper case and makes it unique among live missions, and a draft that
+    /// has not asked for one must not invent it (§18.6: the code may be
+    /// omitted, driven against the live API).
+    pub fn create_scenario_mission(
+        &self,
+        token: &str,
+        title: &str,
+        description: &str,
+    ) -> Result<ScenarioMission, BackendError> {
+        let data = self.post(
+            token,
+            "/scenario-missions",
+            serde_json::json!({ "title": title, "description": description }),
+        )?;
+        Self::parse_mission(&data)
+    }
+
+    /// Append a step to a Saved Scenario. Append only — the caller does not
+    /// choose a position, so two authors adding at once cannot collide on the
+    /// ordering index.
+    ///
+    /// `kind` is sent only when the draft has one: a step created without a
+    /// kind takes the server's own default, which is what the console's
+    /// composer has always sent.
+    pub fn add_mission_step(
+        &self,
+        token: &str,
+        mission_id: i64,
+        kind: Option<&str>,
+        content: &str,
+        window: Option<(&str, &str)>,
+    ) -> Result<ScenarioMission, BackendError> {
+        let mut body = serde_json::Map::new();
+        body.insert("content".into(), serde_json::Value::String(content.into()));
+        if let Some(kind) = kind {
+            body.insert("kind".into(), serde_json::Value::String(kind.into()));
+        }
+        if let Some((start, end)) = window {
+            body.insert("start_hour".into(), serde_json::Value::String(start.into()));
+            body.insert("end_hour".into(), serde_json::Value::String(end.into()));
+        }
+        let data = self.post(
+            token,
+            &format!("/scenario-missions/{mission_id}/steps"),
+            serde_json::Value::Object(body),
+        )?;
+        Self::parse_mission(&data)
+    }
+
+    /// Append a command to a step of a Saved Scenario. A `beat` refuses this
+    /// with a 409, so the composer refuses it locally first.
+    pub fn add_mission_substep(
+        &self,
+        token: &str,
+        mission_id: i64,
+        step_id: i64,
+        content: &str,
+    ) -> Result<ScenarioMission, BackendError> {
+        let data = self.post(
+            token,
+            &format!("/scenario-missions/{mission_id}/steps/{step_id}/substeps"),
+            serde_json::json!({ "content": content }),
+        )?;
+        Self::parse_mission(&data)
+    }
+
+    /// Replace a command's audience in a Saved Scenario: REGISTER hull ids
+    /// under `units`, which is the template ladder's own shape — the game
+    /// ladder's is `related:[{kind:"hull", id}]`, and the two are not
+    /// interchangeable (§11).
+    pub fn set_mission_substep_related(
+        &self,
+        token: &str,
+        mission_id: i64,
+        step_id: i64,
+        substep_id: i64,
+        units: &[i64],
+    ) -> Result<Vec<RelatedHull>, BackendError> {
+        let data = self.put(
+            token,
+            &format!(
+                "/scenario-missions/{mission_id}/steps/{step_id}/substeps/{substep_id}/related"
+            ),
+            serde_json::json!({ "units": units }),
+        )?;
+        Ok(Self::parse_related_hulls(&data))
+    }
+
+    /// Remove a step from a Saved Scenario. Positions are not renumbered, so a
+    /// gap in the order is legal and expected — the same rule the game's book
+    /// follows.
+    pub fn delete_mission_step(
+        &self,
+        token: &str,
+        mission_id: i64,
+        step_id: i64,
+    ) -> Result<ScenarioMission, BackendError> {
+        let data = self.delete(
+            token,
+            &format!("/scenario-missions/{mission_id}/steps/{step_id}"),
+        )?;
+        Self::parse_mission(&data)
+    }
+
+    /// A command's audience in a Saved Scenario, as register hulls.
+    pub fn mission_substep_related(
+        &self,
+        token: &str,
+        mission_id: i64,
+        step_id: i64,
+        substep_id: i64,
+    ) -> Result<Vec<RelatedHull>, BackendError> {
+        let data = self.get(
+            token,
+            &format!(
+                "/scenario-missions/{mission_id}/steps/{step_id}/substeps/{substep_id}/related"
+            ),
+        )?;
+        Ok(Self::parse_related_hulls(&data))
+    }
+
+    /// One Saved Scenario, steps nested.
+    ///
+    /// A mission without an id is a decode error rather than a dropped row,
+    /// for the reason a scenario without one is: the draft either seeds from
+    /// THIS mission or it does not exist, and a silently skipped row leaves
+    /// the operator looking at an empty list with nothing on screen to explain
+    /// it.
+    ///
+    /// STEPS ARE ORDERED BY `position`, and their sub-steps with them. The
+    /// array's own order is not a promise, and the number the operator reads
+    /// (`01`, `02`) is the position — a list drawn in array order could number
+    /// the same book two ways.
+    fn parse_mission(v: &serde_json::Value) -> Result<ScenarioMission, BackendError> {
+        let id = v["id"]
+            .as_i64()
+            .ok_or_else(|| BackendError::Other("mission answer without an id".to_string()))?;
+        let mut steps: Vec<MissionStep> = v["steps"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Self::parse_mission_step)
+            .collect();
+        steps.sort_by_key(|s| s.position);
+        Ok(ScenarioMission {
+            id,
+            code: v["code"].as_str().unwrap_or("").to_string(),
+            title: v["title"].as_str().unwrap_or("").to_string(),
+            description: v["description"].as_str().unwrap_or("").to_string(),
+            play_count: v["play_count"].as_i64().unwrap_or(0),
+            // The documented mission carries no date of its own; the landing's
+            // row still needs one, so it is read when the server sends it and
+            // otherwise falls back to the newest step (see `date_stamp`).
+            updated_at: v["updated_at"].as_str().map(|s| s.to_string()),
+            steps,
+        })
+    }
+
+    fn parse_mission_step(v: &serde_json::Value) -> Option<MissionStep> {
+        let mut substeps: Vec<MissionSubstep> = v["substeps"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Self::parse_mission_substep)
+            .collect();
+        substeps.sort_by_key(|s| s.position);
+        Some(MissionStep {
+            id: v["id"].as_i64()?,
+            position: v["position"].as_i64().unwrap_or(0),
+            kind: v["kind"].as_str().unwrap_or("").to_string(),
+            content: v["content"].as_str().unwrap_or("").to_string(),
+            start_hour: v["start_hour"].as_str().map(|s| s.to_string()),
+            end_hour: v["end_hour"].as_str().map(|s| s.to_string()),
+            updated_at: v["updated_at"].as_str().map(|s| s.to_string()),
+            substeps,
+        })
+    }
+
+    fn parse_mission_substep(v: &serde_json::Value) -> Option<MissionSubstep> {
+        Some(MissionSubstep {
+            id: v["id"].as_i64()?,
+            position: v["position"].as_i64().unwrap_or(0),
+            content: v["content"].as_str().unwrap_or("").to_string(),
+            units: Self::parse_related_hulls(v)
+                .into_iter()
+                .map(|h| h.unit_id)
+                .collect(),
+        })
+    }
+
+    /// A `related` list of hulls, as the template ladder states it:
+    /// `{id_unit, unit_name, hull_number}` — REGISTER ids.
+    fn parse_related_hulls(v: &serde_json::Value) -> Vec<RelatedHull> {
+        v["related"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| {
+                Some(RelatedHull {
+                    unit_id: r["id_unit"].as_i64()?,
+                    name: r["unit_name"].as_str().unwrap_or("").to_string(),
+                    hull_number: r["hull_number"].as_str().unwrap_or("").to_string(),
+                })
+            })
+            .collect()
+    }
+
     /// Where the exercise is, and what the caller is being asked to
     /// declare: the participant's only door onto the plan. `current`
     /// is the step in play (absent between steps); `asking` is the
@@ -2860,9 +3226,7 @@ impl MinosMaster {
     /// a missing `asking` means no step asks this caller, never an
     /// empty step to render.
     fn parse_current_step(v: &serde_json::Value) -> CurrentStepView {
-        fn parse_half(
-            v: &serde_json::Value,
-        ) -> Option<(CurrentStepScenario, CurrentStepStep)> {
+        fn parse_half(v: &serde_json::Value) -> Option<(CurrentStepScenario, CurrentStepStep)> {
             // Every field is READ through `get`, never indexed.
             //
             // A step with no window has no `window_end_at` key AT ALL —
@@ -2897,18 +3261,16 @@ impl MinosMaster {
                 },
             ))
         }
-        let current = v
-            .get("current")
-            .and_then(|c| {
-                let (scenario, step) = parse_half(c)?;
-                let run = c.get("run")?;
-                Some(CurrentStepPlaying {
-                    scenario,
-                    step,
-                    state: run["state"].as_str().unwrap_or("").to_string(),
-                    assumed_start: run["assumed_start"].as_str().map(|s| s.to_string()),
-                })
-            });
+        let current = v.get("current").and_then(|c| {
+            let (scenario, step) = parse_half(c)?;
+            let run = c.get("run")?;
+            Some(CurrentStepPlaying {
+                scenario,
+                step,
+                state: run["state"].as_str().unwrap_or("").to_string(),
+                assumed_start: run["assumed_start"].as_str().map(|s| s.to_string()),
+            })
+        });
         let asking = v.get("asking").and_then(|a| {
             let (scenario, step) = parse_half(a)?;
             let you = a.get("you")?;
@@ -2924,7 +3286,10 @@ impl MinosMaster {
             })
         });
         CurrentStepView {
-            assumed_time: v.get("assumed_time").and_then(|t| t.as_str()).map(|s| s.to_string()),
+            assumed_time: v
+                .get("assumed_time")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string()),
             current,
             asking,
         }
@@ -2992,10 +3357,7 @@ impl MinosMaster {
     }
 
     /// The book, from either envelope shape.
-    fn parse_scenarios(
-        v: &serde_json::Value,
-        game_id: i64,
-    ) -> Vec<GameScenario> {
+    fn parse_scenarios(v: &serde_json::Value, game_id: i64) -> Vec<GameScenario> {
         v.as_array()
             .cloned()
             .unwrap_or_default()
@@ -3033,6 +3395,17 @@ impl MinosMaster {
         })
     }
 
+    /// One nested command of a game's step. A command with no id is dropped
+    /// for the reason a step with no id is: the composer's verbs address it by
+    /// id, and a row nobody can address is a row whose buttons all fail.
+    fn parse_scenario_substep(v: &serde_json::Value) -> Option<GameScenarioSubstep> {
+        Some(GameScenarioSubstep {
+            id: v["id"].as_i64()?,
+            position: v["position"].as_i64().unwrap_or(0),
+            content: v["content"].as_str().unwrap_or("").to_string(),
+        })
+    }
+
     /// One nested step.
     ///
     /// `scenario_id` comes from the PARENT, not from the step's own payload.
@@ -3049,6 +3422,14 @@ impl MinosMaster {
             id: v["id"].as_i64()?,
             scenario_id: parent_scenario_id,
             position: v["position"].as_i64().unwrap_or(0),
+            kind: v["kind"].as_str().unwrap_or("").to_string(),
+            substeps: v["substeps"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(Self::parse_scenario_substep)
+                .collect(),
             // Content may legitimately be empty: a plan is authored while it
             // is being written, and the backend says so explicitly rather
             // than requiring a placeholder.
@@ -3082,8 +3463,14 @@ impl MinosMaster {
             id: v["id"].as_i64()?,
             game_id: v["id_game"].as_i64().unwrap_or(0),
             kind: v["kind"].as_str().unwrap_or("").to_string(),
-            class_code: v["classification"]["code"].as_str().unwrap_or("").to_string(),
-            class_label: v["classification"]["label"].as_str().unwrap_or("").to_string(),
+            class_code: v["classification"]["code"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+            class_label: v["classification"]["label"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
             border_color: v["classification"]["border_color"]
                 .as_str()
                 .unwrap_or("")
@@ -3092,12 +3479,16 @@ impl MinosMaster {
                 .as_str()
                 .map(|s| s.to_string())
                 .or_else(|| {
-                    v["sender"]["author"]["name"].as_str().map(|s| s.to_string())
+                    v["sender"]["author"]["name"]
+                        .as_str()
+                        .map(|s| s.to_string())
                 })
                 .unwrap_or_else(|| "unknown sender".to_string()),
             assumed_role_id: v["sender"]["assumed_role"]["id"].as_i64(),
             author_id: v["sender"]["author"]["id"].as_i64(),
-            author_name: v["sender"]["author"]["name"].as_str().map(|s| s.to_string()),
+            author_name: v["sender"]["author"]["name"]
+                .as_str()
+                .map(|s| s.to_string()),
             broadcast: v["broadcast"].as_bool().unwrap_or(false),
             content: v["content"].as_str().unwrap_or("").to_string(),
             callsign: v["callsign"].as_str().unwrap_or("").to_string(),
@@ -3145,7 +3536,10 @@ impl MinosMaster {
             })
             .collect();
         PlacementList {
-            placed: v["placed"].as_u64().map(|n| n as usize).unwrap_or(placements.len()),
+            placed: v["placed"]
+                .as_u64()
+                .map(|n| n as usize)
+                .unwrap_or(placements.len()),
             unplaced: v["unplaced"].as_i64().unwrap_or(0),
             ready: v["ready"].as_bool().unwrap_or(false),
             placements,
@@ -3167,9 +3561,15 @@ impl MinosMaster {
             game_name: v["game"]["name"].as_str().unwrap_or("").to_string(),
             game_state: v["game"]["state"].as_str().unwrap_or("").to_string(),
             user_id,
-            user_name: v["participant"]["user_name"].as_str().unwrap_or("").to_string(),
+            user_name: v["participant"]["user_name"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
             role_id: v["participant"]["id_game_role"].as_i64().unwrap_or(0),
-            role_name: v["participant"]["role_name"].as_str().unwrap_or("").to_string(),
+            role_name: v["participant"]["role_name"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
             judge: v["participant"]["is_judge_side"].as_bool().unwrap_or(false),
             ready: v["participant"]["is_ready"].as_bool().unwrap_or(false),
             // The caller's own pieces (empty, never null by
@@ -3236,6 +3636,12 @@ pub struct GameRow {
     /// that threw it away left the operator unable to tell a scenario
     /// exercise from a maneuver one before holding it.
     pub mode: String,
+    /// When the game was made, as the server stamps it. The landing's `WHEN`
+    /// column reads this and nothing else: the sheet's `ORIGIN` column has no
+    /// API backing and is dropped (erratum 11), so provenance is a backend
+    /// field request rather than a client guess from names.
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// A game's planned window: two clocks, each with a start and an end.
@@ -3344,6 +3750,17 @@ pub fn new_game_body(req: &NewGame) -> serde_json::Value {
     if let Some(pace) = req.pace {
         body["pace"] = serde_json::Value::String(pace.wire().to_string());
     }
+    // The ceiling is a RANK NUMBER (erratum 7): the server takes `40`, not the
+    // hierarchy row's id, so it is sent as it is held.
+    if let Some(rank) = req.max_echelon_rank {
+        body["max_echelon_rank"] = serde_json::json!(rank);
+    }
+    // The factor rides beside the ends it produced, because a create is one
+    // statement of the time base: the two real ends and the ratio that made
+    // the assumed ones.
+    if let Some(factor) = req.time_factor {
+        body["time_factor"] = serde_json::json!(factor);
+    }
     for (k, v) in [
         ("actual_start", &req.window.actual_start),
         ("actual_end", &req.window.actual_end),
@@ -3381,6 +3798,13 @@ pub struct NewGame {
     pub pace: Option<GamePace>,
     /// The planned window, both clocks.
     pub window: TimeWindow,
+    /// `max_echelon_rank` — THE RANK NUMBER, e.g. `40`, not a hierarchy id
+    /// (erratum 7: driven against the live API). Absent means the server's own
+    /// ceiling, which is every level.
+    pub max_echelon_rank: Option<i64>,
+    /// The assumed-to-real ratio. Absent leaves the server's own, and the
+    /// create accepts it beside the ends the client derived from it (§4.1).
+    pub time_factor: Option<f64>,
 }
 
 /// Partial game edit: the six text fields the create form owns, plus pace
@@ -3444,6 +3868,15 @@ pub struct GameDetail {
     /// to be inconvenient is only inconvenient.
     pub pace: Option<GamePace>,
     pub time_factor: f64,
+    /// The highest echelon rank this game's task organisation may hold. A
+    /// RANK NUMBER — `40`, not a hierarchy id (erratum 7, driven against the
+    /// live API: the create takes the number) — so a client compares numbers
+    /// rather than resolving a level and comparing ids.
+    ///
+    /// `None` means the server sent none, which is "no ceiling", not "rank
+    /// zero": a reopened draft reads it here and a blank one picks it in
+    /// stage 03.
+    pub max_echelon_rank: Option<i64>,
     /// What personnel type to enter the room. Null until the game
     /// enters preparation — a planning game has no room to enter —
     /// and sent to every entitled caller, participants included,
@@ -3828,7 +4261,10 @@ pub struct GamePositionFix {
 
 impl GamePositionUpdate {
     pub fn from_plot(game_id: i64, plot: PositionList) -> Self {
-        let PositionList { assumed_time, positions: rows } = plot;
+        let PositionList {
+            assumed_time,
+            positions: rows,
+        } = plot;
         let positions = rows
             .into_iter()
             .map(|p| GamePositionFix {
@@ -3840,7 +4276,11 @@ impl GamePositionUpdate {
                 assumed_time: p.assumed_time,
             })
             .collect();
-        Self { game_id, assumed_time, positions }
+        Self {
+            game_id,
+            assumed_time,
+            positions,
+        }
     }
 
     pub fn from_fix(game_id: i64, fix: GameFix) -> Self {
@@ -4091,12 +4531,35 @@ pub struct GameScenarioStep {
     pub scenario_id: i64,
     /// Zero-based within the scenario. Gaps are legal after a delete.
     pub position: i64,
+    /// `orders`, `beat`, … — the kind the composer shows as the row's stamp,
+    /// and the one that decides whether a command may be posted on the step at
+    /// all (a `beat` answers 409 to one). Empty when the server stated none.
+    pub kind: String,
     /// May be empty, deliberately: a step whose text is still to come is a
     /// legitimate authoring state, not an error.
     pub content: String,
     /// The window as authored, `HHMM`, four digits. Both ends or neither.
     pub start_hour: Option<String>,
     pub end_hour: Option<String>,
+    /// The step's commands, nested like the steps themselves: there is no
+    /// sub-step list route. Each one's AUDIENCE is a separate read
+    /// ([`MinosMaster::game_substep_related`]) — the nested shape carries the
+    /// instruction and not the hulls it obliges.
+    pub substeps: Vec<GameScenarioSubstep>,
+}
+
+/// One command inside a step of a game's book: one instruction to one
+/// audience.
+///
+/// The audience is NOT here. A game's command carries its hulls on its own
+/// related route (`GET .../substeps/{id}/related`), and the nested read gives
+/// `{id, position, content}` alone — so a caller that wants the audience asks
+/// for it, and one that only draws the row does not pay for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameScenarioSubstep {
+    pub id: i64,
+    pub position: i64,
+    pub content: String,
 }
 
 /// One step run: what happened to one step in one attempt, on the assumed
@@ -4279,6 +4742,149 @@ impl GameScenarioStep {
 /// forwards: `view`'s pure string validation, re-exported here so every
 /// existing `backend::hhmm_*` path resolves unchanged.
 pub use crate::view::{hhmm_ok, hhmm_window_ok};
+
+// ===========================================================================
+// Saved Scenarios: the detached missions the landing's START FROM lists
+// ===========================================================================
+
+/// One Saved Scenario: a detached mission, with no game anywhere.
+///
+/// THE SERVER'S ROW IS `scenario_mission` AND THE OPERATOR'S WORD IS
+/// SCENARIO. It carries steps, their commands, and the REGISTER hulls those
+/// commands oblige — no map, no positions, no seats, no task organisation and
+/// no commander, which is what `NO MAP · NO SEATS, NO GROUPS` means on the
+/// arrival frame (`docs/creation-flow-handoff.md` §10).
+///
+/// It is not a template in the CMS's sense: "template" is that vocabulary's
+/// word for a scenario ROLE, and a Saved Scenario is a plan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScenarioMission {
+    pub id: i64,
+    /// The server's short code, upper case. The landing's START FROM row
+    /// prints it beside the title (`Harbour Sweep · Littoral`), which is the
+    /// frame's second column and needs no new field.
+    pub code: String,
+    pub title: String,
+    pub description: String,
+    pub play_count: i64,
+    /// The mission's own stamp when the server sends one. The documented
+    /// mission shape carries none, so [`ScenarioMission::date_stamp`] is the
+    /// honest accessor: the row still needs a date, and the newest step's own
+    /// stamp is a fact the server does state.
+    pub updated_at: Option<String>,
+    pub steps: Vec<MissionStep>,
+}
+
+impl ScenarioMission {
+    pub fn step_count(&self) -> usize {
+        self.steps.len()
+    }
+
+    pub fn sub_step_count(&self) -> usize {
+        self.steps.iter().map(|s| s.substeps.len()).sum()
+    }
+
+    /// The date the landing's row shows: the mission's own stamp, or the
+    /// newest step's, or nothing.
+    ///
+    /// A mission has no date field in the documented shape and its steps do,
+    /// so a client that only read the mission's would show an empty column for
+    /// every Saved Scenario. Nothing is derived beyond "the last thing that
+    /// happened in it", which the server does state.
+    pub fn date_stamp(&self) -> Option<&str> {
+        if let Some(stamp) = &self.updated_at {
+            return Some(stamp.as_str());
+        }
+        self.steps
+            .iter()
+            .filter_map(|s| s.updated_at.as_deref())
+            .max()
+    }
+
+    /// The register hulls this mission obliges anywhere, de-duplicated and in
+    /// step order: what a draft seeded from it puts in the force.
+    pub fn audienced_units(&self) -> Vec<i64> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for step in &self.steps {
+            for sub in &step.substeps {
+                for unit in &sub.units {
+                    if seen.insert(*unit) {
+                        out.push(*unit);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// One step of a Saved Scenario: a kind, an instruction and an optional
+/// window, with its commands nested.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissionStep {
+    pub id: i64,
+    /// The order the step runs in. The number the operator reads IS this, and
+    /// the array's own order is not a promise.
+    pub position: i64,
+    /// `orders`, `beat`, … The kind decides whether the step may hold
+    /// commands at all: a beat refuses one with a 409.
+    pub kind: String,
+    pub content: String,
+    pub start_hour: Option<String>,
+    pub end_hour: Option<String>,
+    pub updated_at: Option<String>,
+    pub substeps: Vec<MissionSubstep>,
+}
+
+impl MissionStep {
+    /// The window, if both ends are present. One accessor, for the reason
+    /// [`GameScenarioStep::window`] gives: half a window is unrepresentable on
+    /// the wire.
+    pub fn window(&self) -> Option<(&str, &str)> {
+        Some((self.start_hour.as_deref()?, self.end_hour.as_deref()?))
+    }
+
+    /// Whether this step carries no commands.
+    ///
+    /// A BEAT IS A MOMENT, NOT A COMMAND BATCH. The server answers 409 to a
+    /// command posted on one, so the composer refuses a drop locally and says
+    /// what the server would have said: make it an orders step first.
+    pub fn is_beat(&self) -> bool {
+        self.kind.eq_ignore_ascii_case("beat")
+    }
+}
+
+/// One command inside a step: one instruction to one audience.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissionSubstep {
+    pub id: i64,
+    pub position: i64,
+    pub content: String,
+    /// REGISTER hull ids — the master data's `id_unit`, never a game unit id.
+    /// The template ladder's audience is `{units:[…]}` of these (§11).
+    pub units: Vec<i64>,
+}
+
+/// One hull a related list names, as the template ladder resolves it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelatedHull {
+    pub unit_id: i64,
+    pub name: String,
+    pub hull_number: String,
+}
+
+impl RelatedHull {
+    /// The one line a card or a row shows: the name and the pennant.
+    pub fn label(&self) -> String {
+        match (self.name.trim(), self.hull_number.trim()) {
+            ("", "") => format!("hull {}", self.unit_id),
+            ("", number) => number.to_string(),
+            (name, "") => name.to_string(),
+            (name, number) => format!("{name} {number}"),
+        }
+    }
+}
 
 /// The date the exercise clock is stamped with, and it is NOT a real date.
 ///
@@ -4478,7 +5084,9 @@ impl GameReadinessView {
     /// client may attach the participant names to that one sentence, and
     /// nothing else. Deliberately not a rule: the verdict is `can_execute`.
     pub fn names_readiness(&self) -> bool {
-        self.blockers.iter().any(|b| b.contains("not declared themselves ready"))
+        self.blockers
+            .iter()
+            .any(|b| b.contains("not declared themselves ready"))
     }
 }
 
@@ -4938,11 +5546,7 @@ impl MinosMaster {
         unit_ids: &[i64],
     ) -> Result<EmbarkationResult, BackendError> {
         let body = serde_json::json!({ "unit_ids": unit_ids });
-        let data = self.post(
-            token,
-            &format!("/units/{unit_id}/embarkations"),
-            body,
-        )?;
+        let data = self.post(token, &format!("/units/{unit_id}/embarkations"), body)?;
         Ok(Self::parse_embarkation_result(&data))
     }
 
@@ -5080,7 +5684,10 @@ impl MinosMaster {
                 would_hold: c["would_hold"].as_i64().unwrap_or(0),
             })
             .collect();
-        EmbarkationResult { units, over_capacity }
+        EmbarkationResult {
+            units,
+            over_capacity,
+        }
     }
 
     // ── Fleet picker: asset groups and service-branch counts ───────────
@@ -5129,7 +5736,7 @@ impl MinosMaster {
 
 #[cfg(test)]
 mod scenario_tests {
-    use super::{hhmm_ok, hhmm_window_ok, MinosMaster, GameScenarioStep};
+    use super::{GameScenarioStep, MinosMaster, hhmm_ok, hhmm_window_ok};
 
     /// The client's `HHMM` check has to be exactly as strict as the server's
     /// or it defers a local correction to a 400 from the field. The refused
@@ -5139,7 +5746,9 @@ mod scenario_tests {
         for good in ["0000", "0900", "1000", "1030", "2359"] {
             assert!(hhmm_ok(good), "{good} should be accepted");
         }
-        for bad in ["", "9", "900", "2400", "10:00", "1060", "9999", "+900", "09 0", "abcd"] {
+        for bad in [
+            "", "9", "900", "2400", "10:00", "1060", "9999", "+900", "09 0", "abcd",
+        ] {
             assert!(!hhmm_ok(bad), "{bad:?} should be refused");
         }
     }
@@ -5168,9 +5777,11 @@ mod scenario_tests {
             id: 1,
             scenario_id: 1,
             position: 0,
+            kind: "orders".into(),
             content: "sweep".into(),
             start_hour: Some("1000".into()),
             end_hour: Some("1030".into()),
+            substeps: Vec::new(),
         };
         assert_eq!(both.window(), Some(("1000", "1030")));
         assert_eq!(both.window_label(), "1000-1030");
@@ -5243,6 +5854,154 @@ mod scenario_tests {
         assert_eq!(s.steps.len(), 1);
         assert_eq!(s.steps[0].content, "has an id");
     }
+
+    /// A step's commands arrive NESTED inside it, like the steps inside the
+    /// scenario: there is no sub-step list route. The audience does not ride
+    /// along — a game command's hulls are its own related read — so the nested
+    /// shape is the instruction and nothing more.
+    #[test]
+    fn a_steps_commands_arrive_nested_and_addressable() {
+        let v: serde_json::Value = serde_json::json!({
+            "id": 5, "id_game": 3, "title": "t",
+            "steps": [{
+                "id": 9, "position": 0, "kind": "orders", "content": "take station",
+                "substeps": [
+                    { "id": 20, "position": 1, "content": "second" },
+                    { "position": 0, "content": "no id, dropped" },
+                    { "id": 19, "position": 0, "content": "first" }
+                ]
+            }]
+        });
+        let s = MinosMaster::parse_scenario(&v, 3).expect("a scenario");
+        assert_eq!(s.steps[0].kind, "orders");
+        let ids: Vec<i64> = s.steps[0].substeps.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![20, 19], "kept in the server's order, one dropped");
+        assert_eq!(s.steps[0].substeps[0].content, "second");
+    }
+}
+
+#[cfg(test)]
+mod mission_tests {
+    use super::MinosMaster;
+
+    fn mission(v: serde_json::Value) -> super::ScenarioMission {
+        MinosMaster::parse_mission(&v).expect("a mission with an id")
+    }
+
+    /// A Saved Scenario's steps come back ordered by `position`, because the
+    /// number the operator reads IS the position and the array's order is not
+    /// a promise. Its commands come with it, and their audience is REGISTER
+    /// hull ids.
+    #[test]
+    fn a_mission_parses_with_ordered_steps_and_commands() {
+        let m = mission(serde_json::json!({
+            "id": 12, "code": "LITTORAL", "title": "Harbour Sweep",
+            "description": "the sweep", "play_count": 3,
+            "steps": [
+                { "id": 5, "position": 1, "kind": "beat", "content": "contact",
+                  "substeps": [] },
+                { "id": 4, "position": 0, "kind": "orders", "content": "transit",
+                  "start_hour": "0820", "end_hour": "0910",
+                  "substeps": [
+                    { "id": 8, "position": 1, "content": "second",
+                      "related": [ { "id_unit": 352, "unit_name": "Slamet Riyadi",
+                                     "hull_number": "352" } ] },
+                    { "id": 7, "position": 0, "content": "first",
+                      "related": [ { "id_unit": 351, "unit_name": "Ahmad Yani",
+                                     "hull_number": "351" } ] }
+                  ] }
+            ]
+        }));
+        assert_eq!(m.title, "Harbour Sweep");
+        assert_eq!(m.code, "LITTORAL");
+        assert_eq!(m.step_count(), 2);
+        assert_eq!(m.sub_step_count(), 2);
+        let order: Vec<i64> = m.steps.iter().map(|s| s.id).collect();
+        assert_eq!(order, vec![4, 5], "ordered by position, not by the array");
+        assert_eq!(m.steps[0].window(), Some(("0820", "0910")));
+        assert!(m.steps[1].is_beat(), "a beat carries no commands");
+        assert!(!m.steps[0].is_beat());
+        let ids: Vec<i64> = m.steps[0].substeps.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![7, 8], "the commands are ordered too");
+        assert_eq!(m.steps[0].substeps[0].units, vec![351], "register ids");
+    }
+
+    /// The force a draft seeded from a Saved Scenario holds: every hull any
+    /// command obliges, once, in step order. A hull named by three commands is
+    /// one hull.
+    #[test]
+    fn the_audience_is_the_union_of_every_command() {
+        let m = mission(serde_json::json!({
+            "id": 1, "title": "t",
+            "steps": [
+                { "id": 1, "position": 0, "content": "a", "substeps": [
+                    { "id": 1, "position": 0, "content": "x",
+                      "related": [ { "id_unit": 351 }, { "id_unit": 352 } ] },
+                    { "id": 2, "position": 1, "content": "y",
+                      "related": [ { "id_unit": 352 } ] }
+                ] },
+                { "id": 2, "position": 1, "content": "b", "substeps": [
+                    { "id": 3, "position": 0, "content": "z",
+                      "related": [ { "id_unit": 353 } ] }
+                ] }
+            ]
+        }));
+        assert_eq!(m.audienced_units(), vec![351, 352, 353]);
+    }
+
+    /// A mission has no date field in the documented shape and its steps do,
+    /// so the row's date is the newest stamp either one carries — never a
+    /// blank column.
+    #[test]
+    fn the_date_is_the_missions_or_the_newest_steps() {
+        let with_own = mission(serde_json::json!({
+            "id": 1, "title": "t", "updated_at": "2026-10-18T09:00:00Z",
+            "steps": [ { "id": 1, "position": 0, "content": "a",
+                          "updated_at": "2026-10-20T09:00:00Z", "substeps": [] } ]
+        }));
+        assert_eq!(with_own.date_stamp(), Some("2026-10-18T09:00:00Z"));
+
+        let steps_only = mission(serde_json::json!({
+            "id": 1, "title": "t",
+            "steps": [
+                { "id": 1, "position": 0, "content": "a",
+                  "updated_at": "2026-10-15T09:00:00Z", "substeps": [] },
+                { "id": 2, "position": 1, "content": "b",
+                  "updated_at": "2026-10-18T09:00:00Z", "substeps": [] }
+            ]
+        }));
+        assert_eq!(
+            steps_only.date_stamp(),
+            Some("2026-10-18T09:00:00Z"),
+            "the newest thing that happened in it"
+        );
+
+        let neither = mission(serde_json::json!({ "id": 1, "title": "t" }));
+        assert_eq!(neither.date_stamp(), None, "nothing to show, and no guess");
+    }
+
+    /// A mission without an id is a decode error rather than a dropped row:
+    /// a draft either seeds from THIS mission or it does not exist.
+    #[test]
+    fn a_mission_without_an_id_is_refused() {
+        assert!(MinosMaster::parse_mission(&serde_json::json!({ "title": "n" })).is_err());
+    }
+
+    /// The template ladder resolves an audience to hulls by REGISTER id, and
+    /// the label is what a card prints.
+    #[test]
+    fn a_related_hull_reads_its_register_id_and_labels() {
+        let hulls = MinosMaster::parse_related_hulls(&serde_json::json!({
+            "related": [
+                { "id_unit": 351, "unit_name": "KRI Ahmad Yani", "hull_number": "351" },
+                { "id_unit": 352, "unit_name": "", "hull_number": "352" }
+            ]
+        }));
+        assert_eq!(hulls.len(), 2);
+        assert_eq!(hulls[0].unit_id, 351);
+        assert_eq!(hulls[0].label(), "KRI Ahmad Yani 351");
+        assert_eq!(hulls[1].label(), "352", "a nameless hull is its pennant");
+    }
 }
 
 #[cfg(test)]
@@ -5251,6 +6010,41 @@ mod game_prose_tests {
 
     fn detail(v: serde_json::Value) -> GameDetail {
         MinosMaster::parse_game_detail(&v, 7)
+    }
+
+    /// `max_echelon_rank` is a RANK NUMBER — `40`, not a hierarchy id — so it
+    /// reads as a number and is compared as one. Absent is "no ceiling", which
+    /// is a different thing from rank zero.
+    #[test]
+    fn the_ceiling_reads_as_a_rank_number() {
+        let d = detail(serde_json::json!({
+            "id": 7, "name": "n", "mode": "maneuver", "state": "planning",
+            "max_echelon_rank": 40
+        }));
+        assert_eq!(d.max_echelon_rank, Some(40));
+        let none = detail(serde_json::json!({
+            "id": 7, "name": "n", "mode": "maneuver", "state": "planning"
+        }));
+        assert_eq!(none.max_echelon_rank, None, "no ceiling, not rank zero");
+    }
+
+    /// A list row carries the instant it was made: the landing's `WHEN` column
+    /// reads `created_at` and nothing else (there is no origin field to read —
+    /// erratum 11).
+    #[test]
+    fn a_game_row_carries_when_it_was_made() {
+        let row = MinosMaster::parse_game_row(&serde_json::json!({
+            "id": 12,
+            "name": "Baltic Shield 26",
+            "mode": "maneuver",
+            "state": "planning",
+            "created_at": "2026-10-23T09:41:00+07:00",
+            "updated_at": "2026-10-24T10:00:00+07:00"
+        }))
+        .expect("a row with an id");
+        assert_eq!(row.created_at, "2026-10-23T09:41:00+07:00");
+        assert_eq!(row.mode, "maneuver");
+        assert_eq!(row.state, "planning");
     }
 
     /// The bug this fixes: `description` was sent by the create form and
@@ -5298,7 +6092,10 @@ mod game_prose_tests {
             "overlay_text": "D+1"
         }));
         assert_eq!(d.area.as_deref(), Some("Strait of Malacca"));
-        assert_eq!(d.map_tag, None, "an empty map tag is unset, not set-to-empty");
+        assert_eq!(
+            d.map_tag, None,
+            "an empty map tag is unset, not set-to-empty"
+        );
         assert_eq!(d.overlay_text.as_deref(), Some("D+1"));
     }
 
@@ -5406,6 +6203,8 @@ mod new_game_tests {
                 assumed_start: Some("2000-01-01T08:00:00Z".into()),
                 assumed_end: Some("2000-01-01T16:00:00Z".into()),
             },
+            max_echelon_rank: Some(40),
+            time_factor: Some(2.0),
         };
         let body = new_game_body(&req);
         assert_eq!(body["name"], "Operasi Batu Malang");
@@ -5418,6 +6217,11 @@ mod new_game_tests {
         assert_eq!(body["actual_end"], "2026-11-01T16:00:00Z");
         assert_eq!(body["assumed_start"], "2000-01-01T08:00:00Z");
         assert_eq!(body["assumed_end"], "2000-01-01T16:00:00Z");
+        assert_eq!(
+            body["max_echelon_rank"], 40,
+            "the rank number, not a hierarchy id"
+        );
+        assert_eq!(body["time_factor"], 2.0);
     }
 
     /// A BLANK OPTIONAL IS OMITTED, never sent empty.
@@ -5456,8 +6260,7 @@ mod new_game_tests {
 #[cfg(test)]
 mod window_authoring_tests {
     use super::{
-        GamePace, GameUpdate, MinosMaster, TimeWindow, actual_to_rfc3339,
-        assumed_hhmm_to_rfc3339,
+        GamePace, GameUpdate, MinosMaster, TimeWindow, actual_to_rfc3339, assumed_hhmm_to_rfc3339,
     };
 
     /// The exercise clock has no date to speak of, so the conversion supplies
@@ -5808,7 +6611,10 @@ mod window_authoring_tests {
         assert_eq!(units.len(), 2);
         assert!(!units[0].is_cleared, "aboard means no orders until cleared");
         assert!(units[1].is_cleared, "a cleared piece may act");
-        assert_eq!(units[1].cleared_at.as_deref(), Some("2016-01-31T13:01:33.786Z"));
+        assert_eq!(
+            units[1].cleared_at.as_deref(),
+            Some("2016-01-31T13:01:33.786Z")
+        );
         // A CMS answer carries no clearance — absence reads as aboard,
         // never as permission.
         let bare = serde_json::json!({ "units": [{ "id": 7 }] });
@@ -5847,15 +6653,20 @@ mod window_authoring_tests {
     #[test]
     fn current_step_absent_halves_are_absences_not_empty_steps() {
         let view = MinosMaster::parse_current_step(&serde_json::json!({}));
-        assert!(view.current.is_none(), "between steps is a state, not an error");
-        assert!(view.asking.is_none(), "no step asking is the ordinary rest state");
+        assert!(
+            view.current.is_none(),
+            "between steps is a state, not an error"
+        );
+        assert!(
+            view.asking.is_none(),
+            "no step asking is the ordinary rest state"
+        );
     }
-
 }
 
 #[cfg(test)]
 mod hierarchy_write_tests {
-    use super::{HierarchyNode, MinosMaster};
+    use super::{GamePace, GameUpdate, HierarchyNode, MinosMaster, TimeWindow};
 
     /// A created node reads back out of the forest the server answers
     /// with. The write and the read share one parser, and the echelon id
@@ -5938,7 +6749,11 @@ mod hierarchy_write_tests {
                 rq.as_reader().read_to_string(&mut text).unwrap_or(0);
                 let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                 let body = if method == "POST" && url.ends_with("/games/3/hierarchy") {
-                    assert_eq!(v["id_unit_hierarchy"].as_i64(), Some(7), "create names its level");
+                    assert_eq!(
+                        v["id_unit_hierarchy"].as_i64(),
+                        Some(7),
+                        "create names its level"
+                    );
                     assert_eq!(v["name"].as_str(), Some("Gugus Tempur"));
                     assert!(
                         v.get("parent_id").is_none(),
@@ -5950,13 +6765,25 @@ mod hierarchy_write_tests {
                     );
                     r#"{"status_code":201,"message":"Created","data":[{"id":41,"id_unit_hierarchy":7,"echelon_name":"Gugus","echelon_rank":3,"name":"Gugus Tempur","icon":"","note":"","children":[]}]}"#
                 } else if method == "PUT" && url.ends_with("/games/3/hierarchy/41/parent") {
-                    assert_eq!(v["parent_id"].as_i64(), Some(19), "the move names its new parent");
+                    assert_eq!(
+                        v["parent_id"].as_i64(),
+                        Some(19),
+                        "the move names its new parent"
+                    );
                     r#"{"status_code":200,"message":"Successfull","data":[]}"#
                 } else if method == "PUT" && url.ends_with("/games/3/hierarchy/41/commander") {
-                    assert_eq!(v["id_commander"].as_i64(), Some(6), "the appointment names the person");
+                    assert_eq!(
+                        v["id_commander"].as_i64(),
+                        Some(6),
+                        "the appointment names the person"
+                    );
                     r#"{"status_code":200,"message":"Successfull","data":[]}"#
                 } else if method == "PUT" && url.ends_with("/games/3/units/13/hierarchy") {
-                    assert_eq!(v["id_hierarchy_node"].as_i64(), Some(41), "placement names the node");
+                    assert_eq!(
+                        v["id_hierarchy_node"].as_i64(),
+                        Some(41),
+                        "placement names the node"
+                    );
                     r#"{"status_code":200,"message":"Successfull","data":[]}"#
                 } else {
                     panic!("unexpected request: {method} {url}");
@@ -5968,10 +6795,74 @@ mod hierarchy_write_tests {
         let created = master
             .hierarchy_create_node("AT", 3, 7, "Gugus Tempur", None, "", "")
             .expect("create answers the forest");
-        assert_eq!(created.len(), 1, "the create answer is the tree, not the node");
+        assert_eq!(
+            created.len(),
+            1,
+            "the create answer is the tree, not the node"
+        );
         assert_eq!(created[0].unit_hierarchy_id, Some(7));
         master.hierarchy_move_node("AT", 3, 41, 19).expect("move");
-        master.hierarchy_set_commander("AT", 3, 41, 6).expect("appoint");
+        master
+            .hierarchy_set_commander("AT", 3, 41, 6)
+            .expect("appoint");
         master.game_unit_place("AT", 3, 13, 41).expect("place");
+    }
+
+    /// THE TERMS PATCH CARRIES ONLY WHAT MOVED.
+    ///
+    /// The planning phase's ESSENTIALS form writes the exercise's name, pace
+    /// and prose as ONE partial edit, and a field nobody touched must be
+    /// ABSENT from the body rather than present and empty: Minos reads an
+    /// empty string as "clear this", so a form that restated the fields the
+    /// server already holds would blank the ones the operator never opened.
+    ///
+    /// The window rides in the same body, one key at a time, for the reason
+    /// `update_game`'s own doc gives: the server merges the clock keys
+    /// separately and checks each against the start already on the game.
+    #[test]
+    fn the_terms_patch_carries_only_what_moved() {
+        let server = tiny_http::Server::http("127.0.0.1:18111").expect("bind test port");
+        std::thread::spawn(move || {
+            let mut rq = server.incoming_requests().next().expect("one request");
+            use std::io::Read as _;
+            assert_eq!(rq.method().as_str(), "PATCH");
+            assert!(
+                rq.url().ends_with("/games/9"),
+                "the held game: {}",
+                rq.url()
+            );
+            let mut text = String::new();
+            rq.as_reader().read_to_string(&mut text).unwrap_or(0);
+            let v: serde_json::Value = serde_json::from_str(&text).expect("a JSON body");
+            assert_eq!(v["name"].as_str(), Some("Renamed"));
+            assert_eq!(v["pace"].as_str(), Some("fast"));
+            assert!(
+                v.get("purpose").is_none(),
+                "a field nobody moved is absent, not empty"
+            );
+            assert!(v.get("description").is_none());
+            assert!(v.get("target").is_none());
+            assert_eq!(
+                v["actual_start"].as_str(),
+                Some("2026-11-01T08:00:00+00:00")
+            );
+            let body = r#"{"status_code":200,"message":"Successfull","data":{"id":9,"name":"Renamed","mode":"maneuver","state":"planning","pace":"fast"}}"#;
+            let _ = rq.respond(tiny_http::Response::from_string(body));
+        });
+        let master = MinosMaster::new("http://127.0.0.1:18111/api/v1").expect("client builds");
+        let update = GameUpdate {
+            name: Some("Renamed".into()),
+            pace: Some(GamePace::Fast),
+            window: TimeWindow {
+                actual_start: Some("2026-11-01T08:00:00+00:00".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let detail = master
+            .update_game("AT", 9, &update)
+            .expect("the patch answers the detail");
+        assert_eq!(detail.name, "Renamed");
+        assert_eq!(detail.pace, Some(GamePace::Fast));
     }
 }

@@ -17,11 +17,21 @@
 //!   Leaf: no GPUI, no shell.
 //! - [`advance`]: the stage advance as a plan — the order the server takes
 //!   the writes in, and the rules that refuse it whole.
+//! - [`fixtures`]: the frames' deterministic states — `TFG_FLOW=<frame>`,
+//!   staged without a write. Pure data; the shell renders it.
 //! - [`force`]: the operator's force before Minos hears of it, and the diff a stage advance writes.
 //! - [`embark`]: the embark rule — what may go aboard what, decided against
 //!   the spec the server published. Leaf: no GPUI, no draft, no network.
 //! - [`dnd`]: entity-to-entity drag and drop — what a drop on a hull, a person
 //!   or a group means. Leaf: no GPUI, no draft, no network.
+//! - [`draft`]: the creation flow's draft — the origin, the mode's stages and
+//!   verbs, the derived time base, what blocks a press, and the journal of what
+//!   a previous press already wrote. Local until the press; no GPUI, no network.
+//! - [`commit`]: the press — two ladders of writes in the order the server
+//!   accepts them, planned against what it already holds, issued one at a time
+//!   through a transport seam, journaled, resumable, and never rolled back.
+//!   Local-first by construction: stages 01–06 write nothing, and this is where
+//!   the one write happens.
 //! - [`backend`]: v0 poll contract: `PollSource`, file replay, HTTP stub.
 //! - [`symbology`]: APP-6C symbol model + generated icon geometry. Leaf: depends on nothing.
 //! - [`shell_gpui`]: the GPUI shell — the island chrome and the U5 parity
@@ -44,8 +54,13 @@
 //!   off `egui::Context::default()`.
 //! - [`readiness`]: the execution gate's unknown states — why the last read
 //!   produced no verdict, and what to say while it has not. Toolkit-free.
+//! - [`ring`]: the ring pack — a group dropped on the map, as pure geometry:
+//!   the centre, the rings, the spread from 12 o'clock and the write order.
+//!   Leaf: no GPUI, no draft, no network.
 //! - [`window`]: the exercise's planned window and the one rule that says
 //!   what a window is — shared with the scenario composer. Toolkit-free.
+//! - [`terms`]: the exercise's prose and pace as the planning panel edits
+//!   them, and the one partial edit the server takes for them. Toolkit-free.
 //! - [`calendar`]: the month as six weeks of days, and the local datetimes a
 //!   scenario's window is written in. Toolkit-free; the console draws it.
 //! - [`visuals`]: every hull's picture state — the versioned visual cache and
@@ -63,6 +78,7 @@
 //! Module list is alphabetical after `assets`.
 
 pub mod advance;
+pub mod arrival;
 pub mod assets;
 pub mod backend;
 pub mod book;
@@ -70,18 +86,23 @@ pub mod calendar;
 pub mod catalog;
 pub mod clock;
 pub mod command;
+pub mod commit;
+pub mod control;
 pub mod dnd;
+pub mod draft;
 pub mod embark;
+pub mod fixtures;
 pub mod fleet;
 pub mod force;
-pub mod gamestate;
 pub mod gamefeed;
+pub mod gamestate;
+pub mod geo;
 pub mod gpuprobe;
 pub mod groups;
 pub mod halo;
-pub mod geo;
 pub mod ink;
 pub mod land;
+pub mod landing;
 pub mod library;
 pub mod log;
 pub mod map_gate;
@@ -93,16 +114,20 @@ pub mod overlay;
 pub mod paths;
 pub mod phase;
 pub mod pickers;
+pub mod qr;
 pub mod readiness;
+pub mod register;
+pub mod ring;
 pub mod roster;
-pub mod sfx;
 pub mod selfcheck;
 pub mod settings;
+pub mod sfx;
 pub mod shell_gpui;
 pub mod shell_threads;
 pub mod sim;
 pub mod store;
 pub mod symbology;
+pub mod terms;
 pub mod thumb_rotate;
 pub mod view;
 pub mod visuals;

@@ -2,8 +2,9 @@
 //!
 //! A [`Group`] is an id, a name, a [`GroupKind`], an optional commander,
 //! and two member lists: directly mustered `units` and `children` groups.
-//! Nesting is generic — any group may hold units, child groups, or both —
-//! and every child must sit at a strictly lower rank (see `hierarchy`).
+//! A child sits at the level immediately above its parent — never higher,
+//! and never a level skipped (see `GroupKind::sits_under`) — and a hull
+//! (an Unsur) may only be mustered directly into a Satuan Tugas.
 
 /// A level of the task organisation, lowest first.
 ///
@@ -62,6 +63,30 @@ impl GroupKind {
             _ => None,
         }
     }
+
+    /// The level directly above this one, by the +10 rank rule.
+    ///
+    /// Ranks are gapped, and the gap IS the rule: a body may only be the
+    /// direct child of the level one step up. A Satuan Tugas sits in a
+    /// Gugus; it does not sit in an Operasi Gabungan, even though that is
+    /// "above" it. `None` at the top, where there is nobody to sit under.
+    pub fn above(self) -> Option<Self> {
+        let want = self.rank().checked_add(10)?;
+        [
+            Self::Unsur,
+            Self::SatuanTugas,
+            Self::Gugus,
+            Self::OperasiGabungan,
+        ]
+        .into_iter()
+        .find(|kind| kind.rank() == want)
+    }
+
+    /// Whether this kind may sit DIRECTLY under `parent`: exactly the
+    /// level above, never a skipped one.
+    pub fn sits_under(self, parent: Self) -> bool {
+        self.above() == Some(parent)
+    }
 }
 
 /// One group: shared identity plus unit and child-group members.
@@ -78,23 +103,38 @@ pub struct Group {
     pub commander: Option<String>,
 }
 
-/// The rank rule, in the one place it is worded: a child sits strictly
-/// below its parent. Both the in-memory forest (`hierarchy`) and the local
-/// draft (`plan`) refuse through here, so a rank violation reads the same
-/// wherever it is raised.
+/// The rank rule, in the one place it is worded: a child sits at the level
+/// immediately above its parent, never a skipped one. Both the in-memory
+/// forest (`hierarchy`) and the local draft (`plan`) refuse through here, so
+/// a rank violation reads the same wherever it is raised.
 pub(super) fn rank_refusal(child_name: &str, child: GroupKind, parent: GroupKind) -> String {
     format!(
-        "rank violation: child `{child_name}` ({}:{}) not below {}:{}",
+        "rank violation: child `{child_name}` ({}:{}) sits only under {}:{}, not {}:{}",
         child.label(),
         child.rank(),
+        child.above().map(|k| k.label()).unwrap_or("nothing"),
+        child.rank().saturating_add(10),
         parent.label(),
         parent.rank(),
     )
 }
 
+/// The hull rule, in the one place it is worded: a hull IS an Unsur (rank
+/// 10), so it may only be mustered directly into a Satuan Tugas (rank 20),
+/// the level immediately above it. A Gugus holding hulls directly would skip
+/// the level the organisation says is there.
+pub(super) fn hull_refusal(kind: GroupKind) -> String {
+    format!(
+        "rank violation: hulls are Unsur:10 and sit only under SatuanTugas:20, not {}:{}",
+        kind.label(),
+        kind.rank(),
+    )
+}
+
 /// A group may not become its own ancestor. The in-memory forest makes
-/// that impossible by construction (a child is always strictly lower), so
-/// only the draft, where a re-parent is an edit, can meet it.
+/// that impossible by construction (a child's rank is always higher than
+/// its parent's by exactly ten, so the walk up is finite), so only the
+/// draft, where a re-parent is an edit, can meet it.
 pub(super) fn cycle_refusal(group_name: &str) -> String {
     format!("group `{group_name}` cannot be its own ancestor")
 }

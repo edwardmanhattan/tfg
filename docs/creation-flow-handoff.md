@@ -186,6 +186,15 @@ row is chosen, where `BLANK SCENARIO` is a row. What it does:
 | a `planning` game row | opens a `Reopened` draft seeded from it |
 | any other game row | opens the console, as a double-click would — there is nothing left to draft |
 
+**THE LAST ANSWER WINS** (erratum 15). The landing has one verb and two
+questions — a mode (create) and a row (open) — and a row left selected from an
+earlier look used to retarget that verb: the operator chose a mode, pressed
+`PROCEED`, and landed in the selected game's console instead of the draft they
+had just described. So each answer withdraws the other: choosing a mode clears
+the row selection, and selecting a row clears the mode and the START FROM
+answer. A row and a mode are never both answered, and `PROCEED` is always about
+the thing the operator picked last.
+
 A row in `preparation`, `execution` or `closure` is not editable: the terms,
 the force and the tree are fixed once planning ends (the server refuses the
 writes with 409). Say so on the row's hint rather than opening a draft that
@@ -266,6 +275,14 @@ sixth column**, and it exists in stages **02, 03, 04 and 05**.
 - **A card is a drop target** in stages 04 and 05 (a hull's audience, a hull's
   commander) and a **group row is a drop target** in stage 05 (a group's
   commander).
+- **A card shows the hull**: its photograph when the archive has one, its NATO
+  glyph otherwise. The band above the name is the picture, and the ship does
+  not have to be read out of a string.
+- **A card says who commands it** once a commander is assigned
+  (`BY LT. FITRI`), and `NO COMMANDER` while it is not; a group's channel row
+  says `COMMANDED BY …` for the body itself.
+- **The chip is a handle too**: drag it to put the closed basket somewhere, and
+  a click that does not move still opens it.
 - `✕` on a card takes the hull out of the force. In a `Reopened` draft that is
   a delete at commit; in a blank one it is simply not written.
 
@@ -466,6 +483,10 @@ A reopened draft, `12 UNITS · 9 PLACED · 3 UNPLACED`, a flat grid of cards,
 The map expands to the window. Header: `MAP MODE`, `<n> PLACED · <n> UNPLACED ·
 <n> SELECTED`, `ESC TO RETURN`.
 
+- **The right button moves the camera; the left does not.** A right-drag pans,
+  the wheel zooms, and the left button belongs to the things on the chart — a
+  press on a mark takes that hull, a click on water clears the selection. The
+  first build panned on the left, so every hull gesture also dragged the sea.
 - Selecting a pin selects the hull (one at a time).
 - `⌫ LIFT POSITION` clears the position and **keeps the hull in the game**.
 - Dragging a cluster moves every hull in it: `MOVE ONE HULL → 1 PLACEMENT
@@ -503,43 +524,60 @@ OPGAB JAYA   OPERASI GABUNGAN · 40   Cdr. Anwar
 - The `HOLDS UNSUR · 10` badge appears on a body that holds hulls. It is
   derived from what the body holds, never asserted, so it cannot lie.
 - The echelon picker on the left offers the `/hierarchy` vocabulary with its
-  ranks (`OPERASI GABUNGAN · 40`, `GUGUS · 30`, `SATUAN TUGAS · 20`).
+  ranks (`OPERASI GABUNGAN · 40`, `GUGUS · 30`, `SATUAN TUGAS · 20`). `UNSUR` is
+  not a rung: a hull is a leaf, not a body that holds anything, so it is not
+  offered as a level to build.
 - **`CAP max_echelon_rank`** is shown in the header as the ceiling, printed as
   the rank number (`CAP 40`). It is a game field, so it is set here (where it has
   meaning) and sent on create (§12.7). The rank check is numeric: a body's
-  `echelon_rank` must be below its parent's and at or below the cap.
+  `echelon_rank` must be **exactly ten above its parent's** — the immediate upper
+  level, never a skipped one — and at or below the cap.
 
 ### 6.2 Gestures
 
 | Drop | Result |
 | --- | --- |
-| a hull card on a body | the hull joins that body |
+| a hull card on a body | the hull joins that body, if it is a `SATUAN TUGAS` |
 | a hull card on empty canvas | a new body is made there and the hull joins it; the echelon picker opens on it |
-| a group row on a body | the group re-parents under it |
+| a group row on a body | the group re-parents under it, if it is the level directly above |
+| a group row on an echelon rung | under the selected body at that level, or a new body at that level when the tree has none |
 | a group row on empty canvas | the group becomes a root |
 | a body on a body | re-parent, if the rank allows |
+
+**A body is dragged by its own band**, in stage 03, and the thing in the hand is
+the body — not its cards. Its upper level can be a group already drawn on the
+canvas, or a **rung** in the echelon column: the canvas only takes a parent that
+is already on it, and the rung names the LEVEL, so the gesture works even when
+the parent does not exist yet (a body is made at that level and takes the drop).
 
 `DROP ON EMPTY CANVAS → A NEW GROUP · PICK ITS ECHELON` is literal: the drop
 creates the node, then the echelon picker opens on it, and until a rank is
 picked the node is not a body and cannot hold anything.
 
-### 6.3 The four refusals (F4b)
+### 6.3 The refusals (F4b)
 
 1. **A group inside a hull.** `A GROUP CANNOT SIT INSIDE A HULL — AN UNSUR IS A
    UNIT, NOT A CONTAINER — IT HAS NO BODY TO HOLD ANYTHING`. A hull card is not
    a drop target for a group.
-2. **A child at or above its parent's rank.** `THE BODY DASHES BEFORE THE
-   RELEASE`. Refuse locally, naming both ranks.
+2. **A child that is not at the level directly above its parent.** The rule is
+   `child.rank + 10 == parent.rank`, not "strictly below": a `SATUAN TUGAS` (20)
+   sits in a `GUGUS` (30) and **not** in an `OPERASI GABUNGAN` (40), even though
+   that is above it. `THE BODY DASHES BEFORE THE RELEASE`. Refuse locally, naming
+   the level that would take it as well as the one that will not.
 3. **A group inside itself, however deep the path.** `THE TREE WOULD STOP BEING
    A TREE`. Refuse locally, naming the path.
-4. **A node from another game.** `THE SERVER ENFORCES IT THROUGH A COMPOSITE
+4. **A hull on a body that is not a `SATUAN TUGAS`.** A hull IS an `UNSUR`
+   (rank 10), so its immediate upper level is the `SATUAN TUGAS` (20); a `GUGUS`
+   or an `OPERASI GABUNGAN` holding hulls directly would skip the level the
+   organisation says is there. Refuse locally and name the level that holds them.
+5. **A node from another game.** `THE SERVER ENFORCES IT THROUGH A COMPOSITE
    KEY`. This one cannot happen in a client that only holds this game's nodes,
    so it is a **rendered server refusal**, not a local check. Do not write a
    local mirror of a rule the client cannot break.
 
-And what is allowed: `SKIPPING A LEVEL IS ALLOWED · ONE HULL IN ONE PLACE ·
-RE-DROPPING MOVES IT`. One hull in one body: dropping it on a second body moves
-it, and the first body loses it.
+And what is allowed: `A CHILD SITS ONLY UNDER THE LEVEL DIRECTLY ABOVE IT ·
+ONE HULL IN ONE PLACE · RE-DROPPING MOVES IT`. One hull in one body: dropping it
+on a second body moves it, and the first body loses it.
 
 ### 6.4 The ring pack (F4c)
 
@@ -606,9 +644,13 @@ window:
 05  RECOVER    ORDERS · 11:00–11:30
 ```
 
-`+ STEP` and `+ BEAT` append. `STEPS RUN IN ORDER. WINDOWS MAY OVERLAP.` —
-the API agrees: windows may overlap, but a new step's window may not begin
-before the previous step's window **ended**.
+`+ STEP` appends, and makes the scenario first when the book has none yet (a
+scenario draft opens with an empty book, so a button that only appended a step
+answered nothing). The step's KIND is a property of the step, set in its header
+(`ORDERS` / `BEAT`), not a second add button: a beat is an orders step that
+pauses for an event. `STEPS RUN IN ORDER. WINDOWS MAY OVERLAP.` — the API
+agrees: windows may overlap, but a new step's window may not begin before the
+previous step's window **ended**.
 
 **Right: the selected step.** Its window, `+ SUB-STEP`, and the sub-steps:
 
@@ -642,8 +684,12 @@ which is what "the kind says the step obliges nobody" means.
 ### 7.2 The basket, nested (F5b)
 
 Stages 03–05 show the force nested by group, every card carrying its commander
-line (`COMMANDED BY LT. FITRI`, `COMMANDED BY —`). A group row drags out as
-**its leaf hulls**:
+line (`COMMANDED BY LT. FITRI`, `COMMANDED BY —`). **Every body is a channel**,
+drawn in the tree's own order and indented by depth — an operation's row, then a
+gugus under it, then its satuan tugas, then the cards. A body with no hulls
+directly mustered still draws its row, because it is the level its children hang
+from; the hulls no body holds are the `UNGROUPED` channel, last. A group row
+drags out as **its leaf hulls**:
 
 > `A SATGAS DRAGS OUT AS ITS CARDS · AN OPERATION OR A GUGUS AS EVERY CARD
 > BENEATH IT`
@@ -669,10 +715,11 @@ order:
 
 ### 8.1 Two panes
 
-**Left: `FIND PEOPLE`.** A server-side search (`12 MATCH · 6 SHOWN · SEARCH IS
-SERVER-SIDE`) over `GET /users?search=`, each row a name, a hull if the person
-is attached to one (`KRI 351 · AHMAD YANI`), and a **role picker**. The picker
-is the only way to seat somebody here.
+**Left: `FIND PEOPLE`.** A search over the room's people, each row a name and a
+**role dropdown**. The dropdown is the only way to seat somebody here, and it
+is a dropdown because the game's role vocabulary can be longer than a row of
+buttons. Its options are the game's own roles when the session carries them
+(`/games/{id}/roles`), the sheet's three otherwise, plus `NOT PLAYING` last.
 
 **Right: `SEATS`.** One row per seated person, role, and scope:
 
@@ -690,8 +737,16 @@ REFEREE      Kpt. Sari       JUDGE SIDE · NO SCOPE
   re-read the roster after a role change rather than patch its own copy.
 - `A ROLE IS THIS GAME'S OWN COPY` — the ids come from the game, not from
   `/game-roles` (§12.3).
-- The picker **reflects the current seat**. `NOT PLAYING` is the value for
-  someone not considered, not a default painted over a seat (erratum 5).
+- The picker **reflects the current seat**. `NOT PLAYING` is the DEFAULT for
+  someone who has not been seated — not an official role — and a value once
+  chosen: it writes nothing and still counts as a decision (erratum 5).
+- **The whole seat row is the drag handle**, not only the name: the carry starts
+  anywhere on role, name or scope, and the basket row under the pointer tints
+  while a seat is in the air so the target is not a guess. A group has a
+  commander as much as a hull does.
+- **The search is the people's own**, not the register's: one term used to live
+  in both fields, so a hull search survived into this stage and filtered the
+  people list with no field on screen (erratum 17).
 
 ### 8.2 `Not Playing`
 
@@ -1057,6 +1112,63 @@ closure`, and `preparation` is where Play Directly lands, so it is the tab an
 operator will look for first. Render five (§3.1). The counts in the
 frame are illustrative; a real tab bar derives every one of them.
 
+**15. The landing's one verb cannot serve two answers.** `PROCEED` sits under
+the wizard, but it also acted on a selected history row, and the row won. A row
+clicked once (a select, not an open) therefore stayed armed: every mode chosen
+afterwards was ignored, and the press opened that game's console instead of the
+draft the operator had just described. **The last answer wins**: choosing a mode
+clears the row selection, selecting a row clears the mode and the START FROM
+answer. A row and a mode are never both answered (§3.1).
+
+**16. Stage 03's tree rules, and its basket, were drawn but not enforced.** Five
+defects in one screen, each now a rule with a test:
+
+- **The basket was a flat grid.** It printed the group rows as captions and put
+  every card in one wrap beneath them, so a card's channel was a label rather
+  than a place. It now draws the same tree the board does: a channel per body,
+  indented by depth, the cards under the body that musters them, `UNGROUPED`
+  last (§7.2).
+- **A rank could skip a level.** `add_group`/`stage_group`/`set_parent` accepted
+  any lower rank, so an `UNSUR` could sit straight in a `GUGUS`. The rule is
+  `child.rank + 10 == parent.rank` (§6.3.2), and a hull — an `UNSUR` — therefore
+  sits only in a `SATUAN TUGAS` (§6.3.4).
+- **`UNSUR` was offered as an echelon.** It is the hull, not a container, so the
+  rung is gone from the column (§6.1).
+- **A group could not be dragged.** The board's band selects but did not carry;
+  the only draggable thing was a basket card, which carries hulls. A band now
+  carries the BODY, to a body on the canvas or to a rung (§6.2).
+- **Dragging the basket panned the chart and stuttered.** The press reached the
+  map ground behind the basket, so every move moved the camera; and the drag's
+  own move handler lived on the band the drag moves, so GPUI dropped moves whose
+  pointer had outrun the panel, while every move re-dirtied the whole window on a
+  software rasteriser. The basket now blocks the mouse at its wrapper (so the
+  ground never sees the press) and a full-window capture layer owns the drag
+  while the grip is held; a move notifies only when the clamped corner actually
+  changes.
+
+**17. Stage 02–05's cards, gestures and fields.** Six things the sheet draws
+that the build had not made true:
+
+- **A card is a picture as well as a name.** The register's cards, the basket's,
+  the board's leaf cards and a sub-step's audience now carry the hull's
+  photograph, or its NATO glyph when the archive has none (§3.5).
+- **`+ STEP` did nothing on an empty book.** A scenario draft opens with no
+  staged scenario, and the button silently returned. It now makes the scenario
+  (named for the exercise) and the step (§7.1).
+- **`+ BEAT` was a second verb for a property.** The step's kind is set on the
+  step (`ORDERS` / `BEAT` in its header), and a beat still refuses sub-steps
+  with the server's sentence.
+- **The role buttons could not hold a real vocabulary.** The picker is a
+  dropdown, fed by the session's roles when it has them; `NOT PLAYING` is the
+  default, not a server role (§8.1).
+- **A commander was invisible.** The basket's cards say `BY <NAME>` and its
+  group rows say `COMMANDED BY <NAME>`; a target tints under the pointer while
+  a seat is carried (§8.1).
+- **The search bled between stages.** The register and the people list shared
+  one term; they now have one field each (§8.1).
+- **The left button panned the map.** The right button pans, the left takes the
+  marks (§5.6).
+
 ---
 
 ## 13. Visual rules
@@ -1176,6 +1288,9 @@ made to hold "9 placed, 3 unplaced, 4 groups, 5 in them". Add one seed family,
 TFG_FLOW=f1a | f1b | f2a | f2b | f3a | f3b | f3c | f3d | f3e
          f4a | f4b | f4c | f5a | f5b | f6a | f6b | f7 | f8
 TFG_FLOW_FAIL=seats          # stages F7's 502 at write 02, seats
+TFG_BASKET=1                 # opens the basket; the way to photograph F4a's
+                             # nested tree, which has no frame of its own
+TFG_MAP=1                    # opens map mode for the same reason
 ```
 
 A fixture capture is a picture of the fixture. It is the right evidence for

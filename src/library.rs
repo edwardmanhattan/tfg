@@ -130,7 +130,10 @@ impl Library {
                 return Library::default();
             }
             Err(_) => {
-                return Library { scenarios: Vec::new(), read_failed: true };
+                return Library {
+                    scenarios: Vec::new(),
+                    read_failed: true,
+                };
             }
         };
         match serde_json::from_str::<Library>(&text) {
@@ -139,7 +142,10 @@ impl Library {
                 library.read_failed = false;
                 library
             }
-            Err(_) => Library { scenarios: Vec::new(), read_failed: true },
+            Err(_) => Library {
+                scenarios: Vec::new(),
+                read_failed: true,
+            },
         }
     }
 
@@ -153,11 +159,18 @@ impl Library {
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| format!("the library could not be written as JSON: {e}"))?;
         let temporary = temporary_path(path);
-        std::fs::write(&temporary, text.as_bytes())
-            .map_err(|e| format!("the library could not be written ({}): {e}", temporary.display()))?;
+        std::fs::write(&temporary, text.as_bytes()).map_err(|e| {
+            format!(
+                "the library could not be written ({}): {e}",
+                temporary.display()
+            )
+        })?;
         if let Err(e) = std::fs::rename(&temporary, path) {
             let _ = std::fs::remove_file(&temporary);
-            return Err(format!("the library could not be put in place ({}): {e}", path.display()));
+            return Err(format!(
+                "the library could not be put in place ({}): {e}",
+                path.display()
+            ));
         }
         Ok(())
     }
@@ -245,12 +258,18 @@ pub fn new_id() -> String {
     static SEQUENCE: Mutex<(i64, u64)> = Mutex::new((0, 0));
 
     let millis = chrono::Utc::now().timestamp_millis();
-    let mut sequence = SEQUENCE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut sequence = SEQUENCE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (last_millis, count) = *sequence;
     // A clock that steps backwards must not hand out an id that was already
     // handed out, so the counter only ever grows within a millisecond and
     // the millisecond never goes back.
-    let (millis, count) = if millis > last_millis { (millis, 0) } else { (last_millis, count + 1) };
+    let (millis, count) = if millis > last_millis {
+        (millis, 0)
+    } else {
+        (last_millis, count + 1)
+    };
     *sequence = (millis, count);
     format!("{millis}-{count}")
 }
@@ -317,18 +336,24 @@ fn temporary_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::book::{plan, BookWrite, LiveScenario};
+    use crate::book::{BookWrite, LiveScenario, plan};
 
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("tfg-library-test-{name}-{}", std::process::id()))
     }
 
     fn step(content: &str) -> SavedStep {
-        SavedStep { content: content.to_string(), ..Default::default() }
+        SavedStep {
+            content: content.to_string(),
+            ..Default::default()
+        }
     }
 
     fn scenario(title: &str) -> SavedScenario {
-        SavedScenario { title: title.to_string(), ..Default::default() }
+        SavedScenario {
+            title: title.to_string(),
+            ..Default::default()
+        }
     }
 
     /// A machine that has never saved a scenario has no library. That is
@@ -371,7 +396,10 @@ mod tests {
                     content: "sweep north".into(),
                     start_hour: Some("0600".into()),
                     end_hour: Some("0700".into()),
-                    location: Some(Place { lat: -5.1234, lon: 119.5678 }),
+                    location: Some(Place {
+                        lat: -5.1234,
+                        lon: 119.5678,
+                    }),
                     related: vec![("hull".into(), 13), ("node".into(), 5)],
                 },
                 step("hold"),
@@ -390,8 +418,17 @@ mod tests {
         assert_eq!(held.steps.len(), 2);
         assert_eq!(held.steps[0].content, "sweep north");
         assert_eq!(held.steps[0].start_hour.as_deref(), Some("0600"));
-        assert_eq!(held.steps[0].location, Some(Place { lat: -5.1234, lon: 119.5678 }));
-        assert_eq!(held.steps[0].related, vec![("hull".to_string(), 13), ("node".to_string(), 5)]);
+        assert_eq!(
+            held.steps[0].location,
+            Some(Place {
+                lat: -5.1234,
+                lon: 119.5678
+            })
+        );
+        assert_eq!(
+            held.steps[0].related,
+            vec![("hull".to_string(), 13), ("node".to_string(), 5)]
+        );
         assert!(held.steps[1].start_hour.is_none());
 
         // The file is the whole library, one object, and nothing of the
@@ -409,12 +446,28 @@ mod tests {
     #[test]
     fn an_upsert_replaces_by_id_and_gives_a_blank_one_a_name() {
         let mut library = Library::default();
-        library.upsert(SavedScenario { id: "kept".into(), title: "First".into(), ..Default::default() });
-        library.upsert(SavedScenario { id: "other".into(), title: "Second".into(), ..Default::default() });
+        library.upsert(SavedScenario {
+            id: "kept".into(),
+            title: "First".into(),
+            ..Default::default()
+        });
+        library.upsert(SavedScenario {
+            id: "other".into(),
+            title: "Second".into(),
+            ..Default::default()
+        });
 
-        let id = library.upsert(SavedScenario { id: "kept".into(), title: "Revised".into(), ..Default::default() });
+        let id = library.upsert(SavedScenario {
+            id: "kept".into(),
+            title: "Revised".into(),
+            ..Default::default()
+        });
         assert_eq!(id, "kept");
-        assert_eq!(library.scenarios.len(), 2, "the same id is replaced, not added");
+        assert_eq!(
+            library.scenarios.len(),
+            2,
+            "the same id is replaced, not added"
+        );
         assert_eq!(library.get("kept").unwrap().title, "Revised");
 
         let fresh = library.upsert(scenario("Third"));
@@ -428,7 +481,11 @@ mod tests {
     #[test]
     fn a_remove_answers_whether_it_was_there() {
         let mut library = Library::default();
-        library.upsert(SavedScenario { id: "held".into(), title: "Held".into(), ..Default::default() });
+        library.upsert(SavedScenario {
+            id: "held".into(),
+            title: "Held".into(),
+            ..Default::default()
+        });
         assert!(library.remove("held"));
         assert!(!library.remove("held"));
         assert!(library.get("held").is_none());
@@ -440,14 +497,30 @@ mod tests {
     #[test]
     fn the_sorted_list_is_case_blind_and_stable() {
         let mut library = Library::default();
-        library.upsert(SavedScenario { id: "3".into(), title: "beta".into(), ..Default::default() });
-        library.upsert(SavedScenario { id: "1".into(), title: "Alpha".into(), ..Default::default() });
-        library.upsert(SavedScenario { id: "2".into(), title: "alpha".into(), ..Default::default() });
+        library.upsert(SavedScenario {
+            id: "3".into(),
+            title: "beta".into(),
+            ..Default::default()
+        });
+        library.upsert(SavedScenario {
+            id: "1".into(),
+            title: "Alpha".into(),
+            ..Default::default()
+        });
+        library.upsert(SavedScenario {
+            id: "2".into(),
+            title: "alpha".into(),
+            ..Default::default()
+        });
 
         let titles: Vec<&str> = library.sorted().iter().map(|s| s.title.as_str()).collect();
         assert_eq!(titles, vec!["Alpha", "alpha", "beta"]);
         let ids: Vec<&str> = library.sorted().iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["1", "2", "3"], "the id breaks the tie the title leaves");
+        assert_eq!(
+            ids,
+            vec!["1", "2", "3"],
+            "the id breaks the tie the title leaves"
+        );
     }
 
     /// The pin's words and the Inspector's reading of the same place are
@@ -455,7 +528,10 @@ mod tests {
     /// "here" and not "this rivet".
     #[test]
     fn the_place_text_carries_four_decimals() {
-        let text = place_text(&Place { lat: -5.12341, lon: 119.98762 });
+        let text = place_text(&Place {
+            lat: -5.12341,
+            lon: 119.98762,
+        });
         assert_eq!(text, "at -5.1234, 119.9876");
     }
 
@@ -498,6 +574,8 @@ mod tests {
                 BookWrite::AddStep { .. } => "addstep",
                 BookWrite::RemoveStep { .. } => "remove",
                 BookWrite::SetRelated { .. } => "relate",
+                BookWrite::AddSubstep { .. } => "addsub",
+                BookWrite::SetAudience { .. } => "audience",
             })
             .collect();
         assert_eq!(kinds, vec!["create", "addstep", "addstep", "relate"]);
@@ -506,8 +584,12 @@ mod tests {
             &writes[1],
             BookWrite::AddStep { content, window: Some((_, _)), .. } if content == "sweep north"
         ));
-        assert!(matches!(&writes[2], BookWrite::AddStep { content, window: None, .. } if content == "hold"));
-        assert!(matches!(&writes[3], BookWrite::SetRelated { refs, .. } if refs == &vec![("hull".to_string(), 13)]));
+        assert!(
+            matches!(&writes[2], BookWrite::AddStep { content, window: None, .. } if content == "hold")
+        );
+        assert!(
+            matches!(&writes[3], BookWrite::SetRelated { refs, .. } if refs == &vec![("hull".to_string(), 13)])
+        );
     }
 
     /// A step's window is both ends or neither, and the file can break that
@@ -532,7 +614,10 @@ mod tests {
         assert!(staged.steps[0].start.is_none());
         assert!(staged.steps[0].end.is_none());
         let writes = plan(&draft, &[]);
-        assert!(matches!(&writes[1], BookWrite::AddStep { window: None, .. }));
+        assert!(matches!(
+            &writes[1],
+            BookWrite::AddStep { window: None, .. }
+        ));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -583,8 +668,14 @@ mod tests {
         let staged = draft.get_new(local).unwrap();
         let first = staged.steps[0].local_id;
         let second = staged.steps[1].local_id;
-        assert_eq!(draft.related(local, first), Some(&vec![("hull".to_string(), 13)]));
-        assert_eq!(draft.related(local, second), Some(&vec![("node".to_string(), 5)]));
+        assert_eq!(
+            draft.related(local, first),
+            Some(&vec![("hull".to_string(), 13)])
+        );
+        assert_eq!(
+            draft.related(local, second),
+            Some(&vec![("node".to_string(), 5)])
+        );
     }
 
     /// Two ids made in the same moment must not be the same id, or the
@@ -617,7 +708,10 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(&target) && name != &target)
             .collect();
-        assert!(stray.is_empty(), "the temp file is renamed over the target, not left beside it");
+        assert!(
+            stray.is_empty(),
+            "the temp file is renamed over the target, not left beside it"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -625,10 +719,16 @@ mod tests {
     /// server already holds: a saved scenario is deployed, never merged.
     #[test]
     fn a_staged_scenario_is_a_new_one_whatever_the_server_holds() {
-        let saved = SavedScenario { title: "First light".into(), ..Default::default() };
+        let saved = SavedScenario {
+            title: "First light".into(),
+            ..Default::default()
+        };
         let mut draft = BookDraft::new();
         stage_into(&mut draft, &saved);
-        let live = vec![LiveScenario { id: 7, steps: Vec::new() }];
+        let live = vec![LiveScenario {
+            id: 7,
+            steps: Vec::new(),
+        }];
         let writes = plan(&draft, &live);
         assert!(matches!(&writes[0], BookWrite::Create { .. }));
     }
@@ -639,7 +739,10 @@ mod tests {
     /// test is the shape contract written down.
     #[test]
     fn the_saved_shapes_are_built_in_full() {
-        let place = Place { lat: -6.2, lon: 106.8 };
+        let place = Place {
+            lat: -6.2,
+            lon: 106.8,
+        };
         let step = SavedStep {
             content: "cross the river".to_string(),
             start_hour: Some("1000".to_string()),

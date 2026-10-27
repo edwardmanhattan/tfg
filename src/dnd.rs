@@ -22,7 +22,23 @@
 //! buzz be honest: it fires for a reason the operator could have predicted
 //! from the hover indicator, not for a drag that silently did nothing.
 
-/// What the pointer is carrying.
+/// THE PEEL'S THRESHOLD, in logical pixels (`§5.3`).
+///
+/// A PRESS THAT DOES NOT MOVE IS NOT A COMMAND. The register has no checkbox
+/// and no click-to-add, so the only way a hull enters the game is a press that
+/// becomes a drag — and this number is what separates the two. It is small
+/// enough that a deliberate peel lifts immediately and large enough that a
+/// click's own jitter does not stage a hull nobody meant to place.
+pub const PEEL_THRESHOLD: f32 = 4.0;
+
+/// Whether a press at `from`, now at `at`, has become a drag.
+pub fn peel_lifts(from: (f32, f32), at: (f32, f32)) -> bool {
+    let dx = at.0 - from.0;
+    let dy = at.1 - from.1;
+    (dx * dx + dy * dy).sqrt() >= PEEL_THRESHOLD
+}
+
+/// What the pointer is carrying./// What the pointer is carrying.
 ///
 /// The shell's ghost carries display data as well — a thumbnail, a glyph —
 /// but the ghost is how the drag LOOKS. This is what it MEANS, and it is the
@@ -177,9 +193,9 @@ pub fn resolve_drop(entity: &DragEntity, target: &DropTarget) -> DropVerdict {
         (DragEntity::Player { .. }, DropTarget::Player { .. }) => DropVerdict::Refused {
             why: "a person commands pieces, not people".to_string(),
         },
-        (DragEntity::Player { user_id, .. }, DropTarget::Roster) => DropVerdict::Seat {
-            user_id: *user_id,
-        },
+        (DragEntity::Player { user_id, .. }, DropTarget::Roster) => {
+            DropVerdict::Seat { user_id: *user_id }
+        }
 
         // ── A group ───────────────────────────────────────────────────────
         (DragEntity::Group { group_id, .. }, DropTarget::Group { group_id: parent }) => {
@@ -201,7 +217,8 @@ pub fn resolve_drop(entity: &DragEntity, target: &DropTarget) -> DropVerdict {
             why: "drop a person ON the group to give it a commander".to_string(),
         },
         (DragEntity::Group { .. }, DropTarget::Map { .. }) => DropVerdict::Refused {
-            why: "a group has no map position \u{2014} it lives in the task organisation".to_string(),
+            why: "a group has no map position \u{2014} it lives in the task organisation"
+                .to_string(),
         },
         (DragEntity::Group { .. }, DropTarget::Roster) => DropVerdict::Refused {
             why: "a group is not a seat \u{2014} it lives in the task organisation".to_string(),
@@ -380,5 +397,15 @@ mod tests {
         let refused = resolve_drop(&unit(7), &DropTarget::Unit { unit_id: 7 });
         assert!(!refused.accepted());
         assert!(refused.refusal().is_some());
+    }
+
+    /// A CLICK DOES NOT LIFT; A DRAG DOES — and the threshold is one number,
+    /// not a guess at each call site.
+    #[test]
+    fn a_press_lifts_only_when_it_moves() {
+        assert!(!peel_lifts((100.0, 100.0), (102.0, 101.0)), "jitter");
+        assert!(!super::peel_lifts((100.0, 100.0), (100.0, 100.0)));
+        assert!(super::peel_lifts((100.0, 100.0), (100.0, 106.0)));
+        assert!(super::peel_lifts((100.0, 100.0), (96.0, 96.0)));
     }
 }

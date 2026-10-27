@@ -231,7 +231,7 @@ One floating panel (Session, Roster, Inspector, Orders, Log) over the fullscreen
 _Avoid_: dock, pane, window (that's the OS frame)
 
 **Wizard**:
-The stepped onboarding (Welcome → Session → Fleet → Review → Live) that IS the Setup phase: a centered island, skippable, dismissed on going Live.
+The stepped onboarding (Welcome → Session → Fleet → Review → Live) that IS the Setup phase: a centered island, skippable, dismissed on going Live. Being replaced by the draft's stages (see Creation): the creation flow does not keep two ways to create a game, and the wizard's five window fields become stage 01's derived time base.
 _Avoid_: tour, guide
 
 **Log**:
@@ -271,4 +271,78 @@ _Avoid_: read flag (that's the console's own unread bookkeeping), seen
 **Assumed identity**:
 The scenario role a sender spoke AS. When a message carries one, the server withholds the real author — from everybody, the Game Master included — so the console shows the assumed identity alone and never guesses the author back.
 _Avoid_: alias, pen name, role (that's the seat)
+
+## Creation
+
+The flow that makes a game or a Saved Scenario: the landing, one draft, six
+stages, three presses (`docs/creation-flow-handoff.md`).
+
+**Draft**:
+One game being composed on this machine: its mode, its terms and time base,
+its force, its task organisation, its book, its roster, and the journal of what
+a previous press already wrote. Every stage edits memory and nothing is written
+until a press in stage 06; closing the window loses it. A draft is a create
+(`Blank`, `SavedScenario`) or a diff (`Reopened`), which its origin decides.
+_Avoid_: session (that's the held game), wizard state, template
+
+**Origin**:
+What a draft was made from — `Blank { mode }`, `SavedScenario { mission_id }`
+or `Reopened { game_id }`. It decides what is prefilled and whether a press is
+a create or a diff against what the server holds; a `Reopened` draft only
+exists for a game in `planning`.
+_Avoid_: source (that's a Fix's provenance), kind
+
+**Stage**:
+One row of the draft's rail: essentials, units, groups, scenario, players,
+review. Six for a scenario draft and five for a static or maneuver one, because
+neither of those has a book. The rail NAVIGATES — a stage is reached by
+clicking it, not by finishing the one before — and only the three verbs are
+gated.
+_Avoid_: step (that's the scenario's), wizard step, phase
+
+**Verb**:
+One of the three presses in stage 06: Save as Game Session, Save as Scenario,
+Play Directly. A verb is disabled and says why, using the same blockers that
+would stop it; a static or maneuver draft earns two of them.
+_Avoid_: action, mode
+
+**Ladder position**:
+A numbered write in one of the two write orders: 01–09 for a game, M1–M3 for a
+Saved Scenario. The ladder's numbers are a different series from the rail's and
+do not move with the mode.
+_Avoid_: stage, step
+
+**Saved Scenario**:
+A server-side detached mission: steps, sub-steps and the hulls their audiences
+name, with no game, no map, no seats, no groups and no commanders. Made by Save
+as Scenario, listed on the landing's START FROM, and a draft may be seeded from
+one.
+_Avoid_: template (that's the CMS's role vocabulary), mission, library
+
+**Considered**:
+A person the operator has made a decision about in the Players stage: seated, or
+explicitly `NOT PLAYING`. The stage's denominator is `seated ∪ considered`, so a
+person nobody touched does not count. `NOT PLAYING` writes nothing; it deletes
+the participant row when there is one.
+_Avoid_: selected, ticked, added
+
+**Blocker**:
+Why a verb cannot run: the stage the operator can fix it in, and a sentence that
+names the field, the hull or the body. The sentence is the server's rule read
+one stage earlier, never a client-only nicety.
+_Avoid_: error, validation message
+
+**Journal**:
+The record of what a press has already written — one landing per ladder
+position, plus the ids the server returned for staged rows. A resumed press
+reads the journal, never the draft's optimism: a position the journal says
+succeeded is not sent again.
+_Avoid_: log (that's the session's action journal), history
+
+**Ring pack**:
+What a group does to the map when it is dropped on it: its hulls laid out around
+the drop point — first hull at the anchor, then rings of `6k` at radius `k·R`,
+spread from 12 o'clock — with a sub-group keeping its own centre. Nothing about
+the pack is stored; the commit writes N placements in unit-id order.
+_Avoid_: cluster (that's the gesture), formation, spread
 

@@ -106,12 +106,7 @@ pub struct DraftHull {
 }
 
 impl DraftHull {
-    pub fn new(
-        unit_id: i64,
-        name: String,
-        hull_number: String,
-        class_id: String,
-    ) -> Self {
+    pub fn new(unit_id: i64, name: String, hull_number: String, class_id: String) -> Self {
         Self {
             unit_id,
             name,
@@ -280,6 +275,32 @@ impl ForceDraft {
             }
             None => false,
         }
+    }
+
+    /// MOVE A CLUSTER (`§5.6`): shift every named hull's staged position by the
+    /// same delta, and answer how many moved.
+    ///
+    /// A CLUSTER IS A GESTURE, NOT A STORED OBJECT — a group's hulls, or a
+    /// selection. It is staged here exactly like one hull's move, so the commit
+    /// writes ONE PLACEMENT PER HULL in unit-id order, with no batch route:
+    /// `MOVE A CLUSTER → N WRITES, UNIT-ID ORDER, NO BATCH ROUTE`. A hull with
+    /// no ground is not moved (there is nothing to shift), and a delta of
+    /// nothing moves nothing.
+    pub fn move_cluster(&mut self, units: &[i64], d_lat: f64, d_lon: f64) -> usize {
+        if d_lat == 0.0 && d_lon == 0.0 {
+            return 0;
+        }
+        let mut moved = 0usize;
+        for unit_id in units {
+            if let Some(hull) = self.hulls.get_mut(unit_id) {
+                if let Some(start) = &mut hull.start {
+                    start.lat = (start.lat + d_lat).clamp(-90.0, 90.0);
+                    start.lon = (start.lon + d_lon).clamp(-180.0, 180.0);
+                    moved += 1;
+                }
+            }
+        }
+        moved
     }
 
     /// Say what course a hull starts on. `None` says nothing about it.
@@ -491,7 +512,13 @@ impl std::fmt::Display for ForceGap {
 /// The checks run in the order the operator is likely to meet them, and the
 /// first one to fire refuses the whole draft: a plan that writes the commander
 /// of a hull it cannot embark would half-commit.
-fn gap(draft: &ForceDraft, live: &[LiveHull]) -> Option<ForceGap> {
+///
+/// `pub` for the creation flow's REVIEW stage, which asks the same question
+/// one stage earlier and must give the same answer: it passes the empty
+/// `live` a draft has not written anything to, so every drafted hull is
+/// judged as the new one it is (`crate::draft`). Two answers to "is this
+/// force writable" is the drift this module exists to prevent.
+pub fn gap(draft: &ForceDraft, live: &[LiveHull]) -> Option<ForceGap> {
     let uncommanded: Vec<String> = draft
         .hulls()
         .filter(|hull| hull.commander_id.is_none() && !live_holds(live, hull.unit_id))
@@ -582,10 +609,7 @@ fn doubled_hulls(draft: &ForceDraft) -> Vec<String> {
 /// This is a rule about the ROOM, so it is not in [`gap`]: the draft alone
 /// does not say who is judge-side, and the shell's own door to the plan
 /// does not carry the room either. The advance carries both and asks.
-pub fn judge_side_gap(
-    draft: &ForceDraft,
-    judges: &BTreeMap<i64, String>,
-) -> Option<ForceGap> {
+pub fn judge_side_gap(draft: &ForceDraft, judges: &BTreeMap<i64, String>) -> Option<ForceGap> {
     for hull in draft.hulls() {
         let Some(commander) = hull.commander_id else {
             continue;
@@ -772,7 +796,12 @@ mod tests {
         h
     }
 
-    fn live(unit_id: i64, name: &str, commander_id: Option<i64>, start: Option<(f64, f64)>) -> LiveHull {
+    fn live(
+        unit_id: i64,
+        name: &str,
+        commander_id: Option<i64>,
+        start: Option<(f64, f64)>,
+    ) -> LiveHull {
         LiveHull {
             unit_id,
             name: name.into(),
@@ -1013,9 +1042,22 @@ mod tests {
         assert_eq!(
             plan(&draft, &[]),
             Ok(vec![
-                ForceWrite::Assign { unit_id: 7, name: "KRI Nanggala".into(), commander_id: 3 },
-                ForceWrite::Place { unit_id: 7, name: "KRI Nanggala".into(), lat: -5.4, lon: 106.2 },
-                ForceWrite::Assign { unit_id: 8, name: "KRI Rangsat".into(), commander_id: 4 },
+                ForceWrite::Assign {
+                    unit_id: 7,
+                    name: "KRI Nanggala".into(),
+                    commander_id: 3
+                },
+                ForceWrite::Place {
+                    unit_id: 7,
+                    name: "KRI Nanggala".into(),
+                    lat: -5.4,
+                    lon: 106.2
+                },
+                ForceWrite::Assign {
+                    unit_id: 8,
+                    name: "KRI Rangsat".into(),
+                    commander_id: 4
+                },
             ])
         );
     }
@@ -1043,12 +1085,7 @@ mod tests {
         let mut h = hull(7, "KRI Nanggala", Some((-5.4, 106.2)));
         h.commander_id = Some(3);
         draft.upsert(h);
-        let server = vec![live(
-            7,
-            "KRI Nanggala",
-            Some(3),
-            Some((-5.40001, 106.2)),
-        )];
+        let server = vec![live(7, "KRI Nanggala", Some(3), Some((-5.40001, 106.2)))];
         assert_eq!(plan(&draft, &server).unwrap().len(), 1);
     }
 
@@ -1069,7 +1106,11 @@ mod tests {
         commanded.commander_id = Some(3);
         draft.upsert(commanded);
         draft.upsert(hull(8, "KRI Rangsat", Some((-5.1, 106.9))));
-        let names: Vec<&str> = draft.uncommanded().iter().map(|h| h.name.as_str()).collect();
+        let names: Vec<&str> = draft
+            .uncommanded()
+            .iter()
+            .map(|h| h.name.as_str())
+            .collect();
         assert_eq!(names, vec!["KRI Rangsat"]);
     }
 
@@ -1205,9 +1246,21 @@ mod tests {
         assert_eq!(
             plan(&draft, &[]),
             Ok(vec![
-                ForceWrite::Assign { unit_id: 5, name: "KRI Ahmad Yani".into(), commander_id: 3 },
-                ForceWrite::Assign { unit_id: 7, name: "KRI Nanggala".into(), commander_id: 4 },
-                ForceWrite::Embark { host: 5, child: 7, name: "KRI Nanggala".into() },
+                ForceWrite::Assign {
+                    unit_id: 5,
+                    name: "KRI Ahmad Yani".into(),
+                    commander_id: 3
+                },
+                ForceWrite::Assign {
+                    unit_id: 7,
+                    name: "KRI Nanggala".into(),
+                    commander_id: 4
+                },
+                ForceWrite::Embark {
+                    host: 5,
+                    child: 7,
+                    name: "KRI Nanggala".into()
+                },
             ])
         );
     }
@@ -1393,11 +1446,20 @@ mod tests {
     fn a_re_read_keeps_a_staged_placement() {
         let mut draft = ForceDraft::new();
         draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
-        draft.set_start(7, Some(Start { lat: -5.0, lon: 107.0 }));
+        draft.set_start(
+            7,
+            Some(Start {
+                lat: -5.0,
+                lon: 107.0,
+            }),
+        );
         draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
         assert_eq!(
             draft.get(7).and_then(|h| h.start),
-            Some(Start { lat: -5.0, lon: 107.0 }),
+            Some(Start {
+                lat: -5.0,
+                lon: 107.0
+            }),
             "the operator's placement is the operator's"
         );
     }
@@ -1425,7 +1487,10 @@ mod tests {
         draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
         assert!(!draft.contains(7), "and it does not come back");
         assert_eq!(
-            plan(&draft, &[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]),
+            plan(
+                &draft,
+                &[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]
+            ),
             Ok(vec![ForceWrite::Remove {
                 unit_id: 7,
                 name: "KRI Nanggala".into()
@@ -1443,7 +1508,10 @@ mod tests {
         draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-6.0, 108.0)))]);
         assert_eq!(
             draft.get(7).and_then(|h| h.start),
-            Some(Start { lat: -6.0, lon: 108.0 }),
+            Some(Start {
+                lat: -6.0,
+                lon: 108.0
+            }),
             "the server's placement is the newer word"
         );
     }
@@ -1455,5 +1523,63 @@ mod tests {
         draft.seed(&[live(7, "KRI Nanggala", Some(3), Some((-5.4, 106.2)))]);
         draft.seed(&[]);
         assert!(!draft.contains(7));
+    }
+}
+
+#[cfg(test)]
+mod cluster_tests {
+    use super::*;
+
+    fn force() -> ForceDraft {
+        let mut force = ForceDraft::new();
+        for (unit_id, start) in [
+            (
+                351,
+                Some(Start {
+                    lat: -3.0,
+                    lon: 108.0,
+                }),
+            ),
+            (
+                352,
+                Some(Start {
+                    lat: -3.1,
+                    lon: 108.1,
+                }),
+            ),
+            (353, None),
+        ] {
+            force.upsert(DraftHull {
+                unit_id,
+                name: format!("KRI {unit_id}"),
+                hull_number: format!("{unit_id}"),
+                class_id: "AHMAD YANI".into(),
+                start,
+                commander_id: None,
+                host: None,
+                course_deg: None,
+            });
+        }
+        force
+    }
+
+    /// A CLUSTER MOVES EVERY HULL THAT HAS GROUND, and leaves the rest alone.
+    #[test]
+    fn a_cluster_moves_what_is_placed() {
+        let mut force = force();
+        let moved = force.move_cluster(&[351, 352, 353], 0.5, -0.25);
+        assert_eq!(moved, 2, "the unplaced hull has nothing to shift");
+        let a = force.get(351).unwrap().start.clone().unwrap();
+        let b = force.get(352).unwrap().start.clone().unwrap();
+        assert!((a.lat + 2.5).abs() < 1e-9 && (a.lon - 107.75).abs() < 1e-9);
+        assert!((b.lat + 2.6).abs() < 1e-9 && (b.lon - 107.85).abs() < 1e-9);
+        assert!(force.get(353).unwrap().start.is_none());
+    }
+
+    /// A DELTA OF NOTHING MOVES NOTHING — the verb is not a no-op write.
+    #[test]
+    fn a_empty_move_stages_nothing() {
+        let mut force = force();
+        assert_eq!(force.move_cluster(&[351, 352], 0.0, 0.0), 0);
     }
 }

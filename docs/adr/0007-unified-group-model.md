@@ -8,10 +8,11 @@ The opening proposal was a shared trait; the map decided otherwise
 - **One `Group` struct** (`id`, `name`, `kind`, `commander`, `units`,
   `children`) plus **`GroupKind::{Unsur, SatuanTugas, Gugus,
   OperasiGabungan}`** with explicit gapped ranks (10/20/30/40).
-- Nesting is generic: any group may hold units, child groups, or both;
-  every child sits at a strictly lower rank (cycles impossible by
-  construction). Unit placement is a nullable leaf assignment; forests
-  (multiple roots) allowed.
+- Nesting is ordered: a child sits at the level **immediately** above its
+  parent (rank + 10, never a skipped level), which makes cycles impossible by
+  construction. A hull IS an `UNSUR` (rank 10), so hulls sit only in a
+  `SatuanTugas` (20) — not directly in a Gugus or an Operasi Gabungan. Unit
+  placement is a nullable leaf assignment; forests (multiple roots) allowed.
 - Authority is rank-derived: max covering rank wins, organizer supreme.
 
 ## Considered Options

@@ -20,7 +20,22 @@ wgpu = "30"
 tiny_http = "0.12.0"
 # Live socket (transport resolution): pinned exact, own thread + own
 # runtime in the actor; the UI thread never touches async.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "net", "io-util", "sync", "macros"] }
+# The control plane's transport (`control::server`): HTTP JSON and one
+# WebSocket route on the same port, on its own thread with its own runtime.
+# hyper/tungstenite are already in the lockfile through the socket SDK, so
+# this adds no new crate to the tree.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio-tungstenite = "0.28"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# `tfgctl watch`: the reference client's blocking WebSocket reader.
+tungstenite = "0.28"
+# Device tokens are stored as a hash (`control::devices`), so a copy of the
+# devices file is not a copy of the credentials. Already in the tree.
+sha2 = "0.10"
 tokio-centrifuge = "=0.2.6"
 # Local-first store (master-data ticket): sqlite with the amalgamation
 # compiled in, so air-gapped delivery machines need no system library.

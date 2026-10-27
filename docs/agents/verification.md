@@ -128,6 +128,71 @@ The scroll hit test, the two hover predicates, the bubble order, and why
 `docs/gpui-gotchas.md`. Read it before reasoning about who receives a
 gesture. It is eight tool calls of source-reading, done once.
 
+## 8. The control plane has a real-binary smoke.
+
+`bash scripts/control-smoke.sh` launches the console with the control server,
+sends `tfgctl camera left` and `camera zoom-in`, and asserts on the numbers: the
+centre moved west, the zoom rose by one, and a watching client received the
+attributed `camera.changed`. It is the only test that proves a remote command
+reached the shell, because the hub is written from the camera the shell renders.
+
+It is a window launch, so it follows the capture rules: it kills only this
+checkout's stale console, it needs both binaries built, and it leaves its
+artifacts in `/tmp/opencode/control-smoke`. A failure prints the check and the
+numbers it saw; the unit tests around the same code are
+`cargo test --lib --offline control::` and they do not open a window.
+
+Twelve checks since pairing landed: the last four pair a device against the
+console, read the camera with the device's own token, revoke it, and assert the
+table exists at `TFG_CONTROL_DEVICES` with mode `0600` and no plaintext token.
+The device table is a throwaway path, so the smoke never leaves a paired phone
+behind on the machine that ran it.
+
+## 9. The headless host has its own smoke, and it needs no display.
+
+`bash scripts/control-server-smoke.sh` is the sibling of the one above, and the
+opposite shape on purpose. It starts `tfg-server`, drives it with `tfgctl`,
+pairs a device, revokes it, restarts the process, and asserts 28 things —
+including that a revoked token is still refused after the restart and that the
+devices file is `0600` with no plaintext token in it. Nothing opens a window, so
+it runs over ssh and in a container with no `DISPLAY`.
+
+What it cannot prove: that anything was drawn. `tfg-server` owns a camera and
+nothing else, so this is the test for *state agreement*, not for a picture. A UI
+surface still needs §3.
+
+Its artifacts land in `/tmp/opencode/control-server-smoke`, and the server log
+there is the readable evidence: one line per applied command, with the revision,
+the resulting camera and the client that asked.
+
+Both smokes are the same bargain: a script that would fail loudly rather than a
+screenshot that looks right. The pairing smoke earned its keep on the first run
+by failing three checks on a wrong assumption about the CLI's JSON shape, which
+is exactly the kind of thing that reads fine and is wrong.
+
+## 10. A QR code is a picture. Decode it.
+
+A QR matrix that is subtly wrong still *looks* like a QR code, so "it renders"
+is not evidence. Two tools settle it:
+
+- `qrencode -t ASCII -l M -m 0 -8 -v N` is an independent encoder. Compare
+  module for module; every module must agree. One clean way to look at a
+  disagreement is to dump all eight mask candidates from `qr.rs` (the ignored
+  `qr::tests::dump_for_comparison` writes them) and check that qrencode's matrix
+  equals one of them. If it does, the data, parity, placement and format bits
+  are right and only the mask heuristic differs — both codes are valid.
+- `zbarimg --quiet --raw` is an independent decoder. Write a PBM (`P1`) from
+  the matrix with a four-module quiet zone, scale it up six times, and assert
+  the decoded bytes equal the payload. Do the same for the code as the terminal
+  actually printed it, by turning `█▀▄ ` cells back into two module rows: that
+  tests the renderer, not just the encoder. Use a payload filled to exact
+  capacity for every version; a wrong block table hides until a boundary.
+
+The `tfgctl pair` path only draws when stdout is a terminal, so drive it through
+a PTY (a Python `pty.openpty()` driver is enough) and pair the device over
+`POST /v1/pair` while it waits. Redirect the same command and assert that no
+glyph appears, so a piped script's output stays parseable.
+
 ## The loop, in one paragraph
 
 Write the test. Run it. Make it fail for the right reason. Fix the code.

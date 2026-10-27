@@ -1,0 +1,665 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tfg.invalid/schemas/control-v1.json",
+  "title": "TFG control protocol v1",
+  "description": "Every JSON body in the TFG control protocol v1: commands posted to POST /v1/commands, events pushed over GET /v1/ws, the pairing and device bodies, and the error reply. The prose contract is docs/control-api-v1.md; this file is its machine-readable shape.",
+  "$defs": {
+    "protocol_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "geo_point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "latitude",
+        "longitude"
+      ],
+      "properties": {
+        "latitude": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "longitude": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180
+        }
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "center",
+        "zoom",
+        "width",
+        "height"
+      ],
+      "properties": {
+        "center": {
+          "$ref": "#/$defs/geo_point"
+        },
+        "zoom": {
+          "type": "number",
+          "minimum": -30,
+          "maximum": 30
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "view": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "camera"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "camera": {
+          "$ref": "#/$defs/camera"
+        }
+      }
+    },
+    "command": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/command_camera_set"
+        },
+        {
+          "$ref": "#/$defs/command_camera_nudge"
+        },
+        {
+          "$ref": "#/$defs/command_camera_zoom"
+        },
+        {
+          "$ref": "#/$defs/command_view_report"
+        }
+      ]
+    },
+    "command_camera_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "payload"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/protocol_version"
+        },
+        "client_id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "command_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "type": {
+          "const": "camera.set"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "center",
+            "zoom"
+          ],
+          "properties": {
+            "center": {
+              "$ref": "#/$defs/geo_point"
+            },
+            "zoom": {
+              "type": "number",
+              "minimum": -30,
+              "maximum": 30
+            }
+          }
+        }
+      }
+    },
+    "command_camera_nudge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "payload"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/protocol_version"
+        },
+        "client_id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "command_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "type": {
+          "const": "camera.nudge"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "dx_fraction",
+            "dy_fraction"
+          ],
+          "properties": {
+            "dx_fraction": {
+              "type": "number",
+              "minimum": -2,
+              "maximum": 2
+            },
+            "dy_fraction": {
+              "type": "number",
+              "minimum": -2,
+              "maximum": 2
+            }
+          }
+        }
+      }
+    },
+    "command_camera_zoom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "payload"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/protocol_version"
+        },
+        "client_id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "command_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "type": {
+          "const": "camera.zoom"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "delta"
+          ],
+          "properties": {
+            "delta": {
+              "type": "number",
+              "minimum": -10,
+              "maximum": 10
+            }
+          }
+        }
+      }
+    },
+    "event": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/event_snapshot"
+        },
+        {
+          "$ref": "#/$defs/event_camera_changed"
+        },
+        {
+          "$ref": "#/$defs/event_command_accepted"
+        },
+        {
+          "$ref": "#/$defs/event_command_rejected"
+        }
+      ]
+    },
+    "event_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "revision",
+        "views"
+      ],
+      "properties": {
+        "type": {
+          "const": "snapshot"
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/protocol_version"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "views": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/view"
+          },
+          "required": [
+            "main"
+          ]
+        }
+      }
+    },
+    "event_camera_changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "revision",
+        "view"
+      ],
+      "properties": {
+        "type": {
+          "const": "camera.changed"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "source": {
+          "type": "string"
+        },
+        "command_id": {
+          "type": "string"
+        },
+        "view": {
+          "$ref": "#/$defs/view"
+        }
+      }
+    },
+    "event_command_accepted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "command_id",
+        "revision"
+      ],
+      "properties": {
+        "type": {
+          "const": "command.accepted"
+        },
+        "command_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "event_command_rejected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "command_id",
+        "code",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "command.rejected"
+        },
+        "command_id": {
+          "type": "string"
+        },
+        "code": {
+          "$ref": "#/$defs/error_code"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error"
+      ],
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "code",
+            "message"
+          ],
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/error_code"
+            },
+            "message": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "command_view_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "payload"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/protocol_version"
+        },
+        "client_id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "command_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "type": {
+          "const": "view.report"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "width",
+            "height"
+          ],
+          "properties": {
+            "width": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8192
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8192
+            }
+          }
+        }
+      }
+    },
+    "scope": {
+      "type": "string",
+      "enum": [
+        "observe",
+        "control_view",
+        "admin"
+      ]
+    },
+    "error_code": {
+      "type": "string",
+      "enum": [
+        "unauthorized",
+        "forbidden",
+        "invalid_json",
+        "invalid_command",
+        "unsupported_protocol",
+        "body_too_large",
+        "not_found",
+        "host_gone",
+        "too_many_clients",
+        "server_error",
+        "invalid_pairing_code",
+        "no_pairing_window",
+        "pairing_expired",
+        "too_many_attempts",
+        "unknown_device"
+      ]
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "scopes",
+        "created_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^dev-[0-9a-f]+$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 48
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/scope"
+          },
+          "minItems": 1
+        },
+        "created_at": {
+          "type": "integer",
+          "description": "Unix seconds."
+        },
+        "last_seen": {
+          "type": "integer",
+          "description": "Unix seconds; absent if never."
+        }
+      },
+      "description": "A paired device as the API reports it. The stored token hash is never part of this shape."
+    },
+    "whoami": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client",
+        "label",
+        "scopes"
+      ],
+      "properties": {
+        "client": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/scope"
+          }
+        }
+      }
+    },
+    "device_list": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "devices"
+      ],
+      "properties": {
+        "devices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/device"
+          }
+        }
+      }
+    },
+    "pairing_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scopes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/scope"
+          },
+          "description": "Defaults to observe + control_view. admin is refused: a paired device may not pair another."
+        },
+        "ttl_seconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 600,
+          "default": 120
+        }
+      },
+      "description": "POST /v1/pairing, with the operator token."
+    },
+    "pairing_offer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "expires_in",
+        "uri",
+        "payload",
+        "scopes"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$"
+        },
+        "expires_in": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "uri": {
+          "type": "string",
+          "pattern": "^tfg-control://pair\\?"
+        },
+        "payload": {
+          "type": "string",
+          "description": "The same offer as JSON, for a client that prefers to parse it."
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/scope"
+          }
+        }
+      },
+      "description": "The answer to POST /v1/pairing. uri and payload are the two shapes a QR code or deep link would carry; the server does not render an image."
+    },
+    "pair_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 32
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 48
+        },
+        "client_id": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "description": "POST /v1/pair. Unauthenticated: the code is the credential. Case, spaces and the dash do not matter."
+    },
+    "paired": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device",
+        "token"
+      ],
+      "properties": {
+        "device": {
+          "$ref": "#/$defs/device"
+        },
+        "token": {
+          "type": "string",
+          "minLength": 32,
+          "description": "Returned once and never again."
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "description": "The answer to a successful POST /v1/pair."
+    },
+    "rotation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device",
+        "token"
+      ],
+      "properties": {
+        "device": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "description": "The answer to POST /v1/auth/rotate."
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/command"
+    },
+    {
+      "$ref": "#/$defs/event"
+    },
+    {
+      "$ref": "#/$defs/error"
+    },
+    {
+      "$ref": "#/$defs/pairing_request"
+    },
+    {
+      "$ref": "#/$defs/pairing_offer"
+    },
+    {
+      "$ref": "#/$defs/pair_request"
+    },
+    {
+      "$ref": "#/$defs/paired"
+    },
+    {
+      "$ref": "#/$defs/device"
+    },
+    {
+      "$ref": "#/$defs/device_list"
+    },
+    {
+      "$ref": "#/$defs/whoami"
+    },
+    {
+      "$ref": "#/$defs/rotation"
+    }
+  ]
+}

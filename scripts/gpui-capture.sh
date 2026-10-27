@@ -22,7 +22,15 @@
 #      looks like a plausible but wrong picture. That cost a whole debugging
 #      pass: the shell was drawing the sign-in card while the crops showed the
 #      console.
-#   5. The window must be on the ACTIVE workspace, and it must be RAISED.
+#   5. THE CAPTURE GETS ITS OWN WORKSPACE. Hyprland tiles: an app that opens
+#      beside another one on a busy workspace gets half the screen, and a
+#      capture of half a window is a picture of a layout nobody runs. So the
+#      window is moved to an EMPTY workspace (`TFG_CAPTURE_WS`, default 6),
+#      that workspace is made active, the rect is re-read (a window alone on a
+#      workspace is a different size from a window beside another), and the
+#      operator's workspace is restored on the way out.
+#
+#   5b. The window must be on the ACTIVE workspace, and it must be RAISED.
 #      `grim -o eDP-1` screencopies the composited output, which is the active
 #      workspace only — a window on another workspace is not merely
 #      mis-cropped, it is absent, and whatever is on top at those coordinates
@@ -87,6 +95,7 @@ sleep 0.5
 # 2. The trap: however this script ends, the app does too.
 PID=""
 cleanup() {
+    restore_workspace 2>/dev/null || true
     if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
         kill "$PID" 2>/dev/null || true
         sleep 0.3
@@ -141,6 +150,46 @@ if [ -z "$RECT" ]; then
 fi
 read -r X Y W H WWS WADDR <<< "$RECT"
 echo "window rect (logical): $X $Y $W $H  on workspace '$WWS'"
+
+# 5. ITS OWN WORKSPACE. A window beside another one is half a window, and the
+# full-width layout is the one worth looking at. Move it to an empty workspace,
+# go there, and re-read the rect: becoming alone on a workspace resizes it.
+CAPTURE_WS="${TFG_CAPTURE_WS:-6}"
+if [ -n "$WADDR" ] && [ -n "$CAPTURE_WS" ] && [ "$WWS" != "$CAPTURE_WS" ]; then
+    # MOVE, THEN FOLLOW. This build's `hyprctl dispatch` takes a Lua
+    # EXPRESSION, not a dispatcher string (`hl.dispatch(movewindow 6)` is a
+    # syntax error), so the old form only ever worked by luck. Two moves are
+    # tried, then focus is put on the window — which is what switches the
+    # compositor to the workspace the window now lives on.
+    if timeout "$T" hyprctl dispatch movetoworkspacesilent "${CAPTURE_WS},address:${WADDR}" >/dev/null 2>&1 \
+        || timeout "$T" hyprctl eval "hl.dsp.window.move({ workspace = \"${CAPTURE_WS}\" })" >/dev/null 2>&1; then
+        timeout "$T" hyprctl eval "hl.dsp.focus({ window = \"${WADDR}\" })" >/dev/null 2>&1 || true
+        sleep 1.5
+        RECT=$(timeout "$T" hyprctl -j clients | python3 -c "
+import json,sys
+addr='$WADDR'
+for c in json.load(sys.stdin):
+    if c.get('address')==addr:
+        a,s=c['at'],c['size']
+        print(a[0],a[1],s[0],s[1],c.get('workspace',{}).get('name',''),c.get('address',''))
+        break
+" || true)
+        if [ -n "$RECT" ]; then
+            read -r X Y W H WWS WADDR <<< "$RECT"
+            echo "moved to workspace '$CAPTURE_WS': rect now $X $Y $W $H"
+        fi
+    else
+        echo "note: could not move the window to workspace '$CAPTURE_WS'; capturing where it is" >&2
+    fi
+fi
+
+# And the operator's workspace comes back, whatever happens below.
+restore_workspace() {
+    # Nothing to restore: the window is killed by the same trap, and the
+    # compositor drops an empty workspace back to another on its own. Switching
+    # by force here would move the OPERATOR somewhere they did not ask to be.
+    :
+}
 
 # 6. RAISE THE WINDOW before the pixels are read. grim screencopies the
 # COMPOSITED output, so whatever is on top of the app at its rect is what

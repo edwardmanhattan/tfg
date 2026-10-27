@@ -19,7 +19,9 @@ mod plan;
 mod scopes;
 
 pub use model::{Group, GroupKind};
-pub use plan::{join_members, plan, GroupRef, GroupWrite, GroupsDraft, LiveGroup, StagedGroup};
+pub use plan::{
+    GroupRef, GroupWrite, GroupsDraft, LiveGroup, StagedGroup, TreeNode, join_members, plan, tree,
+};
 pub use scopes::Scope;
 
 /// The session's group forest.
@@ -83,17 +85,33 @@ mod tests {
     /// asks that question every frame to keep child symbols quiet.
     #[test]
     fn nested_ids_reports_every_child_and_no_root() {
-        // Built bottom-up, as the hierarchy demands: a child exists
-        // before its parent can muster it.
+        // Built bottom-up, as the hierarchy demands, one level at a time:
+        // a child exists before its parent can muster it.
         let mut g = Groups::default();
-        g.add_group("unsur".into(), "Unsur".into(), GroupKind::Unsur, vec![], vec![], None)
-            .expect("unsur");
+        g.add_group(
+            "unsur".into(),
+            "Unsur".into(),
+            GroupKind::Unsur,
+            vec![],
+            vec![],
+            None,
+        )
+        .expect("unsur");
+        g.add_group(
+            "satgas".into(),
+            "Satgas".into(),
+            GroupKind::SatuanTugas,
+            vec![],
+            vec!["unsur".into()],
+            None,
+        )
+        .expect("satgas");
         g.add_group(
             "gugus".into(),
             "Gugus".into(),
             GroupKind::Gugus,
             vec![],
-            vec!["unsur".into()],
+            vec!["satgas".into()],
             None,
         )
         .expect("gugus");
@@ -108,9 +126,10 @@ mod tests {
         .expect("op");
         let nested = g.nested_ids();
         assert!(nested.contains("unsur"), "a child is nested");
-        assert!(nested.contains("gugus"), "a grandchild is nested too");
+        assert!(nested.contains("satgas"), "and so is a grandchild");
+        assert!(nested.contains("gugus"), "and a great-grandchild");
         assert!(!nested.contains("op"), "a root is nobody's child");
-        assert_eq!(nested.len(), 2);
+        assert_eq!(nested.len(), 3);
     }
 
     fn rig() -> (Groups, HashMap<String, String>) {
@@ -151,7 +170,10 @@ mod tests {
     fn jurisdiction_descends_through_children() {
         let (g, seats) = rig();
         let caca = g.commanded_units("caca", &seats);
-        assert_eq!(caca, ["u1", "u2", "u3"].into_iter().map(String::from).collect());
+        assert_eq!(
+            caca,
+            ["u1", "u2", "u3"].into_iter().map(String::from).collect()
+        );
         let ani = g.commanded_units("ani", &seats);
         assert_eq!(ani, ["u1", "u2"].into_iter().map(String::from).collect());
         assert!(g.commanded_units("nobody", &seats).is_empty());
@@ -170,21 +192,39 @@ mod tests {
     #[test]
     fn deeper_level_outranks_shallower() {
         let (mut g, seats) = (Groups::default(), HashMap::new());
-        g.add_group("e1".into(), "Unsur 1".into(), GroupKind::Unsur, vec!["u1".into()], vec![], Some(
-            "ani".into(),
-        ))
+        g.add_group(
+            "s1".into(),
+            "Satgas A".into(),
+            GroupKind::SatuanTugas,
+            vec!["u1".into()],
+            vec![],
+            Some("ani".into()),
+        )
+        .unwrap();
+        g.add_group(
+            "g1".into(),
+            "Gugus A".into(),
+            GroupKind::Gugus,
+            vec![],
+            vec!["s1".into()],
+            Some("budi".into()),
+        )
         .unwrap();
         g.add_group(
             "o1".into(),
             "OpGab".into(),
             GroupKind::OperasiGabungan,
             vec![],
-            vec!["e1".into()],
+            vec!["g1".into()],
             Some("caca".into()),
         )
         .unwrap();
-        assert_eq!(g.authority("caca", "u1", &seats), Some(Authority::OPERASI_GABUNGAN));
-        assert_eq!(g.authority("ani", "u1", &seats), Some(Authority::UNSUR));
+        assert_eq!(
+            g.authority("caca", "u1", &seats),
+            Some(Authority::OPERASI_GABUNGAN)
+        );
+        assert_eq!(g.authority("budi", "u1", &seats), Some(Authority::GUGUS));
+        assert_eq!(g.authority("ani", "u1", &seats), Some(Authority::SATGAS));
     }
 
     #[test]
@@ -200,7 +240,14 @@ mod tests {
     fn unit_in_two_groups_is_rejected() {
         let (mut g, _) = rig();
         let err = g
-            .add_group("s3".into(), "Satgas C".into(), GroupKind::SatuanTugas, vec!["u1".into()], vec![], None)
+            .add_group(
+                "s3".into(),
+                "Satgas C".into(),
+                GroupKind::SatuanTugas,
+                vec!["u1".into()],
+                vec![],
+                None,
+            )
             .unwrap_err();
         assert!(err.contains("already in group"), "{err}");
     }
@@ -209,7 +256,14 @@ mod tests {
     fn group_over_unknown_child_is_rejected() {
         let (mut g, _) = rig();
         let err = g
-            .add_group("g2".into(), "Gugus Y".into(), GroupKind::Gugus, vec![], vec!["nope".into()], None)
+            .add_group(
+                "g2".into(),
+                "Gugus Y".into(),
+                GroupKind::Gugus,
+                vec![],
+                vec!["nope".into()],
+                None,
+            )
             .unwrap_err();
         assert!(err.contains("unknown group"), "{err}");
     }
@@ -218,17 +272,70 @@ mod tests {
     fn child_at_or_above_own_rank_is_rejected() {
         let (mut g, _) = rig();
         let err = g
-            .add_group("x1".into(), "Sideways".into(), GroupKind::SatuanTugas, vec![], vec!["s1".into()], None)
+            .add_group(
+                "x1".into(),
+                "Sideways".into(),
+                GroupKind::SatuanTugas,
+                vec![],
+                vec!["s1".into()],
+                None,
+            )
             .unwrap_err();
         assert!(err.contains("rank violation"), "{err}");
+    }
+
+    /// A SKIPPED LEVEL IS NOT A PARENT. `rig` has a Gugus holding two Satuan
+    /// Tugas; an Operasi Gabungan cannot take a Satuan Tugas directly, even
+    /// though it is above it.
+    #[test]
+    fn a_skipped_level_is_rejected() {
+        let (mut g, _) = rig();
+        let err = g
+            .add_group(
+                "o1".into(),
+                "OpGab".into(),
+                GroupKind::OperasiGabungan,
+                vec![],
+                vec!["s1".into()],
+                None,
+            )
+            .unwrap_err();
+        assert!(err.contains("rank violation"), "{err}");
+        assert!(err.contains("SatuanTugas:20"), "{err}");
+        assert!(err.contains("OperasiGabungan:40"), "{err}");
+    }
+
+    /// A HULL IS AN UNSUR AND SITS ONLY IN A SATUAN TUGAS: a Gugus may hold
+    /// Satuan Tugas, never hulls of its own.
+    #[test]
+    fn a_hull_in_a_gugus_is_rejected() {
+        let (mut g, _) = rig();
+        let err = g
+            .add_group(
+                "g2".into(),
+                "Gugus Y".into(),
+                GroupKind::Gugus,
+                vec!["u9".into()],
+                vec![],
+                None,
+            )
+            .unwrap_err();
+        assert!(err.contains("hulls are Unsur:10"), "{err}");
+        assert!(err.contains("Gugus:30"), "{err}");
     }
 
     #[test]
     fn echelon_names_resolve_to_kinds_and_strangers_refuse() {
         assert_eq!(GroupKind::from_echelon("Unsur"), Some(GroupKind::Unsur));
-        assert_eq!(GroupKind::from_echelon("Satuan Tugas"), Some(GroupKind::SatuanTugas));
+        assert_eq!(
+            GroupKind::from_echelon("Satuan Tugas"),
+            Some(GroupKind::SatuanTugas)
+        );
         assert_eq!(GroupKind::from_echelon("Gugus"), Some(GroupKind::Gugus));
-        assert_eq!(GroupKind::from_echelon("Operasi Gabungan"), Some(GroupKind::OperasiGabungan));
+        assert_eq!(
+            GroupKind::from_echelon("Operasi Gabungan"),
+            Some(GroupKind::OperasiGabungan)
+        );
         // Ranks are compared, never these strings — but the strings are
         // still the lookup, so a future level resolves to nothing
         // rather than to somebody else's rank.

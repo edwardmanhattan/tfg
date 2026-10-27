@@ -1,21 +1,23 @@
 //! Group hierarchy (map #70, spec #76): build and query the forest.
 //!
 //! Groups are created bottom-up over existing children; every child must
-//! sit at a strictly lower rank than its parent, which makes cycles
+//! sit at the level immediately above its parent, which makes cycles
 //! impossible by construction. Everything fails loud: blank/dup names
-//! and ids, double-mustered units, unknown or mis-ranked children.
+//! and ids, double-mustered units, unknown or mis-ranked children, and a
+//! hull mustered anywhere but a Satuan Tugas.
 
 use std::collections::HashSet;
 
-use super::model::{
-    duplicate_unit_refusal, rank_refusal, repeated_unit_refusal, Group, GroupKind,
-};
 use super::Groups;
+use super::model::{
+    Group, GroupKind, duplicate_unit_refusal, hull_refusal, rank_refusal, repeated_unit_refusal,
+};
 
 impl Groups {
     /// Add a group. Fails loud: blank/dup name or id, a unit already
     /// mustered in another group (jurisdiction stays unambiguous), an
-    /// unknown child, or a child at or above this group's own rank.
+    /// unknown child, a child not immediately below this group's own rank,
+    /// or a hull outside a Satuan Tugas.
     pub fn add_group(
         &mut self,
         id: String,
@@ -34,6 +36,9 @@ impl Groups {
         if self.groups.iter().any(|g| g.name == name) {
             return Err(format!("duplicate group name `{name}`"));
         }
+        if !units.is_empty() && kind != GroupKind::SatuanTugas {
+            return Err(hull_refusal(kind));
+        }
         let mut seen: HashSet<&str> = HashSet::new();
         for u in &units {
             if !seen.insert(u.as_str()) {
@@ -50,11 +55,18 @@ impl Groups {
             let Some(child) = self.groups.iter().find(|g| &g.id == c) else {
                 return Err(format!("unknown group `{c}`"));
             };
-            if child.kind.rank() >= kind.rank() {
+            if !child.kind.sits_under(kind) {
                 return Err(rank_refusal(&child.name, child.kind, kind));
             }
         }
-        self.groups.push(Group { id, name, kind, units, children, commander });
+        self.groups.push(Group {
+            id,
+            name,
+            kind,
+            units,
+            children,
+            commander,
+        });
         Ok(())
     }
 
@@ -78,7 +90,9 @@ impl Groups {
 
     /// The group directly mustering a unit, if any.
     pub fn group_of_unit(&self, unit: &str) -> Option<&Group> {
-        self.groups.iter().find(|g| g.units.iter().any(|u| u == unit))
+        self.groups
+            .iter()
+            .find(|g| g.units.iter().any(|u| u == unit))
     }
 
     /// Member units of one group, descended through its children.

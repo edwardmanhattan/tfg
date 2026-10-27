@@ -53,12 +53,64 @@ impl ComposerDraft {
     }
 }
 
+/// What a step IS (`§7.1`): an orders step, or a beat.
+///
+/// The kind is not decoration: a BEAT carries no sub-steps, and the server
+/// answers 409 if one is sent. The composer refuses it locally with the same
+/// sentence, so the refusal arrives before the press rather than from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StepKind {
+    #[default]
+    Orders,
+    Beat,
+}
+
+impl StepKind {
+    pub fn wire(self) -> &'static str {
+        match self {
+            StepKind::Orders => "orders",
+            StepKind::Beat => "beat",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StepKind::Orders => "ORDERS",
+            StepKind::Beat => "BEAT",
+        }
+    }
+
+    /// The sentence the server would give, said here instead.
+    pub const BEAT_REFUSAL: &'static str =
+        "A BEAT CARRIES NO SUB-STEPS \u{2014} THE SERVER ANSWERS 409";
+}
+
+/// One sub-step: a command, its audience, and the nodes the audience came
+/// from.
+///
+/// A SUB-STEP SHARES ITS STEP'S WINDOW (`§7.1`) — it has no window of its own,
+/// which is why there is no start or end here. `nodes` is PROVENANCE, not a
+/// write: a group dropped on a sub-step resolves to its hulls at drop time, and
+/// the nodes are shown as where the hulls came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedSubStep {
+    /// Negative while staged: never collides with a server id.
+    pub local_id: i64,
+    /// The step it belongs to (either half staged).
+    pub step: i64,
+    pub content: String,
+    pub units: Vec<i64>,
+    pub nodes: Vec<i64>,
+}
+
 /// One step being authored, before the server has given it an id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StagedStep {
     /// Negative while staged: never collides with a server id, so the
     /// composer can select and display staged rows with the same key.
     pub local_id: i64,
+    /// Orders or a beat (`§7.1`). A beat carries no sub-steps.
+    pub kind: StepKind,
     pub content: String,
     /// `HHMM`, both ends or neither — validated on the way in, same as
     /// the step form, so the flush never posts a half window.
@@ -92,6 +144,9 @@ pub struct BookDraft {
     step_adds: BTreeMap<i64, Vec<StagedStep>>,
     step_cuts: Vec<(i64, i64)>,
     step_relations: BTreeMap<(i64, i64), Vec<(String, i64)>>,
+    /// Sub-steps by the step they belong to (`§7.1`). A sub-step is ONE command
+    /// to ONE audience; its window is its step's.
+    substeps: BTreeMap<i64, Vec<StagedSubStep>>,
     next_local: i64,
 }
 
@@ -160,6 +215,7 @@ impl BookDraft {
         let slot = self.news.get_mut(&local_id)?;
         slot.steps.push(StagedStep {
             local_id: step_local,
+            kind: StepKind::Orders,
             content: content.to_string(),
             start: window.clone().map(|(a, _)| a),
             end: window.map(|(_, b)| b),
@@ -182,6 +238,159 @@ impl BookDraft {
         dropped
     }
 
+    /// Make a step a beat, or an orders step again.
+    ///
+    /// Turning an orders step into a beat KEEPS its sub-steps: deleting them
+    /// would be this form destroying work the operator did, and the server
+    /// accepts deleting a sub-step from a beat — so the composer refuses new
+    /// ones and leaves the old ones visible.
+    pub fn set_kind(&mut self, step_local: i64, kind: StepKind) -> bool {
+        for scenario in self.news.values_mut() {
+            for step in scenario.steps.iter_mut() {
+                if step.local_id == step_local {
+                    step.kind = kind;
+                    return true;
+                }
+            }
+        }
+        for steps in self.step_adds.values_mut() {
+            for step in steps.iter_mut() {
+                if step.local_id == step_local {
+                    step.kind = kind;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The kind of a staged step.
+    pub fn kind_of(&self, step_local: i64) -> Option<StepKind> {
+        for scenario in self.news.values() {
+            if let Some(step) = scenario.steps.iter().find(|s| s.local_id == step_local) {
+                return Some(step.kind);
+            }
+        }
+        for steps in self.step_adds.values() {
+            if let Some(step) = steps.iter().find(|s| s.local_id == step_local) {
+                return Some(step.kind);
+            }
+        }
+        None
+    }
+
+    /// Stage a sub-step on a step. A BEAT REFUSES, with the server's sentence
+    /// (`§7.1`): the refusal is the same one the 409 would carry, said before
+    /// the press instead of after it.
+    pub fn stage_substep(&mut self, step_local: i64, content: &str) -> Result<i64, String> {
+        if self.kind_of(step_local) == Some(StepKind::Beat) {
+            return Err(StepKind::BEAT_REFUSAL.to_string());
+        }
+        let local_id = self.fresh_local();
+        self.substeps
+            .entry(step_local)
+            .or_default()
+            .push(StagedSubStep {
+                local_id,
+                step: step_local,
+                content: content.to_string(),
+                units: Vec::new(),
+                nodes: Vec::new(),
+            });
+        Ok(local_id)
+    }
+
+    /// Set a sub-step's audience.
+    ///
+    /// ONE SUB-STEP PER HULL PER STEP: a hull that joins this audience leaves
+    /// every other sub-step of the SAME step, because the server refuses two
+    /// commands to one hull in one step. A hull in another step is untouched —
+    /// a hull can be idle in one step and busy in the next.
+    pub fn set_substep_units(
+        &mut self,
+        step_local: i64,
+        substep_local: i64,
+        units: Vec<i64>,
+    ) -> bool {
+        let Some(list) = self.substeps.get_mut(&step_local) else {
+            return false;
+        };
+        for other in list.iter_mut().filter(|s| s.local_id != substep_local) {
+            other.units.retain(|u| !units.contains(u));
+        }
+        let Some(target) = list.iter_mut().find(|s| s.local_id == substep_local) else {
+            return false;
+        };
+        target.units = units;
+        true
+    }
+
+    /// Replace a sub-step's command text in the local planning draft.
+    pub fn set_substep_content(
+        &mut self,
+        step_local: i64,
+        substep_local: i64,
+        content: impl Into<String>,
+    ) -> bool {
+        let Some(target) = self
+            .substeps
+            .get_mut(&step_local)
+            .and_then(|list| list.iter_mut().find(|s| s.local_id == substep_local))
+        else {
+            return false;
+        };
+        target.content = content.into();
+        true
+    }
+
+    /// ADD hulls to a sub-step's audience — the drop's own verb (`§7.3`).
+    ///
+    /// Answers `(added, total)`, because the sheet's release reads
+    /// `RELEASE ADDS 2 \u{b7} 5 HULLS`: the operator sees what the drop did and
+    /// what the command now holds, not merely that something changed.
+    ///
+    /// A hull already in ANOTHER sub-step of the SAME step is MOVED, which is
+    /// what preserves one sub-step per hull per step. A hull in another STEP is
+    /// untouched — a hull can be idle in one step and busy in the next.
+    pub fn add_substep_units(
+        &mut self,
+        step_local: i64,
+        substep_local: i64,
+        units: &[i64],
+    ) -> (usize, usize) {
+        let Some(list) = self.substeps.get_mut(&step_local) else {
+            return (0, 0);
+        };
+        for other in list.iter_mut().filter(|s| s.local_id != substep_local) {
+            other.units.retain(|u| !units.contains(u));
+        }
+        let Some(target) = list.iter_mut().find(|s| s.local_id == substep_local) else {
+            return (0, 0);
+        };
+        let mut added = 0usize;
+        for unit in units {
+            if !target.units.contains(unit) {
+                target.units.push(*unit);
+                added += 1;
+            }
+        }
+        target.units.sort_unstable();
+        (added, target.units.len())
+    }
+
+    /// The step's sub-steps, in the order they were authored.    /// The step's sub-steps, in the order they were authored.
+    pub fn substeps_of(&self, step_local: i64) -> &[StagedSubStep] {
+        self.substeps
+            .get(&step_local)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Every sub-step the draft holds, in step then authoring order.
+    pub fn all_substeps(&self) -> impl Iterator<Item = &StagedSubStep> {
+        self.substeps.values().flat_map(|list| list.iter())
+    }
+
     /// Stage a step onto a server-held scenario.
     pub fn stage_step_add(
         &mut self,
@@ -190,12 +399,16 @@ impl BookDraft {
         window: Option<(String, String)>,
     ) -> i64 {
         let step_local = self.fresh_local();
-        self.step_adds.entry(scenario_id).or_default().push(StagedStep {
-            local_id: step_local,
-            content: content.to_string(),
-            start: window.clone().map(|(a, _)| a),
-            end: window.map(|(_, b)| b),
-        });
+        self.step_adds
+            .entry(scenario_id)
+            .or_default()
+            .push(StagedStep {
+                local_id: step_local,
+                kind: StepKind::Orders,
+                content: content.to_string(),
+                start: window.clone().map(|(a, _)| a),
+                end: window.map(|(_, b)| b),
+            });
         step_local
     }
 
@@ -236,6 +449,10 @@ impl BookDraft {
 
     pub fn staged_news(&self) -> impl Iterator<Item = &StagedScenario> {
         self.news.values()
+    }
+
+    pub fn staged_news_mut(&mut self) -> impl Iterator<Item = &mut StagedScenario> {
+        self.news.values_mut()
     }
 
     /// Staged step-adds for one server-held scenario, in authoring order.
@@ -320,6 +537,50 @@ impl BookDraft {
     pub fn pending(&self, live: &[LiveScenario]) -> usize {
         plan(self, live).len()
     }
+
+    /// How many steps the operator has STAGED, across every scenario in the
+    /// book.
+    ///
+    /// The frame's steps are not here, because this draft does not hold the
+    /// frame: `plan` takes the live scenarios as an argument, and a
+    /// re-read's steps are the read's, not the draft's. The caller that
+    /// wants the whole book's count adds the read to this one — the
+    /// creation flow's rail does exactly that, and a count that quietly
+    /// answered for half a book would be the sort of number nobody can
+    /// check.
+    pub fn staged_step_count(&self) -> usize {
+        self.news.values().map(|s| s.steps.len()).sum::<usize>()
+            + self.step_adds.values().map(Vec::len).sum::<usize>()
+    }
+
+    /// How many hulls are staged against a step, across the whole book.
+    ///
+    /// EVERY ONE IS STEP-LEVEL, and that is why the count matters: Minos
+    /// refuses a step-level audience with a 409 always, on both ladders, and
+    /// an audience belongs on a sub-step. Until this model holds sub-steps,
+    /// a non-zero answer here is the creation flow's `plan` gap rather than a
+    /// write (`crate::commit`).
+    pub fn relation_count(&self) -> usize {
+        self.step_relations.values().map(Vec::len).sum()
+    }
+}
+
+/// THE IDLE BUCKET, DERIVED (`§7.1`): the force minus the union of the step's
+/// sub-step audiences.
+///
+/// Read-only in this slice, and derivable at all only because the union is the
+/// whole answer: a hull with no command in this step is idle in it, and a hull
+/// that is idle here may be busy in the next — the step's window still covers
+/// it. Sorted by unit id, so a row does not reshuffle between renders.
+pub fn idle_in_step(force: &[i64], substeps: &[&StagedSubStep]) -> Vec<i64> {
+    let mut at: Vec<i64> = force
+        .iter()
+        .copied()
+        .filter(|unit| !substeps.iter().any(|s| s.units.contains(unit)))
+        .collect();
+    at.sort_unstable();
+    at.dedup();
+    at
 }
 
 /// One scenario as Minos holds it: the last thing the sync left behind.
@@ -385,6 +646,29 @@ pub enum BookWrite {
         step: StepRef,
         refs: Vec<(String, i64)>,
     },
+    /// A sub-step: `POST .../steps/{step}/substeps` (`§7.1`).
+    ///
+    /// It follows its step, because the step's id is what the route takes —
+    /// so the ladder's step position creates the step and the command in the
+    /// same breath, and the journal resolves each as the answer names it.
+    AddSubstep {
+        scenario: ScenarioRef,
+        step: StepRef,
+        substep: i64,
+        content: String,
+    },
+    /// A sub-step's audience: `PUT .../substeps/{s}/related`, the WHOLE list.
+    ///
+    /// THE ONLY PLACE AN AUDIENCE IS WRITTEN. A step-level relation is refused
+    /// with a 409 on both ladders, so that stays a gap and never becomes a
+    /// write.
+    SetAudience {
+        scenario: ScenarioRef,
+        step: StepRef,
+        substep: i64,
+        hulls: Vec<i64>,
+        nodes: Vec<i64>,
+    },
 }
 
 impl BookWrite {
@@ -399,6 +683,11 @@ impl BookWrite {
             }
             Self::RemoveStep { step_id, .. } => format!("remove step {step_id}"),
             Self::SetRelated { refs, .. } => format!("relate {} post(s)", refs.len()),
+            Self::AddSubstep { content, .. } => {
+                let short: String = content.chars().take(40).collect();
+                format!("add sub-step {short:?}")
+            }
+            Self::SetAudience { hulls, .. } => format!("relate {} hull(s)", hulls.len()),
         }
     }
 }
@@ -427,6 +716,24 @@ pub fn plan(draft: &BookDraft, live: &[LiveScenario]) -> Vec<BookWrite> {
                 content: step.content.clone(),
                 window: step.start.clone().zip(step.end.clone()),
             });
+            // A sub-step is a ROW OF ITS STEP (`§7.1`), so it is written right
+            // after the step exists and before the next step is posted: the
+            // composer's order is the ladder's order.
+            for sub in draft.substeps_of(step.local_id) {
+                writes.push(BookWrite::AddSubstep {
+                    scenario: ScenarioRef::New(news.local_id),
+                    step: StepRef::New(step.local_id),
+                    substep: sub.local_id,
+                    content: sub.content.clone(),
+                });
+                writes.push(BookWrite::SetAudience {
+                    scenario: ScenarioRef::New(news.local_id),
+                    step: StepRef::New(step.local_id),
+                    substep: sub.local_id,
+                    hulls: sub.units.clone(),
+                    nodes: sub.nodes.clone(),
+                });
+            }
         }
     }
     let mut live_adds: Vec<(&i64, &Vec<StagedStep>)> = draft.step_adds.iter().collect();
@@ -442,13 +749,31 @@ pub fn plan(draft: &BookDraft, live: &[LiveScenario]) -> Vec<BookWrite> {
                 content: step.content.clone(),
                 window: step.start.clone().zip(step.end.clone()),
             });
+            for sub in draft.substeps_of(step.local_id) {
+                writes.push(BookWrite::AddSubstep {
+                    scenario: ScenarioRef::Live(*sid),
+                    step: StepRef::New(step.local_id),
+                    substep: sub.local_id,
+                    content: sub.content.clone(),
+                });
+                writes.push(BookWrite::SetAudience {
+                    scenario: ScenarioRef::Live(*sid),
+                    step: StepRef::New(step.local_id),
+                    substep: sub.local_id,
+                    hulls: sub.units.clone(),
+                    nodes: sub.nodes.clone(),
+                });
+            }
         }
     }
     for (sid, step_id) in &draft.step_cuts {
         if !live.iter().any(|l| l.id == *sid) {
             continue;
         }
-        writes.push(BookWrite::RemoveStep { scenario_id: *sid, step_id: *step_id });
+        writes.push(BookWrite::RemoveStep {
+            scenario_id: *sid,
+            step_id: *step_id,
+        });
     }
     // Relations last: every row they name — the scenario, the step — is
     // posted ahead of them.
@@ -466,7 +791,11 @@ pub fn plan(draft: &BookDraft, live: &[LiveScenario]) -> Vec<BookWrite> {
             }
             (ScenarioRef::Live(*sid), StepRef::Live(*step))
         };
-        writes.push(BookWrite::SetRelated { scenario, step, refs: refs.clone() });
+        writes.push(BookWrite::SetRelated {
+            scenario,
+            step,
+            refs: refs.clone(),
+        });
     }
     writes
 }
@@ -476,7 +805,10 @@ mod tests {
     use super::*;
 
     fn live(id: i64) -> LiveScenario {
-        LiveScenario { id, steps: Vec::new() }
+        LiveScenario {
+            id,
+            steps: Vec::new(),
+        }
     }
 
     #[test]
@@ -500,19 +832,23 @@ mod tests {
                 },
                 BookWrite::AddStep {
                     scenario: ScenarioRef::New(local),
-                    step: StepRef::New(draft
-                        .get_new(local)
-                        .and_then(|sc| sc.steps.first().map(|s| s.local_id))
-                        .unwrap_or(0)),
+                    step: StepRef::New(
+                        draft
+                            .get_new(local)
+                            .and_then(|sc| sc.steps.first().map(|s| s.local_id))
+                            .unwrap_or(0)
+                    ),
                     content: "sweep north".into(),
                     window: Some(("0600".into(), "0700".into())),
                 },
                 BookWrite::AddStep {
                     scenario: ScenarioRef::New(local),
-                    step: StepRef::New(draft
-                        .get_new(local)
-                        .and_then(|sc| sc.steps.get(1).map(|s| s.local_id))
-                        .unwrap_or(0)),
+                    step: StepRef::New(
+                        draft
+                            .get_new(local)
+                            .and_then(|sc| sc.steps.get(1).map(|s| s.local_id))
+                            .unwrap_or(0)
+                    ),
                     content: "hold".into(),
                     window: None,
                 },
@@ -622,6 +958,8 @@ mod tests {
                 BookWrite::AddStep { .. } => "addstep",
                 BookWrite::RemoveStep { .. } => "remove",
                 BookWrite::SetRelated { .. } => "relate",
+                BookWrite::AddSubstep { .. } => "addsub",
+                BookWrite::SetAudience { .. } => "audience",
             })
             .collect();
         assert_eq!(kinds, vec!["create", "addstep", "relate"]);
@@ -735,7 +1073,11 @@ mod tests {
     #[test]
     fn an_empty_step_is_not_the_drafts_business() {
         let d = ComposerDraft::default();
-        assert_eq!(d.problem(), None, "content is the server's rule, not the draft's");
+        assert_eq!(
+            d.problem(),
+            None,
+            "content is the server's rule, not the draft's"
+        );
     }
 
     /// A good window comes through as the pair the request expects, not as
@@ -766,6 +1108,192 @@ mod tests {
         assert_eq!(
             half.problem().as_deref(),
             Some("a window needs an end as well as a start")
+        );
+    }
+}
+
+#[cfg(test)]
+mod substep_tests {
+    use super::*;
+
+    fn book() -> (BookDraft, i64, i64) {
+        let mut book = BookDraft::new();
+        let scenario = book.stage_scenario_named("Harbour sweep", "the sweep north");
+        let step = book
+            .stage_step_new(
+                scenario,
+                "SWEEP the strait",
+                Some(("0930".into(), "1015".into())),
+            )
+            .expect("a step");
+        (book, scenario, step)
+    }
+
+    /// A BEAT CARRIES NO SUB-STEPS, and the refusal is the server's sentence
+    /// said before the press instead of after it.
+    #[test]
+    fn a_beat_refuses_a_substep_with_the_servers_words() {
+        let (mut book, _scenario, step) = book();
+        assert!(book.set_kind(step, StepKind::Beat));
+        let err = book.stage_substep(step, "TAKE STATION").unwrap_err();
+        assert_eq!(err, StepKind::BEAT_REFUSAL);
+        assert!(err.contains("409"), "the operator reads the answer's shape");
+        // And an orders step takes one.
+        assert!(book.set_kind(step, StepKind::Orders));
+        assert!(book.stage_substep(step, "TAKE STATION").is_ok());
+    }
+
+    /// ONE SUB-STEP PER HULL PER STEP: a hull joining one audience leaves the
+    /// others in the SAME step.
+    #[test]
+    fn a_hull_leaves_another_substep_of_the_same_step() {
+        let (mut book, _scenario, step) = book();
+        let first = book.stage_substep(step, "TAKE STATION XYZ").expect("first");
+        let second = book
+            .stage_substep(step, "TAKE STATION XYA")
+            .expect("second");
+        assert!(book.set_substep_units(step, first, vec![351, 352, 353]));
+        assert!(book.set_substep_units(step, second, vec![352, 367]));
+        let subs = book.substeps_of(step);
+        let a = subs.iter().find(|s| s.local_id == first).expect("first");
+        let b = subs.iter().find(|s| s.local_id == second).expect("second");
+        assert_eq!(a.units, vec![351, 353], "352 moved to the other command");
+        assert_eq!(b.units, vec![352, 367]);
+    }
+
+    /// THE IDLE BUCKET IS THE FORCE MINUS EVERY AUDIENCE, in unit order.
+    #[test]
+    fn the_idle_bucket_is_derived() {
+        let (mut book, _scenario, step) = book();
+        let first = book.stage_substep(step, "TAKE STATION XYZ").expect("first");
+        let second = book
+            .stage_substep(step, "TAKE STATION XYA")
+            .expect("second");
+        book.set_substep_units(step, first, vec![351, 352, 353]);
+        book.set_substep_units(step, second, vec![354, 367]);
+        let subs: Vec<&StagedSubStep> = book.substeps_of(step).iter().collect();
+        let force = vec![371, 524, 365, 361, 367, 351, 352, 353, 354];
+        assert_eq!(
+            idle_in_step(&force, &subs),
+            vec![361, 365, 371, 524],
+            "sorted, deduped, and nobody from an audience"
+        );
+    }
+}
+
+#[cfg(test)]
+mod substep_plan_tests {
+    use super::*;
+
+    /// A SUB-STEP IS POSTED AFTER ITS STEP AND ITS AUDIENCE AFTER THAT — the
+    /// composer's order is the ladder's order, because the route takes the
+    /// step's id.
+    #[test]
+    fn a_substep_and_its_audience_follow_their_step() {
+        let mut book = BookDraft::new();
+        let scenario = book.stage_scenario("Harbour sweep");
+        let first = book
+            .stage_step_new(scenario, "SWEEP", Some(("0930".into(), "1015".into())))
+            .expect("a step");
+        let sub = book
+            .stage_substep(first, "TAKE STATION XYZ")
+            .expect("a sub-step");
+        book.set_substep_units(first, sub, vec![351, 352]);
+        let second = book
+            .stage_step_new(scenario, "RECOVER", None)
+            .expect("a step");
+        let writes = plan(&book, &[]);
+        let kinds: Vec<&str> = writes
+            .iter()
+            .map(|w| match w {
+                BookWrite::Create { .. } => "create",
+                BookWrite::AddStep { .. } => "addstep",
+                BookWrite::AddSubstep { .. } => "addsub",
+                BookWrite::SetAudience { .. } => "audience",
+                BookWrite::RemoveStep { .. } => "remove",
+                BookWrite::SetRelated { .. } => "relate",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["create", "addstep", "addsub", "audience", "addstep"],
+            "the command rides its step, and the next step follows"
+        );
+        assert!(matches!(
+            &writes[3],
+            BookWrite::SetAudience { substep, hulls, .. } if *substep == sub && hulls == &vec![351, 352]
+        ));
+        // `second` has no sub-steps, and nothing invents one.
+        assert!(
+            matches!(&writes[4], BookWrite::AddStep { step: StepRef::New(id), .. } if *id == second)
+        );
+    }
+}
+
+#[cfg(test)]
+mod audience_drop_tests {
+    use super::*;
+
+    /// THE DROP ADDS, and answers the two numbers the release reads: how many
+    /// joined, and how many the command now holds.
+    #[test]
+    fn adding_units_answers_added_and_total() {
+        let mut book = BookDraft::new();
+        let scenario = book.stage_scenario("Harbour sweep");
+        let step = book
+            .stage_step_new(scenario, "SWEEP", None)
+            .expect("a step");
+        let sub = book.stage_substep(step, "TAKE STATION XYZ").expect("a sub");
+        book.set_substep_units(step, sub, vec![351]);
+        assert_eq!(book.add_substep_units(step, sub, &[352, 353]), (2, 3));
+        // Dropping the same hulls again adds nothing, and says so.
+        assert_eq!(book.add_substep_units(step, sub, &[352, 353]), (0, 3));
+    }
+
+    /// A HULL ALREADY IN ANOTHER SUB-STEP OF THE SAME STEP IS MOVED — that is
+    /// the rule the server states, kept here rather than discovered on the wire.
+    #[test]
+    fn a_drop_moves_a_hull_between_substeps_of_one_step() {
+        let mut book = BookDraft::new();
+        let scenario = book.stage_scenario("Harbour sweep");
+        let step = book
+            .stage_step_new(scenario, "SWEEP", None)
+            .expect("a step");
+        let a = book.stage_substep(step, "TAKE STATION XYZ").expect("a");
+        let b = book.stage_substep(step, "TAKE STATION XYA").expect("b");
+        book.set_substep_units(step, a, vec![351, 352, 353]);
+        book.set_substep_units(step, b, vec![367]);
+        // 352 joins b: moved out of a, added to b.
+        assert_eq!(book.add_substep_units(step, b, &[352]), (1, 2));
+        let subs = book.substeps_of(step);
+        assert_eq!(subs[0].units, vec![351, 353]);
+        assert_eq!(subs[1].units, vec![352, 367]);
+    }
+
+    /// A HULL IN ANOTHER STEP IS UNTOUCHED.
+    #[test]
+    fn a_drop_leaves_the_other_steps_alone() {
+        let mut book = BookDraft::new();
+        let scenario = book.stage_scenario("Harbour sweep");
+        let first = book
+            .stage_step_new(scenario, "SWEEP", None)
+            .expect("a step");
+        let second = book
+            .stage_step_new(scenario, "RECOVER", None)
+            .expect("a step");
+        let a = book.stage_substep(first, "TAKE STATION").expect("a");
+        let b = book.stage_substep(second, "TAKE STATION").expect("b");
+        book.set_substep_units(first, a, vec![351]);
+        book.set_substep_units(second, b, vec![351]);
+        assert_eq!(
+            book.substeps_of(first)[0].units,
+            vec![351],
+            "still the first step's hull"
+        );
+        assert_eq!(
+            book.substeps_of(second)[0].units,
+            vec![351],
+            "and the second's"
         );
     }
 }

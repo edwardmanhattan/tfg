@@ -30,6 +30,8 @@
 //! value, it is named for the role. Do not strip these comments: they are the
 //! part that stops the next change from being wrong.
 
+pub mod kit;
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -56,11 +58,21 @@ impl Rgba {
     /// white and black at low alpha rather than real colours, because they
     /// have to sit on a panel that is itself on top of arbitrary map tiles.
     pub const fn white_alpha(a: u8) -> Self {
-        Self { r: 255, g: 255, b: 255, a }
+        Self {
+            r: 255,
+            g: 255,
+            b: 255,
+            a,
+        }
     }
 
     pub const fn black_alpha(a: u8) -> Self {
-        Self { r: 0, g: 0, b: 0, a }
+        Self {
+            r: 0,
+            g: 0,
+            b: 0,
+            a,
+        }
     }
 
     pub const fn with_alpha(mut self, a: u8) -> Self {
@@ -694,14 +706,42 @@ pub const INSPECTOR_IMAGE_MAX_HEIGHT: f32 = 180.0;
 // ---------------------------------------------------------------------------
 
 /// An axis-aligned box, as (min_x, min_y, max_x, max_y).
+///
+/// CORNERS, NOT ORIGIN AND SIZE — and a renderer that destructures this as
+/// `(x, y, w, h)` draws the element as wide as its right edge and as tall as
+/// its bottom edge. That is not hypothetical: the planning cards were drawn
+/// that way for a day, so six cards each as wide as its own right coordinate
+/// overlapped into one dark field, and the operator's report was "they look
+/// crumpled with each other". A renderer wants [`Rect`]; [`box_rect`] is the
+/// conversion, and it exists so the conversion is written once.
 pub type Box = (f32, f32, f32, f32);
+
+/// An axis-aligned rectangle as ORIGIN AND SIZE: `(left, top, width, height)`.
+///
+/// The shape every toolkit's element builder wants, and the one thing a
+/// [`Box`] is not. It has its own name because the two were the same type for
+/// a day and one renderer took the wrong one.
+pub type Rect = (f32, f32, f32, f32);
 
 pub const fn box_at(x: f32, y: f32, w: f32, h: f32) -> Box {
     (x, y, x + w, y + h)
 }
 
+/// A [`Box`] as the [`Rect`] a renderer sets on an element.
+///
+/// The one conversion, named so a call site cannot hold a box and call it a
+/// width: `let (x, y, w, h) = some_box` type-checks and is wrong by exactly
+/// the origin.
+pub const fn box_rect(b: Box) -> Rect {
+    (b.0, b.1, box_w(b), box_h(b))
+}
+
 pub const fn box_w(b: Box) -> f32 {
     b.2 - b.0
+}
+
+pub const fn box_h(b: Box) -> f32 {
+    b.3 - b.1
 }
 
 /// Fit an Inspector image inside the available width without letting a
@@ -732,10 +772,6 @@ pub fn inspector_image_size(
     } else {
         (width, height)
     }
-}
-
-pub const fn box_h(b: Box) -> f32 {
-    b.3 - b.1
 }
 
 pub const fn box_cx(b: Box) -> f32 {
@@ -912,7 +948,12 @@ pub const BODY_SCROLL_SLACK: f32 = 12.0;
 /// full band height. `edge_x` is the band's left edge on a right dock,
 /// its right edge on a left dock.
 pub fn zone_grip_rect(band: Box, edge_x: f32) -> Box {
-    (edge_x - ZONE_GRIP_W * 0.5, band.1, edge_x + ZONE_GRIP_W * 0.5, band.3)
+    (
+        edge_x - ZONE_GRIP_W * 0.5,
+        band.1,
+        edge_x + ZONE_GRIP_W * 0.5,
+        band.3,
+    )
 }
 
 /// Next live zone width after a grip drag: add the pointer delta on a left
@@ -1270,34 +1311,21 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
         // opens the surface that answers the only question this state has:
         // which exercise.
         crate::gamestate::GameState::NoSession => {}
-        // PLANNING is the console's column, island for island and height for
-        // height (`main.rs::side_zone`): read the plan back (Essentials),
-        // set the clock's pace (Control), choose what fights (Fleet), seat
-        // the room (Players), and watch the gate (Review). One omission,
-        // named: `z.groups`, the task organisation, which is the console's
-        // own local scratch authoring and has no read route at all.
-        crate::gamestate::GameState::Planning => {
-                out.push(slot(IslandKey::Essentials, 470.0));
-                // 320, not the console's 182 and not the 210 this island grew
-                // to: the hold joined the pace here (SCENARIO CLOCK plus its
-                // pill cost ~30pt), and the PLANNED WINDOW joined it after that
-                // (five fields in two rows, the label, and the note that says
-                // who may write them). At 182 the pill painted half below the
-                // island's own box, the silent-clip defect
-                // `docs/ui-overhaul-status.md` records, and the fix for that
-                // was the box and not the content. The same fix, twice.
-                //
-                // AND 320, NOT 210: at 210 the window's note — the line that
-                // says the window is STAGED and that writing it needs the
-                // administrator's ticket — painted below the island's own box,
-                // which is the same silent clip at the same place. A capture
-                // showed it: the fields were there and the note was not.
-                out.push(slot(IslandKey::Control, 320.0));
-            out.push(slot(IslandKey::Fleet, 320.0));
-            out.push(slot(IslandKey::Players, 300.0));
-            out.push(slot(IslandKey::Groups, 280.0));
-            out.push(slot(IslandKey::Review, 380.0));
-        }
+        // PLANNING IS THE GRID, not a column.
+        //
+        // The phase used to be a stack down one side of the window, and a
+        // stack is a scroll: the operator scrolled to find the fifth thing
+        // they needed, and the ground they were planning on was a strip
+        // down the side of the frame. The phase is six equal panels over
+        // the map now (`planning_grid`), and the column holds nothing at
+        // all in this state.
+        //
+        // The Control island is GONE, and that is the owner's direction:
+        // the multiplier, the hold and the window are the exercise clock,
+        // and the exercise clock is part of the exercise's terms — so it
+        // lives in the terms panel now, and a planning room does not say
+        // the exercise's name and its clock in two separate places.
+        crate::gamestate::GameState::Planning => {}
         // Preparation is the gate. The console's Readiness island is
         // exactly what Command carries here.
         //
@@ -1372,6 +1400,209 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
 }
 
 // ---------------------------------------------------------------------------
+// The planning GRID
+// ---------------------------------------------------------------------------
+
+/// The planning phase's layout: SIX EQUAL islands, three across and two
+/// down, floating over the map.
+///
+/// The planning phase used to be a COLUMN — a stack of panels down one side
+/// of the map, scrolled. A column is the right answer for a console that
+/// must hold every state at once, and the wrong one for a phase whose
+/// membership is fixed and known: the operator scrolled to find the fifth
+/// thing they needed, and the map they were planning ON was a strip down
+/// the side.
+///
+/// Six equal cells over the map puts the ground UNDER the plan: the
+/// exercise is fought on that water, and the plan is drawn on it.
+pub const GRID_COLS: usize = 3;
+
+/// The narrowest a cell may be and still hold the console's own panels.
+///
+/// The console's column is 320pt wide, and its panels were built for it: a
+/// field row, a rule and a value. A cell narrower than that cannot hold
+/// them, and a cell that cannot hold them shows them cut at the edge.
+pub const GRID_MIN_CELL_W: f32 = 320.0;
+
+/// The margin BETWEEN two islands.
+///
+/// A margin, not a border: the map shows through it, and it is what says
+/// "these are six things and not one thing with six rooms".
+///
+/// 16 AND NOT 12. The panels are dark and TRANSLUCENT over a map that is
+/// dark water most of the time, so a 12pt margin read as the panels' own
+/// edges touching: the gap was there and the eye could not find it. The
+/// margin is the only thing separating six panels over the same sea, and
+/// it has to be wide enough to see.
+pub const GRID_GAP: f32 = 16.0;
+
+/// The margin from the window's edge to the outer islands.
+///
+/// The same as [`GRID_GAP`], so the frame's own margin and the margin
+/// between two panels are one measurement. A grid whose outer margin is
+/// tighter than its inner one reads as panels pushed at the window's
+/// edges, which is the opposite of air.
+pub const GRID_INSET: f32 = 16.0;
+
+/// The corner radius of a planning panel.
+///
+/// The console's column panels are SQUARE ([`PANEL_RADIUS`]) because they
+/// are instruments bolted into a stack. These six are not a stack: they
+/// float on the map with a margin all round them, and a floating card with
+/// square corners reads as a hole cut in the water rather than as a card
+/// laid on it. [`ISLAND_RADIUS`] is the rounding the console already
+/// trusts for exactly that shape.
+pub const GRID_CARD_RADIUS: f32 = ISLAND_RADIUS;
+
+/// The body inset of a planning panel.
+///
+/// Larger than [`PANEL_PAD`], which is a band's inset: these bodies hold
+/// fields, lists and rules, and 16 is the same breathing room an island
+/// body gets ([`ISLAND_PAD`]). The columns are a third of the window wide,
+/// so a body pinned at 10 to its own edge reads as text against a wall.
+pub const GRID_PAD: f32 = ISLAND_PAD;
+
+/// The planning panels' opacity.
+///
+/// The planning phase draws its six panels OVER the map, and the map is
+/// the ground the plan is written for — so the panels are a little bit
+/// transparent, and the operator can see the water their exercise will be
+/// fought on through the plan that will be fought there.
+///
+/// NOT LESS. The console's ink is light on a dark panel, and the panel is
+/// dark; at 91% over a pale map the field is still a dark field, and the
+/// type still reads. Below that the type starts to fight the coastline
+/// under it, and a plan nobody can read is worse than a map nobody can
+/// see.
+pub const GRID_CARD_ALPHA: u8 = 240;
+
+/// The six panels of the planning grid.
+///
+/// The order is the READING order, and it is the task's order: what the
+/// exercise IS (Essentials), what is running it (Exercise), who is in it
+/// (Players), what fights (Fleet), what one of them is (Unit), and how it
+/// is organised (Groups). The operator reads the grid left to right, top
+/// to bottom, and this is the path their eye takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GridPanel {
+    /// The session's own terms, EDITED IN PLACE: the name, the pace, the
+    /// Game Master's prose, the planned window, the room key, the clock's
+    /// multiplier, and — in a scenario exercise — the book it plays.
+    ///
+    /// The form is the creation wizard's, because it asks the same
+    /// questions of the same session: a planning room should not make the
+    /// operator open a second surface to fix a typo in the name they typed
+    /// at the door.
+    Essentials,
+    /// The exercise itself, and nothing else: the console's mark, the kind
+    /// of game, the phase, and the one verb that ends the phase.
+    Exercise,
+    /// Who is in the room — the seats the session holds — and the door to
+    /// the picker those seats are chosen in.
+    Players,
+    /// What fights — the hulls the session holds — and the door to the
+    /// register they are drawn from.
+    Fleet,
+    /// The selected hull, in full.
+    Unit,
+    /// The task organisation: the groups, and the groups inside groups.
+    Groups,
+}
+
+impl GridPanel {
+    /// The band's title.
+    pub fn title(self) -> &'static str {
+        match self {
+            GridPanel::Essentials => "ESSENTIALS",
+            GridPanel::Exercise => "EXERCISE",
+            GridPanel::Players => "PLAYERS",
+            GridPanel::Fleet => "FLEET",
+            GridPanel::Unit => "UNIT",
+            GridPanel::Groups => "GROUPS",
+        }
+    }
+
+    /// Whether the panel carries a title band.
+    ///
+    /// FIVE OF THE SIX DO. The EXERCISE panel does not, and the reason is
+    /// that its title IS its body: the console's wordmark, ARCONS, is the
+    /// largest thing on the grid and it is already the name of the surface.
+    /// A band above it saying EXERCISE gives one panel two headings and
+    /// spends the top of the tallest cell on the weaker of them.
+    pub fn has_title(self) -> bool {
+        self != GridPanel::Exercise
+    }
+
+    /// The six panels, in reading order.
+    pub const ALL: [GridPanel; 6] = [
+        GridPanel::Essentials,
+        GridPanel::Exercise,
+        GridPanel::Players,
+        GridPanel::Fleet,
+        GridPanel::Unit,
+        GridPanel::Groups,
+    ];
+}
+
+/// Where the planning grid sits, and where each of its six cells is.
+///
+/// The grid fills the window BELOW the top band — the band is the clock
+/// and the identity, and it is the one thing that is the same in every
+/// phase, so it stays where it is — and the cells are EQUAL: a grid whose
+/// cells are not equal is a grid whose importance is decided by size, and
+/// the operator reads the big one and leaves the rest.
+///
+/// The cells are computed here and drawn there, so the layout cannot be
+/// one thing on the screen and another in the code.
+pub fn planning_grid(viewport: Box) -> Vec<Box> {
+    let top = top_band_h() + GRID_INSET;
+    let area_w = (viewport.2 - 2.0 * GRID_INSET).max(0.0);
+    let area_h = (viewport.3 - top - GRID_INSET).max(0.0);
+    let cols = planning_grid_cols(viewport.2);
+    let rows = (GridPanel::ALL.len() + cols - 1) / cols;
+    let cell_w = (area_w - GRID_GAP * (cols - 1) as f32) / cols as f32;
+    let cell_h = (area_h - GRID_GAP * (rows - 1) as f32) / rows as f32;
+    let mut out = Vec::with_capacity(cols * rows);
+    for row in 0..rows {
+        for col in 0..cols {
+            out.push(box_at(
+                GRID_INSET + col as f32 * (cell_w + GRID_GAP),
+                top + row as f32 * (cell_h + GRID_GAP),
+                cell_w,
+                cell_h,
+            ));
+        }
+    }
+    out
+}
+
+/// The grid's columns, and they follow the window.
+///
+/// THREE on a window wide enough to hold them, and TWO on one that is not:
+/// a cell narrower than the console's own column cannot hold the console's
+/// own panels, and a grid of cells that cannot hold them is a grid of
+/// cut-off rows.
+///
+/// So the grid is responsive the way a layout should be: the WINDOW decides
+/// how many columns there are, and the panels inside them are the same
+/// panels either way.
+pub fn planning_grid_cols(viewport_w: f32) -> usize {
+    let area = (viewport_w - 2.0 * GRID_INSET).max(0.0);
+    let fits = |cols: usize| (area - GRID_GAP * (cols - 1) as f32) / cols as f32 >= GRID_MIN_CELL_W;
+    if fits(GRID_COLS) {
+        GRID_COLS
+    } else if fits(2) {
+        2
+    } else {
+        // ONE column: the window is too narrow for the console's own panels
+        // side by side, and a grid of cells that cannot hold them is a grid
+        // of cut-off rows. One column is the console's own column, and it
+        // holds.
+        1
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The SESSIONS card
 // ---------------------------------------------------------------------------
 
@@ -1396,6 +1627,14 @@ pub const SESSIONS_H: f32 = 560.0;
 /// token, so the row a test aims at is the row that is drawn.
 pub const SESSION_ROW_H: f32 = 22.0;
 
+/// One tab band's height in the SESSIONS card's history: the five state tabs
+/// between the list's title and its first row.
+///
+/// A token for the same reason a row's height is one: a band whose height is
+/// its content's is a band that moves the first row, and a click that lands on
+/// a tab when it aimed at a row holds the wrong exercise.
+pub const TAB_BAND_H: f32 = 22.0;
+
 /// The margin between the SESSIONS card and the window's edge, on every
 /// side.
 ///
@@ -1417,11 +1656,14 @@ pub const CARD_INSET: f32 = 32.0;
 /// card whose title band is cut off by the window's own edge, and the band
 /// exists to carry the name of the surface — an operator who cannot read
 /// "SESSIONS" does not know which surface they are in.
-pub fn sessions_card_rect(viewport: Box) -> Box {
+pub fn sessions_card_rect(viewport: Box) -> Rect {
     // The room the card has, once the window's own margin is taken off.
     let room_w = (viewport.2 - 2.0 * CARD_INSET).max(0.0);
     let room_h = (viewport.3 - 2.0 * CARD_INSET).max(0.0);
-    let w = SESSIONS_W.min(room_w).max(240.0).min((viewport.2 - 16.0).max(0.0));
+    let w = SESSIONS_W
+        .min(room_w)
+        .max(240.0)
+        .min((viewport.2 - 16.0).max(0.0));
     // The card holds the wizard, and the wizard's content grows with the
     // text — so the card does too. A card whose last field is below its
     // own bottom edge is a card the operator has to scroll to finish.
@@ -1442,13 +1684,50 @@ pub fn sessions_card_rect(viewport: Box) -> Box {
 ///
 /// The card's own title band and the rule under it, then the column's
 /// padding, then the LIST's title band and the rule under it, then the gap,
+/// THE FLOW'S CONTENT COLUMN — `(left, width)` of the row the panels sit in.
+///
+/// The flow is a full-window surface with its own chrome (`kit::STRIP_H`), the
+/// double rule under it, and a centred content column no wider than
+/// `kit::CONTENT_W`. This is the arithmetic of all three, in the kernel, so a
+/// test that wants to click a row and the render that draws it are reading the
+/// same numbers.
+pub fn flow_content(viewport: Rect) -> (f32, f32) {
+    let w = kit::CONTENT_W.min(viewport.2 - 48.0).max(280.0);
+    ((viewport.2 - w) / 2.0, w)
+}
+
+/// The y of the flow's content row: the chrome, the double rule, and the
+/// body's own top inset.
+pub fn flow_content_top() -> f32 {
+    let strip = pt(kit::STRIP_H);
+    let rules = pt(kit::STRIP_RULE_GAP) + kit::EDGE_WIDTH;
+    strip + rules + 8.0
+}
+
+/// The first history row's centre: the content corner, the panel's band, its
+/// rule, the body's inset, the tabs, the column header, then half a row.
+///
+/// The sessions card is gone; the history lives in the flow's left panel, and
+/// a test that aims at a row has to aim where the flow draws it.
+pub fn flow_first_row_point(viewport: Rect) -> (f32, f32) {
+    let (left, _) = flow_content(viewport);
+    let band = pt(kit::BAND_H) + kit::EDGE_WIDTH;
+    let pad = pt(PANEL_PAD);
+    let tabs = pt(24.0) + pt(PANEL_GAP);
+    let header = pt(LABEL_PT) + pt(4.0) + kit::EDGE_WIDTH;
+    (
+        left + 120.0,
+        flow_content_top() + band + pad + tabs + header + pt(kit::ROW_H) / 2.0,
+    )
+}
+
 /// then half a row. Every term is a token, and the render draws the same
 /// terms in the same order — so the point this names is where the row is.
 ///
 /// This exists because the sessions list left the column: a test that found
 /// a row by walking the column's arithmetic cannot find a row that is not
 /// in the column, and a test that cannot find the row proves nothing.
-pub fn sessions_first_row_point(card: Box) -> (f32, f32) {
+pub fn sessions_first_row_point(card: Rect) -> (f32, f32) {
     let x = card.0 + PANEL_PAD + 60.0;
     let y = card.1
         + title_h()
@@ -1456,6 +1735,13 @@ pub fn sessions_first_row_point(card: Box) -> (f32, f32) {
         + PANEL_PAD
         + title_h()
         + 1.0
+        + PANEL_GAP
+        // THE HISTORY'S FIVE STATE TABS, and the gap on either side of them.
+        // The creation flow put the tabs between the list's title and its first
+        // row (`docs/creation-flow-handoff.md` §3.1), so the arithmetic that
+        // names the first row grew one term — and a test that aimed at the old
+        // point would now aim at a tab.
+        + TAB_BAND_H
         + PANEL_GAP
         + SESSION_ROW_H / 2.0;
     (x, y)
@@ -1768,7 +2054,11 @@ pub const FRAME_DASH_GAP_PX: f32 = 2.5;
 /// Each vertex moves along its own radius, which is exact for a polygon and
 /// the right approximation for an arc: the casing follows the frame instead
 /// of sitting inside it.
-pub fn offset_run_outward(points: &[(f32, f32)], center: (f32, f32), offset: f32) -> Vec<(f32, f32)> {
+pub fn offset_run_outward(
+    points: &[(f32, f32)],
+    center: (f32, f32),
+    offset: f32,
+) -> Vec<(f32, f32)> {
     points
         .iter()
         .map(|(x, y)| {
@@ -1836,7 +2126,6 @@ pub fn hhmm_ok(s: &str) -> bool {
 pub fn hhmm_window_ok(start: &str, end: &str) -> bool {
     hhmm_ok(start) && hhmm_ok(end) && start < end
 }
-
 
 /// The camera's zoom rails, as the console clamps them (`main.rs:16559`).
 ///
@@ -1975,11 +2264,7 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            vec![
-                IslandKey::Command,
-                IslandKey::Crew,
-                IslandKey::Log,
-            ]
+            vec![IslandKey::Command, IslandKey::Crew, IslandKey::Log,]
         );
     }
 
@@ -1994,25 +2279,20 @@ mod tests {
     #[test]
     fn every_state_has_the_column_it_should() {
         let keys = |state: GameState, player: bool| -> Vec<IslandKey> {
-            zone_islands(state, player).into_iter().map(|s| s.key).collect()
+            zone_islands(state, player)
+                .into_iter()
+                .map(|s| s.key)
+                .collect()
         };
         // No session: NOTHING. The games to hold live in the middle of the
         // frame, and the register belongs to planning.
         assert_eq!(keys(GameState::NoSession, false), Vec::<IslandKey>::new());
-        // Planning is the console's column, island for island: read the plan
-        // back, set the clock, choose what fights, seat the room, watch the
-        // gate. One omission, named in `zone_islands`: `z.groups`.
-        assert_eq!(
-            keys(GameState::Planning, false),
-            [
-                Essentials_key(),
-                Control_key(),
-                Fleet_key(),
-                Players_key(),
-                Groups_key(),
-                Review_key(),
-            ]
-        );
+        // Planning is the GRID: six equal panels over the map, and the
+        // column holds NOTHING in this state. The membership that used to
+        // be here — Essentials, Control, Fleet, Players, Groups, Review —
+        // is the grid's six panels now, and the Control island is gone
+        // because the clock is part of the exercise's terms.
+        assert_eq!(keys(GameState::Planning, false), Vec::<IslandKey>::new());
         // Preparation is the gate: the seat's readiness, and who has declared.
         assert_eq!(
             keys(GameState::Preparation, false),
@@ -2032,26 +2312,8 @@ mod tests {
         );
     }
 
-    fn Fleet_key() -> IslandKey {
-        IslandKey::Fleet
-    }
     fn Crew_key() -> IslandKey {
         IslandKey::Crew
-    }
-    fn Essentials_key() -> IslandKey {
-        IslandKey::Essentials
-    }
-    fn Control_key() -> IslandKey {
-        IslandKey::Control
-    }
-    fn Players_key() -> IslandKey {
-        IslandKey::Players
-    }
-    fn Review_key() -> IslandKey {
-        IslandKey::Review
-    }
-    fn Groups_key() -> IslandKey {
-        IslandKey::Groups
     }
     fn Command_key() -> IslandKey {
         IslandKey::Command
@@ -2068,8 +2330,14 @@ mod tests {
             GameState::Preparation,
             GameState::Closure,
         ] {
-            let a: Vec<IslandKey> = zone_islands(state, false).into_iter().map(|s| s.key).collect();
-            let b: Vec<IslandKey> = zone_islands(state, true).into_iter().map(|s| s.key).collect();
+            let a: Vec<IslandKey> = zone_islands(state, false)
+                .into_iter()
+                .map(|s| s.key)
+                .collect();
+            let b: Vec<IslandKey> = zone_islands(state, true)
+                .into_iter()
+                .map(|s| s.key)
+                .collect();
             assert_eq!(a, b, "{state:?} changed shape for a player station");
         }
         let a: Vec<IslandKey> = zone_islands(GameState::Execution, false)
@@ -2148,7 +2416,10 @@ mod tests {
             );
             let id = key.id();
             assert!(!id.is_empty());
-            assert!(id.chars().all(|c| c.is_ascii_lowercase()), "{id:?} is not a key");
+            assert!(
+                id.chars().all(|c| c.is_ascii_lowercase()),
+                "{id:?} is not a key"
+            );
         }
     }
 
@@ -2163,18 +2434,18 @@ mod tests {
     /// tomorrow, and the ceiling must follow the column's own shape.
     #[test]
     fn the_stack_height_counts_a_gap_per_island() {
-        let slots = zone_islands(GameState::Planning, false);
+        // CLOSURE, not planning: the planning phase is the grid now and its
+        // column holds nothing, so a stack test in that state would be
+        // testing an empty stack.
+        let slots = zone_islands(GameState::Closure, false);
         let sum: f32 = slots.iter().map(|s| s.height).sum();
         assert_eq!(
             zone_stack_height(&slots),
             sum + ZONE_ISLAND_GAP * slots.len() as f32
         );
-            // Six islands: the console's planning heights, and — because the
-            // fields are joined — no gaps between them.
-            assert_eq!(
-                zone_stack_height(&slots),
-                470.0 + 320.0 + 320.0 + 300.0 + 280.0 + 380.0
-        );
+        // Three islands: the console's closure heights, and — because the
+        // fields are joined — no gaps between them.
+        assert_eq!(zone_stack_height(&slots), 420.0 + 260.0 + 330.0);
     }
 
     /// Origins and height come from the same arithmetic. This is the pair
@@ -2184,7 +2455,7 @@ mod tests {
     #[test]
     fn the_stack_origin_is_the_last_origin_plus_its_height() {
         let band = (376.0, 56.0, 736.0, 596.0);
-        let slots = zone_islands(GameState::Planning, false);
+        let slots = zone_islands(GameState::Closure, false);
         for i in 1..slots.len() {
             let (x, y) = zone_slot_origin(band, &slots, i);
             let (_, py) = zone_slot_origin(band, &slots, i - 1);
@@ -2199,24 +2470,166 @@ mod tests {
     #[test]
     fn the_column_scrolls_only_by_what_it_overflows() {
         let band = (376.0, 56.0, 736.0, 596.0);
-        // A 540-tall band against the 2146-tall planning stack. That the
-        // planning column overflows is not incidental: six islands of the
-        // console's own heights cannot fit any window this console runs in,
-        // which is WHY the column scrolls at all — and why
-        // `a_wheel_over_the_column_moves_the_column` seeds a planning session.
-        let slots = zone_islands(GameState::Planning, false);
-        assert_eq!(
-            zone_stack_height(&slots),
-                470.0 + 320.0 + 320.0 + 300.0 + 280.0 + 380.0
-            );
-            assert_eq!(zone_overflow(zone_stack_height(&slots), band), 1530.0);
+        // A 540-tall band against the 1010-tall CLOSURE stack. That a
+        // column overflows is not incidental: the console's own heights
+        // cannot fit any window this console runs in, which is WHY the
+        // column scrolls at all.
+        //
+        // PLANNING IS NOT HERE ANYMORE: the phase is the grid now, and its
+        // column holds nothing, so its stack is empty and it overflows by
+        // nothing. The grid's own geometry is pinned by
+        // `the_planning_grid_is_six_equal_cells`.
+        let slots = zone_islands(GameState::Closure, false);
+        assert_eq!(zone_stack_height(&slots), 420.0 + 260.0 + 330.0);
+        assert_eq!(zone_overflow(zone_stack_height(&slots), band), 470.0);
+        // And the planning phase's column is empty: the grid is the phase.
+        assert!(zone_islands(GameState::Planning, false).is_empty());
         // A short stack in a tall band scrolls not at all.
         assert_eq!(zone_overflow(100.0, band), 0.0);
     }
 
+    /// THE GRID'S COLUMNS FOLLOW THE WINDOW.
+    ///
+    /// Three on a window wide enough to hold them, two on one that is not:
+    /// a cell narrower than the console's own column cannot hold the
+    /// console's own panels, and a grid of cells that cannot hold them is a
+    /// grid of cut-off rows.
+    #[test]
+    fn the_planning_grid_fits_the_window_it_is_drawn_in() {
+        assert_eq!(planning_grid_cols(1536.0), 3, "a wide window gets three");
+        assert_eq!(planning_grid_cols(1280.0), 3);
+        assert_eq!(planning_grid_cols(768.0), 2, "a narrow one gets two");
+        assert_eq!(planning_grid_cols(600.0), 1, "a very narrow one gets one");
+        // And either way there are six cells, and each is wide enough to
+        // hold the console's own panels.
+        for w in [1536.0, 1024.0, 768.0, 600.0] {
+            let cells = planning_grid((0.0, 0.0, w, 838.0));
+            assert_eq!(cells.len(), 6, "six panels at every width");
+            assert!(
+                box_w(cells[0]) >= GRID_MIN_CELL_W - 0.01,
+                "a cell at {w}pt wide is too narrow for the console's panels: {}",
+                box_w(cells[0])
+            );
+        }
+    }
+
+    /// THE PLANNING GRID IS SIX EQUAL CELLS, and they are inside the window.
+    ///
+    /// Equal is the claim: a grid whose cells differ is a grid whose
+    /// importance is decided by size, and the operator reads the big one
+    /// and leaves the rest. The grid is also BELOW the top band — the band
+    /// is the clock and the identity, and it is the same in every phase.
+    #[test]
+    fn the_planning_grid_is_six_equal_cells() {
+        let viewport = (0.0, 0.0, 960.0, 838.0);
+        let cells = planning_grid(viewport);
+        assert_eq!(cells.len(), 6, "six panels: three across and two down");
+        let (w, h) = (box_w(cells[0]), box_h(cells[0]));
+        for cell in &cells {
+            assert!(
+                (box_w(*cell) - w).abs() < 0.01,
+                "the cells are equal in width"
+            );
+            assert!(
+                (box_h(*cell) - h).abs() < 0.01,
+                "the cells are equal in height"
+            );
+            // Every cell is inside the window.
+            assert!(cell.0 >= viewport.0 && cell.1 >= viewport.1);
+            assert!(cell.0 + box_w(*cell) <= viewport.2 + 0.01);
+            assert!(cell.1 + box_h(*cell) <= viewport.3 + 0.01);
+            // And below the top band, which is the one thing the grid does
+            // not cover.
+            assert!(cell.1 >= top_band_h(), "the band stays the band's");
+        }
+        // The gap between two cells is the margin, and it is a margin: the
+        // cells do not touch.
+        assert!((cells[1].0 - (cells[0].0 + w) - GRID_GAP).abs() < 0.01);
+        assert!((cells[3].1 - (cells[0].1 + h) - GRID_GAP).abs() < 0.01);
+        // And the panels are the six the phase is made of, in reading order.
+        assert_eq!(GridPanel::ALL.len(), 6);
+        assert_eq!(GridPanel::ALL[0], GridPanel::Essentials);
+        assert_eq!(GridPanel::ALL[5], GridPanel::Groups);
+    }
+
+    /// A CELL IS CORNERS AND A CARD IS ORIGIN AND SIZE, and the conversion
+    /// between them is one function because getting it wrong is silent.
+    ///
+    /// The planning cards were drawn from `let (x, y, w, h) = cell`, which
+    /// type-checks and sets each card's width to its own RIGHT COORDINATE:
+    /// every card ran to the far edge of the window, the six overlapped into
+    /// one dark field, and the only visible seams were where the next card's
+    /// left border happened to land. `box_rect` is the conversion, and this
+    /// pins it against the grid the renderer draws.
+    #[test]
+    fn a_grid_cell_converts_to_the_card_that_sits_in_it() {
+        let cells = planning_grid((0.0, 0.0, 1536.0, 838.0));
+        for cell in &cells {
+            let (x, y, w, h) = box_rect(*cell);
+            assert_eq!(x, cell.0, "the card's left edge is the cell's");
+            assert_eq!(y, cell.1, "the card's top edge is the cell's");
+            assert!((w - box_w(*cell)).abs() < 0.01);
+            assert!((h - box_h(*cell)).abs() < 0.01);
+            // The card ENDS at its cell's right and bottom edges, not at the
+            // window's.
+            assert!(x + w <= 1536.0 + 0.01, "a card runs off the window");
+            assert!(y + h <= 838.0 + 0.01, "a card runs off the window");
+        }
+        // And the two cards on the first row are one GRID_GAP apart, which is
+        // a gap only if the first one is as wide as its cell.
+        let (_, _, w0, _) = box_rect(cells[0]);
+        let (x1, _, _, _) = box_rect(cells[1]);
+        assert!((x1 - (cells[0].0 + w0) - GRID_GAP).abs() < 0.01);
+    }
+
+    /// FIVE BANDS, NOT SIX: the Exercise panel's body is its title.
+    ///
+    /// The wordmark already names the surface, and a band above it saying
+    /// EXERCISE gives the tallest cell on the grid two headings — the
+    /// weaker of them spending the top of the panel.
+    #[test]
+    fn the_exercise_panel_carries_no_title_band() {
+        assert!(!GridPanel::Exercise.has_title());
+        assert_eq!(
+            GridPanel::ALL.iter().filter(|p| p.has_title()).count(),
+            5,
+            "every panel but Exercise has a band"
+        );
+        for panel in GridPanel::ALL {
+            if panel != GridPanel::Exercise {
+                assert!(panel.has_title(), "{panel:?} keeps its band");
+                assert!(!panel.title().is_empty());
+            }
+        }
+    }
+
+    /// A CARD, NOT A HOLE CUT IN THE WATER: rounded, and standing off its
+    /// neighbours by a margin wide enough to see.
+    ///
+    /// The panels are translucent over dark water, so a margin measured to
+    /// "some gap exists" was measured to the wrong thing: at 12pt the six
+    /// read as one field with seams. The rounding and the margin are what
+    /// make them six cards on a chart.
+    #[test]
+    fn a_planning_card_is_rounded_and_stands_off_its_neighbour() {
+        assert_eq!(
+            GRID_CARD_RADIUS, ISLAND_RADIUS,
+            "the console's floating rounding"
+        );
+        assert_eq!(
+            GRID_INSET, GRID_GAP,
+            "the frame's margin is the panels' margin"
+        );
+        assert!(
+            GRID_GAP >= 16.0,
+            "a margin the eye cannot find is not a margin"
+        );
+        assert!(GRID_PAD > PANEL_PAD, "a body is not a title band");
+    }
 
     #[test]
-    fn the_palette_has_no_toolkit_type() {        // The whole point of the kernel, pinned.
+    fn the_palette_has_no_toolkit_type() {
+        // The whole point of the kernel, pinned.
         let c = CONSOLE_NIGHT;
         assert_eq!((c.r, c.g, c.b, c.a), (0x0F, 0x17, 0x2A, 255));
         assert_eq!(c.as_f32()[0], 0x0F as f32 / 255.0);
@@ -2352,6 +2765,27 @@ mod tests {
     /// minimum height that the window was allowed to be smaller than. A
     /// card taller than its window is a card whose name the operator
     /// cannot read — and the name is the one thing the band is for.
+    /// THE FLOW'S FIRST ROW IS INSIDE THE FLOW'S HISTORY PANEL.
+    ///
+    /// The point is arithmetic over tokens; this pins that the arithmetic
+    /// lands inside the panel it means, for the sizes the console is opened
+    /// at. A test that aims at a row and a render that draws it read these
+    /// same numbers.
+    #[test]
+    fn the_flows_first_row_point_is_inside_the_history_panel() {
+        for (w, h) in [(1536.0, 864.0), (1280.0, 720.0), (768.0, 838.0)] {
+            let viewport = (0.0, 0.0, w, h);
+            let (left, content_w) = flow_content(viewport);
+            let (x, y) = flow_first_row_point(viewport);
+            assert!(
+                x > left && x < left + content_w,
+                "x {x} inside {left}..{left}+{content_w}"
+            );
+            assert!(y > flow_content_top(), "the row is under the chrome");
+            assert!(y < h, "the row is on screen at {w}x{h}");
+        }
+    }
+
     #[test]
     fn the_sessions_card_fits_the_window_it_is_opened_in() {
         for (w, h) in [
@@ -2415,10 +2849,7 @@ mod tests {
     /// for rather than drifted into.
     #[test]
     fn the_console_boots_bigger_than_it_shipped() {
-        assert!(
-            TEXT_SCALE_DEFAULT > 0,
-            "there is a default"
-        );
+        assert!(TEXT_SCALE_DEFAULT > 0, "there is a default");
         assert!(
             TEXT_SCALES[TEXT_SCALE_DEFAULT] > TEXT_SCALES[0],
             "and it is not the smallest rung of the ladder"
@@ -2475,7 +2906,10 @@ mod tests {
         // drawn at a fixed pixel length reads fewer kilometres at high
         // latitude. The first version of this test had the direction
         // backwards and the function was right.
-        assert!(jkt < eq, "further from the equator is FEWER metres per pixel");
+        assert!(
+            jkt < eq,
+            "further from the equator is FEWER metres per pixel"
+        );
         assert!((jkt / eq - (6.2f64.to_radians()).cos()).abs() < 1e-9);
     }
 
@@ -2535,11 +2969,13 @@ mod tests {
         // that jumps while the map moves smoothly under it.
         let mut last: Option<f64> = None;
         for zoom in [6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0] {
-            let (metres, _) =
-                scale_bar(metres_per_pixel(-6.2, zoom), 70.0, 170.0).expect("a bar");
+            let (metres, _) = scale_bar(metres_per_pixel(-6.2, zoom), 70.0, 170.0).expect("a bar");
             if let Some(prev) = last {
                 let ratio = (metres / prev).max(prev / metres);
-                assert!(ratio <= 5.0, "zoom {zoom}: {metres} m from {prev} m is a jump");
+                assert!(
+                    ratio <= 5.0,
+                    "zoom {zoom}: {metres} m from {prev} m is a jump"
+                );
             }
             last = Some(metres);
         }
@@ -2695,32 +3131,64 @@ mod tests {
     fn a_body_claims_the_wheel_only_past_the_slack() {
         // The Operator case from the docs: 98.4 measured against 94
         // available is 4pt of trailing nothing — not a scrollable body.
-        let trailing = BodyFit { content_h: 98.4, viewport_h: 94.0, offset: 0.0 };
+        let trailing = BodyFit {
+            content_h: 98.4,
+            viewport_h: 94.0,
+            offset: 0.0,
+        };
         assert!(!trailing.can_scroll_down());
         assert!(!trailing.can_scroll_up());
         // A body that fits exactly claims nothing either way.
-        let fitting = BodyFit { content_h: 200.0, viewport_h: 200.0, offset: 0.0 };
+        let fitting = BodyFit {
+            content_h: 200.0,
+            viewport_h: 200.0,
+            offset: 0.0,
+        };
         assert!(!fitting.can_scroll_down());
         assert!(!fitting.can_scroll_up());
         // Real overflow scrolls down but not up from the top.
-        let tall = BodyFit { content_h: 600.0, viewport_h: 248.0, offset: 0.0 };
+        let tall = BodyFit {
+            content_h: 600.0,
+            viewport_h: 248.0,
+            offset: 0.0,
+        };
         assert!(tall.can_scroll_down());
         assert!(!tall.can_scroll_up());
         // At the bottom the wheel goes back to the column.
-        let bottom = BodyFit { content_h: 600.0, viewport_h: 248.0, offset: 352.0 };
+        let bottom = BodyFit {
+            content_h: 600.0,
+            viewport_h: 248.0,
+            offset: 352.0,
+        };
         assert!(!bottom.can_scroll_down());
         assert!(bottom.can_scroll_up());
         // Midway both directions are live.
-        let mid = BodyFit { content_h: 600.0, viewport_h: 248.0, offset: 100.0 };
+        let mid = BodyFit {
+            content_h: 600.0,
+            viewport_h: 248.0,
+            offset: 100.0,
+        };
         assert!(mid.can_scroll_down());
         assert!(mid.can_scroll_up());
     }
 
     #[test]
     fn one_gesture_moves_one_thing() {
-        let tall = BodyFit { content_h: 600.0, viewport_h: 248.0, offset: 0.0 };
-        let bottom = BodyFit { content_h: 600.0, viewport_h: 248.0, offset: 352.0 };
-        let fitting = BodyFit { content_h: 200.0, viewport_h: 200.0, offset: 0.0 };
+        let tall = BodyFit {
+            content_h: 600.0,
+            viewport_h: 248.0,
+            offset: 0.0,
+        };
+        let bottom = BodyFit {
+            content_h: 600.0,
+            viewport_h: 248.0,
+            offset: 352.0,
+        };
+        let fitting = BodyFit {
+            content_h: 200.0,
+            viewport_h: 200.0,
+            offset: 0.0,
+        };
         // Zero delta and outside band: nobody.
         assert_eq!(chained_wheel(Some(tall), 0.0, true), WheelOwner::Neither);
         assert_eq!(chained_wheel(Some(tall), 24.0, false), WheelOwner::Neither);
@@ -2731,7 +3199,10 @@ mod tests {
         assert_eq!(chained_wheel(Some(bottom), 24.0, true), WheelOwner::Body);
         assert_eq!(chained_wheel(Some(bottom), -24.0, true), WheelOwner::Column);
         // A fitting body never takes it; the column does.
-        assert_eq!(chained_wheel(Some(fitting), -24.0, true), WheelOwner::Column);
+        assert_eq!(
+            chained_wheel(Some(fitting), -24.0, true),
+            WheelOwner::Column
+        );
         // No body under the pointer, inside the band: column.
         assert_eq!(chained_wheel(None, -24.0, true), WheelOwner::Column);
     }
@@ -2807,7 +3278,10 @@ mod tests {
     fn the_band_sits_below_the_top_band() {
         let band = zone_band((0.0, 0.0, 1920.0, 1080.0), 320.0);
         assert_eq!(band.1, zone_top_gap());
-        assert_eq!(band.3, 1080.0, "the column runs to the window's bottom edge");
+        assert_eq!(
+            band.3, 1080.0,
+            "the column runs to the window's bottom edge"
+        );
         assert!((box_w(band) - 320.0).abs() < 0.001);
     }
 }

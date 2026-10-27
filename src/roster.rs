@@ -52,6 +52,19 @@ pub struct StagedSeat {
 pub struct RosterDraft {
     seats: BTreeMap<i64, StagedSeat>,
     removed: BTreeSet<i64>,
+    /// Everybody the operator has explicitly put at `NOT PLAYING`.
+    ///
+    /// A DECLINED PERSON IS NOT A WRITE AND STILL A DECISION. Taking a
+    /// seated person out is an unseat, but the picker also offers `NOT
+    /// PLAYING` for somebody the server has never held — and that writes
+    /// nothing at all (`docs/creation-flow-handoff.md` §8.2). The decision
+    /// still has to be visible, because the stage's denominator is
+    /// `seated ∪ explicitly Not Playing`: a person the operator considered
+    /// counts whether or not there was a row to delete.
+    ///
+    /// Kept apart from `removed` for that reason: `removed` is the write
+    /// list, and this is the answer to "what have they decided about".
+    declined: BTreeSet<i64>,
     /// What the server last said, per seat. The reference the merge reads.
     frame: BTreeMap<i64, LiveSeat>,
 }
@@ -66,6 +79,7 @@ impl RosterDraft {
     /// they are in.
     pub fn stage(&mut self, seat: StagedSeat) {
         self.removed.remove(&seat.user_id);
+        self.declined.remove(&seat.user_id);
         self.seats.insert(seat.user_id, seat);
     }
 
@@ -74,6 +88,10 @@ impl RosterDraft {
     /// advance, so `on_server` is the mirror's word, not a guess.
     pub fn remove(&mut self, user_id: i64, on_server: bool) {
         self.seats.remove(&user_id);
+        // NOT PLAYING is a decision either way. Only the half with a row on
+        // the server owes a delete; the half without one owes nothing, and
+        // both count in [`Self::considered`].
+        self.declined.insert(user_id);
         if on_server {
             self.removed.insert(user_id);
         } else {
@@ -100,7 +118,9 @@ impl RosterDraft {
             .values()
             .filter(|seat| match self.frame.get(&seat.user_id) {
                 None => true,
-                Some(held) => held.role_id != seat.role_id || held.judge != seat.judge,
+                Some(held) => {
+                    !same_role_name(&seat.role_name, &held.role_name) || held.judge != seat.judge
+                }
             })
             .cloned()
             .collect();
@@ -128,12 +148,19 @@ impl RosterDraft {
             self.seats.insert(seat.user_id, seat);
         }
         self.removed = removals;
+        // A person the server now seats is not "Not Playing" any more: the
+        // operator's mark was about somebody with no seat, and the seat has
+        // arrived from somewhere else. Counting both would put one person in
+        // the denominator twice.
+        self.declined
+            .retain(|id| !live.iter().any(|l| l.user_id == *id));
         self.frame = live.iter().map(|l| (l.user_id, l.clone())).collect();
     }
 
     /// Withdraw a staged removal: the operator changed their mind and the
     /// server row stands.
     pub fn restore(&mut self, user_id: i64) -> bool {
+        self.declined.remove(&user_id);
         self.removed.remove(&user_id)
     }
 
@@ -160,12 +187,33 @@ impl RosterDraft {
         self.removed.contains(&user_id)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.seats.is_empty() && self.removed.is_empty()
+    /// Whether the operator has said `NOT PLAYING` about this person.
+    pub fn is_declined(&self, user_id: i64) -> bool {
+        self.declined.contains(&user_id)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.seats.is_empty() && self.removed.is_empty() && self.declined.is_empty()
+    }
+
+    /// The roster's rows: the seats and the removals that owe a write.
     pub fn len(&self) -> usize {
         self.seats.len() + self.removed.len()
+    }
+
+    /// THE CONSIDERED SET — the denominator the Players stage's rail shows.
+    ///
+    /// `seated ∪ explicitly Not Playing`, and nobody else: a person the
+    /// operator has not touched is not considered and does not count. That
+    /// is what makes the number a statement about the operator's decisions
+    /// rather than about the directory's size.
+    pub fn considered(&self) -> usize {
+        self.seats.len() + self.declined.len()
+    }
+
+    /// Every person the operator has put at `NOT PLAYING`, in id order.
+    pub fn declined(&self) -> impl Iterator<Item = &i64> {
+        self.declined.iter()
     }
 
     /// Every staged seat, in user-id order.
@@ -183,6 +231,7 @@ impl RosterDraft {
     pub fn clear(&mut self) {
         self.seats.clear();
         self.removed.clear();
+        self.declined.clear();
         self.frame.clear();
     }
 
@@ -215,6 +264,62 @@ pub struct LiveSeat {
     /// Whether the seat sits on the judge side. Captured from the same read
     /// as the role, because the role id alone does not say which side it is.
     pub judge: bool,
+}
+
+/// What a seat's scope IS (`§8.3`): a group row, or a hull card. The same
+/// seat either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeTarget {
+    Group(i64),
+    Hull(i64),
+}
+
+impl ScopeTarget {
+    pub fn label(self) -> String {
+        match self {
+            ScopeTarget::Group(id) => format!("group {id}"),
+            ScopeTarget::Hull(id) => format!("hull {id}"),
+        }
+    }
+}
+
+/// Whether this drop may become a scope, and if not, WHY — in the operator's
+/// words, before the server hears about it.
+///
+/// The four rules `§8.3` states, kept in one place so the hover, the buzz and
+/// the write cannot disagree:
+///
+/// 1. a judge-side seat holds NO scope;
+/// 2. one person commands at most ONE scope;
+/// 3. one scope has at most one commander;
+/// 4. a hull's commander can be changed by a drop, never cleared — that is not
+///    a refusal here, it is the absence of a `✕`.
+pub fn scope_refusal(
+    judge: bool,
+    seat_scope: Option<ScopeTarget>,
+    target_scope: ScopeTarget,
+    target_commander: Option<i64>,
+    seat_user: i64,
+) -> Option<String> {
+    if judge {
+        return Some("A JUDGE-SIDE SEAT HOLDS NO SCOPE".to_string());
+    }
+    if seat_scope == Some(target_scope) {
+        return Some("ALREADY THIS SEAT'S SCOPE".to_string());
+    }
+    if let Some(held) = seat_scope {
+        return Some(format!(
+            "ONE PERSON COMMANDS ONE SCOPE \u{2014} THIS SEAT ALREADY HOLDS {}",
+            held.label()
+        ));
+    }
+    match target_commander {
+        Some(holder) if holder != seat_user => Some(format!(
+            "ONE SCOPE HAS ONE COMMANDER \u{2014} {} IS HELD BY USER {holder}",
+            target_scope.label()
+        )),
+        _ => None,
+    }
 }
 
 /// One roster write the sync owes Minos. Each is one endpoint.
@@ -253,15 +358,36 @@ impl RosterWrite {
     /// held the whole advance up.
     pub fn label(&self) -> String {
         match self {
-            Self::Seat { user_name, role_name, .. } => {
+            Self::Seat {
+                user_name,
+                role_name,
+                ..
+            } => {
                 format!("seat {user_name} as {role_name}")
             }
-            Self::Role { user_name, role_name, .. } => {
+            Self::Role {
+                user_name,
+                role_name,
+                ..
+            } => {
                 format!("move {user_name} to {role_name}")
             }
             Self::Unseat { user_name, .. } => format!("unseat {user_name}"),
         }
     }
+}
+
+/// Whether two seats name the same role.
+///
+/// A SEAT IS COMPARED BY ITS ROLE'S NAME, not by its id, because the ids are
+/// not comparable across the two vocabularies: a blank draft's picker holds
+/// `GET /game-roles`' ids, and the game's own role ids are different numbers
+/// for the same role — the server refuses one vocabulary's id against the
+/// other's game with a 409 (`docs/creation-flow-handoff.md` §12.3). The name
+/// is what the operator chose, and it is what the creation flow's seat write
+/// carries.
+fn same_role_name(a: &str, b: &str) -> bool {
+    a == b
 }
 
 /// The writes that carry `draft` onto a server holding `live`, in the
@@ -291,12 +417,14 @@ pub fn plan(draft: &RosterDraft, live: &[LiveSeat]) -> Vec<RosterWrite> {
                 role_name: seat.role_name.clone(),
                 call_sign: seat.call_sign.clone(),
             }),
-            Some(held) if held.role_id != seat.role_id => roles.push(RosterWrite::Role {
-                user_id: seat.user_id,
-                user_name: seat.user_name.clone(),
-                role_id: seat.role_id,
-                role_name: seat.role_name.clone(),
-            }),
+            Some(held) if !same_role_name(&seat.role_name, &held.role_name) => {
+                roles.push(RosterWrite::Role {
+                    user_id: seat.user_id,
+                    user_name: seat.user_name.clone(),
+                    role_id: seat.role_id,
+                    role_name: seat.role_name.clone(),
+                });
+            }
             Some(_) => {}
         }
     }
@@ -387,7 +515,7 @@ pub fn judge_side_moves(draft: &RosterDraft, live: &[LiveSeat]) -> Vec<JudgeSide
         let Some(held) = live.iter().find(|l| l.user_id == seat.user_id) else {
             continue;
         };
-        if held.role_id == seat.role_id {
+        if same_role_name(&held.role_name, &seat.role_name) {
             continue;
         }
         moves.push(JudgeSideMove {
@@ -553,7 +681,10 @@ mod tests {
         draft.remove(6, true);
         assert_eq!(
             plan(&draft, &[live(6, "Budi", 1)]),
-            vec![RosterWrite::Unseat { user_id: 6, user_name: "Budi".into() }]
+            vec![RosterWrite::Unseat {
+                user_id: 6,
+                user_name: "Budi".into()
+            }]
         );
     }
 
@@ -626,7 +757,10 @@ mod tests {
         let mut draft = RosterDraft::new();
         draft.stage(staged(6, "Budi", 2, true));
         let judges = judge_seats(&draft, &[live(6, "Budi", 1)]);
-        assert!(judges.contains_key(&6), "the staged judge side is the one that lands");
+        assert!(
+            judges.contains_key(&6),
+            "the staged judge side is the one that lands"
+        );
         assert_eq!(judges.get(&6).map(String::as_str), Some("Budi"));
 
         let mut back = RosterDraft::new();
@@ -761,7 +895,11 @@ mod tests {
         let mut draft = RosterDraft::new();
         draft.seed(&[live(6, "Budi", 1)]);
         draft.seed(&[live(6, "Budi", 2)]);
-        assert_eq!(draft.get(6).map(|s| s.role_id), Some(2), "the server's role");
+        assert_eq!(
+            draft.get(6).map(|s| s.role_id),
+            Some(2),
+            "the server's role"
+        );
         assert!(
             plan(&draft, &[live(6, "Budi", 2)]).is_empty(),
             "and nothing is owed for it"
@@ -778,5 +916,109 @@ mod tests {
         draft.seed(&[]);
         assert!(!draft.is_removed(6), "there is no seat left to leave");
         assert!(plan(&draft, &[]).is_empty());
+    }
+
+    /// THE CONSIDERED SET IS SEATED PLUS EXPLICITLY NOT PLAYING, and nobody
+    /// else. A person the operator has not touched does not count: the
+    /// stage's denominator is a statement about decisions, not about the
+    /// directory.
+    #[test]
+    fn the_considered_set_is_seated_plus_not_playing() {
+        let mut draft = RosterDraft::new();
+        assert_eq!(draft.considered(), 0);
+        draft.stage(seat(6, "Budi", 1));
+        assert_eq!(draft.considered(), 1);
+        // Somebody the server has never held, put at NOT PLAYING: no write,
+        // and still a decision.
+        draft.remove(7, false);
+        assert!(draft.is_declined(7));
+        assert!(plan(&draft, &[]).len() == 1, "only the seat is owed");
+        assert_eq!(draft.considered(), 2);
+        // Re-picking them withdraws the mark rather than counting twice.
+        draft.stage(seat(7, "Rina", 1));
+        assert!(!draft.is_declined(7));
+        assert_eq!(draft.considered(), 2);
+    }
+
+    /// A staged newcomer taken back out is `NOT PLAYING` too: taking somebody
+    /// out of the draft is one decision whether or not the server ever heard
+    /// of them.
+    #[test]
+    fn taking_a_staged_seat_out_counts_as_not_playing() {
+        let mut draft = RosterDraft::new();
+        draft.stage(seat(6, "Budi", 1));
+        draft.remove(6, false);
+        assert!(draft.is_declined(6));
+        assert_eq!(draft.considered(), 1);
+        assert!(plan(&draft, &[]).is_empty(), "there was nothing to unseat");
+    }
+
+    /// A person the server now seats is not "Not Playing" any more: keeping
+    /// the mark would put one person in the denominator twice.
+    #[test]
+    fn a_seat_arriving_from_the_server_withdraws_the_declined_mark() {
+        let mut draft = RosterDraft::new();
+        draft.remove(6, false);
+        draft.seed(&[live(6, "Budi", 1)]);
+        assert!(!draft.is_declined(6));
+        assert_eq!(draft.considered(), 1);
+    }
+}
+
+#[cfg(test)]
+mod scope_rule_tests {
+    use super::*;
+
+    /// A JUDGE-SIDE SEAT HOLDS NO SCOPE — refused locally, in the words the
+    /// sheet uses, rather than at the server.
+    #[test]
+    fn a_judge_seat_cannot_take_a_scope() {
+        let why = scope_refusal(true, None, ScopeTarget::Group(7), None, 11);
+        assert_eq!(why.as_deref(), Some("A JUDGE-SIDE SEAT HOLDS NO SCOPE"));
+    }
+
+    /// ONE PERSON COMMANDS ONE SCOPE, and the refusal NAMES the one they hold.
+    #[test]
+    fn a_second_scope_is_refused_by_name() {
+        let why = scope_refusal(
+            false,
+            Some(ScopeTarget::Group(7)),
+            ScopeTarget::Group(9),
+            None,
+            3,
+        );
+        let why = why.expect("a refusal");
+        assert!(why.contains("ONE PERSON COMMANDS ONE SCOPE"), "{why}");
+        assert!(why.contains("group 7"), "it names the scope held: {why}");
+    }
+
+    /// ONE SCOPE HAS ONE COMMANDER, and the refusal names the holder.
+    #[test]
+    fn an_occupied_scope_names_its_holder() {
+        let why = scope_refusal(false, None, ScopeTarget::Hull(351), Some(5), 3).expect("refused");
+        assert!(why.contains("HELD BY USER 5"), "{why}");
+    }
+
+    /// The same seat re-dropping on its own scope is a no-op, not an error with
+    /// a confusing sentence.
+    #[test]
+    fn dropping_on_your_own_scope_says_so() {
+        let why = scope_refusal(
+            false,
+            Some(ScopeTarget::Hull(351)),
+            ScopeTarget::Hull(351),
+            Some(3),
+            3,
+        );
+        assert_eq!(why.as_deref(), Some("ALREADY THIS SEAT'S SCOPE"));
+    }
+
+    /// A free scope takes the seat.
+    #[test]
+    fn a_free_scope_takes_the_seat() {
+        assert!(scope_refusal(false, None, ScopeTarget::Group(7), None, 3).is_none());
+        // And a hull commanded by this very person is not "occupied" by anybody
+        // else.
+        assert!(scope_refusal(false, None, ScopeTarget::Hull(351), Some(3), 3).is_none());
     }
 }

@@ -116,7 +116,9 @@ impl AuthenticatedUser {
 fn parse_pair(data: &serde_json::Value) -> Result<TokenPair, BackendError> {
     let access = data["access_token"].as_str().unwrap_or("");
     if access.is_empty() {
-        return Err(BackendError::Other("auth answer without an access token".to_string()));
+        return Err(BackendError::Other(
+            "auth answer without an access token".to_string(),
+        ));
     }
     let scheme = data["token_type"].as_str().unwrap_or("");
     if scheme != "Bearer" {
@@ -207,10 +209,11 @@ impl MinosAuth {
             }))
             .send()?;
         let status = resp.status();
+        let request_id = crate::backend::request_id_of(&resp);
         if !status.is_success() {
             // M1: refusal bodies carry field detail — surface it.
             let body: serde_json::Value = resp.json().unwrap_or(serde_json::Value::Null);
-            return Err(BackendError::http_error(status.as_u16(), &body));
+            return Err(BackendError::http_error(status.as_u16(), &body, request_id));
         }
         Ok(())
     }
@@ -234,12 +237,13 @@ impl MinosAuth {
             .json(&body)
             .send()?;
         let status = resp.status();
+        let request_id = crate::backend::request_id_of(&resp);
         if !status.is_success() {
             // Logout answers 204 whatever happens, so a failure here is
             // transport-level — still run it through the detail reader
             // in case the backend ever explains itself.
             let body: serde_json::Value = resp.json().unwrap_or(serde_json::Value::Null);
-            return Err(BackendError::http_error(status.as_u16(), &body));
+            return Err(BackendError::http_error(status.as_u16(), &body, request_id));
         }
         Ok(())
     }
@@ -262,10 +266,10 @@ impl MinosAuth {
             .bearer_auth(access_token)
             .send()?;
         let status = resp.status();
-        let body: serde_json::Value =
-            resp.json().unwrap_or(serde_json::Value::Null);
+        let request_id = crate::backend::request_id_of(&resp);
+        let body: serde_json::Value = resp.json().unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
-            return Err(BackendError::http_error(status.as_u16(), &body));
+            return Err(BackendError::http_error(status.as_u16(), &body, request_id));
         }
         let data = &body["data"];
         parse_user(data)
@@ -339,8 +343,8 @@ pub fn keyring_save(user: &str, token: &str) -> Result<(), BackendError> {
 
 /// Load the stored refresh token, if any.
 pub fn keyring_load(user: &str) -> Result<Option<String>, BackendError> {
-    let entry =
-        keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| BackendError::Keyring(e.to_string()))?;
+    let entry = keyring::Entry::new(KEYRING_SERVICE, user)
+        .map_err(|e| BackendError::Keyring(e.to_string()))?;
     match entry.get_password() {
         Ok(pw) => Ok(Some(pw)),
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -350,8 +354,8 @@ pub fn keyring_load(user: &str) -> Result<Option<String>, BackendError> {
 
 /// Forget the stored refresh token (sign out). Missing entry is fine.
 pub fn keyring_clear(user: &str) -> Result<(), BackendError> {
-    let entry =
-        keyring::Entry::new(KEYRING_SERVICE, user).map_err(|e| BackendError::Keyring(e.to_string()))?;
+    let entry = keyring::Entry::new(KEYRING_SERVICE, user)
+        .map_err(|e| BackendError::Keyring(e.to_string()))?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),

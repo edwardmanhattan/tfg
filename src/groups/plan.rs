@@ -12,10 +12,10 @@
 //!
 //! THE DRAFT NEVER HOLDS A TREE THE SERVER WOULD REFUSE. Three rules are
 //! checked at STAGE time, not at flush time, in the model's own words:
-//! a child sits strictly below its parent (`GroupKind::rank`), a group may
-//! not become its own ancestor, and a unit belongs to one group. A refusal
-//! the operator meets while their cursor is still in the field is a refusal
-//! they can act on.
+//! a child sits at the level immediately above its parent (`GroupKind::sits_under`),
+//! a group may not become its own ancestor, and a unit belongs to one group —
+//! and a hull (an Unsur) only ever to a Satuan Tugas. A refusal the operator
+//! meets while their cursor is still in the field is a refusal they can act on.
 //!
 //! THE ORDER OF [`plan`] IS LOAD-BEARING:
 //!
@@ -34,7 +34,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::model::{
-    cycle_refusal, duplicate_unit_refusal, rank_refusal, repeated_unit_refusal, GroupKind,
+    GroupKind, cycle_refusal, duplicate_unit_refusal, hull_refusal, rank_refusal,
+    repeated_unit_refusal,
 };
 
 /// One group as Minos last held it: the last thing a read left behind.
@@ -170,7 +171,8 @@ impl GroupsDraft {
     /// Stage a new group. Answers its negative local id, so the caller can
     /// open it like any other row. Fails loud when the tree would not be one
     /// the server accepts: a blank or duplicate name, an unknown parent, a
-    /// rank violation, or a unit another group already holds.
+    /// rank violation, a hull outside a Satuan Tugas, or a unit another
+    /// group already holds.
     pub fn stage_group(
         &mut self,
         echelon_id: i64,
@@ -186,9 +188,12 @@ impl GroupsDraft {
                 .view(parent)
                 .map(|g| g.kind)
                 .ok_or_else(|| format!("unknown group `{parent}`"))?;
-            if kind.rank() >= parent_kind.rank() {
+            if !kind.sits_under(parent_kind) {
                 return Err(rank_refusal(name, kind, parent_kind));
             }
+        }
+        if !units.is_empty() && kind != GroupKind::SatuanTugas {
+            return Err(hull_refusal(kind));
         }
         self.check_units(None, &units)?;
         let local_id = self.fresh_local();
@@ -220,7 +225,11 @@ impl GroupsDraft {
 
     /// Hand a group to a commander, or clear the appointment. A group with
     /// nobody steering it is a legal draft state, unlike a piece.
-    pub fn set_commander(&mut self, group_id: i64, commander_id: Option<i64>) -> Result<(), String> {
+    pub fn set_commander(
+        &mut self,
+        group_id: i64,
+        commander_id: Option<i64>,
+    ) -> Result<(), String> {
         let Some(slot) = self.edit_slot(group_id) else {
             return Err(format!("unknown group `{group_id}`"));
         };
@@ -229,11 +238,16 @@ impl GroupsDraft {
         Ok(())
     }
 
-    /// Replace a group's unit list. Fails loud on a unit listed twice or a
-    /// unit another group already holds.
+    /// Replace a group's unit list. Fails loud on a unit listed twice, a
+    /// unit another group already holds, or a hull in anything but a
+    /// Satuan Tugas — a hull is an Unsur, and it sits only in the level
+    /// immediately above it.
     pub fn set_units(&mut self, group_id: i64, units: Vec<i64>) -> Result<(), String> {
-        if self.view(group_id).is_none() {
+        let Some(group) = self.view(group_id) else {
             return Err(format!("unknown group `{group_id}`"));
+        };
+        if !units.is_empty() && group.kind != GroupKind::SatuanTugas {
+            return Err(hull_refusal(group.kind));
         }
         self.check_units(Some(group_id), &units)?;
         let Some(slot) = self.edit_slot(group_id) else {
@@ -457,7 +471,7 @@ impl GroupsDraft {
             cursor = self.parent_of(step);
         }
         let child = self.view(id).expect("the group being staged exists");
-        if child.kind.rank() >= parent_group.kind.rank() {
+        if !child.kind.sits_under(parent_group.kind) {
             return Err(rank_refusal(&child.name, child.kind, parent_group.kind));
         }
         Ok(())
@@ -475,7 +489,12 @@ impl GroupsDraft {
         out
     }
 
-    fn emit_create<'a>(&'a self, id: i64, out: &mut Vec<&'a StagedGroup>, done: &mut BTreeSet<i64>) {
+    fn emit_create<'a>(
+        &'a self,
+        id: i64,
+        out: &mut Vec<&'a StagedGroup>,
+        done: &mut BTreeSet<i64>,
+    ) {
         if !done.insert(id) {
             return;
         }
@@ -516,6 +535,84 @@ impl GroupsDraft {
 /// of nothing here: it is dropped rather than given a group nobody holds.
 ///
 /// `members` is `(unit id, group id)` per unit, in the exercise's own order.
+/// One group as the board draws it: the row, and how deep it sits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeNode {
+    pub group: StagedGroup,
+    pub depth: usize,
+}
+
+/// The staged groups as a DRAW ORDER: roots first, each parent before its
+/// children, siblings in descending echelon rank and then by name (`§6.1`).
+///
+/// A TREE IS DRAWN BY WALKING IT, not by sorting a list and hoping the order
+/// reads as a tree. Two things this has to survive, because both are reachable
+/// by dragging:
+///
+/// - **An orphan.** A parent that is not in the staged set (removed, or never
+///   seeded) makes its child a root here rather than a group that silently
+///   vanishes from the board.
+/// - **A cycle.** Two groups naming each other as parent would make the walk
+///   infinite; the second one becomes a root, which is the least surprising
+///   thing to draw and keeps the board finite.
+pub fn tree(groups: &[StagedGroup]) -> Vec<TreeNode> {
+    use std::collections::HashSet;
+    let present: HashSet<i64> = groups.iter().map(|g| g.local_id).collect();
+    let mut children: std::collections::HashMap<Option<i64>, Vec<&StagedGroup>> =
+        std::collections::HashMap::new();
+    for group in groups {
+        let parent = match group.parent {
+            Some(parent) if present.contains(&parent) => Some(parent),
+            _ => None,
+        };
+        children.entry(parent).or_default().push(group);
+    }
+    for bucket in children.values_mut() {
+        bucket.sort_by(|a, b| {
+            b.kind
+                .rank()
+                .cmp(&a.kind.rank())
+                .then_with(|| a.name.cmp(&b.name))
+        });
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    let mut seen: HashSet<i64> = HashSet::new();
+    fn walk(
+        parent: Option<i64>,
+        depth: usize,
+        children: &std::collections::HashMap<Option<i64>, Vec<&StagedGroup>>,
+        seen: &mut std::collections::HashSet<i64>,
+        out: &mut Vec<TreeNode>,
+    ) {
+        let Some(bucket) = children.get(&parent) else {
+            return;
+        };
+        for group in bucket {
+            if !seen.insert(group.local_id) {
+                // A cycle: this group is already on the board above itself.
+                continue;
+            }
+            out.push(TreeNode {
+                group: (*group).clone(),
+                depth,
+            });
+            walk(Some(group.local_id), depth + 1, children, seen, out);
+        }
+    }
+    walk(None, 0, &children, &mut seen, &mut out);
+    // Anything a cycle made unreachable is drawn at the root, so the board
+    // never hides a group the operator made.
+    for group in groups {
+        if !seen.contains(&group.local_id) {
+            out.push(TreeNode {
+                group: group.clone(),
+                depth: 0,
+            });
+        }
+    }
+    out
+}
+
 pub fn join_members(groups: &mut [LiveGroup], members: &[(i64, i64)]) {
     for group in groups.iter_mut() {
         group.units.clear();
@@ -665,7 +762,9 @@ pub fn plan(draft: &GroupsDraft, live: &[LiveGroup]) -> Vec<GroupWrite> {
                     group_id: *group_id,
                     parent: GroupRef::of(parent),
                 }),
-                None => writes.push(GroupWrite::ClearParent { group_id: *group_id }),
+                None => writes.push(GroupWrite::ClearParent {
+                    group_id: *group_id,
+                }),
             }
         }
         match (staged.commander_id, here.commander_id) {
@@ -675,7 +774,9 @@ pub fn plan(draft: &GroupsDraft, live: &[LiveGroup]) -> Vec<GroupWrite> {
                     user_id,
                 });
             }
-            (None, Some(_)) => writes.push(GroupWrite::ClearCommander { group_id: *group_id }),
+            (None, Some(_)) => writes.push(GroupWrite::ClearCommander {
+                group_id: *group_id,
+            }),
             _ => {}
         }
     }
@@ -721,6 +822,58 @@ pub fn plan(draft: &GroupsDraft, live: &[LiveGroup]) -> Vec<GroupWrite> {
 
 #[cfg(test)]
 mod tests {
+
+    fn row(local_id: i64, name: &str, kind: GroupKind, parent: Option<i64>) -> StagedGroup {
+        StagedGroup {
+            local_id,
+            echelon_id: 0,
+            name: name.to_string(),
+            kind,
+            parent,
+            commander_id: None,
+            units: Vec::new(),
+        }
+    }
+
+    /// A TREE IS WALKED: parents before children, siblings by rank then name.
+    #[test]
+    fn the_board_walks_parents_before_children() {
+        let groups = vec![
+            row(-1, "OPGAB", GroupKind::OperasiGabungan, None),
+            row(-2, "GUS-1", GroupKind::Gugus, Some(-1)),
+            row(-3, "TG-2", GroupKind::SatuanTugas, Some(-2)),
+            row(-4, "TG-1", GroupKind::SatuanTugas, Some(-2)),
+        ];
+        let at = tree(&groups);
+        assert_eq!(
+            at.iter()
+                .map(|n| (n.group.name.as_str(), n.depth))
+                .collect::<Vec<_>>(),
+            vec![("OPGAB", 0), ("GUS-1", 1), ("TG-1", 2), ("TG-2", 2)],
+            "a parent is drawn before its children, siblings by name"
+        );
+    }
+
+    /// AN ORPHAN IS A ROOT, not a group that vanishes from the board.
+    #[test]
+    fn an_orphan_is_drawn_at_the_root() {
+        let groups = vec![row(-5, "TG-9", GroupKind::SatuanTugas, Some(-99))];
+        let at = tree(&groups);
+        assert_eq!(at.len(), 1);
+        assert_eq!(at[0].depth, 0);
+    }
+
+    /// A CYCLE STAYS FINITE: the walk visits each group once and the board
+    /// still holds all of them.
+    #[test]
+    fn a_cycle_cannot_loop_the_walk() {
+        let groups = vec![
+            row(-6, "A", GroupKind::Gugus, Some(-7)),
+            row(-7, "B", GroupKind::Gugus, Some(-6)),
+        ];
+        let at = tree(&groups);
+        assert_eq!(at.len(), 2, "both groups are on the board");
+    }
     use super::*;
 
     fn live_group(
@@ -752,7 +905,14 @@ mod tests {
     fn a_staged_root_is_one_create() {
         let mut draft = GroupsDraft::new();
         let id = draft
-            .stage_group(7, "Operasi Gabungan", GroupKind::OperasiGabungan, None, None, vec![])
+            .stage_group(
+                7,
+                "Operasi Gabungan",
+                GroupKind::OperasiGabungan,
+                None,
+                None,
+                vec![],
+            )
             .expect("a bare root stages");
         assert!(id < 0, "a staged group never collides with a server id");
         assert_eq!(
@@ -772,10 +932,17 @@ mod tests {
     fn a_staged_child_is_created_after_its_parent() {
         let mut draft = GroupsDraft::new();
         let parent = draft
-            .stage_group(40, "OpGab", GroupKind::OperasiGabungan, None, None, vec![])
+            .stage_group(30, "Gugus", GroupKind::Gugus, None, None, vec![])
             .unwrap();
         let child = draft
-            .stage_group(20, "Satgas A", GroupKind::SatuanTugas, Some(parent), None, vec![])
+            .stage_group(
+                20,
+                "Satgas A",
+                GroupKind::SatuanTugas,
+                Some(parent),
+                None,
+                vec![],
+            )
             .unwrap();
         let writes = plan(&draft, &[]);
         assert!(matches!(
@@ -789,17 +956,100 @@ mod tests {
         ));
     }
 
-    /// The model's own words, not a second copy: a child must sit strictly
-    /// below its parent, so a Satgas under an Unsur is refused before any
-    /// write is planned.
+    /// The model's own words, not a second copy: a child must sit at the
+    /// level immediately above its parent, so a Satgas under an Unsur is
+    /// refused before any write is planned.
     #[test]
     fn a_rank_violation_is_refused_at_stage_time() {
         let mut draft = GroupsDraft::new();
         draft.seed(&[live_group(1, "Unsur A", GroupKind::Unsur, None, None, &[])]);
         let err = draft
-            .stage_group(20, "Satgas under Unsur", GroupKind::SatuanTugas, Some(1), None, vec![])
+            .stage_group(
+                20,
+                "Satgas under Unsur",
+                GroupKind::SatuanTugas,
+                Some(1),
+                None,
+                vec![],
+            )
             .unwrap_err();
         assert!(err.contains("rank violation"), "{err}");
+    }
+
+    /// A SKIPPED LEVEL IS NOT A PARENT (`§6.3`). A Satuan Tugas belongs in a
+    /// Gugus; an Operasi Gabungan is above it but is not the level above it,
+    /// and the refusal names both ranks so the operator can see the gap.
+    #[test]
+    fn a_skipped_level_is_refused() {
+        let mut draft = GroupsDraft::new();
+        draft.seed(&[live_group(
+            1,
+            "OpGab",
+            GroupKind::OperasiGabungan,
+            None,
+            None,
+            &[],
+        )]);
+        let err = draft
+            .stage_group(
+                20,
+                "Satgas A",
+                GroupKind::SatuanTugas,
+                Some(1),
+                None,
+                vec![],
+            )
+            .unwrap_err();
+        assert!(err.contains("rank violation"), "{err}");
+        assert!(err.contains("SatuanTugas:20"), "{err}");
+        assert!(err.contains("OperasiGabungan:40"), "{err}");
+    }
+
+    /// A HULL IS AN UNSUR AND SITS ONLY IN A SATUAN TUGAS. The basket's cards
+    /// are hulls, so a drop on a Gugus or an Operasi Gabungan is refused with
+    /// the sentence that says which level does hold them.
+    #[test]
+    fn a_hull_sits_only_in_a_satuan_tugas() {
+        let mut draft = GroupsDraft::new();
+        let err = draft
+            .stage_group(30, "Gugus A", GroupKind::Gugus, None, None, vec![7])
+            .unwrap_err();
+        assert!(err.contains("hulls are Unsur:10"), "{err}");
+        assert!(err.contains("Gugus:30"), "{err}");
+
+        let satgas = draft
+            .stage_group(20, "Satgas A", GroupKind::SatuanTugas, None, None, vec![7])
+            .unwrap();
+        assert!(draft.contains(satgas));
+
+        // And the same rule on an edit: a group that already exists cannot
+        // be handed a hull unless it is the level that holds hulls.
+        let gugus = draft
+            .stage_group(30, "Gugus B", GroupKind::Gugus, None, None, vec![])
+            .unwrap();
+        let err = draft.set_units(gugus, vec![8]).unwrap_err();
+        assert!(err.contains("hulls are Unsur:10"), "{err}");
+        // Emptying a group is always legal: a body may hold nothing.
+        draft.set_units(gugus, vec![]).unwrap();
+    }
+
+    /// A GROUP RE-PARENTS ONLY ONE LEVEL. A Satgas already under a Gugus
+    /// cannot be moved straight to the Operasi Gabungan above it.
+    #[test]
+    fn a_group_reparents_only_to_its_immediate_upper_level() {
+        let live = vec![
+            live_group(1, "OpGab", GroupKind::OperasiGabungan, None, None, &[]),
+            live_group(2, "Gugus A", GroupKind::Gugus, Some(1), None, &[]),
+            live_group(3, "Satgas A", GroupKind::SatuanTugas, Some(2), None, &[]),
+        ];
+        let mut draft = GroupsDraft::new();
+        draft.seed(&live);
+        let err = draft.set_parent(3, Some(1)).unwrap_err();
+        assert!(err.contains("rank violation"), "{err}");
+        // The level above it is the one that takes it, and it was already
+        // there: the draft settles to nothing.
+        draft.set_parent(3, Some(2)).unwrap();
+        assert!(draft.is_empty());
     }
 
     /// A new parent inside the group's own subtree is a cycle. It is named
@@ -821,7 +1071,14 @@ mod tests {
     #[test]
     fn a_unit_in_two_groups_is_refused() {
         let mut draft = GroupsDraft::new();
-        draft.seed(&[live_group(1, "Satgas A", GroupKind::SatuanTugas, None, None, &[7])]);
+        draft.seed(&[live_group(
+            1,
+            "Satgas A",
+            GroupKind::SatuanTugas,
+            None,
+            None,
+            &[7],
+        )]);
         let err = draft
             .stage_group(20, "Satgas B", GroupKind::SatuanTugas, None, None, vec![7])
             .unwrap_err();
@@ -833,7 +1090,7 @@ mod tests {
     #[test]
     fn a_synced_tree_plans_nothing() {
         let live = vec![
-            live_group(1, "OpGab", GroupKind::OperasiGabungan, None, Some(3), &[]),
+            live_group(1, "Gugus A", GroupKind::Gugus, None, Some(3), &[]),
             live_group(2, "Satgas A", GroupKind::SatuanTugas, Some(1), None, &[7]),
         ];
         let mut draft = GroupsDraft::new();
@@ -848,7 +1105,7 @@ mod tests {
     #[test]
     fn a_reparent_is_one_move() {
         let live = vec![
-            live_group(1, "OpGab", GroupKind::OperasiGabungan, None, None, &[]),
+            live_group(1, "Gugus A", GroupKind::Gugus, None, None, &[]),
             live_group(2, "Satgas A", GroupKind::SatuanTugas, Some(1), None, &[]),
         ];
         let mut draft = GroupsDraft::new();
@@ -868,16 +1125,33 @@ mod tests {
     /// one different write.
     #[test]
     fn setting_and_clearing_a_commander() {
-        let live = vec![live_group(1, "Satgas A", GroupKind::SatuanTugas, None, None, &[])];
+        let live = vec![live_group(
+            1,
+            "Satgas A",
+            GroupKind::SatuanTugas,
+            None,
+            None,
+            &[],
+        )];
         let mut draft = GroupsDraft::new();
         draft.seed(&live);
         draft.set_commander(1, Some(9)).unwrap();
         assert_eq!(
             plan(&draft, &live),
-            vec![GroupWrite::SetCommander { group: GroupRef::Live(1), user_id: 9 }]
+            vec![GroupWrite::SetCommander {
+                group: GroupRef::Live(1),
+                user_id: 9
+            }]
         );
 
-        let live = vec![live_group(1, "Satgas A", GroupKind::SatuanTugas, None, Some(9), &[])];
+        let live = vec![live_group(
+            1,
+            "Satgas A",
+            GroupKind::SatuanTugas,
+            None,
+            Some(9),
+            &[],
+        )];
         let mut draft = GroupsDraft::new();
         draft.seed(&live);
         draft.set_commander(1, None).unwrap();
@@ -902,7 +1176,10 @@ mod tests {
         ));
         assert_eq!(
             writes[1],
-            GroupWrite::PlaceUnit { group: GroupRef::New(id), unit_id: 7 }
+            GroupWrite::PlaceUnit {
+                group: GroupRef::New(id),
+                unit_id: 7
+            }
         );
     }
 
@@ -921,7 +1198,10 @@ mod tests {
         assert_eq!(
             plan(&draft, &live),
             vec![
-                GroupWrite::Rename { group_id: 1, name: "OpGab Jaya".into() },
+                GroupWrite::Rename {
+                    group_id: 1,
+                    name: "OpGab Jaya".into()
+                },
                 GroupWrite::DeleteNode { group_id: 2 },
             ]
         );
@@ -932,7 +1212,7 @@ mod tests {
     #[test]
     fn a_removed_parent_re_roots_its_children_first() {
         let live = vec![
-            live_group(1, "OpGab", GroupKind::OperasiGabungan, None, None, &[]),
+            live_group(1, "Gugus A", GroupKind::Gugus, None, None, &[]),
             live_group(2, "Satgas A", GroupKind::SatuanTugas, Some(1), None, &[]),
         ];
         let mut draft = GroupsDraft::new();
@@ -964,7 +1244,14 @@ mod tests {
     #[test]
     fn prune_drops_staged_ops_against_deleted_groups() {
         let mut draft = GroupsDraft::new();
-        draft.seed(&[live_group(5, "Satgas A", GroupKind::SatuanTugas, None, None, &[])]);
+        draft.seed(&[live_group(
+            5,
+            "Satgas A",
+            GroupKind::SatuanTugas,
+            None,
+            None,
+            &[],
+        )]);
         draft.set_commander(5, Some(9)).unwrap();
         draft.prune(&[]);
         assert_eq!(plan(&draft, &[]), Vec::new());
@@ -974,7 +1261,14 @@ mod tests {
     /// Pending counts writes, not groups: two edits on one group are two.
     #[test]
     fn pending_counts_writes_not_groups() {
-        let live = vec![live_group(5, "Satgas A", GroupKind::SatuanTugas, None, None, &[])];
+        let live = vec![live_group(
+            5,
+            "Satgas A",
+            GroupKind::SatuanTugas,
+            None,
+            None,
+            &[],
+        )];
         let mut draft = GroupsDraft::new();
         draft.seed(&live);
         draft.rename(5, "Satgas Alpha").unwrap();
@@ -986,7 +1280,14 @@ mod tests {
     /// frame is what the server said, and a unit's owner is one answer.
     #[test]
     fn read_accessors_separate_staged_work_from_the_frame() {
-        let live = vec![live_group(5, "Satgas A", GroupKind::SatuanTugas, None, None, &[7])];
+        let live = vec![live_group(
+            5,
+            "Satgas A",
+            GroupKind::SatuanTugas,
+            None,
+            None,
+            &[7],
+        )];
         let mut draft = GroupsDraft::new();
         draft.seed(&live);
         assert_eq!(draft.unit_owner(7), Some(5));
@@ -1010,19 +1311,25 @@ mod tests {
     #[test]
     fn a_units_group_is_joined_onto_the_node() {
         let mut groups = vec![
-            live_group(1, "OpGab", GroupKind::OperasiGabungan, None, None, &[]),
-            live_group(2, "Satgas A", GroupKind::SatuanTugas, Some(1), None, &[]),
+            live_group(1, "Satgas A", GroupKind::SatuanTugas, None, None, &[]),
+            live_group(2, "Satgas B", GroupKind::SatuanTugas, None, None, &[]),
         ];
         join_members(&mut groups, &[(7, 2), (8, 1), (9, 99)]);
         assert_eq!(
-            groups.iter().find(|g| g.group_id == 2).map(|g| g.units.clone()),
+            groups
+                .iter()
+                .find(|g| g.group_id == 2)
+                .map(|g| g.units.clone()),
             Some(vec![7]),
             "the hull that names the node is in it"
         );
         assert_eq!(
-            groups.iter().find(|g| g.group_id == 1).map(|g| g.units.clone()),
+            groups
+                .iter()
+                .find(|g| g.group_id == 1)
+                .map(|g| g.units.clone()),
             Some(vec![8]),
-            "and the hull that names the root is in the root"
+            "and the hull that names the other root is in that one"
         );
     }
 
@@ -1042,5 +1349,3 @@ mod tests {
         assert!(groups[0].units.is_empty());
     }
 }
-
-

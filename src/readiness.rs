@@ -65,10 +65,10 @@ impl ReadinessGap {
 pub fn unknown_gate_blockers(gap: ReadinessGap) -> Vec<String> {
     vec![match gap {
         ReadinessGap::NotRead => "the readiness check has not run yet".to_string(),
-        ReadinessGap::Unread => "the readiness check could not be read — retry the sync".to_string(),
-        ReadinessGap::Absent => {
-            "this server does not publish the readiness check".to_string()
+        ReadinessGap::Unread => {
+            "the readiness check could not be read — retry the sync".to_string()
         }
+        ReadinessGap::Absent => "this server does not publish the readiness check".to_string(),
     }]
 }
 
@@ -91,7 +91,10 @@ mod tests {
             fast: false,
         };
         assert_eq!(view.blockers.len(), 2);
-        assert!(!view.names_readiness(), "neither blocker is about readiness");
+        assert!(
+            !view.names_readiness(),
+            "neither blocker is about readiness"
+        );
     }
 
     /// An unread or unrun gate must NEVER read as clear.
@@ -102,8 +105,14 @@ mod tests {
     /// on a game nobody has checked.
     #[test]
     fn an_unknown_gate_refuses_rather_than_reads_as_clear() {
-        assert!(!unknown_gate_blockers(ReadinessGap::NotRead).is_empty(), "never run yet");
-        assert!(!unknown_gate_blockers(ReadinessGap::Unread).is_empty(), "read failed");
+        assert!(
+            !unknown_gate_blockers(ReadinessGap::NotRead).is_empty(),
+            "never run yet"
+        );
+        assert!(
+            !unknown_gate_blockers(ReadinessGap::Unread).is_empty(),
+            "read failed"
+        );
     }
 
     /// A server that answers 404 does not publish the check, so the message
@@ -116,11 +125,15 @@ mod tests {
             status: 404,
             message: "Not Found".to_string(),
             detail: None,
+            request_id: None,
         };
         let gap = ReadinessGap::of(&absent);
         assert_eq!(gap, ReadinessGap::Absent, "a 404 is not a transport hiccup");
         let msg = &unknown_gate_blockers(gap)[0];
-        assert!(!msg.contains("retry"), "a retry cannot conjure the route: {msg}");
+        assert!(
+            !msg.contains("retry"),
+            "a retry cannot conjure the route: {msg}"
+        );
         assert!(msg.contains("does not publish"), "{msg}");
     }
 
@@ -132,6 +145,7 @@ mod tests {
             status: 503,
             message: "unavailable".to_string(),
             detail: None,
+            request_id: Some("req-503".to_string()),
         };
         assert_eq!(ReadinessGap::of(&other), ReadinessGap::Unread);
         assert!(unknown_gate_blockers(ReadinessGap::Unread)[0].contains("retry"));
