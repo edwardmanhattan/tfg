@@ -535,7 +535,8 @@ operator running `tfg-server` in a terminal has one command for the whole
 exchange. It cannot show the token it hands out: that goes to the device.
 
 The CLI is a reference client, not an API the mobile app shells out to. The
-phone speaks this protocol directly.
+phone speaks this protocol directly; [`mobile-client-quickstart.md`](mobile-client-quickstart.md)
+is the build brief for that client.
 
 ## `tfg-server`
 
