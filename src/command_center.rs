@@ -20,23 +20,27 @@
 //! one.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext, Application, Bounds, Context, IntoElement, ParentElement, Render, Styled,
-    StyledImage, TitlebarOptions, Window, WindowBounds, WindowOptions, div, img, px, size,
+    StyledImage, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img, point, px,
+    size,
 };
 
 use crate::control::{
     AcceptedCommand, CameraSnapshot, ClientConfig, ClientHandle, Command, DisplayHello, Event,
-    GeoPoint, OBSERVER_VIEW, Readiness, ReadinessReason, SessionState, UnitState, ViewState,
-    spawn_client,
+    GeoPoint, OBSERVER_VIEW, ObserverUi, Readiness, ReadinessReason, SessionState, UnitState,
+    ViewState, spawn_client,
 };
 use crate::map_gate::FrameSlot;
 use crate::map_geometry;
+use crate::shell_gpui::{PHOTO_ZOOM, paint_unit_mark};
 use crate::shell_threads::{MapReq, MapResp};
 use crate::view;
+use crate::view::MapSymbolShape;
 
 /// Where this display follows, and what it calls itself.
 #[derive(Clone, Debug)]
@@ -89,6 +93,66 @@ impl CommandCenterConfig {
 }
 
 /// Run the command center until its window closes.
+/// One hull's photograph, decoded and in the byte order the atlas takes.
+struct Picture {
+    width: u32,
+    height: u32,
+    /// BGRA, the order `RenderImage` expects (the console swizzles the same
+    /// way, and `turn_to_size` carries the four channels untouched).
+    bgra: Vec<u8>,
+}
+
+/// Fetch hull photographs from the control server, once each.
+///
+/// The wall has no Minos credential by design; the console publishes what it
+/// already fetched, and this thread asks for the hulls the session names. One
+/// request per hull, ever: a picture does not change under an exercise.
+fn spawn_picture_fetch(
+    server: String,
+    token: String,
+    requests: Receiver<Vec<i64>>,
+    pictures: Sender<(i64, Picture)>,
+) {
+    std::thread::spawn(move || {
+        let Ok(http) = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+        else {
+            return;
+        };
+        for batch in requests {
+            for unit_id in batch {
+                let url = format!("{server}/v1/units/{unit_id}/picture");
+                let Ok(response) = http.get(&url).bearer_auth(&token).send() else {
+                    // The console publishes a picture when it fetches one;
+                    // a hull without a photograph has no route at all, and a
+                    // 404 is the ordinary answer.
+                    continue;
+                };
+                if !response.status().is_success() {
+                    continue;
+                }
+                let Ok(bytes) = response.bytes() else { continue };
+                let Ok(image) = image::load_from_memory(&bytes) else {
+                    continue;
+                };
+                let rgba = image.to_rgba8();
+                let (width, height) = rgba.dimensions();
+                let mut bgra = rgba.into_raw();
+                crate::map_gate::swizzle_rgba_to_bgra(&mut bgra);
+                let _ = pictures.send((
+                    unit_id,
+                    Picture {
+                        width,
+                        height,
+                        bgra,
+                    },
+                ));
+            }
+        }
+    });
+}
+
 pub fn run(
     config: CommandCenterConfig,
     map_tx: Sender<MapReq>,
@@ -109,6 +173,14 @@ pub fn run(
     client_config.events = Some(events_tx);
     let client = spawn_client(client_config, commands_tx)?;
     let server = config.server.clone();
+    let (picture_request_tx, picture_request_rx) = std::sync::mpsc::channel::<Vec<i64>>();
+    let (picture_tx, picture_rx) = std::sync::mpsc::channel::<(i64, Picture)>();
+    spawn_picture_fetch(
+        server.clone(),
+        config.token.clone(),
+        picture_request_rx,
+        picture_tx,
+    );
 
     Application::new().run(move |cx: &mut App| {
         register_fonts(cx);
@@ -127,7 +199,16 @@ pub fn run(
             ..Default::default()
         };
         let entity = cx.new(|_| {
-            CommandCenter::new(server, client, events_rx, commands_rx, map_tx, map_rx)
+            CommandCenter::new(
+                server,
+                client,
+                events_rx,
+                commands_rx,
+                map_tx,
+                map_rx,
+                picture_request_tx,
+                picture_rx,
+            )
         });
         let window = cx.open_window(opts, |_window, _cx| entity.clone());
         if window.is_err() {
@@ -186,6 +267,8 @@ struct CommandCenter {
     /// from" and "no exercise" are different waiting screens.
     session: Option<SessionState>,
     readiness: Readiness,
+    /// The phone's windows and the hull its popup is about.
+    ui: ObserverUi,
     heard_from_host: bool,
 
     /// The observer camera, as the host has it.
@@ -199,6 +282,19 @@ struct CommandCenter {
 
     frame: FrameSlot,
     incoming: Option<(u64, u32, u32, Vec<u8>, (f64, f64), f64)>,
+    /// Hull photographs, as fetched from the control server.
+    pictures: HashMap<i64, Picture>,
+    /// When each hull's picture was last asked for. A wall can start before
+    /// the console has fetched a picture, so a missing one is asked again —
+    /// slowly, not once per tick.
+    picture_asked: HashMap<i64, Instant>,
+    picture_request: Sender<Vec<i64>>,
+    picture_rx: Receiver<(i64, Picture)>,
+    /// Turned pictures, keyed by hull, raster size and whole degree. The
+    /// console's cache, with the same reason: a turn is expensive and a hull
+    /// on one course asks for the same raster every frame.
+    turned: HashMap<(i64, u32, u32, u16), Arc<gpui::RenderImage>>,
+    turned_bytes: usize,
     /// Where each hull is being drawn, and where it is going.
     ///
     /// The session's positions arrive once a second; the wall draws at fifty
@@ -220,6 +316,7 @@ struct Glide {
 }
 
 impl CommandCenter {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         server: String,
         client: ClientHandle,
@@ -227,6 +324,8 @@ impl CommandCenter {
         commands: Receiver<AcceptedCommand>,
         map_tx: Sender<MapReq>,
         map_rx: Receiver<MapResp>,
+        picture_request: Sender<Vec<i64>>,
+        picture_rx: Receiver<(i64, Picture)>,
     ) -> Self {
         Self {
             server,
@@ -237,6 +336,7 @@ impl CommandCenter {
             map_rx,
             session: None,
             readiness: Readiness::waiting(ReadinessReason::NoSession),
+            ui: ObserverUi::default(),
             heard_from_host: false,
             camera: CameraSnapshot::from_tuple((
                 map_geometry::MAP_CENTER.0,
@@ -251,6 +351,12 @@ impl CommandCenter {
             seq: 0,
             frame: FrameSlot::new(),
             incoming: None,
+            pictures: HashMap::new(),
+            picture_asked: HashMap::new(),
+            picture_request,
+            picture_rx,
+            turned: HashMap::new(),
+            turned_bytes: 0,
             glide: HashMap::new(),
         }
     }
@@ -266,11 +372,13 @@ impl CommandCenter {
                     views,
                     session,
                     readiness,
+                    ui,
                     ..
                 } => {
                     self.note_positions(session.as_ref());
                     self.session = session;
                     self.readiness = readiness;
+                    self.ui = ui;
                     if let Some(view) = views
                         .get(OBSERVER_VIEW)
                         .or_else(|| views.get(crate::control::MAIN_VIEW))
@@ -279,11 +387,15 @@ impl CommandCenter {
                     }
                 }
                 Event::SessionChanged {
-                    session, readiness, ..
+                    session,
+                    readiness,
+                    ui,
+                    ..
                 } => {
                     self.note_positions(session.as_ref());
                     self.session = session;
                     self.readiness = readiness;
+                    self.ui = ui;
                 }
                 Event::CameraChanged { view, .. } => {
                     if view.id == OBSERVER_VIEW {
@@ -304,6 +416,32 @@ impl CommandCenter {
                 self.camera.zoom = zoom;
                 self.asked = None;
                 self.client.followed(self.camera);
+            }
+        }
+        // Pictures the fetcher landed: kept for the mark's photo LOD.
+        while let Ok((unit_id, picture)) = self.picture_rx.try_recv() {
+            self.pictures.insert(unit_id, picture);
+        }
+        // Ask for the pictures of every hull the session names, once.
+        if let Some(session) = &self.session {
+            let now = Instant::now();
+            let wanted: Vec<i64> = session
+                .units
+                .iter()
+                .filter(|unit| unit.position.is_some())
+                .filter(|unit| !self.pictures.contains_key(&unit.id))
+                .filter(|unit| {
+                    self.picture_asked
+                        .get(&unit.id)
+                        .is_none_or(|at| now.saturating_duration_since(*at) >= Duration::from_secs(5))
+                })
+                .map(|unit| unit.id)
+                .collect();
+            if !wanted.is_empty() {
+                for id in &wanted {
+                    self.picture_asked.insert(*id, now);
+                }
+                let _ = self.picture_request.send(wanted);
             }
         }
         while let Ok((no, at, zoom, (w, h), mut rgba)) = self.map_rx.try_recv() {
@@ -478,6 +616,566 @@ fn waiting_copy(
     }
 }
 
+/// One hull as this frame draws it.
+struct Mark {
+    x: f32,
+    y: f32,
+    symbol: MapSymbolShape,
+    affiliation: crate::symbology::Affiliation,
+    stale: bool,
+    focused: bool,
+    /// The turned photograph and the box it occupies, when this zoom is
+    /// close enough and the hull has a picture.
+    photo: Option<(Arc<gpui::RenderImage>, f32, f32)>,
+}
+
+impl CommandCenter {
+    /// Every hull on screen, projected at the live camera, with the mark the
+    /// console would draw at this zoom.
+    fn prepare_marks(&mut self, win_w: f32, win_h: f32) -> Vec<Mark> {
+        let Some(session) = self.session.clone() else {
+            return Vec::new();
+        };
+        // Gathered first, turned second: the turned-picture cache needs
+        // `&mut self`, and a hull's placement is a read.
+        let mut pending = Vec::new();
+        for unit in &session.units {
+            let Some(position) = self.placed(unit) else {
+                continue;
+            };
+            let (x, y) = map_geometry::project_mercator(
+                position.latitude,
+                position.longitude,
+                (self.camera.center.latitude, self.camera.center.longitude),
+                self.camera.zoom,
+                f64::from(self.map_dims.0),
+                f64::from(self.map_dims.1),
+            );
+            if !(0.0..=1.0).contains(&(x / f64::from(self.map_dims.0)))
+                || !(0.0..=1.0).contains(&(y / f64::from(self.map_dims.1)))
+            {
+                continue;
+            }
+            pending.push((
+                unit.id,
+                win_w * (x as f32 / self.map_dims.0),
+                win_h * (y as f32 / self.map_dims.1),
+                MapSymbolShape::from_wire(&unit.symbol),
+                crate::symbology::Affiliation::from_str(&unit.affiliation),
+                unit.stale,
+                self.ui.focus == Some(unit.id),
+                position.latitude,
+                unit.loa_m,
+                unit.beam_m,
+                unit.heading_deg,
+            ));
+        }
+        // The map picture is drawn to fill the window, so one axis's scale is
+        // the other's: the window is the frame's aspect.
+        let s = if self.map_dims.0 > 0.0 {
+            win_w / self.map_dims.0
+        } else {
+            1.0
+        };
+        let mut out = Vec::with_capacity(pending.len());
+        for (id, x, y, symbol, affiliation, stale, focused, latitude, loa, beam, heading) in pending {
+            let photo = match (
+                self.camera.zoom >= PHOTO_ZOOM,
+                hull_extent(latitude, loa, beam, heading, self.camera.zoom, s),
+            ) {
+                (true, Some((length_px, beam_px, degree))) => {
+                    self.turned_for(id, length_px, beam_px, degree)
+                }
+                _ => None,
+            };
+            out.push(Mark {
+                x,
+                y,
+                symbol,
+                affiliation,
+                stale,
+                focused,
+                photo,
+            });
+        }
+        out
+    }
+
+    /// One hull's photograph, turned into the box it is seen in.
+    fn turned_for(
+        &mut self,
+        unit_id: i64,
+        length_px: f32,
+        beam_px: f32,
+        degree: u16,
+    ) -> Option<(Arc<gpui::RenderImage>, f32, f32)> {
+        let picture = self.pictures.get(&unit_id)?;
+        let (w, h) = (picture.width, picture.height);
+        let theta = degree as f32 - 90.0;
+        let (tw, th) = crate::thumb_rotate::turned_size(length_px, beam_px, theta);
+        // Capped, as the console caps it: a hull a kilometre long does not
+        // cost a megabyte of pixels.
+        let fit = (512.0 / tw.max(th)).min(1.0);
+        let (rw, rh) = (
+            (tw * fit).round().max(1.0) as u32,
+            (th * fit).round().max(1.0) as u32,
+        );
+        let key = (unit_id, rw, rh, degree);
+        if let Some(image) = self.turned.get(&key) {
+            return Some((image.clone(), tw, th));
+        }
+        let kx = w as f32 / length_px.max(1.0);
+        let ky = h as f32 / beam_px.max(1.0);
+        let pixels =
+            crate::thumb_rotate::turn_to_size(&picture.bgra, w, h, theta, rw, rh, kx, ky)?;
+        let buffer = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(rw, rh, pixels)?;
+        let image = Arc::new(gpui::RenderImage::new([image::Frame::new(buffer)]));
+        self.turned_bytes += (rw as usize) * (rh as usize) * 4;
+        if self.turned_bytes > 4 * 1024 * 1024 {
+            // A cache, not a ledger: emptied when it grows past its budget,
+            // exactly as the console's is.
+            self.turned.clear();
+            self.turned_bytes = 0;
+        }
+        self.turned.insert(key, image.clone());
+        Some((image, tw, th))
+    }
+
+    /// The hull the phone focused, and where its mark is this frame.
+    fn focused_unit(&self, win_w: f32, win_h: f32) -> Option<((f32, f32), UnitState)> {
+        let id = self.ui.focus?;
+        let unit = self
+            .session
+            .as_ref()?
+            .units
+            .iter()
+            .find(|unit| unit.id == id)?
+            .clone();
+        let position = self.placed(&unit)?;
+        let (x, y) = map_geometry::project_mercator(
+            position.latitude,
+            position.longitude,
+            (self.camera.center.latitude, self.camera.center.longitude),
+            self.camera.zoom,
+            f64::from(self.map_dims.0),
+            f64::from(self.map_dims.1),
+        );
+        Some((
+            (
+                win_w * (x as f32 / self.map_dims.0),
+                win_h * (y as f32 / self.map_dims.1),
+            ),
+            unit,
+        ))
+    }
+
+    /// The card beside the focused hull.
+    fn unit_card(
+        &self,
+        unit: &UnitState,
+        at: (f32, f32),
+        win_w: f32,
+        win_h: f32,
+    ) -> gpui::AnyElement {
+        const W: f32 = 300.0;
+        const H: f32 = 208.0;
+        // Beside the mark, flipped when that side has no room, and clamped so
+        // a small window can never push the card past its edge.
+        let left = (if at.0 + 24.0 + W > win_w {
+            at.0 - 24.0 - W
+        } else {
+            at.0 + 24.0
+        })
+        .clamp(8.0, (win_w - W - 8.0).max(8.0));
+        let top = (at.1 - H / 2.0).clamp(72.0, (win_h - H - 8.0).max(72.0));
+        let step = self
+            .session
+            .as_ref()
+            .and_then(|session| session.scenario.as_ref())
+            .map(|scenario| match &scenario.step {
+                Some(step) if !step.trim().is_empty() => format!("{} · {step}", scenario.title),
+                _ => scenario.title.clone(),
+            })
+            .unwrap_or_else(|| "—".to_string());
+        let commander = unit
+            .commander
+            .as_ref()
+            .map(|commander| commander.name.clone())
+            .unwrap_or_else(|| "uncommanded".to_string());
+        let speed = unit
+            .speed_kn
+            .map(|speed| format!("{speed:.0} kn"))
+            .unwrap_or_else(|| "—".to_string());
+        let course = unit
+            .heading_deg
+            .map(|heading| format!("{heading:.0}°"))
+            .unwrap_or_else(|| "—".to_string());
+        let embarked = if unit.embarked.is_empty() {
+            "—".to_string()
+        } else {
+            unit.embarked
+                .iter()
+                .map(|child| child.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let row = |label: &'static str, value: String| {
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .font_family("PT Mono")
+                        .text_size(px(10.0))
+                        .text_color(crate::ink::rgba(view::BODY_SILVER))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_right()
+                        .font_family("Saira Condensed")
+                        .text_size(px(13.0))
+                        .text_color(crate::ink::rgba(view::MAP_INK))
+                        .child(value),
+                )
+        };
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(W))
+            .border_1()
+            .border_color(crate::ink::rgba(view::RADAR_CYAN.with_alpha(160)))
+            .bg(crate::ink::rgba(view::PANEL_SLATE.with_alpha(238)))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .border_b_1()
+                    .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(11.0))
+                            .text_color(crate::ink::rgba(view::RADAR_CYAN))
+                            .child(format!("UNIT {}", unit.index)),
+                    )
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(10.0))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child(unit.hull_number.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .p(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(17.0))
+                            .text_color(crate::ink::rgba(view::MAP_INK))
+                            .child(unit.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(11.0))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child(unit.class_name.clone()),
+                    )
+                    .child(row("COMMANDER", commander))
+                    .child(row("SPEED", speed))
+                    .child(row("COURSE", course))
+                    .child(row("EMBARKED", embarked))
+                    .child(row("STEP", step)),
+            )
+            .into_any_element()
+    }
+
+    /// The three observer windows, in the console's right column.
+    fn panels(&self, mut root: gpui::Div, _win_w: f32, _win_h: f32) -> gpui::Div {
+        let Some(session) = &self.session else {
+            return root;
+        };
+        let open = self.ui.panels;
+        if !open.any() {
+            return root;
+        }
+        let mut column = div()
+            .absolute()
+            .top(px(80.0))
+            .right(px(16.0))
+            .w(px(348.0))
+            .flex()
+            .flex_col()
+            .gap(px(12.0));
+        if open.crew {
+            column = column.child(self.crew_panel(session));
+        }
+        if open.scenario {
+            column = column.child(self.scenario_panel(session));
+        }
+        if open.comms {
+            column = column.child(self.comms_panel(session));
+        }
+        root = root.child(column);
+        root
+    }
+
+    fn panel_shell(&self, title: String, body: gpui::Div) -> gpui::AnyElement {
+        div()
+            .border_1()
+            .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+            .bg(crate::ink::rgba(view::PANEL_SLATE.with_alpha(242)))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(12.0))
+                    .py(px(5.0))
+                    .border_b_1()
+                    .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+                    .bg(crate::ink::rgba(view::CONSOLE_NIGHT))
+                    .font_family("Saira Condensed")
+                    .text_size(px(11.0))
+                    .text_color(crate::ink::rgba(view::RADAR_CYAN))
+                    .child(title),
+            )
+            .child(div().p(px(10.0)).flex().flex_col().gap(px(6.0)).child(body))
+            .into_any_element()
+    }
+
+    fn crew_panel(&self, session: &SessionState) -> gpui::AnyElement {
+        let ready = session.participants.iter().filter(|p| p.ready).count();
+        let title = format!(
+            "CREW  {} SEAT(S) · {} READY",
+            session.participants.len(),
+            ready
+        );
+        let mut body = div().flex().flex_col().gap(px(6.0));
+        if session.participants.is_empty() {
+            body = body.child(
+                div()
+                    .font_family("Saira Condensed")
+                    .text_size(px(12.0))
+                    .text_color(crate::ink::rgba(view::BODY_SILVER))
+                    .child("no seats published"),
+            );
+        }
+        for person in &session.participants {
+            let hulls: Vec<String> = session
+                .units
+                .iter()
+                .filter(|unit| unit.commander.as_ref().is_some_and(|c| c.id == person.id))
+                .map(|unit| format!("{} {}", unit.index, unit.name))
+                .collect();
+            let mut row = div()
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .child(
+                            div()
+                                .font_family("Saira Condensed")
+                                .text_size(px(13.0))
+                                .text_color(crate::ink::rgba(view::MAP_INK))
+                                .child(if person.name.trim().is_empty() {
+                                    person.role.clone()
+                                } else {
+                                    person.name.clone()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .font_family("PT Mono")
+                                .text_size(px(9.0))
+                                .text_color(crate::ink::rgba(if person.judge {
+                                    view::BODY_SILVER
+                                } else if person.ready {
+                                    view::SIGNAL_GREEN
+                                } else {
+                                    view::BODY_SILVER
+                                }))
+                                .child(if person.judge {
+                                    "JUDGE".to_string()
+                                } else if person.ready {
+                                    "READY".to_string()
+                                } else {
+                                    "WAITING".to_string()
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .font_family("PT Mono")
+                        .text_size(px(9.0))
+                        .text_color(crate::ink::rgba(view::BODY_SILVER))
+                        .child(person.role.clone()),
+                );
+            for hull in hulls {
+                row = row.child(
+                    div()
+                        .max_w(px(320.0))
+                        .truncate()
+                        .font_family("PT Mono")
+                        .text_size(px(9.5))
+                        .text_color(crate::ink::rgba(view::MAP_INK))
+                        .child(hull),
+                );
+            }
+            body = body.child(row);
+        }
+        self.panel_shell(title, body)
+    }
+
+    fn scenario_panel(&self, session: &SessionState) -> gpui::AnyElement {
+        let title = session
+            .scenario
+            .as_ref()
+            .map(|scenario| scenario.title.clone())
+            .unwrap_or_else(|| "no scenario published".to_string());
+        let step = session
+            .scenario
+            .as_ref()
+            .and_then(|scenario| scenario.step.clone())
+            .unwrap_or_else(|| "no step is playing".to_string());
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .font_family("Saira Condensed")
+                    .text_size(px(14.0))
+                    .text_color(crate::ink::rgba(view::MAP_INK))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .font_family("Saira Condensed")
+                    .text_size(px(12.0))
+                    .text_color(crate::ink::rgba(view::MAP_INK))
+                    .child(step),
+            )
+            .child(
+                div()
+                    .font_family("PT Mono")
+                    .text_size(px(9.5))
+                    .text_color(crate::ink::rgba(view::BODY_SILVER))
+                    .child(format!(
+                        "{} · {} · {}",
+                        session.phase.to_uppercase(),
+                        session.mode.to_uppercase(),
+                        session.name
+                    )),
+            );
+        self.panel_shell("SCENARIO".to_string(), body)
+    }
+
+    fn comms_panel(&self, session: &SessionState) -> gpui::AnyElement {
+        let title = format!("COMMS  {} MESSAGE(S)", session.messages.len());
+        let mut body = div().flex().flex_col().gap(px(8.0));
+        if session.messages.is_empty() {
+            body = body.child(
+                div()
+                    .font_family("Saira Condensed")
+                    .text_size(px(12.0))
+                    .text_color(crate::ink::rgba(view::BODY_SILVER))
+                    .child("no traffic in this exercise"),
+            );
+        }
+        for message in session.messages.iter().take(6) {
+            let time = message
+                .at
+                .split('T')
+                .nth(1)
+                .map(|rest| rest.chars().take(5).collect::<String>())
+                .unwrap_or_default();
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .font_family("PT Mono")
+                                    .text_size(px(9.5))
+                                    .text_color(crate::ink::rgba(view::RADAR_CYAN))
+                                    .child(format!(
+                                        "{}{}",
+                                        message.sender,
+                                        if message.assumed { "" } else { "" }
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .font_family("PT Mono")
+                                    .text_size(px(9.0))
+                                    .text_color(crate::ink::rgba(view::BODY_SILVER))
+                                    .child(format!("{} {time}", message.degree)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(12.0))
+                            .text_color(crate::ink::rgba(view::MAP_INK))
+                            .child(message.content.clone()),
+                    ),
+            );
+        }
+        self.panel_shell(title, body)
+    }
+}
+
+/// The length, beam and whole-degree course a hull's photograph is drawn at,
+/// when it has all three.
+fn hull_extent(
+    latitude: f64,
+    loa_m: Option<f64>,
+    beam_m: Option<f64>,
+    heading_deg: Option<f64>,
+    zoom: f64,
+    s: f32,
+) -> Option<(f32, f32, u16)> {
+    let (loa, beam, heading) = (loa_m?, beam_m?, heading_deg?);
+    if loa <= 0.0 || beam <= 0.0 {
+        return None;
+    }
+    let mpp = map_geometry::meters_per_pixel(latitude, zoom);
+    if !mpp.is_finite() || mpp <= 0.0 {
+        return None;
+    }
+    Some((
+        (loa / mpp) as f32 * s,
+        (beam / mpp) as f32 * s,
+        heading.round().rem_euclid(360.0) as u16,
+    ))
+}
+
 impl Render for CommandCenter {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some((no, w, h, bgra, _at, _zoom)) = self.incoming.take() {
@@ -505,71 +1203,75 @@ impl Render for CommandCenter {
             );
         }
 
-        // The markers: numbered, projected at the picture's own camera, and
-        // scaled from the picture's pixel space to the window.
-        if let Some(session) = &self.session {
-            for unit in &session.units {
-                let Some(position) = self.placed(unit) else {
-                    continue;
-                };
-                let (x, y) = map_geometry::project_mercator(
-                    position.latitude,
-                    position.longitude,
-                    (self.camera.center.latitude, self.camera.center.longitude),
-                    self.camera.zoom,
-                    f64::from(self.map_dims.0),
-                    f64::from(self.map_dims.1),
-                );
-                if !(0.0..=1.0).contains(&(x / f64::from(self.map_dims.0))) {
-                    continue;
-                }
-                if !(0.0..=1.0).contains(&(y / f64::from(self.map_dims.1))) {
-                    continue;
-                }
-                let left = win_w * (x as f32 / self.map_dims.0);
-                let top = win_h * (y as f32 / self.map_dims.1);
-                let ink = if unit.stale {
-                    crate::ink::rgba(view::BODY_SILVER)
-                } else {
-                    crate::ink::rgba(view::RADAR_CYAN)
-                };
-                root = root.child(
-                    div()
-                        .absolute()
-                        .left(px(left - 13.0))
-                        .top(px(top - 13.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            div()
-                                .w(px(26.0))
-                                .h(px(26.0))
-                                .rounded_full()
-                                .border_1()
-                                .border_color(ink)
-                                .bg(crate::ink::rgba(view::CONSOLE_NIGHT))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .font_family("PT Mono")
-                                .text_size(px(12.0))
-                                .text_color(ink)
-                                .child(unit.index.to_string()),
-                        )
-                        .child(
-                            div()
-                                .px(px(6.0))
-                                .py(px(2.0))
-                                .bg(crate::ink::rgba(view::CONSOLE_NIGHT.with_alpha(220)))
-                                .font_family("Saira Condensed")
-                                .text_size(px(12.0))
-                                .text_color(crate::ink::rgba(view::MAP_INK))
-                                .child(unit.name.clone()),
-                        ),
-                );
-            }
+        // THE MARKS ARE THE CONSOLE'S MARKS. Below `PHOTO_ZOOM` a hull is its
+        // affiliation frame with the taxonomy glyph inside it — the same
+        // painting the console does, from the same function — and at or above
+        // it the hull's own photograph, sized by its published length and beam
+        // and turned on its course. A numbered dot was the wall's invention and
+        // it is gone: the grid number belongs on the phone, not on the water.
+        let marks = self.prepare_marks(win_w, win_h);
+        if !marks.is_empty() {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .size_full()
+                    .child(canvas(
+                        |bounds, _, _| bounds,
+                        move |_bounds, _, window, _| {
+                            for mark in &marks {
+                                if let Some((photo, w, h)) = &mark.photo {
+                                    let b = Bounds::new(
+                                        point(px(mark.x - w / 2.0), px(mark.y - h / 2.0)),
+                                        size(px(*w), px(*h)),
+                                    );
+                                    // The corner radius scales with the
+                                    // photograph, as the console's does.
+                                    let r = px(w.min(*h).min(8.0) / 2.0);
+                                    let _ = window.paint_image(
+                                        b,
+                                        gpui::Corners::all(r),
+                                        photo.clone(),
+                                        0,
+                                        false,
+                                    );
+                                } else {
+                                    paint_unit_mark(
+                                        window,
+                                        (mark.x, mark.y),
+                                        mark.symbol,
+                                        mark.affiliation,
+                                        mark.stale,
+                                    );
+                                }
+                                if mark.focused {
+                                    crate::shell_gpui::paint_unit_reticle(
+                                        window,
+                                        (mark.x, mark.y),
+                                        view::RADAR_CYAN,
+                                    );
+                                }
+                            }
+                        },
+                    )),
+            );
+        }
+
+        // The observer's windows, exactly the three the phone toggles. They
+        // sit in the console's right column and use its panel grammar: a
+        // tracked-caps title band on Panel Slate over a Console Night body,
+        // one hairline edge.
+        if self.ready() {
+            root = self.panels(root, win_w, win_h);
+        }
+
+        // The focused hull's card: the phone tapped its grid button, the
+        // camera centred it, and this says who and what it is without leaving
+        // the water. Drawn after the windows so it is never buried by them,
+        // beside the mark and flipped to whichever side has room.
+        if let Some((mark, unit)) = self.focused_unit(win_w, win_h) {
+            root = root.child(self.unit_card(&unit, (mark.0, mark.1), win_w, win_h));
         }
 
         // The waiting scrim: the map stays visible because the place matters,

@@ -238,6 +238,22 @@ done
 sleep 0.4
 "$CLI" --server "$URL" --token "$TOKEN" --json camera get --view observer >"$OUT/observer-after-focus.json" 2>&1
 "$CLI" --server "$URL" --token "$TOKEN" --json camera get >"$OUT/main-after-focus.json" 2>&1
+# The phone's windows and the hull pictures: both are server state, and both
+# are what the wall draws from. The picture is a real 1x1 PNG so the GET is
+# checked against bytes, not against a content type alone.
+"$CLI" --server "$URL" --token "$TOKEN" --json panel >"$OUT/panels-closed.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" panel crew on >"$OUT/panel-crew-on.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" --json session status >"$OUT/session-panel-open.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" --json panel >"$OUT/panels-open.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" panel crew off >"$OUT/panel-crew-off.json" 2>&1
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' \
+    | base64 -d >"$OUT/hull.png"
+curl -sS -X PUT "$URL/v1/units/9001/picture" \
+    -H "Authorization: Bearer $TOKEN" -H 'content-type: image/png' \
+    --data-binary @"$OUT/hull.png" >"$OUT/picture-put.json"
+curl -sS -o "$OUT/picture-got.png" -w '%{http_code} %{content_type}' \
+    "$URL/v1/units/9001/picture" -H "Authorization: Bearer $TOKEN" >"$OUT/picture-get.txt"
+
 # The console goes quiet: the session outlives its heartbeat, the verdict flips
 # to `stale`, and steering is refused while it is.
 sleep 17
@@ -475,6 +491,44 @@ check(
     "steering is refused while the session is stale",
     "not_ready" in stale_text and "stale" in stale_text,
     stale_text.strip()[:120],
+)
+panels_closed = json.loads((out_dir / "panels-closed.json").read_text())
+check(
+    "no observer window is open until the phone asks",
+    panels_closed.get("panels", {}).get("crew") is not True,
+    json.dumps(panels_closed),
+)
+panel_open = json.loads((out_dir / "session-panel-open.json").read_text())
+check(
+    "the phone's window reaches the shared state",
+    panel_open.get("ui", {}).get("panels", {}).get("crew") is True,
+    json.dumps(panel_open.get("ui")),
+)
+panel_read = json.loads((out_dir / "panels-open.json").read_text())
+check(
+    "the panel read names the open window",
+    panel_read.get("panels", {}).get("crew") is True,
+    json.dumps(panel_read),
+)
+panel_off = json.loads((out_dir / "panel-crew-off.json").read_text())
+check(
+    "the window closes again",
+    panel_off.get("status") == "accepted",
+    json.dumps(panel_off),
+)
+picture_put = json.loads((out_dir / "picture-put.json").read_text())
+check(
+    "the console publishes a hull picture",
+    picture_put.get("status") == "stored",
+    json.dumps(picture_put),
+)
+got_status, got_type = (out_dir / "picture-get.txt").read_text().split()
+served = (out_dir / "picture-got.png").read_bytes()
+check(
+    "the wall can fetch the same bytes",
+    got_status == "200" and got_type == "image/png"
+    and served[:8] == b"\x89PNG\r\n\x1a\n" and len(served) > 40,
+    f"{got_status} {got_type} {len(served)} bytes",
 )
 check(
     "closing the command center releases observation",

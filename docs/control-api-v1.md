@@ -256,9 +256,19 @@ command centers are attached. This is the read a phone's waiting screen polls.
   "displays": [
     { "id": "wall-1", "label": "wall-1", "role": "command_center",
       "viewport": { "width": 1280, "height": 720 } }
-  ]
+  ],
+  "ui": {
+    "panels": { "crew": true, "scenario": false, "comms": false },
+    "focus": 9001
+  }
 }
 ```
+
+The session also carries `participants` (the exercise's seats, for the Crew
+window) and `messages` (the traffic the console may read, newest first, bounded
+to the most recent 40) — see [the session body](#get-v1session) above for the
+fields. `units[]` carries `loa_m`, `beam_m`, `affiliation` and `symbol` so a wall
+with no store can draw the console's own mark and photograph.
 
 `session` is `null` when the console holds no exercise. `units[].index` is the
 number the phone's grid and the wall's marker share; the server assigns it from
@@ -283,6 +293,11 @@ When it is not ready, `reason` names the one thing to wait for:
 An expired session is kept and reported `stale` rather than deleted: a stale map
 beats an empty one.
 
+`ui` is the observer's screen: the three windows the phone opened and the hull
+its popup is about. It is UI state, but it lives on the host so every attached
+wall agrees with the phone and a reconnect restores the same screen instead of a
+blank one. A new exercise (a different game id), or a clear, resets it.
+
 ### `PUT /v1/session` and `DELETE /v1/session`
 
 Needs `admin`. These are the console's routes, not a phone's: the console is the
@@ -298,6 +313,22 @@ again. Both answer
 ```
 
 or `{ "status": "unchanged", … }`.
+
+### `GET /v1/units/{unit_id}/picture`
+
+The hull's photograph, as `image/png`, from the console's own cache. Needs
+`observe`.
+
+The console is the only process that may read Minos, so it is the only thing
+that fetches pictures; a wall has no Minos credential and asks here instead.
+`PUT` the same route publishes one (needs `admin`, a PNG body up to 4 MiB); the
+console does that once per hull, when its thumb fetcher lands the picture.
+`404` is the ordinary answer for a hull with no photograph, and a wall that gets
+one draws the symbol instead.
+
+`loa_m`/`beam_m` on the session's units are what size the photograph: the console
+draws a hull at its published length and beam, not at whatever pixels the upload
+happened to have.
 
 ### `GET /v1/displays`
 
@@ -434,6 +465,25 @@ so a phone never needs to know where a hull is.
 - `camera.focus` on `main` is `422`: the operator's camera is not a remote
   surface, and accepting it on `main` would let a phone drag the game master's
   map.
+
+### `ui.set`
+
+Open or close one of the observer's windows, or change the hull the popup is
+about (the latter rides `camera.focus`).
+
+```json
+{ "type": "ui.set", "payload": { "panel": "crew", "open": true } }
+```
+
+- `panel` is `crew`, `scenario` or `comms`. There is no `units` window: the
+  phone's unit grid is a control, not a panel, and Crew is the people and hulls
+  the exercise holds.
+- The state is idempotent: the same `open` twice changes nothing and advances no
+  revision.
+- It needs `control_view` and the readiness gate, like a nudge — opening a
+  window on a wall that is not observing is a gesture into a hole.
+- It is carried to every wall in `session.changed` (and in the snapshot), which
+  is why it is one event with the session rather than a camera move.
 
 ### `view.report`
 
@@ -613,7 +663,7 @@ On connect the server sends the whole state, then one event per change:
 | --- | --- |
 | `snapshot` | The whole state at `revision`: views, session, readiness, displays. Sent on connect, and again after a gap. |
 | `camera.changed` | A camera moved. `view.id` says which one. `source` names the client, or `desktop` for the operator's own gesture. `command_id` is present when a command caused it. |
-| `session.changed` | The exercise, its phase, its units, the readiness verdict, or the attached displays changed. One event, because they all answer the same question: may I steer, and what am I steering? |
+| `session.changed` | The exercise, its phase, its units, the readiness verdict, the attached displays, or the observer's windows changed. One event, because they all answer the same question: may I steer, and what am I looking at? `ui` carries the open windows and the focused hull. |
 | `display.attached` | This socket's `display.hello` was accepted. Carries the id the host recorded. |
 | `display.rejected` | This socket's `display.hello` was refused (a phone without `admin`, a bad role). The socket stays open. |
 | `command.accepted` | A command reached the host. The evidence that it *worked* is the `camera.changed` that follows. |
@@ -721,6 +771,7 @@ cargo run --bin tfgctl -- … units
 cargo run --bin tfgctl -- … focus 3 [--zoom 12]
 cargo run --bin tfgctl -- … display list
 cargo run --bin tfgctl -- … display attach --id wall-1 --label wall-1 --width 1920 --height 1080
+cargo run --bin tfgctl -- … panel crew on      # also scenario, comms; `panel` lists
 ```
 
 `session watch` polls `GET /v1/session` once a second and prints one line per
@@ -885,8 +936,8 @@ camera; it does not click a button.
   center.
 - A verb for the phone's OK button. The button is inert until the protocol has
   something for it to mean.
-- Comms content. The panel exists on the phone as a placeholder; nothing is
-  published for it in this phase.
+- The OK button's verb. The phone's button is inert until the protocol has
+  something for it to mean.
 - `GET /v1/commands/{id}` for polling a command's fate. The event stream is the
   only way to see one applied.
 - TLS. `wss` and `https` are refused by `tfgctl watch` with a message rather

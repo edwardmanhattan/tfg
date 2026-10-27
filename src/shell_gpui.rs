@@ -4991,6 +4991,11 @@ impl IslandDemo {
                 // host already reports this size with its camera.
                 let _ = (width, height);
             }
+            crate::control::Command::UiSet { .. } => {
+                // The observer's windows belong to the wall, whose client
+                // applies them from the session event. The console has its own
+                // chrome and is not remoted.
+            }
         }
         self.map_control = None;
     }
@@ -5173,7 +5178,12 @@ impl IslandDemo {
     /// — the first `None` marks the fact rather than clearing a session
     /// another console may have published.
     fn publish_session(&mut self) {
-        let projection = control_projection(&self.session);
+        let projection = control_projection(
+            &self.session,
+            &self.live,
+            &self.unit_specs,
+            &self.hull_sizes,
+        );
         if self.session_published.as_ref() == Some(&projection) {
             return;
         }
@@ -30653,6 +30663,144 @@ impl IslandDemo {
         col.into_any_element()
     }
 
+    /// The selected hull's card, floating beside its mark.
+    ///
+    /// The Inspector states everything a hull is; this says the few things an
+    /// operator asks while looking at the water — who commands it, which way
+    /// it is going and how fast, what is aboard, and which step is playing —
+    /// without moving their eyes to a panel. The command center draws the same
+    /// card for the hull the phone focused.
+    fn unit_popup(&self, win_w: f32, win_h: f32) -> AnyElement {
+        let Some(id) = self.selected_unit.as_deref() else {
+            return div().into_any_element();
+        };
+        let Some(marker) = self.live.iter().find(|marker| marker.id == id) else {
+            return div().into_any_element();
+        };
+        let (mw, mh) = self.map_dims;
+        let (s, ox, oy) = map_view(
+            f64::from(mw),
+            f64::from(mh),
+            f64::from(win_w),
+            f64::from(win_h),
+        );
+        let at = self.marker_frame_px(marker);
+        let (mx, my) = (
+            ox as f32 + at.0 as f32 * s as f32,
+            oy as f32 + at.1 as f32 * s as f32,
+        );
+        if mx < 0.0 || my < 0.0 || mx > win_w || my > win_h {
+            return div().into_any_element();
+        }
+        let facts = self.unit_facts(id);
+        let step = self
+            .session
+            .step
+            .as_ref()
+            .and_then(|step| step.playing.as_ref())
+            .map(|line| {
+                if line.content.trim().is_empty() {
+                    line.scenario.clone()
+                } else {
+                    format!("{} \u{00b7} {}", line.scenario, line.content)
+                }
+            })
+            .unwrap_or_else(|| "\u{2014}".to_string());
+        let row = |label: &'static str, value: String| {
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .font_family("PT Mono")
+                        .text_size(px(10.0))
+                        .text_color(rgba(view::BODY_SILVER))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_right()
+                        .font_family("Saira Condensed")
+                        .text_size(px(13.0))
+                        .text_color(rgba(view::MAP_INK))
+                        .child(value),
+                )
+        };
+        const W: f32 = 300.0;
+        const H: f32 = 206.0;
+        let left = if mx + 24.0 + W > win_w {
+            (mx - 24.0 - W).max(8.0)
+        } else {
+            mx + 24.0
+        };
+        // Clear the top band (64 px) and the zoom strip.
+        let top = (my - H / 2.0).clamp(76.0, (win_h - H - 8.0).max(76.0));
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(W))
+            .border_1()
+            .border_color(rgba(view::RADAR_CYAN.with_alpha(150)))
+            .bg(rgba(view::PANEL_SLATE.with_alpha(240)))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .border_b_1()
+                    .border_color(rgba(view::HAIRLINE_SLATE))
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(11.0))
+                            .text_color(rgba(view::RADAR_CYAN))
+                            .child("UNIT"),
+                    )
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(10.0))
+                            .text_color(rgba(view::BODY_SILVER))
+                            .child(facts.hull.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .p(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(17.0))
+                            .text_color(rgba(view::MAP_INK))
+                            .child(facts.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(11.0))
+                            .text_color(rgba(view::BODY_SILVER))
+                            .child(facts.class.clone()),
+                    )
+                    .child(row("COMMANDER", facts.commander.clone()))
+                    .child(row("SPEED", facts.speed.clone()))
+                    .child(row("COURSE", facts.course.clone()))
+                    .child(row("EMBARKED", facts.embark.clone()))
+                    .child(row("STEP", step)),
+            )
+            .into_any_element()
+    }
+
     /// The marker layer, now live: one ring per tracked hull, at its
     /// projected fix position.
     ///
@@ -30912,19 +31060,19 @@ impl IslandDemo {
 /// stops saying "some frigate" and starts saying "this one". Below it the
 /// symbol box (20 px at this shell's marker layer) is the larger mark and the
 /// honest one, so the glyph stays.
-const PHOTO_ZOOM: f64 = 14.0;
+pub const PHOTO_ZOOM: f64 = 14.0;
 
 /// The symbol box a hull's mark is drawn in, in window pixels.
 ///
 /// The frame, the glyph and the mark's own reach all measure against it, so
 /// the ring the map draws around a hull clears the same box the hull is drawn
 /// in.
-const MARK_BOX_PX: f32 = 20.0;
+pub const MARK_BOX_PX: f32 = 20.0;
 
 /// The glyph's reach in the FLOW's map layer, and the selection reticle's
 /// radius — the same pair the console's marker layer uses, named once here so
 /// the flow cannot drift from it.
-const MAP_GLYPH_SCALE: f32 = 1.35;
+pub const MAP_GLYPH_SCALE: f32 = 1.35;
 const MAP_SELECT_R: f32 = 15.0;
 
 /// How far the rotator's rim stands clear of the mark it rings.
@@ -31533,6 +31681,36 @@ fn paint_frame(
             stroke_run(window, &pts, FRAME_STROKE_PX, hue);
         }
     }
+}
+
+/// The console's own mark: the affiliation frame with the taxonomy glyph
+/// inside it.
+///
+/// Public so the command center draws the same mark from the same code. The
+/// wall has no store to resolve a symbol itself, so the binary publishes the
+/// resolved shape and affiliation with the session; the painting is here
+/// because it is the console's vocabulary and a second copy of it would
+/// drift.
+pub fn paint_unit_mark(
+    window: &mut Window,
+    center: (f32, f32),
+    symbol: crate::view::MapSymbolShape,
+    affiliation: crate::symbology::Affiliation,
+    stale: bool,
+) {
+    paint_frame(window, center, affiliation, false, stale, MARK_BOX_PX);
+    paint_glyph(
+        window,
+        center,
+        symbol,
+        map_symbol_fill(symbol, stale),
+        MAP_GLYPH_SCALE,
+    );
+}
+
+/// The reticle the console draws around the hull it has selected.
+pub fn paint_unit_reticle(window: &mut Window, center: (f32, f32), ink: Rgba) {
+    paint_reticle(window, center, 15.0, ink);
 }
 
 /// A closed polygon, filled.
@@ -32707,6 +32885,7 @@ impl Render for IslandDemo {
             } else {
                 self.markers(vp.2, vp.3).into_any_element()
             })
+            .child(self.unit_popup(vp.2, vp.3).into_any_element())
             .child(if self.session.execution {
                 // Execution draws its widgets on the map, not a column.
                 div().into_any_element()
@@ -34891,7 +35070,12 @@ pub const CLOCK_GRANT: &str = "clock control needs the control grant in this ses
 /// What is deliberately NOT here: message traffic, the roster of people, the
 /// exercise's terms. A viewer watches hulls move; anything beyond that is the
 /// console's own business and would be a projection nobody asked for.
-fn control_projection(session: &SessionView) -> Option<crate::control::SessionState> {
+fn control_projection(
+    session: &SessionView,
+    live: &[LiveMarker],
+    specs: &std::collections::BTreeMap<i64, UnitFigures>,
+    hull_sizes: &std::collections::HashMap<i64, (f64, f64)>,
+) -> Option<crate::control::SessionState> {
     if !session.signed_in || session.game_id <= 0 || session.game.trim().is_empty() {
         return None;
     }
@@ -34949,6 +35133,30 @@ fn control_projection(session: &SessionView) -> Option<crate::control::SessionSt
             heading_deg: None,
             speed_kn: None,
             stale: false,
+            // The mark and the side come from the wire's own resolution (the
+            // binary reads the store's taxonomy); a hull with no fix yet has
+            // neither, which is the honest answer rather than a guessed hull.
+            symbol: live
+                .iter()
+                .find(|marker| marker.id == piece.id.to_string())
+                .map(|marker| marker.symbol.wire_name().to_string())
+                .unwrap_or_default(),
+            affiliation: live
+                .iter()
+                .find(|marker| marker.id == piece.id.to_string())
+                .map(|marker| marker.affiliation.as_str().to_string())
+                .unwrap_or_default(),
+            // The figures the console already mirrors. The command center
+            // sizes a photograph by them; the hull's own picture at the
+            // picture's zoom is the reason they are published at all.
+            loa_m: hull_sizes
+                .get(&piece.id)
+                .map(|(loa, _)| *loa)
+                .or_else(|| specs.get(&piece.id).and_then(|figures| figures.loa_m)),
+            beam_m: hull_sizes
+                .get(&piece.id)
+                .map(|(_, beam)| *beam)
+                .or_else(|| specs.get(&piece.id).and_then(|figures| figures.beam_m)),
         })
         .collect();
     Some(crate::control::SessionState {
@@ -34973,8 +35181,44 @@ fn control_projection(session: &SessionView) -> Option<crate::control::SessionSt
                 step: Some(line.content.clone()).filter(|content| !content.trim().is_empty()),
             }),
         units,
+        // The room, as the console shows it. An observer's Crew is the same
+        // roster minus the controls, so it is the same list.
+        participants: session
+            .people
+            .iter()
+            .map(|person| crate::control::ParticipantState {
+                id: person.id,
+                name: person.name.clone(),
+                role: person.role.clone(),
+                judge: person.judge,
+                ready: person.ready,
+            })
+            .collect(),
+        // The exercise's traffic, newest first and bounded: a wall is a
+        // glance, and a page of traffic that never stops growing is not a
+        // thing to publish on every change.
+        messages: session
+            .messages
+            .iter()
+            .take(MESSAGES_PUBLISHED)
+            .map(|message| crate::control::MessageState {
+                id: message.id,
+                kind: message.kind.clone(),
+                class_label: message.class_label.clone(),
+                sender: message.sender.clone(),
+                assumed: message.assumed,
+                broadcast: message.broadcast,
+                content: message.content.clone(),
+                at: message.at.clone(),
+                degree: message.degree.clone(),
+            })
+            .collect(),
     })
 }
+
+/// How much of the exercise's traffic the projection carries. The console's
+/// Comms scrollback is longer; an observer reads the recent picture.
+const MESSAGES_PUBLISHED: usize = 40;
 
 /// What the shell says to the binary. ONE channel, because there is one
 /// seam: the shell never reads or writes the network or the map thread
@@ -50818,7 +51062,7 @@ mod tests {
     #[test]
     fn the_projection_carries_the_hulls_their_commanders_and_what_is_aboard() {
         let session = observation_view();
-        let projection = control_projection(&session).expect("a held exercise projects");
+        let projection = control_projection(&session, &[], &Default::default(), &Default::default()).expect("a held exercise projects");
         assert_eq!(projection.game_id, 4127);
         assert_eq!(projection.name, "Sunda Strait Watch");
         assert_eq!(projection.phase, "execution");
@@ -50855,9 +51099,67 @@ mod tests {
         assert!(projection.units[1].embarked.is_empty());
     }
 
+    /// The seats and the traffic ride the projection too: the wall's Crew and
+    /// Comms are the console's own lists, and a console that publishes only
+    /// hulls leaves two windows empty for no reason.
+    #[test]
+    fn the_projection_carries_the_room_and_the_traffic() {
+        let mut session = observation_view();
+        session.people = vec![
+            PersonView {
+                id: 501,
+                name: "Lt Cdr Halvorsen".to_string(),
+                call_sign: String::new(),
+                role: "Commando".to_string(),
+                role_id: 3,
+                judge: false,
+                ready: true,
+                present: true,
+            },
+            PersonView {
+                id: 77,
+                name: "Super User".to_string(),
+                call_sign: String::new(),
+                role: "Penyelenggara".to_string(),
+                role_id: 1,
+                judge: true,
+                ready: false,
+                present: true,
+            },
+        ];
+        session.messages = vec![MessageView {
+            id: 9,
+            kind: "telegram".to_string(),
+            class_code: "TERBUKA".to_string(),
+            class_label: "Terbuka".to_string(),
+            sender: "Lt Cdr Halvorsen".to_string(),
+            author_id: None,
+            assumed: true,
+            broadcast: true,
+            content: "contact bearing 090, range 12".to_string(),
+            at: "2026-10-27T13:05:00+07:00".to_string(),
+            degree: "BIASA".to_string(),
+            reply_to: None,
+            to_me: false,
+            recipients: Vec::new(),
+            read_at: None,
+        }];
+        let projection = control_projection(&session, &[], &Default::default(), &Default::default())
+            .expect("a projection");
+        assert_eq!(projection.participants.len(), 2);
+        assert_eq!(projection.participants[0].name, "Lt Cdr Halvorsen");
+        assert_eq!(projection.participants[0].role, "Commando");
+        assert!(projection.participants[0].ready);
+        assert!(projection.participants[1].judge);
+        assert_eq!(projection.messages.len(), 1);
+        assert_eq!(projection.messages[0].content, "contact bearing 090, range 12");
+        assert!(projection.messages[0].assumed, "an assumed author is never invented");
+        assert_eq!(projection.messages[0].degree, "BIASA");
+    }
+
     #[test]
     fn the_projection_names_the_scenario_being_played_and_not_the_book() {
-        let projection = control_projection(&observation_view()).expect("a projection");
+        let projection = control_projection(&observation_view(), &[], &Default::default(), &Default::default()).expect("a projection");
         let scenario = projection.scenario.expect("a scenario");
         assert_eq!(scenario.id, 88);
         assert_eq!(scenario.title, "Sunda Strait, first light");
@@ -50867,7 +51169,7 @@ mod tests {
     #[test]
     fn a_console_holding_no_exercise_projects_nothing() {
         // Signed out.
-        assert!(control_projection(&SessionView::default()).is_none());
+        assert!(control_projection(&SessionView::default(), &[], &Default::default(), &Default::default()).is_none());
         // Signed in, but no game held: a phase with no id is not an exercise.
         let mut hanging = SessionView {
             signed_in: true,
@@ -50875,9 +51177,9 @@ mod tests {
             state: "planning".to_string(),
             ..SessionView::default()
         };
-        assert!(control_projection(&hanging).is_none());
+        assert!(control_projection(&hanging, &[], &Default::default(), &Default::default()).is_none());
         hanging.game_id = 9;
-        assert!(control_projection(&hanging).is_some());
+        assert!(control_projection(&hanging, &[], &Default::default(), &Default::default()).is_some());
     }
 
     /// The tick calls this twenty times a second; the message leaves on a

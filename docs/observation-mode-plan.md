@@ -574,12 +574,18 @@ three details came out of building it and are worth writing down here.
   `width`/`height` are whichever display last reported them; the command center
   copies only centre and zoom from the observer view and keeps its own size.
 
-Verification done: `control-server-smoke.sh` 41/41; `cargo test --lib control::*`
+Verification done: `control-server-smoke.sh` 47/47; `cargo test --lib control::*`
 (protocol, hub, server, client, publisher) and `cargo test --bin tfgctl` green;
 `cargo check --all-targets` clean. Driven captures of the command center in its
 waiting and ready states, plus a live `focus` that moved `observer` and left
 `main` alone. Ready state was proven with `fixtures/observation-session.json` on
 a headless host; no live Minos execution exercise was available locally.
+
+The phone's windows, the hull pictures and the unit card were added after the
+first pass, against a live Minos exercise: `ui.set` (crew/scenario/comms) is host
+state, `GET/PUT /v1/units/{id}/picture` carries the console's photographs, and
+the projection now includes participants, messages, and the hull facts a mark
+needs (`symbol`, `affiliation`, `loa_m`, `beam_m`).
 
 Two lib tests fail on this tree and are unrelated to observation:
 `map_render::tests::quad_bow_follows_the_compass` (a float tolerance: 180.0000025

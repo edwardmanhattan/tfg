@@ -32,9 +32,10 @@ So the app ships these surfaces:
 2. **Waiting** — until observation is open, say which of the four reasons it is
    waiting for. This is not an error state; it is the normal state before an
    exercise reaches execution.
-3. **Scenario / Comms / Units** — the three panels behind the toggles. Comms is
-   a placeholder in this phase; Scenario shows the title and step; Units is the
-   numbered grid.
+3. **Scenario / Comms / Crew** — the three toggles. They open the same three
+   windows on the wall (`ui.set {panel}`); Crew is the seats and hulls the
+   exercise holds, and it replaced the old "Units" name — the API takes
+   `crew`, never `units`. The unit grid is a control, not a panel.
 4. **Motion** — a d-pad for nudges, `+`/`-` for zoom steps, and an `OK` button
    that is inert until the protocol has a verb for it.
 5. **Unit grid** — one numbered tile per unit. Tapping it calls
@@ -708,7 +709,36 @@ Two rules that come from the server, not from taste:
   the grid greyed out with the last known roster, because a stale map beats an
   empty one.
 
-### 6.2 The unit grid and the popup
+### 6.2 The three windows and the popup
+
+The wall draws exactly three windows, and the phone opens them by name:
+
+```json
+POST /v1/commands
+{ "protocol_version": 2, "view": "observer",
+  "type": "ui.set", "payload": { "panel": "crew", "open": true } }
+```
+
+| `panel` | The window |
+| --- | --- |
+| `crew` | The exercise's seats by role, each with the hulls they command and whether they are ready. |
+| `scenario` | The scenario being played and its step. |
+| `comms` | The traffic the console published, newest first. |
+
+- It is idempotent and gated like a nudge: `409 not_ready` before observation
+  opens, `422` for a panel name that is not one of the three.
+- The state is the host's, not the app's: it comes back in the snapshot as
+  `ui.panels` and changes arrive in `session.changed`, so a reconnect restores
+  the same screen.
+- A new exercise closes every window.
+
+Focusing a unit (`camera.focus`) also sets `ui.focus`, and that is what opens
+the **unit card** on the wall: floating beside the hull, showing its commander,
+speed, course, embarked units and the step being played. Tapping a unit in the
+grid should send the focus and nothing else — the wall decides how to draw the
+card.
+
+### 6.3 The unit grid and the popup
 
 `session.units[]` is ordered by the server; `index` is the number to print on
 the tile (1-based, matching the wall's markers), and `id` is what
@@ -744,7 +774,7 @@ showUnitPopup(unit);   // hull, commander, embarked; position if present
 - `camera.focus` is resolved **host-side** against the session, so you never
   send coordinates and never need to know where a hull is.
 
-### 6.3 Testing without a wall or an exercise
+### 6.4 Testing without a wall or an exercise
 
 The observer path needs three things at once: an execution session, a display,
 and the phone. A real exercise needs Minos; a test does not. `fixtures/observation-session.json`
@@ -804,7 +834,16 @@ running; `Ctrl-C` detaches, and readiness drops back to `no_display`:
 # ready    session 4127 · observer 1280x800 · 6 unit(s)
 ```
 
-Now the same command moves only the observer view:
+The phone's windows are server state too:
+
+```bash
+./target/debug/tfgctl … panel crew on
+# {"command_id":"…","status":"accepted","view":"observer","revision":22}
+./target/debug/tfgctl … panel
+# open: crew
+```
+
+Then the same command moves only the observer view:
 
 ```bash
 ./target/debug/tfgctl … focus 1 --zoom 12
@@ -835,7 +874,7 @@ What to take from the transcript:
 - `focus` moved `observer` and left `main` alone. If your app's focus moved the
   operator's map, it sent no `view` field, or the wall is rendering `main`.
 
-### 6.4 Building the real wall
+### 6.5 Building the real wall
 
 The command center is the same binary in another mode:
 
@@ -1003,6 +1042,7 @@ curl -sS -X POST http://192.168.1.20:8787/v1/commands \
 | Every observer command is `409 not_ready` | Observation is not open, and the message names why. | Show the waiting card; do not retry in a loop. Common cause: no command center attached. |
 | The operator's map moves when the phone nudges | The command omitted `view`, so it addressed `main`, or the wall renders `main`. | Send `"view": "observer"`, and run the wall with `--mode command-center`. |
 | The unit grid focuses the wrong hull | The app sent `index` where `camera.focus` wants `id`. | `index` is the tile number; `id` is the session's unit id. |
+| `422 unknown panel` on a toggle | The app still calls the panel `units`. | The three are `crew`, `scenario`, `comms`; the grid is a control, not a window. |
 | The wall says "no viewport" | The display never announced its size. | `view.report` is for nudges; the display's record needs `display.hello` with `viewport`. The command center does both. |
 
 ---

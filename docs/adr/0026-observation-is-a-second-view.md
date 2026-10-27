@@ -116,6 +116,43 @@ is `2`. The routes stay under `/v1/`.
 This is a clean break. The project is in development, every in-repo client moved
 in the same wave, and a v1 body is refused rather than half-read.
 
+### The wall draws the console's mark, at the console's zoom
+
+A numbered dot was the wall's first marker and it was wrong: the console's
+convention is the affiliation frame with the taxonomy glyph below `PHOTO_ZOOM`
+(14), and the hull's own photograph above it, sized by its published length and
+beam and turned on its course. The wall draws the same thing from the same
+painting function (`shell_gpui::paint_unit_mark`), because a second copy of the
+symbology would drift.
+
+The wall has no store to resolve a symbol and no Minos credential to fetch a
+photograph, so the projection carries what it needs: `symbol`, `affiliation`,
+`loa_m`, `beam_m`, and pictures over `GET /v1/units/{id}/picture`. The console
+is still the only Minos reader; it publishes the pictures it already fetched
+(`admin` write, `observe` read), and a hull without one falls back to the
+symbol.
+
+### The phone's windows are host state
+
+Crew, Scenario and Comms are opened by the phone, drawn by the wall, and stored
+on the host (`ui.panels`, toggled by `ui.set {panel, open}`). Device-local panel
+state would let a reconnect come back to a blank screen, and two command centers
+would disagree about the same exercise. The window names are `crew`, `scenario`
+and `comms`: the unit grid is a control, not a panel, and "Crew" is what the
+console has always called the seats.
+
+The projection grew for the same reason: participants (Crew), the traffic the
+console may read (Comms), and the hull facts a mark needs. Observers seeing the
+exercise's traffic is now a decided policy, not a deferred question — the
+console publishes what it may read, and nothing else.
+
+### A focused hull gets a card
+
+`camera.focus` centres the hull and sets `ui.focus`; the wall draws a small card
+beside it with the commander, speed, course, embarked units and the step being
+played. The console draws the same card for its selected hull, because the
+operator asks the same question while looking at the water.
+
 ### The command center is a mode of the same binary
 
 `tfg --mode command-center` branches before the keyring and the Minos sign-in, so
@@ -147,9 +184,17 @@ is part of the contract.
   is the complete list; the map is the glance.
 - **The OK button does nothing.** There is no verb for it yet. Shipping an inert
   button is honest; inventing a command so the button feels alive is not.
-- **Comms publishes nothing in this phase.** The panel exists on the phone as a
-  placeholder. Whether observers may see message traffic is a policy decision,
-  not a protocol one, and it is still open.
+- **Comms publishes the console's own traffic.** Observers see what the console
+  may read, bounded to the most recent 40 messages in the projection. A
+  recipient-only message the console cannot see is a message the wall cannot
+  show; the projection never widens the console's inbox.
+- **The wall can show a photograph without Minos.** The picture route is the
+  second thing the control plane carries besides state. It is a PNG per hull,
+  cached by the console and fetched once by a wall; the wall still holds no
+  Minos credential.
+- **The unit card and the Inspector say overlapping things.** The card is the
+  glance beside the hull; the Inspector is the full file. On a small window they
+  can overlap, and the card is drawn above the windows so it is never buried.
 
 ## Verified
 

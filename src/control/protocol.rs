@@ -107,6 +107,52 @@ pub struct SessionState {
     pub scenario: Option<ScenarioState>,
     #[serde(default)]
     pub units: Vec<UnitState>,
+    /// The exercise's seats, as the console sees them: the Crew panel's rows.
+    #[serde(default)]
+    pub participants: Vec<ParticipantState>,
+    /// The traffic the console may read, newest first, bounded. Published so
+    /// an observer's Comms panel says what the exercise is saying; the
+    /// console is still the only Minos reader.
+    #[serde(default)]
+    pub messages: Vec<MessageState>,
+}
+
+/// One seat in the exercise, for the Crew panel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParticipantState {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub judge: bool,
+    #[serde(default)]
+    pub ready: bool,
+}
+
+/// One message the exercise holds, as an observer may see it.
+///
+/// `assumed` keeps the console's rule: a message sent as a scenario role has
+/// no author, and the projection never invents one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageState {
+    pub id: i64,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub class_label: String,
+    #[serde(default)]
+    pub sender: String,
+    #[serde(default)]
+    pub assumed: bool,
+    #[serde(default)]
+    pub broadcast: bool,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub at: String,
+    #[serde(default)]
+    pub degree: String,
 }
 
 impl SessionState {
@@ -155,7 +201,7 @@ pub struct ScenarioState {
 }
 
 /// One hull a viewer may look at.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct UnitState {
     /// The number the phone's grid and the command center's marker share.
     /// The hub assigns it from the host's array order, so a publisher leaves
@@ -185,6 +231,22 @@ pub struct UnitState {
     /// No live fix within the registry's own staleness window.
     #[serde(default)]
     pub stale: bool,
+    /// Published length and beam, when Minos has them: the command center
+    /// sizes a hull's photograph by the ground its hull covers, exactly as
+    /// the console does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loa_m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beam_m: Option<f64>,
+    /// The affiliation the console resolved for this hull (`friendly`,
+    /// `neutral`, `hostile`, `unknown`). The wall has no store to resolve it.
+    #[serde(default)]
+    pub affiliation: String,
+    /// The taxonomy symbol, as a wire word (`frigate`, `destroyer`, …). A
+    /// client that does not share the console's store draws the same mark
+    /// from this.
+    #[serde(default)]
+    pub symbol: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -276,6 +338,74 @@ pub struct DisplayViewport {
     pub height: u32,
 }
 
+/// Which observer windows the phone has asked the wall to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PanelSet {
+    #[serde(default)]
+    pub crew: bool,
+    #[serde(default)]
+    pub scenario: bool,
+    #[serde(default)]
+    pub comms: bool,
+}
+
+/// One of the observer's three windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    Crew,
+    Scenario,
+    Comms,
+}
+
+impl Panel {
+    pub fn parse(raw: &str) -> Option<Panel> {
+        match raw {
+            "crew" => Some(Panel::Crew),
+            "scenario" => Some(Panel::Scenario),
+            "comms" => Some(Panel::Comms),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Panel::Crew => "crew",
+            Panel::Scenario => "scenario",
+            Panel::Comms => "comms",
+        }
+    }
+}
+
+impl PanelSet {
+    /// Set one window, leaving the others as they were.
+    pub fn set(&mut self, panel: Panel, open: bool) {
+        match panel {
+            Panel::Crew => self.crew = open,
+            Panel::Scenario => self.scenario = open,
+            Panel::Comms => self.comms = open,
+        }
+    }
+
+    pub fn any(self) -> bool {
+        self.crew || self.scenario || self.comms
+    }
+}
+
+/// What the observer's screen looks like: the windows the phone opened and
+/// the hull its popup is about.
+///
+/// This is UI state, not a game fact — but it lives on the host so every
+/// attached wall agrees with the phone, and so a reconnect restores the same
+/// screen instead of a blank one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ObserverUi {
+    #[serde(default)]
+    pub panels: PanelSet,
+    /// The unit whose popup is open. Set by `camera.focus`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<i64>,
+}
+
 /// The role a display announces. Only a command center may be remoted.
 pub const COMMAND_CENTER_ROLE: &str = "command_center";
 
@@ -360,6 +490,12 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zoom: Option<f64>,
     },
+    /// Open or close one of the observer's windows.
+    ///
+    /// The phone sends the panel's wire name and the state it wants, so a
+    /// retry is idempotent and two toggles cannot fight over "open".
+    #[serde(rename = "ui.set")]
+    UiSet { panel: String, open: bool },
     /// The viewport the display is rendering at, in device pixels.
     ///
     /// This is a *display's* fact rather than a view's: it is sent by a client
@@ -428,6 +564,13 @@ impl Command {
                     && (!zoom.is_finite() || !(-30.0..=30.0).contains(zoom))
                 {
                     return Err("focus zoom must be finite and between -30 and 30".to_string());
+                }
+            }
+            Self::UiSet { panel, .. } => {
+                if Panel::parse(panel).is_none() {
+                    return Err(format!(
+                        "unknown panel {panel:?}; the observer has crew, scenario and comms"
+                    ));
                 }
             }
             Self::ViewReport { width, height } => {
@@ -572,6 +715,8 @@ pub enum Event {
         session: Option<SessionState>,
         readiness: Readiness,
         displays: Vec<DisplayState>,
+        #[serde(default)]
+        ui: ObserverUi,
     },
     /// A camera that moved. `revision` is the revision of the new state.
     #[serde(rename = "camera.changed")]
@@ -594,6 +739,8 @@ pub enum Event {
         session: Option<SessionState>,
         readiness: Readiness,
         displays: Vec<DisplayState>,
+        #[serde(default)]
+        ui: ObserverUi,
     },
     /// A display handshake was accepted on this socket.
     #[serde(rename = "display.attached")]
@@ -846,6 +993,7 @@ mod tests {
             session: None,
             readiness: Readiness::waiting(ReadinessReason::NoSession),
             displays: Vec::new(),
+            ui: Default::default(),
         };
         let text = serde_json::to_string(&event).expect("serializes");
         let back: Event = serde_json::from_str(&text).expect("parses");
@@ -920,7 +1068,9 @@ mod tests {
                 heading_deg: None,
                 speed_kn: None,
                 stale: false,
+                ..UnitState::default()
             }],
+            ..SessionState::default()
         };
         assert!(session.validate().is_ok());
         session.units.push(session.units[0].clone());
@@ -938,6 +1088,7 @@ mod tests {
                 mode: "maneuver".to_string(),
                 scenario: None,
                 units: Vec::new(),
+                ..SessionState::default()
             }),
             readiness: Readiness::waiting(ReadinessReason::NoDisplay),
             displays: vec![DisplayState {
@@ -946,6 +1097,7 @@ mod tests {
                 role: "command_center".to_string(),
                 viewport: None,
             }],
+            ui: Default::default(),
         };
         let text = serde_json::to_string(&event).expect("serializes");
         let back: Event = serde_json::from_str(&text).expect("parses");
@@ -985,6 +1137,10 @@ mod tests {
             Command::ViewReport {
                 width: 1280,
                 height: 720,
+            },
+            Command::UiSet {
+                panel: "crew".to_string(),
+                open: true,
             },
         ];
         let schema = schema();

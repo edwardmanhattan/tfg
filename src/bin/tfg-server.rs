@@ -215,6 +215,9 @@ fn describe(command: &Command) -> String {
             None => format!("camera.focus unit {unit_id}"),
         },
         Command::ViewReport { width, height } => format!("view.report {width}x{height}"),
+        Command::UiSet { panel, open } => {
+            format!("ui.set {panel} {}", if *open { "open" } else { "close" })
+        }
     }
 }
 

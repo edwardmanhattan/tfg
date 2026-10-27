@@ -1906,6 +1906,43 @@ pub enum MapSymbolShape {
     Port,
 }
 
+impl MapSymbolShape {
+    /// The wire name, for a client that does not share the console's store
+    /// (the observation command center draws the same mark from this).
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            MapSymbolShape::Dot => "dot",
+            MapSymbolShape::Destroyer => "destroyer",
+            MapSymbolShape::Frigate => "frigate",
+            MapSymbolShape::Corvette => "corvette",
+            MapSymbolShape::Auxiliary => "auxiliary",
+            MapSymbolShape::Landing => "landing",
+            MapSymbolShape::Submarine => "submarine",
+            MapSymbolShape::Plane => "plane",
+            MapSymbolShape::Tank => "tank",
+            MapSymbolShape::Port => "port",
+        }
+    }
+
+    /// The name back. An unknown word is the generic dot, never a panic.
+    pub fn from_wire(name: &str) -> MapSymbolShape {
+        [
+            MapSymbolShape::Destroyer,
+            MapSymbolShape::Frigate,
+            MapSymbolShape::Corvette,
+            MapSymbolShape::Auxiliary,
+            MapSymbolShape::Landing,
+            MapSymbolShape::Submarine,
+            MapSymbolShape::Plane,
+            MapSymbolShape::Tank,
+            MapSymbolShape::Port,
+        ]
+        .into_iter()
+        .find(|shape| shape.wire_name() == name)
+        .unwrap_or(MapSymbolShape::Dot)
+    }
+}
+
 /// A regular polygon's vertices about `center`, the first at `rotation`.
 ///
 /// The rotation is the caller's because the glyphs are not all

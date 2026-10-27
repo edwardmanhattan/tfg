@@ -367,6 +367,7 @@ async fn handle(
                     "session": state.hub.session(),
                     "readiness": state.hub.readiness(),
                     "displays": state.hub.displays(),
+                    "ui": state.hub.ui(),
                 }),
             ))
         }
@@ -420,6 +421,58 @@ async fn handle(
                     "revision": state.hub.revision(),
                     "readiness": state.hub.readiness(),
                 }),
+            ))
+        }
+        (&Method::GET, path) if path.starts_with("/v1/units/") => {
+            if let Err(response) = require(&grant, Scope::Observe) {
+                return Ok(response);
+            }
+            let mut parts = path.trim_start_matches("/v1/units/").split('/');
+            let unit_id = parts.next().unwrap_or_default();
+            if parts.next() != Some("picture") || parts.next().is_some() {
+                return Ok(not_found());
+            }
+            let Ok(unit_id) = unit_id.parse::<i64>() else {
+                return Ok(not_found());
+            };
+            let Some(png) = state.hub.picture(unit_id) else {
+                return Ok(not_found());
+            };
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "image/png")
+                .body(Full::new(Bytes::from(png.to_vec())))
+                .unwrap_or_else(|_| Response::new(Full::new(Bytes::from_static(b"")))))
+        }
+        (&Method::PUT, path) if path.starts_with("/v1/units/") => {
+            // The console is the only reader of Minos, so it is the only
+            // publisher of hull pictures. A wall fetches them from here.
+            if let Err(response) = require(&grant, Scope::Admin) {
+                return Ok(response);
+            }
+            let mut parts = path.trim_start_matches("/v1/units/").split('/');
+            let unit_id = parts.next().unwrap_or_default();
+            if parts.next() != Some("picture") || parts.next().is_some() {
+                return Ok(not_found());
+            }
+            let Ok(unit_id) = unit_id.parse::<i64>() else {
+                return Ok(not_found());
+            };
+            let body = match read_body_limited(request, MAX_PICTURE_BYTES).await {
+                Ok(body) => body,
+                Err(response) => return Ok(response),
+            };
+            if body.len() < 8 || &body[..8] != b"\x89PNG\r\n\x1a\n" {
+                return Ok(error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    error_code::INVALID_COMMAND,
+                    "a hull picture must be a PNG",
+                ));
+            }
+            state.hub.set_picture(unit_id, body.to_vec());
+            Ok(json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "status": "stored", "unit_id": unit_id, "bytes": body.len() }),
             ))
         }
         (&Method::GET, "/v1/displays") => {
@@ -506,6 +559,9 @@ fn needed_scope(command: &Command) -> Scope {
         // lies about it could change what "a quarter of a viewport" means, so
         // it needs the same scope that steering does.
         Command::ViewReport { .. } => Scope::ControlView,
+        // Opening a window on the wall is the same authority a nudge needs:
+        // it is observer UI, and a watch-only device does not steer it.
+        Command::UiSet { .. } => Scope::ControlView,
     }
 }
 
@@ -665,8 +721,19 @@ fn rotate(state: &Arc<ServerState>, grant: &super::devices::Grant) -> Response<F
 }
 
 /// Read a bounded JSON body, or the refusal that says why not.
+/// A hull photograph is not a command body: a 512 px PNG is a few hundred
+/// kilobytes, and the console already caps the picture it keeps.
+const MAX_PICTURE_BYTES: usize = 4 * 1024 * 1024;
+
 async fn read_body(request: Request<Incoming>) -> Result<Bytes, Response<Full<Bytes>>> {
-    match Limited::new(request.into_body(), MAX_BODY_BYTES)
+    read_body_limited(request, MAX_BODY_BYTES).await
+}
+
+async fn read_body_limited(
+    request: Request<Incoming>,
+    limit: usize,
+) -> Result<Bytes, Response<Full<Bytes>>> {
+    match Limited::new(request.into_body(), limit)
         .collect()
         .await
     {
@@ -1506,6 +1573,96 @@ mod tests {
         let (revision, views) = last.expect("a snapshot arrived");
         assert_eq!(revision, 1);
         assert_eq!(views["main"].camera.zoom, 12.0);
+    }
+
+    /// The phone opens a window: the observer UI is server state, so every
+    /// attached wall draws it and a reconnect restores it.
+    #[test]
+    fn the_observer_ui_is_a_command_and_a_read() {
+        let host = FakeHost::start();
+        host.put_session(&session_json("execution"));
+        // Readiness needs a display; attach one through the hub.
+        host.hub.attach_display(crate::control::DisplayState {
+            id: "wall-1".to_string(),
+            label: "wall-1".to_string(),
+            role: "command_center".to_string(),
+            viewport: None,
+        });
+
+        let opened = host.post(serde_json::json!({
+            "protocol_version": 2,
+            "client_id": "phone-7",
+            "view": "observer",
+            "type": "ui.set",
+            "payload": { "panel": "crew", "open": true }
+        }));
+        assert_eq!(opened.status(), 202, "the window opens");
+
+        let read = host.session();
+        assert_eq!(read["ui"]["panels"]["crew"], true);
+        assert_eq!(read["ui"]["panels"]["comms"], false);
+
+        // A panel the observer does not have is refused at the boundary.
+        let bad = host.post(serde_json::json!({
+            "protocol_version": 2,
+            "view": "observer",
+            "type": "ui.set",
+            "payload": { "panel": "units", "open": true }
+        }));
+        assert_eq!(bad.status(), 422, "there is no `units` window");
+    }
+
+    /// The wall fetches the hull picture the console published, and a phone
+    /// may read it; writing one needs the operator.
+    #[test]
+    fn a_hull_picture_is_published_and_served() {
+        let host = FakeHost::start();
+        // A 1x1 PNG: the smallest real one.
+        let png: Vec<u8> = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let put = host
+            .http
+            .put(format!("{}/v1/units/1/picture", host.handle.url()))
+            .bearer_auth(TOKEN)
+            .header("content-type", "image/png")
+            .body(png.clone())
+            .send()
+            .expect("request");
+        assert_eq!(put.status(), 200);
+        let got = host.get("/v1/units/1/picture");
+        assert_eq!(got.status(), 200);
+        assert_eq!(got.headers()["content-type"], "image/png");
+        assert_eq!(got.bytes().expect("bytes").as_ref(), png.as_slice());
+
+        // A paired phone may read it and may not replace it.
+        let (_, token) = host.pair_device("phone", &["observe", "control_view"]);
+        let read = host.call("GET", Some(&token), "/v1/units/1/picture", None);
+        assert_eq!(read.status(), 200);
+        let write = host
+            .http
+            .put(format!("{}/v1/units/1/picture", host.handle.url()))
+            .bearer_auth(&token)
+            .header("content-type", "image/png")
+            .body(png)
+            .send()
+            .expect("request");
+        assert_eq!(write.status(), 403, "a phone does not publish pictures");
+
+        // A body that is not a PNG is refused rather than served later.
+        let not_png = host
+            .http
+            .put(format!("{}/v1/units/1/picture", host.handle.url()))
+            .bearer_auth(TOKEN)
+            .body(b"not a png".to_vec())
+            .send()
+            .expect("request");
+        assert_eq!(not_png.status(), 422);
+        assert_eq!(host.get("/v1/units/9/picture").status(), 404);
     }
 
     fn session_json(phase: &str) -> serde_json::Value {

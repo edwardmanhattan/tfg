@@ -26,11 +26,12 @@
 
 use super::protocol::{
     CameraSnapshot, CameraSource, Command, DisplayState, Event, GeoPoint, MAIN_VIEW,
-    OBSERVER_VIEW, PROTOCOL_VERSION, Readiness, ReadinessReason, SessionState, ViewState,
+    OBSERVER_VIEW, ObserverUi, PROTOCOL_VERSION, Panel, Readiness, ReadinessReason, SessionState,
+    ViewState,
 };
 use crate::map_geometry::pan_center;
 use crate::view::{ZOOM_MAX, ZOOM_MIN};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -80,6 +81,14 @@ struct Shared {
     session: Option<SessionRecord>,
     displays: BTreeMap<String, DisplayRecord>,
     readiness: Readiness,
+    /// The observer's windows and popup, as the phone set them.
+    ui: ObserverUi,
+    /// Hull pictures the console published, PNG-encoded, keyed by unit id.
+    ///
+    /// Not part of the revision: a picture is fetched by a client that wants
+    /// it, not fanned out to every watcher, and the session has already said
+    /// which hulls exist.
+    pictures: HashMap<i64, Arc<Vec<u8>>>,
     revision: u64,
     /// Recent `(command_id, first seen)` pairs, oldest first.
     seen: VecDeque<(String, Instant)>,
@@ -148,6 +157,8 @@ impl ControlHub {
                 session: None,
                 displays: BTreeMap::new(),
                 readiness: Readiness::waiting(ReadinessReason::NoSession),
+                ui: ObserverUi::default(),
+                pictures: HashMap::new(),
                 revision: 0,
                 seen: VecDeque::new(),
             })),
@@ -190,6 +201,22 @@ impl ControlHub {
         self.lock().session.as_ref().map(|record| record.state.clone())
     }
 
+    /// The observer's windows and popup.
+    pub fn ui(&self) -> ObserverUi {
+        self.lock().ui
+    }
+
+    /// A hull picture the console published, PNG-encoded.
+    pub fn picture(&self, unit_id: i64) -> Option<Arc<Vec<u8>>> {
+        self.lock().pictures.get(&unit_id).cloned()
+    }
+
+    /// Store a hull picture. Not a revision: a picture is fetched by the
+    /// client that wants it, not fanned out with the session.
+    pub fn set_picture(&self, unit_id: i64, png: Vec<u8>) {
+        self.lock().pictures.insert(unit_id, Arc::new(png));
+    }
+
     /// The command centers attached and live right now.
     pub fn displays(&self) -> Vec<DisplayState> {
         let shared = self.lock();
@@ -226,6 +253,7 @@ impl ControlHub {
             session: shared.session.as_ref().map(|record| record.state.clone()),
             readiness: readiness_at(&shared, now),
             displays: live_displays(&shared, now),
+            ui: shared.ui,
         }
     }
 
@@ -302,6 +330,26 @@ impl ControlHub {
         if !shared.views.contains_key(view) && !create_observer(&mut shared, view) {
             return Err(ApplyError::UnknownView(view.to_string()));
         }
+        // A panel toggle is observer UI, not a camera. It has its own event
+        // (the session one) because every attached wall draws the same
+        // windows, and a revision bump is how they learn.
+        if let Command::UiSet { panel, open } = command {
+            let Some(panel) = Panel::parse(panel) else {
+                return Ok(None);
+            };
+            let mut panels = shared.ui.panels;
+            panels.set(panel, *open);
+            if panels == shared.ui.panels {
+                return Ok(None);
+            }
+            shared.ui.panels = panels;
+            let revision = bump(&mut shared);
+            let readiness = readiness_at(&shared, Instant::now());
+            let event = session_event(&shared, revision, readiness);
+            drop(shared);
+            let _ = self.events.send(event);
+            return Ok(Some(revision));
+        }
         let current = *shared
             .views
             .get(view)
@@ -343,6 +391,7 @@ impl ControlHub {
                 ..current
             }),
             Command::CameraFocus { unit_id, zoom } => {
+                shared.ui.focus = Some(*unit_id);
                 let position = shared
                     .session
                     .as_ref()
@@ -369,6 +418,7 @@ impl ControlHub {
                 height: *height,
                 ..current
             }),
+            Command::UiSet { .. } => unreachable!("handled above"),
         };
         let Some(camera) = next else {
             return Ok(None);
@@ -429,6 +479,11 @@ impl ControlHub {
         {
             shared.views.insert(OBSERVER_VIEW.to_string(), main);
         }
+        if reset {
+            // A different exercise is a different screen: the phone's windows
+            // and popup belonged to the last one.
+            shared.ui = ObserverUi::default();
+        }
         let revision = bump(&mut shared);
         let readiness = readiness_at(&shared, now);
         shared.readiness = readiness.clone();
@@ -456,6 +511,7 @@ impl ControlHub {
         let now = Instant::now();
         let mut shared = self.lock();
         shared.session.take()?;
+        shared.ui = ObserverUi::default();
         let revision = bump(&mut shared);
         let readiness = readiness_at(&shared, now);
         shared.readiness = readiness.clone();
@@ -674,6 +730,7 @@ fn session_event(shared: &Shared, revision: u64, readiness: Readiness) -> Event 
         session: shared.session.as_ref().map(|record| record.state.clone()),
         readiness,
         displays: live_displays(shared, Instant::now()),
+        ui: shared.ui,
     }
 }
 
@@ -735,7 +792,7 @@ mod tests {
             heading_deg: None,
             speed_kn: None,
             stale: false,
-        }
+                ..UnitState::default()        }
     }
 
     fn session(phase: &str, units: Vec<UnitState>) -> SessionState {
@@ -750,6 +807,7 @@ mod tests {
                 step: None,
             }),
             units,
+            ..SessionState::default()
         }
     }
 
@@ -866,6 +924,7 @@ mod tests {
                 session,
                 readiness,
                 displays,
+                ..
             } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(revision, 1);
@@ -1174,6 +1233,68 @@ mod tests {
 
         hub.detach_display("wall-1");
         assert_eq!(hub.readiness().reason, Some(ReadinessReason::NoDisplay));
+    }
+
+    #[test]
+    fn the_phone_opens_a_window_and_the_hub_remembers_it() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", Some(-6.2))]));
+        hub.attach_display(display("wall-1"));
+        assert!(!hub.ui().panels.crew);
+
+        let mut events = hub.subscribe();
+        let revision = hub
+            .apply_view(
+                OBSERVER_VIEW,
+                &Command::UiSet {
+                    panel: "crew".to_string(),
+                    open: true,
+                },
+                CameraSource::desktop(),
+            )
+            .expect("accepted");
+        assert!(revision.is_some(), "opening a window is a state change");
+        assert!(hub.ui().panels.crew);
+
+        // The event every wall draws from carries the window.
+        let event = events.try_recv().expect("an event");
+        let Event::SessionChanged { ui, revision, .. } = event else {
+            panic!("a panel toggle is a session event");
+        };
+        assert!(ui.panels.crew);
+        assert_eq!(revision, revision);
+
+        // The same toggle again is not a change.
+        let again = hub
+            .apply_view(
+                OBSERVER_VIEW,
+                &Command::UiSet {
+                    panel: "crew".to_string(),
+                    open: true,
+                },
+                CameraSource::desktop(),
+            )
+            .expect("accepted");
+        assert!(again.is_none());
+
+        // A focus names the hull the popup is about.
+        hub.apply_view(
+            OBSERVER_VIEW,
+            &Command::CameraFocus {
+                unit_id: 1,
+                zoom: None,
+            },
+            CameraSource::desktop(),
+        )
+        .expect("focus resolves");
+        assert_eq!(hub.ui().focus, Some(1));
+
+        // A different exercise closes the windows.
+        let mut next = session("execution", vec![unit(2, "Tromp", Some(-6.1))]);
+        next.game_id = 43;
+        hub.set_session(next);
+        assert!(!hub.ui().panels.crew);
+        assert_eq!(hub.ui().focus, None);
     }
 
     #[test]

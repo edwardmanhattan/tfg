@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tfg.invalid/schemas/control-v1.json",
   "title": "TFG control protocol v2",
-  "description": "Every JSON body in the TFG control protocol v2: commands posted to POST /v1/commands, the session projection published with PUT /v1/session, events pushed over GET /v1/ws, the display handshake a command center sends up that socket, the pairing and device bodies, and the error reply. The prose contract is docs/control-api-v1.md; this file is its machine-readable shape.",
+  "description": "Every JSON body in the TFG control protocol v2: commands posted to POST /v1/commands, the session projection published with PUT /v1/session, events pushed over GET /v1/ws, the display handshake a command center sends up that socket, the observer UI the phone sets, the pairing and device bodies, and the error reply. Hull pictures travel as image/png on GET/PUT /v1/units/{id}/picture and are not JSON. The prose contract is docs/control-api-v1.md; this file is its machine-readable shape.",
   "$defs": {
     "protocol_version": {
       "type": "integer",
@@ -89,8 +89,32 @@
         },
         {
           "$ref": "#/$defs/command_view_report"
+        },
+        {
+          "$ref": "#/$defs/command_ui_set"
         }
       ]
+    },
+    "command_ui_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "payload"],
+      "properties": {
+        "protocol_version": {"$ref": "#/$defs/protocol_version"},
+        "client_id": {"type": "string"},
+        "command_id": {"type": "string"},
+        "view": {"type": "string", "enum": ["observer"]},
+        "type": {"const": "ui.set"},
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["panel", "open"],
+          "properties": {
+            "panel": {"type": "string", "enum": ["crew", "scenario", "comms"]},
+            "open": {"type": "boolean"}
+          }
+        }
+      }
     },
     "command_camera_set": {
       "type": "object",
@@ -300,6 +324,9 @@
           "items": {
             "$ref": "#/$defs/display"
           }
+        },
+        "ui": {
+          "$ref": "#/$defs/observer_ui"
         }
       }
     },
@@ -823,7 +850,69 @@
         },
         "stale": {
           "type": "boolean"
+        },
+        "loa_m": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "beam_m": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "affiliation": {
+          "type": "string",
+          "enum": ["unknown", "friendly", "neutral", "hostile"]
+        },
+        "symbol": {
+          "type": "string",
+          "enum": ["dot", "destroyer", "frigate", "corvette", "auxiliary", "landing", "submarine", "plane", "tank", "port"]
         }
+      }
+    },
+    "participant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "name": {"type": "string"},
+        "role": {"type": "string"},
+        "judge": {"type": "boolean"},
+        "ready": {"type": "boolean"}
+      }
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "description": "One message the console published for observers. `assumed` keeps the console's rule: a message sent as a scenario role has no author, and the projection never invents one.",
+      "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "kind": {"type": "string"},
+        "class_label": {"type": "string"},
+        "sender": {"type": "string"},
+        "assumed": {"type": "boolean"},
+        "broadcast": {"type": "boolean"},
+        "content": {"type": "string"},
+        "at": {"type": "string"},
+        "degree": {"type": "string"}
+      }
+    },
+    "observer_ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The observer's windows and the hull its popup is about. UI state, on the host so every attached wall agrees with the phone.",
+      "properties": {
+        "panels": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "crew": {"type": "boolean"},
+            "scenario": {"type": "boolean"},
+            "comms": {"type": "boolean"}
+          }
+        },
+        "focus": {"type": "integer", "minimum": 1}
       }
     },
     "session": {
@@ -835,7 +924,7 @@
         "phase",
         "units"
       ],
-      "description": "The console's projection of the exercise it holds. A projection: no credentials, no message traffic.",
+      "description": "The console's projection of the exercise it holds. A projection: no credentials, and only the traffic the console itself may read. Hull pictures are fetched separately (GET /v1/units/{id}/picture).",
       "properties": {
         "game_id": {
           "type": "integer",
@@ -858,6 +947,18 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/unit"
+          }
+        },
+        "participants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/participant"
+          }
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/message"
           }
         }
       }
@@ -991,6 +1092,9 @@
           "items": {
             "$ref": "#/$defs/display"
           }
+        },
+        "ui": {
+          "$ref": "#/$defs/observer_ui"
         }
       }
     },

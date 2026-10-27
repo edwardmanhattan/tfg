@@ -73,6 +73,15 @@ pub enum SessionUpdate {
     Roster(Box<Option<SessionState>>),
     /// The newest fix for each hull named, keyed by unit id.
     Positions(Vec<(i64, UnitPosition)>),
+    /// A hull's photograph: raw RGBA plus its pixel size. The publisher
+    /// encodes it once and hands it to the sink, because the console's thumb
+    /// fetcher must not pay PNG time on the frame tick.
+    Picture {
+        unit_id: i64,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
 }
 
 /// Where a projection goes.
@@ -131,6 +140,18 @@ impl SessionHandle {
             return;
         }
         self.send(SessionUpdate::Positions(positions));
+    }
+
+    /// One hull's photograph, as the console fetched it. A wall renders the
+    /// same picture at the picture's zoom; a console that cannot show it (a
+    /// headless host) drops it.
+    pub fn picture(&self, unit_id: i64, width: u32, height: u32, rgba: Vec<u8>) {
+        self.send(SessionUpdate::Picture {
+            unit_id,
+            width,
+            height,
+            rgba,
+        });
     }
 
     fn send(&self, update: SessionUpdate) {
@@ -257,6 +278,21 @@ impl Publisher {
                     self.positions.clear();
                 }
             }
+            SessionUpdate::Picture {
+                unit_id,
+                width,
+                height,
+                rgba,
+            } => {
+                match encode_png(width, height, &rgba) {
+                    Ok(png) => {
+                        if let Err(error) = self.sink.picture(unit_id, png) {
+                            self.log.log(&error);
+                        }
+                    }
+                    Err(error) => self.log.log(&error),
+                }
+            }
             SessionUpdate::Positions(positions) => {
                 for (id, fix) in positions {
                     self.positions.insert(id, fix);
@@ -337,6 +373,21 @@ fn live(unit: &mut UnitState, fix: Option<UnitPosition>) {
     }
 }
 
+/// Encode a hull's raw RGBA as the PNG the control plane serves.
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let Some(image) = image::RgbaImage::from_raw(width, height, rgba.to_vec()) else {
+        return Err(format!(
+            "a hull picture of {width}x{height} does not match its {} bytes",
+            rgba.len()
+        ));
+    };
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|error| format!("encoding a hull picture: {error}"))?;
+    Ok(png)
+}
+
 enum Sink {
     Hub(ControlHub),
     Http {
@@ -390,6 +441,37 @@ impl Sink {
                     "publishing the session: HTTP {status} {}",
                     body.chars().take(160).collect::<String>()
                 ))
+            }
+            Self::Dead(reason) => Err(reason.clone()),
+        }
+    }
+
+    fn picture(&self, unit_id: i64, png: Vec<u8>) -> Result<(), String> {
+        match self {
+            Self::Hub(hub) => {
+                hub.set_picture(unit_id, png);
+                Ok(())
+            }
+            Self::Http {
+                http,
+                url,
+                token,
+            } => {
+                // The session URL ends in `/v1/session`; the picture route is
+                // its sibling under the same base.
+                let base = url.trim_end_matches("/session");
+                let response = http
+                    .put(format!("{base}/units/{unit_id}/picture"))
+                    .bearer_auth(token)
+                    .header("content-type", "image/png")
+                    .body(png)
+                    .send()
+                    .map_err(|error| format!("publishing a hull picture: {error}"))?;
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(());
+                }
+                Err(format!("publishing a hull picture: HTTP {status}"))
             }
             Self::Dead(reason) => Err(reason.clone()),
         }
@@ -475,7 +557,7 @@ mod tests {
             heading_deg: None,
             speed_kn: None,
             stale: false,
-        }
+                ..UnitState::default()        }
     }
 
     fn roster() -> SessionState {
@@ -490,6 +572,7 @@ mod tests {
                 step: Some("Step 3".to_string()),
             }),
             units: vec![unit(9, "Evertsen", Some(-6.2)), unit(4, "Tromp", None)],
+            ..SessionState::default()
         }
     }
 
@@ -611,6 +694,23 @@ mod tests {
             hub.session().is_some(),
             "a publisher that was never told anything deleted another console's session"
         );
+    }
+
+    /// A hull photograph crosses the publisher as raw RGBA and arrives at the
+    /// sink as the PNG the wall fetches.
+    #[test]
+    fn a_hull_picture_reaches_the_hub_as_png() {
+        let hub = ControlHub::new(crate::control::CameraSnapshot::from_tuple((
+            -6.2, 106.8, 11.0, 800, 600,
+        )));
+        let handle = spawn_session_publisher(SessionSink::Hub(hub.clone())).expect("publisher");
+        handle.picture(1, 2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255]);
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(2) && hub.picture(1).is_none() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let png = hub.picture(1).expect("the picture arrived");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     }
 
     #[test]

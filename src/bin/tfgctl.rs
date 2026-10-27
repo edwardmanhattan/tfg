@@ -60,6 +60,8 @@ observation (what the phone and the command center see):
   display attach [--id ID] [--label L] [--width W --height H]
                                           hold this terminal open as a command
                                           center (needs the operator's token)
+  panel                                   which observer windows are open
+  panel crew|scenario|comms on|off        open or close one on the wall
 
   --view NAME                             which view camera/focus commands are
                                           about; `main` (default) or `observer`
@@ -200,6 +202,10 @@ fn run() -> Result<(), String> {
         [command, action, rest @ ..] if command == "display" => {
             let token = require_token(token)?;
             display(&server, &token, action, rest, timeout, json_out)
+        }
+        [command, rest @ ..] if command == "panel" => {
+            let token = require_token(token)?;
+            panel(&client, &server, &token, rest, json_out)
         }
         [command] if command == "whoami" => {
             let token = require_token(token)?;
@@ -368,6 +374,62 @@ fn command_body(view: Option<&str>, kind: &str, payload: Value) -> Value {
         body["view"] = json!(view);
     }
     body
+}
+
+/// `panel`: the observer's windows. With no arguments, list them; with
+/// `crew|scenario|comms on|off`, open or close one on every attached wall.
+fn panel(
+    client: &Client,
+    server: &str,
+    token: &str,
+    rest: &[String],
+    json_out: bool,
+) -> Result<(), String> {
+    let state = fetch_state(client, server, token)?;
+    if rest.is_empty() {
+        let ui = &state["ui"];
+        if json_out {
+            println!("{ui}");
+            return Ok(());
+        }
+        let mut open: Vec<&str> = Vec::new();
+        for name in ["crew", "scenario", "comms"] {
+            if ui["panels"][name].as_bool().unwrap_or(false) {
+                open.push(name);
+            }
+        }
+        if open.is_empty() {
+            println!("no observer window is open");
+        } else {
+            println!("open: {}", open.join(", "));
+        }
+        return Ok(());
+    }
+    if rest.len() != 2 {
+        return Err("panel takes `crew|scenario|comms on|off`, or nothing to list".to_string());
+    }
+    let name = rest[0].as_str();
+    if !matches!(name, "crew" | "scenario" | "comms") {
+        return Err(format!(
+            "unknown panel {name:?}; the observer has crew, scenario and comms"
+        ));
+    }
+    let open = match rest[1].as_str() {
+        "on" | "open" | "true" => true,
+        "off" | "close" | "false" => false,
+        other => return Err(format!("panel state must be on or off, not {other:?}")),
+    };
+    post(
+        client,
+        server,
+        token,
+        command_body(
+            Some("observer"),
+            "ui.set",
+            json!({ "panel": name, "open": open }),
+        ),
+        json_out,
+    )
 }
 
 /// `GET /v1/session`: the exercise the console projected, and whether a phone

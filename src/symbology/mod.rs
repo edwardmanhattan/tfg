@@ -77,6 +77,15 @@ impl Affiliation {
         }
     }
 
+    /// The wire word back. An unknown word is Unknown, never a guess.
+    pub fn from_str(name: &str) -> Affiliation {
+        Affiliation::ALL
+            .iter()
+            .copied()
+            .find(|a| a.as_str() == name)
+            .unwrap_or(Affiliation::Unknown)
+    }
+
     /// A stale ordinal from a future or corrupt row resolves to
     /// Unknown — the honest default, and never a panic.
     pub fn from_ordinal(v: i32) -> Affiliation {

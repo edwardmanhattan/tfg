@@ -2866,8 +2866,18 @@ fn main() {
     if !token.is_empty() {
         spawn_thumb_fetch(host.clone(), token.clone(), thumb_tx.clone());
     }
-    let thumb_feed: tfg::shell_gpui::ThumbFeed =
-        std::boxed::Box::new(move || thumb_rx.try_recv().ok());
+    // The photographs also go to the control plane: a wall renders the same
+    // picture at the picture's zoom, and it has no Minos credential to fetch
+    // one itself. The shell keeps its batch; the publisher gets a copy it can
+    // encode at its own pace.
+    let publisher_pictures = publisher.clone();
+    let thumb_feed: tfg::shell_gpui::ThumbFeed = std::boxed::Box::new(move || {
+        let batch = thumb_rx.try_recv().ok()?;
+        for raw in &batch {
+            publisher_pictures.picture(raw.unit_id, raw.w, raw.h, raw.rgba.clone());
+        }
+        Some(batch)
+    });
     // The messages that arrived, drained like every other feed.
     let live_message_feed: tfg::shell_gpui::LiveMessageFeed =
         std::boxed::Box::new(move || live_msg_rx.try_recv().ok());
