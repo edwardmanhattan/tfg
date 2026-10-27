@@ -1318,6 +1318,17 @@ struct IslandDemo {
     /// The session the top zone reads: the held game and its room's
     /// headcount. `SessionView::default()` when no session is held.
     session: SessionView,
+    /// What the control plane was last told about the held exercise.
+    ///
+    /// The shell publishes its roster on change only: positions move every
+    /// second and belong to the binary's fix registry, and the heartbeat is
+    /// the publisher's job. Comparing the last projection is what keeps the
+    /// twenty-millisecond tick free.
+    ///
+    /// The outer `None` is "nothing has ever been published", which is not the
+    /// same as "published: no exercise" — a console that never held one says
+    /// nothing rather than deleting a session another console published.
+    session_published: Option<Option<crate::control::SessionState>>,
     /// The helm draft, and the last answer about it. `None` heading/speed
     /// means "follow the fix", seeded once the first fix arrives — so the
     /// panel opens on the hull's own course rather than on zero.
@@ -4162,6 +4173,7 @@ impl IslandDemo {
             hold_busy: false,
             hold_status: Status::empty(),
             session,
+            session_published: None,
             helm_heading: None,
             helm_speed: None,
             helm_status: None,
@@ -4965,6 +4977,13 @@ impl IslandDemo {
                 dy_fraction,
             } => self.pan_fraction(dx_fraction, dy_fraction, cx),
             crate::control::Command::CameraZoom { delta } => self.zoom_by(delta, cx),
+            crate::control::Command::CameraFocus { .. } => {
+                // A focus is resolved against a session, and only the server
+                // holds one. By the time a command reaches this shell it has
+                // already been turned into a camera: a focus addressed to the
+                // console is a client bug, and moving nothing is the honest
+                // response to it.
+            }
             crate::control::Command::ViewReport { width, height } => {
                 // The viewport is the display's own fact, and on this desktop
                 // the display is this window: a report from elsewhere is not
@@ -5142,6 +5161,28 @@ impl IslandDemo {
         }
         self.send_camera(false);
         cx.notify();
+    }
+
+    /// Hand the held exercise's projection to the control plane, when it
+    /// changed.
+    ///
+    /// Called from the tick, which is why it compares rather than sends: the
+    /// shell's half of an observation only moves when the operator changes
+    /// something, and the fixes that move on their own are the binary's. A
+    /// console that holds no exercise publishes nothing until it has held one
+    /// — the first `None` marks the fact rather than clearing a session
+    /// another console may have published.
+    fn publish_session(&mut self) {
+        let projection = control_projection(&self.session);
+        if self.session_published.as_ref() == Some(&projection) {
+            return;
+        }
+        if projection.is_none() && self.session_published.is_none() {
+            self.session_published = Some(None);
+            return;
+        }
+        let _ = self.order_tx.send(ToBinary::Session(projection.clone()));
+        self.session_published = Some(projection);
     }
 
     /// The size the picture should be asked for: the window's own device
@@ -34841,6 +34882,100 @@ enum WriteField {
 /// (which learns the grant only from the 403) speaks the landing.
 pub const CLOCK_GRANT: &str = "clock control needs the control grant in this session \u{2014} Game Master or an entrusted judge-side role (app admin is not enough)";
 
+/// The shell's half of an observation: the roster a viewer may see.
+///
+/// Positions here are the exercise's recorded placements. A live fix replaces
+/// them in the publisher, which is the only part of this that changes while a
+/// map sits still — so this function runs only when the roster itself moved.
+///
+/// What is deliberately NOT here: message traffic, the roster of people, the
+/// exercise's terms. A viewer watches hulls move; anything beyond that is the
+/// console's own business and would be a projection nobody asked for.
+fn control_projection(session: &SessionView) -> Option<crate::control::SessionState> {
+    if !session.signed_in || session.game_id <= 0 || session.game.trim().is_empty() {
+        return None;
+    }
+    let label_of = |id: i64| {
+        session
+            .pieces
+            .iter()
+            .find(|piece| piece.id == id)
+            .map(|piece| piece.label.clone())
+            .unwrap_or_else(|| format!("unit {id}"))
+    };
+    let units = session
+        .pieces
+        .iter()
+        .map(|piece| crate::control::UnitState {
+            // The hub numbers the hulls; a publisher leaves it empty, and the
+            // `serde` default is what makes that legal on the wire.
+            index: 0,
+            id: piece.id,
+            name: piece.label.clone(),
+            // The piece row carries no pennant number. An empty string is the
+            // honest answer, and the phone's card omits the line.
+            hull_number: String::new(),
+            class_name: piece.class_name.clone(),
+            commander: match (piece.commander_id, piece.commander_name.trim()) {
+                (Some(id), name) if !name.is_empty() => {
+                    Some(crate::control::CommanderState {
+                        id,
+                        name: name.to_string(),
+                    })
+                }
+                _ => None,
+            },
+            embarked: session
+                .hosts
+                .iter()
+                .filter(|(_, host)| **host == piece.id)
+                .map(|(child, _)| crate::control::UnitRef {
+                    id: *child,
+                    name: label_of(*child),
+                    hull_number: String::new(),
+                })
+                .collect(),
+            embarked_in: session.hosts.get(&piece.id).map(|host| crate::control::UnitRef {
+                id: *host,
+                name: label_of(*host),
+                hull_number: String::new(),
+            }),
+            position: piece.start.map(|(latitude, longitude)| crate::control::GeoPoint {
+                latitude,
+                longitude,
+            }),
+            // A placement is a place, not a course: the fix feed is the only
+            // thing that knows these, and it arrives beside the roster.
+            heading_deg: None,
+            speed_kn: None,
+            stale: false,
+        })
+        .collect();
+    Some(crate::control::SessionState {
+        game_id: session.game_id,
+        name: session.game.clone(),
+        phase: session.state.clone(),
+        mode: session
+            .facts
+            .mode
+            .wire()
+            .unwrap_or_default()
+            .to_string(),
+        // The scenario being PLAYED, never the book around it: a viewer is
+        // watching the exercise, not reading its plan.
+        scenario: session
+            .step
+            .as_ref()
+            .and_then(|step| step.playing.as_ref())
+            .map(|line| crate::control::ScenarioState {
+                id: line.scenario_id,
+                title: line.scenario.clone(),
+                step: Some(line.content.clone()).filter(|content| !content.trim().is_empty()),
+            }),
+        units,
+    })
+}
+
 /// What the shell says to the binary. ONE channel, because there is one
 /// seam: the shell never reads or writes the network or the map thread
 /// itself, it asks, and the binary is the only thing that knows how.
@@ -34870,6 +35005,20 @@ pub enum ToBinary {
         /// a gesture leaves it `None` and the desktop owns the move.
         control: Option<crate::control::CameraSource>,
     },
+    /// The console's projection of the held exercise, for the control plane.
+    ///
+    /// Three parties know three parts of an observation: the shell knows the
+    /// roster (who is in the exercise, what commands them, what is aboard
+    /// what), the binary's fix registry knows where the hulls are, and the
+    /// control plane publishes the join. This message carries the shell's
+    /// part. Its positions are the exercise's recorded placements; the live
+    /// fixes replace them in the publisher, which is the only thing here that
+    /// moves while a map sits still.
+    ///
+    /// Sent when the roster actually changed, and `None` when the console
+    /// stopped holding an exercise. The heartbeat is the publisher's job, so
+    /// a frame that changed nothing visible costs nothing.
+    Session(Option<crate::control::SessionState>),
     /// Deploy a hull where the pointer says: the unit plus the drop point as
     /// fractions of the map FRAME. The shell names fractions, never pixels or
     /// ground — it converts the pointer's window fraction through the same
@@ -38282,6 +38431,11 @@ pub fn run(
                     let _ = cx.update(|app| {
                         drag_drain.update(app, |root: &mut IslandDemo, cx| {
                             root.flush_map(cx);
+                            // The control plane hears about the exercise from
+                            // the same tick: the shell owns the roster, and a
+                            // change to it is the only thing here worth a
+                            // message.
+                            root.publish_session();
                         })
                     });
                     if let Some(accepted) = control_feed() {
@@ -50609,5 +50763,163 @@ mod tests {
             "on the water",
             "the whole composition read: now the console may say it"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The observation: what the console publishes about its exercise. The
+    // roster is the shell's half; the fixes that move on their own belong to
+    // the binary, and the publisher joins the two.
+    // -----------------------------------------------------------------------
+
+    fn observation_piece(id: i64, label: &str, commander: Option<(i64, &str)>) -> PieceView {
+        PieceView {
+            id,
+            class_name: "Frigate".to_string(),
+            label: label.to_string(),
+            commander_id: commander.map(|(id, _)| id),
+            commander_name: commander.map(|(_, name)| name.to_string()).unwrap_or_default(),
+            hierarchy_node: None,
+            start: Some((-6.2 - (id % 10) as f64 / 100.0, 106.8)),
+            placed: true,
+        }
+    }
+
+    fn observation_view() -> SessionView {
+        SessionView {
+            signed_in: true,
+            game: "Sunda Strait Watch".to_string(),
+            game_id: 4127,
+            state: "execution".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
+            step: Some(StepView {
+                assumed_time: "06:12".to_string(),
+                playing: Some(StepLine {
+                    scenario_id: 88,
+                    step_id: 3,
+                    scenario: "Sunda Strait, first light".to_string(),
+                    content: "shadow the contact".to_string(),
+                    state: "playing".to_string(),
+                }),
+                asking: None,
+            }),
+            pieces: vec![
+                observation_piece(9001, "Evertsen", Some((501, "Lt Cdr Halvorsen"))),
+                observation_piece(9002, "Tromp", None),
+                observation_piece(9101, "NH90 N-110", None),
+            ],
+            hosts: [(9101, 9001)].into_iter().collect(),
+            ..SessionView::default()
+        }
+    }
+
+    #[test]
+    fn the_projection_carries_the_hulls_their_commanders_and_what_is_aboard() {
+        let session = observation_view();
+        let projection = control_projection(&session).expect("a held exercise projects");
+        assert_eq!(projection.game_id, 4127);
+        assert_eq!(projection.name, "Sunda Strait Watch");
+        assert_eq!(projection.phase, "execution");
+        assert_eq!(projection.mode, "maneuver");
+        assert_eq!(projection.units.len(), 3);
+
+        let evertsen = &projection.units[0];
+        assert_eq!(evertsen.name, "Evertsen");
+        assert_eq!(
+            evertsen.commander.as_ref().map(|c| c.name.as_str()),
+            Some("Lt Cdr Halvorsen")
+        );
+        assert_eq!(
+            evertsen.embarked.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
+            vec!["NH90 N-110"],
+            "the host carries the helicopter, by name"
+        );
+        // The placement is the exercise's, and it is not a live fix: the
+        // publisher is what decides that a hull nobody has plotted is stale.
+        let placed = evertsen.position.expect("the exercise placed it");
+        assert!(
+            (placed.latitude + 6.21).abs() < 1e-9 && (placed.longitude - 106.8).abs() < 1e-9,
+            "the placement is the exercise's, not a guess: {placed:?}"
+        );
+        assert_eq!(evertsen.heading_deg, None);
+        assert!(!evertsen.stale);
+
+        let helicopter = &projection.units[2];
+        assert_eq!(
+            helicopter.embarked_in.as_ref().map(|u| u.name.as_str()),
+            Some("Evertsen")
+        );
+        assert!(helicopter.commander.is_none(), "a hull nobody commands says so");
+        assert!(projection.units[1].embarked.is_empty());
+    }
+
+    #[test]
+    fn the_projection_names_the_scenario_being_played_and_not_the_book() {
+        let projection = control_projection(&observation_view()).expect("a projection");
+        let scenario = projection.scenario.expect("a scenario");
+        assert_eq!(scenario.id, 88);
+        assert_eq!(scenario.title, "Sunda Strait, first light");
+        assert_eq!(scenario.step.as_deref(), Some("shadow the contact"));
+    }
+
+    #[test]
+    fn a_console_holding_no_exercise_projects_nothing() {
+        // Signed out.
+        assert!(control_projection(&SessionView::default()).is_none());
+        // Signed in, but no game held: a phase with no id is not an exercise.
+        let mut hanging = SessionView {
+            signed_in: true,
+            game: "Game 9".to_string(),
+            state: "planning".to_string(),
+            ..SessionView::default()
+        };
+        assert!(control_projection(&hanging).is_none());
+        hanging.game_id = 9;
+        assert!(control_projection(&hanging).is_some());
+    }
+
+    /// The tick calls this twenty times a second; the message leaves on a
+    /// change and on nothing else. The heartbeat is the publisher's job.
+    #[gpui::test]
+    fn a_roster_change_reaches_the_sink_once_and_a_quiet_tick_sends_nothing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 0, 0, observation_view(), tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.publish_session();
+                demo.publish_session();
+            })
+        });
+        let sent = rx.try_recv().expect("the roster reached the sink");
+        let projection = match sent {
+            ToBinary::Session(projection) => projection.expect("a held exercise"),
+            other => panic!("expected a session projection, got {other:?}"),
+        };
+        assert_eq!(projection.game_id, 4127);
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged roster is not news to the publisher"
+        );
+
+        // Losing the exercise says so exactly once, because a phone waiting on
+        // a session that ended should be told rather than time out.
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                demo.session = SessionView::default();
+                demo.publish_session();
+                demo.publish_session();
+            })
+        });
+        match rx.try_recv().expect("the clear reached the sink") {
+            ToBinary::Session(projection) => assert!(projection.is_none()),
+            other => panic!("expected a clear, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "the clear is sent once");
     }
 }

@@ -35,8 +35,8 @@
 //! nothing sensible to compare them against.
 
 use crate::control::{
-    AcceptedCommand, CameraSnapshot, Command, CommandRequest, Event, GeoPoint, MAIN_VIEW,
-    PROTOCOL_VERSION, ViewState,
+    AcceptedCommand, CameraSnapshot, Command, CommandRequest, DisplayHello, DisplayViewport, Event,
+    GeoPoint, MAIN_VIEW, PROTOCOL_VERSION, ViewState,
 };
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -91,6 +91,21 @@ pub struct ClientConfig {
     /// work and the stop flag. Not a protocol timeout.
     pub read_timeout: Duration,
     pub post_timeout: Duration,
+    /// Which view this console renders. A console following another console
+    /// renders `main`; a command center renders `observer`, the view a phone
+    /// moves. Commands this client posts are about the same view.
+    pub view: String,
+    /// Announce this client as a display on every connection. `None` for a
+    /// console that is merely following: only a display is remoted, and only
+    /// a display needs the server to count it.
+    pub display: Option<DisplayHello>,
+    /// A copy of every event the host sent, for a reader that does not walk
+    /// the camera reducer. The command center draws readiness and markers from
+    /// this; the following console needs none and leaves it `None`.
+    pub events: Option<Sender<Event>>,
+    /// How often an attached display says it is still there. The server reaps
+    /// after thirty seconds, so the default ten is two missed beats of margin.
+    pub heartbeat: Duration,
 }
 
 impl ClientConfig {
@@ -102,6 +117,10 @@ impl ClientConfig {
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_millis(250),
             post_timeout: Duration::from_secs(3),
+            view: MAIN_VIEW.to_string(),
+            display: None,
+            events: None,
+            heartbeat: Duration::from_secs(10),
         }
     }
 }
@@ -340,6 +359,10 @@ fn run(
     };
     let mut failures = FailureLog::default();
     let mut backoff = BACKOFF_START;
+    // The display survives its connections: its id and the viewport it has
+    // already learned. A reconnect re-announces with the size we know rather
+    // than blanking the host's record for a second.
+    let mut display = config.display.clone();
     while !stop.load(Ordering::SeqCst) {
         let started = Instant::now();
         let connection = connect(&config, &endpoint);
@@ -362,6 +385,7 @@ fn run(
             endpoint: endpoint.clone(),
             token: config.token.clone(),
             client_id: config.client_id.clone(),
+            view: config.view.clone(),
             synced: false,
             revision: 0,
             last_known: None,
@@ -369,9 +393,21 @@ fn run(
             display_size: None,
             pending: None,
             counter: 0,
+            display: display.clone(),
+            announced: None,
+            attached: None,
+            last_beat: Instant::now(),
+            events: config.events.clone(),
+            heartbeat: config.heartbeat,
             log: FailureLog::default(),
         };
-        match session.run(&http, &reports, &commands, &stop) {
+        let end = session.run(&http, &reports, &commands, &stop);
+        // Keep whatever this connection learned about the display for the
+        // next one: a viewport is a fact about the wall, not about a socket.
+        if let Some(learned) = session.display.take() {
+            display = Some(learned);
+        }
+        match end {
             SessionEnd::Stopped => return,
             SessionEnd::Dropped(reason) => {
                 failures.log(&format!("the event stream stopped: {reason}"));
@@ -461,6 +497,8 @@ struct Session {
     endpoint: Endpoint,
     token: String,
     client_id: String,
+    /// The view this console renders and posts about.
+    view: String,
     /// True once a snapshot has been read on THIS connection. Revisions and
     /// cameras are not carried across a reconnect.
     synced: bool,
@@ -478,6 +516,20 @@ struct Session {
     /// yet. Reports that do not match it are ticks from before the move.
     pending: Option<(GeoPoint, f64)>,
     counter: u64,
+    /// The display this session announces, when it is one.
+    display: Option<DisplayHello>,
+    /// The viewport this connection has already announced. A resize is a new
+    /// `display.hello`, because a display's record is what carries its size.
+    announced: Option<(u32, u32)>,
+    /// The id the host accepted this display under, on THIS connection. The
+    /// heartbeat carries it; a reconnect announces again rather than assuming
+    /// the attachment survived the socket.
+    attached: Option<String>,
+    last_beat: Instant,
+    /// Where a UI hears what the host said. Cloned from the config, and `None`
+    /// for a following console.
+    events: Option<Sender<Event>>,
+    heartbeat: Duration,
     log: FailureLog,
 }
 
@@ -489,6 +541,24 @@ impl Session {
         commands: &Sender<AcceptedCommand>,
         stop: &AtomicBool,
     ) -> SessionEnd {
+        // A display announces itself on every connection, before it reads a
+        // frame: presence is the socket, and a socket that has not said what
+        // it is is a follower, not a command center.
+        if let Some(display) = &self.display {
+            let hello = serde_json::json!({
+                "type": "display.hello",
+                "payload": display,
+            });
+            if let Err(error) = self
+                .socket
+                .send(tungstenite::Message::text(hello.to_string()))
+            {
+                return SessionEnd::Dropped(format!("announcing this display: {error}"));
+            }
+            self.announced = display
+                .viewport
+                .map(|viewport| (viewport.width, viewport.height));
+        }
         loop {
             if stop.load(Ordering::SeqCst) {
                 return SessionEnd::Stopped;
@@ -504,6 +574,24 @@ impl Session {
                 Ok(Some(event)) => self.event(event, commands, http),
                 Ok(None) => {}
                 Err(error) => return SessionEnd::Dropped(error),
+            }
+            // The heartbeat rides the same loop as the reads: a quiet stream
+            // still wakes on the socket's read timeout, which is why the
+            // client sets one.
+            if let Some(id) = &self.attached {
+                if self.last_beat.elapsed() >= self.heartbeat {
+                    let beat = serde_json::json!({
+                        "type": "display.heartbeat",
+                        "payload": { "id": id },
+                    });
+                    if let Err(error) = self
+                        .socket
+                        .send(tungstenite::Message::text(beat.to_string()))
+                    {
+                        return SessionEnd::Dropped(format!("heartbeating this display: {error}"));
+                    }
+                    self.last_beat = Instant::now();
+                }
             }
         }
     }
@@ -535,6 +623,13 @@ impl Session {
         commands: &Sender<AcceptedCommand>,
         http: &reqwest::blocking::Client,
     ) {
+        // A reader that keeps its own state sees the wire, not the reducer's
+        // decisions. Best effort: a window that stopped polling loses an event
+        // and gets a fresh snapshot on the next connection, which is the same
+        // rule the socket already lives by.
+        if let Some(events) = &self.events {
+            let _ = events.send(event.clone());
+        }
         match event {
             Event::Snapshot {
                 revision, views, ..
@@ -542,7 +637,7 @@ impl Session {
                 self.revision = revision;
                 self.synced = true;
                 self.pending = None;
-                if let Some(view) = views.get(MAIN_VIEW) {
+                if let Some(view) = views.get(self.view.as_str()) {
                     self.follow(view, commands, "server", None);
                     // The display's own size is a fact the host needs even
                     // when the camera arrives at the one the display shows.
@@ -568,7 +663,7 @@ impl Session {
                     // back from a gesture that has moved on since.
                     return;
                 }
-                if view.id == MAIN_VIEW {
+                if view.id == self.view {
                     self.follow(
                         &view,
                         commands,
@@ -576,6 +671,19 @@ impl Session {
                         command_id.as_deref(),
                     );
                 }
+            }
+            // The observation state belongs to the console that hosts an
+            // exercise, not to one that follows another. A follower keeps
+            // showing the camera it was given.
+            Event::SessionChanged { .. } => {}
+            Event::DisplayAttached { id } => {
+                self.attached = Some(id);
+                self.last_beat = Instant::now();
+            }
+            Event::DisplayRejected { code, message } => {
+                self.attached = None;
+                self.log
+                    .log(&format!("the host refused this display: {message} ({code})"));
             }
             Event::CommandAccepted { .. } => {}
             Event::CommandRejected {
@@ -617,6 +725,7 @@ impl Session {
             command_id: command_id
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("follow-r{}", self.revision)),
+            view: view.id.clone(),
             command: Command::CameraSet {
                 center: camera.center,
                 zoom: camera.zoom,
@@ -663,6 +772,7 @@ impl Session {
                         http,
                     );
                 }
+                self.announce_viewport(camera.width, camera.height);
             }
             Report::Viewport { width, height } => {
                 self.display_size = Some((width, height));
@@ -670,6 +780,7 @@ impl Session {
                     return;
                 }
                 self.report_viewport(width, height, http);
+                self.announce_viewport(width, height);
             }
         }
     }
@@ -690,7 +801,43 @@ impl Session {
     fn sync_viewport(&mut self, http: &reqwest::blocking::Client) {
         if let Some((width, height)) = self.display_size {
             self.report_viewport(width, height, http);
+            self.announce_viewport(width, height);
         }
+    }
+
+    /// Re-announce this display when its size changes.
+    ///
+    /// `view.report` tells the host what to resolve a phone's nudge against;
+    /// the display's *record* is what `display list` and a waiting screen read
+    /// for "observer 1920x1080". Only the attach message carries a viewport, so
+    /// a resize is a second `display.hello` with the same id — the host
+    /// replaces the record rather than stacking one.
+    fn announce_viewport(&mut self, width: u32, height: u32) {
+        let Some(display) = &mut self.display else {
+            return;
+        };
+        if self.announced == Some((width, height)) {
+            return;
+        }
+        if width == 0 || height == 0 {
+            return;
+        }
+        display.viewport = Some(DisplayViewport { width, height });
+        let hello = serde_json::json!({
+            "type": "display.hello",
+            "payload": display,
+        });
+        if let Err(error) = self
+            .socket
+            .send(tungstenite::Message::text(hello.to_string()))
+        {
+            // The loop will drop the socket on its next read; the reconnect
+            // announces again with the viewport this method just remembered.
+            self.log
+                .log(&format!("announcing this display's size: {error}"));
+            return;
+        }
+        self.announced = Some((width, height));
     }
 
     /// Post one command and absorb its success.
@@ -702,6 +849,7 @@ impl Session {
         self.counter += 1;
         let request = CommandRequest {
             protocol_version: Some(PROTOCOL_VERSION),
+            view: Some(self.view.clone()),
             client_id: Some(self.client_id.clone()),
             command_id: Some(command_id.clone()),
             command,
@@ -851,6 +999,109 @@ mod tests {
             .expect("the snapshot reaches the shell");
         assert_eq!(accepted.command, place(&start));
         assert_eq!(accepted.client_id, "server");
+    }
+
+
+    /// A command center is a display: it announces itself on the socket, the
+    /// host counts it, and a reader hears both the snapshot and the attach.
+    /// Nothing about this is a follow-the-camera behaviour, which is why the
+    /// `main`-view tests above never see a display appear.
+    #[test]
+    fn a_command_center_announces_itself_and_is_counted() {
+        use crate::control::{COMMAND_CENTER_ROLE, OBSERVER_VIEW, DisplayViewport};
+
+        let host = Host::start(camera(-6.2, 106.8, 11.0, 1280, 720));
+        let (commands, _forwarded) = channel();
+        let (events_tx, events) = channel();
+        let mut config = host.config();
+        config.view = OBSERVER_VIEW.to_string();
+        config.display = Some(DisplayHello {
+            id: Some("wall-1".to_string()),
+            role: COMMAND_CENTER_ROLE.to_string(),
+            label: "wall-1".to_string(),
+            viewport: Some(DisplayViewport {
+                width: 1920,
+                height: 1080,
+            }),
+        });
+        config.events = Some(events_tx);
+        let _client = spawn_client(config, commands).expect("client starts");
+
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(3) && host.hub.displays().is_empty() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let displays = host.hub.displays();
+        assert_eq!(displays.len(), 1, "the command center was not counted");
+        assert_eq!(displays[0].id, "wall-1");
+        assert_eq!(displays[0].role, COMMAND_CENTER_ROLE);
+        assert_eq!(
+            displays[0].viewport.map(|v| (v.width, v.height)),
+            Some((1920, 1080))
+        );
+
+        // The reader sees the wire, not just the camera reducer's decisions.
+        let mut saw_snapshot = false;
+        let mut saw_attached = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !(saw_snapshot && saw_attached) {
+            match events.recv_timeout(Duration::from_millis(200)) {
+                Ok(Event::Snapshot { .. }) => saw_snapshot = true,
+                Ok(Event::DisplayAttached { id }) => {
+                    assert_eq!(id, "wall-1");
+                    saw_attached = true;
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(saw_snapshot, "the reader never heard the snapshot");
+        assert!(saw_attached, "the reader never heard the attach");
+    }
+
+
+    /// A resized wall re-announces itself, so `display list` and the phone's
+    /// waiting line show the size the observer view actually has. The record
+    /// is the only place that size lives; `view.report` alone leaves it
+    /// blank.
+    #[test]
+    fn a_display_that_resizes_announces_its_new_viewport() {
+        use crate::control::{COMMAND_CENTER_ROLE, OBSERVER_VIEW};
+
+        let host = Host::start(camera(-6.2, 106.8, 11.0, 1280, 720));
+        let (commands, _forwarded) = channel();
+        let mut config = host.config();
+        config.view = OBSERVER_VIEW.to_string();
+        config.display = Some(DisplayHello {
+            id: Some("wall-9".to_string()),
+            role: COMMAND_CENTER_ROLE.to_string(),
+            label: "wall-9".to_string(),
+            viewport: None,
+        });
+        let client = spawn_client(config, commands).expect("client starts");
+
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(3) && host.hub.displays().is_empty() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(host.hub.displays().len(), 1);
+        assert!(
+            host.hub.displays()[0].viewport.is_none(),
+            "a display that has not reported a size must not claim one"
+        );
+
+        client.viewport(1920, 1080);
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(3)
+            && host.hub.displays()[0].viewport.is_none()
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            host.hub.displays()[0].viewport.map(|v| (v.width, v.height)),
+            Some((1920, 1080)),
+            "the resize was not announced"
+        );
     }
 
     #[test]

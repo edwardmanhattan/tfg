@@ -66,6 +66,10 @@ export TFG_TRACE_INPUT=1
 RUN_SECS="${1:-14}"
 OUT="${2:-/tmp/gpui_shot.png}"
 EXTRA_ENV="${3:-}"
+# The binary's own arguments. The command center is the same binary behind
+# `--mode command-center`, and it is captured by the same harness — same
+# window class, same raise, same taint report.
+APP_ARGS="${TFG_ARGS:-}"
 
 T=8   # seconds any single external call may take
 
@@ -111,7 +115,7 @@ trap cleanup EXIT INT TERM
 RUN_LOG="/tmp/gpui_run.$(basename "$PWD").log"
 
 # shellcheck disable=SC2086
-env $EXTRA_ENV ./target/debug/tfg > "$RUN_LOG" 2>&1 &
+env $EXTRA_ENV ./target/debug/tfg $APP_ARGS > "$RUN_LOG" 2>&1 &
 PID=$!
 echo "launched pid $PID  (env: ${EXTRA_ENV:-none})"
 

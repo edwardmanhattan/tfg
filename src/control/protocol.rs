@@ -16,14 +16,21 @@ pub const API_VERSION: &str = "v1";
 
 /// The envelope version, carried in bodies and in the WebSocket snapshot.
 ///
-/// The route version and the envelope version are separate on purpose: a
-/// future v2 can serve `v1` commands on the old routes while the snapshot
-/// says which shape its events have.
-pub const PROTOCOL_VERSION: u64 = 1;
+/// The route version and the envelope version are separate on purpose: this
+/// version can serve commands on the `/v1/` routes while the snapshot says
+/// which shape its events have. Version 2 adds the observation state
+/// (`session`, `readiness`, `displays`) and the observer view.
+pub const PROTOCOL_VERSION: u64 = 2;
 
-/// The one view the desktop renders today. Views are named rather than
-/// implied so a second display can be added without a protocol break.
+/// The camera the operator's console renders. A remote command may name it,
+/// but only the console itself is the authority about it.
 pub const MAIN_VIEW: &str = "main";
+
+/// The camera a command center renders and a phone moves.
+///
+/// It is a view of its own rather than a second meaning for `main` so an
+/// observer can pan without dragging the game master's screen.
+pub const OBSERVER_VIEW: &str = "observer";
 
 /// A geographic point. Latitude is clamped by the map, longitude wraps.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -80,6 +87,254 @@ pub struct ViewState {
     pub camera: CameraSnapshot,
 }
 
+/// The exercise an observation is about, as the console projects it.
+///
+/// This is deliberately a *projection*: the console holds the Minos session,
+/// and the control plane holds only what a viewer needs. No Minos credential,
+/// no roster beyond the hulls that move, no message traffic.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SessionState {
+    pub game_id: i64,
+    pub name: String,
+    /// The server's own word: `planning`, `preparation`, `execution`,
+    /// `closure`. Kept as text so a phase this build has not heard of is
+    /// shown rather than guessed at; [`Self::is_execution`] is the one place
+    /// that decides whether observation is live.
+    pub phase: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario: Option<ScenarioState>,
+    #[serde(default)]
+    pub units: Vec<UnitState>,
+}
+
+impl SessionState {
+    pub fn is_execution(&self) -> bool {
+        self.phase == "execution"
+    }
+
+    /// Validate what a host published before it enters the shared state.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.game_id <= 0 {
+            return Err("a session needs a positive game id".to_string());
+        }
+        if self.phase.trim().is_empty() {
+            return Err("a session needs a phase".to_string());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for unit in &self.units {
+            if unit.id <= 0 {
+                return Err(format!("unit {} has no id", unit.index));
+            }
+            if !seen.insert(unit.id) {
+                return Err(format!("unit {} appears twice", unit.id));
+            }
+            if let Some(position) = unit.position {
+                if !position.latitude.is_finite() || !(-90.0..=90.0).contains(&position.latitude) {
+                    return Err(format!("unit {} has an impossible latitude", unit.id));
+                }
+                if !position.longitude.is_finite()
+                    || !(-180.0..=180.0).contains(&position.longitude)
+                {
+                    return Err(format!("unit {} has an impossible longitude", unit.id));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The scenario being played and the step it is on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScenarioState {
+    pub id: i64,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+}
+
+/// One hull a viewer may look at.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnitState {
+    /// The number the phone's grid and the command center's marker share.
+    /// The hub assigns it from the host's array order, so a publisher leaves
+    /// it out and a client reads it back.
+    #[serde(default)]
+    pub index: u32,
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub hull_number: String,
+    #[serde(default)]
+    pub class_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commander: Option<CommanderState>,
+    /// The hulls aboard this one, direct children only.
+    #[serde(default)]
+    pub embarked: Vec<UnitRef>,
+    /// The hull this one is aboard, when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embarked_in: Option<UnitRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<GeoPoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading_deg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_kn: Option<f64>,
+    /// No live fix within the registry's own staleness window.
+    #[serde(default)]
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommanderState {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnitRef {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub hull_number: String,
+}
+
+/// Why observation is not open yet. The phone's waiting screen names these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessReason {
+    NoSession,
+    NotExecution,
+    NoDisplay,
+    Stale,
+}
+
+impl ReadinessReason {
+    /// The wire word, for a log line or an error message.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSession => "no_session",
+            Self::NotExecution => "not_execution",
+            Self::NoDisplay => "no_display",
+            Self::Stale => "stale",
+        }
+    }
+
+    /// What a waiting screen says to a person. The phone renders the wire word
+    /// and its own copy; this is for the CLI and the console's readiness bar.
+    pub fn sentence(self) -> &'static str {
+        match self {
+            Self::NoSession => "no exercise is open on the console",
+            Self::NotExecution => "the exercise is not in the execution phase",
+            Self::NoDisplay => "no command center is attached",
+            Self::Stale => "the console has stopped refreshing the exercise",
+        }
+    }
+}
+
+/// The server's verdict about whether a phone may steer the observer view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Readiness {
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ReadinessReason>,
+}
+
+impl Readiness {
+    pub fn ready() -> Self {
+        Self {
+            ready: true,
+            reason: None,
+        }
+    }
+
+    pub fn waiting(reason: ReadinessReason) -> Self {
+        Self {
+            ready: false,
+            reason: Some(reason),
+        }
+    }
+}
+
+/// A command center currently attached to the event stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisplayState {
+    pub id: String,
+    pub label: String,
+    /// `command_center` today; a role rather than a bool so another display
+    /// kind can be added without a new field.
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<DisplayViewport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayViewport {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The role a display announces. Only a command center may be remoted.
+pub const COMMAND_CENTER_ROLE: &str = "command_center";
+
+/// A display's first message on the event stream.
+///
+/// Sent *up* the WebSocket, not over HTTP: the attachment dies with the socket,
+/// which is the one fact the rest of the system needs. A display that is not
+/// attached is not showing anything, and a socket that is open is showing
+/// something.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisplayHello {
+    /// Stable for the life of a display. Reusing it after a reconnect replaces
+    /// the old record rather than stacking a second one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub role: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<DisplayViewport>,
+}
+
+impl DisplayHello {
+    /// The display's id, or a generated one. Bounded and printable, because it
+    /// is broadcast to every client and drawn on the console's readiness bar.
+    pub fn display_id(&self) -> String {
+        let raw = self.id.as_deref().unwrap_or_default().trim();
+        let cleaned: String = raw
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+            .take(48)
+            .collect();
+        if cleaned.is_empty() {
+            "display".to_string()
+        } else {
+            cleaned
+        }
+    }
+
+    pub fn label_or_id(&self) -> String {
+        let label = self.label.trim();
+        if label.is_empty() {
+            self.display_id()
+        } else {
+            label.chars().take(64).collect()
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.role != COMMAND_CENTER_ROLE {
+            return Err(format!(
+                "`{}` is not a display role this build serves; the only one is `{COMMAND_CENTER_ROLE}`",
+                self.role
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Commands accepted by the control plane.
 ///
 /// The names are the wire names. `camera.nudge` carries viewport FRACTIONS:
@@ -95,6 +350,16 @@ pub enum Command {
     CameraNudge { dx_fraction: f64, dy_fraction: f64 },
     #[serde(rename = "camera.zoom")]
     CameraZoom { delta: f64 },
+    /// Centre a view on one of the session's hulls.
+    ///
+    /// The host resolves the unit against the session it owns, so a phone
+    /// never has to convert a stale position into a camera it guessed.
+    #[serde(rename = "camera.focus")]
+    CameraFocus {
+        unit_id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zoom: Option<f64>,
+    },
     /// The viewport the display is rendering at, in device pixels.
     ///
     /// This is a *display's* fact rather than a view's: it is sent by a client
@@ -155,6 +420,16 @@ impl Command {
                     ));
                 }
             }
+            Self::CameraFocus { unit_id, zoom } => {
+                if *unit_id <= 0 {
+                    return Err("a focus command needs a positive unit id".to_string());
+                }
+                if let Some(zoom) = zoom
+                    && (!zoom.is_finite() || !(-30.0..=30.0).contains(zoom))
+                {
+                    return Err("focus zoom must be finite and between -30 and 30".to_string());
+                }
+            }
             Self::ViewReport { width, height } => {
                 // A viewport is a display's own size. Zero is the state before
                 // the first frame and is not a report; something enormous is a
@@ -179,10 +454,14 @@ impl Command {
 /// beside `type` and `payload`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandRequest {
-    /// Envelope version. Absent means v1; a future version is refused rather
-    /// than misread.
+    /// Envelope version. Absent means the current one; a future version is
+    /// refused rather than misread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<u64>,
+    /// Which view the command is about. Absent means `main`, so an old client
+    /// that never learned about the observer still talks to the console.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
     /// Who is asking. Used for attribution in events, not for authorization:
     /// the bearer token is what authorizes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,6 +478,16 @@ impl CommandRequest {
     /// The client's name for itself, bounded and printable.
     pub fn client_id(&self) -> String {
         normalise_client_id(self.client_id.as_deref())
+    }
+
+    /// The view this command names. Empty or absent is `main`.
+    pub fn view_id(&self) -> String {
+        self.view
+            .as_deref()
+            .map(str::trim)
+            .filter(|view| !view.is_empty())
+            .unwrap_or(MAIN_VIEW)
+            .to_string()
     }
 }
 
@@ -226,6 +515,9 @@ pub fn normalise_client_id(raw: Option<&str>) -> String {
 pub struct AcceptedCommand {
     pub client_id: String,
     pub command_id: String,
+    /// The view the command named, already normalised. `main` for a console
+    /// command; `observer` for a phone or command-center viewport report.
+    pub view: String,
     pub command: Command,
 }
 
@@ -277,6 +569,9 @@ pub enum Event {
         protocol_version: u64,
         revision: u64,
         views: BTreeMap<String, ViewState>,
+        session: Option<SessionState>,
+        readiness: Readiness,
+        displays: Vec<DisplayState>,
     },
     /// A camera that moved. `revision` is the revision of the new state.
     #[serde(rename = "camera.changed")]
@@ -288,6 +583,25 @@ pub enum Event {
         command_id: Option<String>,
         view: ViewState,
     },
+    /// The observation state changed: the session, its phase, its units, the
+    /// readiness verdict, or which command centers are attached.
+    ///
+    /// One event rather than four, because every one of them changes the same
+    /// decision on the phone: may I steer, and what am I steering?
+    #[serde(rename = "session.changed")]
+    SessionChanged {
+        revision: u64,
+        session: Option<SessionState>,
+        readiness: Readiness,
+        displays: Vec<DisplayState>,
+    },
+    /// A display handshake was accepted on this socket.
+    #[serde(rename = "display.attached")]
+    DisplayAttached { id: String },
+    /// A display handshake was refused. The socket stays open, so a client
+    /// can retry with a different id or give a readable reason.
+    #[serde(rename = "display.rejected")]
+    DisplayRejected { code: String, message: String },
     /// The reader's command reached the desktop's channel. The camera event
     /// that follows is what proves it was applied.
     #[serde(rename = "command.accepted")]
@@ -334,6 +648,9 @@ pub mod error_code {
     pub const TOO_MANY_ATTEMPTS: &str = "too_many_attempts";
     /// No device has that id.
     pub const UNKNOWN_DEVICE: &str = "unknown_device";
+    /// The observation is not open yet: no session, not execution, no command
+    /// center attached, or the console went quiet. The body names which.
+    pub const NOT_READY: &str = "not_ready";
 }
 
 #[cfg(test)]
@@ -526,6 +843,9 @@ mod tests {
                     camera: CameraSnapshot::from_tuple((-6.108, 106.91, 11.0, 800, 600)),
                 },
             )]),
+            session: None,
+            readiness: Readiness::waiting(ReadinessReason::NoSession),
+            displays: Vec::new(),
         };
         let text = serde_json::to_string(&event).expect("serializes");
         let back: Event = serde_json::from_str(&text).expect("parses");
@@ -536,6 +856,101 @@ mod tests {
     fn a_camera_tuple_round_trips_through_the_protocol() {
         let tuple = (-6.2, 106.8, 12.5, 1280, 720);
         assert_eq!(CameraSnapshot::from_tuple(tuple).to_tuple(), tuple);
+    }
+
+    #[test]
+    fn a_command_without_a_view_is_about_the_console() {
+        let request = parse(r#"{"type":"camera.zoom","payload":{"delta":1.0}}"#);
+        assert_eq!(request.view_id(), MAIN_VIEW);
+        let request = parse(r#"{"view":"observer","type":"camera.zoom","payload":{"delta":1.0}}"#);
+        assert_eq!(request.view_id(), OBSERVER_VIEW);
+        let request = parse(r#"{"view":"  ","type":"camera.zoom","payload":{"delta":1.0}}"#);
+        assert_eq!(request.view_id(), MAIN_VIEW);
+    }
+
+    #[test]
+    fn a_focus_needs_a_real_unit_and_a_usable_zoom() {
+        assert!(
+            Command::CameraFocus {
+                unit_id: 0,
+                zoom: None
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Command::CameraFocus {
+                unit_id: 1,
+                zoom: Some(f64::NAN)
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Command::CameraFocus {
+                unit_id: 1,
+                zoom: Some(14.0)
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_session_rejects_duplicate_and_impossible_units() {
+        let mut session = SessionState {
+            game_id: 42,
+            name: "Exercise".to_string(),
+            phase: "execution".to_string(),
+            mode: "maneuver".to_string(),
+            scenario: None,
+            units: vec![UnitState {
+                index: 1,
+                id: 7,
+                name: "Evertsen".to_string(),
+                hull_number: "F805".to_string(),
+                class_name: "Frigate".to_string(),
+                commander: None,
+                embarked: Vec::new(),
+                embarked_in: None,
+                position: Some(GeoPoint {
+                    latitude: -6.2,
+                    longitude: 106.8,
+                }),
+                heading_deg: None,
+                speed_kn: None,
+                stale: false,
+            }],
+        };
+        assert!(session.validate().is_ok());
+        session.units.push(session.units[0].clone());
+        assert!(session.validate().is_err());
+    }
+
+    #[test]
+    fn readiness_and_session_events_round_trip() {
+        let event = Event::SessionChanged {
+            revision: 3,
+            session: Some(SessionState {
+                game_id: 42,
+                name: "Exercise".to_string(),
+                phase: "execution".to_string(),
+                mode: "maneuver".to_string(),
+                scenario: None,
+                units: Vec::new(),
+            }),
+            readiness: Readiness::waiting(ReadinessReason::NoDisplay),
+            displays: vec![DisplayState {
+                id: "wall-1".to_string(),
+                label: "wall-1".to_string(),
+                role: "command_center".to_string(),
+                viewport: None,
+            }],
+        };
+        let text = serde_json::to_string(&event).expect("serializes");
+        let back: Event = serde_json::from_str(&text).expect("parses");
+        assert_eq!(back, event);
+        assert!(text.contains("\"no_display\""));
     }
 
     /// The schema is embedded rather than read from disk, so a build in a
@@ -563,6 +978,10 @@ mod tests {
                 dy_fraction: 0.0,
             },
             Command::CameraZoom { delta: 1.0 },
+            Command::CameraFocus {
+                unit_id: 42,
+                zoom: Some(12.0),
+            },
             Command::ViewReport {
                 width: 1280,
                 height: 720,

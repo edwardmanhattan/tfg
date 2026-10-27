@@ -37,8 +37,9 @@ mkdir -p "$OUT/devices"
 
 SERVER_PID=""
 WATCH_PID=""
+DISPLAY_PID=""
 cleanup() {
-    for pid in $WATCH_PID $SERVER_PID; do
+    for pid in $DISPLAY_PID $WATCH_PID $SERVER_PID; do
         [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     done
 }
@@ -178,6 +179,83 @@ DEVICE_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["pair
 
 echo "== the paired device was $DEVICE_ID"
 
+# Observation: an exercise is published, a command center attaches, the phone's
+# focus moves the observer view and never the game master's camera.
+#
+# This is the point of the control plane's second half, and none of it is
+# visible to a unit test: the readiness verdict crosses HTTP, the display
+# handshake crosses the WebSocket, and the focus is resolved against the session
+# the server holds.
+echo "== observation mode"
+"$CLI" --server "$URL" --token "$TOKEN" session set --file fixtures/observation-session.json \
+    >"$OUT/session-published.json" 2>&1 || true
+"$CLI" --server "$URL" --token "$TOKEN" --json session status >"$OUT/session-no-display.json" 2>&1
+# A phone token cannot publish the exercise: only the console holds one.
+python3 - "$URL" "$TOKEN" "$OUT" <<'DEVICE_PUT'
+import json, sys, urllib.error, urllib.request
+url, operator, out = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def call(method, path, token=None, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url + path, data=data, method=method)
+    if token:
+        request.add_header("Authorization", "Bearer " + token)
+    if data:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request) as response:
+            return response.status, json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        return error.code, json.loads(error.read() or b"{}")
+
+# A fresh phone, because the device this script paired earlier has been
+# revoked by the time it gets here and would be refused for the wrong reason.
+_, offer = call("POST", "/v1/pairing", operator, {"scopes": ["observe", "control_view"]})
+_, paired = call("POST", "/v1/pair", None,
+                 {"code": offer.get("code", ""), "label": "observation phone"})
+phone = paired.get("token", "")
+body = json.loads(open("fixtures/observation-session.json").read())
+status, reply = call("PUT", "/v1/session", phone, body)
+with open(f"{out}/session-put-device.json", "w") as handle:
+    json.dump({"status": status, "body": reply}, handle)
+DEVICE_PUT
+"$CLI" --server "$URL" --token "$TOKEN" display attach --id smoke-wall --label "smoke wall" \
+    --width 1920 --height 1080 >"$OUT/display.log" 2>&1 &
+DISPLAY_PID=$!
+for _ in $(seq 1 20); do
+    if "$CLI" --server "$URL" --token "$TOKEN" --json session status 2>/dev/null \
+        | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["readiness"]["ready"] else 1)' 2>/dev/null; then
+        break
+    fi
+    sleep 0.25
+done
+"$CLI" --server "$URL" --token "$TOKEN" --json session status >"$OUT/session-ready.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" --json display list >"$OUT/display-list.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" --json units >"$OUT/units.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" --json camera get >"$OUT/main-before-focus.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" --json camera get --view observer >"$OUT/observer-before-focus.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" --json focus 3 --zoom 13 >"$OUT/focus.json" 2>&1 || true
+sleep 0.4
+"$CLI" --server "$URL" --token "$TOKEN" --json camera get --view observer >"$OUT/observer-after-focus.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" --json camera get >"$OUT/main-after-focus.json" 2>&1
+# The console goes quiet: the session outlives its heartbeat, the verdict flips
+# to `stale`, and steering is refused while it is.
+sleep 17
+"$CLI" --server "$URL" --token "$TOKEN" --json session status >"$OUT/session-stale.json" 2>&1
+"$CLI" --server "$URL" --token "$TOKEN" --json focus 1 >"$OUT/focus-stale.json" 2>&1 || true
+# The command center closes its window and stops counting at once.
+kill "$DISPLAY_PID" 2>/dev/null || true
+DISPLAY_PID=""
+for _ in $(seq 1 20); do
+    if "$CLI" --server "$URL" --token "$TOKEN" --json display list 2>/dev/null \
+        | python3 -c 'import json,sys; sys.exit(0 if not json.load(sys.stdin)["displays"] else 1)' 2>/dev/null; then
+        break
+    fi
+    sleep 0.25
+done
+"$CLI" --server "$URL" --token "$TOKEN" --json session status >"$OUT/session-detached.json" 2>&1
+echo "== observation mode released its display"
+
 # A restart is the only test that a revoked device stays revoked: an in-memory
 # table would pass every check above and forget everything here.
 stop_server
@@ -230,6 +308,19 @@ devices = read("devices.json")
 revoked = read("revoked.json")
 revoke_twice = read("revoke-twice.json")
 viewport = read("viewport.json")
+session_published = read("session-published.json")
+session_no_display = read("session-no-display.json")
+session_ready = read("session-ready.json")
+display_list = read("display-list.json")
+units = read("units.json")
+focus = read("focus.json")
+observer_before = read("observer-before-focus.json")
+observer_after = read("observer-after-focus.json")
+main_before = read("main-before-focus.json")
+main_after = read("main-after-focus.json")
+session_stale = read("session-stale.json")
+session_detached = read("session-detached.json")
+session_put_device = read("session-put-device.json")
 
 check("the reference client's nudge was accepted", left.get("status") == "accepted", json.dumps(left))
 check("the reference client's zoom was accepted", zoom.get("status") == "accepted", json.dumps(zoom))
@@ -303,6 +394,93 @@ check(
 check("a device can be revoked", revoked.get("status") == 200)
 check("revoking twice is a 404", revoke_twice.get("status") == 404)
 check("a revoked token is refused at once", read("revoked-token.json").get("status") == 401)
+
+check(
+    "the console's projection was accepted",
+    session_published.get("status") == "changed"
+    and session_published.get("readiness", {}).get("reason") == "no_display",
+    json.dumps(session_published)[:160],
+)
+check(
+    "a session with no command center waits",
+    session_no_display.get("readiness", {}).get("reason") == "no_display",
+    json.dumps(session_no_display.get("readiness")),
+)
+check(
+    "a paired phone cannot publish the console's session",
+    session_put_device.get("status") == 403,
+    json.dumps(session_put_device)[:120],
+)
+check(
+    "an attached command center opens observation",
+    session_ready.get("readiness", {}).get("ready") is True,
+    json.dumps(session_ready.get("readiness")),
+)
+displays = display_list.get("displays", [])
+check(
+    "the display list names the attached command center",
+    len(displays) == 1 and displays[0].get("id") == "smoke-wall"
+    and displays[0].get("viewport", {}).get("width") == 1920,
+    json.dumps(displays)[:160],
+)
+listed_units = units if isinstance(units, list) else units.get("session", {}).get("units")
+check(
+    "the units are numbered the way the phone's grid numbers them",
+    isinstance(listed_units, list)
+    and len(listed_units) == 6
+    and [unit.get("index") for unit in listed_units] == [1, 2, 3, 4, 5, 6],
+    f"{len(listed_units) if isinstance(listed_units, list) else '?'} units",
+)
+check(
+    "focus is accepted against the observer view",
+    focus.get("status") == "accepted" and focus.get("view") == "observer",
+    json.dumps(focus)[:120],
+)
+
+
+def centre(camera):
+    try:
+        return (round(camera["center"]["latitude"], 6), round(camera["center"]["longitude"], 6))
+    except (KeyError, TypeError):
+        return None
+
+
+check(
+    "the observer view centred on unit 3 at the requested zoom",
+    centre(observer_after) == (-6.0211, 105.7733)
+    and abs(observer_after.get("zoom", 0) - 13.0) < 1e-9,
+    f'{centre(observer_after)} zoom {observer_after.get("zoom")}',
+)
+check(
+    "the observer command moved the observer view",
+    centre(observer_before) != centre(observer_after),
+    f"{centre(observer_before)} -> {centre(observer_after)}",
+)
+check(
+    "the game master's camera did not move",
+    centre(main_before) == centre(main_after)
+    and main_before.get("zoom") == main_after.get("zoom"),
+    f"{centre(main_before)} zoom {main_before.get('zoom')} -> "
+    f"{centre(main_after)} zoom {main_after.get('zoom')}",
+)
+check(
+    "a console that stopped refreshing turns the verdict stale",
+    session_stale.get("readiness", {}).get("reason") == "stale",
+    json.dumps(session_stale.get("readiness")),
+)
+# The CLI prints a refusal as one line on stderr, and that line is the
+# contract a person reads: the code and the reason.
+stale_text = (out_dir / "focus-stale.json").read_text() if (out_dir / "focus-stale.json").exists() else ""
+check(
+    "steering is refused while the session is stale",
+    "not_ready" in stale_text and "stale" in stale_text,
+    stale_text.strip()[:120],
+)
+check(
+    "closing the command center releases observation",
+    session_detached.get("readiness", {}).get("reason") in ("no_display", "no_session", "stale"),
+    json.dumps(session_detached.get("readiness")),
+)
 
 # After the restart.
 check(

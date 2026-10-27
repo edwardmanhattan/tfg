@@ -14,8 +14,9 @@ use super::auth;
 use super::devices::{Credentials, Devices, PairError, Scope};
 use super::hub::ControlHub;
 use super::protocol::{
-    API_VERSION, AcceptedCommand, Command, CommandRequest, Event, MAIN_VIEW, PROTOCOL_VERSION,
-    error_code,
+    API_VERSION, AcceptedCommand, COMMAND_CENTER_ROLE, CameraSource, Command, CommandRequest,
+    DisplayHello, DisplayState, Event, MAIN_VIEW, PROTOCOL_VERSION, Readiness, ReadinessReason,
+    SessionState, error_code,
 };
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -47,6 +48,12 @@ pub const MAX_WS_CLIENTS: usize = 8;
 
 /// How long startup waits for the listener to bind before reporting failure.
 const BIND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often sessions and displays are checked against their deadlines.
+///
+/// Fine enough that a phone notices a dead console within a couple of seconds
+/// of the deadline, coarse enough to be nothing on the runtime.
+const EXPIRY_TICK: Duration = Duration::from_secs(2);
 
 /// Where the server listens and what it accepts.
 #[derive(Debug, Clone)]
@@ -192,11 +199,24 @@ pub fn spawn_server(
                 let advertised = advertised_url(addr);
                 let state = Arc::new(ServerState {
                     credentials: Arc::new(Credentials::new(config.token.clone(), devices)),
-                    hub,
+                    hub: hub.clone(),
                     command_tx,
                     clients: Arc::new(AtomicUsize::new(0)),
                     generated: AtomicU64::new(0),
                     advertised,
+                });
+                // The readiness verdict is computed from timestamps, so it is
+                // already right the moment a deadline passes. This task exists
+                // to *say so*: a phone sitting on a waiting screen has to be
+                // told that the console went quiet, and a display that closed
+                // its laptop must stop counting as attached.
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(EXPIRY_TICK);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        hub.expire();
+                    }
                 });
                 accept_loop(listener, state).await;
             });
@@ -329,13 +349,89 @@ async fn handle(
             if tail != Some("camera") || parts.next().is_some() {
                 return Ok(not_found());
             }
-            if view_id != MAIN_VIEW {
+            let Some(camera) = state.hub.camera_of(view_id) else {
                 return Ok(not_found());
-            }
-            let camera = state.hub.camera();
+            };
             Ok(json_response(
                 StatusCode::OK,
                 &serde_json::json!({ "id": view_id, "camera": camera }),
+            ))
+        }
+        (&Method::GET, "/v1/session") => {
+            if let Err(response) = require(&grant, Scope::Observe) {
+                return Ok(response);
+            }
+            Ok(json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "session": state.hub.session(),
+                    "readiness": state.hub.readiness(),
+                    "displays": state.hub.displays(),
+                }),
+            ))
+        }
+        (&Method::PUT, "/v1/session") => {
+            // Only the console publishes: it is the one process that holds a
+            // Minos session, and a projection nobody can vouch for is worse
+            // than none.
+            if let Err(response) = require(&grant, Scope::Admin) {
+                return Ok(response);
+            }
+            let body = match read_body(request).await {
+                Ok(body) => body,
+                Err(response) => return Ok(response),
+            };
+            let session: SessionState = match serde_json::from_slice(&body) {
+                Ok(session) => session,
+                Err(error) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        error_code::INVALID_JSON,
+                        &format!("invalid session JSON: {error}"),
+                    ));
+                }
+            };
+            if let Err(message) = session.validate() {
+                return Ok(error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    error_code::INVALID_COMMAND,
+                    &message,
+                ));
+            }
+            let changed = state.hub.set_session(session).is_some();
+            Ok(json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "status": if changed { "changed" } else { "unchanged" },
+                    "revision": state.hub.revision(),
+                    "readiness": state.hub.readiness(),
+                }),
+            ))
+        }
+        (&Method::DELETE, "/v1/session") => {
+            if let Err(response) = require(&grant, Scope::Admin) {
+                return Ok(response);
+            }
+            state.hub.clear_session();
+            Ok(json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "status": "cleared",
+                    "revision": state.hub.revision(),
+                    "readiness": state.hub.readiness(),
+                }),
+            ))
+        }
+        (&Method::GET, "/v1/displays") => {
+            if let Err(response) = require(&grant, Scope::Observe) {
+                return Ok(response);
+            }
+            Ok(json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "displays": state.hub.displays(),
+                    "readiness": state.hub.readiness(),
+                }),
             ))
         }
         (&Method::POST, "/v1/commands") => Ok(submit_command(request, &state, &grant).await),
@@ -375,7 +471,7 @@ async fn handle(
             if let Err(response) = require(&grant, Scope::Observe) {
                 return Ok(response);
             }
-            Ok(upgrade_websocket(request, state).await)
+            Ok(upgrade_websocket(request, state, grant).await)
         }
         _ => Ok(not_found()),
     }
@@ -398,18 +494,37 @@ fn require(grant: &super::devices::Grant, needed: Scope) -> Result<(), Response<
     }
 }
 
-/// The scope a command needs. Everything that moves the map is
+/// The scope a command needs. Everything that moves a map is
 /// `control_view`; a device that only watches cannot steer.
 fn needed_scope(command: &Command) -> Scope {
     match command {
-        Command::CameraSet { .. } | Command::CameraNudge { .. } | Command::CameraZoom { .. } => {
-            Scope::ControlView
-        }
+        Command::CameraSet { .. }
+        | Command::CameraNudge { .. }
+        | Command::CameraZoom { .. }
+        | Command::CameraFocus { .. } => Scope::ControlView,
         // The viewport is something a display says about itself. A phone that
         // lies about it could change what "a quarter of a viewport" means, so
         // it needs the same scope that steering does.
         Command::ViewReport { .. } => Scope::ControlView,
     }
+}
+
+/// Whether a command may move a camera right now.
+///
+/// The readiness verdict is not advice: it is the answer to "is anyone there to
+/// see this move". A phone steering a view nobody renders is a gesture into a
+/// hole, so the server refuses it and says which condition is missing. The
+/// viewport report is exempt — a display says how big it is the moment it
+/// attaches, before the session is open.
+fn readiness_refusal(command: &Command, readiness: &Readiness) -> Option<(String, String)> {
+    if matches!(command, Command::ViewReport { .. }) || readiness.ready {
+        return None;
+    }
+    let reason = readiness.reason.map(ReadinessReason::as_str).unwrap_or("not_ready");
+    Some((
+        error_code::NOT_READY.to_string(),
+        format!("observation is not open yet: {reason}"),
+    ))
 }
 
 /// `POST /v1/pairing` — the operator opens a window and reads the code out.
@@ -584,6 +699,7 @@ async fn submit_command(
         }
     };
     let client_id = parsed.client_id();
+    let view = parsed.view_id();
     let command_id = parsed
         .command_id
         .map(|id| id.trim().to_string())
@@ -596,7 +712,7 @@ async fn submit_command(
         state.hub.command_rejected(
             &command_id,
             error_code::UNSUPPORTED_PROTOCOL,
-            "the server speaks protocol version 1",
+            "the server speaks protocol version 2",
         );
         return error_response(
             StatusCode::CONFLICT,
@@ -630,6 +746,61 @@ async fn submit_command(
         return error_response(StatusCode::FORBIDDEN, error_code::FORBIDDEN, &message);
     }
 
+    if view != MAIN_VIEW {
+        // A view the console does not render is resolved here, on the server
+        // thread, against the state the server owns. It never reaches the
+        // desktop: a phone must not be able to move the game master's screen,
+        // and the command center is a display, not a second writer.
+        if let Some((code, message)) =
+            readiness_refusal(&parsed.command, &state.hub.readiness())
+        {
+            state.hub.command_rejected(&command_id, &code, &message);
+            return error_response(StatusCode::CONFLICT, &code, &message);
+        }
+        if state.hub.remember_command(&command_id) {
+            return json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "command_id": command_id,
+                    "status": "duplicate",
+                    "view": view,
+                    "revision": state.hub.revision(),
+                }),
+            );
+        }
+        let source = CameraSource {
+            client_id: client_id.clone(),
+            command_id: Some(command_id.clone()),
+        };
+        match state.hub.apply_view(&view, &parsed.command, source) {
+            Ok(_) => {
+                state.hub.command_accepted(&command_id);
+                return json_response(
+                    StatusCode::ACCEPTED,
+                    &serde_json::json!({
+                        "command_id": command_id,
+                        "status": "accepted",
+                        "view": view,
+                        "revision": state.hub.revision(),
+                    }),
+                );
+            }
+            Err(error) => {
+                let message = error.to_string();
+                state.hub.command_rejected(
+                    &command_id,
+                    error_code::INVALID_COMMAND,
+                    &message,
+                );
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    error_code::INVALID_COMMAND,
+                    &message,
+                );
+            }
+        }
+    }
+
     // Idempotency: a retry of a command already accepted answers with the
     // duplicate status and does not reach the desktop a second time.
     if state.hub.remember_command(&command_id) {
@@ -646,6 +817,7 @@ async fn submit_command(
     let accepted = AcceptedCommand {
         client_id,
         command_id: command_id.clone(),
+        view,
         command: parsed.command,
     };
     if state.command_tx.send(accepted).is_err() {
@@ -688,6 +860,7 @@ fn next_command_id(state: &Arc<ServerState>) -> String {
 async fn upgrade_websocket(
     mut request: Request<Incoming>,
     state: Arc<ServerState>,
+    grant: super::devices::Grant,
 ) -> Response<Full<Bytes>> {
     if !is_websocket(&request) {
         return error_response(
@@ -753,7 +926,7 @@ async fn upgrade_websocket(
         };
         let stream =
             WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
-        serve_websocket(stream, hub, events).await;
+        serve_websocket(stream, hub, events, grant).await;
     });
 
     let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
@@ -780,20 +953,48 @@ impl Drop for ClientGuard {
     }
 }
 
+/// One client verb, as it arrives *up* the event stream.
+///
+/// These are not commands: a command is an HTTP POST, where the reply can say
+/// why it was refused. These are facts about the socket itself — a display
+/// announcing that it is on, and a client asking for a fresh snapshot.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "type", content = "payload")]
+enum ClientMessage {
+    #[serde(rename = "request.snapshot")]
+    RequestSnapshot,
+    #[serde(rename = "display.hello")]
+    DisplayHello(DisplayHello),
+    #[serde(rename = "display.heartbeat")]
+    DisplayHeartbeat(DisplayHeartbeat),
+    /// Anything this build does not know. Ignored rather than closing the
+    /// socket: a newer client's extra verb is not a reason to stop showing the
+    /// map.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DisplayHeartbeat {
+    id: String,
+}
+
 async fn serve_websocket(
     mut socket: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     hub: ControlHub,
     mut events: broadcast::Receiver<Event>,
+    grant: super::devices::Grant,
 ) {
     if send_event(&mut socket, hub.snapshot_event()).await.is_err() {
         return;
     }
+    let mut attached: Option<String> = None;
     loop {
         tokio::select! {
             event = events.recv() => match event {
                 Ok(event) => {
                     if send_event(&mut socket, event).await.is_err() {
-                        return;
+                        break;
                     }
                 }
                 // A subscriber that fell behind is resynchronised with a whole
@@ -801,32 +1002,89 @@ async fn serve_websocket(
                 // the truth; anything older is advice.
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     if send_event(&mut socket, hub.snapshot_event()).await.is_err() {
-                        return;
+                        break;
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => return,
+                Err(broadcast::error::RecvError::Closed) => break,
             },
             incoming = socket.next() => match incoming {
                 Some(Ok(Message::Text(text))) => {
-                    // One client verb: ask for a snapshot. A camera command is
-                    // not accepted here — commands go over HTTP, where a reply
-                    // can say why a command was refused.
-                    let wants_snapshot = serde_json::from_str::<serde_json::Value>(text.as_str())
-                        .ok()
-                        .and_then(|value| value.get("type").and_then(|t| t.as_str()).map(str::to_string))
-                        .is_some_and(|kind| kind == "request.snapshot");
-                    if wants_snapshot
-                        && send_event(&mut socket, hub.snapshot_event()).await.is_err()
-                    {
-                        return;
+                    let Ok(message) = serde_json::from_str::<ClientMessage>(text.as_str()) else {
+                        continue;
+                    };
+                    match message {
+                        ClientMessage::RequestSnapshot => {
+                            if send_event(&mut socket, hub.snapshot_event()).await.is_err() {
+                                break;
+                            }
+                        }
+                        ClientMessage::DisplayHello(hello) => {
+                            let reply = attach_display(&hub, &grant, hello);
+                            if send_event(&mut socket, reply.clone()).await.is_err() {
+                                break;
+                            }
+                            attached = match reply {
+                                Event::DisplayAttached { id } => Some(id),
+                                _ => attached,
+                            };
+                            // The snapshot carries the new display list, so a
+                            // client that just attached does not have to guess
+                            // whether it was counted.
+                            if send_event(&mut socket, hub.snapshot_event()).await.is_err() {
+                                break;
+                            }
+                        }
+                        ClientMessage::DisplayHeartbeat(beat) => {
+                            if attached.as_deref() == Some(beat.id.as_str()) {
+                                hub.touch_display(&beat.id);
+                            }
+                        }
+                        ClientMessage::Unknown => {}
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => return,
+                Some(Ok(Message::Close(_))) | None => break,
                 Some(Ok(_)) => {}
-                Some(Err(_)) => return,
+                Some(Err(_)) => break,
             },
         }
     }
+    // The attachment dies with the socket. That is the whole point of putting
+    // it here: a closed window cannot keep claiming to be showing something.
+    if let Some(id) = attached {
+        hub.detach_display(&id);
+    }
+}
+
+/// Answer a display's handshake. A command center is a display the server can
+/// see; only the operator's own credential may claim to be one.
+fn attach_display(
+    hub: &ControlHub,
+    grant: &super::devices::Grant,
+    hello: DisplayHello,
+) -> Event {
+    if !grant.allows(Scope::Admin) {
+        return Event::DisplayRejected {
+            code: error_code::FORBIDDEN.to_string(),
+            message: format!(
+                "a {} display needs the admin scope; this credential carries {:?}",
+                hello.role, grant.scopes
+            ),
+        };
+    }
+    if let Err(message) = hello.validate() {
+        return Event::DisplayRejected {
+            code: error_code::INVALID_COMMAND.to_string(),
+            message,
+        };
+    }
+    let id = hello.display_id();
+    hub.attach_display(DisplayState {
+        label: hello.label_or_id(),
+        role: COMMAND_CENTER_ROLE.to_string(),
+        viewport: hello.viewport,
+        id: id.clone(),
+    });
+    Event::DisplayAttached { id }
 }
 
 async fn send_event(
@@ -964,6 +1222,7 @@ mod tests {
             let request = match method {
                 "GET" => self.http.get(url),
                 "POST" => self.http.post(url),
+                "PUT" => self.http.put(url),
                 "DELETE" => self.http.delete(url),
                 other => panic!("unsupported method {other}"),
             };
@@ -1006,14 +1265,34 @@ mod tests {
             &self,
         ) -> tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>
         {
+            self.connect_ws_as(TOKEN)
+        }
+
+        fn connect_ws_as(
+            &self,
+            token: &str,
+        ) -> tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>
+        {
             let url = format!("{}/v1/ws", self.handle.url().replace("http://", "ws://"));
             let mut request = url.into_client_request().expect("ws request");
             request.headers_mut().insert(
                 hyper::header::AUTHORIZATION,
-                hyper::header::HeaderValue::from_str(&format!("Bearer {TOKEN}")).expect("header"),
+                hyper::header::HeaderValue::from_str(&format!("Bearer {token}")).expect("header"),
             );
             let (socket, _response) = tungstenite::connect(request).expect("ws connect");
             socket
+        }
+
+        /// Publish a projection the way the console does.
+        fn put_session(&self, body: &serde_json::Value) -> reqwest::blocking::Response {
+            self.call("PUT", Some(TOKEN), "/v1/session", Some(body.clone()))
+        }
+
+        /// `/v1/session`, parsed: the readiness verdict and the session.
+        fn session(&self) -> serde_json::Value {
+            let response = self.get("/v1/session");
+            assert_eq!(response.status(), 200);
+            response.json().expect("json")
         }
     }
 
@@ -1043,7 +1322,7 @@ mod tests {
             .expect("request");
         assert_eq!(response.status(), 200);
         let body: serde_json::Value = response.json().expect("json");
-        assert_eq!(body["protocol_version"], 1);
+        assert_eq!(body["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(body["api_version"], "v1");
     }
 
@@ -1063,7 +1342,7 @@ mod tests {
         assert_eq!(authorized.status(), 200);
         let body: serde_json::Value = authorized.json().expect("json");
         assert_eq!(body["type"], "snapshot");
-        assert_eq!(body["protocol_version"], 1);
+        assert_eq!(body["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(body["views"]["main"]["camera"]["zoom"], 11.0);
     }
 
@@ -1077,7 +1356,7 @@ mod tests {
         ));
 
         let response = host.post(serde_json::json!({
-            "protocol_version": 1,
+            "protocol_version": PROTOCOL_VERSION,
             "client_id": "test-cli",
             "command_id": "c-1",
             "type": "camera.nudge",
@@ -1227,6 +1506,376 @@ mod tests {
         let (revision, views) = last.expect("a snapshot arrived");
         assert_eq!(revision, 1);
         assert_eq!(views["main"].camera.zoom, 12.0);
+    }
+
+    fn session_json(phase: &str) -> serde_json::Value {
+        serde_json::json!({
+            "game_id": 42,
+            "name": "Sunda Strait Watch",
+            "phase": phase,
+            "mode": "maneuver",
+            "units": [
+                {
+                    "id": 1,
+                    "name": "Evertsen",
+                    "hull_number": "F805",
+                    "class_name": "Frigate",
+                    "position": { "latitude": -6.2, "longitude": 106.8 }
+                },
+                {
+                    "id": 2,
+                    "name": "Tromp",
+                    "hull_number": "F801",
+                    "class_name": "Frigate",
+                    "position": { "latitude": -5.9, "longitude": 106.9 }
+                }
+            ]
+        })
+    }
+
+    /// Say hello as a display and read until the server answers the handshake.
+    fn hello_as(
+        socket: &mut tungstenite::WebSocket<
+            tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
+        >,
+        id: &str,
+    ) -> Event {
+        socket
+            .send(tungstenite::Message::text(
+                serde_json::json!({
+                    "type": "display.hello",
+                    "payload": {
+                        "id": id,
+                        "role": "command_center",
+                        "label": id,
+                        "viewport": { "width": 1920, "height": 1080 }
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("send hello");
+        for _ in 0..8 {
+            match next_event(socket, Duration::from_secs(2)) {
+                event @ (Event::DisplayAttached { .. } | Event::DisplayRejected { .. }) => {
+                    return event;
+                }
+                _ => {}
+            }
+        }
+        panic!("the server never answered the display handshake");
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    #[test]
+    fn a_session_is_published_numbered_and_read_back() {
+        let host = FakeHost::start();
+        let response = host.put_session(&session_json("execution"));
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().expect("json");
+        assert_eq!(body["status"], "changed");
+        assert_eq!(body["readiness"]["reason"], "no_display");
+
+        let state = host.session();
+        assert_eq!(state["session"]["name"], "Sunda Strait Watch");
+        assert_eq!(state["session"]["units"][0]["index"], 1);
+        assert_eq!(state["session"]["units"][1]["index"], 2);
+        assert_eq!(state["session"]["units"][1]["id"], 2);
+    }
+
+    #[test]
+    fn republishing_the_same_session_is_a_heartbeat() {
+        let host = FakeHost::start();
+        host.put_session(&session_json("execution"));
+        let revision = host.hub.revision();
+        let response = host.put_session(&session_json("execution"));
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().expect("json");
+        assert_eq!(body["status"], "unchanged");
+        assert_eq!(body["revision"], revision);
+    }
+
+    #[test]
+    fn a_session_in_planning_does_not_open_observation() {
+        let host = FakeHost::start();
+        host.put_session(&session_json("planning"));
+        assert_eq!(host.session()["readiness"]["reason"], "not_execution");
+    }
+
+    #[test]
+    fn an_impossible_session_is_refused() {
+        let host = FakeHost::start();
+        let mut body = session_json("execution");
+        body["units"][1]["id"] = serde_json::json!(1);
+        let response = host.put_session(&body);
+        assert_eq!(response.status(), 422);
+        let error: serde_json::Value = response.json().expect("json");
+        assert_eq!(error["error"]["code"], "invalid_command");
+    }
+
+    #[test]
+    fn a_paired_device_cannot_publish_a_session() {
+        let host = FakeHost::start();
+        let (_, token) = host.pair_device("phone", &["observe", "control_view"]);
+        let response = host.call(
+            "PUT",
+            Some(&token),
+            "/v1/session",
+            Some(session_json("execution")),
+        );
+        assert_eq!(response.status(), 403);
+        assert_eq!(host.session()["session"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_session_can_be_cleared() {
+        let host = FakeHost::start();
+        host.put_session(&session_json("execution"));
+        let response = host.call("DELETE", Some(TOKEN), "/v1/session", None);
+        assert_eq!(response.status(), 200);
+        let state = host.session();
+        assert_eq!(state["session"], serde_json::Value::Null);
+        assert_eq!(state["readiness"]["reason"], "no_session");
+    }
+
+    #[test]
+    fn a_display_handshake_opens_observation() {
+        let host = FakeHost::start();
+        host.put_session(&session_json("execution"));
+        assert_eq!(host.session()["readiness"]["reason"], "no_display");
+
+        let mut socket = host.connect_ws();
+        // The snapshot, then the handshake answer.
+        assert!(matches!(
+            next_event(&mut socket, Duration::from_secs(2)),
+            Event::Snapshot { .. }
+        ));
+        match hello_as(&mut socket, "wall-1") {
+            Event::DisplayAttached { id } => assert_eq!(id, "wall-1"),
+            other => panic!("expected an attachment, got {other:?}"),
+        }
+        assert!(wait_until(|| host.hub.readiness().ready));
+        // The first command center creates the observer view from the
+        // operator's camera, and does not move it.
+        assert_eq!(host.hub.camera_of(crate::control::OBSERVER_VIEW), Some(camera(-6.2, 11.0)));
+        assert_eq!(host.hub.camera(), camera(-6.2, 11.0));
+
+        let displays = host.get("/v1/displays");
+        assert_eq!(displays.status(), 200);
+        let displays: serde_json::Value = displays.json().expect("json");
+        assert_eq!(displays["displays"][0]["id"], "wall-1");
+        assert_eq!(displays["displays"][0]["viewport"]["width"], 1920);
+    }
+
+    #[test]
+    fn a_phone_cannot_claim_to_be_a_command_center() {
+        let host = FakeHost::start();
+        host.put_session(&session_json("execution"));
+        let (_, token) = host.pair_device("phone", &["observe", "control_view"]);
+        let mut socket = host.connect_ws_as(&token);
+        assert!(matches!(
+            next_event(&mut socket, Duration::from_secs(2)),
+            Event::Snapshot { .. }
+        ));
+        match hello_as(&mut socket, "impostor") {
+            Event::DisplayRejected { code, .. } => assert_eq!(code, "forbidden"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(host.session()["readiness"]["reason"], "no_display");
+    }
+
+    #[test]
+    fn a_display_that_disconnects_stops_counting() {
+        let host = FakeHost::start();
+        host.put_session(&session_json("execution"));
+        let mut socket = host.connect_ws();
+        assert!(matches!(
+            next_event(&mut socket, Duration::from_secs(2)),
+            Event::Snapshot { .. }
+        ));
+        hello_as(&mut socket, "wall-1");
+        assert!(wait_until(|| host.hub.readiness().ready));
+
+        drop(socket);
+        assert!(
+            wait_until(|| host.hub.readiness().reason
+                == Some(crate::control::ReadinessReason::NoDisplay)),
+            "the display stayed attached after its socket closed"
+        );
+        // The observer camera is kept: a command center that reconnects before
+        // the next session is not thrown back to a default place.
+        assert!(host.hub.camera_of(crate::control::OBSERVER_VIEW).is_some());
+    }
+
+    #[test]
+    fn a_focus_moves_the_observer_and_never_the_console() {
+        let host = FakeHost::start();
+        host.put_session(&session_json("execution"));
+        let mut socket = host.connect_ws();
+        assert!(matches!(
+            next_event(&mut socket, Duration::from_secs(2)),
+            Event::Snapshot { .. }
+        ));
+        hello_as(&mut socket, "wall-1");
+        assert!(wait_until(|| host.hub.readiness().ready));
+
+        let response = host.post(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "view": "observer",
+            "client_id": "phone",
+            "command_id": "focus-1",
+            "type": "camera.focus",
+            "payload": { "unit_id": 2, "zoom": 13.0 }
+        }));
+        assert_eq!(response.status(), 202);
+        let body: serde_json::Value = response.json().expect("json");
+        assert_eq!(body["view"], "observer");
+
+        let observer = host
+            .hub
+            .camera_of(crate::control::OBSERVER_VIEW)
+            .expect("observer");
+        assert!((observer.center.latitude + 5.9).abs() < 1e-9);
+        assert_eq!(observer.zoom, 13.0);
+        // The game master's screen did not move, and the command never reached
+        // the desktop's channel.
+        assert_eq!(host.hub.camera(), camera(-6.2, 11.0));
+        assert!(
+            host.commands.try_recv().is_err(),
+            "an observer command reached the console"
+        );
+    }
+
+    #[test]
+    fn an_observer_command_waits_for_readiness() {
+        let host = FakeHost::start();
+        let response = host.post(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "view": "observer",
+            "client_id": "phone",
+            "command_id": "focus-1",
+            "type": "camera.focus",
+            "payload": { "unit_id": 1 }
+        }));
+        assert_eq!(response.status(), 409);
+        let body: serde_json::Value = response.json().expect("json");
+        assert_eq!(body["error"]["code"], "not_ready");
+        assert!(host.hub.camera_of(crate::control::OBSERVER_VIEW).is_none());
+    }
+
+    #[test]
+    fn a_viewport_report_is_allowed_before_observation_opens() {
+        // A command center says how big it is the moment it attaches; that
+        // cannot wait for a session, and it moves no camera.
+        let host = FakeHost::start();
+        let response = host.post(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "view": "observer",
+            "client_id": "wall-1",
+            "command_id": "viewport-1",
+            "type": "view.report",
+            "payload": { "width": 1920, "height": 1080 }
+        }));
+        assert_eq!(response.status(), 202);
+        let observer = host
+            .hub
+            .camera_of(crate::control::OBSERVER_VIEW)
+            .expect("observer");
+        assert_eq!((observer.width, observer.height), (1920, 1080));
+    }
+
+    #[test]
+    fn a_focus_on_a_unit_nobody_has_is_a_422() {
+        let host = FakeHost::start();
+        host.put_session(&session_json("execution"));
+        let mut socket = host.connect_ws();
+        assert!(matches!(
+            next_event(&mut socket, Duration::from_secs(2)),
+            Event::Snapshot { .. }
+        ));
+        hello_as(&mut socket, "wall-1");
+        assert!(wait_until(|| host.hub.readiness().ready));
+
+        let response = host.post(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "view": "observer",
+            "client_id": "phone",
+            "command_id": "focus-9",
+            "type": "camera.focus",
+            "payload": { "unit_id": 99 }
+        }));
+        assert_eq!(response.status(), 422);
+        let body: serde_json::Value = response.json().expect("json");
+        assert_eq!(body["error"]["code"], "invalid_command");
+    }
+
+    #[test]
+    fn a_snapshot_carries_the_session_and_the_verdict() {
+        let host = FakeHost::start();
+        host.put_session(&session_json("execution"));
+        let mut socket = host.connect_ws();
+        match next_event(&mut socket, Duration::from_secs(2)) {
+            Event::Snapshot {
+                session,
+                readiness,
+                displays,
+                ..
+            } => {
+                let session = session.expect("a session");
+                assert_eq!(session.game_id, 42);
+                assert!(session.is_execution());
+                assert_eq!(session.units.len(), 2);
+                assert_eq!(readiness.reason, Some(crate::control::ReadinessReason::NoDisplay));
+                assert!(displays.is_empty());
+            }
+            other => panic!("expected a snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_display_rejection_does_not_close_the_socket() {
+        // A client that mislabels itself can retry with a different role; a
+        // closed socket would make that a reconnect for a typo.
+        let host = FakeHost::start();
+        let mut socket = host.connect_ws();
+        assert!(matches!(
+            next_event(&mut socket, Duration::from_secs(2)),
+            Event::Snapshot { .. }
+        ));
+        socket
+            .send(tungstenite::Message::text(
+                serde_json::json!({
+                    "type": "display.hello",
+                    "payload": { "id": "x", "role": "coffee_machine" }
+                })
+                .to_string(),
+            ))
+            .expect("send");
+        let mut rejected = false;
+        for _ in 0..8 {
+            match next_event(&mut socket, Duration::from_secs(2)) {
+                Event::DisplayRejected { code, .. } => {
+                    assert_eq!(code, "invalid_command");
+                    rejected = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(rejected, "the bad role was not refused");
+        match hello_as(&mut socket, "wall-1") {
+            Event::DisplayAttached { .. } => {}
+            other => panic!("the socket did not survive the refusal: {other:?}"),
+        }
     }
 
     #[test]

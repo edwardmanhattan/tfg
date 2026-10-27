@@ -1,27 +1,37 @@
-//! The shared control state: one writer, one monotonic revision, one fan-out.
+//! The shared observation state: one revision, one fan-out, one writer per
+//! fact.
 //!
-//! [`ControlHub`] is the single owner of the camera that clients read, and it
-//! has exactly one writer per deployment:
+//! [`ControlHub`] owns everything a remote client may see:
 //!
-//! - **Embedded**: the desktop's order thread (`report_camera`), because it is
-//!   the thread that already owns the camera tuple and the map request. The
-//!   camera in the hub is therefore always one the shell is rendering.
-//! - **Headless** (`tfg-server`): the command thread (`apply`), which resolves
-//!   a semantic command with the same arithmetic the shell uses.
+//! - the camera the console renders (`main`),
+//! - the camera a command center renders and a phone moves (`observer`),
+//! - the exercise the console projected (`session`), with its units,
+//! - which command centers are attached,
+//! - the readiness verdict computed from those facts.
 //!
-//! Either way the server threads only read (`camera`, `snapshot_event`) and
-//! subscribe (`subscribe`). That is the single-writer rule from the
-//! control-plane ADR, enforced by the API rather than by convention.
+//! Each fact has exactly one writer, and the mutex is where they meet:
+//!
+//! - **Embedded**: the desktop's order thread reports `main`; the session
+//!   publisher writes the session; the server thread applies observer
+//!   commands and records displays.
+//! - **Headless** (`tfg-server`): the command thread applies `main`, the HTTP
+//!   route writes the session, the server thread applies observer commands.
+//!
+//! No writer is a toolkit object and no server thread touches GPUI. The camera
+//! in the hub is always one somebody is rendering, and the session is always
+//! one the console actually holds.
 //!
 //! Idempotency lives here too: the hub remembers recent command ids, so a
 //! client that retries a POST after a timeout does not move the camera twice.
 
 use super::protocol::{
-    CameraSnapshot, CameraSource, Command, Event, GeoPoint, MAIN_VIEW, PROTOCOL_VERSION, ViewState,
+    CameraSnapshot, CameraSource, Command, DisplayState, Event, GeoPoint, MAIN_VIEW,
+    OBSERVER_VIEW, PROTOCOL_VERSION, Readiness, ReadinessReason, SessionState, ViewState,
 };
 use crate::map_geometry::pan_center;
 use crate::view::{ZOOM_MAX, ZOOM_MIN};
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -39,9 +49,37 @@ pub const SEEN_COMMAND_CAPACITY: usize = 512;
 /// command; the operator's hand has moved on.
 pub const SEEN_COMMAND_TTL: Duration = Duration::from_secs(300);
 
+/// A session that has not been refreshed for this long is no longer live.
+///
+/// The console refreshes every five seconds. Fifteen seconds tolerates two
+/// missed heartbeats and still notices a crash before a phone has been staring
+/// at a frozen map for long.
+pub const SESSION_TTL: Duration = Duration::from_secs(15);
+
+/// A command center that has not been heard from for this long is gone.
+///
+/// The display heartbeats every ten seconds; thirty seconds tolerates two
+/// missed beats plus a reconnect.
+pub const DISPLAY_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct SessionRecord {
+    state: SessionState,
+    last_seen: Instant,
+}
+
+#[derive(Debug)]
+struct DisplayRecord {
+    state: DisplayState,
+    last_seen: Instant,
+}
+
 #[derive(Debug)]
 struct Shared {
-    camera: CameraSnapshot,
+    views: BTreeMap<String, CameraSnapshot>,
+    session: Option<SessionRecord>,
+    displays: BTreeMap<String, DisplayRecord>,
+    readiness: Readiness,
     revision: u64,
     /// Recent `(command_id, first seen)` pairs, oldest first.
     seen: VecDeque<(String, Instant)>,
@@ -65,6 +103,32 @@ impl Shared {
     }
 }
 
+/// Why a camera command could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyError {
+    /// No view has that name. `observer` is created when a display attaches;
+    /// anything else is a client bug.
+    UnknownView(String),
+    /// The focus command named a unit the session does not hold.
+    UnknownUnit(i64),
+    /// The unit exists but has neither a live fix nor a recorded placement.
+    UnitHasNoPosition(i64),
+}
+
+impl fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownView(view) => write!(f, "there is no view named `{view}`"),
+            Self::UnknownUnit(id) => write!(f, "the session holds no unit {id}"),
+            Self::UnitHasNoPosition(id) => {
+                write!(f, "unit {id} has no position to focus on")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ApplyError {}
+
 /// The handle shared between the desktop host and the server threads.
 ///
 /// Cheap to clone: clones share the same state and the same event fan-out.
@@ -80,7 +144,10 @@ impl ControlHub {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         Self {
             shared: Arc::new(Mutex::new(Shared {
-                camera,
+                views: BTreeMap::from([(MAIN_VIEW.to_string(), camera)]),
+                session: None,
+                displays: BTreeMap::new(),
+                readiness: Readiness::waiting(ReadinessReason::NoSession),
                 revision: 0,
                 seen: VecDeque::new(),
             })),
@@ -88,17 +155,27 @@ impl ControlHub {
         }
     }
 
-    /// A poisoned lock here holds a camera and a revision, not a half-applied
-    /// transaction, so recovering is honest: the state is still whole.
+    /// A poisoned lock here holds whole values and a revision, not a
+    /// half-applied transaction, so recovering is honest.
     fn lock(&self) -> MutexGuard<'_, Shared> {
         self.shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The camera the desktop currently renders.
+    /// The camera the desktop currently renders. The main view is never
+    /// removed, so this cannot be absent.
     pub fn camera(&self) -> CameraSnapshot {
-        self.lock().camera
+        self.lock()
+            .views
+            .get(MAIN_VIEW)
+            .copied()
+            .expect("the main view is created with the hub")
+    }
+
+    /// One named camera, if it exists.
+    pub fn camera_of(&self, view: &str) -> Option<CameraSnapshot> {
+        self.lock().views.get(view).copied()
     }
 
     /// The revision of the shared state. Monotonic; 0 before the first change.
@@ -106,17 +183,49 @@ impl ControlHub {
         self.lock().revision
     }
 
+    /// The exercise the console published, if any. A stale session is still
+    /// returned: the map can keep showing the last known units while the
+    /// readiness verdict says nobody is refreshing them.
+    pub fn session(&self) -> Option<SessionState> {
+        self.lock().session.as_ref().map(|record| record.state.clone())
+    }
+
+    /// The command centers attached and live right now.
+    pub fn displays(&self) -> Vec<DisplayState> {
+        let shared = self.lock();
+        live_displays(&shared, Instant::now())
+    }
+
+    /// The readiness verdict, computed against the clock rather than trusted
+    /// from the last mutation.
+    pub fn readiness(&self) -> Readiness {
+        let shared = self.lock();
+        readiness_at(&shared, Instant::now())
+    }
+
     /// The whole shared state, as the WebSocket snapshot and `/v1/state`.
     pub fn snapshot_event(&self) -> Event {
         let shared = self.lock();
-        let view = ViewState {
-            id: MAIN_VIEW.to_string(),
-            camera: shared.camera,
-        };
+        let now = Instant::now();
         Event::Snapshot {
             protocol_version: PROTOCOL_VERSION,
             revision: shared.revision,
-            views: BTreeMap::from([(MAIN_VIEW.to_string(), view)]),
+            views: shared
+                .views
+                .iter()
+                .map(|(id, camera)| {
+                    (
+                        id.clone(),
+                        ViewState {
+                            id: id.clone(),
+                            camera: *camera,
+                        },
+                    )
+                })
+                .collect(),
+            session: shared.session.as_ref().map(|record| record.state.clone()),
+            readiness: readiness_at(&shared, now),
+            displays: live_displays(&shared, now),
         }
     }
 
@@ -127,37 +236,82 @@ impl ControlHub {
     }
 
     /// A new camera from the desktop, with the client (or hand) that moved it.
-    ///
-    /// Returns the new revision when the camera actually changed, and `None`
-    /// when the tick reported the camera it already had — which is most ticks,
-    /// because the shell tells the binary where the camera is on every one. A
-    /// resize counts: the viewport is part of the camera, and a remote nudge
-    /// resolves against it.
+    /// The main-view wrapper for [`Self::report_view`].
     pub fn report_camera(&self, camera: CameraSnapshot, source: CameraSource) -> Option<u64> {
-        self.commit(camera, source)
+        self.report_view(MAIN_VIEW, camera, source)
     }
 
-    /// Resolve a camera command against the shared state.
+    /// A camera report for one named view.
     ///
-    /// The desktop does not need this: it moves its own camera and reports the
-    /// result, so the camera in the hub is always one it is rendering. A
-    /// headless server has no camera to ask, so the command is applied here —
-    /// with the same Mercator arithmetic and the same zoom rails the shell
-    /// uses, because a reducer that clamped differently from the renderer
-    /// would publish a camera nobody draws.
+    /// Returns the new revision when the camera actually changed, and `None`
+    /// when the tick reported the camera it already had. A resize counts: the
+    /// viewport is part of the camera, and a remote nudge resolves against it.
+    pub fn report_view(
+        &self,
+        view: &str,
+        camera: CameraSnapshot,
+        source: CameraSource,
+    ) -> Option<u64> {
+        let mut shared = self.lock();
+        if !shared.views.contains_key(view) && !create_observer(&mut shared, view) {
+            return None;
+        }
+        if shared.views.get(view).is_some_and(|current| *current == camera) {
+            return None;
+        }
+        shared.views.insert(view.to_string(), camera);
+        let revision = bump(&mut shared);
+        let event = camera_event(
+            revision,
+            view,
+            camera,
+            Some(source.client_id),
+            source.command_id,
+        );
+        drop(shared);
+        let _ = self.events.send(event);
+        Some(revision)
+    }
+
+    /// Resolve a camera command against the main view.
+    pub fn apply(&self, command: &Command, source: CameraSource) -> Option<u64> {
+        self.apply_view(MAIN_VIEW, command, source).ok().flatten()
+    }
+
+    /// Resolve a camera command against one named view.
+    ///
+    /// The desktop does not need this for `main`: it moves its own camera and
+    /// reports the result, so the camera in the hub is always one it is
+    /// rendering. A headless server has no camera to ask, so the command is
+    /// applied here — with the same Mercator arithmetic and the same zoom rails
+    /// the shell uses, because a reducer that clamped differently from the
+    /// renderer would publish a camera nobody draws. The observer view is
+    /// always applied here, on both deployments, because only the command
+    /// center renders it.
     ///
     /// Returns the revision when something changed, `None` when the command was
-    /// a no-op (already at the zoom rail, a nudge of zero, a viewport that is
-    /// the one already reported). An `AcceptedCommand` whose command was a
-    /// no-op is still *accepted*; it simply does not move anything.
-    pub fn apply(&self, command: &Command, source: CameraSource) -> Option<u64> {
-        let current = self.camera();
+    /// a no-op. An `AcceptedCommand` whose command was a no-op is still
+    /// *accepted*; it simply does not move anything.
+    pub fn apply_view(
+        &self,
+        view: &str,
+        command: &Command,
+        source: CameraSource,
+    ) -> Result<Option<u64>, ApplyError> {
+        let mut shared = self.lock();
+        if !shared.views.contains_key(view) && !create_observer(&mut shared, view) {
+            return Err(ApplyError::UnknownView(view.to_string()));
+        }
+        let current = *shared
+            .views
+            .get(view)
+            .expect("the view exists after creation");
         let next = match command {
-            Command::CameraSet { center, zoom } => CameraSnapshot {
+            Command::CameraSet { center, zoom } => Some(CameraSnapshot {
                 center: *center,
                 zoom: zoom.clamp(ZOOM_MIN, ZOOM_MAX),
                 ..current
-            },
+            }),
             Command::CameraNudge {
                 dx_fraction,
                 dy_fraction,
@@ -166,7 +320,7 @@ impl ControlHub {
                 if width <= 0.0 || height <= 0.0 {
                     // No display has said how big it is: a fraction of a
                     // viewport nobody has named has no meaning.
-                    return None;
+                    return Ok(None);
                 }
                 let (latitude, longitude) = pan_center(
                     (current.center.latitude, current.center.longitude),
@@ -176,51 +330,256 @@ impl ControlHub {
                     width,
                     height,
                 );
-                CameraSnapshot {
+                Some(CameraSnapshot {
                     center: GeoPoint {
                         latitude,
                         longitude,
                     },
                     ..current
-                }
+                })
             }
-            Command::CameraZoom { delta } => CameraSnapshot {
+            Command::CameraZoom { delta } => Some(CameraSnapshot {
                 zoom: (current.zoom + delta).clamp(ZOOM_MIN, ZOOM_MAX),
                 ..current
-            },
-            Command::ViewReport { width, height } => CameraSnapshot {
+            }),
+            Command::CameraFocus { unit_id, zoom } => {
+                let position = shared
+                    .session
+                    .as_ref()
+                    .and_then(|record| {
+                        record
+                            .state
+                            .units
+                            .iter()
+                            .find(|unit| unit.id == *unit_id)
+                    })
+                    .ok_or(ApplyError::UnknownUnit(*unit_id))?
+                    .position
+                    .ok_or(ApplyError::UnitHasNoPosition(*unit_id))?;
+                Some(CameraSnapshot {
+                    center: position,
+                    zoom: zoom
+                        .map(|zoom| zoom.clamp(ZOOM_MIN, ZOOM_MAX))
+                        .unwrap_or(current.zoom),
+                    ..current
+                })
+            }
+            Command::ViewReport { width, height } => Some(CameraSnapshot {
                 width: *width,
                 height: *height,
                 ..current
-            },
+            }),
         };
-        self.commit(next, source)
+        let Some(camera) = next else {
+            return Ok(None);
+        };
+        if camera == current {
+            return Ok(None);
+        }
+        shared.views.insert(view.to_string(), camera);
+        let revision = bump(&mut shared);
+        let event = camera_event(
+            revision,
+            view,
+            camera,
+            Some(source.client_id),
+            source.command_id,
+        );
+        drop(shared);
+        let _ = self.events.send(event);
+        Ok(Some(revision))
     }
 
-    /// The one place the shared camera changes. Equality is the coalescing
-    /// rule: a report that matches costs nothing, which is what makes an
-    /// optimistic client safe — a display that follows a command and then
-    /// reports the camera it followed publishes nothing.
-    fn commit(&self, camera: CameraSnapshot, source: CameraSource) -> Option<u64> {
-        let revision = {
-            let mut shared = self.lock();
-            if shared.camera == camera {
-                return None;
-            }
-            shared.camera = camera;
-            shared.revision += 1;
-            shared.revision
-        };
-        let _ = self.events.send(Event::CameraChanged {
-            revision,
-            source: Some(source.client_id),
-            command_id: source.command_id,
-            view: ViewState {
-                id: MAIN_VIEW.to_string(),
-                camera,
-            },
+    /// Publish the console's projection of the exercise it holds.
+    ///
+    /// The hub owns the unit numbers: it assigns `index` from array order, so
+    /// the phone's grid and the command center's markers cannot disagree. A
+    /// publish equal to the current state is a heartbeat and publishes
+    /// nothing.
+    pub fn set_session(&self, mut session: SessionState) -> Option<u64> {
+        for (index, unit) in session.units.iter_mut().enumerate() {
+            unit.index = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        }
+        let now = Instant::now();
+        let mut shared = self.lock();
+        let previous_game = shared.session.as_ref().map(|record| record.state.game_id);
+        let changed = shared
+            .session
+            .as_ref()
+            .map(|record| &record.state)
+            != Some(&session);
+        // Computed rather than read from the cached verdict: the clock moved
+        // since the last mutation, and a session that went quiet is exactly
+        // the case this publish revives.
+        let was_stale = readiness_at(&shared, now).reason == Some(ReadinessReason::Stale);
+        shared.session = Some(SessionRecord {
+            state: session.clone(),
+            last_seen: now,
         });
+        if !changed && !was_stale {
+            shared.readiness = readiness_at(&shared, now);
+            return None;
+        }
+        // A new exercise opens where the operator is looking; an update to the
+        // same exercise leaves the observer where the phone put it.
+        let reset = previous_game != Some(session.game_id);
+        if reset
+            && let Some(main) = shared.views.get(MAIN_VIEW).copied()
+            && shared.views.contains_key(OBSERVER_VIEW)
+        {
+            shared.views.insert(OBSERVER_VIEW.to_string(), main);
+        }
+        let revision = bump(&mut shared);
+        let readiness = readiness_at(&shared, now);
+        shared.readiness = readiness.clone();
+        let mut events = vec![session_event(&shared, revision, readiness)];
+        if reset
+            && let Some(observer) = shared.views.get(OBSERVER_VIEW).copied()
+        {
+            events.push(camera_event(
+                revision,
+                OBSERVER_VIEW,
+                observer,
+                Some("server".to_string()),
+                None,
+            ));
+        }
+        drop(shared);
+        publish(&self.events, events);
         Some(revision)
+    }
+
+    /// The console no longer holds an exercise. The observer camera is kept
+    /// where it was, so a command center that reconnects before the next
+    /// session is not thrown back to a default place.
+    pub fn clear_session(&self) -> Option<u64> {
+        let now = Instant::now();
+        let mut shared = self.lock();
+        shared.session.take()?;
+        let revision = bump(&mut shared);
+        let readiness = readiness_at(&shared, now);
+        shared.readiness = readiness.clone();
+        let event = session_event(&shared, revision, readiness);
+        drop(shared);
+        let _ = self.events.send(event);
+        Some(revision)
+    }
+
+    /// Refresh a session without republishing it.
+    ///
+    /// A heartbeat that arrives while the session is healthy changes nothing.
+    /// One that revives a stale session is a real change: readiness flips back.
+    pub fn touch_session(&self) -> Option<u64> {
+        let now = Instant::now();
+        let mut shared = self.lock();
+        shared.session.as_ref()?;
+        // Read the verdict *before* refreshing: a session that was stale is
+        // exactly the one this heartbeat brings back.
+        let was_stale = readiness_at(&shared, now).reason == Some(ReadinessReason::Stale);
+        if let Some(record) = shared.session.as_mut() {
+            record.last_seen = now;
+        }
+        if !was_stale {
+            return None;
+        }
+        let revision = bump(&mut shared);
+        let readiness = readiness_at(&shared, now);
+        shared.readiness = readiness.clone();
+        let event = session_event(&shared, revision, readiness);
+        drop(shared);
+        let _ = self.events.send(event);
+        Some(revision)
+    }
+
+    /// Record that a command center is attached. The first one creates the
+    /// observer view from the operator's camera.
+    pub fn attach_display(&self, display: DisplayState) -> Option<u64> {
+        let now = Instant::now();
+        let mut shared = self.lock();
+        let id = display.id.clone();
+        shared.displays.insert(
+            id,
+            DisplayRecord {
+                state: display,
+                last_seen: now,
+            },
+        );
+        let created = if shared.views.contains_key(OBSERVER_VIEW) {
+            None
+        } else {
+            shared
+                .views
+                .get(MAIN_VIEW)
+                .copied()
+                .map(|main| {
+                    shared.views.insert(OBSERVER_VIEW.to_string(), main);
+                    main
+                })
+        };
+        let revision = bump(&mut shared);
+        let readiness = readiness_at(&shared, now);
+        shared.readiness = readiness.clone();
+        let mut events = vec![session_event(&shared, revision, readiness)];
+        if let Some(observer) = created {
+            events.push(camera_event(
+                revision,
+                OBSERVER_VIEW,
+                observer,
+                Some("server".to_string()),
+                None,
+            ));
+        }
+        drop(shared);
+        publish(&self.events, events);
+        Some(revision)
+    }
+
+    /// A display's heartbeat. No revision: being alive is not a change.
+    pub fn touch_display(&self, id: &str) {
+        let mut shared = self.lock();
+        if let Some(record) = shared.displays.get_mut(id) {
+            record.last_seen = Instant::now();
+        }
+    }
+
+    /// A display's socket ended. Readiness may flip; the observer camera is
+    /// deliberately kept.
+    pub fn detach_display(&self, id: &str) -> Option<u64> {
+        let now = Instant::now();
+        let mut shared = self.lock();
+        shared.displays.remove(id)?;
+        let revision = bump(&mut shared);
+        let readiness = readiness_at(&shared, now);
+        shared.readiness = readiness.clone();
+        let event = session_event(&shared, revision, readiness);
+        drop(shared);
+        let _ = self.events.send(event);
+        Some(revision)
+    }
+
+    /// Reap sessions and displays that stopped beating.
+    ///
+    /// Called on a timer by the server. Emits once per transition rather than
+    /// once per tick.
+    pub fn expire(&self) -> bool {
+        let now = Instant::now();
+        let mut shared = self.lock();
+        let before = readiness_at(&shared, now);
+        let before_displays = shared.displays.len();
+        shared
+            .displays
+            .retain(|_, record| now.saturating_duration_since(record.last_seen) <= DISPLAY_TTL);
+        let removed = shared.displays.len() != before_displays;
+        let readiness = readiness_at(&shared, now);
+        shared.readiness = readiness.clone();
+        if !removed && readiness == before {
+            return false;
+        }
+        let revision = bump(&mut shared);
+        let event = session_event(&shared, revision, readiness);
+        drop(shared);
+        let _ = self.events.send(event);
+        true
     }
 
     /// Record a command id. `true` means it was already seen: a retry, and the
@@ -262,10 +621,90 @@ impl ControlHub {
     }
 }
 
+/// `observer` is the only view that may be created on demand. `main` exists
+/// from construction; anything else is a client mistake, not a new display.
+fn create_observer(shared: &mut Shared, view: &str) -> bool {
+    if view != OBSERVER_VIEW {
+        return false;
+    }
+    let Some(main) = shared.views.get(MAIN_VIEW).copied() else {
+        return false;
+    };
+    shared.views.insert(OBSERVER_VIEW.to_string(), main);
+    true
+}
+
+fn bump(shared: &mut Shared) -> u64 {
+    shared.revision += 1;
+    shared.revision
+}
+
+fn live_displays(shared: &Shared, now: Instant) -> Vec<DisplayState> {
+    shared
+        .displays
+        .values()
+        .filter(|record| now.saturating_duration_since(record.last_seen) <= DISPLAY_TTL)
+        .map(|record| record.state.clone())
+        .collect()
+}
+
+fn readiness_at(shared: &Shared, now: Instant) -> Readiness {
+    let Some(session) = &shared.session else {
+        return Readiness::waiting(ReadinessReason::NoSession);
+    };
+    if now.saturating_duration_since(session.last_seen) > SESSION_TTL {
+        return Readiness::waiting(ReadinessReason::Stale);
+    }
+    if !session.state.is_execution() {
+        return Readiness::waiting(ReadinessReason::NotExecution);
+    }
+    let command_center = shared.displays.values().any(|record| {
+        record.state.role == "command_center"
+            && now.saturating_duration_since(record.last_seen) <= DISPLAY_TTL
+    });
+    if !command_center {
+        return Readiness::waiting(ReadinessReason::NoDisplay);
+    }
+    Readiness::ready()
+}
+
+fn session_event(shared: &Shared, revision: u64, readiness: Readiness) -> Event {
+    Event::SessionChanged {
+        revision,
+        session: shared.session.as_ref().map(|record| record.state.clone()),
+        readiness,
+        displays: live_displays(shared, Instant::now()),
+    }
+}
+
+fn camera_event(
+    revision: u64,
+    view: &str,
+    camera: CameraSnapshot,
+    source: Option<String>,
+    command_id: Option<String>,
+) -> Event {
+    Event::CameraChanged {
+        revision,
+        source,
+        command_id,
+        view: ViewState {
+            id: view.to_string(),
+            camera,
+        },
+    }
+}
+
+fn publish(events: &broadcast::Sender<Event>, events_to_send: Vec<Event>) {
+    for event in events_to_send {
+        let _ = events.send(event);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::protocol::GeoPoint;
+    use crate::control::protocol::{GeoPoint, ScenarioState, UnitState};
 
     fn camera(latitude: f64) -> CameraSnapshot {
         CameraSnapshot {
@@ -276,6 +715,50 @@ mod tests {
             zoom: 11.0,
             width: 800,
             height: 600,
+        }
+    }
+
+    fn unit(id: i64, name: &str, latitude: Option<f64>) -> UnitState {
+        UnitState {
+            index: 0,
+            id,
+            name: name.to_string(),
+            hull_number: format!("H{id}"),
+            class_name: "Frigate".to_string(),
+            commander: None,
+            embarked: Vec::new(),
+            embarked_in: None,
+            position: latitude.map(|latitude| GeoPoint {
+                latitude,
+                longitude: 106.8,
+            }),
+            heading_deg: None,
+            speed_kn: None,
+            stale: false,
+        }
+    }
+
+    fn session(phase: &str, units: Vec<UnitState>) -> SessionState {
+        SessionState {
+            game_id: 42,
+            name: "Exercise".to_string(),
+            phase: phase.to_string(),
+            mode: "maneuver".to_string(),
+            scenario: Some(ScenarioState {
+                id: 7,
+                title: "Sunda Strait".to_string(),
+                step: None,
+            }),
+            units,
+        }
+    }
+
+    fn display(id: &str) -> DisplayState {
+        DisplayState {
+            id: id.to_string(),
+            label: id.to_string(),
+            role: "command_center".to_string(),
+            viewport: None,
         }
     }
 
@@ -380,10 +863,16 @@ mod tests {
                 protocol_version,
                 revision,
                 views,
+                session,
+                readiness,
+                displays,
             } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(revision, 1);
                 assert_eq!(views[MAIN_VIEW].camera, camera(-6.1));
+                assert!(session.is_none());
+                assert_eq!(readiness, Readiness::waiting(ReadinessReason::NoSession));
+                assert!(displays.is_empty());
             }
             other => panic!("expected a snapshot, got {other:?}"),
         }
@@ -582,5 +1071,328 @@ mod tests {
             }
             other => panic!("expected a camera event, got {other:?}"),
         }
+    }
+
+    // The observer view -----------------------------------------------------
+
+    #[test]
+    fn a_fresh_hub_waits_for_a_session() {
+        let hub = ControlHub::new(camera(-6.2));
+        assert_eq!(hub.readiness(), Readiness::waiting(ReadinessReason::NoSession));
+        assert!(hub.camera_of(OBSERVER_VIEW).is_none());
+    }
+
+    #[test]
+    fn an_observer_view_appears_when_a_display_attaches_and_copies_the_console() {
+        let hub = ControlHub::new(camera(-6.2));
+        assert_eq!(hub.attach_display(display("wall-1")), Some(1));
+        assert_eq!(hub.camera_of(OBSERVER_VIEW), Some(camera(-6.2)));
+        // The console's camera is untouched.
+        assert_eq!(hub.camera(), camera(-6.2));
+    }
+
+    #[test]
+    fn attaching_a_display_says_so_and_names_the_observer_view() {
+        let hub = ControlHub::new(camera(-6.2));
+        let mut rx = hub.subscribe();
+        hub.attach_display(display("wall-1"));
+        match rx.try_recv().expect("an event") {
+            Event::SessionChanged { displays, .. } => {
+                assert_eq!(displays, vec![display("wall-1")]);
+            }
+            other => panic!("expected a session event, got {other:?}"),
+        }
+        match rx.try_recv().expect("a camera event") {
+            Event::CameraChanged { view, .. } => assert_eq!(view.id, OBSERVER_VIEW),
+            other => panic!("expected a camera event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_the_observer_view_may_be_created_on_demand() {
+        let hub = ControlHub::new(camera(-6.2));
+        assert_eq!(
+            hub.apply_view("sideboard", &Command::CameraZoom { delta: 1.0 }, source("x")),
+            Err(ApplyError::UnknownView("sideboard".to_string()))
+        );
+        assert_eq!(
+            hub.apply_view(OBSERVER_VIEW, &Command::CameraZoom { delta: 1.0 }, source("x"))
+                .expect("the observer is created on demand"),
+            Some(1)
+        );
+        let observer = hub.camera_of(OBSERVER_VIEW).expect("observer");
+        assert_eq!(observer.center, camera(-6.2).center);
+    }
+
+    #[test]
+    fn a_phone_moves_the_observer_and_the_console_stays_put() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.attach_display(display("wall-1"));
+        assert_eq!(
+            hub.apply_view(OBSERVER_VIEW, &Command::CameraZoom { delta: 1.0 }, source("phone")),
+            Ok(Some(2))
+        );
+        assert_eq!(hub.camera_of(OBSERVER_VIEW).expect("observer").zoom, 12.0);
+        assert_eq!(hub.camera(), camera(-6.2));
+    }
+
+    #[test]
+    fn a_new_exercise_opens_where_the_operator_is_looking() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.attach_display(display("wall-1"));
+        let _ = hub.apply_view(OBSERVER_VIEW, &Command::CameraZoom { delta: 4.0 }, source("phone"));
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", Some(-6.2))]));
+        assert_eq!(hub.camera_of(OBSERVER_VIEW), Some(camera(-6.2)));
+    }
+
+    #[test]
+    fn the_same_exercise_being_updated_leaves_the_observer_alone() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.attach_display(display("wall-1"));
+        let _ = hub.apply_view(OBSERVER_VIEW, &Command::CameraZoom { delta: 4.0 }, source("phone"));
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", Some(-6.2))]));
+        let moved = hub.camera_of(OBSERVER_VIEW).expect("observer");
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", Some(-6.1))]));
+        assert_eq!(hub.camera_of(OBSERVER_VIEW), Some(moved));
+    }
+
+    // Readiness -------------------------------------------------------------
+
+    #[test]
+    fn readiness_walks_from_no_session_to_ready() {
+        let hub = ControlHub::new(camera(-6.2));
+        assert_eq!(hub.readiness().reason, Some(ReadinessReason::NoSession));
+
+        hub.set_session(session("planning", vec![unit(1, "Evertsen", None)]));
+        assert_eq!(hub.readiness().reason, Some(ReadinessReason::NotExecution));
+
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", None)]));
+        assert_eq!(hub.readiness().reason, Some(ReadinessReason::NoDisplay));
+
+        hub.attach_display(display("wall-1"));
+        assert_eq!(hub.readiness(), Readiness::ready());
+
+        hub.detach_display("wall-1");
+        assert_eq!(hub.readiness().reason, Some(ReadinessReason::NoDisplay));
+    }
+
+    #[test]
+    fn an_expired_session_is_stale_rather_than_gone() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", None)]));
+        hub.attach_display(display("wall-1"));
+        assert!(hub.readiness().ready);
+
+        // Backdate the session rather than sleeping: the clock is the input.
+        {
+            let mut shared = hub.lock();
+            let record = shared.session.as_mut().expect("a session");
+            record.last_seen = Instant::now() - (SESSION_TTL + Duration::from_secs(1));
+        }
+        let readiness = hub.readiness();
+        assert_eq!(readiness.reason, Some(ReadinessReason::Stale));
+        // The units are still there: a stale map beats an empty one.
+        assert_eq!(hub.session().expect("session").units.len(), 1);
+    }
+
+    #[test]
+    fn a_heartbeat_revives_a_stale_session_once() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", None)]));
+        hub.attach_display(display("wall-1"));
+        {
+            let mut shared = hub.lock();
+            let record = shared.session.as_mut().expect("a session");
+            record.last_seen = Instant::now() - (SESSION_TTL + Duration::from_secs(1));
+        }
+        assert_eq!(hub.readiness().reason, Some(ReadinessReason::Stale));
+
+        let revision = hub.revision();
+        assert_eq!(hub.touch_session(), Some(revision + 1));
+        assert!(hub.readiness().ready);
+        // A second heartbeat while healthy is not a change.
+        assert_eq!(hub.touch_session(), None);
+    }
+
+    #[test]
+    fn republishing_an_unchanged_session_is_a_heartbeat_not_an_event() {
+        let hub = ControlHub::new(camera(-6.2));
+        let exercise = session("execution", vec![unit(1, "Evertsen", None)]);
+        assert!(hub.set_session(exercise.clone()).is_some());
+        let mut rx = hub.subscribe();
+        assert_eq!(hub.set_session(exercise), None);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn unit_numbers_come_from_array_order() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.set_session(session(
+            "execution",
+            vec![unit(9, "Evertsen", None), unit(4, "Tromp", None)],
+        ));
+        let units = hub.session().expect("session").units;
+        assert_eq!(units[0].index, 1);
+        assert_eq!(units[1].index, 2);
+        assert_eq!(units[0].id, 9);
+        assert_eq!(units[1].id, 4);
+    }
+
+    #[test]
+    fn clearing_a_session_keeps_the_observer_camera() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.attach_display(display("wall-1"));
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", Some(-6.2))]));
+        let _ = hub.apply_view(OBSERVER_VIEW, &Command::CameraZoom { delta: 3.0 }, source("phone"));
+        let moved = hub.camera_of(OBSERVER_VIEW).expect("observer");
+
+        assert!(hub.clear_session().is_some());
+        assert!(hub.session().is_none());
+        assert_eq!(hub.readiness().reason, Some(ReadinessReason::NoSession));
+        assert_eq!(hub.camera_of(OBSERVER_VIEW), Some(moved));
+        // Clearing nothing is not a change.
+        assert_eq!(hub.clear_session(), None);
+    }
+
+    // Focus -----------------------------------------------------------------
+
+    #[test]
+    fn a_focus_puts_the_observer_on_the_unit_without_moving_the_console() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.attach_display(display("wall-1"));
+        hub.set_session(session(
+            "execution",
+            vec![unit(1, "Evertsen", Some(-6.2)), unit(2, "Tromp", Some(-5.9))],
+        ));
+        assert_eq!(
+            hub.apply_view(
+                OBSERVER_VIEW,
+                &Command::CameraFocus {
+                    unit_id: 2,
+                    zoom: Some(13.0),
+                },
+                source("phone"),
+            )
+            .expect("focus resolves")
+            .is_some(),
+            true
+        );
+        let observer = hub.camera_of(OBSERVER_VIEW).expect("observer");
+        assert_eq!(observer.center.latitude, -5.9);
+        assert_eq!(observer.zoom, 13.0);
+        // The viewport the command center reported is preserved.
+        assert_eq!((observer.width, observer.height), (800, 600));
+        assert_eq!(hub.camera(), camera(-6.2));
+    }
+
+    #[test]
+    fn a_focus_without_a_zoom_leaves_the_scale_alone() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.attach_display(display("wall-1"));
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", Some(-5.0))]));
+        hub.apply_view(
+            OBSERVER_VIEW,
+            &Command::CameraFocus {
+                unit_id: 1,
+                zoom: None,
+            },
+            source("phone"),
+        )
+        .expect("focus resolves");
+        let observer = hub.camera_of(OBSERVER_VIEW).expect("observer");
+        assert_eq!(observer.center.latitude, -5.0);
+        assert_eq!(observer.zoom, 11.0);
+    }
+
+    #[test]
+    fn a_focus_names_the_unit_it_cannot_find() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.attach_display(display("wall-1"));
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", None)]));
+
+        assert_eq!(
+            hub.apply_view(
+                OBSERVER_VIEW,
+                &Command::CameraFocus {
+                    unit_id: 99,
+                    zoom: None
+                },
+                source("phone"),
+            ),
+            Err(ApplyError::UnknownUnit(99))
+        );
+        assert_eq!(
+            hub.apply_view(
+                OBSERVER_VIEW,
+                &Command::CameraFocus {
+                    unit_id: 1,
+                    zoom: None
+                },
+                source("phone"),
+            ),
+            Err(ApplyError::UnitHasNoPosition(1))
+        );
+        // A refused focus moved nothing and advanced nothing.
+        assert_eq!(hub.camera_of(OBSERVER_VIEW), Some(camera(-6.2)));
+        assert_eq!(hub.revision(), 2);
+    }
+
+    #[test]
+    fn a_focus_on_a_unit_already_centred_is_a_no_op() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.attach_display(display("wall-1"));
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", Some(-6.2))]));
+        let focus = Command::CameraFocus {
+            unit_id: 1,
+            zoom: Some(11.0),
+        };
+        assert_eq!(
+            hub.apply_view(OBSERVER_VIEW, &focus, source("phone")),
+            Ok(None)
+        );
+    }
+
+    // Expiry ----------------------------------------------------------------
+
+    #[test]
+    fn an_expired_display_is_reaped_and_readiness_falls_back() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", None)]));
+        hub.attach_display(display("wall-1"));
+        assert!(hub.readiness().ready);
+
+        {
+            let mut shared = hub.lock();
+            let record = shared.displays.get_mut("wall-1").expect("a display");
+            record.last_seen = Instant::now() - (DISPLAY_TTL + Duration::from_secs(1));
+        }
+        // The verdict is already wrong without a tick, because it is computed.
+        assert_eq!(hub.readiness().reason, Some(ReadinessReason::NoDisplay));
+        assert!(hub.displays().is_empty());
+    }
+
+    #[test]
+    fn expiring_twice_is_one_change() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.set_session(session("execution", vec![unit(1, "Evertsen", None)]));
+        hub.attach_display(display("wall-1"));
+        {
+            let mut shared = hub.lock();
+            let record = shared.displays.get_mut("wall-1").expect("a display");
+            record.last_seen = Instant::now() - (DISPLAY_TTL + Duration::from_secs(1));
+        }
+        assert!(hub.expire());
+        assert!(!hub.expire());
+    }
+
+    #[test]
+    fn a_live_display_is_not_reaped() {
+        let hub = ControlHub::new(camera(-6.2));
+        hub.attach_display(display("wall-1"));
+        let revision = hub.revision();
+        hub.touch_display("wall-1");
+        assert!(!hub.expire());
+        assert_eq!(hub.revision(), revision);
+        assert_eq!(hub.displays().len(), 1);
     }
 }

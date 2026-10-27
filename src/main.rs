@@ -37,6 +37,27 @@ enum ControlEndpoint {
 /// Following wins when both names are present. A stray `TFG_CONTROL_LISTEN`
 /// left in a shell while pointing the console at a server should not open a
 /// second authority; it should say what it ignored.
+
+/// The window mode this launch asked for, if any.
+///
+/// One flag rather than a second binary: the map thread, the fonts and the
+/// crate are shared, and the only thing that must not be is the console's
+/// Minos session. `--mode` is read before any of that, and an unknown value is
+/// refused rather than silently starting the console the operator did not ask
+/// for.
+fn mode_from_args() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--mode" {
+            return Some(args.next().unwrap_or_default());
+        }
+        if let Some(value) = arg.strip_prefix("--mode=") {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 fn control_endpoint_from_env() -> ControlEndpoint {
     let following = std::env::var("TFG_CONTROL_SERVER")
         .ok()
@@ -111,6 +132,35 @@ fn main() {
             cache,
             jump_pump: tfg::map_geometry::JUMP_PUMP,
         });
+
+    // THE OTHER MODE. A command center is a display, not a console: it holds
+    // no Minos session and no credential of its own, and it branches here so
+    // that the sign-in, the keyring and the register below cannot run on a
+    // wall. It is given the same map thread the console would have used —
+    // the picture is the same picture, asked for at this window's size.
+    match mode_from_args().as_deref() {
+        Some("command-center") => {
+            let config = match tfg::command_center::CommandCenterConfig::from_env() {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("command center: {error}");
+                    std::process::exit(2);
+                }
+            };
+            match tfg::command_center::run(config, req_tx, resp_rx) {
+                Ok(()) => return,
+                Err(error) => {
+                    eprintln!("command center: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!("tfg: unknown --mode {other:?}; this build has `command-center`");
+            std::process::exit(2);
+        }
+        None => {}
+    }
 
     // U8 step 4's first panel: the roster sheet's rows are the real hull
     // register. Credentials from the environment, never from the source —
@@ -461,16 +511,21 @@ fn main() {
     // Exactly one of these is Some. The host handle owns the listening thread;
     // the client handle owns the one following thread and is cloned into the
     // order loop below, because that loop is where the camera is written down.
-    let (control_client, _control_handle) = match control_endpoint_from_env() {
+    //
+    // The third is where the console's projection of its exercise goes: into
+    // the hub when this console IS the host, over HTTP when it follows one, and
+    // nowhere when no control plane is configured.
+    let (control_client, _control_handle, session_sink) = match control_endpoint_from_env() {
         ControlEndpoint::Follow { server, token } => {
+            let sink = tfg::control::SessionSink::http(server.clone(), token.clone());
             match tfg::control::spawn_client(
                 tfg::control::ClientConfig::new(server, token),
                 control_tx,
             ) {
-                Ok(handle) => (Some(handle), None),
+                Ok(handle) => (Some(handle), None, sink),
                 Err(error) => {
                     eprintln!("control client disabled: {error}");
-                    (None, None)
+                    (None, None, tfg::control::SessionSink::Off)
                 }
             }
         }
@@ -487,11 +542,15 @@ fn main() {
             match tfg::control::spawn_server(config, control_tx, control_hub.clone()) {
                 Ok(handle) => {
                     eprintln!("control server listening on {}", handle.url());
-                    (None, Some(handle))
+                    (
+                        None,
+                        Some(handle),
+                        tfg::control::SessionSink::Hub(control_hub.clone()),
+                    )
                 }
                 Err(error) => {
                     eprintln!("control server disabled: {error}");
-                    (None, None)
+                    (None, None, tfg::control::SessionSink::Off)
                 }
             }
         }
@@ -499,9 +558,23 @@ fn main() {
             // Nobody to send to. Dropping the sender makes the shell's feed a
             // cheap `None` instead of a channel that can never produce.
             drop(control_tx);
-            (None, None)
+            (None, None, tfg::control::SessionSink::Off)
         }
     };
+    // The publisher: the shell's roster joined with this side's fixes, written
+    // to whichever sink the console has. `Off` builds no thread at all, so a
+    // local launch pays nothing for a feature it is not using. Held in an
+    // `Arc` because the order loop and the fix feed are two threads and both
+    // have something to say to it.
+    let publisher = std::sync::Arc::new(
+        match tfg::control::spawn_session_publisher(session_sink) {
+            Ok(handle) => handle,
+            Err(error) => {
+                eprintln!("session publisher disabled: {error}");
+                tfg::control::SessionHandle::off()
+            }
+        },
+    );
     // Hull photographs ride their own channel: the send end is cloned
     // into the order loop (every card sign-in fetches on the new token)
     // and the receive end feeds the shell below.
@@ -512,6 +585,7 @@ fn main() {
         let camera2 = camera.clone();
         let control_hub2 = control_hub.clone();
         let control_client2 = control_client.clone();
+        let publisher_order = publisher.clone();
         let req_tx2 = req_tx.clone();
         // The photo channel's send end rides into the order loop: every
         // card sign-in fetches again on the new token — a launch without
@@ -684,6 +758,13 @@ fn main() {
                             // frames.
                             tfg::map_geometry::GESTURE_PUMP,
                         ));
+                    }
+                    tfg::shell_gpui::ToBinary::Session(projection) => {
+                        // The shell's half of the observation: who is in the
+                        // exercise and where it placed them. The positions
+                        // that move on their own arrive from the fix feed
+                        // beside this, and the publisher joins the two.
+                        publisher_order.roster(projection);
                     }
                     tfg::shell_gpui::ToBinary::DeployUnit { unit_id, fx, fy } => {
                         // The picker's drop (or its click-to-place fallback):
@@ -2705,6 +2786,10 @@ fn main() {
     // The socket's own log cadence: one line every ten publications, so
     // the wire says what it is carrying without drowning the plot's line.
     let mut wire_log_ticks: u32 = 0;
+    // Fixes reach the control plane at the pace a viewer needs, not the pace
+    // the map draws: one message a second carries every hull the registry has.
+    let mut positions_due: Option<std::time::Instant> = None;
+    let publisher_fix = publisher.clone();
 
     // The picker's drill tree, read once off the synced mirror like the
     // symbol resolver above it: the taxonomy does not move under us, and a
@@ -2930,6 +3015,37 @@ fn main() {
                     longitude: view.latest.position.longitude,
                     trail: view.trail.len(),
                 });
+            }
+            // The control plane's fixes, from the same read the markers came
+            // from: a hull's ship id IS its unit id, which is how the wire and
+            // the roster agree on which hull this is. Sent once a second, and
+            // only when something arrived — a quiet registry leaves the
+            // publisher's last fix for each hull standing rather than blanking
+            // a map nobody said had changed.
+            let due = positions_due
+                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
+            if due && !batch.is_empty() {
+                let positions: Vec<(i64, tfg::control::UnitPosition)> = batch
+                    .iter()
+                    .filter_map(|marker| {
+                        marker.id.parse::<i64>().ok().map(|id| {
+                            (
+                                id,
+                                tfg::control::UnitPosition {
+                                    latitude: marker.latitude,
+                                    longitude: marker.longitude,
+                                    heading_deg: marker.heading_deg.map(f64::from),
+                                    speed_kn: marker.speed_kn.map(f64::from),
+                                    stale: marker.stale,
+                                },
+                            )
+                        })
+                    })
+                    .collect();
+                if !positions.is_empty() {
+                    publisher_fix.positions(positions);
+                    positions_due = Some(std::time::Instant::now());
+                }
             }
             if batch.is_empty() { None } else { Some(batch) }
         }),

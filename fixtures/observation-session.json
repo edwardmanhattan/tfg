@@ -1,0 +1,88 @@
+{
+  "game_id": 4127,
+  "name": "Sunda Strait Watch",
+  "phase": "execution",
+  "mode": "maneuver",
+  "scenario": {
+    "id": 88,
+    "title": "Sunda Strait, first light",
+    "step": "Step 3 of 7: shadow the contact"
+  },
+  "units": [
+    {
+      "id": 9001,
+      "name": "Evertsen",
+      "hull_number": "F805",
+      "class_name": "Karel Doorman frigate",
+      "commander": { "id": 501, "name": "Lt Cdr Halvorsen" },
+      "embarked": [
+        { "id": 9101, "name": "NH90 N-110", "hull_number": "N-110" }
+      ],
+      "position": { "latitude": -5.9123, "longitude": 105.8412 },
+      "heading_deg": 72.0,
+      "speed_kn": 18.4,
+      "stale": false
+    },
+    {
+      "id": 9002,
+      "name": "Tromp",
+      "hull_number": "F801",
+      "class_name": "Karel Doorman frigate",
+      "commander": { "id": 502, "name": "Cdr Okafor" },
+      "embarked": [],
+      "position": { "latitude": -5.8764, "longitude": 106.0122 },
+      "heading_deg": 68.0,
+      "speed_kn": 19.1,
+      "stale": false
+    },
+    {
+      "id": 9003,
+      "name": "KRI Diponegoro",
+      "hull_number": "365",
+      "class_name": "Diponegoro corvette",
+      "commander": { "id": 503, "name": "Cdr Santoso" },
+      "embarked": [],
+      "position": { "latitude": -6.0211, "longitude": 105.7733 },
+      "heading_deg": 95.5,
+      "speed_kn": 12.8,
+      "stale": false
+    },
+    {
+      "id": 9004,
+      "name": "KRI Sultan Iskandar Muda",
+      "hull_number": "367",
+      "class_name": "Diponegoro corvette",
+      "commander": null,
+      "embarked": [],
+      "position": { "latitude": -6.1044, "longitude": 106.1551 },
+      "heading_deg": 44.0,
+      "speed_kn": 11.2,
+      "stale": false
+    },
+    {
+      "id": 9101,
+      "name": "NH90 N-110",
+      "hull_number": "N-110",
+      "class_name": "NH90 NFH",
+      "commander": null,
+      "embarked": [],
+      "embarked_in": { "id": 9001, "name": "Evertsen", "hull_number": "F805" },
+      "position": { "latitude": -5.9123, "longitude": 105.8412 },
+      "heading_deg": 72.0,
+      "speed_kn": 18.4,
+      "stale": false
+    },
+    {
+      "id": 9005,
+      "name": "Merchant MV Strait Pioneer",
+      "hull_number": "IMO 9412205",
+      "class_name": "Bulk carrier",
+      "commander": null,
+      "embarked": [],
+      "position": { "latitude": -6.2233, "longitude": 106.0444 },
+      "heading_deg": 312.0,
+      "speed_kn": 9.6,
+      "stale": true
+    }
+  ]
+}

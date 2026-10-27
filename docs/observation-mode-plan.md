@@ -554,3 +554,34 @@ after the first five phases are in use.
 5. **Command-center credential.** Command centers use the operator token today.
    Is distributing that token to every wall acceptable, or should there be a
    `display` scope minted by pairing?
+
+## 12. Status
+
+Phases 1–5 are built and uncommitted in the working tree. The design they
+implemented is recorded in
+[`docs/adr/0026-observation-is-a-second-view.md`](adr/0026-observation-is-a-second-view.md);
+three details came out of building it and are worth writing down here.
+
+- **The publisher has a `told` gate.** A console that starts while another
+  holds the session must not clear it. It publishes nothing until the shell has
+  told it what this console holds, and a clear is only ever sent for a session
+  it published.
+- **A display re-announces when it resizes.** `view.report` is what a nudge
+  resolves against; the display's *record* is what `display list` and the
+  waiting screen read. Only `display.hello` carries a viewport, so a resize is a
+  second hello with the same id, and the host replaces the record.
+- **The wall's camera size is the window's, not the view's.** A view's
+  `width`/`height` are whichever display last reported them; the command center
+  copies only centre and zoom from the observer view and keeps its own size.
+
+Verification done: `control-server-smoke.sh` 41/41; `cargo test --lib control::*`
+(protocol, hub, server, client, publisher) and `cargo test --bin tfgctl` green;
+`cargo check --all-targets` clean. Driven captures of the command center in its
+waiting and ready states, plus a live `focus` that moved `observer` and left
+`main` alone. Ready state was proven with `fixtures/observation-session.json` on
+a headless host; no live Minos execution exercise was available locally.
+
+Two lib tests fail on this tree and are unrelated to observation:
+`map_render::tests::quad_bow_follows_the_compass` (a float tolerance: 180.0000025
+against 180) and `sim::tests::order_move_applies_then_higher_overrides_loudly`.
+Both files are untouched by this work.

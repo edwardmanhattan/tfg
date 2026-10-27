@@ -86,6 +86,7 @@ pub mod calendar;
 pub mod catalog;
 pub mod clock;
 pub mod command;
+pub mod command_center;
 pub mod commit;
 pub mod control;
 pub mod dnd;

@@ -13,26 +13,55 @@ pairing QR code, but the app is its own client of the same HTTP/WebSocket API.
 
 ## 1. What the app does
 
-The first version is a remote control, not a map renderer. That is a hard scope
-line, and it comes from the server, not from taste:
+The app is the **observer's** hand on an exercise that is running: a remote for
+the command-center wall, not a map renderer and not a second game master.
+
+Two hard facts set the scope, and they come from the server:
 
 - The API publishes a **camera** — latitude, longitude, zoom, viewport size —
-  and accepts **semantic commands** to move it.
-- It publishes **no tiles, no map image, and no game state**. `tfg-server` has
-  no picture at all; the console has one, but there is no endpoint that streams
-  it.
+  and accepts **semantic commands** to move it. It also publishes the
+  **session**: the exercise, its phase, its units, and whether observation is
+  open.
+- It publishes **no tiles, no map image, and no game state beyond that
+  projection**. The command center has the picture; there is no endpoint that
+  streams it.
 
-So the app should ship these four surfaces:
+So the app ships these surfaces:
 
 1. **Pair** — scan a QR code or type an eight-character code.
-2. **Live camera readout** — latitude, longitude, zoom, and who moved it last.
-3. **Motion** — drag to pan, pinch or buttons to zoom, and a "go to" form.
-4. **Connection status** — paired as whom, connected/reconnecting, last event
-   age, and a way to forget the device.
+2. **Waiting** — until observation is open, say which of the four reasons it is
+   waiting for. This is not an error state; it is the normal state before an
+   exercise reaches execution.
+3. **Scenario / Comms / Units** — the three panels behind the toggles. Comms is
+   a placeholder in this phase; Scenario shows the title and step; Units is the
+   numbered grid.
+4. **Motion** — a d-pad for nudges, `+`/`-` for zoom steps, and an `OK` button
+   that is inert until the protocol has a verb for it.
+5. **Unit grid** — one numbered tile per unit. Tapping it calls
+   `camera.focus` on that unit and opens a popup with the hull, commander and
+   embarked units.
+6. **Connection status** — paired as whom, connected/reconnecting, readiness,
+   and a way to forget the device.
 
 A map preview can come later, drawn by the app from its own tile provider, using
 the camera in `camera.changed` as the viewport. Do not block the first version
 on it.
+
+### Why the phone cannot move the game master's map
+
+The observer camera is its own view, `observer`. The operator's camera is
+`main`. A phone command carries `"view": "observer"` and the host applies it
+there; `main` is never addressable from a phone. And the host refuses observer
+commands until **all** of these hold:
+
+1. a session exists,
+2. its phase is `execution`,
+3. a command-center display is attached,
+4. the session was refreshed within the last 15 seconds.
+
+That refusal is `409 not_ready`, and `GET /v1/session` tells you the reason
+before you send anything. Build the waiting screen from the read, not from the
+refusal.
 
 ### Words the API uses
 
@@ -43,6 +72,11 @@ on it.
 | **pairing code** | Eight characters, `XXXX-XXXX`, valid for 120 seconds, single use. |
 | **device token** | 64 hex characters, minted when the phone spends the code. This is the phone's credential. Returned once. |
 | **scope** | `observe`, `control_view`, `admin`. A phone needs the first two. `admin` is refused to paired devices on purpose. |
+| **session** | A projection of the exercise the console holds: game id, name, phase, scenario, units. It is not the game; the console publishes it. |
+| **readiness** | The server's computed verdict: `{ready, reason}`. The reason is one of `no_session`, `not_execution`, `no_display`, `stale`. |
+| **observer view** | The camera a phone may move. Always `"observer"`; never `"main"`. |
+| **command center** | A display that renders the observer view — the wall the phone remotes. Readiness requires one to be attached. |
+| **unit `index`** | The number on the grid and on the wall's marker. Assigned by the server from the publisher's array order. Send `id`, not `index`, in `camera.focus`. |
 
 ---
 
@@ -83,7 +117,7 @@ from the phone's browser before writing any Dart:
 
 ```bash
 curl http://192.168.1.20:8787/v1/hello
-# {"protocol_version":1,"api_version":"v1","service":"tfg-control","revision":7,"pairing_open":false}
+# {"protocol_version":2,"api_version":"v1","service":"tfg-control","revision":7,"pairing_open":false}
 ```
 
 If that fails: the two devices are on different networks, the access point has
@@ -94,7 +128,7 @@ Fix it before writing code; it will not fix itself later.
 
 - Same Wi-Fi as the host, not the guest SSID.
 - Android 9+ and iOS 14+ are the targets. Both block plain HTTP by default;
-  section 6 has the two settings that unblock it.
+  section 7 has the two settings that unblock it.
 - The app needs a QR scanner only for the fast path. Typing the code must
   always work, so build that first.
 
@@ -123,8 +157,14 @@ Everything is under `/v1/`. JSON in, JSON out, UTF-8. Bodies are small.
 | `POST` | `/v1/pair` | none | Spend a pairing code, get a device token. |
 | `GET` | `/v1/whoami` | bearer | Which grant this token is. |
 | `GET` | `/v1/state` | bearer | Whole state, same shape as the WS snapshot. |
+| `GET` | `/v1/session` | bearer | The exercise, readiness and attached displays. Poll this while waiting. |
+| `GET` | `/v1/displays` | bearer | Attached command centers and readiness. |
 | `POST` | `/v1/commands` | bearer | Send one camera command. |
 | `GET` | `/v1/ws` | bearer | WebSocket event stream. |
+
+Bodies carry `"protocol_version": 2`. A v1 body is refused with
+`409 unsupported_protocol`. The routes kept their `/v1/` prefix — a path is a
+place, a version is a language.
 
 Errors always look like this, and `code` is the contract — branch on it, do not
 parse `message`:
@@ -133,7 +173,7 @@ parse `message`:
 { "error": { "code": "forbidden", "message": "this credential may not send control_view commands" } }
 ```
 
-The full contract is [`docs/control-api-v1.md`](control-api-v1.md). Sections 3–5
+The full contract is [`docs/control-api-v1.md`](control-api-v1.md). Sections 3–6
 below are the subset the app needs, with exact field names.
 
 ### 3.1 The snapshot
@@ -143,7 +183,7 @@ Sent on connect to `/v1/ws`, and returned by `GET /v1/state`:
 ```json
 {
   "type": "snapshot",
-  "protocol_version": 1,
+  "protocol_version": 2,
   "revision": 7,
   "views": {
     "main": {
@@ -154,28 +194,65 @@ Sent on connect to `/v1/ws`, and returned by `GET /v1/state`:
         "width": 1280,
         "height": 720
       }
+    },
+    "observer": {
+      "id": "observer",
+      "camera": {
+        "center": { "latitude": -5.9123, "longitude": 105.8412 },
+        "zoom": 12.0,
+        "width": 1280,
+        "height": 720
+      }
     }
-  }
+  },
+  "session": {
+    "game_id": 4127,
+    "name": "Sunda Strait Watch",
+    "phase": "execution",
+    "mode": "exercise",
+    "units": []
+  },
+  "readiness": { "ready": true },
+  "displays": [
+    { "id": "wall-1", "label": "wall-1", "role": "command_center",
+      "viewport": { "width": 1280, "height": 720 } }
+  ]
 }
 ```
 
-There is exactly one view today, `"main"`. Read it by key rather than by taking
-the first entry, so a second display is additive rather than a crash.
+Two views exist, `"main"` (the operator's) and `"observer"` (yours). Read them
+by key rather than by taking the first entry. `session` is `null` when the
+console holds no exercise, and `readiness` carries the reason when it is not
+`ready`. The full `session` shape is in
+[`docs/control-api-v1.md`](control-api-v1.md#get-v1session); the app needs
+`name`, `phase`, `scenario`, and `units[]` with `index`, `id`, `name`,
+`commander`, `embarked`, `position` and `stale`.
 
 ### 3.2 The other events
 
 ```json
 { "type": "camera.changed", "revision": 8, "source": "phone-7",
   "command_id": "01J8Z6Q0K3",
-  "view": { "id": "main", "camera": { "...": "..." } } }
+  "view": { "id": "observer", "camera": { "...": "..." } } }
+```
+
+```json
+{ "type": "session.changed", "revision": 9,
+  "session": { "game_id": 4127, "name": "Sunda Strait Watch", "phase": "execution", "...": "..." },
+  "readiness": { "ready": true },
+  "displays": [ { "id": "wall-1", "role": "command_center", "...": "..." } ] }
 ```
 
 ```json
 { "type": "command.accepted", "command_id": "01J8Z6Q0K3", "revision": 8 }
 { "type": "command.rejected", "command_id": "01J8Z6Q0K3",
-  "code": "invalid_command", "message": "latitude must be finite and between -90 and 90" }
+  "code": "not_ready", "message": "observation is not open yet: not_execution" }
 ```
 
+- `camera.changed` carries `view.id`. Ignore one addressed to `main`: that is the
+  operator's camera, and the phone never draws it.
+- `session.changed` is the one event for the session, the readiness verdict and
+  the display list. Redraw the waiting card and the unit grid from it.
 - `source` is `"desktop"` for the operator's own hand, or a client id.
 - `command.accepted` means the host took it. **`camera.changed` is the proof it
   moved.** Do not animate the camera off the HTTP 202.
@@ -190,13 +267,18 @@ the first entry, so a second display is additive rather than a crash.
 
 ```json
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "client_id": "phone-7",
   "command_id": "phone-7-42",
+  "view": "observer",
   "type": "camera.nudge",
   "payload": { "dx_fraction": 0.25, "dy_fraction": 0.0 }
 }
 ```
+
+`view` may be `"main"` or `"observer"`; absent means `main`. **The phone always
+sends `"observer"`.** A command against `observer` before observation is open is
+`409 not_ready` — the same four reasons as the read.
 
 Replies:
 
@@ -212,6 +294,7 @@ The four command types:
 | `camera.nudge` | `{"dx_fraction": f64, "dy_fraction": f64}` | Fractions of the host's viewport, each within ±2. Positive `dx` moves the camera **west**, positive `dy` **north** — the same sense as dragging the map. |
 | `camera.zoom` | `{"delta": f64}` | Center-anchored, ±10 per command, host clamps to its zoom rails (3.0–18.0). |
 | `camera.set` | `{"center": {"latitude": f64, "longitude": f64}, "zoom": f64}` | Absolute and idempotent. Latitude ±90, longitude ±180, zoom ±30. Out of range is a `422`, not a clamp. |
+| `camera.focus` | `{"unit_id": i64, "zoom": f64?}` | Centre the observer view on a unit the session published. `zoom` is optional. An unknown unit, or one with no position, is `422 invalid_command`. |
 | `view.report` | `{"width": u32, "height": u32}` | Only for a client that **renders the map**. See the warning below. |
 
 **`view.report` is the one command to be careful with.** A nudge is a fraction of
@@ -229,6 +312,11 @@ Nudges are drag-like:
 
 That sign is easy to get backwards. Check it against `tfgctl camera left`, which
 sends exactly `{"dx_fraction": 0.25, "dy_fraction": 0.0}`.
+
+The d-pad is four nudges at a fixed fraction — a quarter of the observer view is
+a comfortable step — and `+`/`-` are `camera.zoom` with `{"delta": ±1.0}`. The
+`OK` button sends nothing in this phase: the protocol has no verb for it, and a
+button that posts a made-up command is worse than one that does nothing.
 
 `command_id` is optional, but send one. The host remembers recent ids for five
 minutes; a retry with the same id answers `duplicate` and does not move the map
@@ -494,7 +582,8 @@ class ControlClient {
         .post(Uri.parse('$baseUrl/v1/commands'),
             headers: {..._auth, 'content-type': 'application/json'},
             body: jsonEncode({
-              'protocol_version': 1,
+              'protocol_version': 2,
+              'view': 'observer',
               'client_id': clientId,
               'command_id': id,
               'type': type,
@@ -540,10 +629,21 @@ client.events.listen((event) {
   switch (event['type']) {
     case 'snapshot':
       final views = event['views'] as Map<String, dynamic>;
-      setState(() => camera = Camera.fromJson(
-          (views['main'] as Map<String, dynamic>)['camera']));
+      setState(() {
+        camera = Camera.fromJson(
+            (views['observer'] as Map<String, dynamic>)['camera']);
+        session = event['session'] as Map<String, dynamic>?;
+        readiness = event['readiness'] as Map<String, dynamic>;
+      });
+    case 'session.changed':
+      setState(() {
+        session = event['session'] as Map<String, dynamic>?;
+        readiness = event['readiness'] as Map<String, dynamic>;
+      });
     case 'camera.changed':
       final view = event['view'] as Map<String, dynamic>;
+      // `main` is the operator's camera; the phone only draws observer.
+      if (view['id'] != 'observer') break;
       setState(() => camera = Camera.fromJson(view['camera']));
     case 'command.rejected':
       showSnack('${event['code']}: ${event['message']}');
@@ -583,9 +683,175 @@ the user back to pairing with a message that says the device was revoked — not
 
 ---
 
-## 6. Platform configuration
+## 6. Step 3 — observation mode
 
-### 6.1 Android
+### 6.1 The waiting gate
+
+Read `GET /v1/session` on launch and on every `session.changed`, and show the
+card that matches `readiness.reason`. Poll it once a second until the stream is
+up; after that the event tells you.
+
+| `ready` | `reason` | Card |
+| --- | --- | --- |
+| `false` | `no_session` | "No exercise open. Waiting for the game master to start one." |
+| `false` | `not_execution` | "«name» is in «phase». Observation opens at execution." |
+| `false` | `no_display` | "Execution is running, but no command center is attached." |
+| `false` | `stale` | "The host stopped reporting. Reconnecting…" |
+| `true` | — | No card. The unit grid and the d-pad are live. |
+
+Two rules that come from the server, not from taste:
+
+- **Do not try to be helpful and send commands anyway.** They are refused
+  `409 not_ready`, and a d-pad that twitches while lying about the state is
+  worse than one that is visibly off.
+- **`stale` is not `no_session`.** A stale session still carries its units: show
+  the grid greyed out with the last known roster, because a stale map beats an
+  empty one.
+
+### 6.2 The unit grid and the popup
+
+`session.units[]` is ordered by the server; `index` is the number to print on
+the tile (1-based, matching the wall's markers), and `id` is what
+`camera.focus` takes.
+
+```json
+{
+  "index": 1,
+  "id": 9001,
+  "name": "Evertsen",
+  "hull_number": "F805",
+  "class_name": "Karel Doorman frigate",
+  "commander": { "id": 501, "name": "Lt Cdr Halvorsen" },
+  "embarked": [ { "id": 9101, "name": "NH90 N-110", "hull_number": "N-110" } ],
+  "position": { "latitude": -5.9123, "longitude": 105.8412 },
+  "stale": false
+}
+```
+
+Tapping a tile does two things:
+
+```dart
+await send('camera.focus', {'unit_id': unit['id'], 'zoom': 12.0});
+showUnitPopup(unit);   // hull, commander, embarked; position if present
+```
+
+- `zoom` is optional. Sending `12.0` is the build's choice; the server accepts
+  any value in its rails.
+- `commander` and `position` can be `null`; `embarked` can be empty. Render the
+  absence, do not hide the row.
+- A unit with `stale: true` has an old fix. The focus still works if it has a
+  position; the popup should say the fix is stale.
+- `camera.focus` is resolved **host-side** against the session, so you never
+  send coordinates and never need to know where a hull is.
+
+### 6.3 Testing without a wall or an exercise
+
+The observer path needs three things at once: an execution session, a display,
+and the phone. A real exercise needs Minos; a test does not. `fixtures/observation-session.json`
+is a six-unit execution projection, and `tfgctl display attach` is a command
+center with no window.
+
+Terminal 1 — a headless host on the LAN:
+
+```bash
+./target/debug/tfg-server \
+  --listen 0.0.0.0:8787 \
+  --token "$OPERATOR_TOKEN" \
+  --ephemeral --lat -6.2 --lon 106.8 --zoom 11
+```
+
+Terminal 2 — publish the fixture, and keep it fresh (a session goes `stale`
+after 15 s without a refresh; the console does this every 5 s):
+
+```bash
+while true; do
+  ./target/debug/tfgctl --server http://192.168.1.15:8787 --token "$OPERATOR_TOKEN" \
+    session set --file fixtures/observation-session.json >/dev/null
+  sleep 5
+done
+```
+
+Terminal 3 — the read the phone makes, with a **paired** token:
+
+```bash
+curl -sS http://192.168.1.15:8787/v1/session \
+  -H "Authorization: Bearer $PHONE_TOKEN" \
+  | jq '{ready: .readiness, session: .session.name, units: (.session.units | length)}'
+```
+
+```json
+{ "ready": { "ready": false, "reason": "no_display" },
+  "session": "Sunda Strait Watch", "units": 6 }
+```
+
+Steering is refused, correctly:
+
+```bash
+curl -sS -X POST http://192.168.1.15:8787/v1/commands \
+  -H "Authorization: Bearer $PHONE_TOKEN" -H 'content-type: application/json' \
+  -d '{"protocol_version":2,"view":"observer","client_id":"curl",
+       "type":"camera.focus","payload":{"unit_id":9001}}'
+# {"error":{"code":"not_ready","message":"observation is not open yet: no_display"}}
+```
+
+Terminal 2 — attach a simulated command center. It heartbeats, so leave it
+running; `Ctrl-C` detaches, and readiness drops back to `no_display`:
+
+```bash
+./target/debug/tfgctl --server http://192.168.1.15:8787 --token "$OPERATOR_TOKEN" \
+  display attach --id wall-1 --label wall-1 --width 1280 --height 800
+# attached as wall-1 (wall-1); Ctrl-C to leave
+# ready    session 4127 · observer 1280x800 · 6 unit(s)
+```
+
+Now the same command moves only the observer view:
+
+```bash
+./target/debug/tfgctl … focus 1 --zoom 12
+# {"command_id":"…","status":"accepted","view":"observer","revision":23}
+
+./target/debug/tfgctl … camera get --view observer
+# -5.91230, 105.84120 at zoom 12.00 (1280x800)
+
+./target/debug/tfgctl … camera get --view main
+# -6.20000, 106.80000 at zoom 11.00 (800x600)   ← the operator's map did not move
+```
+
+`tfgctl units` prints the grid's data in one table:
+
+```text
+#  id    name                        hull  class                  note
+1  9001  Evertsen                    F805  Karel Doorman frigate  -5.912,105.841; CO Lt Cdr Halvorsen; carries NH90 N-110
+2  9002  Tromp                       F801  Karel Doorman frigate  -5.876,106.012; CO Cdr Okafor
+…
+```
+
+What to take from the transcript:
+
+- `PUT /v1/session` needs the **operator** token. A phone can read the session
+  and never write it.
+- The gate is `no_display` until a command center attaches, then `ready`. The
+  same command flips from `409` to `202` with no other change.
+- `focus` moved `observer` and left `main` alone. If your app's focus moved the
+  operator's map, it sent no `view` field, or the wall is rendering `main`.
+
+### 6.4 Building the real wall
+
+The command center is the same binary in another mode:
+
+```bash
+TFG_CONTROL_SERVER=http://192.168.1.15:8787 \
+TFG_CONTROL_TOKEN="$OPERATOR_TOKEN" \
+TFG_DISPLAY_ID=wall-1 TFG_DISPLAY_LABEL=wall-1 \
+./target/debug/tfg --mode command-center
+```
+
+It needs the operator credential because `display.hello` requires `admin`. That
+is deliberate: the device being remoted cannot be the device doing the remoting.
+
+## 7. Platform configuration
+
+### 7.1 Android
 
 There is no TLS on this protocol yet. `https://` and `wss://` are refused by the
 host, so the app must be allowed to speak plain HTTP to a LAN address.
@@ -612,7 +878,7 @@ Camera permission, only if you ship the scanner:
 <uses-permission android:name="android.permission.CAMERA" />
 ```
 
-### 6.2 iOS
+### 7.2 iOS
 
 `ios/Runner/Info.plist`:
 
@@ -633,7 +899,7 @@ arbitrary loads. iOS also shows a one-time "allow local network" prompt on first
 connection; if the user declines, every request fails with a generic socket
 error, so surface a hint that mentions Settings → Privacy → Local Network.
 
-### 6.3 Desktop debug note
+### 7.3 Desktop debug note
 
 You can run the Flutter app on a desktop target for faster iteration, but the
 final check must be on a phone: the cleartext settings, the local-network
@@ -641,7 +907,7 @@ permission and the QR scanner exist only there.
 
 ---
 
-## 7. Test checklist
+## 8. Test checklist
 
 Run these in order. Each one has a specific failure to look for.
 
@@ -699,6 +965,13 @@ curl -sS -X POST http://192.168.1.20:8787/v1/commands \
 11. **Background/foreground.** Background the app for a minute, return. Either
     the socket survived or it reconnected; in both cases the readout must be
     current, not stale.
+12. **Waiting gate.** With no command center attached, the app shows the
+    `no_display` card and the d-pad does nothing. Attach
+    `tfgctl display attach`; the card must clear without reopening the app.
+13. **Focus.** Tap unit 3. The wall centres on the hull whose popup names
+    "KRI Diponegoro", and the operator's own map does not move.
+14. **Stale.** Kill the fixture publisher. Within ~15 s the card says the host
+    stopped reporting, and the units stay on screen greyed out.
 
 **What "working" means**
 
@@ -709,7 +982,7 @@ curl -sS -X POST http://192.168.1.20:8787/v1/commands \
 
 ---
 
-## 8. Traps, collected
+## 9. Traps, collected
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
@@ -727,10 +1000,14 @@ curl -sS -X POST http://192.168.1.20:8787/v1/commands \
 | QR scans but pairing fails | The QR's advertised `url` is the wrong interface (VPN/Docker). | Edit the URL, or type the code against the address that answered `/v1/hello`. |
 | `tfgctl pair` never prints "paired" | The phone called the host but the CLI is pointed at another address or host. | `--server` must be the same host the phone reached. |
 | App is asked for a password it does not have | The user pasted the operator token. | Paired devices get their own token; the operator token never goes in the app. |
+| Every observer command is `409 not_ready` | Observation is not open, and the message names why. | Show the waiting card; do not retry in a loop. Common cause: no command center attached. |
+| The operator's map moves when the phone nudges | The command omitted `view`, so it addressed `main`, or the wall renders `main`. | Send `"view": "observer"`, and run the wall with `--mode command-center`. |
+| The unit grid focuses the wrong hull | The app sent `index` where `camera.focus` wants `id`. | `index` is the tile number; `id` is the session's unit id. |
+| The wall says "no viewport" | The display never announced its size. | `view.report` is for nudges; the display's record needs `display.hello` with `viewport`. The command center does both. |
 
 ---
 
-## 9. What not to build
+## 10. What not to build
 
 - **No SSH, no shell, no `tfgctl` invocation.** The app is an HTTP/WebSocket
   client. Anything that shells out to a CLI will not work on iOS and is not
@@ -743,6 +1020,14 @@ curl -sS -X POST http://192.168.1.20:8787/v1/commands \
 - **No `admin` scope.** Pairing refuses it. Revocation and re-pairing happen at
   the host.
 - **No TLS assumptions.** There is no TLS yet. Do not ship an `https` default.
+- **No `display.hello` from the phone.** It needs `admin`, the phone does not
+  have it, and the refusal is the point: the device being remoted must not be
+  the device that satisfies readiness.
+- **No invented OK verb.** The button ships inert. When the protocol grows a
+  verb, the button gets a command; not before.
+- **No unit positions you compute yourself.** `camera.focus` takes an id; the
+  host resolves the position, and a phone that guesses coordinates will be
+  wrong the moment a hull moves.
 
 When the app is running against a host and you are unsure whether a failure is
 the app or the host, `tfgctl` is the tiebreaker: if `tfgctl` can do it from

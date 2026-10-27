@@ -28,6 +28,7 @@ mod client;
 mod devices;
 mod hub;
 mod protocol;
+mod publish;
 mod server;
 
 pub use auth::MIN_TOKEN_LEN;
@@ -38,8 +39,13 @@ pub use devices::{
 };
 pub use hub::ControlHub;
 pub use protocol::{
-    API_VERSION, AcceptedCommand, CameraSnapshot, CameraSource, Command, CommandRequest, Event,
-    GeoPoint, MAIN_VIEW, PROTOCOL_VERSION, ViewState, error_code,
+    API_VERSION, AcceptedCommand, COMMAND_CENTER_ROLE, CameraSnapshot, CameraSource, Command,
+    CommandRequest, CommanderState, DisplayHello, DisplayState, DisplayViewport, Event, GeoPoint,
+    MAIN_VIEW, OBSERVER_VIEW, PROTOCOL_VERSION, Readiness, ReadinessReason, ScenarioState,
+    SessionState, UnitRef, UnitState, ViewState, error_code,
+};
+pub use publish::{
+    SessionHandle, SessionSink, SessionUpdate, UnitPosition, spawn_session_publisher,
 };
 pub use server::{MAX_BODY_BYTES, MAX_WS_CLIENTS, ServerConfig, ServerHandle, spawn_server};
 

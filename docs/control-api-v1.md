@@ -1,9 +1,14 @@
-# TFG control API v1
+# TFG control API v2
 
 A TFG host can expose a small control endpoint so another client — the `tfgctl`
-CLI today, a phone or a second screen later — can move the map and watch the
-shared state. It is off unless the operator turns it on, and it binds to
-loopback unless they say otherwise.
+CLI today, a phone or a command-center wall later — can move the map, watch the
+shared state, and observe a live exercise. It is off unless the operator turns
+it on, and it binds to loopback unless they say otherwise.
+
+The routes kept their `/v1/` prefix; only the envelope version moved to `2`.
+Version 2 adds the observation surfaces: a shared **session**, a computed
+**readiness** verdict, display presence, the `observer` view, and
+`camera.focus`. A v1 client is refused, not misread: see [Versions](#versions).
 
 There are two hosts, one protocol:
 
@@ -63,12 +68,18 @@ clients talk to the host, and the host talks to Minos.
 
 ## Versions
 
-- The routes are under `/v1/`.
-- Bodies carry `protocol_version`: `1`.
-- `GET /v1/hello` reports both. It is unauthenticated, because a client that
-  cannot read `hello` cannot learn which version to speak.
-- A command whose `protocol_version` is not `1` is refused with
+- The routes are under `/v1/`. The prefix did not move when the envelope did:
+  a path is a place, a version is a language.
+- Bodies carry `protocol_version`: `2`.
+- `GET /v1/hello` reports the envelope version and the route version. It is
+  unauthenticated, because a client that cannot read `hello` cannot learn which
+  version to speak.
+- A command whose `protocol_version` is not `2` is refused with
   `409 unsupported_protocol`. Being misread is worse than being refused.
+- v2 is a clean break: the snapshot carries `session`, `readiness` and
+  `displays`, the wire has one more event (`session.changed`), and `observer`
+  exists as a second view. Every client in this repository moved together, and
+  an old client is expected to fail loudly rather than half-work.
 
 ## Authentication and scopes
 
@@ -113,7 +124,7 @@ to run when a command is refused.
 
 ```json
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "api_version": "v1",
   "service": "tfg-control",
   "revision": 7,
@@ -137,7 +148,7 @@ The whole shared state, and the shape the WebSocket sends on connect.
 ```json
 {
   "type": "snapshot",
-  "protocol_version": 1,
+  "protocol_version": 2,
   "revision": 7,
   "views": {
     "main": {
@@ -148,8 +159,33 @@ The whole shared state, and the shape the WebSocket sends on connect.
         "width": 1280,
         "height": 720
       }
+    },
+    "observer": {
+      "id": "observer",
+      "camera": {
+        "center": { "latitude": -5.9123, "longitude": 105.8412 },
+        "zoom": 12.0,
+        "width": 1280,
+        "height": 720
+      }
     }
-  }
+  },
+  "session": {
+    "game_id": 45,
+    "name": "Sunda Strait Watch",
+    "phase": "execution",
+    "mode": "exercise",
+    "units": []
+  },
+  "readiness": { "ready": true },
+  "displays": [
+    {
+      "id": "wall-1",
+      "label": "wall-1",
+      "role": "command_center",
+      "viewport": { "width": 1280, "height": 720 }
+    }
+  ]
 }
 ```
 
@@ -162,8 +198,11 @@ last reported with `view.report`, or the console's base geometry until one does.
 ### `GET /v1/views`
 
 ```json
-{ "views": { "main": { "id": "main", "camera": { … } } } }
+{ "views": { "main": { "id": "main", "camera": { … } }, "observer": { … } } }
 ```
+
+`main` is the operator's camera. `observer` is the camera a phone may move: it
+is a **separate** view, so a remote command can never drag the game master's map.
 
 ### `GET /v1/views/{view_id}/camera`
 
@@ -179,8 +218,98 @@ last reported with `view.report`, or the console's base geometry until one does.
 }
 ```
 
-An unknown view is `404 not_found`. Today there is exactly one view, `main`, and
-it is named rather than implied so a second display is additive.
+An unknown view is `404 not_found`. There are two views today, `main` and
+`observer`; they are named rather than implied so a third display is additive.
+Every command may carry `"view": "observer"` to address the second one; absent
+means `main`.
+
+### `GET /v1/session`
+
+The exercise the console projected, whether observation is open, and which
+command centers are attached. This is the read a phone's waiting screen polls.
+
+```json
+{
+  "session": {
+    "game_id": 45,
+    "name": "Sunda Strait Watch",
+    "phase": "execution",
+    "mode": "exercise",
+    "scenario": { "id": 7, "title": "Sunda Strait, first light", "step": "Step 3 of 7: shadow the contact" },
+    "units": [
+      {
+        "index": 1,
+        "id": 9001,
+        "name": "Evertsen",
+        "hull_number": "F805",
+        "class_name": "Karel Doorman frigate",
+        "commander": { "id": 3, "name": "Lt Cdr Halvorsen" },
+        "embarked": [{ "id": 9101, "name": "NH90 N-110", "hull_number": "" }],
+        "position": { "latitude": -5.9123, "longitude": 105.8412 },
+        "heading_deg": 84.0,
+        "speed_kn": 14.0,
+        "stale": false
+      }
+    ]
+  },
+  "readiness": { "ready": true },
+  "displays": [
+    { "id": "wall-1", "label": "wall-1", "role": "command_center",
+      "viewport": { "width": 1280, "height": 720 } }
+  ]
+}
+```
+
+`session` is `null` when the console holds no exercise. `units[].index` is the
+number the phone's grid and the wall's marker share; the server assigns it from
+the publisher's array order.
+
+**Readiness is computed, never asserted.** It is `ready` only when all four hold:
+
+1. a session exists,
+2. its phase is `execution`,
+3. at least one `command_center` display is attached,
+4. the session was refreshed within the last 15 seconds.
+
+When it is not ready, `reason` names the one thing to wait for:
+
+| `reason` | Meaning | What a waiting screen says |
+| --- | --- | --- |
+| `no_session` | Nothing has been published. | "No exercise open." |
+| `not_execution` | A session exists in another phase. | "«name» is in planning. Observation opens at execution." |
+| `no_display` | Execution, but no command center is attached. | "No command center is attached." |
+| `stale` | The console stopped refreshing (crashed or lost the network). | "The host stopped reporting. Reconnecting…" |
+
+An expired session is kept and reported `stale` rather than deleted: a stale map
+beats an empty one.
+
+### `PUT /v1/session` and `DELETE /v1/session`
+
+Needs `admin`. These are the console's routes, not a phone's: the console is the
+only process that holds a Minos session, and it publishes a projection. A client
+that is not the console has nothing to put here.
+
+A `PUT` replaces the projection and refreshes its clock; the same body sent
+again is a heartbeat, not a change. `DELETE` says the console holds no exercise
+again. Both answer
+
+```json
+{ "status": "changed", "revision": 12, "readiness": { "ready": true } }
+```
+
+or `{ "status": "unchanged", … }`.
+
+### `GET /v1/displays`
+
+```json
+{ "displays": [ { "id": "wall-1", "label": "wall-1", "role": "command_center",
+                  "viewport": { "width": 1280, "height": 720 } } ],
+  "readiness": { "ready": true } }
+```
+
+A display is present for as long as its WebSocket lives, refreshed by a
+heartbeat every 10 s and reaped after 30. `viewport` is `null` until the display
+reports a size.
 
 ## Commands
 
@@ -189,7 +318,7 @@ the WebSocket says when it took effect.
 
 ```json
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "client_id": "phone-7",
   "command_id": "01J8Z6Q0K3",
   "type": "camera.nudge",
@@ -203,7 +332,8 @@ the WebSocket says when it took effect.
 | `payload` | yes | Command arguments; the shape belongs to the type. |
 | `command_id` | no | Unique per command. A retry with the same id is answered `duplicate` and does not act twice. Generated by the server when omitted. |
 | `client_id` | no | Attribution only. Not authorization. Bounded to 64 printable characters; `remote` when absent. |
-| `protocol_version` | no | Envelope version. Absent means 1. |
+| `protocol_version` | no | Envelope version. Absent means 1, which this server refuses. |
+| `view` | no | `main` (the operator's camera, default) or `observer` (the phone's). |
 
 Accepted reply — `202 Accepted`:
 
@@ -286,6 +416,25 @@ Latitude is `-90..=90`, longitude `-180..=180`, zoom `-30..=30`, all finite. A
 value outside those bounds is refused, not clamped: a latitude of 91 is a bug in
 the client, and a server that quietly fixes it hides the bug.
 
+### `camera.focus`
+
+Centre the observer view on a unit the session published. This is what the
+phone's numbered grid sends; it is resolved **host-side** against the session,
+so a phone never needs to know where a hull is.
+
+```json
+{ "type": "camera.focus", "payload": { "unit_id": 9001, "zoom": 12.0 } }
+```
+
+- `unit_id` is the session's `units[].id` (not the grid number — the grid number
+  is `index`, and the phone sends `id`).
+- `zoom` is optional; omitted keeps the observer view's current zoom.
+- An id the session does not carry is `422 invalid_command`; a unit with no
+  position is the same, with a message saying so.
+- `camera.focus` on `main` is `422`: the operator's camera is not a remote
+  surface, and accepting it on `main` would let a phone drag the game master's
+  map.
+
 ### `view.report`
 
 A display says how big its viewport is, in device pixels.
@@ -306,6 +455,22 @@ size that was reported last.
   means for everybody.
 - It is a change like any other: it advances `revision` once, and a repeat of the
   same size does not.
+- On the `observer` view it is exempt from the readiness gate: a waiting display
+  still has to say how big it is.
+
+### The readiness gate
+
+Commands against `observer` are refused until observation is open:
+
+```json
+{ "error": { "code": "not_ready",
+             "message": "observation is not open yet: no_display" } }
+```
+
+`409 not_ready`, with the same four reasons the read uses. The gate is
+server-side because a phone that has not read `GET /v1/session` yet must not be
+able to steer; `view.report` is the one exemption, and `main` is untouched (the
+operator's own gestures are not a remote client).
 
 ## Pairing and devices
 
@@ -446,8 +611,11 @@ On connect the server sends the whole state, then one event per change:
 
 | Event | Meaning |
 | --- | --- |
-| `snapshot` | The whole state at `revision`. Sent on connect, and again after a gap. |
-| `camera.changed` | The camera moved. `source` names the client, or `desktop` for the operator's own gesture. `command_id` is present when a command caused it. |
+| `snapshot` | The whole state at `revision`: views, session, readiness, displays. Sent on connect, and again after a gap. |
+| `camera.changed` | A camera moved. `view.id` says which one. `source` names the client, or `desktop` for the operator's own gesture. `command_id` is present when a command caused it. |
+| `session.changed` | The exercise, its phase, its units, the readiness verdict, or the attached displays changed. One event, because they all answer the same question: may I steer, and what am I steering? |
+| `display.attached` | This socket's `display.hello` was accepted. Carries the id the host recorded. |
+| `display.rejected` | This socket's `display.hello` was refused (a phone without `admin`, a bad role). The socket stays open. |
 | `command.accepted` | A command reached the host. The evidence that it *worked* is the `camera.changed` that follows. |
 | `command.rejected` | A command was refused at the boundary. The HTTP reply carried the same code. |
 
@@ -470,6 +638,35 @@ of a guessed patch. A client can also ask at any time:
 Camera commands are not accepted on the WebSocket. They go over HTTP, where a
 refusal can be a reply.
 
+### A command center is a display
+
+A command center attaches over the same socket and says what it is:
+
+```json
+{ "type": "display.hello",
+  "payload": { "id": "wall-1", "role": "command_center", "label": "wall-1",
+               "viewport": { "width": 1920, "height": 1080 } } }
+```
+
+It then beats every 10 s:
+
+```json
+{ "type": "display.heartbeat", "payload": { "id": "wall-1" } }
+```
+
+Rules:
+
+- `display.hello` needs `admin`. A paired phone is refused, which is the
+  enforcement behind "only command-center mode can be remoted": the presence
+  that satisfies readiness cannot be faked by the device being remoted.
+- Presence is the socket. A reconnect announces again; the attachment dies with
+  the socket, and a display that stops beating is reaped after 30 s.
+- Re-announcing with the same id replaces the record rather than stacking a
+  second one. That is also how a display reports a resize: `view.report` says
+  what to resolve a nudge against, the record says what the wall can show.
+- One observer view is shared by every command center. Per-display cameras are
+  deferred.
+
 At most 8 clients may watch at once; the ninth is refused with
 `503 too_many_clients`. A client that disconnects does not disturb the host or
 the other clients.
@@ -486,7 +683,8 @@ the other clients.
 | 400 | `invalid_json` | Body is not JSON, or not a command. |
 | 413 | `body_too_large` | Body over 64 KiB. |
 | 422 | `invalid_command` | Parsed, but the values cannot be applied. |
-| 409 | `unsupported_protocol` | `protocol_version` is not 1. |
+| 409 | `unsupported_protocol` | `protocol_version` is not 2. |
+| 409 | `not_ready` | An `observer` command before observation is open. The message names the reason. |
 | 404 | `not_found` | No such route or view. |
 | 503 | `host_gone` | The host's command channel is closed (the window is gone). |
 | 503 | `too_many_clients` | Too many WebSocket clients. |
@@ -513,7 +711,37 @@ cargo run --bin tfgctl -- … pair --scopes observe,control_view
 cargo run --bin tfgctl -- … devices
 cargo run --bin tfgctl -- … revoke dev-4b2379bfa714
 cargo run --bin tfgctl -- … rotate --save
+
+# observation
+cargo run --bin tfgctl -- … session status
+cargo run --bin tfgctl -- … session watch [--until ready]
+cargo run --bin tfgctl -- … session set --file session.json
+cargo run --bin tfgctl -- … session clear
+cargo run --bin tfgctl -- … units
+cargo run --bin tfgctl -- … focus 3 [--zoom 12]
+cargo run --bin tfgctl -- … display list
+cargo run --bin tfgctl -- … display attach --id wall-1 --label wall-1 --width 1920 --height 1080
 ```
+
+`session watch` polls `GET /v1/session` once a second and prints one line per
+**transition**, not one per tick:
+
+```text
+waiting  no session
+waiting  session 45 "Sunda Strait Watch" is planning
+waiting  session 45 "Sunda Strait Watch" in execution, no command center attached
+ready    session 45 · observer 1280x720 · 6 unit(s)
+```
+
+`--until ready` exits `0` at the first ready line, which is what a script or a
+waiting UI wants. `--interval 500ms` changes the poll.
+
+`focus 3` sends `camera.focus` for grid number 3 on the `observer` view;
+`--view main` addresses the operator's view explicitly (and is refused by the
+readiness gate and the focus rule). `display attach` opens a WebSocket, sends
+`display.hello`, reports a viewport, heartbeats, and prints readiness
+transitions — it simulates a command center, so the whole server-side feature is
+testable before a wall exists.
 
 Flags: `--server`, `--token`, `--json` (stable JSON on stdout, one object per
 line), `--timeout 3s`. Configuration falls back to `TFG_CONTROL_URL` and
@@ -582,6 +810,28 @@ TFG_CONTROL_TOKEN="$(openssl rand -hex 32)" \
 cargo run
 ```
 
+### The command center
+
+`--mode command-center` turns the same binary into the wall a phone remotes:
+
+```bash
+TFG_CONTROL_SERVER=http://192.168.1.15:8787 \
+TFG_CONTROL_TOKEN="$OPERATOR_TOKEN" \
+TFG_DISPLAY_ID=wall-1 TFG_DISPLAY_LABEL=wall-1 \
+cargo run -- --mode command-center
+```
+
+It renders the `observer` view and nothing else: no roster, no composer, no
+Minos credential. It branches before the keyring and the sign-in, so that claim
+is structural. It announces itself as a `command_center` display (which needs
+`admin`), beats every 10 s, and re-announces when its window resizes.
+
+What it shows: a top strip with the exercise, the scenario step, the unit count
+and the observer zoom; the map at the observer camera; numbered markers for the
+units that fall on screen; and, while observation is not open, a card naming the
+one thing it is waiting for. It takes no camera gesture of its own — it is a
+display, not a controller.
+
 It opens no listener and reads no device table. On launch it connects to
 `/v1/ws` with the same bearer token, takes the host's snapshot, and moves the
 map to the camera in it. After that, every `camera.changed` the host publishes
@@ -629,8 +879,14 @@ camera; it does not click a button.
 - **QR image files.** The offer carries a URI and a JSON payload, and
   `tfgctl pair` draws the payload as a terminal QR code for a phone to scan.
   Writing an image file (PNG/SVG) is left to a client.
-- Session and marker events: `session.changed` and `marker.changed` are
-  reserved, not emitted.
+- `marker.changed`. Markers ride `session.changed`; a separate event would say
+  the same thing twice.
+- Per-display cameras. One `observer` view is shared by every attached command
+  center.
+- A verb for the phone's OK button. The button is inert until the protocol has
+  something for it to mean.
+- Comms content. The panel exists on the phone as a placeholder; nothing is
+  published for it in this phase.
 - `GET /v1/commands/{id}` for polling a command's fate. The event stream is the
   only way to see one applied.
 - TLS. `wss` and `https` are refused by `tfgctl watch` with a message rather

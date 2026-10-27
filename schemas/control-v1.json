@@ -1,12 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tfg.invalid/schemas/control-v1.json",
-  "title": "TFG control protocol v1",
-  "description": "Every JSON body in the TFG control protocol v1: commands posted to POST /v1/commands, events pushed over GET /v1/ws, the pairing and device bodies, and the error reply. The prose contract is docs/control-api-v1.md; this file is its machine-readable shape.",
+  "title": "TFG control protocol v2",
+  "description": "Every JSON body in the TFG control protocol v2: commands posted to POST /v1/commands, the session projection published with PUT /v1/session, events pushed over GET /v1/ws, the display handshake a command center sends up that socket, the pairing and device bodies, and the error reply. The prose contract is docs/control-api-v1.md; this file is its machine-readable shape.",
   "$defs": {
     "protocol_version": {
       "type": "integer",
-      "const": 1
+      "const": 2
     },
     "geo_point": {
       "type": "object",
@@ -85,6 +85,9 @@
           "$ref": "#/$defs/command_camera_zoom"
         },
         {
+          "$ref": "#/$defs/command_camera_focus"
+        },
+        {
           "$ref": "#/$defs/command_view_report"
         }
       ]
@@ -108,6 +111,11 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 128
+        },
+        "view": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Which view the command is about. Absent means `main`."
         },
         "type": {
           "const": "camera.set"
@@ -151,6 +159,11 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 128
+        },
+        "view": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Which view the command is about. Absent means `main`."
         },
         "type": {
           "const": "camera.nudge"
@@ -197,6 +210,11 @@
           "minLength": 1,
           "maxLength": 128
         },
+        "view": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Which view the command is about. Absent means `main`."
+        },
         "type": {
           "const": "camera.zoom"
         },
@@ -222,6 +240,9 @@
           "$ref": "#/$defs/event_snapshot"
         },
         {
+          "$ref": "#/$defs/event_session_changed"
+        },
+        {
           "$ref": "#/$defs/event_camera_changed"
         },
         {
@@ -229,6 +250,12 @@
         },
         {
           "$ref": "#/$defs/event_command_rejected"
+        },
+        {
+          "$ref": "#/$defs/event_display_attached"
+        },
+        {
+          "$ref": "#/$defs/event_display_rejected"
         }
       ]
     },
@@ -239,7 +266,8 @@
         "type",
         "protocol_version",
         "revision",
-        "views"
+        "views",
+        "readiness"
       ],
       "properties": {
         "type": {
@@ -260,6 +288,18 @@
           "required": [
             "main"
           ]
+        },
+        "session": {
+          "$ref": "#/$defs/session"
+        },
+        "readiness": {
+          "$ref": "#/$defs/readiness"
+        },
+        "displays": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/display"
+          }
         }
       }
     },
@@ -380,6 +420,11 @@
           "minLength": 1,
           "maxLength": 128
         },
+        "view": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Which view the command is about. Absent means `main`."
+        },
         "type": {
           "const": "view.report"
         },
@@ -430,7 +475,8 @@
         "no_pairing_window",
         "pairing_expired",
         "too_many_attempts",
-        "unknown_device"
+        "unknown_device",
+        "not_ready"
       ]
     },
     "device": {
@@ -625,6 +671,364 @@
         }
       },
       "description": "The answer to POST /v1/auth/rotate."
+    },
+    "command_camera_focus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "payload"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/protocol_version"
+        },
+        "client_id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "command_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "view": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "type": {
+          "const": "camera.focus"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "unit_id"
+          ],
+          "properties": {
+            "unit_id": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "zoom": {
+              "type": "number",
+              "minimum": -30,
+              "maximum": 30
+            }
+          }
+        }
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        },
+        "step": {
+          "type": "string"
+        }
+      }
+    },
+    "commander": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "unit_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "hull_number": {
+          "type": "string"
+        }
+      }
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "id",
+        "name"
+      ],
+      "description": "One hull a viewer may look at. `index` is the hub's array position, the number the phone grid and the command center marker share.",
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "name": {
+          "type": "string"
+        },
+        "hull_number": {
+          "type": "string"
+        },
+        "class_name": {
+          "type": "string"
+        },
+        "commander": {
+          "$ref": "#/$defs/commander"
+        },
+        "embarked": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/unit_ref"
+          }
+        },
+        "embarked_in": {
+          "$ref": "#/$defs/unit_ref"
+        },
+        "position": {
+          "$ref": "#/$defs/geo_point"
+        },
+        "heading_deg": {
+          "type": "number"
+        },
+        "speed_kn": {
+          "type": "number"
+        },
+        "stale": {
+          "type": "boolean"
+        }
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "game_id",
+        "name",
+        "phase",
+        "units"
+      ],
+      "description": "The console's projection of the exercise it holds. A projection: no credentials, no message traffic.",
+      "properties": {
+        "game_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "name": {
+          "type": "string"
+        },
+        "phase": {
+          "type": "string",
+          "description": "The server's own word: planning, preparation, execution, closure. Only `execution` opens observation."
+        },
+        "mode": {
+          "type": "string"
+        },
+        "scenario": {
+          "$ref": "#/$defs/scenario"
+        },
+        "units": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/unit"
+          }
+        }
+      }
+    },
+    "readiness_reason": {
+      "type": "string",
+      "enum": [
+        "no_session",
+        "not_execution",
+        "no_display",
+        "stale"
+      ]
+    },
+    "readiness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ready"
+      ],
+      "properties": {
+        "ready": {
+          "type": "boolean"
+        },
+        "reason": {
+          "$ref": "#/$defs/readiness_reason"
+        }
+      }
+    },
+    "display_viewport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "width",
+        "height"
+      ],
+      "properties": {
+        "width": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "display": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "role"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 48
+        },
+        "label": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "command_center"
+          ]
+        },
+        "viewport": {
+          "$ref": "#/$defs/display_viewport"
+        }
+      }
+    },
+    "display_hello": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Sent up the event stream by a display. The attachment dies with the socket, which is the fact the server needs. The admin scope is required: a paired phone cannot claim to be a command center.",
+      "required": [
+        "type",
+        "role"
+      ],
+      "properties": {
+        "type": {
+          "const": "display.hello"
+        },
+        "id": {
+          "type": "string",
+          "maxLength": 48
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "command_center"
+          ]
+        },
+        "viewport": {
+          "$ref": "#/$defs/display_viewport"
+        }
+      }
+    },
+    "event_session_changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "revision",
+        "readiness"
+      ],
+      "description": "The observation state changed: the session, its phase, its units, the readiness verdict, or which command centers are attached. One event because all of them answer one question.",
+      "properties": {
+        "type": {
+          "const": "session.changed"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "session": {
+          "$ref": "#/$defs/session"
+        },
+        "readiness": {
+          "$ref": "#/$defs/readiness"
+        },
+        "displays": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/display"
+          }
+        }
+      }
+    },
+    "event_display_attached": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id"
+      ],
+      "properties": {
+        "type": {
+          "const": "display.attached"
+        },
+        "id": {
+          "type": "string"
+        }
+      }
+    },
+    "event_display_rejected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "code",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "display.rejected"
+        },
+        "code": {
+          "$ref": "#/$defs/error_code"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
     }
   },
   "oneOf": [
@@ -660,6 +1064,9 @@
     },
     {
       "$ref": "#/$defs/rotation"
+    },
+    {
+      "$ref": "#/$defs/display_hello"
     }
   ]
 }

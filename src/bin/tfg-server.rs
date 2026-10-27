@@ -210,6 +210,10 @@ fn describe(command: &Command) -> String {
             dy_fraction,
         } => format!("camera.nudge {dx_fraction:+.2},{dy_fraction:+.2}"),
         Command::CameraZoom { delta } => format!("camera.zoom {delta:+.2}"),
+        Command::CameraFocus { unit_id, zoom } => match zoom {
+            Some(zoom) => format!("camera.focus unit {unit_id} @{zoom:.2}"),
+            None => format!("camera.focus unit {unit_id}"),
+        },
         Command::ViewReport { width, height } => format!("view.report {width}x{height}"),
     }
 }
