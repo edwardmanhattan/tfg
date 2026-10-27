@@ -266,8 +266,17 @@ fn main() {
             // column lands on NoSession with the shell's fixture rows to
             // pick. The roster stays real; only the hold is staged.
             tfg::shell_gpui::SessionView::default()
-        } else {
+        } else if pinned.is_some() {
+            // A pinned game IS a held game: the headless capture seeds it.
             fetch_session(&host, &token, pinned).unwrap_or_default()
+        } else {
+            // A SIGNED-IN LAUNCH HOLDS NOTHING. The app opens on the
+            // launcher, not on the newest game this account can see: holding
+            // is the operator's choice from that list, and a console that
+            // opens already inside somebody's exercise is a console that
+            // answered a question nobody asked. The rows themselves are read
+            // below, for the launcher's history.
+            tfg::shell_gpui::SessionView::default()
         };
         // The camera's opening zoom comes from the MAP's own constant, not the
         // shell's: the shell shows what it asked for, and this is the ask.
@@ -277,6 +286,16 @@ fn main() {
         // the one a shipped build starts in.
         s.signed_in = !token.is_empty();
         s
+    };
+
+    // The launcher's history: the games this account can see, read once at
+    // launch so the landing has rows before any sign-in answer arrives. A
+    // failed read is an empty history, which the landing says rather than
+    // pretending the account has no games.
+    let initial_sessions: Vec<tfg::shell_gpui::SessionRow> = if token.is_empty() {
+        Vec::new()
+    } else {
+        fetch_launch_rows(&host, &token).unwrap_or_default()
     };
 
     // The register's class NAMES, for the symbol bridge's fallback.
@@ -3214,6 +3233,7 @@ fn main() {
         order_tx,
         roster,
         roster_total,
+        initial_sessions,
         session,
         fleet_tax,
         taxonomies,
@@ -3698,6 +3718,33 @@ fn flatten_nodes(tree: &[tfg::backend::HierarchyNode]) -> Vec<tfg::groups::LiveG
     out
 }
 
+/// The launcher's history, from the one read that names every game.
+///
+/// The picker's rows (`fetch_session_rows`) read the participants too, because
+/// the seat column is that screen's subject. The launcher draws name, mode,
+/// state and when, and needs none of it — and a launch that paid 55
+/// participant reads before the window opened would be a slow door for a list
+/// that is already on the first answer. The seat arrives with the sign-in
+/// answer when the operator opens a game.
+fn fetch_launch_rows(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::SessionRow>> {
+    let master = tfg::backend::MinosMaster::new(host).ok()?;
+    let games = master.games_list(token).ok()?;
+    Some(
+        games
+            .iter()
+            .map(|g| tfg::shell_gpui::SessionRow {
+                id: g.id,
+                name: g.name.clone(),
+                state: g.state.clone(),
+                mode: g.mode.clone(),
+                my_role: String::new(),
+                judge: false,
+                created_at: g.created_at.clone(),
+            })
+            .collect(),
+    )
+}
+
 fn fetch_session_rows(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::SessionRow>> {
     let master = tfg::backend::MinosMaster::new(host).ok()?;
     let (me, _name) = master.me(token).ok()?;
@@ -3844,8 +3891,9 @@ fn fetch_session(
     // `facts.read` records whether it ANSWERED: a read this account may not
     // make is a different thing from a game with nothing written on it, and
     // Essentials says which it is looking at.
-    let facts = match master.game_detail(token, game_id) {
-        Ok(d) => tfg::shell_gpui::GameFacts {
+    let detail = master.game_detail(token, game_id).ok();
+    let facts = match &detail {
+        Some(d) => tfg::shell_gpui::GameFacts {
             // The mode is PARSED HERE, ONCE, WHERE THE SESSION IS READ.
             // Every rule about a mode is a function of this value, and a
             // rule that compared the mode's spelling at each site would be
@@ -3861,18 +3909,18 @@ fn fetch_session(
                 Some(tfg::backend::GamePace::Fast) => "fast".to_string(),
                 None => "unrecognised".to_string(),
             },
-            description: d.description,
-            purpose: d.purpose,
-            target: d.target,
-            actual_start: d.window.actual_start.unwrap_or_default(),
-            actual_end: d.window.actual_end.unwrap_or_default(),
-            assumed_start: d.window.assumed_start.unwrap_or_default(),
-            assumed_end: d.window.assumed_end.unwrap_or_default(),
+            description: d.description.clone(),
+            purpose: d.purpose.clone(),
+            target: d.target.clone(),
+            actual_start: d.window.actual_start.clone().unwrap_or_default(),
+            actual_end: d.window.actual_end.clone().unwrap_or_default(),
+            assumed_start: d.window.assumed_start.clone().unwrap_or_default(),
+            assumed_end: d.window.assumed_end.clone().unwrap_or_default(),
             time_factor: d.time_factor,
-            room_key: d.room_key.unwrap_or_default(),
+            room_key: d.room_key.clone().unwrap_or_default(),
             read: true,
         },
-        Err(_) => tfg::shell_gpui::GameFacts::default(),
+        None => tfg::shell_gpui::GameFacts::default(),
     };
     // The published checklist. `None` for a planning room is the ordinary
     // case (the route 404s until preparation), not a failure to report.
@@ -4211,6 +4259,7 @@ fn fetch_session(
         })
         .collect();
     Some(tfg::shell_gpui::SessionView {
+        detail,
         // The camera's opening zoom is the MAP's constant and the caller sets
         // it: the session read has no business knowing the map's defaults.
         zoom: 0.0,

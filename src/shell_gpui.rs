@@ -1314,6 +1314,10 @@ struct IslandDemo {
     flow_drop_note: Option<String>,
     /// The hold latch and its verdict line, for the picker's verb.
     hold_busy: bool,
+    /// The hold the landing asked for was a PLANNING row: when the answer
+    /// lands, the held game opens as a `Reopened` draft in the flow, not as
+    /// the console.
+    hold_to_draft: bool,
     hold_status: Status,
     /// The session the top zone reads: the held game and its room's
     /// headcount. `SessionView::default()` when no session is held.
@@ -3825,7 +3829,7 @@ impl IslandDemo {
         // shell built without one. The console's own path is the data dir's,
         // and it is handed in by `new_with_library`.
         let path = std::env::temp_dir().join("tfg-scenario-library.json");
-        Self::new_with_library(
+        let mut demo = Self::new_with_library(
             roster,
             roster_total,
             selected,
@@ -3833,7 +3837,13 @@ impl IslandDemo {
             order_tx,
             path,
             None,
-        )
+        );
+        // THE CONSOLE, FOR THE CALLERS THAT ASK FOR IT. The shipped launch
+        // opens the launcher instead (see `run`), but a headless test that
+        // builds a demo and clicks a roster row is testing the console under
+        // it; a flow test opens the flow itself (`sessions_open`).
+        demo.sessions_open = false;
+        demo
     }
 
     /// The shell's state, with the library's own path.
@@ -4171,6 +4181,7 @@ impl IslandDemo {
                 Vec::new()
             },
             hold_busy: false,
+            hold_to_draft: false,
             hold_status: Status::empty(),
             session,
             session_published: None,
@@ -13345,10 +13356,6 @@ impl IslandDemo {
         self.hold_busy = false;
         self.hold_status.clear();
         self.session = session;
-        // The card goes: an exercise is held, and the console's job is now
-        // that exercise. The card was the answer to "which exercise?", and
-        // the question has been answered.
-        self.sessions_open = false;
         // A HOLD IS NOT A RE-READ: the drafts belong to the game that was
         // holding them, so they are FORGOTTEN before the new frame is
         // seeded. (A re-seed alone would MERGE — that is the rule for a read
@@ -13358,6 +13365,37 @@ impl IslandDemo {
         // against what Minos actually holds rather than against an empty
         // draft that would read every existing piece as a removal.
         self.reseed_drafts();
+        // THE FLOW KEEPS THE PLANNING GAME. A planning row reopened from the
+        // landing is the draft's own subject; opening the console here was
+        // why the old planning surface kept reappearing under the new shell.
+        // The draft takes the frame `reseed_drafts` just built — same types,
+        // one seeding rule — and the flow stays up.
+        let reopened = if self.hold_to_draft {
+            self.session
+                .detail
+                .as_ref()
+                .and_then(crate::draft::Draft::reopened)
+                .map(|mut draft| {
+                    draft.force = self.force.clone();
+                    draft.roster = self.roster_draft.clone();
+                    draft.groups = self.groups.clone();
+                    draft.book = self.book.clone();
+                    draft
+                })
+        } else {
+            None
+        };
+        self.hold_to_draft = false;
+        if let Some(draft) = reopened {
+            self.flow_draft = Some(draft);
+            self.flow_stage = crate::draft::Stage::Essentials;
+            self.stage_one_reached = 1;
+            self.sessions_open = true;
+        } else {
+            // The card goes: an exercise is held, and the console's job is now
+            // that exercise — the execution and closure surfaces.
+            self.sessions_open = false;
+        }
         // The same baseline as a created session: a new hold's traffic is
         // what the console holds, not what arrived since the operator last
         // looked.
@@ -22888,8 +22926,26 @@ impl IslandDemo {
                                 .id("flow-close")
                                 .cursor_pointer()
                                 .on_click(cx.listener(|view, _, _, cx| {
-                                    view.flow_arrival = None;
-                                    view.sessions_open = false;
+                                    // THE FLOW IS THE SHELL, so CLOSE does not
+                                    // uncover a console behind it: it lets go
+                                    // of the draft (back to the launcher), and
+                                    // on the launcher itself it ends the
+                                    // session. A console under a form was the
+                                    // second state machine; there is no
+                                    // longer one to fall back to.
+                                    if view.flow_draft.is_some()
+                                        || view.flow_arrival.is_some()
+                                        || view.flow_map
+                                    {
+                                        view.flow_draft = None;
+                                        view.flow_arrival = None;
+                                        view.flow_map = false;
+                                        view.flow_pan = None;
+                                        view.flow_peel = None;
+                                        view.flow_carry = None;
+                                    } else {
+                                        view.sign_out(cx);
+                                    }
                                     cx.notify();
                                 }))
                                 .child(kit::mono_caps("CLOSE", view::LABEL_PT, kit::MUTED_INK)),
@@ -23534,9 +23590,14 @@ impl IslandDemo {
                 }
             }
             crate::landing::Proceed::Reopen(game_id) => {
+                // A PLANNING ROW OPENS THE DRAFT, not the console: the hold
+                // is the read the draft seeds from, and the answer lands in
+                // `apply_hold` with the flow still on screen.
+                self.hold_to_draft = true;
                 self.send_hold(game_id, cx);
             }
             crate::landing::Proceed::Open { game_id, .. } => {
+                self.hold_to_draft = false;
                 self.send_hold(game_id, cx);
             }
         }
@@ -27273,6 +27334,89 @@ impl IslandDemo {
     /// water it sits on. That is the shipped convention; a 14-pixel dot
     /// replaced it for one build and told the operator nothing about which
     /// hull it was.
+    /// The flow as the WHOLE window: the chart behind it, the surface over
+    /// it, and the picker popup last.
+    fn flow_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let size = window.viewport_size();
+        self.map_window = (f32::from(size.width), f32::from(size.height));
+        let map = if self.flow_map {
+            self.flow_map_layer()
+        } else {
+            self.flow_backdrop()
+        };
+        let surface = self.flow_surface(cx);
+        div()
+            .relative()
+            .size_full()
+            .children(map)
+            .child(surface)
+            .children(self.picker_popup(cx))
+            .into_any_element()
+    }
+
+    /// The chart behind the flow's form.
+    ///
+    /// The same placement the map mode and the console use: the last picture,
+    /// put where the LIVE camera says it belongs, with the bands smeared. A
+    /// static `object_fit(Fill)` backdrop was what made `tfgctl camera left`
+    /// look dead while the form was open — the camera moved and the picture
+    /// under it did not.
+    fn flow_backdrop(&self) -> Option<AnyElement> {
+        let frame = self.gate.image()?.clone();
+        let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
+        if mw <= 0.0 || mh <= 0.0 {
+            return None;
+        }
+        let live = (self.map_center, self.map_zoom);
+        let rendered = (self.map_render_center, self.map_render_zoom);
+        let edges = [
+            self.gate.edge(FrameEdge::Left),
+            self.gate.edge(FrameEdge::Right),
+            self.gate.edge(FrameEdge::Top),
+            self.gate.edge(FrameEdge::Bottom),
+        ];
+        Some(
+            canvas(
+                |bounds, _, _| bounds,
+                move |bounds, _, window, _| {
+                    let bp = (f64::from(bounds.size.width), f64::from(bounds.size.height));
+                    let placement =
+                        map_geometry::place_frame(live.0, live.1, rendered.0, rendered.1, (mw, mh), bp);
+                    let _ = window.paint_image(
+                        rect_bounds(placement.frame),
+                        Corners::all(px(0.0)),
+                        frame.clone(),
+                        0,
+                        false,
+                    );
+                    for (band, edge) in [
+                        (placement.left, &edges[0]),
+                        (placement.right, &edges[1]),
+                        (placement.top, &edges[2]),
+                        (placement.bottom, &edges[3]),
+                    ] {
+                        let (Some(band), Some(edge)) = (band, edge) else {
+                            continue;
+                        };
+                        let _ = window.paint_image(
+                            rect_bounds(band),
+                            Corners::all(px(0.0)),
+                            (*edge).clone(),
+                            0,
+                            false,
+                        );
+                    }
+                },
+            )
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w_full()
+            .h_full()
+            .into_any_element(),
+        )
+    }
+
     fn flow_map_layer(&mut self) -> Option<AnyElement> {
         if !self.flow_map {
             return None;
@@ -31953,6 +32097,15 @@ impl Render for IslandDemo {
         if !self.session.signed_in {
             return self.signed_out(cx);
         }
+        // THE FLOW IS THE SURFACE, NOT AN OVERLAY. It used to be appended to
+        // the console's root as a modal, which left the console underneath:
+        // its map still received the wheel and the left press, so a gesture
+        // on the flow's own UI could pan or zoom the map under it. The flow
+        // paints the chart itself (behind its form, and in map mode), so the
+        // console is not part of this frame at all.
+        if self.sessions_open && !self.sheet {
+            return self.flow_window(window, cx);
+        }
         if self.sheet {
             return div()
                 .relative()
@@ -32430,6 +32583,23 @@ impl Render for IslandDemo {
                             cx.notify();
                         }
                     }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|view, ev: &MouseDownEvent, window, cx| {
+                        // THE RIGHT BUTTON IS THE CAMERA. A press over a
+                        // panel is the panel's, as for the left; over the
+                        // chart it starts a pan, and nothing else does.
+                        let at = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        if !view.pin_arm && view.over_grid_panel(at, window) {
+                            return;
+                        }
+                        view.pan = Some(at);
+                        view.press_at = None;
+                        view.pick_made = None;
+                        view.press_unit = None;
+                        view.unit_drag = None;
+                        view.course_turn = None;
+                        view.place_down = None;
+                        cx.notify();
+                    }))
                     .on_mouse_down(MouseButton::Left, cx.listener(|view, ev: &MouseDownEvent, window, cx| {
                         let at = (f32::from(ev.position.x), f32::from(ev.position.y));
                         // A PRESS OVER A PLANNING PANEL IS THE PANEL'S, and
@@ -32472,9 +32642,12 @@ impl Render for IslandDemo {
                                 view.draggable_at(at.0, at.1, vp.2, vp.3)
                             {
                                 view.unit_drag = Some(UnitDrag { unit_id: uid, moved: false });
-                            } else {
-                                view.pan = Some(at);
                             }
+                            // LEFT ON WATER IS NOT A PAN. The camera belongs
+                            // to the right button (the flow's §5.6, and what
+                            // an operator's left hand is for: the things on
+                            // the map). A press on water selects nothing and
+                            // moves nothing; the release still clears.`
                             // The unit under the press, if any. The pick is
                             // made HERE and undone if the press turns into
                             // a pan, because a release is delivered to
@@ -32492,6 +32665,28 @@ impl Render for IslandDemo {
                         // without this the next move over the water would
                         // PAN it, which is how a chart ends up somewhere
                         // nobody dragged it.
+                        if ev.pressed_button == Some(MouseButton::Right) {
+                            let Some((lx, ly)) = view.pan else {
+                                return;
+                            };
+                            let (mw, mh) = view.map_dims;
+                            let vp = viewport(window);
+                            view.pan = Some((x, y));
+                            if mw > 0.0 && mh > 0.0 && vp.2 > 0.0 && vp.3 > 0.0 {
+                                let (s, _, _) = map_view(
+                                    f64::from(mw),
+                                    f64::from(mh),
+                                    f64::from(vp.2),
+                                    f64::from(vp.3),
+                                );
+                                view.pan_by(
+                                    f64::from(x - lx) / s,
+                                    f64::from(y - ly) / s,
+                                    cx,
+                                );
+                            }
+                            return;
+                        }
                         if ev.pressed_button != Some(MouseButton::Left) {
                             view.pan = None;
                             view.press_at = None;
@@ -32519,11 +32714,15 @@ impl Render for IslandDemo {
                         }
                         if let Some((ax, ay)) = view.place_down {
                             if (x - ax).hypot(y - ay) > 6.0 {
-                                view.pan = Some((x, y));
+                                // A LEFT DRAG IS NOT A PAN. The armed click
+                                // only places; a hand that moved was aiming
+                                // at something else, so the arm is dropped
+                                // and the camera stays where it is.
                                 view.place_down = None;
-                            } else {
-                                return;
+                                view.press_at = None;
+                                view.pick_made = None;
                             }
+                            return;
                         }
                         // A press that has MOVED is a drag, and what it drags
                         // depends on what it started on.
@@ -32583,6 +32782,10 @@ impl Render for IslandDemo {
                                 cx,
                             );
                         }
+                    }))
+                    .on_mouse_up(MouseButton::Right, cx.listener(|view, _: &MouseUpEvent, _, cx| {
+                        view.pan = None;
+                        cx.notify();
                     }))
                     .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, window, cx| {
                         // The wheel over the map is the map's ZOOM, anchored
@@ -33345,49 +33548,7 @@ impl Render for IslandDemo {
                     )
                     .into_any_element(),
             )
-        } else if self.sessions_open {
-            // THE FLOW (F1–F8). It is not a card: every frame in the sheet is
-            // the whole window, with its own chrome strip, its own columns and
-            // its own bottom line. `flow_surface` is that place.
-            let size = window.viewport_size();
-            self.map_window = (f32::from(size.width), f32::from(size.height));
-            // THE FLOW IS DRAWN ON THE CHART, NOT OVER THE OLD CONSOLE.
-            //
-            // The surface is translucent by design (`kit::PANEL_ALPHA`), so
-            // whatever is behind it shows through — and what must be behind it
-            // is the map, not the console the flow replaces. The map frame is
-            // already in hand (`gate.image()`), so the flow's layer paints it
-            // full-window first and the surface over it: the islands, the top
-            // zone and the rails of the old console are covered, the chart is
-            // not.
-            // In MAP MODE the flow's map layer paints the frame itself,
-            // through `place_frame` — the live camera's placement, cover, with
-            // the bands smeared. It goes BEHIND the surface, not over it: the
-            // chrome strip and the bottom band are the flow's own, they stay
-            // on screen in map mode (the sheet's frames show them), and a
-            // picture painted last would cover them.
-            let map: Option<AnyElement> = if self.flow_map {
-                self.flow_map_layer()
-            } else {
-                self.gate
-                    .image()
-                    .map(|frame| img(frame).w_full().h_full().object_fit(ObjectFit::Fill))
-                    .map(|el| el.into_any_element())
-            };
-            let surface = self.flow_surface(cx);
-            Some(
-                div()
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .children(map)
-                    .child(surface)
-                    .children(self.picker_popup(cx))
-                    .into_any_element(),
-            )
-        } else if self.book_open && !self.pin_arm && !self.dragging {
+                } else if self.book_open && !self.pin_arm && !self.dragging {
             // The book is an authoring form too — scenarios and steps are
             // read, the title and step rows write — so it shares the
             // authoring card for the same reason.
@@ -34741,6 +34902,12 @@ pub struct RoomRow {
 pub struct SessionView {
     pub game: String,
     pub state: String,
+    /// The game's own detail read, when one was made.
+    ///
+    /// The flow's `Reopened` draft is seeded from this: its terms, its mode and
+    /// its pace come from the server's own row, not from the flattened copy
+    /// the console reads. `None` when no game is held or the read failed.
+    pub detail: Option<crate::backend::GameDetail>,
     /// Seats assigned in the room.
     pub seats: usize,
     /// How many have presented the room key (the headcount proper).
@@ -36048,6 +36215,7 @@ pub type EmbarkSpecFeed = std::boxed::Box<
 impl Default for SessionView {
     fn default() -> Self {
         SessionView {
+            detail: None,
             game: String::new(),
             state: String::new(),
             seats: 0,
@@ -38479,6 +38647,7 @@ pub fn run_replay(dir: String, burst_ms: u64, looping: bool) {
         std::sync::mpsc::channel().0,
         fixture_roster(),
         125,
+        Vec::new(),
         SessionView::default(),
         FleetTaxonomy::default(),
         BTreeMap::new(),
@@ -38515,6 +38684,9 @@ pub fn run(
     order_tx: OrderSink,
     roster: Vec<RosterRow>,
     roster_total: usize,
+    // The games the account can see, read before the window opens: the
+    // launcher's history on a launch that holds nothing.
+    initial_sessions: Vec<SessionRow>,
     session: SessionView,
     fleet_tax: FleetTaxonomy,
     unit_taxonomy: BTreeMap<i64, crate::embark::HullTaxonomy>,
@@ -38613,6 +38785,17 @@ pub fn run(
                 // reads it: "four helicopters" is a rule about KINDS, and the
                 // store is what says what kind a hull is.
                 demo.unit_taxonomy = unit_taxonomy;
+                // THE LAUNCHER'S HISTORY. The constructor cannot see it (it
+                // takes the held session, not the list), and the landing is
+                // seeded the moment the first sign-in answer lands. A launch
+                // that holds nothing has no answer to wait for, so the rows
+                // read before the window opened are installed here.
+                if std::env::var("TFG_SESSIONS").as_deref() != Ok("1")
+                    && !initial_sessions.is_empty()
+                {
+                    demo.sessions = initial_sessions.clone();
+                    demo.seed_history();
+                }
                 demo
             });
             // The opening ask: the camera the operator will look at, and a
@@ -43447,6 +43630,80 @@ mod tests {
         }
     }
 
+    /// A planning row reopens as the flow's draft, not as the console.
+    ///
+    /// The hold is the read the draft seeds from; the old path closed the flow
+    /// and showed the planning console, which is the surface the flow replaced.
+    #[gpui::test]
+    fn a_planning_hold_reopens_as_a_draft(cx: &mut gpui::TestAppContext) {
+        let detail = crate::backend::GameDetail {
+            id: 42,
+            name: "Baltic Shield 26".into(),
+            mode: "maneuver".into(),
+            state: "planning".into(),
+            description: "the exercise".into(),
+            purpose: "prove the flow".into(),
+            target: "the board".into(),
+            area: None,
+            map_tag: None,
+            overlay_text: None,
+            window: crate::backend::TimeWindow {
+                actual_start: Some("2026-11-01T08:00:00+07:00".into()),
+                actual_end: Some("2026-11-01T09:30:00+07:00".into()),
+                assumed_start: Some("2000-01-01T06:00:00+07:00".into()),
+                assumed_end: Some("2000-01-01T09:00:00+07:00".into()),
+            },
+            pace: Some(crate::backend::GamePace::Standard),
+            time_factor: 2.0,
+            max_echelon_rank: Some(40),
+            room_key: None,
+        };
+        let mut held = SessionView {
+            signed_in: true,
+            game_id: 42,
+            game: "Baltic Shield 26".into(),
+            state: "planning".into(),
+            detail: Some(detail),
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(
+                fixture_roster(),
+                8,
+                0,
+                SessionView::default(),
+                std::sync::mpsc::channel().0,
+            );
+            demo.sessions_open = true;
+            demo.hold_to_draft = true;
+            demo
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, _cx| {
+                demo.apply_hold(held.clone());
+                assert!(demo.sessions_open, "the flow keeps the planning game");
+                let draft = demo.flow_draft.as_ref().expect("a reopened draft");
+                assert_eq!(draft.origin, crate::draft::Origin::Reopened { game_id: 42 });
+                assert_eq!(draft.terms.name, "Baltic Shield 26");
+                assert_eq!(demo.flow_stage, crate::draft::Stage::Essentials);
+            })
+        });
+        // A hold that is not a reopen still opens the console.
+        let mut execution = held.clone();
+        execution.state = "execution".into();
+        execution.game_id = 43;
+        execution.detail = None;
+        cx.update(|_, app| {
+            view.update(app, |demo, _cx| {
+                demo.hold_to_draft = false;
+                demo.apply_hold(execution.clone());
+                assert!(!demo.sessions_open, "an execution hold is the console");
+            })
+        });
+        held.state = "preparation".into();
+        let _ = held;
+    }
+
     /// THE REPORTED DEFECT, DRIVEN END TO END IN THE SHELL.
     ///
     /// A row clicked earlier stayed selected, so every mode the operator chose
@@ -44194,6 +44451,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
             demo.flow_draft = crate::fixtures::groups_draft();
+            demo.sessions_open = true;
             demo.flow_stage = crate::draft::Stage::Groups;
             demo.flow_map = true;
             demo.flow_basket_open = true;
@@ -44245,6 +44503,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
             demo.flow_draft = crate::fixtures::groups_draft();
+            demo.sessions_open = true;
             demo.flow_basket_open = true;
             demo.flow_basket_pos = Some((100.0, 100.0));
             demo.flow_basket_grab = Some((0.0, 0.0));
@@ -44310,6 +44569,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
             demo.flow_draft = crate::fixtures::reopened_twelve();
+            demo.sessions_open = true;
             demo.flow_stage = crate::draft::Stage::Units;
             demo.flow_basket_open = false;
             demo
@@ -44348,6 +44608,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
             demo.flow_draft = crate::fixtures::reopened_twelve();
+            demo.sessions_open = true;
             demo.flow_stage = crate::draft::Stage::Units;
             demo.flow_basket_open = false;
             demo
@@ -44537,6 +44798,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
             demo.flow_draft = crate::fixtures::reopened_twelve();
+            demo.sessions_open = true;
             demo.flow_stage = crate::draft::Stage::Units;
             demo.flow_map = true;
             demo.map_dims = (960.0, 1048.0);
@@ -50794,8 +51056,8 @@ mod tests {
             "a drag that started on a hull must leave the selection alone"
         );
         assert!(
-            center != (-6.108, 106.910),
-            "the drag must still PAN: the pan is the press with the button held"
+            center == (-6.108, 106.910),
+            "a left drag does not pan: the camera belongs to the right button"
         );
     }
 
