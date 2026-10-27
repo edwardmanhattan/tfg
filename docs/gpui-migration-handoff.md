@@ -5614,3 +5614,54 @@ gap stands too — a hull the SERVER already carries is not in the session
 read, so the plan cannot write the detach that would move it; the rule
 answers the local question and the server's own answer still lands on the
 line.
+
+### U9 — the marker glide comes back (2026-10-27)
+
+The egui console interpolated a hull between two accepted fixes: a glide clock
+started at the instant a fix landed, the marker was drawn at
+`registry.blend(id, frac)`, and course rode the same fraction. The GPUI port
+took the marker from `view.latest.position` instead, so a moving hull stood
+still between fixes and then jumped the whole leg. At a wide zoom a leg is a
+fraction of a pixel and nobody noticed; at a close one it is three or four
+pixels once or twice a second, which reads as a teleport.
+
+Found on a live Minos exercise (`TGF-AUDIT-man3`, execution, one hull under
+way at 8 kn on the hosted dev server), not by inspection. The console's marker
+batch was traced per tick (`MARK`/`TFG_MARK_TRACE`, since removed), which is
+the stream the shell draws:
+
+| | ticks | distinct marker positions | longest hold |
+| --- | --- | --- | --- |
+| before | 1530 | 70 | 46 ticks (~1.4 s) |
+| after | 1456 | 1456 | 1 tick |
+
+The fix is in `main.rs`'s fix feed: a per-hull `glide_at` (reset on every
+accepted fix), a `glide_snap` for a gap over five seconds (a reconnect or a
+paused exercise snaps rather than animating a route nobody saw), and
+`registry.blend`/`blend_heading` at the clamped fraction — the egui rule,
+`GAME_PLOT_ANIMATION_SECS` = 1 s and `POLL_SECS` = 2 s. `glide_fraction` is a
+pure function with a test, so the clamp cannot drift.
+
+**What the live feed actually does.** `GET /games/{id}/positions` is read once
+a second, and the socket's `game:<id>:positions` channel now pushes as well
+(the module's note that "nothing publishes to it yet" no longer holds), so a
+hull is refreshed about twice a second. The glide still uses the one-second
+interval: the marker covers part of a leg between fixes and takes the
+remainder when the next fix lands, which is the shape the egui console had.
+The remaining step — a hull with a close zoom — was measured at 2–3% of ticks
+carrying a 1–2 m correction when a fix lands early; that is the same
+correction the egui build had, not a new one.
+
+**The command center glides too.** Its markers come from the session
+projection, which is published once a second, so the wall stepped at the same
+cadence. `command_center.rs` keeps a `Glide` per unit (previous → latest,
+over the measured arrival gap) and draws at the blend; measured at 312
+distinct positions in 326 ticks on the same live exercise.
+
+**Verified.** The same live exercise end to end: the console held game 60,
+published it (`TGF-AUDIT-man3 [execution] 1 unit`), the wall attached and
+readiness went `no_display` → `ready`, and `focus 1 --zoom 14` moved
+`observer` to the hull's real position while `main` stayed put. Captures:
+`/tmp/opencode/live/obs/wall-live.png` (the wall over the live exercise) and
+`/tmp/opencode/live/obs/console-live.png` (the console at zoom 15 over the
+same hull).

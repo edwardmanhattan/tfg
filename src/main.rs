@@ -58,6 +58,38 @@ fn mode_from_args() -> Option<String> {
     None
 }
 
+/// How far through a hull's display interval a tick is.
+///
+/// Zero at the instant the fix landed, one once the interval has passed. The
+/// position is the blend between the previous and the latest fix at this
+/// fraction (ADR-0011: display-only, bounded by the poll cadence). A clamp
+/// rather than an easing curve: a hull under way should travel at its own
+/// speed, and an ease would make it accelerate into every fix.
+fn glide_fraction(elapsed_secs: f64, interval_secs: f64) -> f64 {
+    if !interval_secs.is_finite() || interval_secs <= 0.0 {
+        return 1.0;
+    }
+    (elapsed_secs / interval_secs).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod glide_tests {
+    use super::glide_fraction;
+
+    #[test]
+    fn the_glide_clamps_to_the_interval() {
+        assert_eq!(glide_fraction(0.0, 1.0), 0.0);
+        assert_eq!(glide_fraction(0.5, 1.0), 0.5);
+        assert_eq!(glide_fraction(1.0, 1.0), 1.0);
+        // A late tick rests at the newer fix rather than overshooting it.
+        assert_eq!(glide_fraction(9.0, 1.0), 1.0);
+        // A clock that went backwards (or a nonsense interval) cannot draw
+        // a hull behind where it was.
+        assert_eq!(glide_fraction(-0.5, 1.0), 0.0);
+        assert_eq!(glide_fraction(0.5, 0.0), 1.0);
+    }
+}
+
 fn control_endpoint_from_env() -> ControlEndpoint {
     let following = std::env::var("TFG_CONTROL_SERVER")
         .ok()
@@ -2789,6 +2821,19 @@ fn main() {
     // Fixes reach the control plane at the pace a viewer needs, not the pace
     // the map draws: one message a second carries every hull the registry has.
     let mut positions_due: Option<std::time::Instant> = None;
+    // The glide clock. A hull's fix arrives once or twice a second, but the
+    // shell draws at fifty: the marker is placed at the BLEND between the last
+    // two fixes, by the fraction of the display interval that has passed since
+    // the newer one landed. This is the rule the egui console used (ADR-0011: a
+    // hull between fixes is an interpolation, not an animation) and the GPUI
+    // port dropped — without it a hull jumps the whole leg at once, which reads
+    // as teleporting at any zoom where a leg is longer than a pixel.
+    let mut glide_at: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
+    // The arrival of the previous fix, for the snap-after-a-gap rule.
+    let mut glide_seen: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
+    let mut glide_snap: std::collections::HashSet<String> = std::collections::HashSet::new();
     let publisher_fix = publisher.clone();
 
     // The picker's drill tree, read once off the synced mirror like the
@@ -2870,8 +2915,46 @@ fn main() {
             // game fix is scenario-stamped (never aged against the wall
             // clock) and because the wire's silence must not mark a running
             // exercise's hulls stale.
+            // One arrival note per accepted fix: the glide starts at the
+            // instant the fix landed, not at a stamp on the fix (a game fix is
+            // scenario-stamped, hours from the wall clock). A gap of more than
+            // five seconds is a reconnect or a paused exercise: snap rather
+            // than animate a route nobody saw.
+            fn note_arrivals(
+                acked: Vec<(String, u64)>,
+                now: std::time::Instant,
+                glide_at: &mut std::collections::HashMap<String, std::time::Instant>,
+                glide_seen: &mut std::collections::HashMap<String, std::time::Instant>,
+                glide_snap: &mut std::collections::HashSet<String>,
+            ) {
+                for (id, _) in acked {
+                    let gap = glide_seen
+                        .get(&id)
+                        .map(|last| now.saturating_duration_since(*last));
+                    match gap {
+                        Some(gap) if gap > std::time::Duration::from_secs(5) => {
+                            glide_snap.insert(id.clone());
+                        }
+                        Some(_) => {
+                            glide_snap.remove(&id);
+                        }
+                        None => {
+                            glide_snap.remove(&id);
+                        }
+                    }
+                    glide_seen.insert(id.clone(), now);
+                    glide_at.insert(id, now);
+                }
+            }
             while let Ok(fixes) = game_fix_rx.try_recv() {
-                registry.poll_game(fixes);
+                let acked = registry.poll_game(fixes);
+                note_arrivals(
+                    acked,
+                    std::time::Instant::now(),
+                    &mut glide_at,
+                    &mut glide_seen,
+                    &mut glide_snap,
+                );
             }
             // The socket's events. The order publication is the one that
             // moves a hull: it carries the position the order put it at,
@@ -2894,12 +2977,26 @@ fn main() {
                             );
                         }
                         if !fixes.is_empty() {
-                            registry.poll_game(fixes);
+                            let acked = registry.poll_game(fixes);
+                            note_arrivals(
+                    acked,
+                    std::time::Instant::now(),
+                    &mut glide_at,
+                    &mut glide_seen,
+                    &mut glide_snap,
+                );
                         }
                     }
                     tfg::backend::LiveEvent::OrderIssued(event) => {
                         let fix = tfg::gamefeed::order_fix(&event);
-                        registry.poll_game(vec![fix]);
+                        let acked = registry.poll_game(vec![fix]);
+                        note_arrivals(
+                    acked,
+                    std::time::Instant::now(),
+                    &mut glide_at,
+                    &mut glide_seen,
+                    &mut glide_snap,
+                );
                     }
                     tfg::backend::LiveEvent::Vanished(ids) => {
                         for id in ids {
@@ -2982,7 +3079,14 @@ fn main() {
                 }
             }
             while let Ok(fixes) = poll_rx.try_recv() {
-                registry.poll(fixes);
+                let acked = registry.poll(fixes);
+                note_arrivals(
+                    acked,
+                    std::time::Instant::now(),
+                    &mut glide_at,
+                    &mut glide_seen,
+                    &mut glide_snap,
+                );
             }
             for view in registry.ships() {
                 let (clat, clon, zoom, mw, mh) = camera_fix.lock().map(|c| *c).unwrap_or((
@@ -2992,9 +3096,40 @@ fn main() {
                     tfg::map_geometry::MAP_W as u32,
                     tfg::map_geometry::MAP_H as u32,
                 ));
+                // How far through the display interval this tick is. A game
+                // plot is read once a second and the wire polled every two, so
+                // the fraction reaches one just as the next fix is due; a hull
+                // with no previous fix, or one that waited out a gap, is drawn
+                // at its latest position outright.
+                // How long a hull takes to glide over one display interval:
+                // the egui console's `GAME_PLOT_ANIMATION_SECS`/`POLL_SECS`.
+                // A game publication lands about twice a second (the plot's
+                // read and the socket's push), so the marker covers part of a
+                // leg between fixes and takes the remainder when the next fix
+                // arrives. That is the shape the egui console had; the point
+                // is that a still hull is still and a moving one moves every
+                // tick, not that the leg is split evenly.
+                let interval_secs = if view.source == tfg::geo::track::FixSource::Game {
+                    1.0
+                } else {
+                    2.0
+                };
+                let snap = glide_snap.remove(&view.ship_id);
+                let frac = match (glide_at.get(&view.ship_id), snap) {
+                    (Some(started), false) => {
+                        glide_fraction(started.elapsed().as_secs_f64(), interval_secs)
+                    }
+                    _ => 1.0,
+                };
+                let placed = registry
+                    .blend(&view.ship_id, frac)
+                    .unwrap_or(view.latest.position);
+                let heading = registry
+                    .blend_heading(&view.ship_id, frac)
+                    .or(view.latest.heading_deg);
                 let (x, y) = tfg::map_geometry::project_mercator(
-                    view.latest.position.latitude,
-                    view.latest.position.longitude,
+                    placed.latitude,
+                    placed.longitude,
                     (clat, clon),
                     zoom,
                     mw as f64,
@@ -3009,10 +3144,10 @@ fn main() {
                     stale: view.stale,
                     symbol,
                     affiliation,
-                    heading_deg: view.latest.heading_deg,
+                    heading_deg: heading,
                     speed_kn: view.latest.speed_kn,
-                    latitude: view.latest.position.latitude,
-                    longitude: view.latest.position.longitude,
+                    latitude: placed.latitude,
+                    longitude: placed.longitude,
                     trail: view.trail.len(),
                 });
             }

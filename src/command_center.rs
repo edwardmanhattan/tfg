@@ -19,8 +19,9 @@
 //! not a controller), read Minos, or invent an OK verb before the protocol has
 //! one.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext, Application, Bounds, Context, IntoElement, ParentElement, Render, Styled,
@@ -29,7 +30,8 @@ use gpui::{
 
 use crate::control::{
     AcceptedCommand, CameraSnapshot, ClientConfig, ClientHandle, Command, DisplayHello, Event,
-    OBSERVER_VIEW, Readiness, ReadinessReason, SessionState, ViewState, spawn_client,
+    GeoPoint, OBSERVER_VIEW, Readiness, ReadinessReason, SessionState, UnitState, ViewState,
+    spawn_client,
 };
 use crate::map_gate::FrameSlot;
 use crate::map_geometry;
@@ -197,6 +199,24 @@ struct CommandCenter {
 
     frame: FrameSlot,
     incoming: Option<(u64, u32, u32, Vec<u8>, (f64, f64), f64)>,
+    /// Where each hull is being drawn, and where it is going.
+    ///
+    /// The session's positions arrive once a second; the wall draws at fifty
+    /// frames. Without this a marker jumps a whole second's leg at once, which
+    /// at a close zoom reads as a hull teleporting. The blend is the same rule
+    /// the console uses (ADR-0011): display-only, between two accepted
+    /// positions, never a new fact.
+    glide: HashMap<i64, Glide>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    from: GeoPoint,
+    to: GeoPoint,
+    at: Instant,
+    /// The interval the last two positions actually arrived at, so the blend
+    /// finishes as the next one lands.
+    gap: f64,
 }
 
 impl CommandCenter {
@@ -231,6 +251,7 @@ impl CommandCenter {
             seq: 0,
             frame: FrameSlot::new(),
             incoming: None,
+            glide: HashMap::new(),
         }
     }
 
@@ -247,6 +268,7 @@ impl CommandCenter {
                     readiness,
                     ..
                 } => {
+                    self.note_positions(session.as_ref());
                     self.session = session;
                     self.readiness = readiness;
                     if let Some(view) = views
@@ -259,6 +281,7 @@ impl CommandCenter {
                 Event::SessionChanged {
                     session, readiness, ..
                 } => {
+                    self.note_positions(session.as_ref());
                     self.session = session;
                     self.readiness = readiness;
                 }
@@ -287,6 +310,72 @@ impl CommandCenter {
             crate::map_gate::swizzle_rgba_to_bgra(&mut rgba);
             self.incoming = Some((no, w, h, rgba, at, zoom));
         }
+    }
+
+    /// Start a new glide for every hull whose position moved.
+    ///
+    /// Only a change starts one: a `session.changed` that carries a readiness
+    /// flip leaves the markers where they are, and a hull standing still must
+    /// not shimmer just because events keep arriving.
+    fn note_positions(&mut self, session: Option<&SessionState>) {
+        let now = Instant::now();
+        let Some(session) = session else {
+            self.glide.clear();
+            return;
+        };
+        let live: std::collections::HashSet<i64> = session.units.iter().map(|u| u.id).collect();
+        self.glide.retain(|id, _| live.contains(id));
+        for unit in &session.units {
+            let Some(position) = unit.position else {
+                self.glide.remove(&unit.id);
+                continue;
+            };
+            match self.glide.get_mut(&unit.id) {
+                Some(glide) if glide.to == position => {}
+                Some(glide) => {
+                    let gap = now
+                        .saturating_duration_since(glide.at)
+                        .as_secs_f64()
+                        .clamp(0.2, 3.0);
+                    // The old destination becomes the start: the blend stays
+                    // between two accepted positions, and the marker is drawn
+                    // where it already was rather than snapping to the last one.
+                    glide.from = glide.to;
+                    glide.to = position;
+                    glide.at = now;
+                    glide.gap = gap;
+                }
+                None => {
+                    self.glide.insert(
+                        unit.id,
+                        Glide {
+                            from: position,
+                            to: position,
+                            at: now,
+                            gap: 1.0,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Where a hull is drawn this frame: the blend through its glide.
+    fn placed(&self, unit: &UnitState) -> Option<GeoPoint> {
+        let Some(glide) = self.glide.get(&unit.id) else {
+            return unit.position;
+        };
+        let frac = if glide.gap <= 0.0 {
+            1.0
+        } else {
+            (glide.at.elapsed().as_secs_f64() / glide.gap).clamp(0.0, 1.0)
+        };
+        let lat = glide.from.latitude + (glide.to.latitude - glide.from.latitude) * frac;
+        let lon = glide.from.longitude + (glide.to.longitude - glide.from.longitude) * frac;
+        Some(GeoPoint {
+            latitude: lat,
+            longitude: lon,
+        })
     }
 
     fn follow(&mut self, view: &ViewState) {
@@ -420,7 +509,7 @@ impl Render for CommandCenter {
         // scaled from the picture's pixel space to the window.
         if let Some(session) = &self.session {
             for unit in &session.units {
-                let Some(position) = unit.position else {
+                let Some(position) = self.placed(unit) else {
                     continue;
                 };
                 let (x, y) = map_geometry::project_mercator(
