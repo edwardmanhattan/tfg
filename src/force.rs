@@ -371,7 +371,9 @@ pub enum ForceWrite {
     Assign {
         unit_id: i64,
         name: String,
-        commander_id: i64,
+        /// Named when the operator has named one. A planning save may hold
+        /// hulls whose commanders come later.
+        commander_id: Option<i64>,
     },
     /// Change who commands a hull the server already has.
     HandOver {
@@ -434,20 +436,20 @@ impl ForceWrite {
 /// that cannot be written refuses WHOLE and names the hulls: issuing the rest
 /// would half-commit a force the operator cannot see.
 ///
-/// Four states refuse, and all four are Minos's rules rather than this
-/// module's. A hull in the exercise with nobody to steer it is the first:
-/// `game_units.id_commander` is NOT NULL and the assignment endpoint says so
-/// in as many words. The draft tolerates the state so the operator can work;
-/// the sync refuses it, because handing a piece to whoever happened to be
-/// seated first is the one answer nobody can undo by looking at the map. One
-/// person commanding two hulls is the second: the server says "That person
-/// already commands the unit ... One person commands one thing", and a
-/// second hull for the same commander is refused as a conflict rather than
-/// as a duplicate. A hull told to ride itself, and a ring of hulls that
-/// carry each other, are the next two: the attach endpoint refuses both
+/// Three states refuse, and all three are Minos's rules rather than this
+/// module's. One person commanding two hulls is the first: the server says
+/// "That person already commands the unit ... One person commands one
+/// thing", and a second hull for the same commander is refused as a conflict
+/// rather than as a duplicate. A hull told to ride itself, and a ring of hulls
+/// that carry each other, are the next two: the attach endpoint refuses both
 /// outright ("putting the group inside the carrier is a ring"), and they are
 /// the states a drag can build, so catching them here is the point of this
 /// module rather than a courtesy.
+///
+/// AN UNCOMMANDED HULL IS NOT A REFUSAL. `POST /games/{id}/units` takes the
+/// hull alone, and planning a TFG can take months, so a save may leave the
+/// commanders for later. The start gate is where a force has to be complete,
+/// not the save.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForceGap {
     pub reason: GapReason,
@@ -463,8 +465,6 @@ pub struct ForceGap {
 /// operator it is would send them to the Player picker to fix a drag.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GapReason {
-    /// A hull the server does not hold has nobody to command it.
-    Uncommanded,
     /// One person is given two hulls.
     TwoCommands,
     /// A hull is given to a seat that may not command.
@@ -479,10 +479,6 @@ impl std::fmt::Display for ForceGap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let hulls = self.hulls.join(", ");
         match self.reason {
-            GapReason::Uncommanded => write!(
-                f,
-                "{hulls} — Minos gives every piece a commander, so name one on the Player picker first"
-            ),
             GapReason::TwoCommands => write!(
                 f,
                 "{hulls} — one person commands one thing, so the second hull needs a second commander"
@@ -519,18 +515,11 @@ impl std::fmt::Display for ForceGap {
 /// judged as the new one it is (`crate::draft`). Two answers to "is this
 /// force writable" is the drift this module exists to prevent.
 pub fn gap(draft: &ForceDraft, live: &[LiveHull]) -> Option<ForceGap> {
-    let uncommanded: Vec<String> = draft
-        .hulls()
-        .filter(|hull| hull.commander_id.is_none() && !live_holds(live, hull.unit_id))
-        .map(|hull| hull.name.clone())
-        .collect();
-    if !uncommanded.is_empty() {
-        return Some(ForceGap {
-            reason: GapReason::Uncommanded,
-            hulls: uncommanded,
-            who: None,
-        });
-    }
+    // A HULL MAY BE UNCOMMANDED. `POST /games/{id}/units` takes the hull
+    // alone: Minos's "a piece always has a commander" is a rule for the START
+    // GATE, not for planning, and a plan that takes months begins with hulls
+    // whose commanders are not named yet. The console refused the whole press
+    // over it, which made an early save impossible.
 
     // ONE PERSON, ONE THING. The server refuses a second hull for a
     // commander who already has one ("That person already commands the unit
@@ -684,11 +673,7 @@ pub fn plan(draft: &ForceDraft, live: &[LiveHull]) -> Result<Vec<ForceWrite>, Fo
             writes.push(ForceWrite::Assign {
                 unit_id: hull.unit_id,
                 name: hull.name.clone(),
-                // The gap check above is what makes this a total function: a
-                // hull the server lacks got past it only by having one.
-                commander_id: hull
-                    .commander_id
-                    .expect("a planned assignment carries a commander"),
+                commander_id: hull.commander_id,
             });
             if let Some(start) = hull.start {
                 writes.push(ForceWrite::Place {
@@ -830,7 +815,7 @@ mod tests {
                 ForceWrite::Assign {
                     unit_id: 7,
                     name: "KRI Nanggala".into(),
-                    commander_id: 3
+                    commander_id: Some(3)
                 },
                 ForceWrite::Place {
                     unit_id: 7,
@@ -909,19 +894,28 @@ mod tests {
         );
     }
 
+    /// A HULL MAY BE SAVED WITHOUT A COMMANDER. Planning a TFG takes months,
+    /// and the commanders are named later; `POST /games/{id}/units` takes the
+    /// hull alone, so the assignment is the write and the commander is an
+    /// optional field on it.
     #[test]
-    fn an_uncommanded_hull_refuses_the_whole_plan() {
+    fn an_uncommanded_hull_is_assigned_without_a_commander() {
         let mut draft = ForceDraft::new();
         draft.upsert(hull(7, "KRI Nanggala", Some((-5.4, 106.2))));
         draft.upsert(hull(8, "KRI Rangsat", Some((-5.1, 106.9))));
+        let writes = plan(&draft, &[]).expect("a plan without commanders");
         assert_eq!(
-            plan(&draft, &[]),
-            Err(ForceGap {
-                reason: GapReason::Uncommanded,
-                hulls: vec!["KRI Nanggala".into(), "KRI Rangsat".into()],
-                who: None,
-            })
+            writes
+                .iter()
+                .filter(|w| matches!(w, ForceWrite::Assign { .. }))
+                .count(),
+            2,
+            "both hulls are assigned"
         );
+        assert!(writes.iter().all(|w| match w {
+            ForceWrite::Assign { commander_id, .. } => commander_id.is_none(),
+            _ => true,
+        }));
     }
 
     #[test]
@@ -1045,7 +1039,7 @@ mod tests {
                 ForceWrite::Assign {
                     unit_id: 7,
                     name: "KRI Nanggala".into(),
-                    commander_id: 3
+                    commander_id: Some(3)
                 },
                 ForceWrite::Place {
                     unit_id: 7,
@@ -1056,7 +1050,7 @@ mod tests {
                 ForceWrite::Assign {
                     unit_id: 8,
                     name: "KRI Rangsat".into(),
-                    commander_id: 4
+                    commander_id: Some(4)
                 },
             ])
         );
@@ -1249,12 +1243,12 @@ mod tests {
                 ForceWrite::Assign {
                     unit_id: 5,
                     name: "KRI Ahmad Yani".into(),
-                    commander_id: 3
+                    commander_id: Some(3)
                 },
                 ForceWrite::Assign {
                     unit_id: 7,
                     name: "KRI Nanggala".into(),
-                    commander_id: 4
+                    commander_id: Some(4)
                 },
                 ForceWrite::Embark {
                     host: 5,

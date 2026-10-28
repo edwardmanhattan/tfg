@@ -1275,15 +1275,14 @@ impl Draft {
             return blockers;
         }
 
-        // 5. The force, through the module that owns the rule: an uncommanded
-        //    hull, one commander given two hulls, a hull riding itself, a ring
-        //    of carriers. The empty `live` is deliberate — a pressed draft
-        //    judges every hull as the new piece it is about to write.
+        // 5. The force, through the module that owns the rule: one commander
+        //    given two hulls, a hull riding itself, a ring of carriers. An
+        //    UNCOMMANDED hull is not one of them — a planning save names its
+        //    commanders later. The empty `live` is deliberate — a pressed
+        //    draft judges every hull as the new piece it is about to write.
         if let Some(gap) = crate::force::gap(&self.force, &[]) {
             let stage = match gap.reason {
-                GapReason::Uncommanded | GapReason::TwoCommands | GapReason::JudgeSideCommander => {
-                    Stage::Players
-                }
+                GapReason::TwoCommands | GapReason::JudgeSideCommander => Stage::Players,
                 GapReason::SelfHost | GapReason::Ring => Stage::Units,
             };
             blockers.push(Blocker {
@@ -1896,22 +1895,22 @@ mod tests {
     /// an illegal write, so the verb names the hulls — and never invents a
     /// placeholder commander.
     #[test]
-    fn an_uncommanded_hull_blocks_the_game_ladders_and_names_the_hull() {
+    fn an_uncommanded_hull_does_not_block_a_planning_save() {
+        // PLANNING TAKES MONTHS, AND COMMANDERS COME LATER. The server takes
+        // a hull on its own, so the save must not demand a seat for every
+        // hull first.
         let mut draft = Draft::blank(GameMode::Maneuver).unwrap();
         draft.terms.name = "Baltic Shield 26".into();
         draft.force.upsert(hull(351, "KRI AHMAD YANI", None));
-        let blocking = draft.blockers(Verb::SaveAsGameSession);
-        assert_eq!(blocking.len(), 1, "{blocking:?}");
-        assert_eq!(blocking[0].stage, Stage::Players);
         assert!(
-            blocking[0].sentence.contains("KRI AHMAD YANI"),
-            "{blocking:?}"
+            draft.can_run(Verb::SaveAsGameSession),
+            "{:?}",
+            draft.blockers(Verb::SaveAsGameSession)
         );
-
-        // And the fix is a seat plus an assignment, not a default.
-        draft.roster.stage(seat(4, "Lt. Fitri"));
-        draft.force.set_commander(351, Some(4));
-        assert!(draft.can_run(Verb::SaveAsGameSession));
+        assert!(
+            draft.can_run(Verb::PlayDirectly),
+            "and the transition out of planning has no commander precondition"
+        );
     }
 
     /// A commander who is not a participant is a 400 on the assignment write:
@@ -1958,6 +1957,13 @@ mod tests {
             .stage_step_new(scenario, "TAKE STATION XYZ", None)
             .expect("a step");
         draft.force.upsert(hull(351, "KRI AHMAD YANI", None));
+        assert!(draft.can_run(Verb::SaveAsScenario));
+        // The game ladder still has a rule of its own: a judge-side commander
+        // may not steer a hull. The mission ladder is not its business.
+        let mut judge = seat(9, "Kpt. Sari");
+        judge.judge = true;
+        draft.roster.stage(judge);
+        draft.force.set_commander(351, Some(9));
         assert!(draft.can_run(Verb::SaveAsScenario));
         assert!(!draft.can_run(Verb::SaveAsGameSession));
     }

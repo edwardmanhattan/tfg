@@ -27364,10 +27364,47 @@ impl IslandDemo {
     /// `flow_search`; this keeps `flow_people_search`.
     fn people_matches(&self) -> Vec<(i64, String)> {
         let term = self.flow_people_search.trim().to_lowercase();
-        self.crew_choices()
+        self.flow_people_choices()
             .into_iter()
             .filter(|(_, name)| term.is_empty() || name.to_lowercase().contains(&term))
             .collect()
+    }
+
+    /// WHO THE SEAT PICKER OFFERS: the deployment's accounts, plus the
+    /// draft's own staged seats.
+    ///
+    /// THE DIRECTORY, NOT THE ROOM. A game being planned has no participants
+    /// yet, so `session.people` — the held game's roster — is empty, and the
+    /// stage showed `0 MATCH` for a deployment full of people. An account is
+    /// not a seat until the press writes it; the picker's job is to show the
+    /// people there are.
+    ///
+    /// The staged seats are added because a draft may name somebody a page of
+    /// the directory did not carry, and the row must still read as a person.
+    fn flow_people_choices(&self) -> Vec<(i64, String)> {
+        let mut people: Vec<(i64, String)> = self
+            .session
+            .directory
+            .iter()
+            .map(|row| (row.id, row.name.clone()))
+            .collect();
+        // The room's own people too: a held game whose directory read did not
+        // answer still knows who is in it, and a picker that dropped them
+        // would be a picker that lost the exercise's own roster.
+        for person in &self.session.people {
+            if !people.iter().any(|(id, _)| *id == person.id) {
+                people.push((person.id, person.name.clone()));
+            }
+        }
+        if let Some(draft) = &self.flow_draft {
+            for seat in draft.roster.staged() {
+                match people.iter_mut().find(|(id, _)| *id == seat.user_id) {
+                    Some(row) => row.1 = seat.user_name.clone(),
+                    None => people.push((seat.user_id, seat.user_name.clone())),
+                }
+            }
+        }
+        people
     }
 
     /// The roles the DROPDOWN offers: the game's own when the session has them,
@@ -27419,7 +27456,6 @@ impl IslandDemo {
         let mut split = div().flex().flex_row().flex_1().min_h_0().w_full();
 
         // ---- FIND PEOPLE --------------------------------------------
-        let crew = self.crew_choices();
         let term = self.flow_people_search.trim().to_lowercase();
         let matches = self.people_matches();
         let mut left = div()
@@ -27720,6 +27756,16 @@ impl IslandDemo {
             }
             row = row.child(roles);
             left = left.child(row);
+        }
+        if matches.is_empty() {
+            left = left.child(kit::note(
+                if term.is_empty() {
+                    "No accounts in the directory \u{2014} the read did not answer."
+                } else {
+                    "No account matches that search."
+                },
+                kit::MUTED_INK,
+            ));
         }
         left = left
             .child(kit::edge_rule())
@@ -41202,7 +41248,7 @@ mod tests {
                 writes[0],
                 crate::force::ForceWrite::Assign {
                     unit_id: 1,
-                    commander_id: 2,
+                    commander_id: Some(2),
                     ..
                 }
             ),
@@ -41218,7 +41264,7 @@ mod tests {
     /// no second copy of it — which is why this goes through `sync_force`
     /// rather than through a staging call that checks for itself.
     #[gpui::test]
-    fn an_uncommanded_piece_stops_the_whole_plan_and_is_named(cx: &mut gpui::TestAppContext) {
+    fn an_uncommanded_piece_is_a_planning_save(cx: &mut gpui::TestAppContext) {
         let (tx, rx) = std::sync::mpsc::channel();
         let session = SessionView {
             state: "planning".to_string(),
@@ -41229,7 +41275,7 @@ mod tests {
         };
         let (view, cx) =
             cx.add_window_view(|_, _| IslandDemo::new(fixture_roster(), 2, 0, session, tx));
-        let why = cx.update(|_window, app| {
+        cx.update(|_window, app| {
             view.update(app, |demo, _| {
                 demo.force.upsert(crate::force::DraftHull {
                     unit_id: 1,
@@ -41241,17 +41287,26 @@ mod tests {
                     host: None,
                     course_deg: None,
                 });
-                demo.sync_force()
-                    .expect_err("an uncommanded piece is not writable")
+                // The commander is named in the Players stage, later: a
+                // planning save writes the hull without one.
+                let writes = crate::force::plan(&demo.force, &demo.live_hulls())
+                    .expect("an uncommanded hull is writable");
+                assert!(
+                    writes.iter().any(|write| matches!(
+                        write,
+                        crate::force::ForceWrite::Assign {
+                            commander_id: None,
+                            ..
+                        }
+                    )),
+                    "the hull is assigned with no commander: {writes:?}"
+                );
+                demo.sync_force().expect("the plan is writable");
             })
         });
         assert!(
-            why.contains("KRI Ahmad Yani"),
-            "the refusal names the hull rather than saying invalid: {why}"
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "and nothing was sent — a refused plan must not half-commit"
+            rx.try_recv().is_ok(),
+            "the write is sent rather than refused"
         );
     }
 
@@ -42074,21 +42129,51 @@ mod tests {
                 "the console's own sentence: {}",
                 demo.force_status
             );
-            match crate::force::plan(&demo.force, &demo.live_hulls()) {
-                Err(gap) => {
-                    assert_eq!(
-                        gap.reason,
-                        crate::force::GapReason::Uncommanded,
-                        "the advance is where the backend's commander rule bites"
-                    );
-                    assert!(
-                        gap.hulls.iter().any(|h| h.contains("Ahmad Yani")),
-                        "the sentence names the hull it refuses: {gap:?}"
-                    );
-                }
-                Ok(_) => panic!("an uncommanded hull refuses the whole advance"),
-            }
+            // A PLANNING SAVE TAKES AN UNCOMMANDED HULL. The commander is
+            // named later; the assignment is the hull alone, and the press
+            // does not stop over it.
+            let writes = crate::force::plan(&demo.force, &demo.live_hulls())
+                .expect("an uncommanded hull is a legal planning save");
+            assert!(
+                writes.iter().any(|write| matches!(
+                    write,
+                    crate::force::ForceWrite::Assign {
+                        commander_id: None,
+                        ..
+                    }
+                )),
+                "the hull is assigned with no commander: {writes:?}"
+            );
         });
+    }
+
+    /// THE SEAT PICKER SEATS FROM THE DIRECTORY, NOT FROM THE ROOM. A game
+    /// being planned has no participants, so `session.people` is empty; the
+    /// directory is the list that exists before the game does.
+    #[test]
+    fn the_seat_picker_reads_the_directory_before_a_game_exists() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            directory: vec![DirectoryRow {
+                id: 7,
+                name: "Budi Santoso".to_string(),
+                unit: "Koarmada".to_string(),
+                rank: "Letkol".to_string(),
+                appointment: String::new(),
+            }],
+            ..SessionView::default()
+        };
+        let mut demo = IslandDemo::new(fixture_roster(), 0, 0, session, tx);
+        demo.flow_draft = crate::draft::Draft::blank(crate::gamestate::GameMode::Scenario);
+        assert_eq!(
+            demo.flow_people_choices(),
+            vec![(7, "Budi Santoso".to_string())],
+            "the directory is the picker's list"
+        );
+        demo.flow_people_search = "bud".into();
+        assert_eq!(demo.people_matches().len(), 1, "the search finds them");
+        demo.flow_people_search = "nobody".into();
+        assert!(demo.people_matches().is_empty());
     }
 
     /// A planning session with the operator seated and one more seat to hand
@@ -46979,9 +47064,11 @@ mod tests {
     fn the_people_search_does_not_read_the_registers_term(cx: &mut gpui::TestAppContext) {
         let (tx, _rx) = std::sync::mpsc::channel();
         let session = SessionView {
+            // Ids the fixture's seats do not use: an account and a seat
+            // share an id only when they are the same person.
             people: vec![
                 PersonView {
-                    id: 3,
+                    id: 201,
                     name: "Budi Santoso".to_string(),
                     call_sign: "BUDI".to_string(),
                     role: String::new(),
@@ -46991,7 +47078,7 @@ mod tests {
                     present: true,
                 },
                 PersonView {
-                    id: 4,
+                    id: 202,
                     name: "Markus Wijaya".to_string(),
                     call_sign: "MARKUS".to_string(),
                     role: String::new(),

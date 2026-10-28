@@ -940,7 +940,7 @@ mod tests {
             .expect("create");
         assert_eq!(game.id, 3);
         assert_eq!(game.state, "planning", "games are born in planning");
-        let pieces = master.assign_unit("AT", 3, 13, 6).expect("assign");
+        let pieces = master.assign_unit("AT", 3, 13, Some(6)).expect("assign");
         assert_eq!(pieces[0].commander_id, Some(6), "assign answers with units");
         let pieces = master.remove_unit("AT", 3, 13).expect("remove");
         assert!(pieces.is_empty(), "remove answers with the emptied units");

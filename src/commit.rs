@@ -257,7 +257,12 @@ pub enum Write {
     DeleteNode { node: Ref },
     /// 04 — `POST /games/{id}/units`. Minos requires a commander, and that
     /// commander must already be a participant: this is why SEATS is 02.
-    AssignUnit { unit_id: i64, commander_id: i64 },
+    AssignUnit {
+        unit_id: i64,
+        /// Named when the draft has one. A planning save may leave it out:
+        /// the server takes the hull alone and the commander comes later.
+        commander_id: Option<i64>,
+    },
     /// 04 — `PUT /games/{id}/units/{unit_id}/hierarchy`.
     PlaceUnitInNode { unit_id: i64, node: Ref },
     /// 04 — `DELETE /games/{id}/units/{unit_id}/hierarchy`.

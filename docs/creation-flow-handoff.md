@@ -466,11 +466,14 @@ warning is the whole of stage 05's reason to exist:
 
 > `COMMIT WRITES 1 THEN 2` · `A PIECE NEEDS A COMMANDER`
 
-A hull with no commander is a legal **draft** state and an illegal **write**.
-The draft must reach REVIEW with a commander for every hull, or the verb names
-the hulls that have none. Never invent a placeholder commander: `POST
-/games/{id}/units` requires a real participant of that game, not on the judge
-side.
+**A hull with no commander is legal, in the draft and on the server.**
+`POST /games/{id}/units` takes the hull alone (verified against the dev server:
+`201`, and the row comes back without `id_commander`), because planning a TFG
+takes months and the commanders are named later. A game session saved from
+stage 06 may therefore hold uncommanded hulls; the Players stage is where they
+are filled in, not a condition on the save. NEVER INVENT A PLACEHOLDER: a
+commander that is named must be a real participant of that game, not on the
+judge side, and one person commands one thing.
 
 ### 5.5 The basket open (F3d)
 
@@ -843,8 +846,13 @@ order:
 
 ### 8.1 Two panes
 
-**Left: `FIND PEOPLE`.** A search over the room's people, each row a name and a
-**role dropdown**. The dropdown is the only way to seat somebody here, and it
+**Left: `FIND PEOPLE`.** A search over **the deployment's accounts**, each row
+a name and a **role dropdown**. The list is the directory (`GET /users`), not
+the held game's roster: a game being planned has no participants yet, so
+reading only the roster showed `0 MATCH` for a deployment full of people. The
+room's own people are merged in as well, for a held game whose directory read
+did not answer. An account is not a seat until the press writes it; the
+picker's job is to show the people there are. The dropdown is the only way to seat somebody here, and it
 is a dropdown because the game's role vocabulary can be longer than a row of
 buttons. Its options are the game's own roles when the session carries them
 (`/games/{id}/roles`), the sheet's three otherwise, plus `NOT PLAYING` last.
@@ -996,7 +1004,7 @@ halves of that are wrong, and the corrections are erratum 1:
 | # | Write | Endpoint | Why here |
 | --- | --- | --- | --- |
 | 01 | GAME | `POST /games` | Lands in `planning`. Everything else hangs off its id. |
-| 02 | SEATS | `POST /games/{id}/participants` | **Before units**: a hull's commander must already be a participant. |
+| 02 | SEATS | `POST /games/{id}/participants` | **Before units**, when a hull names a commander: that commander must already be a participant. An uncommanded hull needs no seat. |
 | 03 | HIERARCHY | `POST /games/{id}/hierarchy`, top-down | A parent before its child. **The level is the server's id**: the flow's rung is a local kind, and `id_unit_hierarchy` is resolved from `GET /hierarchy`, read once per press. Without the vocabulary the press is a gap, not a `0`. |
 | 04 | UNITS | `POST /games/{id}/units`, then the tree placement, then embarkations, removals last | Needs the seat (02) and the node (03); the tree placement is a second write per hull, and an embarkation needs both of its ends to exist. |
 | 05 | PLACEMENTS | `PUT /games/{id}/units/{unit_id}/placement` | One write per hull, unit-id order. |
@@ -1154,7 +1162,7 @@ fields, and a 5xx as one line with the status and the request id.
 | 03 | `POST /games/{id}/hierarchy` | `id_unit_hierarchy, name, parent_id?, icon?, note?` | 400 `id_unit_hierarchy` (rank, ceiling); 400 `parent_id` |
 | 03 | `PUT /games/{id}/hierarchy/{node}/parent` | `parent_id` | re-parent |
 | 03 | `DELETE /games/{id}/hierarchy/{node}` | — | node and its subtree |
-| 04 | `POST /games/{id}/units` | `id_unit, id_commander, note?` | 400 `id_commander` (not a participant, or judge-side) |
+| 04 | `POST /games/{id}/units` | `id_unit, id_commander?, note?` | 400 `id_commander` when named (not a participant, or judge-side); the hull alone is `201` |
 | 04 | `PATCH /games/{id}/units/{unit_id}` | `id_commander, note?` | 400 `id_commander` |
 | 04 | `PUT /games/{id}/units/{unit_id}/hierarchy` | `id_hierarchy_node` | 400 if the node is not this game's |
 | 05 | `PUT /games/{id}/units/{unit_id}/placement` | `latitude, longitude` | both required, may be 0; ±90 / ±180; 409 once play began |
@@ -1189,10 +1197,11 @@ Each of these is a place where the frames, taken literally, do not build. The
 resolution is the one to implement.
 
 **1. The write order.** F7 prints game → hierarchy → units → placements → steps
-→ seats → commanders → readiness → transition. `POST /games/{id}/units`
-requires `id_commander`, and that commander must already be a participant, so
-**seats precede units**; and a hull's tree placement needs its node, so
-**hierarchy precedes units**. Use §9.2's order. F7's own footer — "the ladder is
+→ seats → commanders → readiness → transition. A hull's commander must already
+be a participant *when one is named*, so **seats precede units**; and a hull's
+tree placement needs its node, so **hierarchy precedes units**. Use §9.2's
+order. (`id_commander` itself is optional on assignment — a plan may save an
+uncommanded hull.) F7's own footer — "the ladder is
 the same order for all three verbs, each verb just stops earlier" — is also
 wrong: Save as Scenario has its own, shorter ladder.
 

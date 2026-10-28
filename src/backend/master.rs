@@ -861,13 +861,18 @@ impl MinosMaster {
         token: &str,
         game_id: i64,
         unit_id: i64,
-        commander_id: i64,
+        commander_id: Option<i64>,
     ) -> Result<Vec<GameUnit>, BackendError> {
-        let data = self.post(
-            token,
-            &format!("/games/{game_id}/units"),
-            serde_json::json!({ "id_unit": unit_id, "id_commander": commander_id }),
-        )?;
+        // THE COMMANDER IS OPTIONAL. `POST /games/{id}/units` takes the hull
+        // alone (verified against the dev server: 201, and the row comes back
+        // without `id_commander`), which is what lets a plan be saved before
+        // its commanders are named. The start gate is where the force has to
+        // be complete, not the save.
+        let mut body = serde_json::json!({ "id_unit": unit_id });
+        if let Some(commander) = commander_id {
+            body["id_commander"] = serde_json::Value::from(commander);
+        }
+        let data = self.post(token, &format!("/games/{game_id}/units"), body)?;
         Ok(Self::parse_units(&data))
     }
 

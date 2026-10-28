@@ -285,6 +285,12 @@ fn main() {
         // sign-in card rather than the console, which is the honest state and
         // the one a shipped build starts in.
         s.signed_in = !token.is_empty();
+        // A LAUNCH WITH CACHED CREDENTIALS HOLDS NO GAME, so the session read
+        // never ran and the directory would be empty — which is exactly the
+        // state the Players stage showed as `0 MATCH`.
+        if !token.is_empty() && s.directory.is_empty() {
+            s.directory = read_directory(&host, &token);
+        }
         s
     };
 
@@ -1013,7 +1019,7 @@ fn main() {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
-                            match master.assign_unit(&token2, game_id, unit_id, commander_id) {
+                            match master.assign_unit(&token2, game_id, unit_id, Some(commander_id)) {
                                 Err(e) => Err(format!("not assigned: {e}")),
                                 Ok(_) => {
                                     let (clat, clon, zoom, mw, mh) = camera2
@@ -1147,7 +1153,13 @@ fn main() {
                                     sessions,
                                     missions,
                                     missions_error,
-                                    session: tfg::shell_gpui::SessionView::default(),
+                                    // The seat picker seats from ACCOUNTS, and
+                                    // a fresh sign-in holds no game to read
+                                    // participants from.
+                                    session: tfg::shell_gpui::SessionView {
+                                        directory: read_directory(&host2, &token),
+                                        ..tfg::shell_gpui::SessionView::default()
+                                    },
                                 })
                             }
                             None => {
@@ -2233,7 +2245,7 @@ fn main() {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
-                            match master.assign_unit(&token2, game_id, child, commander_id) {
+                            match master.assign_unit(&token2, game_id, child, Some(commander_id)) {
                                 Err(e) => Err(format!("not assigned: {e}")),
                                 Ok(_) => {
                                     match master.game_attach_units(&token2, game_id, host, &[child])
@@ -3886,6 +3898,34 @@ fn project_message(
     }
 }
 
+/// The deployment's accounts, as the seat picker offers them.
+///
+/// A QUESTION ABOUT ACCOUNTS, NOT ABOUT THE EXERCISE. A new game has no
+/// participants yet, so `session.people` is empty and a picker that read only
+/// it showed `0 MATCH` for a deployment full of people. The directory is read
+/// once at launch, once at sign-in, and with a held game's session.
+fn read_directory(host: &str, token: &str) -> Vec<tfg::shell_gpui::DirectoryRow> {
+    let Ok(master) = tfg::backend::MinosMaster::new(host) else {
+        return Vec::new();
+    };
+    master
+        .users_list(token, "", None, None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|u| tfg::shell_gpui::DirectoryRow {
+            id: u.id,
+            name: if u.name.is_empty() {
+                u.username.clone()
+            } else {
+                u.name.clone()
+            },
+            unit: u.satuan,
+            rank: u.pangkat,
+            appointment: u.jabatan,
+        })
+        .collect()
+}
+
 fn fetch_session(
     host: &str,
     token: &str,
@@ -4118,22 +4158,7 @@ fn fetch_session(
     // exercise. Read here and not on the session's every refresh: it is large,
     // it changes on Minos's own schedule, and the console reads it on the way
     // INTO the picker for the same reason.
-    let directory: Vec<tfg::shell_gpui::DirectoryRow> = master
-        .users_list(token, "", None, None)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|u| tfg::shell_gpui::DirectoryRow {
-            id: u.id,
-            name: if u.name.is_empty() {
-                u.username.clone()
-            } else {
-                u.name.clone()
-            },
-            unit: u.satuan,
-            rank: u.pangkat,
-            appointment: u.jabatan,
-        })
-        .collect();
+    let directory = read_directory(host, token);
     // The book, then what each of its steps obliges: steps arrive only
     // nested, so the related read fans out per step. Best-effort per step —
     // one unreadable step leaves an absent entry, never no session.
