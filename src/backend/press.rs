@@ -33,15 +33,19 @@
 //! console's step-add pump uses against a scenario answer, and it is a read —
 //! reads are free and constant; only writes are the press's.
 //!
-//! A STEP'S CREATE ANSWERS WITH THE WHOLE BOOK, which is the book's id and not
-//! the step's. The engine is told `Done { id: None }` for it rather than being
-//! handed an id that would journal the wrong row: the writes that would NEED a
-//! step's own id are the command and audience writes, and they arrive with the
-//! composer's sub-steps.
+//! A STEP'S CREATE ANSWERS WITH THE WHOLE BOOK, not the step. The new step's
+//! id is the one the answer carries and the book did not: the transport
+//! remembers the book's step ids before the first add and journals the
+//! difference, because the very next write — a command on that step, then its
+//! audience — addresses the step by its staged id. Without that adoption the
+//! press stopped at 06 with "the step this command belongs to was never
+//! created", on a step the server had just made.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::backend::{BackendError, HierarchyNode, MinosMaster, NewGame};
+use crate::backend::{
+    BackendError, GameScenario, HierarchyNode, MinosMaster, NewGame, ScenarioMission,
+};
 use crate::commit::{Answer, Read, Ref, Transport, Write};
 use crate::draft::{Journal, Ladder};
 
@@ -61,6 +65,48 @@ pub struct MasterTransport<'a> {
     /// The tree's node ids as they stood before the press's first create.
     /// `None` until a node create needs it.
     known_nodes: Option<BTreeSet<i64>>,
+    /// The task organisation's vocabulary by level, read at most once per
+    /// press. The ids a create sends are master data (`/hierarchy`), and the
+    /// flow stages a level rather than an id.
+    echelons: Option<Vec<(crate::groups::GroupKind, i64)>>,
+    /// The step and sub-step ids each book held before this press's first
+    /// add, keyed by the book (a scenario or a mission).
+    ///
+    /// A STEP'S ANSWER IS THE WHOLE BOOK. The new row is the id the answer
+    /// carries and the remembered set did not, which is the only way to
+    /// journal the staged step the next command will name.
+    known_books: BTreeMap<i64, BookIds>,
+}
+
+/// The ids a book held before an add.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BookIds {
+    steps: BTreeSet<i64>,
+    substeps: BTreeSet<i64>,
+}
+
+impl BookIds {
+    fn of_game(scenario: &GameScenario) -> Self {
+        Self {
+            steps: scenario.steps.iter().map(|step| step.id).collect(),
+            substeps: scenario
+                .steps
+                .iter()
+                .flat_map(|step| step.substeps.iter().map(|sub| sub.id))
+                .collect(),
+        }
+    }
+
+    fn of_mission(mission: &ScenarioMission) -> Self {
+        Self {
+            steps: mission.steps.iter().map(|step| step.id).collect(),
+            substeps: mission
+                .steps
+                .iter()
+                .flat_map(|step| step.substeps.iter().map(|sub| sub.id))
+                .collect(),
+        }
+    }
 }
 
 impl<'a> MasterTransport<'a> {
@@ -72,6 +118,8 @@ impl<'a> MasterTransport<'a> {
             game: None,
             roles: None,
             known_nodes: None,
+            echelons: None,
+            known_books: BTreeMap::new(),
         }
     }
 
@@ -193,6 +241,100 @@ impl<'a> MasterTransport<'a> {
             })
     }
 
+    /// THE MASTER-DATA ID FOR A LEVEL. The vocabulary is read on the first
+    /// create that needs one; the name is the key because that is what both
+    /// sides carry, and `GroupKind::from_echelon` is the squashing rule the
+    /// console already uses in the other direction.
+    ///
+    /// A level the vocabulary does not name is a refusal BEFORE the request:
+    /// sending `0` is the `400 · id_unit_hierarchy: this field is required`
+    /// that stopped 03, and it names a column rather than the level the
+    /// operator built.
+    fn echelon(&mut self, kind: crate::groups::GroupKind) -> Result<i64, Answer> {
+        if self.echelons.is_none() {
+            let levels = self.master.echelon_levels(self.token).map_err(answer_of)?;
+            let mut by_kind: Vec<(crate::groups::GroupKind, i64)> = Vec::new();
+            for level in levels {
+                if let Some(level_kind) = crate::groups::GroupKind::from_echelon(&level.name) {
+                    if !by_kind.iter().any(|(seen, _)| *seen == level_kind) {
+                        by_kind.push((level_kind, level.id));
+                    }
+                }
+            }
+            self.echelons = Some(by_kind);
+        }
+        self.echelons
+            .as_ref()
+            .expect("just read")
+            .iter()
+            .find(|(level_kind, _)| *level_kind == kind)
+            .map(|(_, id)| *id)
+            .ok_or_else(|| Answer::NotSent {
+                sentence: format!(
+                    "{} is not a level of this deployment's task organisation \u{2014} the \
+                     server's vocabulary names the levels a body may be created at.",
+                    kind.label()
+                ),
+            })
+    }
+
+    // -- the book's ids --------------------------------------------------
+
+    /// Remember a game book's step and sub-step ids, once per book per press.
+    fn remember_game_book(&mut self, game: i64, book: i64) -> Result<(), Answer> {
+        if self.known_books.contains_key(&book) {
+            return Ok(());
+        }
+        let scenario = self
+            .master
+            .game_scenario(self.token, game, book)
+            .map_err(answer_of)?;
+        self.known_books.insert(book, BookIds::of_game(&scenario));
+        Ok(())
+    }
+
+    /// Remember a Saved Scenario's ids, once per mission per press.
+    fn remember_mission(&mut self, mission: i64) -> Result<(), Answer> {
+        if self.known_books.contains_key(&mission) {
+            return Ok(());
+        }
+        let book = self
+            .master
+            .scenario_mission(self.token, mission)
+            .map_err(answer_of)?;
+        self.known_books.insert(mission, BookIds::of_mission(&book));
+        Ok(())
+    }
+
+    /// The one step the answer added, journaled against its staged id.
+    ///
+    /// More than one new id is not a create this client can name — another
+    /// client may have added one at the same moment — so the answer names
+    /// nothing, and the next write refuses loudly instead of addressing a
+    /// row it guessed.
+    fn adopt_step(&mut self, book: i64, ids: BookIds) -> Answer {
+        let before = self.known_books.insert(book, ids.clone()).unwrap_or_default();
+        let added: Vec<i64> = ids.steps.difference(&before.steps).copied().collect();
+        match added.as_slice() {
+            [one] => Answer::Done { id: Some(*one) },
+            _ => Answer::Done { id: None },
+        }
+    }
+
+    /// The one command the answer added, on the same terms.
+    fn adopt_substep(&mut self, book: i64, ids: BookIds) -> Answer {
+        let before = self.known_books.insert(book, ids.clone()).unwrap_or_default();
+        let added: Vec<i64> = ids
+            .substeps
+            .difference(&before.substeps)
+            .copied()
+            .collect();
+        match added.as_slice() {
+            [one] => Answer::Done { id: Some(*one) },
+            _ => Answer::Done { id: None },
+        }
+    }
+
     // -- the node diff ---------------------------------------------------
 
     /// The ids the tree already holds, read once before the first create.
@@ -243,7 +385,15 @@ impl Transport for MasterTransport<'_> {
         // resolved once here instead of in twenty arms.
         match write {
             Write::CreateGame(_) => self.send_without_game(write, journal),
-            Write::CreateBook { .. } if self.ladder == Ladder::Mission => {
+            // THE MISSION LADDER HAS NO GAME AT ALL: its book, its steps and
+            // their commands are addressed by the mission id, and requiring a
+            // game first refused M2 with "the game's id is not known yet".
+            Write::CreateBook { .. }
+            | Write::CreateStep { .. }
+            | Write::CreateSubstep { .. }
+            | Write::SetAudience { .. }
+                if self.ladder == Ladder::Mission =>
+            {
                 self.send_without_game(write, journal)
             }
             _ => match self.game(journal) {
@@ -298,8 +448,10 @@ impl Transport for MasterTransport<'_> {
 }
 
 impl MasterTransport<'_> {
-    /// The two writes that need no game: 01, and M1.
-    fn send_without_game(&mut self, write: &Write, _journal: &Journal) -> Answer {
+    /// The writes that need no game: 01, and the whole mission ladder (M1's
+    /// book, its steps, their commands and audiences), which is addressed by
+    /// the mission's own id.
+    fn send_without_game(&mut self, write: &Write, journal: &Journal) -> Answer {
         match write {
             Write::CreateGame(body) => {
                 let req = NewGame {
@@ -331,7 +483,75 @@ impl MasterTransport<'_> {
                 },
                 Err(e) => answer_of(e),
             },
-            // Unreachable by construction: `send` sends only those two here.
+            // -- M2, M3: the mission's own routes, addressed by its id ----
+            Write::CreateStep {
+                book,
+                kind,
+                content,
+                window,
+                ..
+            } => match self.book(*book, journal) {
+                Ok(mission) => {
+                    if let Err(answer) = self.remember_mission(mission) {
+                        return answer;
+                    }
+                    let window = window.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+                    match self.master.add_mission_step(
+                        self.token,
+                        mission,
+                        kind.as_deref(),
+                        content,
+                        window,
+                    ) {
+                        Ok(answer) => self.adopt_step(mission, BookIds::of_mission(&answer)),
+                        Err(e) => answer_of(e),
+                    }
+                }
+                Err(answer) => answer,
+            },
+            Write::CreateSubstep {
+                book,
+                step,
+                content,
+                ..
+            } => {
+                let (mission, step) =
+                    match (self.book(*book, journal), self.step(*step, journal)) {
+                        (Ok(book), Ok(step)) => (book, step),
+                        (Err(answer), _) | (_, Err(answer)) => return answer,
+                    };
+                if let Err(answer) = self.remember_mission(mission) {
+                    return answer;
+                }
+                match self
+                    .master
+                    .add_mission_substep(self.token, mission, step, content)
+                {
+                    Ok(answer) => self.adopt_substep(mission, BookIds::of_mission(&answer)),
+                    Err(e) => answer_of(e),
+                }
+            }
+            Write::SetAudience {
+                book,
+                step,
+                substep,
+                hulls,
+                nodes: _,
+            } => {
+                let (mission, step, substep) = match (
+                    self.book(*book, journal),
+                    self.step(*step, journal),
+                    self.substep(*substep, journal),
+                ) {
+                    (Ok(b), Ok(s), Ok(c)) => (b, s, c),
+                    (Err(answer), _, _) | (_, Err(answer), _) | (_, _, Err(answer)) => {
+                        return answer;
+                    }
+                };
+                call(self.master.set_mission_substep_related(
+                    self.token, mission, step, substep, hulls,
+                ))
+            }
             other => Answer::NotSent {
                 sentence: format!("{} needs a game, and there is none yet.", other.label()),
             },
@@ -367,9 +587,18 @@ impl MasterTransport<'_> {
             Write::CreateNode {
                 name,
                 echelon_id,
+                kind,
                 parent,
                 ..
             } => {
+                let echelon_id = if *echelon_id != 0 {
+                    *echelon_id
+                } else {
+                    match self.echelon(*kind) {
+                        Ok(id) => id,
+                        Err(answer) => return answer,
+                    }
+                };
                 let parent_id = match parent {
                     Some(parent) => match self.node(*parent, journal) {
                         Ok(id) => Some(id),
@@ -383,7 +612,7 @@ impl MasterTransport<'_> {
                 match self.master.hierarchy_create_node(
                     self.token,
                     game,
-                    *echelon_id,
+                    echelon_id,
                     name,
                     parent_id,
                     "",
@@ -482,14 +711,21 @@ impl MasterTransport<'_> {
                 window,
                 ..
             } => match self.book(*book, journal) {
-                // The answer is the whole book, so its id is the book's. The
-                // step's own id is not what this slice journals.
+                // THE ANSWER IS THE WHOLE BOOK, and the new step is the id it
+                // carries and the remembered book did not. The next write — a
+                // command on this step — names it by the staged id.
                 Ok(book) => {
+                    if let Err(answer) = self.remember_game_book(game, book) {
+                        return answer;
+                    }
                     let window = window.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
-                    call(
-                        self.master
-                            .add_scenario_step(self.token, game, book, content, window),
-                    )
+                    match self
+                        .master
+                        .add_scenario_step(self.token, game, book, content, window)
+                    {
+                        Ok(answer) => self.adopt_step(book, BookIds::of_game(&answer)),
+                        Err(e) => answer_of(e),
+                    }
                 }
                 Err(answer) => answer,
             },
@@ -510,22 +746,18 @@ impl MasterTransport<'_> {
                     (Ok(book), Ok(step)) => (book, step),
                     (Err(answer), _) | (_, Err(answer)) => return answer,
                 };
-                // THE LADDER PICKS THE ROUTE, and it is not a detail: a
-                // Saved Scenario's commands live under
-                // `/scenario-missions/{id}/steps/{s}/substeps`, the game's
-                // under `/games/{id}/scenarios/{s}/steps/{s}/substeps`. The
-                // transport carries the ladder for exactly this fork.
-                // The two ladders answer different types, so each arm keeps
-                // its own `call` rather than a `match` that has to unify them.
-                match self.ladder {
-                    Ladder::Mission => call(
-                        self.master
-                            .add_mission_substep(self.token, game, step, content),
-                    ),
-                    Ladder::Game => call(
-                        self.master
-                            .add_game_substep(self.token, game, book, step, content),
-                    ),
+                // THE ANSWER IS THE WHOLE SCENARIO, so the command's own id
+                // is the one it carries and the remembered book did not —
+                // the audience write immediately after it names that id.
+                if let Err(answer) = self.remember_game_book(game, book) {
+                    return answer;
+                }
+                match self
+                    .master
+                    .add_game_substep(self.token, game, book, step, content)
+                {
+                    Ok(answer) => self.adopt_substep(book, BookIds::of_game(&answer)),
+                    Err(e) => answer_of(e),
                 }
             }
             Write::SetAudience {
@@ -547,18 +779,9 @@ impl MasterTransport<'_> {
                         return answer;
                     }
                 };
-                // Same fork as the create: the template ladder's body is
-                // `units`, the game ladder's is `related:[{kind:"hull",id}]`.
-                match self.ladder {
-                    Ladder::Mission => call(
-                        self.master
-                            .set_mission_substep_related(self.token, game, step, substep, hulls),
-                    ),
-                    Ladder::Game => call(
-                        self.master
-                            .set_game_substep_related(self.token, game, book, step, substep, hulls),
-                    ),
-                }
+                call(self.master.set_game_substep_related(
+                    self.token, game, book, step, substep, hulls,
+                ))
             }
             // -- 07 ----------------------------------------------------
             Write::CommandNode { node, user_id } => match self.node(*node, journal) {
@@ -711,6 +934,116 @@ mod tests {
             "no step answer resolved -1"
         );
         assert!(transport.substep(Ref::Staged(-1), &journal).is_err());
+    }
+
+    /// THE LEVEL IS A SERVER ID. The flow stages a rung — a local kind — and
+    /// the create sends `id_unit_hierarchy`; the vocabulary is read once and
+    /// an unknown level refuses before the request, naming the level rather
+    /// than the column.
+    #[test]
+    fn a_create_resolves_its_level_from_the_vocabulary() {
+        use crate::groups::GroupKind;
+        let master = MinosMaster::new("http://127.0.0.1:1").expect("a client");
+        let mut transport = MasterTransport::new(&master, "t", Ladder::Game);
+        transport.echelons = Some(vec![
+            (GroupKind::SatuanTugas, 2),
+            (GroupKind::Gugus, 3),
+            (GroupKind::OperasiGabungan, 4),
+        ]);
+        assert_eq!(transport.echelon(GroupKind::Gugus).ok(), Some(3));
+        match transport.echelon(GroupKind::Unsur) {
+            Err(Answer::NotSent { sentence }) => assert!(
+                sentence.contains("Unsur"),
+                "the refusal names the level: {sentence}"
+            ),
+            other => panic!("expected NotSent, got {other:?}"),
+        }
+    }
+
+    /// A STEP'S CREATE ANSWERS WITH THE WHOLE BOOK: the new step is the id
+    /// the answer carries and the remembered book did not. Without this the
+    /// command that follows names a staged id no answer resolved, and 06
+    /// stopped with "the step this command belongs to was never created".
+    #[test]
+    fn a_step_create_adopts_the_step_the_book_did_not_have() {
+        let master = MinosMaster::new("http://127.0.0.1:1").expect("a client");
+        let mut transport = MasterTransport::new(&master, "t", Ladder::Game);
+        transport.known_books.insert(
+            7,
+            BookIds {
+                steps: BTreeSet::from([1]),
+                substeps: BTreeSet::from([10]),
+            },
+        );
+        // The step's answer: the new step, no new command.
+        let after_step = BookIds {
+            steps: BTreeSet::from([1, 2]),
+            substeps: BTreeSet::from([10]),
+        };
+        assert_eq!(
+            transport.adopt_step(7, after_step),
+            Answer::Done { id: Some(2) }
+        );
+        // The command is added next, so ITS baseline is the book the step's
+        // answer left: the step exists, the command does not.
+        let after_command = BookIds {
+            steps: BTreeSet::from([1, 2]),
+            substeps: BTreeSet::from([10, 11]),
+        };
+        assert_eq!(
+            transport.adopt_substep(7, after_command),
+            Answer::Done { id: Some(11) }
+        );
+    }
+
+    /// Two new ids in one answer is not one create, and the transport refuses
+    /// to pick: the staged id stays unresolved and the next write says so,
+    /// rather than addressing a row that may belong to somebody else.
+    #[test]
+    fn an_ambiguous_step_answer_names_nothing() {
+        let master = MinosMaster::new("http://127.0.0.1:1").expect("a client");
+        let mut transport = MasterTransport::new(&master, "t", Ladder::Game);
+        transport.known_books.insert(
+            7,
+            BookIds {
+                steps: BTreeSet::new(),
+                substeps: BTreeSet::new(),
+            },
+        );
+        let after = BookIds {
+            steps: BTreeSet::from([1, 2]),
+            substeps: BTreeSet::new(),
+        };
+        assert_eq!(transport.adopt_step(7, after), Answer::Done { id: None });
+    }
+
+    /// THE MISSION LADDER HAS NO GAME. Its step and command writes are
+    /// addressed by the mission's id, so they must never stop on "the game's
+    /// id is not known yet".
+    #[test]
+    fn the_mission_ladder_never_asks_for_a_game() {
+        let master = MinosMaster::new("http://127.0.0.1:1").expect("a client");
+        let mut transport = MasterTransport::new(&master, "t", Ladder::Mission);
+        let mut journal = Journal::new();
+        journal.resolve_book(-1, 55);
+        journal.resolve_step(-2, 66);
+        journal.resolve_substep(-3, 77);
+        let answer = transport.send(
+            &Write::SetAudience {
+                book: Ref::Staged(-1),
+                step: Ref::Staged(-2),
+                substep: Ref::Staged(-3),
+                hulls: vec![351],
+                nodes: Vec::new(),
+            },
+            &journal,
+        );
+        if let Answer::NotSent { sentence } = answer {
+            assert!(
+                !sentence.contains("game's id"),
+                "the mission ladder asked for a game: {sentence}"
+            );
+        }
     }
 
     /// A REOPENED DRAFT'S PRESS ALREADY HAS A GAME. Position 01 writes nothing

@@ -1000,7 +1000,7 @@ halves of that are wrong, and the corrections are erratum 1:
 | 03 | HIERARCHY | `POST /games/{id}/hierarchy`, top-down | A parent before its child. **The level is the server's id**: the flow's rung is a local kind, and `id_unit_hierarchy` is resolved from `GET /hierarchy`, read once per press. Without the vocabulary the press is a gap, not a `0`. |
 | 04 | UNITS | `POST /games/{id}/units`, then the tree placement, then embarkations, removals last | Needs the seat (02) and the node (03); the tree placement is a second write per hull, and an embarkation needs both of its ends to exist. |
 | 05 | PLACEMENTS | `PUT /games/{id}/units/{unit_id}/placement` | One write per hull, unit-id order. |
-| 06 | STEPS | scenarios, steps, sub-steps, audiences | Audiences name hulls, so after 04. |
+| 06 | STEPS | scenarios, steps, sub-steps, audiences | Audiences name hulls, so after 04. Every add answers with the **whole book**, so the new step's or command's id is the one the answer carries and the remembered book did not — the next write names it. |
 | 07 | COMMANDERS | `PUT .../hierarchy/{node}/commander`, `PATCH .../units/{unit_id}` | Group commanders, and a hull's commander where 04's differs. |
 | 08 | READINESS | **`GET /games/{id}/readiness`** — a read | The gate, shown before 09. Never a write. |
 | 09 | TRANSITION | `POST /games/{id}/transitions {to:"preparation"}` | Play Directly only. |
@@ -1027,8 +1027,10 @@ that duplicates.
    already in the game is not assigned again; a placement that matches is not
    re-sent; a participant whose role matches is not re-seated.
 2. **Record what landed.** Every successful write appends to the in-memory
-   `Journal` with the id the server returned. Resume reads the journal, not the
-   draft's optimism.
+   `Journal` with the id the server returned. A book write's answer is the
+   whole page, so the id is the row the answer carries and the remembered page
+   did not; a resume skips a book, step or command the journal already adopted,
+   or it would post the page twice.
 3. **On failure, re-read the family and re-plan.** Re-read the resource family
    that failed (and anything after it that could have changed), then plan again.
    A write the journal says succeeded is never re-sent.
