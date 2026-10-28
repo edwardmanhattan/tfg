@@ -4783,6 +4783,46 @@ impl IslandDemo {
                 }
             }
         }
+        // `TFG_PACK=<group name>` stages a group drop for a capture: the
+        // formation is built around the centroid of the hulls the group
+        // already has on the map, so a capture of it stays on the chart the
+        // fixture opened. The gesture is a drag, and there is no pointer
+        // automation on this machine.
+        if let Ok(name) = std::env::var("TFG_PACK") {
+            let staged = demo.flow_draft.as_ref().and_then(|draft| {
+                let group = draft
+                    .groups
+                    .staged_groups()
+                    .find(|group| group.name.eq_ignore_ascii_case(name.trim()))?;
+                let body = formation_body(draft, group.local_id);
+                // The body's hulls, not only its direct ones: a gugus musters
+                // none of its own, and its centroid is its children's hulls.
+                let placed: Vec<crate::force::Start> = body
+                    .hulls_below()
+                    .iter()
+                    .filter_map(|unit| draft.force.get(*unit).and_then(|hull| hull.start.clone()))
+                    .collect();
+                let anchor = if placed.is_empty() {
+                    crate::force::Start {
+                        lat: -3.32,
+                        lon: 109.05,
+                    }
+                } else {
+                    let n = placed.len() as f64;
+                    crate::force::Start {
+                        lat: placed.iter().map(|at| at.lat).sum::<f64>() / n,
+                        lon: placed.iter().map(|at| at.lon).sum::<f64>() / n,
+                    }
+                };
+                Some(crate::formation::pack(&body, anchor))
+            });
+            if let (Some(pack), Some(draft)) = (staged, demo.flow_draft.as_mut()) {
+                for (unit_id, at) in pack.writes {
+                    draft.force.set_start(unit_id, Some(at));
+                    draft.force.set_host(unit_id, None);
+                }
+            }
+        }
         // `TFG_MANIFEST=<host>` opens that host's manifest for a capture.
         if let Some(host) = std::env::var("TFG_MANIFEST")
             .ok()
@@ -22154,12 +22194,12 @@ impl IslandDemo {
 
     /// A GROUP, OR A CARD, LET GO ON THE WATER (`§6.4`).
     ///
-    /// A HULL DROPPED ON THE MAP IS ONE PLACEMENT; A GROUP IS A PACK. The
-    /// geometry is [`crate::ring`]'s — the anchor is the drop, the hulls go on
-    /// rings around it, and a sub-group keeps its own centre — so this
-    /// function only says what is in the hand and writes the positions the
-    /// pack derived. Nothing is sent: the draft holds them until the press,
-    /// and the press writes them one at a time in unit-id order.
+    /// A HULL DROPPED ON THE MAP IS ONE PLACEMENT; A GROUP IS A FORMATION. The
+    /// geometry is [`crate::formation`]'s — the drop is the wedge's centre,
+    /// and the hulls go in a wedge around it, a sub-group keeping its own
+    /// centre — so this function only says what is in the hand and writes the
+    /// positions the pack derived. Nothing is sent: the draft holds them until
+    /// the press, and the press writes them one at a time in unit-id order.
     ///
     /// A HULL THAT ALREADY HAS GROUND MOVES; one that has none is deployed.
     /// Either way the hull leaves whatever carried it, because a hull with a
@@ -22184,13 +22224,13 @@ impl IslandDemo {
             return false;
         };
         let body = match carry.group_id {
-            Some(id) => ring_body(draft, id),
+            Some(id) => formation_body(draft, id),
             // Cards in the hand are a body with no children: one card lands
-            // on the anchor exactly, several spread on the same rings a
+            // on the anchor exactly, several take the same wedge slots a
             // group's hulls would.
-            None => crate::ring::Body::new(0, carry.unit_ids.clone(), Vec::new()),
+            None => crate::formation::Body::new(0, carry.unit_ids.clone(), Vec::new()),
         };
-        let pack = crate::ring::pack(&body, crate::force::Start { lat, lon });
+        let pack = crate::formation::pack(&body, crate::force::Start { lat, lon });
         if pack.is_empty() {
             self.flow_drop_note = Some(format!(
                 "{} HOLDS NO HULLS \u{b7} NOTHING TO PACK",
@@ -37462,14 +37502,14 @@ fn card_of(cards: &[BasketCard], unit_id: i64) -> Option<&BasketCard> {
     None
 }
 
-/// One body of the task organisation as the ring pack sees it (`§6.4`).
+/// One body of the task organisation as the drop formation sees it (`§6.4`).
 ///
-/// The pack walks a [`crate::ring::Body`], and the draft holds the same tree
+/// The pack walks a [`crate::formation::Body`], and the draft holds the same tree
 /// as rows; this is the one conversion, so the map's drop and the pack cannot
 /// disagree about what sits under what. Hulls are listed whether or not they
 /// are placed: a pack DEPLOYS a body, and a hull with no ground is exactly the
 /// one a drop should put somewhere.
-pub fn ring_body(draft: &crate::draft::Draft, id: i64) -> crate::ring::Body {
+pub fn formation_body(draft: &crate::draft::Draft, id: i64) -> crate::formation::Body {
     let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
     let children_of = crate::groups::children_map(&groups);
     let by_id: std::collections::BTreeMap<i64, &crate::groups::StagedGroup> =
@@ -37480,7 +37520,7 @@ pub fn ring_body(draft: &crate::draft::Draft, id: i64) -> crate::ring::Body {
         children_of: &std::collections::BTreeMap<i64, Vec<i64>>,
         id: i64,
         depth: usize,
-    ) -> crate::ring::Body {
+    ) -> crate::formation::Body {
         // A HULL ABOARD SOMETHING IS NOT PACKED: it follows its host, and
         // giving it a ring of its own would silently disembark it onto water
         // the operator did not choose. The host is packed, and the rider
@@ -37514,7 +37554,7 @@ pub fn ring_body(draft: &crate::draft::Draft, id: i64) -> crate::ring::Body {
                 .map(|child| walk(draft, by_id, children_of, *child, depth + 1))
                 .collect()
         };
-        crate::ring::Body::new(id, hulls, children)
+        crate::formation::Body::new(id, hulls, children)
     }
     walk(draft, &by_id, &children_of, id, 0)
 }
@@ -46267,9 +46307,9 @@ mod tests {
         );
     }
 
-    /// The ring pack's body is the draft's tree, one level at a time.
+    /// The drop formation's body is the draft's tree, one level at a time.
     #[test]
-    fn the_ring_body_is_the_drafts_tree() {
+    fn the_formation_body_is_the_drafts_tree() {
         let draft = crate::fixtures::groups_draft().expect("the groups fixture");
         let gus = draft
             .groups
@@ -46277,7 +46317,7 @@ mod tests {
             .find(|group| group.name == "GUS-1")
             .map(|group| group.local_id)
             .expect("the gugus");
-        let body = ring_body(&draft, gus);
+        let body = formation_body(&draft, gus);
         assert!(body.hulls.is_empty(), "a gugus musters no hulls directly");
         assert_eq!(body.children.len(), 2, "its two satgas");
         let hulls: Vec<i64> = body
@@ -46338,20 +46378,52 @@ mod tests {
                     .filter_map(|hull| hull.start.map(|start| (hull.unit_id, (start.lat, start.lon))))
                     .collect();
                 assert_eq!(after.len(), before.len(), "nothing lost its ground");
-                // The five hulls of the gugus are now a cluster; the four
-                // loose hulls are where they were.
-                let cluster: Vec<(f64, f64)> = after
-                    .iter()
-                    .filter(|(unit, _)| [351, 352, 353, 365, 371].contains(unit))
-                    .map(|(_, at)| *at)
-                    .collect();
-                let (lat, lon) = cluster[0];
-                for (other_lat, other_lon) in &cluster {
+                // THE DROP IS THE PACK, hull for hull: the shell wrote the
+                // geometry the module derived, around the ground under the
+                // pointer.
+                let ground = demo.flow_ground_at((20.0, 20.0), window).expect("ground");
+                let body = formation_body(
+                    demo.flow_draft.as_ref().expect("a draft"),
+                    gus,
+                );
+                let expected = crate::formation::pack(
+                    &body,
+                    crate::force::Start {
+                        lat: ground.0,
+                        lon: ground.1,
+                    },
+                );
+                for (unit, at) in &after {
+                    if ![351, 352, 353, 365, 371].contains(unit) {
+                        continue;
+                    }
+                    let want = expected.get(*unit).expect("packed");
                     assert!(
-                        (other_lat - lat).abs() < 0.15 && (other_lon - lon).abs() < 0.15,
-                        "packed apart, not scattered: {cluster:?}"
+                        (at.0 - want.lat).abs() < 1e-9 && (at.1 - want.lon).abs() < 1e-9,
+                        "{unit} at {at:?}, the pack says {want:?}"
                     );
                 }
+                // And the formation is a hundred metres across, not a screen.
+                let cluster: Vec<(f64, f64)> = expected
+                    .writes
+                    .iter()
+                    .map(|(_, at)| (at.lat, at.lon))
+                    .collect();
+                let closest = cluster
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(a, one)| cluster.iter().skip(a + 1).map(move |two| (one, two)))
+                    .map(|(a, b)| {
+                        let d_lat = (a.0 - b.0) * 111_320.0;
+                        let d_lon =
+                            (a.1 - b.1) * 111_320.0 * ground.0.to_radians().cos();
+                        (d_lat * d_lat + d_lon * d_lon).sqrt()
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                assert!(
+                    (closest - crate::formation::GAP_M).abs() < 1.0,
+                    "the closest pair is {closest} m apart"
+                );
                 assert!(
                     demo.flow_drop_note
                         .as_deref()

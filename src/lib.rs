@@ -54,8 +54,8 @@
 //!   off `egui::Context::default()`.
 //! - [`readiness`]: the execution gate's unknown states — why the last read
 //!   produced no verdict, and what to say while it has not. Toolkit-free.
-//! - [`ring`]: the ring pack — a group dropped on the map, as pure geometry:
-//!   the centre, the rings, the spread from 12 o'clock and the write order.
+//! - [`formation`]: the drop formation — a group dropped on the map, as pure
+//!   geometry: the wedge, the 100 m gap, the tree walk and the write order.
 //!   Leaf: no GPUI, no draft, no network.
 //! - [`window`]: the exercise's planned window and the one rule that says
 //!   what a window is — shared with the scenario composer. Toolkit-free.
@@ -118,7 +118,7 @@ pub mod pickers;
 pub mod qr;
 pub mod readiness;
 pub mod register;
-pub mod ring;
+pub mod formation;
 pub mod roster;
 pub mod selfcheck;
 pub mod settings;

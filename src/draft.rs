@@ -1446,10 +1446,10 @@ fn kind_name(kind: GroupKind) -> &'static str {
     }
 }
 
-/// The hulls a ring pack would place, in unit-id order — the order a commit
+/// The hulls a drop formation would place, in unit-id order — the order a commit
 /// writes them in, whatever order the pack laid them out (§6.4).
 ///
-/// Kept here rather than in `ring` because it is a fact about the WRITE, not
+/// Kept here rather than in `formation` because it is a fact about the WRITE, not
 /// about the geometry: the pack's own order is the tree's, and this is the
 /// order the server's one-placement-at-a-time route can reproduce.
 pub fn write_order(positions: &BTreeMap<i64, Start>) -> Vec<(i64, Start)> {

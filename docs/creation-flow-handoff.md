@@ -107,7 +107,7 @@ y = 730 + 860·n.
 | 3 | **F3a** Stage 02 — the register at rest | **F3b** The peel — press, move, the UI gets out of the way |
 | 4 | **F3c** The drop lands — in the game, on the map, in the basket | **F3d** The basket, open — a saved plan reopened |
 | 5 | **F3e** Map mode — moving what is already there | **F4a** Stage 03 — the composition board |
-| 6 | **F4b** Settled nesting — and the refusals | **F4c** A group dropped on the map — the ring pack |
+| 6 | **F4b** Settled nesting — and the refusals | **F4c** A group dropped on the map — the drop formation |
 | 7 | **F5a** Stage 04 — the composer at rest | **F5b** The basket, nested — a group dropped on a sub-step |
 | 8 | **F6a** Stage 05 — people on the left, seats on the right | **F6b** The basket as a drop target — commander |
 | 9 | **F7** Stage 06 — the commit rail | **F8** Arrival — what each press leaves behind |
@@ -682,56 +682,72 @@ And what is allowed: `A CHILD SITS ONLY UNDER THE LEVEL DIRECTLY ABOVE IT ·
 ONE HULL IN ONE PLACE · RE-DROPPING MOVES IT`. One hull in one body: dropping it
 on a second body moves it, and the first body loses it.
 
-### 6.4 The ring pack (F4c)
+### 6.4 The drop formation (F4c)
 
-A **group** dropped on the map packs its hulls around the drop point — every
-hull under it, placed already or not, because the drop is how a body is
-deployed and how it is moved. A hull dropped on the map is one placement, not a
-pack.
+A **group** dropped on the map lays its hulls out as a **wedge** around the drop
+point — every hull under it, placed already or not, because the drop is how a
+body is deployed and how it is moved. A hull dropped on the map is one
+placement, not a formation.
 
 The gesture: map mode open, the basket open over it, a body's title dragged out
 onto the water. Its hulls are laid out around the pointer, and the note says
 `GUS-1 PACKED · 5 HULLS AROUND THE DROP · 5 PLACEMENT WRITES, UNIT-ID ORDER`.
-Nothing is sent until the press.
+Nothing is sent until the press. Every hull of the body — the children's too,
+except those aboard a host — takes a slot in the one wedge.
 
 This is the one piece of geometry in the flow, so it is a pure module
-(`src/ring.rs`) with its own tests:
+(`src/formation.rs`) with its own tests:
 
-```
-anchor   = the drop point
-ring k   holds 6k hulls, at radius k·R
-packing  = depth-first through the group tree; within a ring, unit-id order
-spread   = 360° ÷ N, starting at 12 o'clock, for a partial ring
-R        ≈ 0.02° of latitude; longitude scaled by 1 ÷ cos(lat)
+```text
+anchor   = the drop point, at the FORMATION'S CENTRE
+shape    = one wedge for the whole body: a lead, then pairs alternating port
+           and starboard, each rank one gap further aft and outboard (30°)
+gap      = 100 m between neighbouring hulls, along an arm and across a rank
+packing  = depth-first through the group tree; within a body, unit-id order
 writing  = every hull's position flattened, sent one at a time in unit-id order
-nothing is stored — reopening shows the hulls, not a cluster
+nothing is stored — reopening shows the hulls, not a formation
 ```
+
+**The shape is a formation, not a ring.** The old pack spread a partial ring
+`360° ÷ N` from 12 o'clock, so two hulls were a line by definition and three
+were a lead with two on a line through it — which is what the map showed. A
+wedge never degenerates: two hulls are abreast, three are a triangle, four a
+diamond. Odd counts have a lead; even counts are pairs alone, so neither arm is
+longer than the other. The slots are centred on their own centroid, so the
+formation's mass lands under the pointer rather than ahead of it.
+
+**The gap is 100 metres**, about a hull's length. The old radius was 0.02° of
+latitude (≈ 2.2 km), which at a planning zoom is a screen apart and at a working
+zoom is off the water the operator is looking at. Longitude is scaled by
+`1 ÷ cos(lat)` at the anchor, so a wedge at 60° north is as wide on the ground
+as one at the equator.
 
 **Two orders, and they are not the same order.** *Packing* is geometry: it walks
 the group tree depth-first so a sub-group's hulls land together, and sorts within
-a ring by unit id so the layout is deterministic. *Writing* is the wire: the
+a body by unit id so the layout is deterministic. *Writing* is the wire: the
 draft records N positions, and the commit flattens them and sends them in
 **unit-id order**, because there is no batch route and unit-id order is the only
 ordering a resumed commit can reproduce. A pack that walks the tree differently
 must not change the write sequence, and a failed write at position k must not
 shift the ones after it.
 
-The consequences worth stating, because the sheet states them:
+The consequences worth stating:
 
-- `5 HULLS · ANCHOR + FOUR AT 90°` — the anchor is hull 1 at the centre; the
-  other four sit on the cardinals, so the cluster has a vertical and a
-  horizontal axis. A full ring of six spreads at 60°: `A FULL RING IS THE
-  SPECIAL CASE — THE SAME RULE, 360° ÷ 6 = 60°`.
-- Capacity: `0 AT THE CENTRE, 6 ON R, 12 ON 2R, 18 ON 3R`.
-- `SAME RULE AT EVERY DEPTH — A SUB-GROUP PACKED INSIDE A RING KEEPS ITS OWN
-  CENTRE`. A gugus packed inside its parent's ring gets its own anchor and
-  packs its own children around it, recursively.
+- **One wedge, not a wedge inside a wedge.** A child that packed its own hulls
+  around its own slot put its outboard hull inside its sibling's arm — 29 m
+  apart in a five-hull gugus. The whole body is one wedge, and the tree is not
+  lost: the map draws its links, which is what an organisation looks like on
+  the water. The walk is still depth-first, so a sub-group's hulls take
+  consecutive slots.
 - `N WRITES IN UNIT-ID ORDER · NO BATCH ROUTE EXISTS`. The draft records N
   positions; commit writes them one at a time in unit-id order, whatever order
   the pack laid them out in.
+- A hull that is **aboard** another is not packed: it follows its host, and
+  giving it a slot would silently disembark it onto water the operator did not
+  choose.
 
-Nothing about the cluster survives the commit: the server sees N placements and
-no group geometry.
+Nothing about the formation survives the commit: the server sees N placements
+and no group geometry.
 
 ---
 
@@ -1343,7 +1359,7 @@ The console is the existing console. This flow adds screens, not a style.
 - **No boxes-in-boxes** for sub-steps. A sub-step is a row; its audience is a
   list of cards on that row.
 - **No pin for a group.** A group has no map marker and no stored anchor. The
-  ring pack is the only thing a group does to the map.
+  drop formation is the only thing a group does to the map.
 - **No step-level `/related` write.** It always 409s.
 - **No sub-step on a beat.** Locally refused with the server's sentence.
 - **No set-ready for somebody else.**
@@ -1364,13 +1380,13 @@ come first because they are the only part that can be tested in six seconds.
 | # | Slice | Files | Proves itself by |
 | --- | --- | --- | --- |
 | 1 | **The draft model** | `src/draft.rs` (new) | unit tests: origin, completeness, the derived time base, the considered set |
-| 2 | **The ring pack** | `src/ring.rs` (new) | unit tests: capacity, spread from 12 o'clock, longitude scaling, packing depth-first, writing in unit-id order |
+| 2 | **The drop formation** | `src/formation.rs` (new) | unit tests: the wedge, the 100 m gap, the centroid on the drop, latitude scaling, packing depth-first, writing in unit-id order |
 | 3 | **The commit engine** | `src/commit.rs` (new) | unit tests with a fake transport: two ladders, diff vs live, journal, resume after a failure at each position, the lost-01 case |
 | 4 | **Backend gaps** | `src/backend/master.rs` | scenario-missions (list, get, create, steps, sub-steps, template audiences), game sub-steps, `max_echelon_rank` on the detail read |
 | 5 | **Landing** | `src/shell_gpui.rs` | F1a, F1b captures; games read, tabs filter, mode, START FROM, Proceed |
 | 6 | **Stage 01** | `src/terms.rs`, shell | F2a, F2b; the ten fields, the stamps, the scroll counter, the derived window |
 | 7 | **Stage 02** | shell, `src/dnd.rs` | F3a–F3e; cascade, search, three states, the peel, the drop, the basket grid, map mode |
-| 8 | **Stage 03** | `src/groups/*`, shell | F4a–F4c; tree, echelon, four refusals, ring pack on drop |
+| 8 | **Stage 03** | `src/groups/*`, shell | F4a–F4c; tree, echelon, four refusals, the wedge on drop |
 | 9 | **Stage 04** | `src/book.rs`, shell | F5a, F5b; steps, sub-steps, audiences, beats, idle bucket, nested basket, drop resolution |
 | 10 | **Stage 05** | `src/roster.rs`, shell | F6a, F6b; people, seats, scopes, Not Playing, the two drop targets |
 | 11 | **Stage 06** | `src/commit.rs`, shell | F7; the rail, the verbs, the failure block, resume |
