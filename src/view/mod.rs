@@ -1355,8 +1355,13 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
         // rides along" — the code has pushed Crew since, and the comment
         // described a column that was never built.)
         crate::gamestate::GameState::Preparation => {
-            out.push(slot(IslandKey::Command, 360.0));
-            out.push(slot(IslandKey::Crew, 330.0));
+            // THE COMMAND PANEL IS GONE FROM PREPARATION (the owner's
+            // direction: for a Game Master or a judge seat it only said "no
+            // hull" and "no helm", and readiness is the one verb it carried).
+            // The verb moved into the centred crew screen, and the column
+            // keeps the room: who is here, and the door to the order of
+            // battle.
+            out.push(slot(IslandKey::Crew, 290.0));
         }
         // Execution is the state the console spends its life in, so the
         // column is a working surface rather than a summary: what you can
@@ -2343,11 +2348,10 @@ mod tests {
         // is the grid's six panels now, and the Control island is gone
         // because the clock is part of the exercise's terms.
         assert_eq!(keys(GameState::Planning, false), Vec::<IslandKey>::new());
-        // Preparation is the gate: the seat's readiness, and who has declared.
-        assert_eq!(
-            keys(GameState::Preparation, false),
-            [Command_key(), Crew_key()]
-        );
+        // Preparation is the room: the order of battle, and its door. The
+        // Command panel left the phase with the owner's direction; readiness
+        // moved into the crew screen it opens.
+        assert_eq!(keys(GameState::Preparation, false), [Crew_key()]);
         // Execution is the working surface, for an organizer. The step is
         // not here: the scenario board takes the middle of the frame.
         assert_eq!(

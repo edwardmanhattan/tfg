@@ -3236,10 +3236,18 @@ into.
 | --- | --- |
 | NoSession | Operator, Fleet |
 | Planning | Operator, Fleet, Crew |
-| Preparation | Operator, Command, Crew |
+| Preparation | Operator, Crew |
 | Execution (organizer) | Operator, Step, Command, Crew |
 | Execution (player station) | Operator, Step |
 | Closure | Operator, Crew |
+
+**Preparation's Command panel was removed** (the owner's direction): for a
+Game Master or a judge seat it only said "no hull" and "no helm", and the one
+verb it carried was readiness. Readiness moved into the centred **crew screen**
+— the order of battle, opened by the column's CREW door or automatically when
+the phase is entered. That screen groups **commanders** (a Commando, or anybody
+who actually holds a hull or group) apart from the **other seats** (by role,
+judge side last), and nests each hull's **embarked riders** under it.
 
 `player` is the console's `player_station()` VERBATIM — a seat held by a
 non-judge — and deliberately does NOT also require a commanded hull. That is

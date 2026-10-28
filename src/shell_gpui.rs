@@ -2112,6 +2112,10 @@ const FLEET_H: f32 = 580.0;
 /// card whose last rows nobody can reach.
 const BOARD_W: f32 = 720.0;
 const BOARD_H: f32 = 580.0;
+/// The crew screen's card. Wider than the authoring form because an order of
+/// battle is people, groups, hulls and what is aboard them.
+const CREW_W: f32 = 720.0;
+const CREW_H: f32 = 600.0;
 
 // ---------------------------------------------------------------------------
 // The commander's rail
@@ -9656,7 +9660,12 @@ impl IslandDemo {
     /// The console's `z.crew`, whose whole reason for existing next to Players
     /// is that sentence. An exercise with three seats and one arrival is the
     /// thing the Game Master needs to see, and a seat count cannot say it.
-    fn crew_body(&mut self, _cx: &mut Context<Self>) -> AnyElement {
+    ///
+    /// This is the COLUMN's summary and the door: the order of battle itself
+    /// is the centred screen (`crew_modal_body`), because a 320pt column
+    /// cannot hold a person, their groups, their hulls and what is aboard
+    /// them without scrolling every one of them.
+    fn crew_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let mut col = div()
             .flex()
             .flex_col()
@@ -9665,55 +9674,105 @@ impl IslandDemo {
         if self.session.game_id == 0 {
             return col.child(note("No session held.")).into_any_element();
         }
+        col = col.child(
+            div()
+                .id("open-crew")
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .h(px(view::pt(24.0)))
+                .px(px(view::pt(6.0)))
+                .cursor_pointer()
+                .border(px(kit::EDGE_WIDTH))
+                .border_color(rgba(kit::LIVE_INK))
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.crew_modal_open = true;
+                    cx.notify();
+                }))
+                .child(kit::mono_caps(
+                    "ORDER OF BATTLE",
+                    view::LABEL_PT,
+                    kit::LIVE_INK,
+                ))
+                .child(kit::machine("\u{25b8}", view::LABEL_PT, kit::LIVE_INK)),
+        );
         if self.session.people.is_empty() {
             return col.child(note("Nobody seated.")).into_any_element();
         }
-        // Kept, and worth keeping: it is the distinction the console's own
-        // roster gets wrong most easily. Seated is what the Game Master did;
-        // in room is what the person did. They are different facts and the
-        // state column below reads the second one.
-        col = col.child(section("IN ROOM"));
-        col = col.child(note("seated is a role; in room is arrival"));
-        for p in &self.session.people {
-            // The state, routed through the status palette rather than left
-            // grey: four states, three of them ink, none of them Body Silver.
-            // A judge is neither ready nor late — the server exempts them from
-            // readiness entirely — so it reads as the neutral fact it is.
-            let (mark, ink) = if p.judge {
-                ("judge".to_string(), IDLE_GREY)
-            } else if !p.present {
-                // Waiting is not a fault: the sand is the transitional ink,
-                // and yellow is kept for the state that needs the operator
-                // (in the room, not ready).
-                ("not arrived".to_string(), WARNING_SAND)
-            } else if p.ready {
-                ("in room".to_string(), SIGNAL_GREEN)
-            } else {
-                ("in room \u{00b7} not ready".to_string(), ALERT_YELLOW)
-            };
-            col = col.child(ruled(vec![
+        col = col.child(kit::remark(
+            "SEATED IS A ROLE \u{b7} IN ROOM IS ARRIVAL",
+            kit::MUTED_INK,
+        ));
+        // The column's list is SORTED BY ROLE — the order of battle's own
+        // order, not the server's arrival order: Commando first, then the
+        // rest of the exercise side, then the judge side.
+        let mut people = self.session.people.clone();
+        people.sort_by_key(|p| (!is_commando(p), p.judge, p.role.to_lowercase(), p.name.clone()));
+        for p in people {
+            let (mark, ink) = crew_state(&p);
+            col = col.child(
                 div()
-                    .flex_1()
-                    .font_family(view::FACE_HUMAN)
-                    .text_size(px(view::pt(view::BODY_PT)))
-                    .text_color(rgba(MAP_INK))
-                    .child(p.name.clone())
-                    .into_any_element(),
-                machine_col(p.role.clone(), 96.0, BODY_SILVER).into_any_element(),
-                machine_col(mark, 132.0, ink).into_any_element(),
-            ]));
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .w_full()
+                    .py(px(view::pt(3.0)))
+                    .border_b(px(kit::EDGE_WIDTH))
+                    .border_color(rgba(HAIRLINE_SLATE))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(6.0))
+                            .child(div().flex_1().min_w_0().child(kit::human(
+                                p.name.clone(),
+                                view::DENSE_PT,
+                                kit::VALUE_INK,
+                            )))
+                            .child(kit::mono_caps(
+                                if p.role.is_empty() {
+                                    "\u{2014}".to_string()
+                                } else {
+                                    p.role.clone()
+                                },
+                                view::LABEL_PT,
+                                kit::MUTED_INK,
+                            )),
+                    )
+                    .child(kit::mono_caps(mark, view::LABEL_PT, ink)),
+            );
         }
         col.into_any_element()
     }
 
-    /// The execution CREW modal: every player, segmented by role, with the
-    /// hulls and task groups a commander holds and a focus door to the map.
+    /// THE ORDER OF BATTLE, CENTRED: who is in the exercise, what each seat
+    /// commands, and what is aboard what.
     ///
-    /// This is the execution phase's crew surface. The column's Crew island is
-    /// a readiness list — who has arrived and who may start — while this is
-    /// the exercise's order of battle by seat: who is in it, and what each
-    /// commander actually has.
+    /// A COMMANDER IS A PERSON, NOT A PIECE. The old crew screen grouped by
+    /// role and then listed the pieces under each person, which is right; it
+    /// drew them in the console's old voice — humanist names, ruled rows, no
+    /// section language — and it never said what was ABOARD a hull. This one
+    /// speaks the planning phase's language: `kit`'s mono-caps labels, Saira
+    /// names, thin hairlines, and the same section head the flow uses.
+    ///
+    /// The sections are the exercise's own:
+    ///
+    /// - **COMMANDERS** — a Commando, or anybody who actually holds a hull
+    ///   or a group, sorted by role then name.
+    /// - **OTHER SEATS** — everyone else, grouped by role, judge side last.
+    /// - **UNCOMMANDED** — hulls and groups nobody has taken yet. A screen
+    ///   that hid them would be an order of battle with a hole in it.
+    ///
+    /// EMBARKATION IS A NEST, NOT A NOTE: a ridden hull lists its riders
+    /// under it, indented, because that is the fact — the host is the hull
+    /// the rider follows, and it has no ground of its own.
     fn crew_modal_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // The head is the modal's own: the surface's name, what it holds, and
+        // the one way out.
         let mut col = div()
             .flex()
             .flex_col()
@@ -9735,8 +9794,11 @@ impl IslandDemo {
                         .items_center()
                         .gap(px(10.0))
                         .child(kit::mono_caps("CREW", view::TITLE_PT, kit::VALUE_INK))
-                        .child(kit::mono_caps(
-                            plural(self.session.seats, "seat"),
+                        .child(kit::machine(
+                            format!(
+                                "{} SEATED \u{b7} {} IN ROOM",
+                                self.session.seats, self.session.present
+                            ),
                             view::LABEL_PT,
                             kit::MUTED_INK,
                         )),
@@ -9752,187 +9814,363 @@ impl IslandDemo {
                         .child(kit::mono_caps("CLOSE", view::LABEL_PT, kit::MUTED_INK)),
                 ),
         );
-        col = col.child(separator());
-        col = col.child(note(
-            "Players are grouped by role. A commander's hulls and task groups \
-             sit beneath their seat; the reticle centres that force on the map.",
-        ));
-        col = col.child(separator());
+        col = col.child(kit::edge_rule());
         if self.session.game_id == 0 {
             return col.child(note("No session held.")).into_any_element();
         }
         if self.session.people.is_empty() {
             return col.child(note("Nobody seated.")).into_any_element();
         }
-
-        // Preserve the server's order but group by role, so the exercise side
-        // comes first and each role reads as one block.
-        let mut by_role: Vec<(String, Vec<PersonView>)> = Vec::new();
-        for person in self.session.people.clone() {
-            if let Some((_, list)) = by_role.iter_mut().find(|(role, _)| *role == person.role) {
-                list.push(person);
-            } else {
-                by_role.push((person.role.clone(), vec![person]));
-            }
+        // THE OPERATOR'S OWN READINESS lives here now: the Command panel that
+        // used to carry it is gone from preparation. A judge is exempt, and
+        // says so rather than offering a verb the server refuses.
+        if let Some(own) = self.crew_own_readiness(cx) {
+            col = col.child(own);
         }
+        let people = self.session.people.clone();
+        let pieces = self.session.pieces.clone();
+        let groups = self.session.groups.clone();
+        let hosts = self.session.hosts.clone();
+        let commands = |id: i64| {
+            pieces.iter().any(|piece| piece.commander_id == Some(id))
+                || groups.iter().any(|group| group.commander_id == Some(id))
+        };
+        let mut commanders: Vec<PersonView> = people
+            .iter()
+            .filter(|person| !person.judge && (is_commando(person) || commands(person.id)))
+            .cloned()
+            .collect();
+        commanders.sort_by_key(|person| (!is_commando(person), person.name.clone()));
+        let commander_ids: Vec<i64> = commanders.iter().map(|person| person.id).collect();
+        let mut others: Vec<PersonView> = people
+            .iter()
+            .filter(|person| !commander_ids.contains(&person.id))
+            .cloned()
+            .collect();
+        others.sort_by_key(|person| (person.judge, person.role.to_lowercase(), person.name.clone()));
+
         let mut list = div()
             .id("crew-modal-list")
             .flex_1()
+            .min_h_0()
             .w_full()
             .overflow_y_scroll()
             .flex()
             .flex_col()
-            .gap(px(8.0));
-        for (role, people) in by_role {
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(kit::mono_caps(&role, view::MACHINE_PT, kit::MUTED_INK))
-                    .child(div().flex_1().h(px(1.0)).bg(rgba(HAIRLINE_SLATE)))
-                    .child(machine(plural(people.len(), "person"), BODY_SILVER)),
-            );
-            for person in people {
-                list = list.child(self.crew_person_card(&person, cx));
+            .gap(px(10.0));
+        if !commanders.is_empty() {
+            list = list.child(crew_section("COMMANDERS", plural(commanders.len(), "seat")));
+            for person in &commanders {
+                list = list.child(self.crew_commander_card(person, &pieces, &groups, &hosts, cx));
             }
         }
-        // Hulls nobody commands are still part of the exercise, and a crew
-        // screen that hid them would be an order of battle with a hole in it.
-        let unassigned: Vec<PieceView> = self
-            .session
-            .pieces
+        if !others.is_empty() {
+            list = list.child(crew_section("OTHER SEATS", plural(others.len(), "seat")));
+            let mut by_role: Vec<(String, bool, Vec<PersonView>)> = Vec::new();
+            for person in others {
+                match by_role.iter_mut().find(|(role, judge, _)| {
+                    *role == person.role && *judge == person.judge
+                }) {
+                    Some((_, _, group)) => group.push(person),
+                    None => by_role.push((person.role.clone(), person.judge, vec![person])),
+                }
+            }
+            for (role, judge, mut people) in by_role {
+                people.sort_by_key(|person| person.name.clone());
+                list = list.child(crew_role_line(&role, judge, people.len()));
+                for person in &people {
+                    list = list.child(self.crew_person_row(person));
+                }
+            }
+        }
+        // Nobody commands these yet. A hull with a rider still shows it.
+        let loose_hulls: Vec<PieceView> = pieces
             .iter()
-            .filter(|piece| piece.commander_id.is_none())
+            .filter(|piece| piece.commander_id.is_none() && !hosts.contains_key(&piece.id))
             .cloned()
             .collect();
-        if !unassigned.is_empty() {
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(kit::mono_caps(
-                        "unassigned hulls",
-                        view::MACHINE_PT,
-                        WARNING_SAND,
-                    ))
-                    .child(div().flex_1().h(px(1.0)).bg(rgba(HAIRLINE_SLATE)))
-                    .child(machine(plural(unassigned.len(), "hull"), BODY_SILVER)),
-            );
-            for piece in unassigned {
-                list = list.child(self.crew_hull_row(&piece, cx));
+        let loose_groups: Vec<crate::groups::LiveGroup> = groups
+            .iter()
+            .filter(|group| group.commander_id.is_none())
+            .cloned()
+            .collect();
+        if !loose_hulls.is_empty() || !loose_groups.is_empty() {
+            list = list.child(crew_section(
+                "UNCOMMANDED",
+                plural(loose_hulls.len() + loose_groups.len(), "row"),
+            ));
+            for group in &loose_groups {
+                list = list.child(self.crew_group_line(group));
+                for unit in &group.units {
+                    if let Some(piece) = pieces.iter().find(|piece| piece.id == *unit) {
+                        list = list.child(self.crew_hull_row(piece, &pieces, &hosts, cx));
+                    }
+                }
+            }
+            for piece in &loose_hulls {
+                list = list.child(self.crew_hull_row(piece, &pieces, &hosts, cx));
             }
         }
         col.child(list).into_any_element()
     }
 
-    /// One person in the crew modal: their seat, then the force they command.
-    fn crew_person_card(&mut self, person: &PersonView, cx: &mut Context<Self>) -> AnyElement {
-        let (mark, ink) = if person.judge {
-            ("judge", IDLE_GREY)
-        } else if !person.present {
-            ("not arrived", WARNING_SAND)
-        } else if person.ready {
-            ("ready", SIGNAL_GREEN)
-        } else {
-            ("in room", WARNING_SAND)
-        };
-        let mut card = div()
+    /// The operator's own readiness, in the crew screen.
+    ///
+    /// THE COMMAND PANEL IS GONE FROM PREPARATION. It carried the declare
+    /// verb, and readiness is the local player's own act — so the verb moved
+    /// here, where the room is. A judge is exempt and reads as the neutral
+    /// fact it is; an execution-phase console has already declared (or the
+    /// gate is past), so the row is preparation's.
+    fn crew_own_readiness(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let seat = self.own_seat()?;
+        if self.session.state != "preparation" {
+            return None;
+        }
+        let name = seat.name.clone();
+        let role = seat.role.clone();
+        let judge = seat.judge;
+        let ready = seat.ready;
+        let busy = self.readiness_busy;
+        let mut row = div()
             .flex()
             .flex_col()
-            .gap(px(4.0))
-            .p(px(8.0))
-            .rounded(px(kit::RADIUS))
-            .bg(rgba(DEEP_WELL.with_alpha(kit::PANEL_ALPHA)))
+            .gap(px(2.0))
+            .w_full()
+            .p(px(view::pt(8.0)))
             .border(px(kit::EDGE_WIDTH))
-            .border_color(rgba(kit::EDGE_INK))
+            .border_color(rgba(if judge {
+                HAIRLINE_SLATE
+            } else if ready {
+                SIGNAL_GREEN
+            } else {
+                kit::LIVE_INK
+            }))
+            .bg(rgba(CONSOLE_NIGHT.with_alpha(kit::PANEL_ALPHA)))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
+                    .justify_between()
                     .gap(px(8.0))
+                    .child(kit::mono_caps(
+                        "YOUR SEAT",
+                        view::LABEL_PT,
+                        kit::MUTED_INK,
+                    ))
                     .child(
                         div()
                             .flex_1()
-                            .font_family(view::FACE_HUMAN)
-                            .text_size(px(view::pt(view::BODY_PT)))
-                            .text_color(rgba(MAP_INK))
-                            .child(person.name.clone()),
+                            .min_w_0()
+                            .child(kit::human(name, view::DENSE_PT, kit::VALUE_INK)),
                     )
-                    .child(
-                        div()
-                            .font_family(view::FACE_MACHINE)
-                            .text_size(px(view::pt(view::LABEL_PT)))
-                            .text_color(rgba(BODY_SILVER))
-                            .child(if person.call_sign.is_empty() {
-                                "\u{2014}".to_string()
-                            } else {
-                                person.call_sign.clone()
-                            }),
-                    )
-                    .child(kit::mono_caps(mark, view::LABEL_PT, ink)),
+                    .child(kit::mono_caps(role, view::LABEL_PT, kit::MUTED_INK)),
             );
-        // A judge commands nothing; its row stops at the seat. Everyone else
-        // gets the force they hold, even when that force is empty — "no
-        // command assigned" is an answer, and the organizer needs it.
-        if !person.judge {
-            let hulls: Vec<PieceView> = self
-                .session
-                .pieces
-                .iter()
-                .filter(|piece| piece.commander_id == Some(person.id))
-                .cloned()
-                .collect();
-            let groups: Vec<crate::groups::LiveGroup> = self
-                .session
-                .groups
-                .iter()
-                .filter(|group| group.commander_id == Some(person.id))
-                .cloned()
-                .collect();
-            if hulls.is_empty() && groups.is_empty() {
-                card = card.child(
+        if judge {
+            row = row.child(kit::remark(
+                "JUDGE SIDE \u{b7} EXEMPT FROM READINESS",
+                kit::MUTED_INK,
+            ));
+            return Some(row.into_any_element());
+        }
+        row = row.child(
+            div()
+                .id("crew-readiness")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(view::pt(26.0)))
+                .mt(px(view::pt(3.0)))
+                .cursor_pointer()
+                .border(px(kit::EDGE_WIDTH))
+                .border_color(rgba(if ready { WARNING_SAND } else { SIGNAL_GREEN }))
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.set_readiness(!ready, cx);
+                }))
+                .child(kit::mono_caps(
+                    if ready {
+                        "WITHDRAW READINESS"
+                    } else {
+                        "READY TO START"
+                    },
+                    view::LABEL_PT,
+                    if ready { WARNING_SAND } else { SIGNAL_GREEN },
+                )),
+        );
+        if busy {
+            row = row.child(kit::remark("SENDING\u{2026}", kit::MUTED_INK));
+        }
+        let status = self.readiness_status.text();
+        if !status.is_empty() {
+            row = row.child(kit::remark(status.to_uppercase(), kit::MUTED_INK));
+        }
+        Some(row.into_any_element())
+    }
+
+    /// One commander's card: their seat, the groups they hold, the hulls they
+    /// steer, and every rider under the hull it follows.
+    fn crew_commander_card(
+        &mut self,
+        person: &PersonView,
+        pieces: &[PieceView],
+        groups: &[crate::groups::LiveGroup],
+        hosts: &HashMap<i64, i64>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (mark, ink) = crew_state(person);
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .w_full()
+            .p(px(view::pt(8.0)))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .bg(rgba(CONSOLE_NIGHT.with_alpha(170)));
+        card = card.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
                     div()
-                        .text_size(px(view::pt(view::LABEL_PT)))
-                        .text_color(rgba(BODY_SILVER.with_alpha(178)))
-                        .child("no command assigned"),
-                );
+                        .flex_1()
+                        .min_w_0()
+                        .child(kit::human(person.name.clone(), view::BODY_PT, kit::VALUE_INK)),
+                )
+                .child(if person.call_sign.eq_ignore_ascii_case(&person.name) {
+                    kit::machine("", view::LABEL_PT, kit::MUTED_INK)
+                } else {
+                    kit::machine(
+                        if person.call_sign.is_empty() {
+                            "\u{2014}".to_string()
+                        } else {
+                            person.call_sign.clone()
+                        },
+                        view::LABEL_PT,
+                        kit::MUTED_INK,
+                    )
+                })
+                .child(kit::mono_caps(
+                    if person.role.is_empty() {
+                        "\u{2014}".to_string()
+                    } else {
+                        person.role.clone()
+                    },
+                    view::LABEL_PT,
+                    kit::MUTED_INK,
+                ))
+                .child(kit::mono_caps(mark, view::LABEL_PT, ink)),
+        );
+        // THE GROUPS THIS SEAT HOLDS, and every group under them: the tree is
+        // the order, and a commander of a gugus needs to see what hangs from
+        // it even when the satgas below are somebody else's.
+        let mut own_groups: Vec<crate::groups::LiveGroup> = groups
+            .iter()
+            .filter(|group| group.commander_id == Some(person.id))
+            .cloned()
+            .collect();
+        own_groups.sort_by_key(|group| std::cmp::Reverse(group.kind.rank()));
+        let mut shown_units: Vec<i64> = Vec::new();
+        for group in &own_groups {
+            card = card.child(self.crew_group_line(group));
+            for unit in &group.units {
+                shown_units.push(*unit);
+                if let Some(piece) = pieces.iter().find(|piece| piece.id == *unit) {
+                    card = card.child(self.crew_hull_row(piece, pieces, hosts, cx));
+                }
             }
-            for hull in hulls {
-                card = card.child(self.crew_hull_row(&hull, cx));
+            for child in crew_descendants(groups, group.group_id) {
+                card = card.child(crew_child_group_line(&child));
             }
-            for group in groups {
-                card = card.child(self.crew_group_row(&group, cx));
-            }
+        }
+        // And the hulls this seat commands directly, outside those groups.
+        let mut own_hulls: Vec<&PieceView> = pieces
+            .iter()
+            .filter(|piece| {
+                piece.commander_id == Some(person.id)
+                    && !shown_units.contains(&piece.id)
+                    && !hosts.contains_key(&piece.id)
+            })
+            .collect();
+        own_hulls.sort_by_key(|piece| piece.id);
+        for piece in own_hulls {
+            card = card.child(self.crew_hull_row(piece, pieces, hosts, cx));
+        }
+        if own_groups.is_empty() && pieces.iter().all(|piece| piece.commander_id != Some(person.id)) {
+            card = card.child(kit::remark("NO COMMAND ASSIGNED", kit::MUTED_INK));
         }
         card.into_any_element()
     }
 
-    /// One commanded hull in the crew modal: face, name, and the focus door.
-    fn crew_hull_row(&mut self, piece: &PieceView, cx: &mut Context<Self>) -> AnyElement {
+    /// One person who is not a commander: their seat and its state.
+    fn crew_person_row(&mut self, person: &PersonView) -> AnyElement {
+        let (mark, ink) = crew_state(person);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .w_full()
+            .min_h(px(view::pt(24.0)))
+            .px(px(view::pt(4.0)))
+            .border_b(px(kit::EDGE_WIDTH))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(kit::human(
+                        person.name.clone(),
+                        view::DENSE_PT,
+                        kit::VALUE_INK,
+                    )),
+            )
+            .child(if person.call_sign.eq_ignore_ascii_case(&person.name) {
+                kit::machine("", view::LABEL_PT, kit::MUTED_INK)
+            } else {
+                kit::machine(
+                    if person.call_sign.is_empty() {
+                        "\u{2014}".to_string()
+                    } else {
+                        person.call_sign.clone()
+                    },
+                    view::LABEL_PT,
+                    kit::MUTED_INK,
+                )
+            })
+            .child(kit::mono_caps(mark, view::LABEL_PT, ink))
+            .into_any_element()
+    }
+
+    /// One commanded hull: its face, its name, and a door to put it on the
+    /// map — then every rider under it, indented.
+    fn crew_hull_row(
+        &mut self,
+        piece: &PieceView,
+        pieces: &[PieceView],
+        hosts: &HashMap<i64, i64>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let id = piece.id;
-        // THE UNIT'S OWN CARD: its photograph when the register has one and
-        // its NATO symbol when it does not, with the name beside it. The
-        // planning phase's fleet rows draw the same pair.
+        let ground = self.piece_ground(id).is_some();
         let face = Self::thumb_box(
             self.thumbs.get(&id).cloned(),
             self.fleet_symbol(id),
             56.0,
-            38.0,
+            34.0,
             1.0,
             ObjectFit::Cover,
         );
-        let ground = self.piece_ground(id).is_some();
         let focus: AnyElement = if ground {
             div()
                 .id(("crew-focus-hull", id as usize))
                 .cursor_pointer()
-                .w(px(16.0))
-                .h(px(16.0))
+                .w(px(view::pt(16.0)))
+                .h(px(view::pt(16.0)))
                 .flex_shrink_0()
                 .on_click(cx.listener(move |view, _, _, cx| {
                     view.crew_modal_open = false;
@@ -9942,116 +10180,110 @@ impl IslandDemo {
                 .into_any_element()
         } else {
             div()
-                .w(px(16.0))
-                .h(px(16.0))
+                .w(px(view::pt(16.0)))
+                .h(px(view::pt(16.0)))
                 .flex_shrink_0()
                 .child(focus_glyph(false))
                 .into_any_element()
         };
-        div()
+        let mut row = div()
             .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .p(px(6.0))
+            .flex_col()
+            .gap(px(2.0))
             .w_full()
-            .rounded(px(kit::RADIUS))
-            .bg(rgba(CONSOLE_NIGHT.with_alpha(170)))
-            .border(px(kit::EDGE_WIDTH))
-            .border_color(rgba(HAIRLINE_SLATE))
-            .child(face)
+            .pl(px(view::pt(6.0)))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(kit::human(
-                        piece.label.clone(),
-                        view::BODY_PT,
-                        kit::VALUE_INK,
-                    )),
-            )
-            .child(focus)
-            .into_any_element()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(7.0))
+                    .w_full()
+                    .p(px(view::pt(4.0)))
+                    .border(px(kit::EDGE_WIDTH))
+                    .border_color(rgba(HAIRLINE_SLATE))
+                    .bg(rgba(DEEP_WELL))
+                    .child(face)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(kit::human(
+                                piece.label.clone(),
+                                view::DENSE_PT,
+                                kit::VALUE_INK,
+                            )),
+                    )
+                    .child(if piece.commander_id.is_none() {
+                        kit::mono_caps("NO COMMANDER", view::LABEL_PT, WARNING_SAND)
+                    } else {
+                        kit::machine("", view::LABEL_PT, kit::MUTED_INK)
+                    })
+                    .child(focus),
+            );
+        // WHAT IS ABOARD IT. A rider follows its host and has no ground of its
+        // own, so it is drawn under the host instead of beside it.
+        for rider in crew_riders(pieces, hosts, id) {
+            let rider_id = rider.id;
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
+                    .w_full()
+                    .pl(px(view::pt(18.0)))
+                    .child(kit::mono_caps("\u{21b3}", view::LABEL_PT, kit::LIVE_INK))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(kit::human(
+                                rider.label.clone(),
+                                view::LABEL_PT,
+                                kit::VALUE_INK,
+                            )),
+                    )
+                    .child(kit::mono_caps("ABOARD", view::LABEL_PT, kit::LIVE_INK))
+                    .child(
+                        div()
+                            .id(("crew-focus-rider", rider_id as usize))
+                            .w(px(view::pt(12.0)))
+                            .h(px(view::pt(12.0)))
+                            .cursor_pointer()
+                            .child(focus_glyph(self.piece_ground(rider_id).is_some())),
+                    ),
+            );
+        }
+        row.into_any_element()
     }
 
-    /// One commanded task group in the crew modal. A group has no map object,
-    /// so its focus door frames the mean ground of the hulls beneath it.
-    fn crew_group_row(
-        &mut self,
-        group: &crate::groups::LiveGroup,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id = group.group_id;
-        let ground = self.group_ground(id).is_some();
-        let focus: AnyElement = if ground {
-            div()
-                .id(("crew-focus-group", id as usize))
-                .cursor_pointer()
-                .w(px(16.0))
-                .h(px(16.0))
-                .flex_shrink_0()
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    view.crew_modal_open = false;
-                    view.jump_to_group(id, cx);
-                }))
-                .child(focus_glyph(true))
-                .into_any_element()
-        } else {
-            div()
-                .w(px(16.0))
-                .h(px(16.0))
-                .flex_shrink_0()
-                .child(focus_glyph(false))
-                .into_any_element()
-        };
-        div()
+    /// One group a seat holds: its level and its name.
+    fn crew_group_line(&mut self, group: &crate::groups::LiveGroup) -> AnyElement {
+        let kind = Self::echelon_word(group.kind);
+        let repeats = group.name.to_uppercase().starts_with(&kind);
+        let mut row = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(7.0))
-            .pl(px(6.0))
-            .child(
-                div()
-                    .w(px(56.0))
-                    .h(px(38.0))
-                    .flex_shrink_0()
-                    .rounded(px(kit::RADIUS))
-                    .bg(rgba(DEEP_WELL))
-                    .child(
-                        canvas(
-                            |b, _, _| b,
-                            move |b, _, window, _| {
-                                let cx = f32::from(b.origin.x) + f32::from(b.size.width) / 2.0;
-                                let cy = f32::from(b.origin.y) + f32::from(b.size.height) / 2.0;
-                                paint_glyph(window, (cx, cy), MapSymbolShape::Dot, RADAR_CYAN, 1.0);
-                            },
-                        )
-                        .size_full(),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.0))
-                    .child(
-                        div()
-                            .font_family(view::FACE_HUMAN)
-                            .text_size(px(view::pt(view::DENSE_PT)))
-                            .text_color(rgba(MAP_INK))
-                            .child(group.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .font_family(view::FACE_MACHINE)
-                            .text_size(px(view::pt(view::LABEL_PT)))
-                            .text_color(rgba(BODY_SILVER))
-                            .child("task group"),
-                    ),
-            )
-            .child(focus)
-            .into_any_element()
+            .gap(px(6.0))
+            .w_full()
+            .pl(px(view::pt(6.0)))
+            .py(px(view::pt(2.0)));
+        if !repeats {
+            row = row.child(kit::mono_caps(kind, view::LABEL_PT, kit::LIVE_INK));
+        }
+        row.child(div().flex_1().min_w_0().child(kit::human(
+            group.name.clone(),
+            view::DENSE_PT,
+            kit::VALUE_INK,
+        )))
+        .child(kit::machine(
+            plural(group.units.len(), "hull"),
+            view::LABEL_PT,
+            kit::MUTED_INK,
+        ))
+        .into_any_element()
     }
 
     /// GROUPS — the task organisation: the forest of groups, their commanders
@@ -13479,6 +13711,12 @@ impl IslandDemo {
             // The card goes: an exercise is held, and the console's job is now
             // that exercise — the execution and closure surfaces.
             self.sessions_open = false;
+        }
+        // PREPARATION IS THE ROOM, so the centred screen is the order of
+        // battle: a hold into preparation opens it. Planning keeps the flow
+        // (above), and execution has its own surfaces.
+        if self.flow_draft.is_none() && self.session.state == "preparation" {
+            self.crew_modal_open = true;
         }
         // The same baseline as a created session: a new hold's traffic is
         // what the console holds, not what arrived since the operator last
@@ -28295,13 +28533,14 @@ impl IslandDemo {
                             .border(px(kit::EDGE_WIDTH))
                             .border_color(rgba(kit::LIVE_INK))
                             .on_click(cx.listener(|view, _, _, cx| {
-                                let library = view
+                                let landing = view
                                     .flow_arrival
                                     .as_ref()
-                                    .map(|arrival| {
-                                        arrival.landing == crate::arrival::Landing::Library
-                                    })
-                                    .unwrap_or(false);
+                                    .map(|arrival| arrival.landing);
+                                let library =
+                                    landing == Some(crate::arrival::Landing::Library);
+                                let preparation = landing
+                                    == Some(crate::arrival::Landing::Preparation);
                                 // THE FLOW IS DONE WITH THE DRAFT. The console
                                 // (or the library) is what the arrival opens;
                                 // keeping the draft would put stage 06 back
@@ -28311,6 +28550,13 @@ impl IslandDemo {
                                 view.flow_draft = None;
                                 view.flow_map = false;
                                 view.sessions_open = library;
+                                // PREPARATION IS THE ROOM. The phase's
+                                // centre is the order of battle, so the
+                                // console opens on it rather than on a column
+                                // of one island.
+                                if preparation {
+                                    view.crew_modal_open = true;
+                                }
                                 cx.notify();
                             }))
                             .child(kit::mono_caps(next, view::MACHINE_PT, kit::LIVE_INK)),
@@ -35227,10 +35473,10 @@ impl Render for IslandDemo {
                     .child(
                         div()
                             .relative()
-                            .w(px(FORM_W))
-                            .h(px(FORM_H))
+                            .w(px(CREW_W))
+                            .h(px(CREW_H))
                             .block_mouse_except_scroll()
-                            .child(modal_silhouette_at(FORM_W, FORM_H))
+                            .child(modal_silhouette_at(CREW_W, CREW_H))
                             .child(self.crew_modal_body(cx)),
                     )
                     .into_any_element(),
@@ -36398,6 +36644,152 @@ pub struct PersonView {
     /// Presented the room key. The API does not report this today (see the
     /// handoff), so it is present in the shape and false in the data.
     pub present: bool,
+}
+
+/// The pieces aboard one host, in unit-id order. Embarkation is the session's
+/// `hosts` map, child to host; a host's row nests these under it.
+fn crew_riders(
+    pieces: &[PieceView],
+    hosts: &HashMap<i64, i64>,
+    host: i64,
+) -> Vec<PieceView> {
+    let mut out: Vec<PieceView> = pieces
+        .iter()
+        .filter(|piece| hosts.get(&piece.id) == Some(&host))
+        .cloned()
+        .collect();
+    out.sort_by_key(|piece| piece.id);
+    out
+}
+
+/// Whether a seat's role is the one that commands. The name is the model's
+/// only cue: a role carries a judge flag, not a "may command" flag, and
+/// `Commando` is the deployment's own name for the seat that steers.
+fn is_commando(person: &PersonView) -> bool {
+    person.role.eq_ignore_ascii_case("commando")
+}
+
+/// A seat's state, in the console's four inks: ready, in room, not arrived,
+/// and the judge side (which is neither ready nor late).
+fn crew_state(person: &PersonView) -> (String, Rgba) {
+    if person.judge {
+        ("JUDGE".to_string(), IDLE_GREY)
+    } else if !person.present {
+        ("NOT ARRIVED".to_string(), WARNING_SAND)
+    } else if person.ready {
+        ("READY".to_string(), SIGNAL_GREEN)
+    } else {
+        ("IN ROOM".to_string(), ALERT_YELLOW)
+    }
+}
+
+/// A section head in the crew screen: the name, a rule, and the count — the
+/// same shape the basket uses for a body.
+fn crew_section(title: &str, count: String) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(view::pt(8.0)))
+        .w_full()
+        .child(kit::mono_caps(title.to_string(), view::LABEL_PT, kit::LIVE_INK))
+        .child(div().flex_1().h(px(1.0)).bg(rgba(HAIRLINE_SLATE)))
+        .child(kit::machine(count, view::LABEL_PT, kit::MUTED_INK))
+        .into_any_element()
+}
+
+/// A role's head inside `OTHER SEATS`: the role, its count, and whether the
+/// seat is on the judge side.
+fn crew_role_line(role: &str, judge: bool, count: usize) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(view::pt(8.0)))
+        .w_full()
+        .pt(px(view::pt(4.0)))
+        .child(kit::mono_caps(
+            if role.is_empty() {
+                "NO ROLE".to_string()
+            } else {
+                role.to_string()
+            },
+            view::LABEL_PT,
+            kit::MUTED_INK,
+        ))
+        .child(div().flex_1().h(px(1.0)).bg(rgba(HAIRLINE_SLATE)))
+        .child(kit::machine(
+            plural(count, "person"),
+            view::LABEL_PT,
+            kit::MUTED_INK,
+        ))
+        .when(judge, |row| {
+            row.child(kit::mono_caps(
+                "JUDGE SIDE",
+                view::LABEL_PT,
+                kit::MUTED_INK,
+            ))
+        })
+        .into_any_element()
+}
+
+/// Every group under `id`, in the tree, not including `id` itself. A parent
+/// chain that loops is bounded: the server refuses a cycle, and a screen must
+/// not hang on one it is handed anyway.
+fn crew_descendants(
+    groups: &[crate::groups::LiveGroup],
+    id: i64,
+) -> Vec<crate::groups::LiveGroup> {
+    let mut out: Vec<crate::groups::LiveGroup> = Vec::new();
+    for group in groups {
+        let mut cursor = group.parent;
+        let mut steps = 0usize;
+        while let Some(parent) = cursor {
+            if parent == id {
+                out.push(group.clone());
+                break;
+            }
+            steps += 1;
+            if steps > 8 {
+                break;
+            }
+            cursor = groups
+                .iter()
+                .find(|other| other.group_id == parent)
+                .and_then(|other| other.parent);
+        }
+    }
+    out.sort_by_key(|group| std::cmp::Reverse(group.kind.rank()));
+    out
+}
+
+/// A descendant body's line: indented under its own commander's parent, and
+/// without its hulls (they are the child's own commander's card).
+fn crew_child_group_line(group: &crate::groups::LiveGroup) -> AnyElement {
+    let kind = crate::shell_gpui::IslandDemo::echelon_word(group.kind);
+    let repeats = group.name.to_uppercase().starts_with(&kind);
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(view::pt(6.0)))
+        .w_full()
+        .pl(px(view::pt(18.0)))
+        .py(px(view::pt(1.0)))
+        .child(kit::mono_caps(
+            "\u{21b3}",
+            view::LABEL_PT,
+            kit::MUTED_INK,
+        ));
+    if !repeats {
+        row = row.child(kit::mono_caps(kind, view::LABEL_PT, kit::MUTED_INK));
+    }
+    row.child(div().flex_1().min_w_0().child(kit::human(
+        group.name.clone(),
+        view::LABEL_PT,
+        kit::MUTED_INK,
+    )))
+    .into_any_element()
 }
 
 /// One seat as the Player picker shows it: Minos's row overlaid with the
@@ -42243,6 +42635,87 @@ mod tests {
         assert!(demo.people_matches().is_empty());
     }
 
+    /// THE ORDER OF BATTLE'S TWO SORTS: a Commando (or anybody who actually
+    /// holds a hull) is a COMMANDER; everyone else is grouped by role, judge
+    /// side last. The screen's own state words are the console's four inks.
+    #[test]
+    fn a_commando_is_the_command_seat() {
+        let person = |role: &str, judge: bool, ready: bool, present: bool| PersonView {
+            id: 1,
+            name: "Lt. Fitri".to_string(),
+            call_sign: "FITRI".to_string(),
+            role: role.to_string(),
+            role_id: 1,
+            judge,
+            ready,
+            present,
+        };
+        assert!(is_commando(&person("Commando", false, false, false)));
+        assert!(is_commando(&person("commando", false, false, false)));
+        assert!(!is_commando(&person("Referee", true, false, false)));
+        assert_eq!(
+            crew_state(&person("Commando", false, false, false)).0,
+            "NOT ARRIVED"
+        );
+        assert_eq!(crew_state(&person("Commando", false, true, true)).0, "READY");
+        assert_eq!(
+            crew_state(&person("Commando", false, false, true)).0,
+            "IN ROOM"
+        );
+        assert_eq!(crew_state(&person("Referee", true, false, false)).0, "JUDGE");
+    }
+
+    /// EMBARKATION IS A NEST: the pieces aboard one host are found through
+    /// the session's `hosts` map, in unit-id order.
+    #[test]
+    fn the_crew_nests_a_rider_under_its_host() {
+        let piece = |id: i64| PieceView {
+            id,
+            class_name: String::new(),
+            label: format!("KRI {id}"),
+            commander_id: Some(id),
+            commander_name: String::new(),
+            hierarchy_node: None,
+            start: None,
+            placed: false,
+            ..PieceView::default()
+        };
+        let pieces = vec![piece(3), piece(1), piece(2)];
+        let hosts = HashMap::from([(2, 1), (3, 1)]);
+        let riders: Vec<i64> = crew_riders(&pieces, &hosts, 1)
+            .into_iter()
+            .map(|piece| piece.id)
+            .collect();
+        assert_eq!(riders, vec![2, 3], "both aboard 1, in id order");
+        assert!(crew_riders(&pieces, &hosts, 2).is_empty());
+    }
+
+    /// The nested bodies under a commander: their own groups are drawn as
+    /// lines, and the children beneath them are the tree's shape.
+    #[test]
+    fn the_crew_tree_walks_the_groups_beneath_a_seat() {
+        use crate::groups::{GroupKind, LiveGroup};
+        let group = |id: i64, parent: Option<i64>, kind: GroupKind| LiveGroup {
+            group_id: id,
+            name: format!("G{id}"),
+            kind,
+            parent,
+            commander_id: None,
+            units: Vec::new(),
+        };
+        let groups = [
+            group(1, None, GroupKind::Gugus),
+            group(2, Some(1), GroupKind::SatuanTugas),
+            group(3, Some(2), GroupKind::SatuanTugas),
+        ];
+        let under: Vec<i64> = crew_descendants(&groups, 1)
+            .into_iter()
+            .map(|group| group.group_id)
+            .collect();
+        assert!(under.contains(&2) && under.contains(&3), "{under:?}");
+        assert!(crew_descendants(&groups, 3).is_empty());
+    }
+
     /// A planning session with the operator seated and one more seat to hand
     /// a hull to. The shared setup of the drop tests below.
     fn drop_session() -> SessionView {
@@ -44496,8 +44969,8 @@ mod tests {
         set_state(&view, cx, "preparation");
         assert_eq!(
             read(&view, cx),
-            vec!["command", "crew"],
-            "preparation is the gate: the seat's readiness, and who declared"
+            vec!["crew"],
+            "preparation is the room: the order of battle, and its door"
         );
         set_state(&view, cx, "execution");
         assert_eq!(
