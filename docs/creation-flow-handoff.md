@@ -1033,6 +1033,13 @@ that duplicates.
    that failed (and anything after it that could have changed), then plan again.
    A write the journal says succeeded is never re-sent.
 
+**A `Reopened` draft's 01 writes nothing**, because the game already exists — so
+the journal never learns its id, and "the game's id is not known yet" is true of
+the journal and false of the press. The transport is told the id from the draft's
+origin (or the live frame) when it is built: every write from 02 on is addressed
+by it, and 03 `HIERARCHY` stopped the ladder on a game 01 had not created
+because it was already there.
+
 **`POST /games` has no idempotency key.** If 01's response is lost — a timeout,
 a 502, a closed socket — the game may exist anyway. Do **not** offer a bare
 "retry 01". Re-read `GET /games?search=<draft name>` and look for a game created

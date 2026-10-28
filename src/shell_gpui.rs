@@ -23978,7 +23978,14 @@ impl IslandDemo {
                         .unwrap_or(1),
                     self.flow_stage.label()
                 ),
-                match (self.press_busy, draft.journal.game_id()) {
+                // A REOPENED DRAFT'S ID IS THE ORIGIN'S until a press's
+                // journal adopts it: 01 creates nothing on a game that
+                // already exists, so the pill read `DRAFT · LOCAL` over
+                // a draft whose header said `GAME 42`.
+                match (
+                    self.press_busy,
+                    draft.journal.game_id().or(draft.origin.game_id()),
+                ) {
                     (true, _) => "WRITING\u{2026}".to_string(),
                     (false, Some(id)) => format!("GAME {id}"),
                     (false, None) => "DRAFT \u{b7} LOCAL".to_string(),

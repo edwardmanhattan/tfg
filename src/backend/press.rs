@@ -82,6 +82,23 @@ impl<'a> MasterTransport<'a> {
         self
     }
 
+    /// THE TRANSPORT A PRESS USES: the game the draft is about, when it
+    /// already has one.
+    ///
+    /// A REOPENED DRAFT'S 01 WRITES NOTHING — the game exists — so the
+    /// journal never learns its id, and every write from 02 on would stop the
+    /// ladder with "the game's id is not known yet". The id is in the origin
+    /// (or the live frame), and this is the one place that reads it for the
+    /// wire. Constructing the transport without it was the failure: 03
+    /// HIERARCHY stopped a reopened press on a game 01 had not created
+    /// because it was already there.
+    pub fn for_draft(mut self, draft: &crate::draft::Draft, live: &crate::commit::Live) -> Self {
+        if let Some(id) = crate::commit::game_id(draft, live) {
+            self.game = Some(id);
+        }
+        self
+    }
+
     fn game(&self, journal: &Journal) -> Result<i64, Answer> {
         journal
             .game_id()
@@ -694,6 +711,31 @@ mod tests {
             "no step answer resolved -1"
         );
         assert!(transport.substep(Ref::Staged(-1), &journal).is_err());
+    }
+
+    /// A REOPENED DRAFT'S PRESS ALREADY HAS A GAME. Position 01 writes nothing
+    /// (the game exists), so the journal never learns the id; the transport is
+    /// told it instead, and every write from 02 on can still name it.
+    #[test]
+    fn a_reopened_press_is_told_the_game_it_edits() {
+        let master = MinosMaster::new("http://127.0.0.1:1").expect("a client");
+        let blank = MasterTransport::new(&master, "t", Ladder::Game);
+        let fresh = crate::draft::Draft::blank(crate::gamestate::GameMode::Scenario)
+            .expect("a blank draft");
+        assert!(
+            blank.for_draft(&fresh, &crate::commit::Live::default())
+                .game(&Journal::new())
+                .is_err(),
+            "a create has no id until 01 answers"
+        );
+        // The frame's game is the one a reopened draft is about; `for_draft`
+        // is what puts it in front of every later write.
+        let live = crate::commit::Live {
+            game_id: Some(42),
+            ..crate::commit::Live::default()
+        };
+        let reopened = MasterTransport::new(&master, "t", Ladder::Game).for_draft(&fresh, &live);
+        assert_eq!(reopened.game(&Journal::new()).ok(), Some(42));
     }
 
     /// A write that names the game fails LOUDLY when the press has not made one

@@ -1300,8 +1300,16 @@ fn main() {
                                 .map(|tree| flatten_nodes(&tree))
                                 .unwrap_or_default();
                         }
-                        let mut wire =
-                            tfg::backend::MasterTransport::new(&transport, &token2, verb.ladder());
+                        // `for_draft` is the game the draft is about: a
+                        // reopened game's 01 writes nothing, so the journal
+                        // never learns the id and every later write needs it
+                        // from here.
+                        let mut wire = tfg::backend::MasterTransport::new(
+                            &transport,
+                            &token2,
+                            verb.ladder(),
+                        )
+                        .for_draft(&draft, &live);
                         let outcome = tfg::commit::run(&mut draft, &live, verb, &offset, &mut wire);
                         if press_tx
                             .send(tfg::shell_gpui::PressAnswer {
