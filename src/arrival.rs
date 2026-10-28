@@ -122,7 +122,11 @@ impl Arrival {
             Landing::Preparation => vec![
                 Row {
                     label: "FORCE",
-                    value: "THE SAME NINE PINS".to_string(),
+                    value: format!(
+                        "{units} UNITS \u{b7} {} OF {} PLACED",
+                        placed.0,
+                        placed.0 + placed.1
+                    ),
                 },
                 Row {
                     label: "PLAN",

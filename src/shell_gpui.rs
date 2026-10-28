@@ -25023,8 +25023,53 @@ impl IslandDemo {
         // (`§9.3`). A copy kept beside it would be a second record that
         // disagrees.
         self.flow_draft = Some(answer.draft);
+        // THE SERVER AFTER THE PRESS. A Done press that made or touched a
+        // game is read back, so a press which lands in `preparation` does not
+        // leave the console holding the `planning` row it started from.
+        if !answer.sessions.is_empty() {
+            self.sessions = answer.sessions;
+            self.seed_history();
+        }
+        if let Some(session) = answer.session {
+            let game = session.detail.as_ref().map(|detail| detail.id);
+            self.session = session;
+            if let Some(id) = game {
+                if let Some(draft) = &mut self.flow_draft {
+                    if !matches!(draft.origin, crate::draft::Origin::Reopened { .. }) {
+                        // THE GAME EXISTS NOW. A second press diffs against
+                        // it instead of creating another one, and the header
+                        // says `GAME <id>` for the same reason.
+                        draft.origin = crate::draft::Origin::Reopened { game_id: id };
+                    }
+                }
+            }
+        }
+        let done = matches!(answer.outcome, crate::commit::Outcome::Done);
+        // THE PRESS ENDS SOMEWHERE (§10). A Done press shows the arrival —
+        // `PREPARATION · LIVE` for Play Directly — rather than leaving the
+        // write order on screen with every row ticked.
+        if done {
+            self.flow_arrival = self.arrival_for(answer.verb);
+        }
         self.press_outcome = Some((answer.verb, answer.outcome));
         cx.notify();
+    }
+
+    /// The arrival for a press that settled every position, from the draft
+    /// the press left.
+    fn arrival_for(&self, verb: crate::draft::Verb) -> Option<crate::arrival::Arrival> {
+        let draft = self.flow_draft.as_ref()?;
+        let (placed, unplaced) = draft.placement_counts();
+        let (seated, considered) = draft.considered();
+        Some(crate::arrival::Arrival::of(
+            verb,
+            draft.journal.game_id().or(draft.origin.game_id()),
+            (placed, unplaced),
+            draft.unit_count(),
+            draft.book_step_count(),
+            draft.book.substep_count(),
+            (seated, considered),
+        ))
     }
 
     // -----------------------------------------------------------------
@@ -28250,8 +28295,22 @@ impl IslandDemo {
                             .border(px(kit::EDGE_WIDTH))
                             .border_color(rgba(kit::LIVE_INK))
                             .on_click(cx.listener(|view, _, _, cx| {
+                                let library = view
+                                    .flow_arrival
+                                    .as_ref()
+                                    .map(|arrival| {
+                                        arrival.landing == crate::arrival::Landing::Library
+                                    })
+                                    .unwrap_or(false);
+                                // THE FLOW IS DONE WITH THE DRAFT. The console
+                                // (or the library) is what the arrival opens;
+                                // keeping the draft would put stage 06 back
+                                // under the next press.
                                 view.flow_arrival = None;
-                                view.sessions_open = false;
+                                view.flow_gate = None;
+                                view.flow_draft = None;
+                                view.flow_map = false;
+                                view.sessions_open = library;
                                 cx.notify();
                             }))
                             .child(kit::mono_caps(next, view::MACHINE_PT, kit::LIVE_INK)),
@@ -37788,6 +37847,14 @@ pub struct PressAnswer {
     pub draft: crate::draft::Draft,
     pub verb: crate::draft::Verb,
     pub outcome: crate::commit::Outcome,
+    /// THE SERVER AFTER THE PRESS, for a Done press that made or touched a
+    /// game: the game's own state, its room, its book. A press that lands in
+    /// `preparation` must not leave the console holding the `planning` row it
+    /// started from.
+    pub session: Option<SessionView>,
+    /// The launcher's rows, re-read with it: the game the press made is in the
+    /// history before the operator goes back to look for it.
+    pub sessions: Vec<SessionRow>,
 }
 
 /// The press's answer channel.
@@ -47739,6 +47806,10 @@ mod tests {
                             },
                             resume_at: 2,
                         },
+                        // A stopped press is not read back: the draft still
+                        // has positions to write, and its order is stage 06.
+                        session: None,
+                        sessions: Vec::new(),
                     },
                     cx,
                 );
@@ -47754,6 +47825,49 @@ mod tests {
                     demo.press_outcome,
                     Some((_, crate::commit::Outcome::Stopped { position: 2, .. }))
                 ));
+            })
+        });
+    }
+
+    /// A DONE PRESS LANDS SOMEWHERE (§10). Play Directly's eight positions
+    /// settle in a game that is now in `preparation`; the shell installs the
+    /// re-read session and shows the arrival, rather than leaving stage 06 on
+    /// screen with every row ticked and the console still saying `planning`.
+    #[gpui::test]
+    fn a_done_play_press_lands_in_preparation(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx)
+        });
+        let draft = crate::fixtures::review_draft().expect("a draft");
+        let session = SessionView {
+            signed_in: true,
+            state: "preparation".to_string(),
+            game: "Test 1".to_string(),
+            game_id: 82,
+            ..SessionView::default()
+        };
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.sessions_open = true;
+                demo.apply_press(
+                    PressAnswer {
+                        draft,
+                        verb: crate::draft::Verb::PlayDirectly,
+                        outcome: crate::commit::Outcome::Done,
+                        session: Some(session),
+                        sessions: Vec::new(),
+                    },
+                    cx,
+                );
+                assert_eq!(demo.session.state, "preparation", "the server's word");
+                let arrival = demo.flow_arrival.as_ref().expect("the arrival is up");
+                assert_eq!(arrival.landing, crate::arrival::Landing::Preparation);
+                assert!(
+                    arrival.landing.lands().contains("PREPARATION"),
+                    "the landing says where it went: {}",
+                    arrival.landing.lands()
+                );
             })
         });
     }

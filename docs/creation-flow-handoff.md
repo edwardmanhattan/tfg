@@ -1081,9 +1081,17 @@ three; the state does. A Saved Scenario is the only arrival with no map at all.
 | | Save as Game Session | Save as Scenario | Play Directly |
 | --- | --- | --- | --- |
 | Lands in | `PLANNING · NOT STARTED` | `SAVED SCENARIOS · 1 NEW` | `PREPARATION · LIVE` |
-| Force | `9 OF 9 PLACED` | `9 UNITS IN THE BASKET` | `THE SAME NINE PINS` |
+| Force | `9 OF 9 PLACED` | `9 UNITS IN THE BASKET` | `<n> UNITS · <n> OF <n> PLACED` |
 | Plan | `9 UNITS · 5 STEPS · 4 SEATED` | `5 STEPS · 4 SUB-STEPS` | `4 SEATED · 0 OF 4 READY` |
 | Next | `OPENS AT 01 ESSENTIALS` | `OPEN IT TO START A NEW GAME` | `THE GAME MASTER PRESSES START` |
+
+**The arrival is what a Done press shows.** The binary re-reads the game after
+the press and the shell installs that session, so Play Directly's last write
+moves the game to `preparation` and the arrival says `PREPARATION · LIVE` — the
+console behind the button is the preparation console, not the `planning` row
+the press started from. `OPEN THE CONSOLE` clears the draft; `OPEN THE LIBRARY`
+returns to the landing. The rows are computed from the draft the press left, so
+a two-hull exercise does not claim nine pins.
 
 The `READY` numbers in the table and in the strip below are the **frame's own
 values**, and both count the Referee, whom the gate exempts. A built panel counts

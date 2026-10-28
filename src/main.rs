@@ -1323,11 +1323,30 @@ fn main() {
                         )
                         .for_draft(&draft, &live);
                         let outcome = tfg::commit::run(&mut draft, &live, verb, &offset, &mut wire);
+                        // THE SERVER AFTER THE PRESS. A Done press that made
+                        // or touched a game is read back here, because the
+                        // flow's next screen is the arrival and the console
+                        // behind it: leaving the shell on the `planning` row
+                        // it started from would report a phase the server has
+                        // already left. The launcher's rows come with it, so
+                        // the new game is in the history.
+                        let game = tfg::commit::game_id(&draft, &live);
+                        let done = matches!(outcome, tfg::commit::Outcome::Done);
+                        let (session, sessions) = if done && game.is_some() {
+                            (
+                                game.and_then(|id| fetch_session(&host2, &token2, Some(id))),
+                                fetch_session_rows(&host2, &token2).unwrap_or_default(),
+                            )
+                        } else {
+                            (None, Vec::new())
+                        };
                         if press_tx
                             .send(tfg::shell_gpui::PressAnswer {
                                 draft,
                                 verb,
                                 outcome,
+                                session,
+                                sessions,
                             })
                             .is_err()
                         {

@@ -402,6 +402,12 @@ impl BookDraft {
         (added, target.units.len())
     }
 
+    /// How many sub-steps the draft stages. The arrival's library row counts
+    /// them, and nothing else needs the whole list.
+    pub fn substep_count(&self) -> usize {
+        self.substeps.values().map(Vec::len).sum()
+    }
+
     /// The step's sub-steps, in the order they were authored.    /// The step's sub-steps, in the order they were authored.
     pub fn substeps_of(&self, step_local: i64) -> &[StagedSubStep] {
         self.substeps
