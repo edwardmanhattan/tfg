@@ -497,6 +497,18 @@ drop, and tints while something is in the air.
 satgas of three and two: a card is a hull, and a body's cards are all the hulls
 it is fought with, not only the ones it musters directly.
 
+**`UNGROUPED` is always drawn, and it is a destination.** A card dropped on it
+leaves whatever body musters it and stays in the game, loose. It is the only
+place the gesture is offered, so it is drawn even when it holds nothing; a
+grouped card also carries a `UNGROUP` action, because a control that only exists
+as a drop target is one the operator has to guess.
+
+**`✕` severs every tie.** A hull is named in four places — the force, a body's
+muster list, a sub-step's audience, and another hull's `host` — and a removal
+cuts all four. Removing it from the force alone left a body still counting
+`UNIT 351`, a sub-step still assigning it, and a rider attached to a hull that
+was gone. Riders come off; they do not vanish with it.
+
 ### 5.6 Map mode (F3e)
 
 The map expands to the window. Header: `MAP MODE`, `<n> PLACED · <n> UNPLACED ·
@@ -527,9 +539,68 @@ The map expands to the window. Header: `MAP MODE`, `<n> PLACED · <n> UNPLACED �
   This is the commit's behaviour, not the drag's: nothing is written until 06.
   At commit, a partial placement failure leaves the successful ones written and
   the journal says which.
+- **A selected hull puts up two cards.** The first is the hull: name, class and
+  number, commander, and its ground — or `ABOARD <host> · FOLLOWS ITS HOST`,
+  with a detach action. The second appears only when the hull carries somebody:
+  the manifest, one row per rider with a glyph, a name and a commander. A hull
+  with ten riders is ten rows in a panel that scrolls, not ten dots on a mark.
 
 A "cluster" here is a set of pins that move together — a group's hulls, or a
 selection. It is a gesture, not a stored object.
+
+### 5.7 Embarkation
+
+A unit can be **aboard** another. Both remain full units: the rider keeps its
+own commander, its own sub-steps and its own place in a body. What it loses is
+its water — while it is aboard it follows the host and cannot be placed
+separately. Minos holds this as a `host` on the unit, and a unit has one host at
+a time.
+
+**The gesture.** Drag a basket card onto another basket card. The host's card
+turns green and breathes while the card is over it; a refused host breathes red.
+The release plays a ding when it lands and a buzz when it does not — the same
+two sounds the console's own embark uses.
+
+**The rule**, checked locally as far as the client can:
+
+```text
+a hull does not embark on itself
+a hull has one host · a second embark refuses and names the host it is on
+a host chain may not come back round (a ring)
+the host must declare a complement that covers the rider's kind, and have room
+```
+
+The first three are the draft's. The fourth is the host's **complement spec**
+(`GET /units/{id}/capacities`), which the server owns; the console reads it the
+first time the pointer rests on a candidate host with a card in the air. Until
+that answer lands the verdict is *unread*, not green: the drop is taken, the
+note says the spec is unread, and the press is the authority. A spec read is
+cached per host.
+
+Embarking **lifts the rider's position** in the same edit. The plan writes one
+`Lift` and one `Embark`, and then nothing else — a hull with a host and a
+position is a state the server refuses.
+
+**What the basket draws.** The rider is not a card of its own: a card is a thing
+the operator can place, and an embarked hull has no water to place. Its host's
+card shows `N ABOARD` with the first five glyphs and opens the **manifest**.
+
+**The manifest is a list, not dots.** One row per rider: glyph, name, commander,
+`DETACH`, and `+N` when the rider carries somebody itself. The rows are the two
+gestures the dots could not offer:
+
+- **a row is a handle** — drag it to a sub-step and the rider takes that
+  command, exactly like a card;
+- **a row is a scope** — drop a seat on it and the rider is commanded. A rider
+  needs a commander like any other hull, and a dot cannot be a drop target.
+
+Ten riders is a list that scrolls. That is the answer to "each unit can carry
+more than ten": the basket stays a grid of hulls, and the manifest is the one
+place where a host's riders become rows.
+
+`UNGROUPED` is not a host: a rider dropped there is ungrouped, not unhosted.
+`DETACH` is the way off a host, and it leaves the hull on the water with no
+ground until it is placed.
 
 ---
 
@@ -727,11 +798,13 @@ line (`COMMANDED BY LT. FITRI`, `COMMANDED BY —`). **Every body is a channel**
 drawn in the tree's own order and indented by depth — an operation's row, then a
 gugus under it, then its satuan tugas, then the cards. A body with no hulls
 directly mustered still draws its row, because it is the level its children hang
-from; the hulls no body holds are the `UNGROUPED` channel, last. A group row
-drags out as **its leaf hulls**:
+from; the hulls no body holds are the `UNGROUPED` channel, last.
 
-> `A SATGAS DRAGS OUT AS ITS CARDS · AN OPERATION OR A GUGUS AS EVERY CARD
-> BENEATH IT`
+**A basket channel's title carries the BODY** — the same gesture as its band on
+the board — so it can be nested, made a root, or packed onto the map as a whole.
+A hull is picked up by its own card, one at a time. A hull **aboard** another is
+not a card at all: it is under its host's `N ABOARD` strip, and the manifest is
+where it is commanded, tasked or detached (§5.7).
 
 ### 7.3 Drop resolution
 
@@ -909,7 +982,7 @@ halves of that are wrong, and the corrections are erratum 1:
 | 01 | GAME | `POST /games` | Lands in `planning`. Everything else hangs off its id. |
 | 02 | SEATS | `POST /games/{id}/participants` | **Before units**: a hull's commander must already be a participant. |
 | 03 | HIERARCHY | `POST /games/{id}/hierarchy`, top-down | A parent before its child. |
-| 04 | UNITS | `POST /games/{id}/units`, then `PUT /games/{id}/units/{unit_id}/hierarchy` | Needs the seat (02) and the node (03); the tree placement is a second write per hull. |
+| 04 | UNITS | `POST /games/{id}/units`, then the tree placement, then embarkations, removals last | Needs the seat (02) and the node (03); the tree placement is a second write per hull, and an embarkation needs both of its ends to exist. |
 | 05 | PLACEMENTS | `PUT /games/{id}/units/{unit_id}/placement` | One write per hull, unit-id order. |
 | 06 | STEPS | scenarios, steps, sub-steps, audiences | Audiences name hulls, so after 04. |
 | 07 | COMMANDERS | `PUT .../hierarchy/{node}/commander`, `PATCH .../units/{unit_id}` | Group commanders, and a hull's commander where 04's differs. |

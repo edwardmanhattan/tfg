@@ -570,7 +570,7 @@ pub fn position(draft: &Draft, live: &Live, verb: Verb, number: u8, offset: &str
             Position {
                 number,
                 name: "UNITS",
-                note: "each hull, then its place in the tree",
+                note: "each hull, its place in the tree, then who is aboard whom",
                 writes,
                 read: None,
             }

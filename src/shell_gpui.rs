@@ -32,7 +32,7 @@
 //! `ShipApp` port starts from this shell and grows into it.
 
 use gpui::{
-    AnyElement, App, AppContext, Application, AssetSource, AsyncApp, Bounds, Context, Corners,
+    AnimationExt, AnyElement, App, AppContext, Application, AssetSource, AsyncApp, Bounds, Context, Corners,
     CursorStyle, Div, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathBuilder, Render,
     ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
@@ -1289,6 +1289,21 @@ struct IslandDemo {
     /// moves that hull, a press on water pans. Two gestures, one surface, and
     /// which one it is depends on what was under the press.
     flow_drag_hull: Option<i64>,
+    /// The host whose MANIFEST the basket is showing, when it is showing one.
+    ///
+    /// The basket's cards are for hulls on the water. A hull aboard another
+    /// has no card of its own — it would be a piece the operator could try
+    /// to place — so its host's card opens this list instead, and the list is
+    /// where a rider is commanded, given a sub-step, or detached.
+    flow_manifest: Option<i64>,
+    /// The hosts whose complement spec has been asked for. The embark rule
+    /// needs the spec to say green or red, and a panel that asked on every
+    /// pointer move would be a fan-out for a table that does not move.
+    flow_caps_asked: std::collections::BTreeSet<i64>,
+    /// The card the pointer is over, while a card is in the air. The glow is
+    /// one card's, not every candidate's: the verdict is only painted on the
+    /// host the release would land on.
+    flow_embark_hover: Option<i64>,
     /// Where the basket has been dragged to, in window points. `None` is the
     /// sheet's own corner (bottom-right); the moment the operator moves it,
     /// their corner wins and survives the re-render.
@@ -4351,6 +4366,9 @@ impl IslandDemo {
             // frame, and `§16` says what that evidence is worth.
             flow_carry: None,
             flow_seat_carry: None,
+            flow_manifest: None,
+            flow_caps_asked: std::collections::BTreeSet::new(),
+            flow_embark_hover: None,
             // `TFG_MAP=1` opens MAP MODE for a capture: a gesture that needs a
             // click on a control cannot be photographed otherwise, and the
             // frame is the state, not the click.
@@ -4744,6 +4762,34 @@ impl IslandDemo {
                     demo.steps_pane = StepsPane::Game(sc.id);
                 }
             }
+        }
+        // `TFG_ABOARD=child:host,child:host` stages embarkation for a capture.
+        // The gesture is a drag, and there is no pointer automation on this
+        // machine: the state has to be seeded the same way every other
+        // gestureless state is.
+        if let Ok(seed) = std::env::var("TFG_ABOARD") {
+            if let Some(draft) = &mut demo.flow_draft {
+                for pair in seed.split(',') {
+                    let mut parts = pair.split(':');
+                    let (Some(child), Some(host)) = (parts.next(), parts.next()) else {
+                        continue;
+                    };
+                    let (Ok(child), Ok(host)) = (child.trim().parse::<i64>(), host.trim().parse::<i64>())
+                    else {
+                        continue;
+                    };
+                    draft.force.set_start(child, None);
+                    draft.force.set_host(child, Some(host));
+                }
+            }
+        }
+        // `TFG_MANIFEST=<host>` opens that host's manifest for a capture.
+        if let Some(host) = std::env::var("TFG_MANIFEST")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+        {
+            demo.flow_manifest = Some(host);
+            demo.flow_basket_open = true;
         }
         demo
     }
@@ -11501,9 +11547,15 @@ impl IslandDemo {
         let spec = match outcome {
             Ok(spec) => spec,
             Err(why) => {
-                self.embark_pending = None;
-                self.force_status = Status::bad(why);
-                crate::sfx::play(crate::sfx::Sfx::Buzz);
+                // A FAILED READ DECIDES NOTHING, BUT IT ONLY INTERRUPTS WHEN
+                // A DROP IS WAITING ON IT. The flow asks for a host's spec
+                // the moment a card rests on it, long before a release; a
+                // signed-out console buzzing at every host it looks at would
+                // be the panel complaining about a gesture nobody made.
+                if self.embark_pending.take().is_some() {
+                    self.force_status = Status::bad(why);
+                    crate::sfx::play(crate::sfx::Sfx::Buzz);
+                }
                 cx.notify();
                 return;
             }
@@ -21689,6 +21741,7 @@ impl IslandDemo {
         at: (f32, f32),
         cx: &mut Context<Self>,
     ) {
+        self.flow_embark_hover = None;
         self.flow_carry = Some(FlowCarry {
             unit_ids,
             group_id: None,
@@ -21712,6 +21765,7 @@ impl IslandDemo {
         at: (f32, f32),
         cx: &mut Context<Self>,
     ) {
+        self.flow_embark_hover = None;
         self.flow_carry = Some(FlowCarry {
             unit_ids: Vec::new(),
             group_id: Some(group_id),
@@ -21734,6 +21788,223 @@ impl IslandDemo {
         }
         self.flow_carry = Some(carry);
         cx.notify();
+    }
+
+    /// THE EMBARK VERDICT, from the draft alone (`§5.7`).
+    ///
+    /// THE RULE HAS FOUR PARTS and three of them are the draft's: a hull does
+    /// not embark on itself, a hull is inside one host at a time, and a chain
+    /// of hosts may not come back round. The fourth is the HOST'S COMPLEMENT
+    /// SPEC — what kinds of hull it takes and how many — which only the
+    /// server knows; [`Self::flow_caps_look`] asks for it, and until the
+    /// answer lands the verdict is [`FlowEmbark::Unread`] rather than a green
+    /// border the client cannot stand behind.
+    fn flow_embark_verdict(&self, host: i64, child: i64) -> FlowEmbark {
+        let Some(draft) = &self.flow_draft else {
+            return FlowEmbark::Refused("NO DRAFT".to_string());
+        };
+        if host == child {
+            return FlowEmbark::Refused("A HULL DOES NOT EMBARK ON ITSELF".to_string());
+        }
+        let Some(child_hull) = draft.force.get(child) else {
+            return FlowEmbark::Refused("THAT HULL IS NOT IN THE GAME".to_string());
+        };
+        if let Some(other) = child_hull.host {
+            if other == host {
+                return FlowEmbark::Refused("IT IS ALREADY ABOARD".to_string());
+            }
+            let name = draft
+                .force
+                .get(other)
+                .map(|hull| hull.name.to_uppercase())
+                .unwrap_or_else(|| format!("#{other}"));
+            return FlowEmbark::Refused(format!("ABOARD {name} \u{b7} DETACH IT FIRST"));
+        }
+        // A ring: walking the host's own chain must never arrive at the hull
+        // being put aboard it. The count is bounded by the draft's size, so a
+        // chain that is already a loop cannot spin here.
+        let mut cursor = Some(host);
+        let mut steps = 0usize;
+        while let Some(id) = cursor {
+            if id == child {
+                return FlowEmbark::Refused(
+                    "A RING \u{b7} THE HOST IS ALREADY ABOARD THIS HULL".to_string(),
+                );
+            }
+            steps += 1;
+            if steps > draft.force.len() {
+                break;
+            }
+            cursor = draft.force.get(id).and_then(|hull| hull.host);
+        }
+        let Some(caps) = self.embark_caps.get(&host) else {
+            return FlowEmbark::Unread;
+        };
+        // The host's riders, from the draft: the server's composition is the
+        // same list once the press has written it, and the draft is what the
+        // operator is looking at.
+        let aboard: Vec<crate::backend::EmbarkedUnit> = draft
+            .force
+            .hulls()
+            .filter(|hull| hull.host == Some(host))
+            .map(|hull| crate::backend::EmbarkedUnit {
+                id: hull.unit_id,
+                name: hull.name.clone(),
+                hull_number: hull.hull_number.clone(),
+                class_name: hull.class_id.clone(),
+                is_cleared: false,
+                cleared_at: None,
+            })
+            .collect();
+        match crate::embark::check(caps, &aboard, &self.unit_taxonomy, host, child) {
+            Ok(()) => FlowEmbark::Allowed,
+            Err(why) => FlowEmbark::Refused(why.reason().to_uppercase()),
+        }
+    }
+
+    /// ASK WHAT A HOST CARRIES, once per host.
+    ///
+    /// The complement spec is the server's — the store's mirror has the
+    /// KINDS, not the boxes — so a drag cannot answer green or red without
+    /// it. The read is fired when the pointer first rests on a candidate
+    /// host with a card in the air: one request per host, not per frame, and
+    /// never for a hull the operator has not pointed at.
+    fn flow_caps_look(&mut self, host: i64) {
+        if self.embark_caps.contains_key(&host) || !self.flow_caps_asked.insert(host) {
+            return;
+        }
+        let _ = self.order_tx.send(ToBinary::ReadEmbarkSpec { host });
+    }
+
+    /// A CARD LET GO ON A CARD: put it aboard (`§5.7`).
+    ///
+    /// The child loses its water and its own placement write; it follows the
+    /// host from here. The verdict is the client's, and the sound is the
+    /// gesture's: a ding for a drop that lands, a buzz for one it refuses —
+    /// the same two sounds the console's own embark uses.
+    fn carry_into_card(&mut self, host: i64, cx: &mut Context<Self>) -> bool {
+        let Some(carry) = self.flow_carry.clone() else {
+            return false;
+        };
+        if !carry.lifted || carry.group_id.is_some() || carry.unit_ids.len() != 1 {
+            return false;
+        }
+        let child = carry.unit_ids[0];
+        if child == host {
+            // A press on a card and a release on the same card is not a
+            // command: the card goes home and says so.
+            self.carry_drop(cx);
+            return true;
+        }
+        self.flow_carry = None;
+        match self.flow_embark_verdict(host, child) {
+            FlowEmbark::Refused(why) => {
+                let name = self
+                    .flow_draft
+                    .as_ref()
+                    .and_then(|draft| draft.force.get(child))
+                    .map(|hull| hull.name.to_uppercase())
+                    .unwrap_or_else(|| format!("#{child}"));
+                let host_name = self
+                    .flow_draft
+                    .as_ref()
+                    .and_then(|draft| draft.force.get(host))
+                    .map(|hull| hull.name.to_uppercase())
+                    .unwrap_or_else(|| format!("#{host}"));
+                self.flow_drop_note = Some(format!(
+                    "{name} CANNOT EMBARK ABOARD {host_name} \u{b7} {why}"
+                ));
+                crate::sfx::play(crate::sfx::Sfx::Buzz);
+            }
+            FlowEmbark::Allowed | FlowEmbark::Unread => {
+                let unread = matches!(
+                    self.flow_embark_verdict(host, child),
+                    FlowEmbark::Unread
+                );
+                let Some(draft) = &mut self.flow_draft else {
+                    return true;
+                };
+                // Aboard, a hull has no water of its own: the placement is
+                // lifted in the same edit, so the plan writes one lift and one
+                // embark rather than leaving a position the server refuses.
+                draft.force.set_start(child, None);
+                draft.force.set_host(child, Some(host));
+                let child_name = draft
+                    .force
+                    .get(child)
+                    .map(|hull| hull.name.to_uppercase())
+                    .unwrap_or_default();
+                let host_name = draft
+                    .force
+                    .get(host)
+                    .map(|hull| hull.name.to_uppercase())
+                    .unwrap_or_default();
+                self.flow_drop_note = Some(if unread {
+                    format!(
+                        "{child_name} ABOARD {host_name} \u{b7} THE HOST'S SPEC IS UNREAD \u{b7} \
+                         THE PRESS WILL SAY IF IT FITS"
+                    )
+                } else {
+                    format!("{child_name} ABOARD {host_name} \u{b7} 1 EMBARKATION WRITE")
+                });
+                crate::sfx::play(crate::sfx::Sfx::Ding);
+            }
+        }
+        self.flow_manifest = Some(host);
+        cx.notify();
+        true
+    }
+
+    /// TAKE A HULL OUT OF ITS HOST. It returns to the water with no ground —
+    /// where it was is not a fact the draft kept while it was aboard.
+    fn flow_detach(&mut self, unit_id: i64, cx: &mut Context<Self>) -> bool {
+        let Some(draft) = &mut self.flow_draft else {
+            return false;
+        };
+        let Some(host) = draft.force.get(unit_id).and_then(|hull| hull.host) else {
+            return false;
+        };
+        draft.force.set_host(unit_id, None);
+        let child_name = draft
+            .force
+            .get(unit_id)
+            .map(|hull| hull.name.to_uppercase())
+            .unwrap_or_default();
+        let host_name = draft
+            .force
+            .get(host)
+            .map(|hull| hull.name.to_uppercase())
+            .unwrap_or_default();
+        self.flow_drop_note = Some(format!(
+            "{child_name} OFF {host_name} \u{b7} 1 DETACH WRITE \u{b7} IT HAS NO GROUND UNTIL PLACED"
+        ));
+        crate::sfx::play(crate::sfx::Sfx::Ding);
+        cx.notify();
+        true
+    }
+
+    /// UNGROUP A HULL: it leaves its body and stays in the game, loose.
+    fn flow_ungroup(&mut self, unit_id: i64, cx: &mut Context<Self>) -> bool {
+        let Some(draft) = &mut self.flow_draft else {
+            return false;
+        };
+        let Some(owner) = draft.ungroup(unit_id) else {
+            return false;
+        };
+        let body = draft
+            .groups
+            .get(owner)
+            .map(|group| group.name.to_uppercase())
+            .unwrap_or_default();
+        let name = draft
+            .force
+            .get(unit_id)
+            .map(|hull| hull.name.to_uppercase())
+            .unwrap_or_default();
+        self.flow_drop_note = Some(format!("{name} UNGROUPED \u{b7} IT SITS IN {body} NO LONGER"));
+        crate::sfx::play(crate::sfx::Sfx::Ding);
+        cx.notify();
+        true
     }
 
     /// Release on a sub-step: the audience write's own verb (`§7.3`).
@@ -21912,9 +22183,8 @@ impl IslandDemo {
         let Some(draft) = &mut self.flow_draft else {
             return false;
         };
-        let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
         let body = match carry.group_id {
-            Some(id) => ring_body(&groups, id),
+            Some(id) => ring_body(draft, id),
             // Cards in the hand are a body with no children: one card lands
             // on the anchor exactly, several spread on the same rings a
             // group's hulls would.
@@ -22667,7 +22937,11 @@ impl IslandDemo {
         // join is a target the operator has to hunt for. The whole channel
         // takes the drop; a released card inside it enlists in the body,
         // which is the same statement the title makes.
-        if group_target {
+        //
+        // `UNGROUPED` IS THE OTHER KIND OF DESTINATION (`§7.2`): a card let
+        // go here leaves whatever body musters it. It is always drawn, even
+        // empty, because it is the only place the gesture is offered.
+        if !group_target {
             let carry_live = self
                 .flow_carry
                 .as_ref()
@@ -22691,6 +22965,60 @@ impl IslandDemo {
                         if view.carry_into_group(carried_group, cx) {
                             cx.stop_propagation();
                         }
+                    }),
+                );
+        } else {
+            // A CARD LET GO ON `UNGROUPED` LEAVES ITS BODY. A body in the
+            // air is not a hull, so the drop says so instead of tearing a
+            // whole command apart.
+            let carry_live = self
+                .flow_carry
+                .as_ref()
+                .map(|carry| carry.lifted)
+                .unwrap_or(false);
+            body = body
+                .min_h(px(pt(if channel.cards.is_empty() { 14.0 } else { 6.0 })))
+                .hover(move |style| {
+                    if carry_live {
+                        style.bg(rgba(kit::LIVE_INK.with_alpha(18)))
+                    } else {
+                        style
+                    }
+                })
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, _, cx| {
+                        let Some(carry) = view.flow_carry.clone() else {
+                            return;
+                        };
+                        if !carry.lifted {
+                            return;
+                        }
+                        view.flow_carry = None;
+                        if carry.group_id.is_some() {
+                            view.flow_drop_note = Some(
+                                "A BODY IS NOT A CARD \u{b7} UNGROUP ITS HULLS ONE AT A TIME"
+                                    .to_string(),
+                            );
+                            crate::sfx::play(crate::sfx::Sfx::Buzz);
+                            cx.notify();
+                            cx.stop_propagation();
+                            return;
+                        }
+                        let mut left = 0usize;
+                        for unit_id in &carry.unit_ids {
+                            if view.flow_ungroup(*unit_id, cx) {
+                                left += 1;
+                            }
+                        }
+                        if left == 0 {
+                            view.flow_drop_note = Some(
+                                "NOTHING TO UNGROUP \u{b7} THOSE HULLS ARE ALREADY LOOSE"
+                                    .to_string(),
+                            );
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
                     }),
                 );
         }
@@ -22775,6 +23103,29 @@ impl IslandDemo {
             .as_ref()
             .map(|carry| carry.lifted)
             .unwrap_or(false);
+        // WHO MUSTERS IT, for the ungroup action: a hull in a body offers the
+        // way out of it, and a loose one has no such action to draw.
+        let grouped = self
+            .flow_draft
+            .as_ref()
+            .and_then(|draft| draft.groups.unit_owner(unit_id))
+            .is_some();
+        // THE VERDICT, WHILE A CARD IS IN THE AIR AND THIS CARD IS A HOST.
+        // One card is the only thing that can embark, and a hull cannot take
+        // itself, so the source card answers nothing.
+        let verdict = self
+            .flow_carry
+            .as_ref()
+            .filter(|carry| {
+                carry.lifted
+                    && carry.group_id.is_none()
+                    && carry.unit_ids.len() == 1
+                    && carry.unit_ids[0] != unit_id
+            })
+            .filter(|_| self.flow_embark_hover == Some(unit_id))
+            .map(|carry| self.flow_embark_verdict(unit_id, carry.unit_ids[0]));
+        let aboard = card.aboard.clone();
+        let carries = card.aboard_count();
         let mut card_el = div()
             .id(("flow-basket-card", unit_id as usize))
             .flex()
@@ -22810,8 +23161,17 @@ impl IslandDemo {
                             .id(("flow-basket-take", unit_id as usize))
                             .cursor_pointer()
                             .on_click(cx.listener(move |view, _, _, cx| {
+                                // A HULL TAKES ITS TIES WITH IT. Removing it
+                                // from the force alone left its body, its
+                                // sub-steps and its riders naming an id the
+                                // draft no longer held — the basket drew
+                                // `UNIT 351` under a body that still counted
+                                // it.
                                 if let Some(draft) = &mut view.flow_draft {
-                                    draft.force.remove(unit_id);
+                                    draft.take_out(unit_id);
+                                }
+                                if view.flow_manifest == Some(unit_id) {
+                                    view.flow_manifest = None;
                                 }
                                 cx.notify();
                             }))
@@ -22857,35 +23217,374 @@ impl IslandDemo {
                     );
                 }),
             )
+            // THE HOST UNDER THE HAND, AND ITS SPEC. Entering a card while a
+            // card is in the air is what makes this card the release's
+            // target: the verdict is computed for it alone, its border
+            // breathes, and its complement spec is read once.
+            .on_hover(cx.listener(move |view, hovered: &bool, _, cx| {
+                if *hovered {
+                    view.flow_embark_hover = Some(unit_id);
+                    let carrying = view
+                        .flow_carry
+                        .as_ref()
+                        .is_some_and(|carry| carry.lifted && carry.group_id.is_none());
+                    if carrying {
+                        view.flow_caps_look(unit_id);
+                    }
+                } else if view.flow_embark_hover == Some(unit_id) {
+                    view.flow_embark_hover = None;
+                }
+                cx.notify();
+            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |view, _, _, cx| {
+                    // A CARD PUT ABOARD THIS ONE (`§5.7`). Before the seat
+                    // drop, because a card in the air is the embark gesture
+                    // and a seat in the air is the command one — they cannot
+                    // both be released here.
+                    if view.carry_into_card(unit_id, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     if view.seat_drop(crate::roster::ScopeTarget::Hull(unit_id), cx) {
                         cx.stop_propagation();
                     }
                 }),
-            )
-            .child(kit::mono_caps(
-                if placed { "ON THE MAP" } else { "NO POSITION" },
-                view::LABEL_PT,
-                if placed {
-                    kit::LIVE_INK
-                } else {
-                    kit::MUTED_INK
-                },
-            ));
+            );
+        // WHAT IS ABOARD, AS A STRIP (`§5.7`).
+        //
+        // THE BASKET DOES NOT EXPAND A MANIFEST ON THE CARD. Ten riders would
+        // make one card taller than the panel, and a dot cannot take a seat
+        // or a sub-step. The card says how many, shows the first few glyphs,
+        // and opens the manifest, which is one row per rider and scrolls.
+        if !aboard.is_empty() {
+            let mut chips = div().flex().flex_row().items_center().gap(px(pt(2.0)));
+            for rider in aboard.iter().take(5) {
+                chips = chips.child(
+                    div()
+                        .w(px(pt(18.0)))
+                        .h(px(pt(18.0)))
+                        .flex_shrink_0()
+                        .border(px(kit::EDGE_WIDTH))
+                        .border_color(rgba(HAIRLINE_SLATE))
+                        .child(self.hull_face(
+                            rider.unit_id,
+                            &rider.class_label,
+                            pt(18.0),
+                            pt(18.0),
+                        )),
+                );
+            }
+            if aboard.len() > 5 {
+                chips = chips.child(kit::machine(
+                    format!("+{}", aboard.len() - 5),
+                    view::LABEL_PT,
+                    kit::MUTED_INK,
+                ));
+            }
+            card_el = card_el.child(
+                div()
+                    .id(("flow-basket-aboard", unit_id as usize))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(pt(4.0)))
+                    .w_full()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.flow_manifest = Some(unit_id);
+                        cx.notify();
+                    }))
+                    .child(chips)
+                    .child(kit::machine(
+                        format!("{carries} ABOARD \u{25b8}"),
+                        view::LABEL_PT,
+                        kit::LIVE_INK,
+                    )),
+            );
+        }
+        // A HULL IN A BODY CAN LEAVE IT. The channel's body is the drop
+        // target too (`UNGROUPED`), but a control that only exists as a
+        // destination is one the operator has to guess.
+        if grouped {
+            card_el = card_el.child(
+                div()
+                    .id(("flow-basket-ungroup", unit_id as usize))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.flow_ungroup(unit_id, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(kit::mono_caps(
+                        "UNGROUP",
+                        view::LABEL_PT,
+                        kit::MUTED_INK,
+                    )),
+            );
+        }
+        // The ground is the last line of the card, because it is the last
+        // fact: aboard a host the hull has none, and the strip above it says
+        // where it is instead.
+        card_el = card_el.child(kit::mono_caps(
+            if placed {
+                "ON THE MAP"
+            } else if card.host.is_some() {
+                "ABOARD"
+            } else {
+                "NO POSITION"
+            },
+            view::LABEL_PT,
+            if placed {
+                kit::LIVE_INK
+            } else if card.host.is_some() {
+                kit::LIVE_INK
+            } else {
+                kit::MUTED_INK
+            },
+        ));
         // The card UNDER the pointer, not every card: the drop lands on the
-        // one the operator is over.
+        // one the operator is over. A seat in the air wins the paint, because
+        // it is the gesture that can be released anywhere on the card; a card
+        // in the air paints the VERDICT, so the refusal is visible before the
+        // operator lets go.
+        let pulse_ink = verdict.as_ref().map(|verdict| match verdict {
+            FlowEmbark::Allowed => SIGNAL_GREEN,
+            FlowEmbark::Refused(_) => FAULT_RED,
+            FlowEmbark::Unread => RADAR_CYAN,
+        });
         card_el = card_el.hover(move |style| {
             if seat_live {
                 style
                     .bg(rgba(WARNING_SAND.with_alpha(28)))
                     .border_color(rgba(WARNING_SAND))
+            } else if let Some(ink) = pulse_ink {
+                style
+                    .bg(rgba(ink.with_alpha(18)))
+                    .border_color(rgba(ink))
             } else {
                 style
             }
         });
+        if let Some(ink) = pulse_ink {
+            // THE GLOW. A refused host is as loud as an allowed one: the
+            // border breathes between a third and full ink, so the card the
+            // operator is over is the one the eye is on. One animation per
+            // card, and only while a card is in the air.
+            return card_el
+                .with_animation(
+                    ("flow-embark-pulse", unit_id as usize),
+                    gpui::Animation::new(std::time::Duration::from_millis(1100)).repeat(),
+                    move |el, delta| {
+                        let breath = if delta < 0.5 {
+                            delta * 2.0
+                        } else {
+                            (1.0 - delta) * 2.0
+                        };
+                        let alpha = 70.0 + 185.0 * breath;
+                        el.border_color(rgba(ink.with_alpha(alpha as u8)))
+                    },
+                )
+                .into_any_element();
+        }
         card_el.into_any_element()
+    }
+
+    /// ONE HOST'S MANIFEST (`§5.7`): every hull aboard it, as a ROW.
+    ///
+    /// WHY A LIST AND NOT DOTS ON THE CARD. A dot cannot carry a name, a
+    /// commander, a sub-step or a detach mark, and ten of them do not fit on
+    /// a card that is 170 points wide. The card says `N ABOARD`; this says
+    /// who, one row each, and scrolls — a hull with forty riders is a long
+    /// list, not a broken layout.
+    ///
+    /// THE ROW IS THE HANDLE. Drag it to a sub-step and the rider takes that
+    /// command; drop a seat on it and the rider is commanded. Those are the
+    /// two gestures the basket's dots could not offer.
+    fn basket_manifest(
+        &self,
+        host: i64,
+        channels: &[BasketChannel],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let draft = self.flow_draft.as_ref()?;
+        let host_hull = draft.force.get(host)?;
+        let host_name = host_hull.name.clone();
+        let card = channels.iter().find_map(|channel| card_of(&channel.cards, host))?;
+        let riders: Vec<BasketCard> = card.aboard.clone();
+        let seat_live = self
+            .flow_seat_carry
+            .as_ref()
+            .map(|carry| carry.lifted)
+            .unwrap_or(false);
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap(px(pt(4.0)))
+            .w_full()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(pt(8.0)))
+                    .w_full()
+                    .child(kit::mono_caps(
+                        format!("ABOARD {}", host_name.to_uppercase()),
+                        view::LABEL_PT,
+                        kit::LIVE_INK,
+                    ))
+                    .child(
+                        div()
+                            .id("flow-manifest-back")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.flow_manifest = None;
+                                cx.notify();
+                            }))
+                            .child(kit::mono_caps(
+                                "\u{25c2} BACK TO THE BASKET",
+                                view::LABEL_PT,
+                                kit::MUTED_INK,
+                            )),
+                    ),
+            );
+        if riders.is_empty() {
+            list = list.child(kit::note(
+                "Nothing is aboard \u{2014} drag a card onto this hull to put it here.",
+                kit::MUTED_INK,
+            ));
+        }
+        for rider in &riders {
+            let unit_id = rider.unit_id;
+            let name = rider.name.clone();
+            let carried_name = name.clone();
+            let number = rider.number.clone();
+            let commander = rider.commander.map(|id| self.person_name(id));
+            let carries = rider.aboard_count();
+            let mut row = div()
+                .id(("flow-manifest-row", unit_id as usize))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(pt(8.0)))
+                .w_full()
+                .min_h(px(pt(34.0)))
+                .flex_shrink_0()
+                .p(px(pt(4.0)))
+                .rounded(px(kit::RADIUS))
+                .border(px(kit::EDGE_WIDTH))
+                .border_color(rgba(HAIRLINE_SLATE))
+                .cursor_pointer()
+                // THE ROW IS A CARD IN THE HAND: a sub-step's audience is a
+                // list of hulls, and a rider is a hull even while it is
+                // aboard.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
+                        view.carry_start(
+                            vec![unit_id],
+                            carried_name.clone(),
+                            (f32::from(ev.position.x), f32::from(ev.position.y)),
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, _, cx| {
+                        if view.seat_drop(crate::roster::ScopeTarget::Hull(unit_id), cx) {
+                            cx.stop_propagation();
+                        }
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(pt(44.0)))
+                        .h(px(pt(24.0)))
+                        .flex_shrink_0()
+                        .child(self.hull_face(unit_id, &rider.class_label, pt(44.0), pt(24.0))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(kit::human(name, view::DENSE_PT, kit::VALUE_INK)),
+                )
+                // THE COMMANDER IS ITS OWN COLUMN, not a second line under
+                // the name: a column inside a row measured its own width from
+                // its longest child and clipped the name to an ellipsis at
+                // chart width. A fixed slot is also what makes the rows line
+                // up — the eye reads down `BY` rather than hunting for it.
+                .child(
+                    div()
+                        .w(px(pt(118.0)))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .child(kit::mono_caps(
+                            match &commander {
+                                Some(who) => format!("BY {}", who.to_uppercase()),
+                                None => "NO COMMANDER".to_string(),
+                            },
+                            view::LABEL_PT,
+                            if commander.is_some() {
+                                kit::LIVE_INK
+                            } else {
+                                WARNING_SAND
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .w(px(pt(34.0)))
+                        .flex_shrink_0()
+                        .child(kit::machine(number, view::LABEL_PT, kit::MUTED_INK)),
+                );
+            if carries > 0 {
+                let inner = unit_id;
+                row = row.child(
+                    div()
+                        .id(("flow-manifest-carries", unit_id as usize))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.flow_manifest = Some(inner);
+                            cx.notify();
+                        }))
+                        .child(kit::machine(
+                            format!("{carries} ABOARD \u{25b8}"),
+                            view::LABEL_PT,
+                            kit::LIVE_INK,
+                        )),
+                );
+            }
+            row = row.child(
+                div()
+                    .id(("flow-manifest-detach", unit_id as usize))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.flow_detach(unit_id, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(kit::mono_caps("DETACH", view::LABEL_PT, WARNING_SAND)),
+            );
+            row = row.hover(move |style| {
+                if seat_live {
+                    style
+                        .bg(rgba(WARNING_SAND.with_alpha(24)))
+                        .border_color(rgba(WARNING_SAND))
+                } else {
+                    style
+                }
+            });
+            list = list.child(row);
+        }
+        list = list.child(kit::remark(
+            "DRAG A ROW TO A SUB-STEP \u{b7} DROP A SEAT ON A ROW TO COMMAND IT",
+            kit::MUTED_INK,
+        ));
+        Some(list.into_any_element())
     }
 
     /// THE BASKET — a sheet that FLOATS over the surface, and belongs to the
@@ -22911,6 +23610,21 @@ impl IslandDemo {
         }
         let (placed, unplaced) = draft.placement_counts();
         let in_game = draft.unit_count();
+        // A RIDER HAS NO GROUND AND IS NOT "UNPLACED": it follows its host.
+        // Saying `2 UNPLACED` about two hulls that are aboard a third reads
+        // as work still to do, so the band names them for what they are.
+        let aboard = draft
+            .force
+            .hulls()
+            .filter(|hull| hull.host.is_some())
+            .count();
+        let placement_line = if aboard > 0 {
+            format!(
+                "{in_game} UNITS \u{b7} {placed} PLACED \u{b7} {aboard} ABOARD"
+            )
+        } else {
+            format!("{in_game} UNITS \u{b7} {placed} PLACED \u{b7} {unplaced} UNPLACED")
+        };
         // THE BASKET CAN BE PUT SOMEWHERE. It floats over the chart, and the
         // chart is what the operator is aiming at: a panel that cannot be
         // moved out of the way covers the water they were about to drop on.
@@ -22988,10 +23702,15 @@ impl IslandDemo {
             // as long as the grip is held, and that is what hears the
             // moves (`basket_drag_capture`).
             kit::band(
-                "BASKET \u{b7} DRAG THIS BAR TO MOVE IT",
-                Some(format!(
-                    "{in_game} UNITS \u{b7} {placed} PLACED \u{b7} {unplaced} UNPLACED"
-                )),
+                match self
+                    .flow_manifest
+                    .and_then(|host| draft.force.get(host))
+                    .map(|hull| hull.name.to_uppercase())
+                {
+                    Some(host) => format!("ABOARD {host} \u{b7} THE MANIFEST"),
+                    None => "BASKET \u{b7} DRAG THIS BAR TO MOVE IT".to_string(),
+                },
+                Some(placement_line.clone()),
             )
             .cursor_pointer()
             .on_mouse_down(
@@ -23023,8 +23742,20 @@ impl IslandDemo {
                 kit::MUTED_INK,
             ));
         }
-        for (at, channel) in channels.iter().enumerate() {
-            cards = cards.child(self.basket_channel(at, channel, cx));
+        // THE MANIFEST REPLACES THE CHANNELS, it does not float over them: the
+        // basket is one sheet, and a second sheet on top of it is a third
+        // surface to move. The host's riders are a list, and a list scrolls.
+        let manifest = self
+            .flow_manifest
+            .filter(|host| draft.force.get(*host).is_some())
+            .and_then(|host| self.basket_manifest(host, &channels, cx));
+        if let Some(manifest) = manifest {
+            cards = cards.child(manifest);
+        } else {
+            self.flow_manifest = None;
+            for (at, channel) in channels.iter().enumerate() {
+                cards = cards.child(self.basket_channel(at, channel, cx));
+            }
         }
         panel = panel
             .child(cards)
@@ -23044,6 +23775,10 @@ impl IslandDemo {
                     ))
                     .child(kit::remark(
                         "\u{2715} TAKES THE PIECE OUT OF THE GAME \u{b7} DRAG A CARD OUT TO PLACE OR MOVE IT",
+                        kit::MUTED_INK,
+                    ))
+                    .child(kit::remark(
+                        "DROP A CARD ON A CARD TO EMBARK IT \u{b7} DROP IT ON UNGROUPED TO LEAVE ITS BODY",
                         kit::MUTED_INK,
                     )),
             );
@@ -27570,6 +28305,7 @@ impl IslandDemo {
         // fight every hull gesture, which is exactly what it did before.
         let ground = div()
             .id("flow-map-ground")
+            .relative()
             .flex_1()
             .min_h_0()
             .w_full()
@@ -27681,7 +28417,12 @@ impl IslandDemo {
                 |view, ev: &ScrollWheelEvent, window, cx| {
                     view.flow_zoom_wheel(ev, window, cx);
                 },
-            ));
+            ))
+            // THE SELECTED HULL'S CARDS FLOAT OVER THE WATER (`§5.6`). They
+            // are children of the ground so they travel with it, and they
+            // occlude the mouse so a click on a card is not a click on the
+            // chart.
+            .children(self.map_selection_panels(cx));
 
         div()
             .flex()
@@ -27692,6 +28433,207 @@ impl IslandDemo {
             .child(header)
             .child(ground)
             .into_any_element()
+    }
+
+    /// THE TWO CARDS A SELECTED HULL PUTS UP (`§5.6`).
+    ///
+    /// The first is the hull: its name, who commands it, where it is. The
+    /// second is only there when the hull carries somebody — the manifest,
+    /// as a list beside the hull rather than a ring of dots on the mark. A
+    /// hull with ten riders is ten rows in a panel that scrolls; a dot per
+    /// rider would be a mark nobody can read at chart scale.
+    fn map_selection_panels(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(id) = self.flow_selected_hull else {
+            return Vec::new();
+        };
+        let Some(draft) = &self.flow_draft else {
+            return Vec::new();
+        };
+        let Some(hull) = draft.force.get(id) else {
+            return Vec::new();
+        };
+        let name = hull.name.clone();
+        let number = hull.hull_number.clone();
+        let class = hull.class_id.clone();
+        let start = hull.start.clone();
+        let host = hull.host;
+        let commander = hull.commander_id.map(|who| self.person_name(who));
+        let riders: Vec<(i64, String, String, Option<i64>, usize)> = draft
+            .force
+            .hulls()
+            .filter(|other| other.host == Some(id))
+            .map(|other| {
+                (
+                    other.unit_id,
+                    other.name.clone(),
+                    other.class_id.clone(),
+                    other.commander_id,
+                    draft
+                        .force
+                        .hulls()
+                        .filter(|rider| rider.host == Some(other.unit_id))
+                        .count(),
+                )
+            })
+            .collect();
+        let host_name = host
+            .and_then(|host| draft.force.get(host))
+            .map(|host| host.name.to_uppercase());
+        let mut info = div()
+            .id("flow-map-info")
+            .block_mouse_except_scroll()
+            .absolute()
+            .top(px(pt(12.0)))
+            .left(px(pt(12.0)))
+            .w(px(pt(252.0)))
+            .flex()
+            .flex_col()
+            .gap(px(pt(4.0)))
+            .p(px(pt(8.0)))
+            .bg(rgba(CONSOLE_NIGHT.with_alpha(kit::CHROME_ALPHA)))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(kit::LIVE_INK))
+            .child(kit::human(name, view::DENSE_PT, kit::VALUE_INK))
+            .child(kit::machine(
+                if number.is_empty() { class } else { format!("{class} \u{b7} {number}") },
+                view::LABEL_PT,
+                kit::MUTED_INK,
+            ))
+            .child(kit::mono_caps(
+                match &commander {
+                    Some(who) => format!("BY {}", who.to_uppercase()),
+                    None => "NO COMMANDER".to_string(),
+                },
+                view::LABEL_PT,
+                if commander.is_some() {
+                    kit::LIVE_INK
+                } else {
+                    WARNING_SAND
+                },
+            ));
+        info = info.child(match (&start, &host_name) {
+            (_, Some(host)) => kit::machine(
+                format!("ABOARD {host} \u{b7} FOLLOWS ITS HOST"),
+                view::LABEL_PT,
+                kit::LIVE_INK,
+            ),
+            (Some(start), None) => kit::machine(
+                format!("LAT {:.4} \u{b7} LON {:.4}", start.lat, start.lon),
+                view::LABEL_PT,
+                kit::MUTED_INK,
+            ),
+            (None, None) => kit::machine("NO POSITION", view::LABEL_PT, WARNING_SAND),
+        });
+        if host.is_some() {
+            info = info.child(
+                div()
+                    .id("flow-map-detach")
+                    .mt(px(pt(2.0)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.flow_detach(id, cx);
+                    }))
+                    .child(kit::mono_caps(
+                        "DETACH FROM THE HOST",
+                        view::LABEL_PT,
+                        WARNING_SAND,
+                    )),
+            );
+        }
+        let mut panels = vec![info.into_any_element()];
+        if !riders.is_empty() {
+            let mut list = div()
+                .id("flow-map-manifest")
+                .block_mouse_except_scroll()
+                .absolute()
+                .top(px(pt(12.0)))
+                .left(px(pt(276.0)))
+                .w(px(pt(240.0)))
+                .max_h(px(pt(320.0)))
+                .flex()
+                .flex_col()
+                .gap(px(pt(3.0)))
+                .p(px(pt(8.0)))
+                .overflow_y_scroll()
+                .bg(rgba(CONSOLE_NIGHT.with_alpha(kit::CHROME_ALPHA)))
+                .border(px(kit::EDGE_WIDTH))
+                .border_color(rgba(HAIRLINE_SLATE))
+                .child(kit::mono_caps(
+                    format!("{} ABOARD", riders.len()),
+                    view::LABEL_PT,
+                    kit::LIVE_INK,
+                ));
+            for (rider_id, rider_name, rider_class, rider_commander, carries) in riders {
+                let who = rider_commander.map(|who| self.person_name(who));
+                list = list.child(
+                    div()
+                        .id(("flow-map-rider", rider_id as usize))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(pt(6.0)))
+                        .w_full()
+                        .min_h(px(pt(24.0)))
+                        .flex_shrink_0()
+                        .px(px(pt(2.0)))
+                        .cursor_pointer()
+                        .border_b(px(kit::EDGE_WIDTH))
+                        .border_color(rgba(HAIRLINE_SLATE))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.flow_selected_hull = Some(rider_id);
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w(px(pt(34.0)))
+                                .h(px(pt(18.0)))
+                                .flex_shrink_0()
+                                .child(self.hull_face(
+                                    rider_id,
+                                    &rider_class,
+                                    pt(34.0),
+                                    pt(18.0),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(kit::human(
+                                    rider_name,
+                                    view::DENSE_PT,
+                                    kit::VALUE_INK,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .child(if carries > 0 {
+                                    kit::machine(
+                                        format!("+{carries}"),
+                                        view::LABEL_PT,
+                                        kit::LIVE_INK,
+                                    )
+                                } else {
+                                    kit::mono_caps(
+                                        match &who {
+                                            Some(who) => who.to_uppercase(),
+                                            None => "\u{2014}".to_string(),
+                                        },
+                                        view::LABEL_PT,
+                                        if who.is_some() {
+                                            kit::MUTED_INK
+                                        } else {
+                                            WARNING_SAND
+                                        },
+                                    )
+                                }),
+                        ),
+                );
+            }
+            panels.push(list.into_any_element());
+        }
+        panels
     }
 
     /// THE MAP, LIVE, AS THE FLOW SEES IT (`§5.6`).
@@ -28059,6 +29001,13 @@ impl IslandDemo {
     /// key handler can stop the event.
     fn flow_escape(&mut self, cx: &mut Context<Self>) -> bool {
         if self.peel_cancel(cx) {
+            return true;
+        }
+        // THE MANIFEST IS A SHEET INSIDE THE BASKET, so it leaves first: ESC
+        // from it returns to the channels, and only a second ESC leaves the
+        // map or closes the flow.
+        if self.flow_manifest.take().is_some() {
+            cx.notify();
             return true;
         }
         if self.flow_map {
@@ -36322,6 +37271,30 @@ pub struct BasketCard {
     /// The person commanding the hull, by id. `None` is a hull nobody
     /// commands — a gap the card says out loud rather than hides.
     pub commander: Option<i64>,
+    /// The hull this one is aboard, when it is aboard something.
+    ///
+    /// A RIDER IS NOT A CARD. It has no water of its own while it is aboard
+    /// — it follows the host — so the basket does not draw it beside the
+    /// host as another piece to place. It is listed under the host, and the
+    /// list is the manifest.
+    pub host: Option<i64>,
+    /// The hulls aboard this one, in unit-id order.
+    pub aboard: Vec<BasketCard>,
+}
+
+impl BasketCard {
+    /// Whether this hull carries anybody.
+    pub fn carries(&self) -> bool {
+        !self.aboard.is_empty()
+    }
+
+    /// Every hull under this one, riders' riders included.
+    pub fn aboard_count(&self) -> usize {
+        self.aboard
+            .iter()
+            .map(|rider| 1 + rider.aboard_count())
+            .sum()
+    }
 }
 
 /// The basket's channels, in the order the tree is drawn.
@@ -36334,6 +37307,64 @@ pub struct BasketCard {
 pub fn basket_channels(draft: &crate::draft::Draft) -> Vec<BasketChannel> {
     let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
     let children_of = crate::groups::children_map(&groups);
+
+    // WHO IS ABOARD WHOM, in unit-id order. A hull with a host the force
+    // still holds is a RIDER: it is drawn under that host, not beside it,
+    // because while it is aboard it has no water of its own.
+    let mut riders: std::collections::BTreeMap<i64, Vec<i64>> =
+        std::collections::BTreeMap::new();
+    for hull in draft.force.hulls() {
+        if let Some(host) = hull.host {
+            if host != hull.unit_id && draft.force.contains(host) {
+                riders.entry(host).or_default().push(hull.unit_id);
+            }
+        }
+    }
+    for ids in riders.values_mut() {
+        ids.sort_unstable();
+    }
+    let is_rider = |unit_id: i64| {
+        draft
+            .force
+            .get(unit_id)
+            .and_then(|hull| hull.host)
+            .is_some_and(|host| host != unit_id && draft.force.contains(host))
+    };
+
+    /// One card, and everything aboard it, depth-first.
+    ///
+    /// The depth guard is for a chain of hosts the draft should not hold
+    /// (the server refuses a ring); it must not make the basket recurse for
+    /// ever if one arrives through a resumed game.
+    fn card(
+        draft: &crate::draft::Draft,
+        riders: &std::collections::BTreeMap<i64, Vec<i64>>,
+        unit_id: i64,
+        depth: usize,
+    ) -> Option<BasketCard> {
+        let hull = draft.force.get(unit_id)?;
+        let aboard: Vec<BasketCard> = if depth >= 8 {
+            Vec::new()
+        } else {
+            riders
+                .get(&unit_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|rider| card(draft, riders, *rider, depth + 1))
+                .collect()
+        };
+        Some(BasketCard {
+            unit_id: hull.unit_id,
+            name: hull.name.clone(),
+            number: hull.hull_number.clone(),
+            class_label: hull.class_id.clone(),
+            placed: hull.start.is_some(),
+            commander: hull.commander_id,
+            host: hull.host,
+            aboard,
+        })
+    }
+
     let mut claimed: Vec<i64> = Vec::new();
     let mut channels: Vec<BasketChannel> = crate::groups::tree(&groups)
         .into_iter()
@@ -36342,34 +37373,31 @@ pub fn basket_channels(draft: &crate::draft::Draft) -> Vec<BasketChannel> {
                 .group
                 .units
                 .iter()
-                .filter_map(|unit_id| {
-                    let hull = draft.force.get(*unit_id)?;
+                .map(|unit_id| {
                     claimed.push(*unit_id);
-                    Some(BasketCard {
-                        unit_id: *unit_id,
-                        name: hull.name.clone(),
-                        number: hull.hull_number.clone(),
-                        class_label: hull.class_id.clone(),
-                        placed: hull.start.is_some(),
-                        commander: hull.commander_id,
-                    })
+                    *unit_id
                 })
+                .filter(|unit_id| !is_rider(*unit_id))
+                .filter_map(|unit_id| card(draft, &riders, unit_id, 0))
                 .collect();
+            // A BODY'S TOTAL IS EVERY HULL UNDER IT, riders included — so it
+            // reads the muster list, not the cards drawn beside it.
+            let total = node.group.units.len();
             BasketChannel {
                 group_id: Some(node.group.local_id),
                 label: node.group.name,
                 depth: node.depth,
                 commander: node.group.commander_id,
-                total: cards.len(),
+                total,
                 cards,
             }
         })
         .collect();
-    // The totals: a body's count is its own cards plus every descendant's,
+    // The totals: a body's count is its own hulls plus every descendant's,
     // so the sum runs down the tree rather than across the list.
     let own: std::collections::BTreeMap<i64, usize> = channels
         .iter()
-        .filter_map(|c| c.group_id.map(|id| (id, c.cards.len())))
+        .filter_map(|c| c.group_id.map(|id| (id, c.total)))
         .collect();
     // A cycle cannot be built (the draft refuses one), but the walk is bounded
     // anyway: a count that recursed for ever would freeze the basket, and the
@@ -36402,27 +37430,36 @@ pub fn basket_channels(draft: &crate::draft::Draft) -> Vec<BasketChannel> {
     let loose: Vec<BasketCard> = draft
         .force
         .hulls()
-        .filter(|hull| !claimed.contains(&hull.unit_id))
-        .map(|hull| BasketCard {
-            unit_id: hull.unit_id,
-            name: hull.name.clone(),
-            number: hull.hull_number.clone(),
-            class_label: hull.class_id.clone(),
-            placed: hull.start.is_some(),
-            commander: hull.commander_id,
-        })
+        .filter(|hull| !claimed.contains(&hull.unit_id) && !is_rider(hull.unit_id))
+        .filter_map(|hull| card(draft, &riders, hull.unit_id, 0))
         .collect();
-    if !loose.is_empty() {
-        channels.push(BasketChannel {
-            group_id: None,
-            label: "UNGROUPED".to_string(),
-            depth: 0,
-            commander: None,
-            total: loose.len(),
-            cards: loose,
-        });
-    }
+    // `UNGROUPED` IS ALWAYS HERE, even with nothing in it: it is the drop
+    // target that ungroups a hull, and a target that disappears once the
+    // last loose hull is grouped is a control the operator cannot find.
+    let total = loose.iter().map(|card| 1 + card.aboard_count()).sum();
+    channels.push(BasketChannel {
+        group_id: None,
+        label: "UNGROUPED".to_string(),
+        depth: 0,
+        commander: None,
+        total,
+        cards: loose,
+    });
     channels
+}
+
+/// The card for `unit_id`, wherever it is drawn — a channel's card, or a
+/// rider inside one. The manifest opens on a host that may itself be aboard.
+fn card_of(cards: &[BasketCard], unit_id: i64) -> Option<&BasketCard> {
+    for card in cards {
+        if card.unit_id == unit_id {
+            return Some(card);
+        }
+        if let Some(found) = card_of(&card.aboard, unit_id) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// One body of the task organisation as the ring pack sees it (`§6.4`).
@@ -36432,19 +37469,37 @@ pub fn basket_channels(draft: &crate::draft::Draft) -> Vec<BasketChannel> {
 /// disagree about what sits under what. Hulls are listed whether or not they
 /// are placed: a pack DEPLOYS a body, and a hull with no ground is exactly the
 /// one a drop should put somewhere.
-pub fn ring_body(groups: &[crate::groups::StagedGroup], id: i64) -> crate::ring::Body {
-    let children_of = crate::groups::children_map(groups);
+pub fn ring_body(draft: &crate::draft::Draft, id: i64) -> crate::ring::Body {
+    let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
+    let children_of = crate::groups::children_map(&groups);
     let by_id: std::collections::BTreeMap<i64, &crate::groups::StagedGroup> =
         groups.iter().map(|group| (group.local_id, group)).collect();
     fn walk(
+        draft: &crate::draft::Draft,
         by_id: &std::collections::BTreeMap<i64, &crate::groups::StagedGroup>,
         children_of: &std::collections::BTreeMap<i64, Vec<i64>>,
         id: i64,
         depth: usize,
     ) -> crate::ring::Body {
+        // A HULL ABOARD SOMETHING IS NOT PACKED: it follows its host, and
+        // giving it a ring of its own would silently disembark it onto water
+        // the operator did not choose. The host is packed, and the rider
+        // goes where the host goes.
         let hulls = by_id
             .get(&id)
-            .map(|group| group.units.clone())
+            .map(|group| {
+                group
+                    .units
+                    .iter()
+                    .copied()
+                    .filter(|unit| {
+                        draft
+                            .force
+                            .get(*unit)
+                            .is_none_or(|hull| hull.host.is_none())
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         // Four levels is the whole ladder (Unsur … Operasi Gabungan); the
         // guard is for a graph that is not one, so a cycle cannot make this
@@ -36456,12 +37511,12 @@ pub fn ring_body(groups: &[crate::groups::StagedGroup], id: i64) -> crate::ring:
                 .get(&id)
                 .into_iter()
                 .flatten()
-                .map(|child| walk(by_id, children_of, *child, depth + 1))
+                .map(|child| walk(draft, by_id, children_of, *child, depth + 1))
                 .collect()
         };
         crate::ring::Body::new(id, hulls, children)
     }
-    walk(&by_id, &children_of, id, 0)
+    walk(draft, &by_id, &children_of, id, 0)
 }
 
 /// One line the map draws for the task organisation: a body's centre to one
@@ -36596,6 +37651,23 @@ fn link_ink(kind: crate::groups::GroupKind) -> crate::view::Rgba {
         GroupKind::Gugus => LINK_GUGUS,
         GroupKind::OperasiGabungan => LINK_OPERASI_GABUNGAN,
     }
+}
+
+/// What the client can say about a drop onto a host (`§5.7`).
+///
+/// Three answers, and the third is the honest one while the host's complement
+/// spec is still in flight: the rule needs what the server knows about the
+/// host, and a client that guessed green would be guessing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FlowEmbark {
+    /// The rule passed on everything the client can check.
+    Allowed,
+    /// The rule refused, in the operator's words.
+    Refused(String),
+    /// The host's complement spec has not been read yet. The drop is taken —
+    /// the draft is local and the press is the authority — and the note says
+    /// so.
+    Unread,
 }
 
 /// One hull in the air: the peel's whole state (`§5.3`).
@@ -44869,6 +45941,255 @@ mod tests {
         assert_eq!(channels.last().and_then(|c| c.group_id), None, "loose last");
     }
 
+    /// A HULL TAKEN OUT SEVERS EVERY TIE IT HAS (`§7.2`).
+    ///
+    /// The bug this pins: the force dropped the hull, the body went on
+    /// mustering it, and the basket drew an id it could not resolve as a
+    /// hull — `UNIT 351` under `TG-1`. A removal is not a force edit; it is
+    /// a statement about every place the hull is named.
+    #[test]
+    fn taking_a_hull_out_leaves_no_ghost() {
+        let mut draft = crate::fixtures::groups_draft().expect("the groups fixture");
+        let book = draft.book.stage_scenario_named("Ties", "");
+        let step = draft
+            .book
+            .stage_step_new(book, "SWEEP", None)
+            .expect("a step");
+        let sub = draft
+            .book
+            .stage_substep(step, "TAKE STATION")
+            .expect("a sub-step");
+        assert!(draft.book.set_substep_units(step, sub, vec![351, 352]));
+        // A rider aboard the hull being taken out.
+        draft.force.set_host(354, Some(351));
+
+        assert!(draft.take_out(351));
+        assert!(draft.force.get(351).is_none());
+        let tg1 = draft
+            .groups
+            .staged_groups()
+            .find(|group| group.name == "TG-1")
+            .expect("the satuan tugas");
+        assert_eq!(tg1.units, vec![352, 353], "the body no longer musters it");
+        assert_eq!(
+            draft.book.substeps_of(step)[0].units,
+            vec![352],
+            "the sub-step no longer commands it"
+        );
+        assert_eq!(
+            draft.force.get(354).and_then(|hull| hull.host),
+            None,
+            "a rider comes off a hull that is gone"
+        );
+        // And nothing draws it: the basket's cards are the hulls it holds.
+        let channels = basket_channels(&draft);
+        assert!(
+            channels
+                .iter()
+                .flat_map(|channel| &channel.cards)
+                .all(|card| card.unit_id != 351),
+            "no ghost card"
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .find(|channel| channel.label == "TG-1")
+                .map(|channel| channel.total),
+            Some(2),
+            "and no phantom in the count"
+        );
+    }
+
+    /// A HULL CAN LEAVE ITS BODY AND STAY IN THE GAME (`03 GROUPS`).
+    #[test]
+    fn a_hull_can_leave_its_body() {
+        let mut draft = crate::fixtures::groups_draft().expect("the groups fixture");
+        let tg1 = draft
+            .groups
+            .staged_groups()
+            .find(|group| group.name == "TG-1")
+            .map(|group| group.local_id)
+            .expect("the satuan tugas");
+        assert_eq!(draft.ungroup(351), Some(tg1));
+        assert!(!draft.groups.unit_in_group(351), "it left the body");
+        assert!(draft.force.get(351).is_some(), "and stayed in the game");
+        assert_eq!(draft.ungroup(351), None, "there is no body left to leave");
+        // The loose card is drawn in `UNGROUPED`, not in `TG-1`.
+        let channels = basket_channels(&draft);
+        let loose = channels
+            .iter()
+            .find(|channel| channel.group_id.is_none())
+            .expect("the ungrouped channel");
+        assert!(loose.cards.iter().any(|card| card.unit_id == 351));
+    }
+
+    /// `UNGROUPED` IS ALWAYS THERE, because it is the gesture's destination:
+    /// a target that disappears with the last loose hull is a control the
+    /// operator cannot find when they need it.
+    #[test]
+    fn the_ungrouped_channel_is_always_drawn() {
+        let mut draft = crate::fixtures::groups_draft().expect("the groups fixture");
+        // Every hull into a body, and the loose list empties.
+        let tg1 = draft
+            .groups
+            .staged_groups()
+            .find(|group| group.name == "TG-1")
+            .map(|group| group.local_id)
+            .expect("tg-1");
+        assert!(draft
+            .groups
+            .set_units(tg1, vec![351, 352, 353, 354, 367, 361, 524])
+            .is_ok());
+        let channels = basket_channels(&draft);
+        let loose = channels
+            .iter()
+            .find(|channel| channel.group_id.is_none())
+            .expect("the channel is still drawn");
+        assert!(loose.cards.is_empty(), "nothing loose, and the target stays");
+    }
+
+    /// A RIDER IS LISTED UNDER ITS HOST, NOT BESIDE IT (`§5.7`).
+    #[test]
+    fn a_rider_is_listed_under_its_host() {
+        let mut draft = crate::fixtures::groups_draft().expect("the groups fixture");
+        draft.force.set_host(352, Some(351));
+        let channels = basket_channels(&draft);
+        let tg1 = channels
+            .iter()
+            .find(|channel| channel.label == "TG-1")
+            .expect("the satuan tugas");
+        assert_eq!(tg1.cards.len(), 2, "the rider is not a card of its own");
+        assert_eq!(tg1.total, 3, "a rider is still one of the body's hulls");
+        let host = tg1
+            .cards
+            .iter()
+            .find(|card| card.unit_id == 351)
+            .expect("the host");
+        assert_eq!(host.aboard.len(), 1);
+        assert_eq!(host.aboard[0].unit_id, 352);
+        assert_eq!(host.aboard_count(), 1);
+    }
+
+    /// THE EMBARK VERDICT IS THE DRAFT'S, UNTIL THE HOST'S SPEC ARRIVES
+    /// (`§5.7`): a ring and a second host are refused without a round trip,
+    /// and an unread spec is `Unread` rather than a green the client cannot
+    /// stand behind.
+    #[test]
+    fn the_embark_verdict_refuses_what_the_draft_can_prove() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
+        demo.flow_draft = crate::fixtures::groups_draft();
+        assert_eq!(
+            demo.flow_embark_verdict(351, 351),
+            FlowEmbark::Refused("A HULL DOES NOT EMBARK ON ITSELF".to_string())
+        );
+        assert_eq!(
+            demo.flow_embark_verdict(351, 352),
+            FlowEmbark::Unread,
+            "the host's boxes have not been read"
+        );
+        // Already aboard something else.
+        demo.flow_draft
+            .as_mut()
+            .expect("a draft")
+            .force
+            .set_host(354, Some(367));
+        assert!(matches!(
+            demo.flow_embark_verdict(351, 354),
+            FlowEmbark::Refused(why) if why.contains("ABOARD")
+        ));
+        // A ring: 352 aboard 351, so 351 may not go aboard 352.
+        demo.flow_draft
+            .as_mut()
+            .expect("a draft")
+            .force
+            .set_host(352, Some(351));
+        assert!(matches!(
+            demo.flow_embark_verdict(352, 351),
+            FlowEmbark::Refused(why) if why.contains("RING")
+        ));
+    }
+
+    /// A CARD LET GO ON A CARD IS ABOARD IT (`§5.7`), and it leaves its water
+    /// behind: a hull with a host AND a position is a state the server
+    /// refuses.
+    #[gpui::test]
+    fn a_card_dropped_on_a_card_embarks(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
+            demo.flow_draft = crate::fixtures::groups_draft();
+            demo.flow_stage = crate::draft::Stage::Units;
+            demo
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.flow_carry = Some(FlowCarry {
+                    unit_ids: vec![354],
+                    group_id: None,
+                    label: "KRI OSWALD SIAHAAN".into(),
+                    from: (10.0, 10.0),
+                    at: (20.0, 20.0),
+                    lifted: true,
+                });
+                assert!(demo.carry_into_card(351, cx));
+                let hull = demo
+                    .flow_draft
+                    .as_ref()
+                    .expect("a draft")
+                    .force
+                    .get(354)
+                    .expect("the rider");
+                assert_eq!(hull.host, Some(351));
+                assert!(hull.start.is_none(), "it has no water of its own");
+                assert_eq!(demo.flow_manifest, Some(351), "the manifest opens");
+                assert!(demo.flow_drop_note.as_deref().unwrap_or_default().contains("ABOARD"));
+            })
+        });
+    }
+
+    /// A REFUSED EMBARK LEAVES THE HULL WHERE IT WAS, and says why.
+    #[gpui::test]
+    fn a_refused_embark_changes_nothing(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
+            demo.flow_draft = crate::fixtures::groups_draft();
+            demo
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.flow_draft
+                    .as_mut()
+                    .expect("a draft")
+                    .force
+                    .set_host(354, Some(367));
+                demo.flow_carry = Some(FlowCarry {
+                    unit_ids: vec![354],
+                    group_id: None,
+                    label: "KRI OSWALD SIAHAAN".into(),
+                    from: (10.0, 10.0),
+                    at: (20.0, 20.0),
+                    lifted: true,
+                });
+                assert!(demo.carry_into_card(351, cx));
+                let hull = demo
+                    .flow_draft
+                    .as_ref()
+                    .expect("a draft")
+                    .force
+                    .get(354)
+                    .expect("the hull");
+                assert_eq!(hull.host, Some(367), "it stays where it was");
+                assert!(demo
+                    .flow_drop_note
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("CANNOT EMBARK"));
+            })
+        });
+    }
+
     /// A BODY'S COUNT IS EVERY HULL UNDER IT. A gugus that musters no hulls
     /// directly still holds its satgas' cards, and the header has to say so:
     /// `0 CARDS` while five ships sit beneath it is a count that lies.
@@ -44950,14 +46271,13 @@ mod tests {
     #[test]
     fn the_ring_body_is_the_drafts_tree() {
         let draft = crate::fixtures::groups_draft().expect("the groups fixture");
-        let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
         let gus = draft
             .groups
             .staged_groups()
             .find(|group| group.name == "GUS-1")
             .map(|group| group.local_id)
             .expect("the gugus");
-        let body = ring_body(&groups, gus);
+        let body = ring_body(&draft, gus);
         assert!(body.hulls.is_empty(), "a gugus musters no hulls directly");
         assert_eq!(body.children.len(), 2, "its two satgas");
         let hulls: Vec<i64> = body

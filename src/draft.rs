@@ -1065,6 +1065,71 @@ impl Draft {
         self.force.len()
     }
 
+    /// TAKE A HULL OUT OF THE EXERCISE, AND SEVER EVERY TIE IT HAS.
+    ///
+    /// A HULL IS NAMED IN FOUR PLACES: the force, a body's muster list, a
+    /// sub-step's audience, and some other hull's `host`. Removing it from
+    /// the force alone left the other three naming an id the draft no longer
+    /// held, and the basket drew that id as `UNIT 351` under a body that
+    /// still claimed it. The ties are cut here, once, because a control that
+    /// removes a hull and forgets one of them is a control that leaves a
+    /// ghost.
+    ///
+    /// RIDERS COME OFF, THEY DO NOT VANISH. A hull taken out cannot carry
+    /// anything afterwards — the attach endpoint 404s on a host the exercise
+    /// does not hold — so anything aboard it returns to the water rather
+    /// than staying attached to a hull nobody can find.
+    ///
+    /// Answers whether the force held it. A hull that was only in a body (a
+    /// state no control builds, but a resumed draft can hold) still has its
+    /// ties cut.
+    pub fn take_out(&mut self, unit_id: i64) -> bool {
+        let held = self.force.remove(unit_id).is_some();
+        // Every body that musters it, in one pass over the ids: `set_units`
+        // borrows the draft mutably, so the list is collected first.
+        let owners: Vec<i64> = self
+            .groups
+            .staged_groups()
+            .filter(|group| group.units.contains(&unit_id))
+            .map(|group| group.local_id)
+            .collect();
+        for owner in owners {
+            let rest: Vec<i64> = self
+                .groups
+                .get(owner)
+                .map(|group| {
+                    group
+                        .units
+                        .iter()
+                        .copied()
+                        .filter(|unit| *unit != unit_id)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let _ = self.groups.set_units(owner, rest);
+        }
+        // Anything it carried returns to the water.
+        let riders: Vec<i64> = self
+            .force
+            .hulls()
+            .filter(|hull| hull.host == Some(unit_id))
+            .map(|hull| hull.unit_id)
+            .collect();
+        for rider in riders {
+            self.force.set_host(rider, None);
+            self.force.set_start(rider, None);
+        }
+        // A sub-step that named it no longer does.
+        self.book.detach_unit(unit_id);
+        held
+    }
+
+    /// UNGROUP A HULL (`03 GROUPS`): take it out of whatever body musters it
+    /// and leave it in the force, loose. Answers the body it left.
+    pub fn ungroup(&mut self, unit_id: i64) -> Option<i64> {
+        self.groups.remove_unit(unit_id)
+    }
+
     /// How many of the force are on the map, and how many are in the game
     /// without a position. The two legends of F3d and the map mode's header
     /// (`<n> PLACED · <n> UNPLACED`).

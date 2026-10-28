@@ -2053,8 +2053,44 @@ fn main() {
                         let outcome = if token2.is_empty() {
                             Err("signed out \u{2014} sign in to embark".to_string())
                         } else if game_id == 0 {
-                            Err("no held game \u{2014} there is no exercise to embark in"
-                                .to_string())
+                            // A DRAFT HAS NO GAME YET, AND STILL HAS HOSTS.
+                            // The complements are a fact about the HULL, not
+                            // about the exercise (`/units/{id}/capacities`),
+                            // so the flow's drag can be answered green or red
+                            // before the game that will hold it exists. What
+                            // it carries is the draft's own list, so the
+                            // aboard half is empty here.
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                let outcome = Err("could not reach the server".to_string());
+                                if embark_spec_tx.send(outcome).is_err() {
+                                    return;
+                                }
+                                continue;
+                            };
+                            let caps = match master.unit_capacities(&token2, host) {
+                                Ok(caps) => caps,
+                                Err(tfg::backend::BackendError::Api { status: 404, .. }) => {
+                                    eprintln!("embark spec for {host}: no complements declared");
+                                    Vec::new()
+                                }
+                                Err(e) => {
+                                    let outcome =
+                                        Err(format!("could not read what {host} carries: {e}"));
+                                    if embark_spec_tx.send(outcome).is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            };
+                            eprintln!(
+                                "embark spec for {host}: {} complement(s), no game yet",
+                                caps.len()
+                            );
+                            Ok(tfg::embark::EmbarkSpec {
+                                host,
+                                caps,
+                                aboard: Vec::new(),
+                            })
                         } else {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 // The order loop answers ONE order and then

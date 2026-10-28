@@ -258,6 +258,31 @@ impl GroupsDraft {
         Ok(())
     }
 
+    /// UNGROUP A HULL: take it out of the body that musters it, and leave it
+    /// in the force. Answers the body it left, or `None` when no body held
+    /// it.
+    ///
+    /// THE GROUP STAYS. A Satuan Tugas that just lost its last hull is a
+    /// legal, empty command — deleting it here would also delete its
+    /// commander's post, which the operator did not ask for. The hull is the
+    /// thing being moved, so it is the only thing that moves.
+    pub fn remove_unit(&mut self, unit_id: i64) -> Option<i64> {
+        let owner = self.unit_owner(unit_id)?;
+        let rest: Vec<i64> = self
+            .view(owner)
+            .map(|group| {
+                group
+                    .units
+                    .iter()
+                    .copied()
+                    .filter(|unit| *unit != unit_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.set_units(owner, rest).ok()?;
+        Some(owner)
+    }
+
     /// Re-parent a group, or make it a root with `None`. Fails loud on an
     /// unknown parent, a cycle, or a rank violation.
     pub fn set_parent(&mut self, group_id: i64, parent: Option<i64>) -> Result<(), String> {

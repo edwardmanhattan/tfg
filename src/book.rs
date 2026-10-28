@@ -325,6 +325,30 @@ impl BookDraft {
         true
     }
 
+    /// CUT A HULL OUT OF EVERY SUB-STEP THAT NAMED IT.
+    ///
+    /// A SUB-STEP'S AUDIENCE IS A LIST OF UNIT IDS, not a reference the
+    /// force can cascade: taking a hull out of the exercise left the book
+    /// still assigning it a task, and the write would then name a hull the
+    /// game does not hold. The cut is local and whole — every sub-step, in
+    /// every step — because the alternative is an audience that depends on
+    /// which step the operator happened to open.
+    ///
+    /// Answers how many sub-steps lost it.
+    pub fn detach_unit(&mut self, unit_id: i64) -> usize {
+        let mut cut = 0usize;
+        for list in self.substeps.values_mut() {
+            for substep in list.iter_mut() {
+                let before = substep.units.len();
+                substep.units.retain(|unit| *unit != unit_id);
+                if substep.units.len() != before {
+                    cut += 1;
+                }
+            }
+        }
+        cut
+    }
+
     /// Replace a sub-step's command text in the local planning draft.
     pub fn set_substep_content(
         &mut self,
