@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TFG Control Server — API List</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, securityLevel: "loose" });</script>
+<style>
+  :root { --bg:#f6f7f9; --card:#ffffff; --ink:#1c2430; --muted:#5b6773; --accent:#1a3a5c; --line:#d9dee6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; line-height:1.6; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { color:var(--accent); font-size: 28px; margin: 0 0 4px; }
+  h2 { color:var(--accent); font-size: 20px; margin: 32px 0 10px; }
+  h3 { font-size: 16px; margin: 22px 0 8px; }
+  code, pre { background:#eceff3; padding:2px 6px; border-radius:4px; font-size: 0.92em; }
+  pre { padding:12px; overflow-x:auto; white-space: pre-wrap; word-wrap: break-word; }
+  table { border-collapse: collapse; width:100%; margin: 10px 0 18px; font-size: 14px; }
+  th, td { border:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; }
+  th { background:#eef2f6; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin: 12px 0 18px; }
+  .mermaid { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; margin: 12px 0 18px; }
+  .note { background:#fff8e6; border:1px solid #ecd9a0; border-radius:8px; padding:10px 14px; margin: 12px 0 18px; }
+  footer { margin-top: 32px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>TFG Control Server — API List</h1>
+  <p>Daftar API untuk server kontrol TFG (protokol v2). Senarai ini untuk developer aplikasi mobile jarak jauh.</p>
+
+  <h2>Base</h2>
+  <div class="card">
+    <ul>
+      <li><strong>Layanan:</strong> <code>tfg-control</code>, <strong>API:</strong> <code>v1</code>, <strong>Protokol:</strong> <code>2</code>.</li>
+      <li><strong>Base path:</strong> <code>/v1/</code>.</li>
+      <li><strong>Host:</strong> konsol mode klien, atau headless host (<code>tfg-server</code>). Default listen: <code>127.0.0.1:8787</code>.</li>
+      <li><strong>Client:</strong> base URL + <code>Authorization: Bearer &lt;token&gt;</code>.</li>
+    </ul>
+  </div>
+
+  <h2>Autentikasi</h2>
+  <div class="card">
+    <ul>
+      <li>Token bearer <strong>wajib</strong> kecuali <code>GET /v1/hello</code> dan <code>POST /v1/pair</code>.</li>
+      <li>Scopes: <code>observe</code>, <code>control_view</code>, <code>admin</code>.</li>
+      <li><code>observe</code> — baca. <code>control_view</code> — perintah kamera + <code>view.report</code>. <code>admin</code> — pairing &amp; perangkat.</li>
+    </ul>
+  </div>
+
+  <h2>Endpoint</h2>
+
+  <h3>Baca</h3>
+  <table>
+    <tr><th>Method</th><th>Path</th><th>Auth</th><th>Purpose</th><th>In</th><th>Out</th><th>Example</th></tr>
+    <tr><td>GET</td><td>/v1/hello</td><td>none</td><td>protocol, revision, pairing_open</td><td>—</td><td>JSON</td><td><code>{"protocol_version":2,"revision":7,"pairing_open":false}</code></td></tr>
+    <tr><td>GET</td><td>/v1/whoami</td><td>bearer</td><td>grant + scopes token</td><td>—</td><td>JSON</td><td><code>{"client":"dev-4b2379bfa714","scopes":["observe","control_view"]}</code></td></tr>
+    <tr><td>GET</td><td>/v1/state</td><td>observe</td><td>state penuh: views, session, readiness, displays</td><td>—</td><td>JSON</td><td><code>{"type":"snapshot","revision":7,"session":{"game_id":45},"readiness":{"ready":true}}</code></td></tr>
+    <tr><td>GET</td><td>/v1/views</td><td>observe</td><td>views</td><td>—</td><td>JSON</td><td><code>{"views":{"main":{"id":"main"},"observer":{"id":"observer"}}}</code></td></tr>
+    <tr><td>GET</td><td>/v1/views/&#123;view_id&#125;/camera</td><td>observe</td><td>camera satu view</td><td>—</td><td>JSON; 404 if unknown</td><td><code>{"id":"main","camera":{"center":{"latitude":-6.108,"longitude":106.91},"zoom":11.0,"width":1280,"height":720}}</code></td></tr>
+    <tr><td>GET</td><td>/v1/session</td><td>observe</td><td>exercise + readiness + displays</td><td>—</td><td>JSON</td><td><code>{"game_id":45,"phase":"execution"}</code></td></tr>
+    <tr><td>GET</td><td>/v1/units/&#123;unit_id&#125;/picture</td><td>observe</td><td>foto kapal (image/png)</td><td>—</td><td>image/png</td><td>image/png</td></tr>
+    <tr><td>GET</td><td>/v1/displays</td><td>observe</td><td>displays + readiness</td><td>—</td><td>JSON</td><td><code>{"displays":[{"id":"wall-1"}],"readiness":{"ready":true}}</code></td></tr>
+  </table>
+
+  <h3>Perintah</h3>
+  <table>
+    <tr><th>Method</th><th>Path</th><th>Auth</th><th>Purpose</th><th>In</th><th>Out</th><th>Example</th></tr>
+    <tr><td>POST</td><td>/v1/commands</td><td>control_view</td><td>kirim satu perintah; 202 accepted / 200 duplicate</td><td>JSON command — <code>{"protocol_version":2,"type":"camera.nudge","payload":{"dx_fraction":0.25,"dy_fraction":0.0}}</code></td><td>202 accepted / 200 duplicate JSON</td><td><code>{"command_id":"01J8Z6Q0K3","status":"accepted","revision":7}</code></td></tr>
+  </table>
+
+  <h3>Realtime</h3>
+  <table>
+    <tr><th>Method</th><th>Path</th><th>Auth</th><th>Purpose</th><th>In</th><th>Out</th><th>Example</th></tr>
+    <tr><td>GET</td><td>/v1/ws</td><td>observe</td><td>realtime stream</td><td>WS upgrade; <code>request.snapshot</code> — e.g. <code>{"type":"request.snapshot"}</code></td><td>events</td><td><code>{"type":"camera.changed","revision":8}</code></td></tr>
+  </table>
+
+  <h2>Diagram API</h2>
+  <div class="mermaid">
+    sequenceDiagram
+        autonumber
+        participant C as Client (Mobile / tfgctl)
+        participant S as TFG Control Server
+        C->>S: GET /v1/hello
+        S-->>C: { protocol_version: 2, revision, pairing_open }
+        C->>S: GET /v1/state
+        S-->>C: { views, session, readiness, displays }
+        C->>S: POST /v1/commands (camera.nudge)
+        S-->>C: 202 accepted { command_id, status, revision }
+        S-->>C: camera.changed { revision, source, view }
+        C->>S: GET /v1/ws
+        S-->>C: snapshot
+  </div>
+
+  <h2 id="pairing-dan-perangkat">Pairing dan Perangkat</h2>
+  <p>Aplikasi mobile <strong>tidak</strong> punya scope <code>admin</code>, jadi <strong>tidak</strong> memanggil <code>POST /v1/pairing</code>. Langkah pertama aplikasi adalah <strong>memindai QR</strong> yang dibuat operator, lalu menukar <code>code</code> dari QR itu dengan token. <code>POST /v1/pairing</code> hanya dijalankan operator (console / <code>tfg-server</code>).</p>
+
+  <div class="card">
+    <h3>Alur pairing (mobile)</h3>
+    <ol>
+      <li><strong>Memindai QR → baca jawaban pairing.</strong> Operator memanggil <code>POST /v1/pairing</code>; server balas JSON berisi <code>code</code>. QR / deep link membawa <code>code</code> + host (<code>url</code>). Aplikasi cukup parsing <code>code</code> dari QR — tidak perlu memanggil <code>/v1/pairing</code>. Contoh jawaban ini dibungkus di dalam QR:</li>
+    </ol>
+    <pre><code>{
+  "code": "K7QM-3XPD",
+  "expires_in": 120,
+  "uri": "tfg-control://pair?url=http://192.168.1.20:8787&code=K7QM-3XPD",
+  "payload": "...",
+  "url": "http://192.168.1.20:8787",
+  "scopes": ["observe", "control_view"]
+}</code></pre>
+    <p style="margin:12px 0 4px"><strong>Aplikasi ambil:</strong> <code>code</code> (<code>"K7QM-3XPD"</code>) dan host dari <code>url</code> (<code>http://192.168.1.20:8787</code>). <code>code</code> berlaku <code>expires_in</code> detik (default 120, dibatasi 30–600).</p>
+    <ol start="2">
+      <li><strong>Tukar code dengan token.</strong> Panggil <code>POST /v1/pair</code> — <strong>tanpa bearer</strong>, karena <code>code</code> itulah kredensialnya — dengan payload di bawah. <code>code</code> dikirim <em>persis</em> seperti yang didapat dari QR.</li>
+    </ol>
+    <pre><code>// POST /v1/pair   (tanpa Authorization header)
+// Content-Type: application/json
+{ "code": "K7QM-3XPD", "label": "phone" }</code></pre>
+    <p style="margin:12px 0 4px"><strong>Jawaban <code>/v1/pair</code>:</strong> simpan <code>token</code> dan pakai sebagai bearer untuk semua panggilan berikutnya. <code>code</code> hanya bisa dipakai sekali; 5 kali salah → <code>429</code>.</p>
+    <pre><code>{
+  "device": { "id": "dev-4b2379bfa714", "label": "phone", "scopes": ["observe","control_view"], "created_at": 1793084168, "last_seen": 1793084168 },
+  "token": "9f2c…",
+  "url": "http://192.168.1.20:8787"
+}</code></pre>
+  </div>
+
+  <div class="note">
+    <strong>Ringkas:</strong> scan QR → ambil <code>code</code> → <code>POST /v1/pair</code> dengan <code>{code, label}</code> (no auth) → simpan <code>token</code> sebagai <code>Authorization: Bearer &lt;token&gt;</code>. Baru mulai baca (<code>/v1/state</code>, <code>/v1/session</code>) dan kirim perintah.
+  </div>
+
+  <h2>Contoh</h2>
+  <h3>Baca</h3>
+  <pre><code>{
+  "protocol_version": 2,
+  "api_version": "v1",
+  "service": "tfg-control",
+  "revision": 7,
+  "pairing_open": false
+}</code></pre>
+  <pre><code>{
+  "client": "dev-4b2379bfa714",
+  "label": "phone",
+  "scopes": ["observe", "control_view"]
+}</code></pre>
+  <pre><code>{
+  "type": "snapshot",
+  "protocol_version": 2,
+  "revision": 7,
+  "views": { "main": { "id": "main", "camera": { "center": { "latitude": -6.108, "longitude": 106.91 }, "zoom": 11.0, "width": 1280, "height": 720 } } },
+  "session": { "game_id": 45, "phase": "execution" },
+  "readiness": { "ready": true },
+  "displays": [ { "id": "wall-1", "role": "command_center" } ]
+}</code></pre>
+  <pre><code>{ "views": { "main": { "id": "main" }, "observer": { "id": "observer" } } }</code></pre>
+  <pre><code>{ "id": "main", "camera": { "center": { "latitude": -6.108, "longitude": 106.91 }, "zoom": 11.0, "width": 1280, "height": 720 } }</code></pre>
+  <pre><code>{ "game_id": 45, "phase": "execution" }</code></pre>
+  <pre><code>image/png</code></pre>
+  <pre><code>{ "displays": [ { "id": "wall-1" } ], "readiness": { "ready": true } }</code></pre>
+
+  <h3>Commands</h3>
+  <pre><code>{
+  "protocol_version": 2,
+  "client_id": "phone-7",
+  "command_id": "01J8Z6Q0K3",
+  "type": "camera.nudge",
+  "payload": { "dx_fraction": 0.25, "dy_fraction": 0.0 },
+  "view": "observer"
+}</code></pre>
+  <pre><code>{ "command_id": "01J8Z6Q0K3", "status": "accepted", "revision": 7 }</code></pre>
+  <pre><code>{ "protocol_version": 2, "type": "camera.zoom", "payload": { "delta": 1.0 } }</code></pre>
+  <pre><code>{ "protocol_version": 2, "type": "camera.set", "payload": { "center": { "latitude": -6.2, "longitude": 106.8 }, "zoom": 12.0 } }</code></pre>
+  <pre><code>{ "protocol_version": 2, "type": "camera.focus", "payload": { "unit_id": 9001, "zoom": 12.0 } }</code></pre>
+  <pre><code>{ "protocol_version": 2, "type": "ui.set", "payload": { "panel": "scenario", "open": true } }</code></pre>
+  <pre><code>{ "protocol_version": 2, "type": "settings.font", "payload": { "step": 1 } }</code></pre>
+  <pre><code>{ "protocol_version": 2, "type": "view.report", "payload": { "width": 1920, "height": 1200 } }</code></pre>
+
+  <h3>Pairing</h3>
+  <pre><code>{ "code": "K7QM-3XPD", "expires_in": 120, "uri": "tfg-control://pair?url=http://192.168.1.20:8787&code=K7QM-3XPD", "payload": "...", "url": "http://192.168.1.20:8787", "scopes": ["observe", "control_view"] }</code></pre>
+  <pre><code>{ "code": "K7QM-3XPD", "label": "phone" }</code></pre>
+  <pre><code>{ "device": { "id": "dev-4b2379bfa714", "label": "phone", "scopes": ["observe","control_view"], "created_at": 1793084168, "last_seen": 1793084168 }, "token": "9f2c…", "url": "http://192.168.1.20:8787" }</code></pre>
+
+  <h3>Realtime</h3>
+  <pre><code>{ "type": "camera.changed", "revision": 8, "source": "phone-7", "command_id": "01J8Z6Q0K3", "view": { "id": "observer", "camera": { "center": { "latitude": -6.2, "longitude": 106.8 }, "zoom": 11.5, "width": 1280, "height": 720 } } }</code></pre>
+
+  <h2>Error</h2>
+  <table>
+    <tr><th>HTTP</th><th>Code</th><th>Purpose</th></tr>
+    <tr><td>401</td><td>unauthorized</td><td>token hilang / salah</td></tr>
+    <tr><td>403</td><td>forbidden</td><td>token ada, scope kurang</td></tr>
+    <tr><td>400</td><td>invalid_json</td><td>body bukan JSON / bukan perintah</td></tr>
+    <tr><td>413</td><td>body_too_large</td><td>body &gt; 64 KiB</td></tr>
+    <tr><td>422</td><td>invalid_command</td><td>perintah tidak bisa diterapkan</td></tr>
+    <tr><td>409</td><td>unsupported_protocol</td><td>protocol_version ≠ 2</td></tr>
+    <tr><td>409</td><td>not_ready</td><td>perintah observer sebelum observation dibuka</td></tr>
+    <tr><td>404</td><td>not_found</td><td>route / view / device tidak ada</td></tr>
+    <tr><td>503</td><td>host_gone</td><td>command channel host tutup</td></tr>
+    <tr><td>503</td><td>too_many_clients</td><td>terlalu banyak client WS</td></tr>
+  </table>
+
+  <h2>Keterangan singkat</h2>
+  <div class="card">
+    <ul>
+      <li><code>GET /v1/state</code> membawa views, session, readiness, displays — ini yang dibaca client.</li>
+      <li><code>POST /v1/commands</code> mengirim perintah; jawaban <code>202 accepted</code> / <code>200 duplicate</code>.</li>
+      <li><code>GET /v1/ws</code> menghubungkan realtime: <code>snapshot</code>, <code>camera.changed</code>, <code>session.changed</code>, <code>display.attached</code>, <code>display.rejected</code>, <code>command.accepted</code>, <code>command.rejected</code>.</li>
+      <li>Perintah kamera: <code>camera.nudge</code>, <code>camera.zoom</code>, <code>camera.set</code>, <code>camera.focus</code>; panel: <code>ui.set</code> (<code>crew</code>, <code>scenario</code>, <code>comms</code>).</li>
+    </ul>
+  </div>
+
+  <h2>Langkah Integrasi (dari nol)</h2>
+  <div class="card">
+    <ol>
+      <li>Jalankan host kontrol (server atau konsol) di jaringan yang sama; catat host-nya (mis. <code>http://192.168.1.20:8787</code>).</li>
+      <li><strong>Pairing dulu untuk dapat token.</strong> Scan QR dari operator, lalu <code>POST /v1/pair</code> dengan <code>{code, label}</code> (tanpa auth); simpan <code>token</code> sebagai bearer. Detail di <a href="#pairing-dan-perangkat">Pairing dan Perangkat</a>.</li>
+      <li>Panggil <code>GET /v1/hello</code> untuk memastikan protokol v2.</li>
+      <li>Dengan bearer, baca: <code>GET /v1/state</code>, <code>GET /v1/session</code>.</li>
+      <li>Cek <code>readiness</code>; jika <code>ready</code>, kirim perintah via <code>POST /v1/commands</code> atau buka <code>GET /v1/ws</code>.</li>
+      <li>Kelola error: <code>401</code>, <code>403</code>, <code>409 not_ready</code>, dst.</li>
+    </ol>
+  </div>
+
+  <footer>TFG Control Server — API list. Detail lengkap: docs/control-api-v1.md.</footer>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({ startOnLoad: true, securityLevel: "loose" });
+</script>
+</body>
+</html>

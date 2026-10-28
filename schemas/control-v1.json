@@ -632,6 +632,7 @@
         "expires_in",
         "uri",
         "payload",
+        "url",
         "scopes"
       ],
       "properties": {
@@ -651,6 +652,10 @@
           "type": "string",
           "description": "The same offer as JSON, for a client that prefers to parse it."
         },
+        "url": {
+          "type": "string",
+          "description": "The direct host base URL the offer points at; what a QR code or deep link hands a client without parsing the URI."
+        },
         "scopes": {
           "type": "array",
           "items": {
@@ -658,7 +663,7 @@
           }
         }
       },
-      "description": "The answer to POST /v1/pairing. uri and payload are the two shapes a QR code or deep link would carry; the server does not render an image."
+      "description": "The answer to POST /v1/pairing. url is the direct host base URL; uri and payload are the two shapes a QR code or deep link would carry; the server does not render an image."
     },
     "pair_request": {
       "type": "object",

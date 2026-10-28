@@ -380,12 +380,13 @@ The response is the offer:
   "expires_in": 120,
   "uri": "tfg-control://pair?url=http://192.168.1.20:8787&code=K7QM-3XPD",
   "payload": "{\"protocol\":\"tfg-control\",\"version\":1,\"url\":\"http://192.168.1.20:8787\",\"pairing_code\":\"K7QM-3XPD\"}",
+  "url": "http://192.168.1.20:8787",
   "scopes": ["observe", "control_view"]
 }
 ```
 
 **The QR encodes `payload`**, not `uri`. `uri` is offered for a deep link. The
-payload is the thing to parse:
+top-level `url` is the direct host base URL; the payload is the thing to parse:
 
 ```json
 { "protocol": "tfg-control", "version": 1,

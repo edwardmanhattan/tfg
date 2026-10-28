@@ -166,6 +166,12 @@ pub struct PairingOffer {
     pub uri: String,
     /// The same thing as JSON, for a client that would rather parse it.
     pub payload: String,
+    /// The direct host base URL the offer points at.
+    ///
+    /// A client should not have to pull the URL out of [`PairingOffer::uri`]
+    /// to learn where to send a command; this field already carries it, next to
+    /// `uri` and `payload`, which are the same offer in their other shapes.
+    pub url: String,
     pub scopes: Vec<Scope>,
 }
 
@@ -401,6 +407,7 @@ impl Devices {
             expires_in: ttl.as_secs(),
             uri,
             payload,
+            url: url.to_string(),
             scopes,
         })
     }
@@ -904,6 +911,7 @@ mod tests {
             .expect("window");
         assert!(offer.uri.starts_with("tfg-control://pair?"));
         assert!(offer.uri.contains("192.168.1.20"));
+        assert_eq!(offer.url, "http://192.168.1.20:8787");
         let payload: serde_json::Value = serde_json::from_str(&offer.payload).expect("json");
         assert_eq!(payload["protocol"], "tfg-control");
         assert_eq!(payload["version"], 1);

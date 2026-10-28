@@ -570,6 +570,7 @@ Needs `admin`.
   "expires_in": 120,
   "uri": "tfg-control://pair?url=http://192.168.1.20:8787&code=K7QM-3XPD",
   "payload": "{\"protocol\":\"tfg-control\",\"version\":1,\"url\":\"http://192.168.1.20:8787\",\"pairing_code\":\"K7QM-3XPD\"}",
+  "url": "http://192.168.1.20:8787",
   "scopes": ["observe", "control_view"]
 }
 ```
@@ -581,8 +582,9 @@ Needs `admin`.
   revocation.
 - Opening a window replaces any window already open: there is one code on screen
   at a time.
-- `uri` and `payload` are the same offer in the two shapes a QR code or a deep
-  link would carry. **The server does not render a QR image**; the offer is
+- `url` is the direct host base URL the offer points at; `uri` and `payload` are
+  the same offer in the two shapes a QR code or a deep link would carry. **The
+  server does not render a QR image**; the offer is
   text. The reference client does draw one: `tfgctl pair` prints a terminal QR
   code when its stdout is a terminal, and only the code, URL and payload lines
   when it is piped. The rendered code is byte-mode level M, versions 1–10, and
