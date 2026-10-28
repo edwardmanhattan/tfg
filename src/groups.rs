@@ -20,7 +20,8 @@ mod scopes;
 
 pub use model::{Group, GroupKind};
 pub use plan::{
-    GroupRef, GroupWrite, GroupsDraft, LiveGroup, StagedGroup, TreeNode, join_members, plan, tree,
+    GroupRef, GroupWrite, GroupsDraft, LiveGroup, StagedGroup, TreeNode, children_map,
+    join_members, plan, tree,
 };
 pub use scopes::Scope;
 

@@ -480,6 +480,23 @@ A reopened draft, `12 UNITS · 9 PLACED · 3 UNPLACED`, a flat grid of cards,
 - `FILLED PIN = ON THE MAP · HOLLOW RING = IN THE GAME, NO POSITION`
 - `✕ TAKES THE PIECE OUT OF THE GAME · DRAG A CARD OUT TO PLACE OR MOVE IT`
 
+**The whole card is the handle.** A press on the picture, the pennant or the
+blank under the name picks the hull up; only the take-mark is outside the
+gesture, and it is a click, not a drag.
+
+**A channel's title carries the BODY; its cards carry themselves.** A body's
+row picks up the body — the same gesture as its band on the board, so it can be
+nested, made a root, or packed onto the map — and a hull is picked up by its own
+card. `UNGROUPED` is not a body, so its title carries the loose hulls it lists.
+
+**A channel is a destination, body and all.** The title is a thin row, and the
+cards under it are what a dropped card would join; the whole channel takes the
+drop, and tints while something is in the air.
+
+**A channel's count is every hull under it.** `5 CARDS` for a gugus holding two
+satgas of three and two: a card is a hull, and a body's cards are all the hulls
+it is fought with, not only the ones it musters directly.
+
 ### 5.6 Map mode (F3e)
 
 The map expands to the window. Header: `MAP MODE`, `<n> PLACED · <n> UNPLACED ·
@@ -493,6 +510,19 @@ The map expands to the window. Header: `MAP MODE`, `<n> PLACED · <n> UNPLACED �
 - `⌫ LIFT POSITION` clears the position and **keeps the hull in the game**.
 - Dragging a cluster moves every hull in it: `MOVE ONE HULL → 1 PLACEMENT
   WRITE`; `MOVE A CLUSTER → N WRITES, UNIT-ID ORDER, NO BATCH ROUTE`.
+- **The organisation is drawn on the water.** Each body is a star: its own
+  centre (the mean of the placed hulls under it) joined to every hull it
+  musters directly and to the centre of every body beneath it. One ink per
+  level — `20` amber, `30` violet, `40` mint — because a link is read by which
+  level it draws. A body with fewer than two placed hulls draws nothing (its
+  centre is its hull), and an unplaced hull is not on the picture: the map
+  draws what is placed, and the basket draws the rest.
+
+  ```text
+  satgas   ●─── hull        a star of its own hulls, in its level's ink
+           ╲─── hull
+  gugus    ●────●           the centres of the satgas under it
+  ```
 - `A FAILURE PART-WAY LEAVES SOME MOVED AND SOME NOT · THE BASKET DRAWS BOTH`.
   This is the commit's behaviour, not the drag's: nothing is written until 06.
   At commit, a partial placement failure leaves the successful ones written and
@@ -583,8 +613,15 @@ on a second body moves it, and the first body loses it.
 
 ### 6.4 The ring pack (F4c)
 
-A **group** dropped on the map packs its hulls around the drop point. A hull
-dropped on the map is one placement, not a pack.
+A **group** dropped on the map packs its hulls around the drop point — every
+hull under it, placed already or not, because the drop is how a body is
+deployed and how it is moved. A hull dropped on the map is one placement, not a
+pack.
+
+The gesture: map mode open, the basket open over it, a body's title dragged out
+onto the water. Its hulls are laid out around the pointer, and the note says
+`GUS-1 PACKED · 5 HULLS AROUND THE DROP · 5 PLACEMENT WRITES, UNIT-ID ORDER`.
+Nothing is sent until the press.
 
 This is the one piece of geometry in the flow, so it is a pure module
 (`src/ring.rs`) with its own tests:

@@ -555,6 +555,50 @@ pub struct TreeNode {
 /// - **A cycle.** Two groups naming each other as parent would make the walk
 ///   infinite; the second one becomes a root, which is the least surprising
 ///   thing to draw and keeps the board finite.
+/// The staged groups' children, by parent — the same edges [`tree`] walks, as
+/// a graph rather than as rows.
+///
+/// THE RING PACK, THE MAP'S LINKS AND THE BASKET'S COUNTS all read the
+/// organisation as "what hangs under this body", and all three need the same
+/// answer in the same order. One function, so a hull that a drop moved under a
+/// different body cannot be packed under one parent and counted under another.
+///
+/// A parent that is not in the staged set makes its child a root, exactly as
+/// [`tree`] draws it: the map must not link a hull to a body that is not there.
+/// A group naming itself is its own root, and the caller's walk is bounded by
+/// the rank ladder rather than by trusting this map.
+pub fn children_map(groups: &[StagedGroup]) -> BTreeMap<i64, Vec<i64>> {
+    let present: BTreeSet<i64> = groups.iter().map(|g| g.local_id).collect();
+    let by_id: BTreeMap<i64, &StagedGroup> =
+        groups.iter().map(|g| (g.local_id, g)).collect();
+    let mut out: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    for group in groups {
+        let Some(parent) = group
+            .parent
+            .filter(|p| present.contains(p) && *p != group.local_id)
+        else {
+            continue;
+        };
+        out.entry(parent).or_default().push(group.local_id);
+    }
+    // The tree's own sibling order — descending rank, then by name (`§6.1`),
+    // so a pack and a board list a body's children the same way round.
+    for bucket in out.values_mut() {
+        bucket.sort_by(|a, b| {
+            let (a, b) = (by_id.get(a), by_id.get(b));
+            match (a, b) {
+                (Some(a), Some(b)) => b
+                    .kind
+                    .rank()
+                    .cmp(&a.kind.rank())
+                    .then_with(|| a.name.cmp(&b.name)),
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+    }
+    out
+}
+
 pub fn tree(groups: &[StagedGroup]) -> Vec<TreeNode> {
     use std::collections::HashSet;
     let present: HashSet<i64> = groups.iter().map(|g| g.local_id).collect();

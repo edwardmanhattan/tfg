@@ -168,6 +168,19 @@ pub const RANK_SATUAN_TUGAS: Rgba = Rgba::rgb(0x25, 0x63, 0xEB);
 pub const RANK_GUGUS: Rgba = Rgba::rgb(0x93, 0x33, 0xEA);
 pub const RANK_OPERASI_GABUNGAN: Rgba = Rgba::rgb(0xEA, 0x58, 0x0C);
 
+/// THE ECHELON LINKS: the ink a map link wears, one per level.
+///
+/// A link between a body and its hulls is read by WHICH LEVEL it draws, so the
+/// ink is the level's — categorical, map-only, and barred from chrome for the
+/// same reason `RANK_*` is. They are not `RANK_*` verbatim because two of that
+/// palette's inks are chosen for a legend against chrome, not for a hairline
+/// over water: `#2563EB` all but vanishes on the sea, and a link nobody can
+/// see is not a link. Warm to cool up the ladder, so two levels stay apart at
+/// one pixel.
+pub const LINK_SATUAN_TUGAS: Rgba = Rgba::rgb(0xF2, 0xA6, 0x2E);
+pub const LINK_GUGUS: Rgba = Rgba::rgb(0xC0, 0x5C, 0xF0);
+pub const LINK_OPERASI_GABUNGAN: Rgba = Rgba::rgb(0x3F, 0xD9, 0xB0);
+
 // ---------------------------------------------------------------------------
 // Rim
 //

@@ -21881,6 +21881,76 @@ impl IslandDemo {
         true
     }
 
+    /// A GROUP, OR A CARD, LET GO ON THE WATER (`§6.4`).
+    ///
+    /// A HULL DROPPED ON THE MAP IS ONE PLACEMENT; A GROUP IS A PACK. The
+    /// geometry is [`crate::ring`]'s — the anchor is the drop, the hulls go on
+    /// rings around it, and a sub-group keeps its own centre — so this
+    /// function only says what is in the hand and writes the positions the
+    /// pack derived. Nothing is sent: the draft holds them until the press,
+    /// and the press writes them one at a time in unit-id order.
+    ///
+    /// A HULL THAT ALREADY HAS GROUND MOVES; one that has none is deployed.
+    /// Either way the hull leaves whatever carried it, because a hull with a
+    /// position AND a host is a state the server refuses.
+    fn carry_into_map(
+        &mut self,
+        at: (f32, f32),
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(carry) = self.flow_carry.clone() else {
+            return false;
+        };
+        if !carry.lifted {
+            return false;
+        }
+        let Some((lat, lon)) = self.flow_ground_at(at, window) else {
+            return false;
+        };
+        self.flow_carry = None;
+        let Some(draft) = &mut self.flow_draft else {
+            return false;
+        };
+        let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
+        let body = match carry.group_id {
+            Some(id) => ring_body(&groups, id),
+            // Cards in the hand are a body with no children: one card lands
+            // on the anchor exactly, several spread on the same rings a
+            // group's hulls would.
+            None => crate::ring::Body::new(0, carry.unit_ids.clone(), Vec::new()),
+        };
+        let pack = crate::ring::pack(&body, crate::force::Start { lat, lon });
+        if pack.is_empty() {
+            self.flow_drop_note = Some(format!(
+                "{} HOLDS NO HULLS \u{b7} NOTHING TO PACK",
+                carry.label.to_uppercase()
+            ));
+            cx.notify();
+            return true;
+        }
+        for (unit_id, start) in &pack.writes {
+            draft.force.set_start(*unit_id, Some(*start));
+            draft.force.set_host(*unit_id, None);
+        }
+        let n = pack.len();
+        self.flow_drop_note = Some(match (carry.group_id.is_some(), n) {
+            (true, n) => format!(
+                "{} PACKED \u{b7} {n} HULLS AROUND THE DROP \u{b7} {n} PLACEMENT WRITES, UNIT-ID ORDER",
+                carry.label.to_uppercase()
+            ),
+            (false, 1) => format!(
+                "{} PLACED \u{b7} 1 PLACEMENT WRITE",
+                carry.label.to_uppercase()
+            ),
+            (false, n) => format!(
+                "{n} CARDS PACKED \u{b7} {n} PLACEMENT WRITES, UNIT-ID ORDER"
+            ),
+        });
+        cx.notify();
+        true
+    }
+
     /// A DROP ON THE EMPTY CANVAS.
     ///
     /// Two things can land here. CARDS make a new body at the echelon chosen
@@ -22461,14 +22531,19 @@ impl IslandDemo {
     /// not a tree. The header carries the body's cards, which is the `§7.2`
     /// rule — a group drags out as every leaf hull beneath it, because the
     /// write names units and never nodes.
-    fn basket_channel(&self, channel: &BasketChannel, cx: &mut Context<Self>) -> AnyElement {
+    fn basket_channel(
+        &self,
+        at: usize,
+        channel: &BasketChannel,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let label = channel.label.clone();
         let indent = pt(14.0 * channel.depth as f32);
         let carried_ids: Vec<i64> = channel.cards.iter().map(|card| card.unit_id).collect();
         let carried_group = channel.group_id.unwrap_or(0);
         let group_target = channel.group_id.is_some();
         let commander = channel.commander.map(|id| self.person_name(id));
-        let count = channel.cards.len();
+        let count = channel.total;
         let seat_live = self
             .flow_seat_carry
             .as_ref()
@@ -22530,18 +22605,39 @@ impl IslandDemo {
                 }
             });
         }
-        if !carried_ids.is_empty() {
-            header = header.cursor_pointer().on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
-                    view.carry_start(
-                        carried_ids.clone(),
-                        label.clone(),
-                        (f32::from(ev.position.x), f32::from(ev.position.y)),
-                        cx,
-                    );
-                }),
-            );
+        // A CHANNEL'S TITLE CARRIES WHAT THE CHANNEL IS. A body's title picks
+        // the BODY up, the way its band does on the board, so it can be
+        // nested, made a root, or packed onto the map as a whole; a body's
+        // cards are picked up one at a time, by their own cards. `UNGROUPED`
+        // is not a body, so its title carries the loose hulls it lists.
+        match channel.group_id {
+            Some(id) => {
+                header = header.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
+                        view.group_carry_start(
+                            id,
+                            label.clone(),
+                            (f32::from(ev.position.x), f32::from(ev.position.y)),
+                            cx,
+                        );
+                    }),
+                );
+            }
+            None if !carried_ids.is_empty() => {
+                header = header.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
+                        view.carry_start(
+                            carried_ids.clone(),
+                            label.clone(),
+                            (f32::from(ev.position.x), f32::from(ev.position.y)),
+                            cx,
+                        );
+                    }),
+                );
+            }
+            None => {}
         }
         // A ROW TAKES A GROUP COMMANDER (`§8.3`).
         if group_target {
@@ -22555,14 +22651,48 @@ impl IslandDemo {
             );
         }
         let mut body = div()
+            .id(("flow-basket-body", at))
             .flex()
             .flex_row()
             .flex_wrap()
             .gap(px(pt(4.0)))
             .w_full()
-            .pl(px(indent + pt(6.0)));
+            .pl(px(indent + pt(6.0)))
+            .pb(px(pt(2.0)));
         for card in &channel.cards {
             body = body.child(self.basket_card(card, cx));
+        }
+        // THE BODY IS A DESTINATION TOO. The title is a thin row, and aiming
+        // a carried card at it while the cards below are the thing it would
+        // join is a target the operator has to hunt for. The whole channel
+        // takes the drop; a released card inside it enlists in the body,
+        // which is the same statement the title makes.
+        if group_target {
+            let carry_live = self
+                .flow_carry
+                .as_ref()
+                .map(|carry| carry.lifted)
+                .unwrap_or(false);
+            body = body
+                .min_h(px(pt(if channel.cards.is_empty() { 14.0 } else { 6.0 })))
+                // A tint, the same one the HEADER uses while a seat is in
+                // the air: the body says "I would take this" before the
+                // operator lets go, and a border would move the layout.
+                .hover(move |style| {
+                    if carry_live {
+                        style.bg(rgba(kit::LIVE_INK.with_alpha(18)))
+                    } else {
+                        style
+                    }
+                })
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, _, cx| {
+                        if view.carry_into_group(carried_group, cx) {
+                            cx.stop_propagation();
+                        }
+                    }),
+                );
         }
         div()
             .flex()
@@ -22668,18 +22798,6 @@ impl IslandDemo {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
-                                    view.carry_start(
-                                        vec![unit_id],
-                                        carried_name.clone(),
-                                        (f32::from(ev.position.x), f32::from(ev.position.y)),
-                                        cx,
-                                    );
-                                }),
-                            )
                             .child(kit::human(name, view::DENSE_PT, kit::VALUE_INK)),
                     )
                     .child(kit::write_mark(if placed {
@@ -22723,6 +22841,22 @@ impl IslandDemo {
                     WARNING_SAND
                 },
             ))
+            // THE WHOLE CARD IS THE HANDLE. A press on the picture, the
+            // pennant or the blank under the name picks the hull up, the way
+            // the window's own controls do; only the ✕ stays outside the
+            // gesture, and it is a click, not a drag.
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
+                    view.carry_start(
+                        vec![unit_id],
+                        carried_name.clone(),
+                        (f32::from(ev.position.x), f32::from(ev.position.y)),
+                        cx,
+                    );
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |view, _, _, cx| {
@@ -22889,8 +23023,8 @@ impl IslandDemo {
                 kit::MUTED_INK,
             ));
         }
-        for channel in &channels {
-            cards = cards.child(self.basket_channel(channel, cx));
+        for (at, channel) in channels.iter().enumerate() {
+            cards = cards.child(self.basket_channel(at, channel, cx));
         }
         panel = panel
             .child(cards)
@@ -25366,13 +25500,10 @@ impl IslandDemo {
     /// from.
     ///
     /// TWO PANES, and the left one is not a filter: it is the CAP (`§6.1`).
-    /// The echelon rungs carry their rank, and the notes under them are the
-    /// rules the server enforces — a child sits at the level immediately above
-    /// its parent, one hull sits in one place, and a hull (an Unsur) sits only
-    /// in a Satuan Tugas. The rungs are CONTAINERS: UNSUR is not one, because
-    /// it is the hull itself, so it is not offered as a level to build. A
-    /// board that showed the tree without these would be a board whose
-    /// refusals look arbitrary.
+    /// The echelon rungs carry their rank, and a group dropped on a rung goes
+    /// under that level. The rungs are CONTAINERS: UNSUR is not one, because
+    /// it is the hull itself, so it is not offered as a level to build — a
+    /// rung that offered it would offer a level nothing can sit under.
     /// The glossary term for an echelon. `GroupKind::label` is the CODE label
     /// (`SatuanTugas`) and it is right for scopes and logs; the board is read
     /// by a person, and reads `SATUAN TUGAS`.
@@ -25419,9 +25550,6 @@ impl IslandDemo {
             .border_color(rgba(kit::EDGE_INK))
             .overflow_y_scroll()
             .child(kit::note("ECHELON", kit::MUTED_INK));
-        // The tree's cap is the highest rank it holds: an echelon ABOVE it
-        // would be a second root, which the server refuses.
-        let cap = groups.iter().map(|g| g.kind.rank()).max().unwrap_or(40);
         // THE RUNGS ARE CONTAINERS. UNSUR is not one — it is the hull, and a
         // hull is what the basket holds — so offering it here would offer a
         // level nothing can sit under (`§6.1`, `§6.3`).
@@ -25475,25 +25603,11 @@ impl IslandDemo {
                     )),
             );
         }
-        echelons = echelons
-            .child(kit::edge_rule())
-            .child(kit::note(
-                "UNSUR IS THE HULL \u{2014} WHAT THE BASKET HOLDS, NOT A CONTAINER.",
-                kit::MUTED_INK,
-            ))
-            .child(kit::note(
-                format!("CAP  max_echelon_rank  \u{b7}  {cap}"),
-                kit::MUTED_INK,
-            ))
-            .child(kit::note(
-                "A CHILD SITS ONLY UNDER THE LEVEL DIRECTLY ABOVE IT.",
-                kit::MUTED_INK,
-            ))
-            .child(kit::note("ONE HULL, ONE PLACE.", kit::MUTED_INK))
-            .child(kit::note(
-                "A HULL IS AN UNSUR \u{2014} IT SITS ONLY IN A SATUAN TUGAS.",
-                kit::MUTED_INK,
-            ));
+        // NO RULE SHEET UNDER THE RUNGS. It listed what the model enforces
+        // (one hull in one place, a child only under the level above, a hull
+        // only in a Satuan Tugas) — and the board says every one of them when
+        // a drag breaks it. A column of levels does not need a caption
+        // reciting the rules; the refusal is where the rule is read.
 
         // ---- the board ----------------------------------------------
         let mut board = div()
@@ -27543,7 +27657,19 @@ impl IslandDemo {
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|view, _: &MouseUpEvent, _, cx| {
+                cx.listener(|view, ev: &MouseUpEvent, window, cx| {
+                    // A GROUP OR A CARD LET GO HERE LANDS HERE (`§6.4`): the
+                    // ground under the pointer is the anchor, and the pack
+                    // lays the hulls out around it. The surface's own release
+                    // would call this "released on nothing", which is what it
+                    // said before the map could take a drop at all.
+                    if view.carry_into_map(
+                        (f32::from(ev.position.x), f32::from(ev.position.y)),
+                        window,
+                        cx,
+                    ) {
+                        cx.stop_propagation();
+                    }
                     // A press that never moved the hull is a click, and the
                     // selection it made stands: the note already says which
                     // hull it is.
@@ -27693,6 +27819,9 @@ impl IslandDemo {
         ];
         // The draft's placed hulls, resolved here: the paint closure is
         // `move` and cannot reach the console's state.
+        // The task organisation, as lines over the same cover transform the
+        // marks use: computed here, projected in the paint closure below.
+        let links = hierarchy_links(&draft);
         let mut marks: Vec<(i64, f64, f64, MapSymbolShape, Option<f32>)> = Vec::new();
         for hull in draft.force.hulls() {
             let Some(start) = &hull.start else {
@@ -27760,6 +27889,52 @@ impl IslandDemo {
                     let (s, ox, oy) = (s as f32, ox as f32, oy as f32);
                     if s <= 0.0 {
                         return;
+                    }
+                    // THE ORGANISATION, UNDER THE SHIPS. A hull is drawn over
+                    // the line that names its body, because the hull is the
+                    // thing, and the line is the reading of it.
+                    let mut drawn_anchor: Option<(f64, f64)> = None;
+                    for link in &links {
+                        let (ax, ay) = map_geometry::project_mercator(
+                            link.from.0,
+                            link.from.1,
+                            live.0,
+                            live.1,
+                            mw,
+                            mh,
+                        );
+                        let (bx, by) = map_geometry::project_mercator(
+                            link.to.0,
+                            link.to.1,
+                            live.0,
+                            live.1,
+                            mw,
+                            mh,
+                        );
+                        let (ax, ay) = (ox + (ax as f32) * s, oy + (ay as f32) * s);
+                        let (bx, by) = (ox + (bx as f32) * s, oy + (by as f32) * s);
+                        let mut line = PathBuilder::stroke(px(1.0));
+                        line.move_to(point(px(ax), px(ay)));
+                        line.line_to(point(px(bx), px(by)));
+                        if let Ok(path) = line.build() {
+                            window.paint_path(path, rgba(link_ink(link.kind).with_alpha(170)));
+                        }
+                        // The junction is the body: a dot says where its
+                        // centre is, so a two-hull star reads as one body
+                        // rather than as two loose lines. Once per body,
+                        // because every link of a star starts at the same
+                        // point and the links arrive together.
+                        if drawn_anchor != Some(link.from) {
+                            drawn_anchor = Some(link.from);
+                            let mut dot = PathBuilder::fill();
+                            dot.move_to(point(px(ax - 2.0), px(ay - 2.0)));
+                            dot.line_to(point(px(ax + 2.0), px(ay - 2.0)));
+                            dot.line_to(point(px(ax + 2.0), px(ay + 2.0)));
+                            dot.line_to(point(px(ax - 2.0), px(ay + 2.0)));
+                            if let Ok(dot) = dot.build() {
+                                window.paint_path(dot, rgba(link_ink(link.kind)));
+                            }
+                        }
                     }
                     for (unit_id, lat, lon, shape, _course) in &marks {
                         let (mx, my) =
@@ -36125,6 +36300,13 @@ pub struct BasketChannel {
     /// does not hold the session.
     pub commander: Option<i64>,
     pub cards: Vec<BasketCard>,
+    /// Every hull under this body, its children's included.
+    ///
+    /// The header says `5 CARDS` for a gugus holding two satgas of two and
+    /// three hulls: a card is a hull, and a body's cards are all the hulls it
+    /// is fought with, not only the ones it musters directly. Counting the
+    /// direct list made a gugus read `0 CARDS` while five ships sat under it.
+    pub total: usize,
 }
 
 /// One hull in the basket, with the words its card draws.
@@ -36151,6 +36333,7 @@ pub struct BasketCard {
 /// last, holding the hulls no body claims.
 pub fn basket_channels(draft: &crate::draft::Draft) -> Vec<BasketChannel> {
     let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
+    let children_of = crate::groups::children_map(&groups);
     let mut claimed: Vec<i64> = Vec::new();
     let mut channels: Vec<BasketChannel> = crate::groups::tree(&groups)
         .into_iter()
@@ -36177,10 +36360,45 @@ pub fn basket_channels(draft: &crate::draft::Draft) -> Vec<BasketChannel> {
                 label: node.group.name,
                 depth: node.depth,
                 commander: node.group.commander_id,
+                total: cards.len(),
                 cards,
             }
         })
         .collect();
+    // The totals: a body's count is its own cards plus every descendant's,
+    // so the sum runs down the tree rather than across the list.
+    let own: std::collections::BTreeMap<i64, usize> = channels
+        .iter()
+        .filter_map(|c| c.group_id.map(|id| (id, c.cards.len())))
+        .collect();
+    // A cycle cannot be built (the draft refuses one), but the walk is bounded
+    // anyway: a count that recursed for ever would freeze the basket, and the
+    // graph is not this function's to trust.
+    fn total_of(
+        id: i64,
+        own: &std::collections::BTreeMap<i64, usize>,
+        children: &std::collections::BTreeMap<i64, Vec<i64>>,
+        seen: &mut std::collections::BTreeSet<i64>,
+    ) -> usize {
+        if !seen.insert(id) {
+            return 0;
+        }
+        let mut total = own.get(&id).copied().unwrap_or(0);
+        for child in children.get(&id).into_iter().flatten() {
+            total += total_of(*child, own, children, seen);
+        }
+        total
+    }
+    for channel in channels.iter_mut() {
+        if let Some(id) = channel.group_id {
+            channel.total = total_of(
+                id,
+                &own,
+                &children_of,
+                &mut std::collections::BTreeSet::new(),
+            );
+        }
+    }
     let loose: Vec<BasketCard> = draft
         .force
         .hulls()
@@ -36200,10 +36418,184 @@ pub fn basket_channels(draft: &crate::draft::Draft) -> Vec<BasketChannel> {
             label: "UNGROUPED".to_string(),
             depth: 0,
             commander: None,
+            total: loose.len(),
             cards: loose,
         });
     }
     channels
+}
+
+/// One body of the task organisation as the ring pack sees it (`§6.4`).
+///
+/// The pack walks a [`crate::ring::Body`], and the draft holds the same tree
+/// as rows; this is the one conversion, so the map's drop and the pack cannot
+/// disagree about what sits under what. Hulls are listed whether or not they
+/// are placed: a pack DEPLOYS a body, and a hull with no ground is exactly the
+/// one a drop should put somewhere.
+pub fn ring_body(groups: &[crate::groups::StagedGroup], id: i64) -> crate::ring::Body {
+    let children_of = crate::groups::children_map(groups);
+    let by_id: std::collections::BTreeMap<i64, &crate::groups::StagedGroup> =
+        groups.iter().map(|group| (group.local_id, group)).collect();
+    fn walk(
+        by_id: &std::collections::BTreeMap<i64, &crate::groups::StagedGroup>,
+        children_of: &std::collections::BTreeMap<i64, Vec<i64>>,
+        id: i64,
+        depth: usize,
+    ) -> crate::ring::Body {
+        let hulls = by_id
+            .get(&id)
+            .map(|group| group.units.clone())
+            .unwrap_or_default();
+        // Four levels is the whole ladder (Unsur … Operasi Gabungan); the
+        // guard is for a graph that is not one, so a cycle cannot make this
+        // walk unbounded.
+        let children = if depth >= 4 {
+            Vec::new()
+        } else {
+            children_of
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .map(|child| walk(by_id, children_of, *child, depth + 1))
+                .collect()
+        };
+        crate::ring::Body::new(id, hulls, children)
+    }
+    walk(&by_id, &children_of, id, 0)
+}
+
+/// One line the map draws for the task organisation: a body's centre to one
+/// of the things under it.
+///
+/// THE MAP SHOWS THE TREE, not only the hulls. A hull on the water is one of
+/// several under a Satuan Tugas, and nothing else on the chart says which —
+/// the basket does, but the basket is a panel and the question is about the
+/// picture. A link is a straight line, in the ink of the level it draws.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HierarchyLink {
+    /// The body's own centre: the mean of every placed hull beneath it.
+    pub from: (f64, f64),
+    /// A hull the body musters directly, or the centre of a child body.
+    pub to: (f64, f64),
+    pub kind: crate::groups::GroupKind,
+}
+
+/// The organisation as lines over the chart.
+///
+/// ONE BODY, ONE STAR: the body's centre to each thing directly under it — its
+/// own placed hulls, and the centres of its child bodies. The star is the
+/// body; a link between every pair of hulls would be a complete graph, which
+/// for five hulls is ten lines and reads as a scribble rather than an order.
+///
+/// A body with fewer than two placed hulls beneath it draws nothing: one hull's
+/// centre IS that hull, and a zero-length line is not a link. An unplaced hull
+/// has no ground to join, so it is not on the picture — the map draws what is
+/// placed, and the basket draws what is not.
+pub fn hierarchy_links(draft: &crate::draft::Draft) -> Vec<HierarchyLink> {
+    let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let children_of = crate::groups::children_map(&groups);
+    let by_id: std::collections::BTreeMap<i64, &crate::groups::StagedGroup> =
+        groups.iter().map(|group| (group.local_id, group)).collect();
+    let placed: std::collections::BTreeMap<i64, (f64, f64)> = draft
+        .force
+        .hulls()
+        .filter_map(|hull| hull.start.map(|start| (hull.unit_id, (start.lat, start.lon))))
+        .collect();
+
+    /// Every hull under a body, itself included.
+    fn beneath(
+        by_id: &std::collections::BTreeMap<i64, &crate::groups::StagedGroup>,
+        children_of: &std::collections::BTreeMap<i64, Vec<i64>>,
+        id: i64,
+        depth: usize,
+        out: &mut Vec<i64>,
+    ) {
+        if let Some(group) = by_id.get(&id) {
+            out.extend(group.units.iter().copied());
+        }
+        // Four levels is the ladder; the guard keeps a graph that is not a
+        // tree from walking for ever, which is the only reason it exists.
+        if depth >= 4 {
+            return;
+        }
+        for child in children_of.get(&id).into_iter().flatten() {
+            beneath(by_id, children_of, *child, depth + 1, out);
+        }
+    }
+
+    /// The mean of the placed hulls among `ids`, or `None` when none is.
+    fn centre(
+        ids: &[i64],
+        placed: &std::collections::BTreeMap<i64, (f64, f64)>,
+    ) -> Option<(f64, f64)> {
+        let mut n = 0.0f64;
+        let mut lat = 0.0f64;
+        let mut lon = 0.0f64;
+        for (y, x) in ids.iter().filter_map(|unit| placed.get(unit)) {
+            lat += y;
+            lon += x;
+            n += 1.0;
+        }
+        if n == 0.0 {
+            return None;
+        }
+        Some((lat / n, lon / n))
+    }
+
+    let mut links = Vec::new();
+    for group in &groups {
+        let id = group.local_id;
+        let mut under = Vec::new();
+        beneath(&by_id, &children_of, id, 0, &mut under);
+        let points: Vec<(f64, f64)> = under
+            .iter()
+            .filter_map(|unit| placed.get(unit).copied())
+            .collect();
+        let Some(anchor) = centre(&under, &placed) else {
+            continue;
+        };
+        if points.len() < 2 {
+            continue;
+        }
+        let mut members: Vec<(f64, f64)> = group
+            .units
+            .iter()
+            .filter_map(|unit| placed.get(unit).copied())
+            .collect();
+        for child in children_of.get(&id).into_iter().flatten() {
+            let mut child_hulls = Vec::new();
+            beneath(&by_id, &children_of, *child, 0, &mut child_hulls);
+            if let Some(at) = centre(&child_hulls, &placed) {
+                members.push(at);
+            }
+        }
+        for member in members {
+            // A duplicate member (two children that share a hull, or the
+            // anchor itself) would draw the same line twice.
+            if member == anchor || links.iter().any(|l: &HierarchyLink| l.to == member && l.from == anchor) {
+                continue;
+            }
+            links.push(HierarchyLink {
+                from: anchor,
+                to: member,
+                kind: group.kind,
+            });
+        }
+    }
+    links
+}
+
+/// The ink a link wears: the level it draws, in the map's own colours.
+fn link_ink(kind: crate::groups::GroupKind) -> crate::view::Rgba {
+    use crate::groups::GroupKind;
+    match kind {
+        GroupKind::Unsur | GroupKind::SatuanTugas => LINK_SATUAN_TUGAS,
+        GroupKind::Gugus => LINK_GUGUS,
+        GroupKind::OperasiGabungan => LINK_OPERASI_GABUNGAN,
+    }
 }
 
 /// One hull in the air: the peel's whole state (`§5.3`).
@@ -44475,6 +44867,217 @@ mod tests {
         let total: usize = channels.iter().map(|channel| channel.cards.len()).sum();
         assert_eq!(total, draft.unit_count(), "no card is lost or doubled");
         assert_eq!(channels.last().and_then(|c| c.group_id), None, "loose last");
+    }
+
+    /// A BODY'S COUNT IS EVERY HULL UNDER IT. A gugus that musters no hulls
+    /// directly still holds its satgas' cards, and the header has to say so:
+    /// `0 CARDS` while five ships sit beneath it is a count that lies.
+    #[test]
+    fn a_channel_counts_every_hull_under_it() {
+        let draft = crate::fixtures::groups_draft().expect("the groups fixture");
+        let channels = basket_channels(&draft);
+        let total = |name: &str| {
+            channels
+                .iter()
+                .find(|channel| channel.label == name)
+                .map(|channel| channel.total)
+                .unwrap_or(0)
+        };
+        assert_eq!(total("OPGAB JAYA"), 5, "the whole organisation");
+        assert_eq!(total("GUS-1"), 5, "two satgas of three and two");
+        assert_eq!(total("TG-1"), 3, "its own cards");
+        assert_eq!(total("TG-2"), 2);
+        assert_eq!(total("UNGROUPED"), 4, "loose hulls are cards too");
+        // The direct lists did not change: a count is not a membership.
+        assert_eq!(
+            channels
+                .iter()
+                .find(|channel| channel.label == "GUS-1")
+                .map(|channel| channel.cards.len()),
+            Some(0)
+        );
+    }
+
+    /// THE MAP DRAWS THE ORGANISATION (`§6.4`): one star per body, in the ink
+    /// of the level it draws.
+    ///
+    /// A star, not a complete graph: five hulls have ten pairs, and ten lines
+    /// between five ships is a scribble. One line per member, from the body's
+    /// own centre.
+    #[test]
+    fn the_map_draws_a_star_for_each_body() {
+        let draft = crate::fixtures::groups_draft().expect("the groups fixture");
+        let links = hierarchy_links(&draft);
+        use crate::groups::GroupKind;
+        let of = |kind: GroupKind| links.iter().filter(|link| link.kind == kind).count();
+        assert_eq!(of(GroupKind::SatuanTugas), 5, "3 in TG-1, 2 in TG-2");
+        assert_eq!(of(GroupKind::Gugus), 2, "the two satgas' centres");
+        // The top level adds nothing: its centre IS its only child's centre,
+        // so the one line it could draw has no length.
+        assert_eq!(of(GroupKind::OperasiGabungan), 0);
+        // A satgas' lines end on its own hulls; a gugus' end on its satgas'
+        // centres, which are means and not hulls.
+        for link in links.iter().filter(|link| link.kind == GroupKind::SatuanTugas) {
+            assert!(
+                draft
+                    .force
+                    .hulls()
+                    .any(|hull| hull.start.map(|start| (start.lat, start.lon)) == Some(link.to)),
+                "{link:?} ends on nothing"
+            );
+        }
+    }
+
+    /// A body whose hulls are all off the map draws no link: the map draws
+    /// what is placed, and the basket draws the rest.
+    #[test]
+    fn an_unplaced_body_draws_no_link() {
+        let mut draft = crate::fixtures::groups_draft().expect("the groups fixture");
+        for unit in [365, 371] {
+            draft.force.set_start(unit, None);
+        }
+        let links = hierarchy_links(&draft);
+        assert!(
+            links
+                .iter()
+                .all(|link| link.kind != crate::groups::GroupKind::SatuanTugas
+                    || link.to.0 > -3.30),
+            "TG-2's hulls are gone, so its lines are too: {links:?}"
+        );
+    }
+
+    /// The ring pack's body is the draft's tree, one level at a time.
+    #[test]
+    fn the_ring_body_is_the_drafts_tree() {
+        let draft = crate::fixtures::groups_draft().expect("the groups fixture");
+        let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
+        let gus = draft
+            .groups
+            .staged_groups()
+            .find(|group| group.name == "GUS-1")
+            .map(|group| group.local_id)
+            .expect("the gugus");
+        let body = ring_body(&groups, gus);
+        assert!(body.hulls.is_empty(), "a gugus musters no hulls directly");
+        assert_eq!(body.children.len(), 2, "its two satgas");
+        let hulls: Vec<i64> = body
+            .children
+            .iter()
+            .flat_map(|child| child.hulls.iter().copied())
+            .collect();
+        assert_eq!(hulls, vec![351, 352, 353, 365, 371], "every hull, once");
+    }
+
+    /// A GROUP LET GO ON THE WATER IS PACKED AROUND IT (`§6.4`), including
+    /// hulls that already had ground: the drag is a move, not only a deploy.
+    #[gpui::test]
+    fn a_group_dropped_on_the_map_packs_its_hulls(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
+            demo.flow_draft = crate::fixtures::groups_draft();
+            demo.flow_stage = crate::draft::Stage::Groups;
+            demo.flow_map = true;
+            demo
+        });
+        cx.update(|window, app| {
+            view.update(app, |demo, cx| {
+                let gus = demo
+                    .flow_draft
+                    .as_ref()
+                    .expect("a draft")
+                    .groups
+                    .staged_groups()
+                    .find(|group| group.name == "GUS-1")
+                    .map(|group| group.local_id)
+                    .expect("the gugus");
+                let before: Vec<(i64, (f64, f64))> = demo
+                    .flow_draft
+                    .as_ref()
+                    .expect("a draft")
+                    .force
+                    .hulls()
+                    .filter_map(|hull| hull.start.map(|start| (hull.unit_id, (start.lat, start.lon))))
+                    .collect();
+                demo.flow_carry = Some(FlowCarry {
+                    unit_ids: Vec::new(),
+                    group_id: Some(gus),
+                    label: "GUS-1".into(),
+                    from: (10.0, 10.0),
+                    at: (20.0, 20.0),
+                    lifted: true,
+                });
+                assert!(demo.carry_into_map((20.0, 20.0), window, cx));
+                assert!(demo.flow_carry.is_none(), "the body left the hand");
+                let after: Vec<(i64, (f64, f64))> = demo
+                    .flow_draft
+                    .as_ref()
+                    .expect("a draft")
+                    .force
+                    .hulls()
+                    .filter_map(|hull| hull.start.map(|start| (hull.unit_id, (start.lat, start.lon))))
+                    .collect();
+                assert_eq!(after.len(), before.len(), "nothing lost its ground");
+                // The five hulls of the gugus are now a cluster; the four
+                // loose hulls are where they were.
+                let cluster: Vec<(f64, f64)> = after
+                    .iter()
+                    .filter(|(unit, _)| [351, 352, 353, 365, 371].contains(unit))
+                    .map(|(_, at)| *at)
+                    .collect();
+                let (lat, lon) = cluster[0];
+                for (other_lat, other_lon) in &cluster {
+                    assert!(
+                        (other_lat - lat).abs() < 0.15 && (other_lon - lon).abs() < 0.15,
+                        "packed apart, not scattered: {cluster:?}"
+                    );
+                }
+                assert!(
+                    demo.flow_drop_note
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("PACKED"),
+                    "{:?}",
+                    demo.flow_drop_note
+                );
+            })
+        });
+    }
+
+    /// A CARD LET GO ON THE WATER IS ONE PLACEMENT, exactly where it fell.
+    #[gpui::test]
+    fn a_card_dropped_on_the_map_lands_on_the_pointer(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
+            demo.flow_draft = crate::fixtures::groups_draft();
+            demo.flow_map = true;
+            demo
+        });
+        cx.update(|window, app| {
+            view.update(app, |demo, cx| {
+                let ground = demo.flow_ground_at((40.0, 60.0), window).expect("ground");
+                demo.flow_carry = Some(FlowCarry {
+                    unit_ids: vec![354],
+                    group_id: None,
+                    label: "KRI OSWALD SIAHAAN".into(),
+                    from: (10.0, 10.0),
+                    at: (40.0, 60.0),
+                    lifted: true,
+                });
+                assert!(demo.carry_into_map((40.0, 60.0), window, cx));
+                let hull = demo
+                    .flow_draft
+                    .as_ref()
+                    .expect("a draft")
+                    .force
+                    .get(354)
+                    .expect("the hull");
+                let start = hull.start.expect("a position");
+                assert!((start.lat - ground.0).abs() < 1e-9);
+                assert!((start.lon - ground.1).abs() < 1e-9);
+            })
+        });
     }
 
     /// A GROUP DROPPED ON A GROUP'S BAND RE-PARENTS UNDER IT (`§6.2`).
