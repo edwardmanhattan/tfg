@@ -953,12 +953,14 @@ mod tests {
             Some("2000-01-01T09:00:00+07:00")
         );
         assert_eq!(time.elapsed_hours(), Some(3.0));
-        // A DRAFT WITH A NAME AND A WINDOW AND NOTHING ELSE has no blocker:
-        // nothing in the flow says a force is required before a press, and the
-        // gate that does say so is one state later and is a READ. So the verbs
-        // unlock here, and the frame's five untouched stages are a state an
-        // operator can leave, not a list of refusals.
-        assert!(draft.blockers(Verb::PlayDirectly).is_empty());
+        // A DRAFT WITH A NAME AND A WINDOW AND NOTHING ELSE IS NOT WRITABLE.
+        // The force is empty and so is the book, and the console refuses to
+        // save a record that opens into nothing; the blockers name the two
+        // stages, in rail order.
+        let blocking = draft.blockers(Verb::PlayDirectly);
+        assert_eq!(blocking.len(), 2, "{blocking:?}");
+        assert_eq!(blocking[0].stage, crate::draft::Stage::Units);
+        assert_eq!(blocking[1].stage, crate::draft::Stage::Scenario);
         assert_eq!(
             draft.stage_count(),
             6,

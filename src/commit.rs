@@ -509,7 +509,7 @@ pub fn position(draft: &Draft, live: &Live, verb: Verb, number: u8, offset: &str
             Position {
                 number,
                 name: "GAME",
-                note: "POST /games \u{2014} lands in planning",
+                note: "the game record",
                 writes,
                 read: None,
             }
@@ -519,7 +519,7 @@ pub fn position(draft: &Draft, live: &Live, verb: Verb, number: u8, offset: &str
         2 => Position {
             number,
             name: "SEATS",
-            note: "POST /games/{id}/participants \u{2014} before units",
+            note: "who sits in it",
             writes: roster::plan(&draft.roster, &live.seats)
                 .into_iter()
                 .map(seat_write)
@@ -529,7 +529,7 @@ pub fn position(draft: &Draft, live: &Live, verb: Verb, number: u8, offset: &str
         3 => Position {
             number,
             name: "HIERARCHY",
-            note: "POST /games/{id}/hierarchy \u{2014} a parent before its child",
+            note: "the task organisation, a parent before its child",
             writes: tree(draft, live)
                 .into_iter()
                 .filter_map(node_write)
@@ -570,7 +570,7 @@ pub fn position(draft: &Draft, live: &Live, verb: Verb, number: u8, offset: &str
             Position {
                 number,
                 name: "UNITS",
-                note: "POST /games/{id}/units, then the tree placement",
+                note: "each hull, then its place in the tree",
                 writes,
                 read: None,
             }
@@ -578,7 +578,7 @@ pub fn position(draft: &Draft, live: &Live, verb: Verb, number: u8, offset: &str
         5 => Position {
             number,
             name: "PLACEMENTS",
-            note: "PUT /games/{id}/units/{unit}/placement \u{2014} unit-id order",
+            note: "where each hull starts",
             writes: force(draft, live)
                 .into_iter()
                 .filter_map(|w| match w {
@@ -594,7 +594,7 @@ pub fn position(draft: &Draft, live: &Live, verb: Verb, number: u8, offset: &str
         6 => Position {
             number,
             name: "STEPS",
-            note: "scenarios, steps, sub-steps, audiences",
+            note: "the book: scenarios, steps, sub-steps, audiences",
             writes: if draft.book.is_empty() || draft.mode != GameMode::Scenario {
                 Vec::new()
             } else {
@@ -626,7 +626,7 @@ pub fn position(draft: &Draft, live: &Live, verb: Verb, number: u8, offset: &str
             Position {
                 number,
                 name: "COMMANDERS",
-                note: "PUT /games/{id}/hierarchy/{node}/commander, and a hull's where 04's differs",
+                note: "who commands what",
                 writes,
                 read: None,
             }
@@ -634,14 +634,14 @@ pub fn position(draft: &Draft, live: &Live, verb: Verb, number: u8, offset: &str
         8 => Position {
             number,
             name: "READINESS",
-            note: "GET /games/{id}/readiness \u{2014} a read, never a write",
+            note: "who has declared \u{2014} a read, never a write",
             writes: Vec::new(),
             read: game_id(draft, live).map(|game_id| Read::Readiness { game_id }),
         },
         9 => Position {
             number,
             name: "TRANSITION",
-            note: "POST /games/{id}/transitions \u{2014} preparation",
+            note: "into preparation",
             writes: vec![Write::Transition { to: "preparation" }],
             read: None,
         },
@@ -660,7 +660,7 @@ fn mission_position(draft: &Draft, live: &Live, number: u8) -> Position {
         1 => Position {
             number,
             name: "M1 MISSION",
-            note: "POST /scenario-missions",
+            note: "the saved scenario's own name and description",
             writes: if draft.journal.mission_id().is_some() {
                 Vec::new()
             } else {
@@ -671,8 +671,8 @@ fn mission_position(draft: &Draft, live: &Live, number: u8) -> Position {
                         .next()
                         .map(|b| b.local_id)
                         .unwrap_or(0),
-                    title: draft.terms.name.trim().to_string(),
-                    description: draft.terms.description.clone(),
+                    title: draft.saved_title().trim().to_string(),
+                    description: draft.saved_description().trim().to_string(),
                 }]
             },
             read: None,
@@ -680,7 +680,7 @@ fn mission_position(draft: &Draft, live: &Live, number: u8) -> Position {
         2 => Position {
             number,
             name: "M2 STEPS",
-            note: "POST /scenario-missions/{id}/steps, in order",
+            note: "its steps, in order",
             writes: mission_steps(draft),
             read: None,
         },
@@ -691,7 +691,7 @@ fn mission_position(draft: &Draft, live: &Live, number: u8) -> Position {
         other => Position {
             number: other,
             name: "M3 COMMANDS",
-            note: "POST .../steps/{s}/substeps, then PUT .../substeps/{s}/related",
+            note: "each command, then who it obliges",
             writes: if draft.book.is_empty() {
                 Vec::new()
             } else {
@@ -1470,6 +1470,9 @@ mod tests {
     }
 
     /// A draft with a name, one seated commander and one placed hull.
+    ///
+    /// A scenario draft also has a step, because an empty book is a stage 04
+    /// the console refuses to write.
     fn ready_draft(mode: GameMode) -> Draft {
         let mut draft = Draft::blank(mode).unwrap();
         draft.terms.name = "Baltic Shield 26".into();
@@ -1477,6 +1480,13 @@ mod tests {
         draft
             .force
             .upsert(hull(351, "KRI AHMAD YANI", Some(4), Some((-3.2, 108.9))));
+        if mode.is_scenario() {
+            let book = draft.book.stage_scenario("The sweep");
+            draft
+                .book
+                .stage_step_new(book, "TAKE STATION XYZ", None)
+                .expect("a step");
+        }
         draft
     }
 
@@ -1587,6 +1597,44 @@ mod tests {
             Write::CreateStep { .. }
         ));
         assert!(plan.positions[2].writes.is_empty(), "no sub-steps yet");
+    }
+
+    /// THE SAVED SCENARIO IS NAMED FROM THE GAME, AND THE OPERATOR'S WORDS
+    /// WIN. M1 posts the mission's own title and description, not the game's.
+    #[test]
+    fn the_saved_scenario_writes_its_own_name_and_description() {
+        let mut draft = Draft::blank(GameMode::Scenario).unwrap();
+        draft.terms.name = "Baltic Shield 26".into();
+        draft.terms.description = "the game's description".into();
+        let book = draft.book.stage_scenario("The sweep");
+        draft
+            .book
+            .stage_step_new(book, "TAKE STATION XYZ", None)
+            .expect("a step");
+
+        let first = plan(&draft, &Live::default(), Verb::SaveAsScenario, "+00:00");
+        match &first.positions[0].writes[0] {
+            Write::CreateBook {
+                title, description, ..
+            } => {
+                assert_eq!(title, "Baltic Shield 26", "prefilled from the game");
+                assert_eq!(description, "the game's description");
+            }
+            other => panic!("expected the book's create, got {other:?}"),
+        }
+
+        draft.set_saved_title("Sweep of the Sound".into());
+        draft.set_saved_description("one sweep, two hulls".into());
+        let edited = plan(&draft, &Live::default(), Verb::SaveAsScenario, "+00:00");
+        match &edited.positions[0].writes[0] {
+            Write::CreateBook {
+                title, description, ..
+            } => {
+                assert_eq!(title, "Sweep of the Sound");
+                assert_eq!(description, "one sweep, two hulls");
+            }
+            other => panic!("expected the book's create, got {other:?}"),
+        }
     }
 
     /// COMMIT IS A DIFF: a hull the server already holds is not assigned again,
@@ -2079,6 +2127,13 @@ mod tests {
     #[test]
     fn a_saved_scenario_press_creates_a_mission_and_journals_it() {
         let mut draft = Draft::saved_scenario(9, "Harbour Sweep", "the sweep");
+        // The shell seeds the mission's steps into the book; the press writes
+        // them after M1. A mission with no steps is refused before this.
+        let book = draft.book.stage_scenario("Harbour Sweep");
+        draft
+            .book
+            .stage_step_new(book, "TAKE STATION XYZ", None)
+            .expect("a step");
         let mut fake = Fake::with_id("create book \"Harbour Sweep\"", 500);
         let outcome = run(
             &mut draft,
@@ -2100,6 +2155,10 @@ mod tests {
     fn a_created_book_is_resolved_for_the_steps_that_name_it() {
         let mut draft = Draft::blank(GameMode::Scenario).unwrap();
         draft.terms.name = "North Sea Patrol".into();
+        draft.roster.stage(seat(4, "Lt. Fitri", "Commando"));
+        draft
+            .force
+            .upsert(hull(351, "KRI AHMAD YANI", Some(4), None));
         let book = draft.book.stage_scenario("The sweep");
         draft
             .book

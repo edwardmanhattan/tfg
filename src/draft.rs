@@ -201,36 +201,12 @@ impl Verb {
         }
     }
 
-    /// What the press writes, as the block's first line.
-    pub fn writes(self) -> &'static str {
-        match self {
-            Verb::SaveAsGameSession => "WRITES 01\u{2013}07 \u{b7} STOPS BEFORE READINESS",
-            Verb::SaveAsScenario => "WRITES ITS UNITS AND ITS STEPS",
-            Verb::PlayDirectly => "WRITES 01\u{2013}09 \u{b7} THE WHOLE LADDER",
-        }
-    }
-
     /// Where the press leaves the console (§10).
     pub fn lands(self) -> &'static str {
         match self {
             Verb::SaveAsGameSession => "LANDS IN PLANNING",
             Verb::SaveAsScenario => "LANDS IN SAVED SCENARIOS",
             Verb::PlayDirectly => "LANDS IN PREPARATION",
-        }
-    }
-
-    /// The one-line consequence the block carries under those two.
-    pub fn consequence(self) -> [&'static str; 2] {
-        match self {
-            Verb::SaveAsGameSession => [
-                "IT KEEPS THE DRAFT OPEN BESIDE IT",
-                "IT DOES NOT START THE EXERCISE",
-            ],
-            Verb::SaveAsScenario => ["NO MAP, NO GROUPS, NO SEATS", "OPEN IT TO START A NEW GAME"],
-            Verb::PlayDirectly => [
-                "IT DOES NOT START THE EXERCISE",
-                "THE GAME MASTER PRESSES START",
-            ],
         }
     }
 
@@ -914,6 +890,24 @@ pub struct Draft {
     pub book: BookDraft,
     pub roster: RosterDraft,
     pub journal: Journal,
+    /// The Saved Scenario's own title, once the operator has edited it.
+    ///
+    /// `None` FOLLOWS THE GAME'S TITLE. Stage 06 draws the field prefilled
+    /// from `terms.name`, and the first keystroke makes it the mission's:
+    /// asking an operator to type the name they typed in stage 01 again is
+    /// the kind of work that produces two slightly different names for one
+    /// plan. `None` rather than a copy, so the field follows a name changed
+    /// after the field was first drawn.
+    pub scenario_title: Option<String>,
+    /// The Saved Scenario's own description, on the same terms.
+    pub scenario_description: Option<String>,
+    /// The steps the SERVER already holds for this game, less the ones this
+    /// draft cuts.
+    ///
+    /// [`BookDraft`] carries the operator's adds and cuts, not the read: a
+    /// reopened game's steps live in `SessionView::book`. This is the count
+    /// the rail and the blockers need, seeded by whoever holds the read.
+    pub held_steps: usize,
 }
 
 impl Draft {
@@ -937,6 +931,9 @@ impl Draft {
             book: BookDraft::new(),
             roster: RosterDraft::new(),
             journal: Journal::new(),
+            scenario_title: None,
+            scenario_description: None,
+            held_steps: 0,
         })
     }
 
@@ -964,6 +961,9 @@ impl Draft {
             book: BookDraft::new(),
             roster: RosterDraft::new(),
             journal: Journal::new(),
+            scenario_title: None,
+            scenario_description: None,
+            held_steps: 0,
         }
     }
 
@@ -993,7 +993,36 @@ impl Draft {
             book: BookDraft::new(),
             roster: RosterDraft::new(),
             journal: Journal::new(),
+            scenario_title: None,
+            scenario_description: None,
+            held_steps: 0,
         })
+    }
+
+    /// The Saved Scenario's title: the game's own until the operator edits it.
+    pub fn saved_title(&self) -> &str {
+        match &self.scenario_title {
+            Some(title) => title.as_str(),
+            None => self.terms.name.trim(),
+        }
+    }
+
+    /// The Saved Scenario's description, on the same terms.
+    pub fn saved_description(&self) -> &str {
+        match &self.scenario_description {
+            Some(description) => description.as_str(),
+            None => self.terms.description.trim(),
+        }
+    }
+
+    /// Take the title into the operator's hands.
+    pub fn set_saved_title(&mut self, title: String) {
+        self.scenario_title = Some(title);
+    }
+
+    /// Take the description into the operator's hands.
+    pub fn set_saved_description(&mut self, description: String) {
+        self.scenario_description = Some(description);
     }
 
     /// The rail's stages, in order.
@@ -1024,6 +1053,9 @@ impl Draft {
             && self.book.is_empty()
             && self.roster.is_empty()
             && self.journal.is_empty()
+            && self.scenario_title.is_none()
+            && self.scenario_description.is_none()
+            && self.held_steps == 0
     }
 
     // -- the counts the rail shows ---------------------------------------
@@ -1065,6 +1097,12 @@ impl Draft {
     /// steps are the read's, and the caller adds them (see the `book` field).
     pub fn staged_step_count(&self) -> usize {
         self.book.staged_step_count()
+    }
+
+    /// `04 SCENARIO` — every step the book will hold: the server's plus the
+    /// ones this draft has staged.
+    pub fn book_step_count(&self) -> usize {
+        self.held_steps + self.staged_step_count()
     }
 
     /// Every node id the draft's tree holds: the server's rows that are still
@@ -1134,7 +1172,37 @@ impl Draft {
             });
         }
 
-        // 3. The mission ladder writes no game, no seats, no hierarchy, no
+        // 3. A STAGE WITH NOTHING IN IT IS NOT A STAGE THAT PASSES. The server
+        //    takes an empty game and an empty mission alike, so the console is
+        //    the last place that can refuse a save which would open into
+        //    nothing. A GROUP IS NOT ONE OF THESE: a flat force is a legal
+        //    game (the board says so), and a task organisation is a way of
+        //    grouping hulls rather than a stage everyone must fill.
+        if verb.ladder() == Ladder::Game && self.unit_count() == 0 {
+            blockers.push(Blocker {
+                stage: Stage::Units,
+                sentence: "The force is empty \u{2014} stage 02 is the hulls the game is fought \
+                           with."
+                    .to_string(),
+            });
+        }
+        if self.mode.is_scenario() && self.book_step_count() == 0 {
+            blockers.push(Blocker {
+                stage: Stage::Scenario,
+                sentence: "The book is empty \u{2014} stage 04 is the steps the exercise runs."
+                    .to_string(),
+            });
+        }
+        if verb == Verb::SaveAsScenario && self.saved_title().trim().is_empty() {
+            blockers.push(Blocker {
+                stage: Stage::Scenario,
+                sentence: "The Saved Scenario has no title \u{2014} a list of saved scenarios is \
+                           read by name."
+                    .to_string(),
+            });
+        }
+
+        // 4. The mission ladder writes no game, no seats, no hierarchy, no
         //    placements and no commanders, so none of the rules below are its
         //    business (§9.2). A Saved Scenario's hulls are register ids.
         blockers.extend(self.book_blockers());
@@ -1142,7 +1210,7 @@ impl Draft {
             return blockers;
         }
 
-        // 4. The force, through the module that owns the rule: an uncommanded
+        // 5. The force, through the module that owns the rule: an uncommanded
         //    hull, one commander given two hulls, a hull riding itself, a ring
         //    of carriers. The empty `live` is deliberate — a pressed draft
         //    judges every hull as the new piece it is about to write.
@@ -1159,7 +1227,7 @@ impl Draft {
             });
         }
 
-        // 5. A commander must be a participant of THIS game and not on the
+        // 6. A commander must be a participant of THIS game and not on the
         //    judge side. The judge half is `force`'s rule, asked of the seats
         //    the draft holds; the participant half is the roster's.
         let judges = crate::roster::judge_seats(&self.roster, &[]);
@@ -1188,7 +1256,7 @@ impl Draft {
             });
         }
 
-        // 6. The tree: a body may not hold a hull the game does not, and no
+        // 7. The tree: a body may not hold a hull the game does not, and no
         //    body may sit above the ceiling. The rank BETWEEN bodies is
         //    refused at stage time (`GroupsDraft`), which is where the drag is.
         let mut strays: Vec<String> = Vec::new();
@@ -1234,7 +1302,7 @@ impl Draft {
             });
         }
 
-        // 7. A group's commander is a participant too, on the same terms.
+        // 8. A group's commander is a participant too, on the same terms.
         let mut unseated_bodies: Vec<String> = Vec::new();
         for id in self.node_ids() {
             let Some(node) = self.groups.get(id) else {
@@ -1665,7 +1733,98 @@ mod tests {
             assert!(!draft.can_run(verb));
         }
         draft.terms.name = "Baltic Shield 26".into();
-        assert!(draft.can_run(Verb::SaveAsScenario), "a name is enough here");
+        // A NAME IS NOT A SCENARIO. The mission has a title and no steps, and
+        // the verb refuses to save a book that opens into nothing.
+        let blocking = draft.blockers(Verb::SaveAsScenario);
+        assert_eq!(blocking.len(), 1, "{blocking:?}");
+        assert_eq!(blocking[0].stage, Stage::Scenario);
+        assert!(blocking[0].sentence.contains("book is empty"), "{blocking:?}");
+
+        let scenario = draft.book.stage_scenario("The sweep");
+        draft
+            .book
+            .stage_step_new(scenario, "TAKE STATION XYZ", None)
+            .expect("a step");
+        assert!(draft.can_run(Verb::SaveAsScenario), "a name and a step");
+    }
+
+    /// THE EMPTY STAGES ARE REFUSED. The server takes a game with no hulls
+    /// and a mission with no steps; the console is the last place that can
+    /// say no, and it names the stage.
+    #[test]
+    fn a_stage_with_nothing_in_it_blocks_the_save() {
+        let mut draft = Draft::blank(GameMode::Scenario).unwrap();
+        draft.terms.name = "North Sea Patrol".into();
+        let blocking = draft.blockers(Verb::SaveAsGameSession);
+        assert_eq!(blocking[0].stage, Stage::Units, "{blocking:?}");
+        assert!(blocking[0].sentence.contains("force is empty"));
+        assert!(blocking.iter().any(|b| b.stage == Stage::Scenario));
+
+        // A hull makes stage 02 a stage; the book still has no steps.
+        draft.roster.stage(seat(4, "Lt. Fitri"));
+        draft.force.upsert(hull(351, "KRI AHMAD YANI", Some(4)));
+        let blocking = draft.blockers(Verb::SaveAsGameSession);
+        assert_eq!(blocking.len(), 1, "{blocking:?}");
+        assert_eq!(blocking[0].stage, Stage::Scenario);
+
+        // And one step settles it.
+        let book = draft.book.stage_scenario("The sweep");
+        draft
+            .book
+            .stage_step_new(book, "TAKE STATION XYZ", None)
+            .expect("a step");
+        assert!(draft.can_run(Verb::SaveAsGameSession));
+        assert!(draft.can_run(Verb::SaveAsScenario));
+    }
+
+    /// A REOPENED DRAFT'S STEPS ARE THE READ'S. The book draft holds adds and
+    /// cuts, so the count that the rail and the blocker use has to add the
+    /// steps the server already holds — otherwise a complete game would be
+    /// refused for an empty book it does not have.
+    #[test]
+    fn a_reopened_drafts_steps_are_counted_from_the_read() {
+        let mut draft = Draft::reopened(&detail()).expect("a planning game");
+        draft.held_steps = 5;
+        assert_eq!(draft.staged_step_count(), 0);
+        assert_eq!(draft.book_step_count(), 5);
+        let blocking = draft.blockers(Verb::SaveAsGameSession);
+        assert!(
+            !blocking.iter().any(|b| b.stage == Stage::Scenario),
+            "{blocking:?}"
+        );
+    }
+
+    /// THE SAVED SCENARIO IS NAMED FROM THE GAME until the operator says
+    /// otherwise: the field opens on the title stage 01 holds, and the first
+    /// edit is the mission's own.
+    #[test]
+    fn the_saved_scenario_follows_the_games_name_until_edited() {
+        let mut draft = Draft::blank(GameMode::Scenario).unwrap();
+        draft.terms.name = "Baltic Shield 26".into();
+        draft.terms.description = "the sweep".into();
+        assert_eq!(draft.saved_title(), "Baltic Shield 26");
+        assert_eq!(draft.saved_description(), "the sweep");
+
+        // A later rename in stage 01 still reaches the field.
+        draft.terms.name = "Baltic Shield 27".into();
+        assert_eq!(draft.saved_title(), "Baltic Shield 27");
+
+        draft.set_saved_title("Sweep of the Sound".into());
+        draft.set_saved_description(String::new());
+        draft.terms.name = "Baltic Shield 28".into();
+        assert_eq!(draft.saved_title(), "Sweep of the Sound", "its own name");
+        assert_eq!(draft.saved_description(), "", "cleared is cleared");
+
+        // A mission with no title is refused, and the blocker is the field's.
+        let book = draft.book.stage_scenario("Sweep of the Sound");
+        draft
+            .book
+            .stage_step_new(book, "TAKE STATION XYZ", None)
+            .expect("a step");
+        draft.set_saved_title("   ".into());
+        let blocking = draft.blockers(Verb::SaveAsScenario);
+        assert_eq!(blocking.len(), 1, "{blocking:?}");
+        assert!(blocking[0].sentence.contains("no title"), "{blocking:?}");
     }
 
     /// A PIECE NEEDS A COMMANDER. A hull with none is a legal draft state and
@@ -1728,6 +1887,11 @@ mod tests {
     fn the_mission_ladder_ignores_the_force_and_the_rosters_rules() {
         let mut draft = Draft::blank(GameMode::Scenario).unwrap();
         draft.terms.name = "Harbour Sweep".into();
+        let scenario = draft.book.stage_scenario("The sweep");
+        draft
+            .book
+            .stage_step_new(scenario, "TAKE STATION XYZ", None)
+            .expect("a step");
         draft.force.upsert(hull(351, "KRI AHMAD YANI", None));
         assert!(draft.can_run(Verb::SaveAsScenario));
         assert!(!draft.can_run(Verb::SaveAsGameSession));
@@ -1743,9 +1907,12 @@ mod tests {
             .stage_group(0, "TG-1", GroupKind::SatuanTugas, None, None, vec![351])
             .expect("a group");
         let blocking = draft.blockers(Verb::SaveAsGameSession);
-        assert_eq!(blocking.len(), 1, "{blocking:?}");
-        assert_eq!(blocking[0].stage, Stage::Groups);
-        assert!(blocking[0].sentence.contains("not in the game"));
+        assert!(
+            blocking
+                .iter()
+                .any(|b| b.stage == Stage::Groups && b.sentence.contains("not in the game")),
+            "{blocking:?}"
+        );
 
         draft.force.upsert(hull(351, "KRI AHMAD YANI", None));
         draft.roster.stage(seat(4, "Lt. Fitri"));
@@ -1759,6 +1926,8 @@ mod tests {
     fn the_ceiling_is_a_rank_number() {
         let mut draft = Draft::blank(GameMode::Maneuver).unwrap();
         draft.terms.name = "Baltic Shield 26".into();
+        draft.roster.stage(seat(4, "Lt. Fitri"));
+        draft.force.upsert(hull(351, "KRI AHMAD YANI", Some(4)));
         draft.ceiling = Some(30);
         draft
             .groups

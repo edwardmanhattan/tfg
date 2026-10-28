@@ -1226,6 +1226,11 @@ struct IslandDemo {
     stage_one_focus: Option<usize>,
     /// The wells' focus handles, minted on first use (GPUI needs a context).
     stage_one_handles: [Option<gpui::FocusHandle>; 11],
+    /// Which of stage 06's two SAVED SCENARIO fields has the keyboard: 0 the
+    /// title, 1 the description. `None` until the operator clicks or tabs.
+    flow_mission_focus: Option<usize>,
+    /// Their focus handles, minted on first use.
+    flow_mission_handles: [Option<gpui::FocusHandle>; 2],
     /// Stage 02's place in the register cascade (`§5.1`). A CASCADE, not tabs:
     /// picking a rung truncates everything below it, and the columns are a fold
     /// over the register the console already synced.
@@ -4285,7 +4290,14 @@ impl IslandDemo {
                 }
                 _ => crate::draft::Stage::Essentials,
             },
-            flow_verb: crate::draft::Verb::SaveAsGameSession,
+            // `TFG_VERB=scenario` opens stage 06 on the mission ladder, which
+            // is what draws the Saved Scenario's two fields. A capture seed,
+            // like `TFG_BOARD`.
+            flow_verb: match std::env::var("TFG_VERB").as_deref() {
+                Ok("scenario") => crate::draft::Verb::SaveAsScenario,
+                Ok("play") => crate::draft::Verb::PlayDirectly,
+                _ => crate::draft::Verb::SaveAsGameSession,
+            },
             press_busy: false,
             press_outcome: None,
             // F2a is the TOP of the form and F2b the bottom: the counter is a
@@ -4403,6 +4415,8 @@ impl IslandDemo {
             flow_drop_note: None,
             stage_one_focus: None,
             stage_one_handles: std::array::from_fn(|_| None),
+            flow_mission_focus: None,
+            flow_mission_handles: std::array::from_fn(|_| None),
             stage_one_scroll: {
                 let handle = ScrollHandle::new();
                 // F2b IS THE BOTTOM OF THE FORM (`§4`): the frame is scrolled to
@@ -13342,6 +13356,22 @@ impl IslandDemo {
                     draft.roster = self.roster_draft.clone();
                     draft.groups = self.groups.clone();
                     draft.book = self.book.clone();
+                    // The read's steps are not in the book draft, which holds
+                    // only adds and cuts: the rail's `04` and the empty-book
+                    // blocker both count what the book WILL hold, which is the
+                    // server's steps minus the ones this draft cuts.
+                    draft.held_steps = self
+                        .session
+                        .book
+                        .iter()
+                        .flat_map(|scenario| {
+                            scenario
+                                .steps
+                                .iter()
+                                .map(move |step| (scenario.id, step.id))
+                        })
+                        .filter(|(scenario, step)| !self.book.is_cut(*scenario, *step))
+                        .count();
                     draft
                 })
         } else {
@@ -23102,6 +23132,7 @@ impl IslandDemo {
         let mut band = div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .justify_between()
             .gap(px(pt(16.0)))
@@ -23169,9 +23200,6 @@ impl IslandDemo {
         }
         band = band.child(
             div()
-                .flex()
-                .flex_col()
-                .gap(px(pt(2.0)))
                 .flex_shrink_0()
                 .child(kit::mono_caps(
                     format!(
@@ -23180,16 +23208,15 @@ impl IslandDemo {
                     ),
                     view::LABEL_PT,
                     kit::VALUE_INK,
-                ))
-                .child(kit::remark(
-                    format!(
-                        "THE VERBS UNLOCK WHEN 01\u{2013}{:02} PASS \u{2014} NOTHING IS WRITTEN BEFORE THAT",
-                        draft.stage_count()
-                    ),
-                    kit::MUTED_INK,
                 )),
         );
-        let mut verbs = div().flex().flex_row().items_center().gap(px(pt(8.0)));
+        let mut verbs = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .justify_end()
+            .gap(px(pt(8.0)));
         for verb in draft.verbs().iter().copied() {
             let live = draft.blockers(verb).is_empty() && !self.press_busy;
             let at_review = self.flow_stage == crate::draft::Stage::Review;
@@ -24051,9 +24078,13 @@ impl IslandDemo {
             return;
         }
         // A VERB THAT CANNOT RUN IS DISABLED AND SAYS WHY, and the button does
-        // not send: the same blockers the panel draws.
+        // not send: the same blockers the panel draws. The refusal also
+        // SELECTS the verb, because the sentence that explains it lives on the
+        // card and in the write order — a footer press that changed nothing on
+        // screen would look like a dead button.
         let blockers = draft.blockers(verb);
         if !blockers.is_empty() {
+            self.flow_verb = verb;
             self.press_outcome = None;
             cx.notify();
             return;
@@ -24141,16 +24172,10 @@ impl IslandDemo {
             );
         }
 
-        // The one note the rail carries: a stage the mode does not have is not
-        // a stage that is empty, and the sentence says which.
-        body = body.child(kit::edge_rule()).child(kit::note(
-            if draft.mode.is_scenario() {
-                "STAGE 04 IS THE BOOK \u{b7} STEPS, SUB-STEPS AND AUDIENCES"
-            } else {
-                "STAGE 04 IS SCENARIO-ONLY \u{b7} STATIC + MANEUVER HAVE FIVE STAGES AND TWO VERBS"
-            },
-            kit::MUTED_INK,
-        ));
+        // NO NOTE UNDER THE RAIL. It carried a sentence explaining which stage
+        // the mode has and what it holds; the rail already says both, and a
+        // column of stages does not need a caption telling the operator how to
+        // read a column of stages.
         panel = panel.child(body);
         panel.into_any_element()
     }
@@ -24170,7 +24195,7 @@ impl IslandDemo {
             }),
             Stage::Units => Some(format!("{}", draft.unit_count())),
             Stage::Groups => Some(format!("{}", draft.group_count())),
-            Stage::Scenario => Some(format!("{}", draft.staged_step_count())),
+            Stage::Scenario => Some(format!("{}", draft.book_step_count())),
             Stage::Players => {
                 let (seated, considered) = draft.considered();
                 Some(format!("{seated} / {considered}"))
@@ -24386,6 +24411,182 @@ impl IslandDemo {
     // F7 — STAGE 06, REVIEW AND COMMIT
     // -----------------------------------------------------------------
 
+    /// One of stage 06's two SAVED SCENARIO fields: the label, the well, the
+    /// keys.
+    ///
+    /// A field, not a readout: the press mints a mission, and a mission is
+    /// named. It opens on the game's own title and description (the operator
+    /// typed them in stage 01, and typing them again is how one plan ends up
+    /// with two names), and the first keystroke makes the words the
+    /// mission's.
+    fn flow_mission_field(
+        &mut self,
+        field: usize,
+        label: &'static str,
+        prose: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let handle = match self.flow_mission_handles[field].clone() {
+            Some(handle) => handle,
+            None => {
+                let handle = cx.focus_handle();
+                self.flow_mission_handles[field] = Some(handle.clone());
+                handle
+            }
+        };
+        let Some(draft) = self.flow_draft.clone() else {
+            return div().into_any_element();
+        };
+        let text = if field == 0 {
+            draft.saved_title().to_string()
+        } else {
+            draft.saved_description().to_string()
+        };
+        let empty = text.is_empty();
+        let focused = self.flow_mission_focus == Some(field);
+        // THE CARET RIDES THE TEXT, not under it. The text keeps a zero
+        // minimum width so a long description wraps inside the well while a
+        // short one keeps the bar right after its last word; a block child of
+        // the well would put the bar on a line of its own.
+        let mut value = div()
+            .flex()
+            .flex_row()
+            .gap(px(2.0))
+            .w_full()
+            .font_family(view::FACE_HUMAN)
+            .text_size(px(view::pt(view::BODY_PT)))
+            .text_color(rgba(if empty { IDLE_GREY } else { MAP_INK }))
+            .child(
+                div()
+                    .min_w_0()
+                    .child(if empty { "\u{2014}".to_string() } else { text }),
+            );
+        if focused {
+            value = value.child(
+                div()
+                    .w(px(1.0))
+                    .h(px(14.0))
+                    .flex_shrink_0()
+                    .bg(rgba(RADAR_CYAN)),
+            );
+        }
+        let mut well = div()
+            .id(("flow-mission-well", field))
+            .track_focus(&handle)
+            .cursor(CursorStyle::IBeam)
+            .flex()
+            .flex_row()
+            .gap(px(3.0))
+            .w_full()
+            .px(px(8.0))
+            .rounded(px(kit::RADIUS))
+            .bg(rgba(DEEP_WELL))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(if focused {
+                kit::LIVE_INK
+            } else {
+                kit::EDGE_INK
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, _, window, cx| {
+                    view.focus_flow_mission(field, window, cx);
+                }),
+            )
+            .on_key_down(cx.listener(move |view, ev: &KeyDownEvent, window, cx| {
+                view.flow_mission_key(field, &ev.keystroke, window, cx);
+            }));
+        // A description is prose and wraps; a title is a name and rides one
+        // line. Both grow with what is in them rather than clipping it.
+        well = if prose {
+            well.items_start().min_h(px(pt(46.0))).py(px(pt(6.0)))
+        } else {
+            well.items_center().h(px(pt(28.0)))
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(pt(2.0)))
+            .w_full()
+            .child(kit::mono_caps(label, view::LABEL_PT, kit::MUTED_INK))
+            .child(well.child(value))
+            .into_any_element()
+    }
+
+    fn focus_flow_mission(&mut self, field: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.flow_mission_focus = Some(field);
+        if let Some(handle) = self.flow_mission_handles[field].clone() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// Tab walks the two fields; everything else is an edit.
+    fn flow_mission_key(
+        &mut self,
+        field: usize,
+        k: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match k.key.as_str() {
+            // Two fields, so Tab and Shift-Tab both walk to the other one.
+            "tab" => {
+                let next = (field + 1) % 2;
+                self.focus_flow_mission(next, window, cx);
+            }
+            "escape" => {
+                self.flow_mission_focus = None;
+                cx.notify();
+            }
+            "backspace" => {
+                if self.flow_mission_edit(field, "backspace") {
+                    cx.notify();
+                }
+            }
+            _ => {
+                if let Some(text) = k
+                    .key_char
+                    .as_deref()
+                    .filter(|t| !t.is_empty() && !t.chars().any(char::is_control))
+                {
+                    if self.flow_mission_edit(field, text) {
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
+    /// One keystroke: backspace removes, text appends. Answers whether the
+    /// draft changed.
+    fn flow_mission_edit(&mut self, field: usize, key: &str) -> bool {
+        let Some(draft) = &mut self.flow_draft else {
+            return false;
+        };
+        let mut text = if field == 0 {
+            draft.saved_title().to_string()
+        } else {
+            draft.saved_description().to_string()
+        };
+        if key == "backspace" {
+            if text.pop().is_none() {
+                return false;
+            }
+        } else {
+            if key.is_empty() || key.chars().any(char::is_control) {
+                return false;
+            }
+            text.push_str(key);
+        }
+        if field == 0 {
+            draft.set_saved_title(text);
+        } else {
+            draft.set_saved_description(text);
+        }
+        true
+    }
+
     /// F7: the rail, the verbs, and the write order.
     ///
     /// The sheet's own columns: verbs on the left of the panel, the ladder on
@@ -24418,8 +24619,11 @@ impl IslandDemo {
             .overflow_y_scroll()
             .child(kit::note("WHAT YOU PRESS", kit::MUTED_INK));
         for verb in draft.verbs().iter().copied() {
+            // A CARD SELECTS, THE FOOTER'S BUTTON PRESSES. The card used to
+            // press on the same click, which made Save as Scenario impossible
+            // to CHOOSE: choosing it was spending it, before the fields it
+            // needs had been drawn.
             let blockers = draft.blockers(verb);
-            let live = blockers.is_empty() && !self.press_busy;
             let chosen = self.flow_verb == verb;
             let mut card = div()
                 .id(("flow-verb-card", verb.stops_at() as usize))
@@ -24433,6 +24637,12 @@ impl IslandDemo {
                 .border(px(kit::EDGE_WIDTH))
                 .border_color(rgba(if chosen { kit::LIVE_INK } else { kit::EDGE_INK }))
                 .bg(rgba(if chosen { PANEL_SLATE } else { DEEP_WELL }))
+                .cursor_pointer()
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.flow_verb = verb;
+                    view.press_outcome = None;
+                    cx.notify();
+                }))
                 .child(
                     div()
                         .flex()
@@ -24441,11 +24651,7 @@ impl IslandDemo {
                         .gap(px(pt(6.0)))
                         .child(kit::radio(chosen))
                         .child(kit::human(verb.label(), view::BODY_PT, kit::VALUE_INK)),
-                )
-                .child(kit::remark(verb.writes().to_string(), kit::MUTED_INK));
-            for line in verb.consequence() {
-                card = card.child(kit::note(line, kit::MUTED_INK));
-            }
+                );
             // The landing strip, as the sheet draws it: a tag, not a sentence.
             // A tag sizes to its word: a column child stretches, so it rides
             // a row of its own.
@@ -24463,15 +24669,6 @@ impl IslandDemo {
                     ),
                     WARNING_SAND,
                 ));
-            }
-            if live && self.flow_stage == crate::draft::Stage::Review {
-                card = card
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.flow_verb = verb;
-                        view.press(verb, cx);
-                        cx.notify();
-                    }));
             }
             verbs = verbs.child(card);
         }
@@ -24528,21 +24725,34 @@ impl IslandDemo {
             .id("flow-ladder")
             .flex()
             .flex_col()
+            .gap(px(pt(4.0)))
             .flex_1()
             .min_w_0()
             .min_h_0()
             .p(px(pt(PANEL_PAD)))
-            .overflow_y_scroll()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .w_full()
-                    .child(kit::note("THE WRITE ORDER", kit::MUTED_INK))
-                    .child(kit::note("ONE AT A TIME", kit::MUTED_INK)),
-            );
+            .overflow_y_scroll();
+        // A SAVED SCENARIO IS NAMED HERE, not in stage 01 twice. The mission
+        // the press mints has its own title and description, and the field
+        // arrives prefilled with the game's own — editable, because a scenario
+        // may be saved under a name the session does not use. It is drawn
+        // above the write order because it is what M1 writes.
+        if self.flow_verb == crate::draft::Verb::SaveAsScenario {
+            ladder = ladder
+                .child(kit::note("SAVED SCENARIO", kit::MUTED_INK))
+                .child(self.flow_mission_field(0, "TITLE", false, cx))
+                .child(self.flow_mission_field(1, "DESCRIPTION", true, cx))
+                .child(div().h(px(pt(2.0))));
+        }
+        ladder = ladder.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .child(kit::note("THE WRITE ORDER", kit::MUTED_INK))
+                .child(kit::note("ONE AT A TIME", kit::MUTED_INK)),
+        );
         let plan = crate::commit::plan(
             &draft,
             &crate::commit::Live::default(),
@@ -45347,6 +45557,45 @@ mod tests {
             })
         });
         assert!(rx.try_recv().is_err(), "nothing reached the sink");
+    }
+
+    /// STAGE 06 NAMES THE MISSION. The field opens on the game's title — the
+    /// operator typed it once — and the first keystroke makes the words the
+    /// mission's own.
+    #[gpui::test]
+    fn the_saved_scenario_is_named_in_stage_six(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
+            let mut draft =
+                crate::draft::Draft::blank(crate::gamestate::GameMode::Scenario).unwrap();
+            draft.terms.name = "Baltic Shield 26".into();
+            demo.flow_draft = Some(draft);
+            demo.flow_stage = crate::draft::Stage::Review;
+            demo.flow_verb = crate::draft::Verb::SaveAsScenario;
+            demo
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _cx| {
+                let before = demo.flow_draft.clone().expect("a draft");
+                assert_eq!(before.saved_title(), "Baltic Shield 26");
+                assert_eq!(before.saved_description(), "");
+
+                assert!(demo.flow_mission_edit(0, "!"));
+                assert!(demo.flow_mission_edit(1, "a"));
+                assert!(demo.flow_mission_edit(1, "b"));
+
+                let after = demo.flow_draft.clone().expect("a draft");
+                assert_eq!(after.saved_title(), "Baltic Shield 26!");
+                assert_eq!(after.saved_description(), "ab");
+
+                assert!(demo.flow_mission_edit(0, "backspace"));
+                assert_eq!(
+                    demo.flow_draft.as_ref().unwrap().saved_title(),
+                    "Baltic Shield 26"
+                );
+            })
+        });
     }
 
     /// THE PRESS SENDS THE WHOLE DRAFT, and the answer REPLACES it: the

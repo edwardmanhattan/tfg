@@ -386,10 +386,12 @@ field as a right-aligned hint (`REQUIRED · 255 MAX`, `OPTIONAL · 4000`,
 
 ### 4.3 Footer
 
-`STAGE 01 OF 06 · THE DRAFT IS LOCAL` and `THE VERBS UNLOCK WHEN 01–06 PASS —
-NOTHING IS WRITTEN BEFORE THAT`. Both are literal, with one substitution: the
-denominator is the **mode's** stage count, so a static or maneuver draft reads
-`OF 05` and `01–05 PASS` (§1).
+`STAGE 01 OF 06 · THE DRAFT IS LOCAL`, with the verbs on the right: each one
+enabled only when its own plan has no blockers, and the row wraps rather than
+clipping a verb at a narrow window. The denominator is the **mode's** stage
+count, so a static or maneuver draft reads `OF 05` (§1). The sentence under the
+counter (`THE VERBS UNLOCK WHEN 01–06 PASS`) is gone: the buttons already say
+which are live and which are not.
 
 ---
 
@@ -801,16 +803,32 @@ prints `WRITTEN`, and 08 is a read (§9.1).
 ### 9.1 The screen
 
 **Left — `WHAT YOU PRESS`.** Three verb blocks (two for static/maneuver), each
-with what it writes, where it lands, and a one-line consequence:
+carrying the verb's name, where it lands, and — when it cannot run — the first
+blocker. The block **selects**; the footer's button presses. Choosing Save as
+Scenario used to spend it on the same click, which made it impossible to choose
+before the mission's name existed.
 
-| Verb | Line | Consequence |
-| --- | --- | --- |
-| Save as Game Session | `WRITES 01–07 · STOPS BEFORE READINESS` | `LANDS IN PLANNING`, `IT KEEPS THE DRAFT OPEN BESIDE IT` |
-| Save as Scenario | `WRITES ITS UNITS AND ITS STEPS` | `NO MAP, NO GROUPS, NO SEATS`, `LANDS IN SAVED SCENARIOS` |
-| Play Directly | `WRITES 01–09 · THE WHOLE LADDER` | `IT DOES NOT START THE EXERCISE`, `LANDS IN PREPARATION` |
+| Verb | Lands |
+| --- | --- |
+| Save as Game Session | `LANDS IN PLANNING` |
+| Save as Scenario | `LANDS IN SAVED SCENARIOS` |
+| Play Directly | `LANDS IN PREPARATION` |
 
 A verb that cannot run is **disabled and says why**, using the same plan that
 would run it (§9.3): the blockers are the plan's gaps, rendered as sentences.
+
+**An empty stage is a refusal.** Minos takes a game with no hulls and a mission
+with no steps, so the console is the last place that can say no: the game
+ladders need at least one hull in stage 02, a scenario's ladders at least one
+step in stage 04, and Save as Scenario a non-empty mission title. `03 GROUPS` is
+deliberately not one of them — a flat force is a legal game, and the task
+organisation is a way of grouping hulls rather than a stage everyone must fill.
+
+**`SAVED SCENARIO`, above the write order.** With Save as Scenario selected the
+right column opens with the mission's own two fields — `TITLE` and
+`DESCRIPTION` — prefilled from the game's own, editable, and posted by M1.
+They are here and not in stage 01 because a Saved Scenario is a mission with a
+name of its own; the field opens on the game's so the name is typed once.
 
 **Right — `THE WRITE ORDER`.** One row per ladder position: number, name,
 one-line description, status. The statuses are `WRITTEN`, `FAILED 502`,

@@ -793,6 +793,20 @@ mod tests {
         let mut draft =
             crate::draft::Draft::blank(crate::gamestate::GameMode::Maneuver).expect("a draft");
         draft.terms.name = "Baltic Shield 26".into();
+        // A game with an empty force is refused before the transport is asked
+        // anything, so the draft that reaches the dead server has one hull.
+        draft.roster.stage(crate::roster::StagedSeat {
+            user_id: 4,
+            user_name: "Lt. Fitri".into(),
+            role_id: 1,
+            role_name: "Commando".into(),
+            call_sign: "FITRI".into(),
+            judge: false,
+        });
+        draft.force.upsert(crate::force::DraftHull {
+            commander_id: Some(4),
+            ..crate::force::DraftHull::new(351, "KRI AHMAD YANI".into(), String::new(), String::new())
+        });
         let outcome = crate::commit::run(
             &mut draft,
             &crate::commit::Live::default(),
