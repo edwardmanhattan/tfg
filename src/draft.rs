@@ -224,7 +224,7 @@ impl Verb {
         match self {
             Verb::SaveAsScenario => 3,
             Verb::SaveAsGameSession => 7,
-            Verb::PlayDirectly => 9,
+            Verb::PlayDirectly => 8,
         }
     }
 }
@@ -244,7 +244,7 @@ impl Ladder {
     /// How many positions the ladder has, read included.
     pub fn length(self) -> u8 {
         match self {
-            Ladder::Game => 9,
+            Ladder::Game => 8,
             Ladder::Mission => 3,
         }
     }
@@ -662,9 +662,13 @@ impl Terms {
 pub enum Landing {
     /// The server answered and gave an id, where the position makes one.
     Written { id: Option<i64> },
-    /// Position 08 of the game ladder: the readiness gate. A READ, so it is
-    /// never "written" — a counter that said it was would be lying about the
-    /// one position whose whole point is that nobody writes it (§9.1).
+    /// A position that READ instead of writing.
+    ///
+    /// NO POSITION ON EITHER LADDER IS ONE TODAY. The readiness gate used to
+    /// be the game ladder's 08, and it was the wrong phase: readiness is
+    /// declared in `preparation`, and Play Directly only moves `planning` to
+    /// `preparation`. The variant stays because the journal's shape is not the
+    /// ladder's, and a future read belongs here rather than in `Written`.
     Read,
     /// The server refused or did not answer. `502` has no envelope, so the
     /// status and the `X-Request-ID` are all there is (§9.1).
@@ -1258,6 +1262,17 @@ impl Draft {
                     .to_string(),
             });
         }
+        // A GAME CANNOT ENTER PREPARATION WITH ONLY JUDGES. Play Directly's
+        // last write is the transition, and the server refuses it with
+        // "nobody on the exercise side has nobody to run the exercise". A
+        // planning save does not transition, so this is Play Directly's rule.
+        if verb == Verb::PlayDirectly && !self.roster.staged().any(|seat| !seat.judge) {
+            blockers.push(Blocker {
+                stage: Stage::Players,
+                sentence: "Nobody on the exercise side is seated \u{2014} a game moves to                            preparation only with somebody to run it, and judges direct rather                            than play."
+                    .to_string(),
+            });
+        }
         if verb == Verb::SaveAsScenario && self.saved_title().trim().is_empty() {
             blockers.push(Blocker {
                 stage: Stage::Scenario,
@@ -1565,7 +1580,7 @@ mod tests {
         assert_eq!(scenario.verbs().len(), 3);
         assert!(scenario.offers(Verb::SaveAsScenario));
         assert_eq!(Verb::SaveAsScenario.ladder(), Ladder::Mission);
-        assert_eq!(Verb::PlayDirectly.stops_at(), 9);
+        assert_eq!(Verb::PlayDirectly.stops_at(), 8);
     }
 
     /// The three origins differ in what a press is: two creates and one diff.
@@ -1907,9 +1922,13 @@ mod tests {
             "{:?}",
             draft.blockers(Verb::SaveAsGameSession)
         );
+        // Play Directly transitions, and the server wants somebody on the
+        // exercise side; that is a roster rule, not a commander one.
+        draft.roster.stage(seat(4, "Lt. Fitri"));
         assert!(
             draft.can_run(Verb::PlayDirectly),
-            "and the transition out of planning has no commander precondition"
+            "{:?}",
+            draft.blockers(Verb::PlayDirectly)
         );
     }
 
@@ -2140,20 +2159,21 @@ mod tests {
     }
 
     /// THE COUNTER'S DENOMINATOR IS THE VERB'S STOP: a Save as Game Session
-    /// press walks seven of the nine game positions, and the panel it draws is
+    /// press walks seven of the eight game positions, and the panel it draws is
     /// that list.
     #[test]
     fn the_settled_counter_counts_the_verbs_own_positions() {
         let draft = Draft::blank(GameMode::Scenario).unwrap();
         assert_eq!(draft.settled(Verb::SaveAsGameSession), (0, 7));
-        assert_eq!(draft.settled(Verb::PlayDirectly), (0, 9));
+        assert_eq!(draft.settled(Verb::PlayDirectly), (0, 8));
         assert_eq!(draft.settled(Verb::SaveAsScenario), (0, 3));
     }
 
-    /// 08 is a READ, and it settles the position without pretending anything
-    /// was written.
+    /// A READ SETTLES A POSITION without pretending anything was written. No
+    /// position on either ladder reads today — the readiness gate left the
+    /// press — but the journal keeps the shape for the one that will.
     #[test]
-    fn the_gate_read_settles_a_position_without_writing_one() {
+    fn a_read_settles_a_position_without_writing_one() {
         let mut journal = Journal::new();
         for position in 1..=7 {
             journal.note_written(Ladder::Game, position, None);

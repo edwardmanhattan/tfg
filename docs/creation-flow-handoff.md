@@ -74,7 +74,7 @@ The three verbs, and where each stops:
 | --- | --- | --- | --- |
 | **Save as Game Session** | game ladder 01–07 | `planning` | Stays open beside it |
 | **Save as Scenario** | mission ladder M1–M3 | Saved Scenarios | Closes into the collection |
-| **Play Directly** | game ladder 01–07, gate 08, transition 09 | `preparation` | Closes into the game |
+| **Play Directly** | game ladder 01–07, then transition 08 | `preparation` | Closes into the game |
 
 A **static** or **maneuver** draft has **five stages and two verbs**: no stage
 04, no Save as Scenario (the server refuses a scenario on a non-scenario game
@@ -965,12 +965,12 @@ They are here and not in stage 01 because a Saved Scenario is a mission with a
 name of its own; the field opens on the game's so the name is typed once.
 
 **Right — `THE WRITE ORDER`.** One row per ladder position: number, name,
-one-line description, status. The statuses are `WRITTEN`, `FAILED 502`,
-`PENDING`, and `READ` for 08 — the gate is a read, so it is never "written",
-and a counter that said it was would be lying about the one position whose
-whole point is that nobody writes it. The counter (`6 OF 9`) counts positions
-**settled**, read included. `ONE AT A TIME` — the ladder is issued one write at
-a time, and the row's status changes as each answer lands.
+one-line description, status. The statuses are `WRITTEN`, `FAILED 502` and
+`PENDING`. **Every position is a write** — the readiness gate used to sit at
+08 and it was the wrong phase (see §9.2), so there is no read in the ladder
+today. The counter (`6 OF 8`) counts positions settled. `ONE AT A TIME` — the
+ladder is issued one write at a time, and the row's status changes as each
+answer lands.
 
 The numbers on screen are the corrected ladder's (§9.2), not the sheet's. F7's
 example failure is on `SEATS`, which the sheet numbers 06 and the corrected
@@ -1010,8 +1010,7 @@ halves of that are wrong, and the corrections are erratum 1:
 | 05 | PLACEMENTS | `PUT /games/{id}/units/{unit_id}/placement` | One write per hull, unit-id order. |
 | 06 | STEPS | scenarios, steps, sub-steps, audiences | Audiences name hulls, so after 04. Every add answers with the **whole book**, so the new step's or command's id is the one the answer carries and the remembered book did not — the next write names it. |
 | 07 | COMMANDERS | `PUT .../hierarchy/{node}/commander`, `PATCH .../units/{unit_id}` | Group commanders, and a hull's commander where 04's differs. |
-| 08 | READINESS | **`GET /games/{id}/readiness`** — a read | The gate, shown before 09. Never a write. |
-| 09 | TRANSITION | `POST /games/{id}/transitions {to:"preparation"}` | Play Directly only. |
+| 08 | TRANSITION | `POST /games/{id}/transitions {to:"preparation"}` | Play Directly only. Readiness is declared **in preparation**, after this write; the readiness gate is the console's preparation surface, not the press. |
 
 **The mission ladder** (Save as Scenario):
 
@@ -1149,7 +1148,7 @@ fields, and a 5xx as one line with the status and the request id.
 | `GET /games/{id}/hierarchy` | Reopened | the tree |
 | `GET /games/{id}/placements` | Reopened | positions and the placed count |
 | `GET /games/{id}/scenarios`, `.../steps` | Reopened | the book |
-| `GET /games/{id}/readiness` | 08 | `can_execute`, `blockers`, `fast` |
+| `GET /games/{id}/readiness` | preparation (the console) | `can_execute`, `blockers`, `fast`; **404 while planning** |
 
 ### Writes
 
@@ -1172,8 +1171,7 @@ fields, and a 5xx as one line with the status and the request id.
 | 06 | `PUT .../substeps/{subid}/related` | `{related:[{kind:"hull", id}]}` | whole list, not a delta; empty clears |
 | 07 | `PUT /games/{id}/hierarchy/{node}/commander` | `id_commander` | participant, not judge-side |
 | 07 | `DELETE /games/{id}/hierarchy/{node}/commander` | — | clears |
-| 08 | `GET /games/{id}/readiness` | — | read only |
-| 09 | `POST /games/{id}/transitions` | `{to:"preparation"}` | 403 not this game's GM; 409 wrong step; 409 preconditions, all named |
+| 08 | `POST /games/{id}/transitions` | `{to:"preparation"}` | 403 not this game's GM; 409 wrong step; 409 preconditions, all named |
 | M1 | `POST /scenario-missions` | `title, code?, description?` | code normalised to upper case, unique among live |
 | M2 | `POST /scenario-missions/{id}/steps` | `kind, content, start_hour?, end_hour?` | as above |
 | M3 | `POST .../steps/{stid}/substeps` | `content` | 409 on a beat |
@@ -1197,7 +1195,9 @@ Each of these is a place where the frames, taken literally, do not build. The
 resolution is the one to implement.
 
 **1. The write order.** F7 prints game → hierarchy → units → placements → steps
-→ seats → commanders → readiness → transition. A hull's commander must already
+→ seats → commanders → readiness → transition. The flow's ladder has no
+readiness position: readiness is declared in `preparation`, and the press only
+moves `planning` to `preparation`. A hull's commander must already
 be a participant *when one is named*, so **seats precede units**; and a hull's
 tree placement needs its node, so **hierarchy precedes units**. Use §9.2's
 order. (`id_commander` itself is optional on assignment — a plan may save an
@@ -1215,7 +1215,7 @@ needs an id, and a blank draft has none. The draft stores role **names** from
 name → id before writing seats. Never send a template role id: the server
 answers 409 because the two vocabularies' ids do not overlap.
 
-**4. Readiness is not a write in this flow.** 08 is a read. Declarations are
+**4. Readiness is not in this flow at all.** Declarations are
 self-service and only accepted in `preparation`. "Play Directly writes 01–09"
 means 01–07 plus the gate read and 09.
 
@@ -1491,7 +1491,7 @@ Six facts this document needed from the live API. Five were driven on
 | 1 | `max_echelon_rank` — hierarchy id or rank number? | **A rank number.** Send `40`. | §12.7, §3.3, §6.1, §11 |
 | 2 | `POST /games` with client-computed `actual_end` / `assumed_end`? | **Accepted.** Send both ends. | §4.1, §12.8 |
 | 3 | `PATCH /games/{id}` with `time_factor` — does it move `assumed_end`? | **No. Send both** `time_factor` and the new `assumed_end`. | §4.1 |
-| 4 | `GET /games/{id}/readiness` — does the read answer? | **Yes**, despite the spec listing only `PUT`/`DELETE`. 08 may depend on it. | §9.2, §10 |
+| 4 | `GET /games/{id}/readiness` — does the read answer? | **Not while planning** (404, verified). The press does not read it; readiness is declared in `preparation` and the console's gate reads it there. | §9.2, §10 |
 | 5 | `GET /units/asset-groups` — is `Aset Lainnya` returned at zero, and does `/unit-categories?id_asset_group=` take its id? | **Open.** | §5.1 |
 | 6 | `POST /scenario-missions` reachable, and may `code` be omitted? | **Yes to both.** | §9.2, M1 |
 

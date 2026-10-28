@@ -408,10 +408,6 @@ impl Transport for MasterTransport<'_> {
             // 08 — the gate. Its verdict is the arrival panel's business; the
             // ladder records that it answered, so an empty list is the whole
             // answer here.
-            Read::Readiness { game_id } => match self.master.game_readiness(self.token, *game_id) {
-                Ok(_) => Answer::Found { ids: Vec::new() },
-                Err(e) => answer_of(e),
-            },
             // The lost-01 question. Filtered HERE because this is the only
             // layer that can read `created_at`: the engine states the window,
             // the transport applies it.
@@ -1240,6 +1236,6 @@ mod substep_route_tests {
         // The fork is `self.ladder`, and the two ladders are different values.
         assert_ne!(Ladder::Mission, Ladder::Game);
         assert_eq!(Ladder::Mission.length(), 3, "M1, M2, M3");
-        assert_eq!(Ladder::Game.length(), 9, "01..09");
+        assert_eq!(Ladder::Game.length(), 8, "01..08");
     }
 }

@@ -958,9 +958,12 @@ mod tests {
         // save a record that opens into nothing; the blockers name the two
         // stages, in rail order.
         let blocking = draft.blockers(Verb::PlayDirectly);
-        assert_eq!(blocking.len(), 2, "{blocking:?}");
+        assert_eq!(blocking.len(), 3, "{blocking:?}");
         assert_eq!(blocking[0].stage, crate::draft::Stage::Units);
         assert_eq!(blocking[1].stage, crate::draft::Stage::Scenario);
+        // Play Directly also transitions, and a game with nobody on the
+        // exercise side cannot move to preparation.
+        assert_eq!(blocking[2].stage, crate::draft::Stage::Players);
         assert_eq!(
             draft.stage_count(),
             6,

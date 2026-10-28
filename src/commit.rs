@@ -649,13 +649,6 @@ pub fn position(draft: &Draft, live: &Live, verb: Verb, number: u8, offset: &str
         }
         8 => Position {
             number,
-            name: "READINESS",
-            note: "who has declared \u{2014} a read, never a write",
-            writes: Vec::new(),
-            read: game_id(draft, live).map(|game_id| Read::Readiness { game_id }),
-        },
-        9 => Position {
-            number,
             name: "TRANSITION",
             note: "into preparation",
             writes: vec![Write::Transition { to: "preparation" }],
@@ -1004,9 +997,6 @@ fn step_ref_id(step: StepRef) -> i64 {
 /// press's, but two of them are reads the ladder depends on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Read {
-    /// 08 — the gate. Its verdict is the arrival panel's business; the ladder
-    /// records that it answered.
-    Readiness { game_id: i64 },
     /// The lost-01 question: every game with this name created in the last
     /// [`LOST_GAME_WINDOW_MINUTES`]. The transport does the filtering, because
     /// only it can read `created_at`.
@@ -1153,19 +1143,6 @@ pub fn run(
             }
             continue;
         }
-        if number == 8 {
-            // The gate is a read of a game that must exist by now: reaching
-            // this without an id is a plan built from nothing, and saying so
-            // is better than settling a position nobody read.
-            let failure = Failure {
-                status: None,
-                request_id: None,
-                sentence: "The gate cannot be read before the game exists.".to_string(),
-            };
-            draft.journal.note_failed(ladder, number, 0, None);
-            return stop(&position, failure);
-        }
-
         for write in &position.writes {
             match transport.send(write, &draft.journal) {
                 Answer::Done { id } => {
@@ -1385,8 +1362,6 @@ mod tests {
         refuse: Vec<String>,
         /// The send call (0-based) this fake refuses, for a ladder-wide sweep.
         fail_on_send: Option<usize>,
-        /// Whether the gate read fails.
-        fail_read: bool,
         calls: usize,
         seen: Vec<String>,
         reads: Vec<String>,
@@ -1454,20 +1429,12 @@ mod tests {
 
         fn read(&mut self, read: &Read, _journal: &Journal) -> Answer {
             self.reads.push(match read {
-                Read::Readiness { .. } => "readiness".to_string(),
                 Read::GamesNamed { .. } => "games-named".to_string(),
             });
-            if self.fail_read && matches!(read, Read::Readiness { .. }) {
-                return Answer::NoAnswer {
-                    status: Some(502),
-                    request_id: Some("req-gate".into()),
-                };
-            }
             match read {
                 Read::GamesNamed { .. } => Answer::Found {
                     ids: self.lost.clone().unwrap_or_default(),
                 },
-                Read::Readiness { .. } => Answer::Found { ids: Vec::new() },
             }
         }
     }
@@ -1572,7 +1539,6 @@ mod tests {
                 "PLACEMENTS",
                 "STEPS",
                 "COMMANDERS",
-                "READINESS",
                 "TRANSITION"
             ]
         );
@@ -1587,14 +1553,16 @@ mod tests {
             plan.positions[4].writes[0],
             Write::Place { unit_id: 351, .. }
         ));
-        // 08 is a read, and it is the only position that is not a write. It
-        // has no game to read before the press, so it draws empty here and is
-        // built again once 01 has made one (the press test proves that).
-        assert!(plan.positions[7].writes.is_empty());
-        assert!(plan.positions[7].read.is_none());
+        // 08 is the transition: the last write, and the only one that moves
+        // a state. Nothing on the ladder reads.
+        assert!(matches!(
+            plan.positions[7].writes[0],
+            Write::Transition { .. }
+        ));
+        assert!(plan.positions.iter().all(|position| position.read.is_none()));
     }
 
-    /// Save as Game Session stops before readiness and never writes 08 or 09.
+    /// Save as Game Session stops before the transition and never writes 08.
     #[test]
     fn a_verb_writes_only_up_to_its_own_position() {
         let draft = ready_draft(GameMode::Maneuver);
@@ -1603,9 +1571,9 @@ mod tests {
         assert!(save.positions.iter().all(|p| p.number <= 7));
 
         let play = plan(&draft, &Live::default(), Verb::PlayDirectly, "+00:00");
-        assert_eq!(play.positions.len(), 9);
+        assert_eq!(play.positions.len(), 8);
         assert_eq!(
-            play.positions[8].writes,
+            play.positions[7].writes,
             vec![Write::Transition { to: "preparation" }]
         );
     }
@@ -1850,10 +1818,14 @@ mod tests {
         );
         assert_eq!(outcome, Outcome::Done, "{outcome:?}");
         assert_eq!(draft.journal.game_id(), Some(42));
-        assert_eq!(draft.journal.settled(Ladder::Game), 9);
-        // The gate was READ, not written.
-        assert_eq!(fake.reads, vec!["readiness"]);
-        assert_eq!(draft.journal.landing(Ladder::Game, 8), Some(&Landing::Read));
+        // EIGHT POSITIONS, ALL WRITES. Readiness left the press: it is declared
+        // in preparation, and the server has no read for it.
+        assert_eq!(draft.journal.settled(Ladder::Game), 8);
+        assert!(fake.reads.is_empty(), "the ladder reads nothing: {:?}", fake.reads);
+        assert_eq!(
+            draft.journal.landing(Ladder::Game, 8),
+            Some(&Landing::Written { id: None })
+        );
     }
 
     /// A failure stops the press at its position, and nothing before it is
@@ -1963,23 +1935,18 @@ mod tests {
         .iter()
         .map(|p| p.writes.len())
         .collect();
-        assert_eq!(counts.len(), 9);
-        assert!(counts.iter().sum::<usize>() >= 9, "{counts:?}");
+        assert_eq!(counts.len(), 8);
+        assert!(counts.iter().sum::<usize>() >= 8, "{counts:?}");
 
-        for position in 1..=9u8 {
+        for position in 1..=8u8 {
             let before: usize = counts[..position as usize - 1].iter().sum();
             let writes_here = counts[position as usize - 1];
-
+            if writes_here == 0 {
+                continue; // nothing to fail at
+            }
             let mut draft = full_draft();
             let mut fake = Fake::with_id("create game \"Baltic Shield 26\"", 42);
-            if writes_here == 0 {
-                if position != 8 {
-                    continue; // nothing to fail at
-                }
-                fake.fail_read = true;
-            } else {
-                fake.fail_on_send = Some(before);
-            }
+            fake.fail_on_send = Some(before);
             let outcome = run(
                 &mut draft,
                 &Live::default(),
@@ -2019,7 +1986,7 @@ mod tests {
                 &mut again,
             );
             assert_eq!(outcome, Outcome::Done, "resume at {position}: {outcome:?}");
-            assert_eq!(draft.journal.settled(Ladder::Game), 9);
+            assert_eq!(draft.journal.settled(Ladder::Game), 8);
             let owed: usize = counts[position as usize - 1..].iter().sum();
             assert_eq!(
                 again.seen.len(),
