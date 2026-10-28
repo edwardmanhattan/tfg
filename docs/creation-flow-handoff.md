@@ -997,7 +997,7 @@ halves of that are wrong, and the corrections are erratum 1:
 | --- | --- | --- | --- |
 | 01 | GAME | `POST /games` | Lands in `planning`. Everything else hangs off its id. |
 | 02 | SEATS | `POST /games/{id}/participants` | **Before units**: a hull's commander must already be a participant. |
-| 03 | HIERARCHY | `POST /games/{id}/hierarchy`, top-down | A parent before its child. |
+| 03 | HIERARCHY | `POST /games/{id}/hierarchy`, top-down | A parent before its child. **The level is the server's id**: the flow's rung is a local kind, and `id_unit_hierarchy` is resolved from `GET /hierarchy`, read once per press. Without the vocabulary the press is a gap, not a `0`. |
 | 04 | UNITS | `POST /games/{id}/units`, then the tree placement, then embarkations, removals last | Needs the seat (02) and the node (03); the tree placement is a second write per hull, and an embarkation needs both of its ends to exist. |
 | 05 | PLACEMENTS | `PUT /games/{id}/units/{unit_id}/placement` | One write per hull, unit-id order. |
 | 06 | STEPS | scenarios, steps, sub-steps, audiences | Audiences name hulls, so after 04. |

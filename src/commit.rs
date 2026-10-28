@@ -110,6 +110,21 @@ pub struct Live {
     /// whole scenario, so the ids already there are what tells the new one
     /// apart.
     pub scenarios: Vec<LiveScenario>,
+    /// The task organisation's vocabulary, as master data gives it.
+    ///
+    /// A NEW BODY'S LEVEL IS A SERVER ID, not the flow's local rank: a
+    /// create sends `id_unit_hierarchy`, and the rung the operator dropped on
+    /// is a `GroupKind`. The catalogue is read at press time, because it is
+    /// master data rather than a fact about the game, and it is here because
+    /// the plan is the only place that knows both halves.
+    pub echelons: Vec<LiveEchelon>,
+}
+
+/// One level of the task organisation: its name and the id a create sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveEchelon {
+    pub name: String,
+    pub id: i64,
 }
 
 impl Live {
@@ -530,10 +545,7 @@ pub fn position(draft: &Draft, live: &Live, verb: Verb, number: u8, offset: &str
             number,
             name: "HIERARCHY",
             note: "the task organisation, a parent before its child",
-            writes: tree(draft, live)
-                .into_iter()
-                .filter_map(node_write)
-                .collect(),
+            writes: tree_writes(draft, live),
             read: None,
         },
         4 => {
@@ -744,17 +756,26 @@ fn seat_write(w: RosterWrite) -> Write {
 /// The tree's node writes: creates, renames, re-parents and removals. The
 /// unit placements and the commanders are the same plan, split across 04 and
 /// 07 because that is where the ladder puts them.
-fn node_write(w: GroupWrite) -> Option<Write> {
+fn node_write(w: GroupWrite, echelons: &[LiveEchelon]) -> Option<Write> {
     match w {
         GroupWrite::CreateNode {
             local_id,
             name,
             echelon_id,
+            kind,
             parent,
         } => Some(Write::CreateNode {
             local_id,
             name,
-            echelon_id,
+            // The staged id when the row came from a read or a fixture;
+            // otherwise the level's id from the vocabulary. A flow-staged
+            // group has none of its own, and sending `0` is the 400 that
+            // stopped 03 on `id_unit_hierarchy`.
+            echelon_id: if echelon_id != 0 {
+                echelon_id
+            } else {
+                echelon_id_for(kind, echelons)
+            },
             parent: parent.map(Ref::from),
         }),
         GroupWrite::Rename { group_id, name } => Some(Write::RenameNode {
@@ -895,6 +916,27 @@ pub fn gaps(draft: &Draft, live: &Live, verb: Verb) -> Vec<String> {
         if let Err(gap) = force::plan(&draft.force, &live.units) {
             gaps.push(format!("The force cannot be written: {gap}"));
         }
+        // A NEW BODY NEEDS ITS LEVEL'S SERVER ID. The flow's rung is a local
+        // kind; the create sends `id_unit_hierarchy`, and `0` is the 400 the
+        // server answers with "this field is required". Saying it before the
+        // press names the level rather than the column.
+        let unlevelled: Vec<&str> = draft
+            .groups
+            .staged_groups()
+            .filter(|group| {
+                draft.groups.is_new(group.local_id)
+                    && group.echelon_id == 0
+                    && echelon_id_for(group.kind, &live.echelons) == 0
+            })
+            .map(|group| group.name.as_str())
+            .collect();
+        if !unlevelled.is_empty() {
+            gaps.push(format!(
+                "The task organisation's levels were not read from the server, so {} has no \
+                 `id_unit_hierarchy` to create it with.",
+                unlevelled.join(", ")
+            ));
+        }
     }
     let audiences = draft.book.relation_count();
     if audiences > 0 {
@@ -928,6 +970,29 @@ pub fn gaps(draft: &Draft, live: &Live, verb: Verb) -> Vec<String> {
 
 fn tree(draft: &Draft, live: &Live) -> Vec<GroupWrite> {
     groups::plan(&draft.groups, &live.nodes)
+}
+
+/// The tree's writes, with each new body's level resolved to the server's id.
+fn tree_writes(draft: &Draft, live: &Live) -> Vec<Write> {
+    tree(draft, live)
+        .into_iter()
+        .filter_map(|w| node_write(w, &live.echelons))
+        .collect()
+}
+
+/// The master-data id for a level, or `0` when the vocabulary has not been
+/// read or does not name that level.
+///
+/// THE NAME IS THE KEY because that is what both sides carry: the catalogue
+/// states `Satuan Tugas`, and [`crate::groups::GroupKind::from_echelon`] is
+/// the one squashing rule the console already uses to turn a server level into
+/// a local kind. Matching the other way round is the same function.
+pub fn echelon_id_for(kind: crate::groups::GroupKind, echelons: &[LiveEchelon]) -> i64 {
+    echelons
+        .iter()
+        .find(|level| crate::groups::GroupKind::from_echelon(&level.name) == Some(kind))
+        .map(|level| level.id)
+        .unwrap_or(0)
 }
 
 /// The force's writes. `force::plan` refuses a draft it cannot write at all;
@@ -1349,6 +1414,30 @@ mod tests {
         reads: Vec<String>,
     }
 
+    /// A live frame that carries the task organisation's vocabulary, the
+    /// way the press reads it before a game ladder. A test that stages a NEW
+    /// body needs it: a create sends `id_unit_hierarchy`, and a local kind is
+    /// not one.
+    fn live_with_levels() -> Live {
+        Live {
+            echelons: vec![
+                LiveEchelon {
+                    name: "Satuan Tugas".into(),
+                    id: 20,
+                },
+                LiveEchelon {
+                    name: "Gugus".into(),
+                    id: 30,
+                },
+                LiveEchelon {
+                    name: "Operasi Gabungan".into(),
+                    id: 40,
+                },
+            ],
+            ..Live::default()
+        }
+    }
+
     impl Fake {
         fn healthy() -> Self {
             Fake::default()
@@ -1739,6 +1828,41 @@ mod tests {
         assert_eq!(game_id(&draft, &Live::default()), Some(42));
     }
 
+    /// A NEW BODY'S LEVEL IS THE SERVER'S ID. The flow stages a rung — a
+    /// local kind — and the create sends `id_unit_hierarchy`; without the
+    /// vocabulary the press refuses before it sends `0` and gets a 400.
+    #[test]
+    fn a_new_body_is_created_at_the_servers_level() {
+        let mut draft = ready_draft(GameMode::Scenario);
+        draft
+            .groups
+            .stage_group(0, "GUS-1", GroupKind::SatuanTugas, None, None, vec![])
+            .expect("a group");
+        let plan = plan(
+            &draft,
+            &live_with_levels(),
+            Verb::SaveAsGameSession,
+            "+00:00",
+        );
+        let echelon = plan.positions[2]
+            .writes
+            .iter()
+            .find_map(|write| match write {
+                Write::CreateNode { echelon_id, .. } => Some(*echelon_id),
+                _ => None,
+            })
+            .expect("a create");
+        assert_eq!(echelon, 20, "the Satuan Tugas level's id");
+
+        // No catalogue, no press: the refusal names the field the server
+        // would have named, before the request is made.
+        let gaps = gaps(&draft, &Live::default(), Verb::SaveAsGameSession);
+        assert!(
+            gaps.iter().any(|gap| gap.contains("id_unit_hierarchy")),
+            "the missing vocabulary is a gap: {gaps:?}"
+        );
+    }
+
     /// A game in any other state is not reopened at all.
     #[test]
     fn a_game_past_planning_has_no_draft() {
@@ -1754,7 +1878,7 @@ mod tests {
         let mut fake = Fake::with_id("create game \"Baltic Shield 26\"", 42);
         let outcome = run(
             &mut draft,
-            &Live::default(),
+            &live_with_levels(),
             Verb::PlayDirectly,
             "+00:00",
             &mut fake,
@@ -1784,7 +1908,7 @@ mod tests {
             .push(("create game \"Baltic Shield 26\"".into(), 42));
         let outcome = run(
             &mut draft,
-            &Live::default(),
+            &live_with_levels(),
             Verb::SaveAsGameSession,
             "+00:00",
             &mut first,
@@ -1815,7 +1939,7 @@ mod tests {
         let mut second = Fake::with_id("create node \"GUS-1\"", 900);
         let outcome = run(
             &mut draft,
-            &Live::default(),
+            &live_with_levels(),
             Verb::SaveAsGameSession,
             "+00:00",
             &mut second,
@@ -1866,7 +1990,7 @@ mod tests {
         // How many writes each position owes, from the plan itself.
         let counts: Vec<usize> = plan(
             &full_draft(),
-            &Live::default(),
+            &live_with_levels(),
             Verb::PlayDirectly,
             "+00:00",
         )
@@ -1893,7 +2017,7 @@ mod tests {
             }
             let outcome = run(
                 &mut draft,
-                &Live::default(),
+                &live_with_levels(),
                 Verb::PlayDirectly,
                 "+00:00",
                 &mut fake,
@@ -1924,7 +2048,7 @@ mod tests {
             let mut again = Fake::with_id("create game \"Baltic Shield 26\"", 42);
             let outcome = run(
                 &mut draft,
-                &Live::default(),
+                &live_with_levels(),
                 Verb::PlayDirectly,
                 "+00:00",
                 &mut again,
@@ -1956,7 +2080,7 @@ mod tests {
         let mut fake = Fake::losing_the_create(vec![77]);
         let outcome = run(
             &mut draft,
-            &Live::default(),
+            &live_with_levels(),
             Verb::SaveAsGameSession,
             "+00:00",
             &mut fake,
@@ -1980,7 +2104,7 @@ mod tests {
         let mut fake = Fake::losing_the_create(Vec::new());
         let outcome = run(
             &mut draft,
-            &Live::default(),
+            &live_with_levels(),
             Verb::SaveAsGameSession,
             "+00:00",
             &mut fake,
@@ -2011,7 +2135,7 @@ mod tests {
         let mut fake = Fake::losing_the_create(vec![41, 42]);
         let outcome = run(
             &mut draft,
-            &Live::default(),
+            &live_with_levels(),
             Verb::SaveAsGameSession,
             "+00:00",
             &mut fake,
@@ -2037,7 +2161,7 @@ mod tests {
         let mut fake = Fake::healthy();
         let outcome = run(
             &mut draft,
-            &Live::default(),
+            &live_with_levels(),
             Verb::SaveAsGameSession,
             "+00:00",
             &mut fake,
@@ -2073,7 +2197,7 @@ mod tests {
         let mut fake = Fake::healthy();
         let outcome = run(
             &mut draft,
-            &Live::default(),
+            &live_with_levels(),
             Verb::SaveAsScenario,
             "+00:00",
             &mut fake,
@@ -2137,7 +2261,7 @@ mod tests {
         let mut fake = Fake::with_id("create book \"Harbour Sweep\"", 500);
         let outcome = run(
             &mut draft,
-            &Live::default(),
+            &live_with_levels(),
             Verb::SaveAsScenario,
             "+00:00",
             &mut fake,
@@ -2169,7 +2293,7 @@ mod tests {
             .push(("create game \"North Sea Patrol\"".into(), 42));
         let outcome = run(
             &mut draft,
-            &Live::default(),
+            &live_with_levels(),
             Verb::SaveAsGameSession,
             "+00:00",
             &mut fake,

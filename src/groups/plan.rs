@@ -731,7 +731,15 @@ pub enum GroupWrite {
     CreateNode {
         local_id: i64,
         name: String,
+        /// The level's master-data id, when the caller staged one.
         echelon_id: i64,
+        /// The level itself. A row staged by the flow carries no
+        /// `id_unit_hierarchy` — the vocabulary is the server's, and the
+        /// flow's rung is a local kind — so the level is what the plan
+        /// carries and the commit resolves the id against the live
+        /// catalogue. Without it the create sent `id_unit_hierarchy: 0` and
+        /// Minos answered `400 · THIS FIELD IS REQUIRED`.
+        kind: GroupKind,
         parent: Option<GroupRef>,
     },
     /// Rename a held node.
@@ -792,6 +800,7 @@ pub fn plan(draft: &GroupsDraft, live: &[LiveGroup]) -> Vec<GroupWrite> {
             local_id: group.local_id,
             name: group.name.clone(),
             echelon_id: group.echelon_id,
+            kind: group.kind,
             parent: group.parent.map(GroupRef::of),
         });
     }
@@ -990,6 +999,7 @@ mod tests {
                 local_id: id,
                 name: "Operasi Gabungan".into(),
                 echelon_id: 7,
+                kind: GroupKind::OperasiGabungan,
                 parent: None,
             }]
         );

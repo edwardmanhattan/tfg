@@ -1300,6 +1300,22 @@ fn main() {
                                 .map(|tree| flatten_nodes(&tree))
                                 .unwrap_or_default();
                         }
+                        // THE TASK ORGANISATION'S VOCABULARY, read once per
+                        // press: a new body's create sends
+                        // `id_unit_hierarchy`, and the flow's rung is only a
+                        // local kind. An empty answer is a gap the plan names
+                        // before it sends `0`.
+                        if verb.ladder() == tfg::draft::Ladder::Game {
+                            live.echelons = transport
+                                .echelon_levels(&token2)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|level| tfg::commit::LiveEchelon {
+                                    name: level.name,
+                                    id: level.id,
+                                })
+                                .collect();
+                        }
                         // `for_draft` is the game the draft is about: a
                         // reopened game's 01 writes nothing, so the journal
                         // never learns the id and every later write needs it
@@ -4933,6 +4949,7 @@ fn flush_groups(
                 local_id,
                 name,
                 echelon_id,
+                kind: _,
                 parent,
             } => {
                 let parent_id = match parent {
