@@ -183,7 +183,14 @@ impl TokenKeeper {
             // The plan replaces the token a slack before it dies, measured
             // from the instant its life started at — the token's own clock,
             // not a second reading of `now` a lock and a write later.
-            chain.due = Some(access.expires_at.saturating_sub(slack_for(pair.expires_in)));
+            chain.due = Some(
+                access
+                    .expires_at
+                    .checked_sub(slack_for(pair.expires_in))
+                    // A slack longer than the token's whole life would put the
+                    // plan before the clock: renew NOW rather than never.
+                    .unwrap_or_else(Instant::now),
+            );
             chain.access = Some(access);
             // An answer without a refresh token keeps the one already held:
             // the chain is a chain, and a refresh that answers with no new
@@ -345,7 +352,14 @@ impl TokenKeeper {
                 token: pair.access_token.clone(),
                 expires_at: Instant::now() + lifetime,
             };
-            chain.due = Some(access.expires_at.saturating_sub(slack_for(pair.expires_in)));
+            chain.due = Some(
+                access
+                    .expires_at
+                    .checked_sub(slack_for(pair.expires_in))
+                    // A slack longer than the token's whole life would put the
+                    // plan before the clock: renew NOW rather than never.
+                    .unwrap_or_else(Instant::now),
+            );
             chain.access = Some(access);
             if pair.refresh_token.is_some() {
                 chain.refresh = pair.refresh_token.clone();
@@ -537,9 +551,16 @@ mod tests {
         let server = tiny_http::Server::http(("127.0.0.1", 18121)).expect("bind test port");
         std::thread::spawn(move || {
             for mut rq in server.incoming_requests().take(1) {
-                let _ = rq.respond(tiny_http::Response::from_string(
-                    r#"{"status_code":401,"message":"Unauthorized","data":null}"#,
-                ));
+                // A REFUSED REFRESH IS A 401 ON THE WIRE, not a 200 whose
+                // envelope says 401: the client reads the HTTP status, and a
+                // stub that lies about it exercises the transient path instead
+                // of the dead chain.
+                let _ = rq.respond(
+                    tiny_http::Response::from_string(
+                        r#"{"status_code":401,"message":"Unauthorized","data":null}"#,
+                    )
+                    .with_status_code(401),
+                );
             }
         });
         let (keeper, events) = TokenKeeper::start("http://127.0.0.1:18121");
