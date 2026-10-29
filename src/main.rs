@@ -202,6 +202,14 @@ fn main() {
     // before the shell opens (see `try_keyring_login`).
     let host = std::env::var("TFG_MINOS_HOST")
         .unwrap_or_else(|_| "https://api.tfg.development.crossnet.co.id/api/v1".to_string());
+    // THE SESSION'S CREDENTIAL, KEPT ALIVE. An access token lives an hour by
+    // contract and a session does not: the keeper rotates the refresh chain a
+    // little before the token dies, and again the moment the server refuses
+    // one (a 109 on the socket, a 401 on a read). Before it existed, a console
+    // left open through an exercise simply stopped working: the wire was
+    // refused and the plot answered 401, and the only cure was to sign in
+    // again. See `backend::session`.
+    let (keeper, token_events) = tfg::backend::TokenKeeper::start(&host);
     // Credentials, in order: the environment (a capture's explicit
     // superuser), then the keyring's stored refresh token (a returning
     // launch skips the card), then the card. `TFG_SIGNED_OUT` wins over
@@ -218,9 +226,15 @@ fn main() {
         } else {
             match (std::env::var("TFG_API_USER"), std::env::var("TFG_API_PASS")) {
                 (Ok(user), Ok(pass)) => match fetch_roster(&host, &user, &pass) {
-                    Some((rows, token, _)) => {
+                    Some((rows, pair)) => {
                         let total = rows.len();
                         eprintln!("roster: {total} hulls from {host}");
+                        // A capture's credential is not the machine's own, so
+                        // the chain is kept in memory only (`None`): no
+                        // keyring entry, because the next launch's operator is
+                        // not this environment variable.
+                        let token = pair.access_token.clone();
+                        keeper.install(&pair, None);
                         (rows, total, token, user)
                     }
                     None => {
@@ -229,9 +243,16 @@ fn main() {
                     }
                 },
                 _ => match try_keyring_login(&host, &paths.last_user) {
-                    Some((rows, token, user)) => {
+                    Some((rows, pair, user)) => {
                         let total = rows.len();
                         eprintln!("roster: keyring session for {user} from {host}");
+                        // The keyring's rotation IS this launch's session: the
+                        // keeper takes the chain from here, so the token it
+                        // installs is the one every read and the wire use, and
+                        // the rotated refresh token is written back by the
+                        // keeper's own rotations.
+                        let token = pair.access_token.clone();
+                        keeper.install(&pair, Some(user.as_str()));
                         (rows, total, token, user)
                     }
                     None => {
@@ -479,6 +500,10 @@ fn main() {
         hold: hold.clone(),
         fix_tx: game_fix_tx.clone(),
         live: Some(live_ctl.clone()),
+        // The keeper, so a 401 read asks for a rotation instead of waiting
+        // out the clock: the server is the authority on what a token is
+        // worth, and it has just said so.
+        refresh: Some(keeper.clone()),
         shutdown: shutdown.clone(),
     });
     // The watches follow the session: the broadcast channel for the held
@@ -486,10 +511,20 @@ fn main() {
     sync_session(
         &hold,
         &live_ctl,
-        &token,
+        &keeper.current(),
         session.game_id,
         &session.state,
         session.me,
+    );
+    // The keeper's rotations, pushed to whoever holds the token. One thread,
+    // because a rotation is only news once: the hold cell the plot reader
+    // reads, the socket's connect data, and (on a refusal) the same teardown a
+    // sign-out performs.
+    spawn_token_follower(
+        token_events,
+        hold.clone(),
+        live_ctl.clone(),
+        wire_ctl_tx.clone(),
     );
 
     // The registry the fix feed drains into. Owned here, beside the poll
@@ -656,6 +691,10 @@ fn main() {
         let live_event2 = live_event_tx.clone();
         let wire_wake2 = wire_wake_tx.clone();
         let game_fix2 = game_fix_tx.clone();
+        // The session's credential. This thread never rotates it — it asks
+        // for the CURRENT token per command — but it installs the pair a card
+        // sign-in mints, and it signs the session out when the operator does.
+        let keeper2 = keeper.clone();
         // The held session's state, as the server last read it. The socket's
         // positions channel is watched only in execution, and this is the
         // word that says so. Read before the closure, because the session
@@ -676,6 +715,12 @@ fn main() {
             // other on the way back.
             let mut seq: u64 = 1000;
             while let Ok(msg) = order_rx.recv() {
+                // The token this command posts with is the session's CURRENT
+                // one, not this thread's copy of it: a console open longer
+                // than an hour has had its token rotated on the keeper's
+                // thread, and posting with the hour-old copy would 401 every
+                // write until somebody signed in again.
+                token2 = keeper2.current();
                 match msg {
                     tfg::shell_gpui::ToBinary::Helm(order) => {
                         let unit_id = order.unit_id.parse::<i64>().unwrap_or(0);
@@ -1085,7 +1130,8 @@ fn main() {
                         // The refusal is a sentence the card can show —
                         // never a swallowed error.
                         let outcome = match fetch_roster(&host2, &identifier, &password) {
-                            Some((rows, token, refresh_token)) => {
+                            Some((rows, pair)) => {
+                                let token = pair.access_token.clone();
                                 let total = rows.len();
                                 let sessions =
                                     fetch_session_rows(&host2, &token).unwrap_or_default();
@@ -1107,15 +1153,15 @@ fn main() {
                                 // token too — a launch without credentials
                                 // must not glyph-hold the rows forever.
                                 token2 = token.clone();
-                                // The refresh token outlives the access
-                                // one: the keyring stores it so the next
-                                // launch skips the card, and the last
-                                // user is remembered to key it by.
+                                // The refresh token outlives the access one,
+                                // and it ROTATES: the keeper owns the chain
+                                // from here, writes each new link to the
+                                // keyring and rotates it before the access
+                                // token dies. The last user is remembered so
+                                // the next launch knows which entry to rotate.
                                 user2 = identifier.clone();
-                                if let Some(rt) = refresh_token.as_deref() {
-                                    let _ = tfg::backend::keyring_save(&identifier, rt);
-                                    tfg::backend::last_user_save(&paths.last_user, &identifier);
-                                }
+                                keeper2.install(&pair, Some(identifier.as_str()));
+                                tfg::backend::last_user_save(&paths.last_user, &identifier);
                                 spawn_thumb_fetch(
                                     host2.clone(),
                                     token.clone(),
@@ -1146,7 +1192,14 @@ fn main() {
                                     .and_then(|m| m.me(&token).ok())
                                     .map(|(id, _)| id)
                                     .unwrap_or(0);
-                                sync_session(&hold2, &live_ctl2, &token2, game_id, &state2, me2);
+                                sync_session(
+                                    &hold2,
+                                    &live_ctl2,
+                                    &keeper2.current(),
+                                    game_id,
+                                    &state2,
+                                    me2,
+                                );
                                 Ok(tfg::shell_gpui::SignedIn {
                                     roster: rows,
                                     roster_total: total,
@@ -1178,6 +1231,11 @@ fn main() {
                         // here — and the live wire keeps its socket,
                         // honestly idle. The keyring entry goes with it:
                         // a signed-out operator stays signed out.
+                        //
+                        // The keeper is cleared FIRST, so the live "the
+                        // server refused our token" path cannot race a
+                        // sign-out into a rotation of a chain nobody holds.
+                        keeper2.clear();
                         let _ = tfg::backend::keyring_clear(&user2);
                         tfg::backend::last_user_clear(&paths.last_user);
                         token2.clear();
@@ -1217,7 +1275,12 @@ fn main() {
                                     // an addressed message travels there and
                                     // nowhere else.
                                     sync_session(
-                                        &hold2, &live_ctl2, &token2, game_id, &state2, s.me,
+                                        &hold2,
+                                        &live_ctl2,
+                                        &keeper2.current(),
+                                        game_id,
+                                        &state2,
+                                        s.me,
                                     );
                                     eprintln!("holding {} ({})", s.game, s.state);
                                     Ok(tfg::shell_gpui::CreatedSession::for_write(
@@ -1896,7 +1959,12 @@ fn main() {
                                             // reading, both at once.
                                             state2 = s.state.clone();
                                             sync_session(
-                                                &hold2, &live_ctl2, &token2, game_id, &state2, s.me,
+                                                &hold2,
+                                                &live_ctl2,
+                                                &keeper2.current(),
+                                                game_id,
+                                                &state2,
+                                                s.me,
                                             );
                                             Ok(tfg::shell_gpui::CreatedSession::for_write(
                                                 s,
@@ -1943,7 +2011,12 @@ fn main() {
                                             // it any more.
                                             state2 = s.state.clone();
                                             sync_session(
-                                                &hold2, &live_ctl2, &token2, game_id, &state2, s.me,
+                                                &hold2,
+                                                &live_ctl2,
+                                                &keeper2.current(),
+                                                game_id,
+                                                &state2,
+                                                s.me,
                                             );
                                             Ok(tfg::shell_gpui::CreatedSession::for_write(
                                                 s,
@@ -2987,6 +3060,9 @@ fn main() {
     // every exercise this account is in, and only the held exercise's
     // traffic belongs in the held exercise's inbox.
     let hold_for_wire = hold.clone();
+    // The session's credential, for the socket's refusal path: a 109 is the
+    // server's own expiry rule firing, and the keeper is what answers it.
+    let keeper_for_wire = keeper.clone();
     // THE PRESS'S ANSWER: the draft with its journal, and the engine's word.
     let press_feed: tfg::shell_gpui::PressFeed =
         std::boxed::Box::new(move || press_rx.try_recv().ok());
@@ -3126,7 +3202,13 @@ fn main() {
                         eprintln!("wire: socket error: {e}");
                     }
                     tfg::backend::LiveEvent::RefreshDue => {
-                        eprintln!("wire: token expired (109) — the socket needs a new one");
+                        // 109 is the server saying the access token is no
+                        // longer worth anything. The keeper rotates the chain
+                        // now — the socket's next handshake carries the new
+                        // token, pushed to it by the follower — so this line
+                        // is a report, not a request for the operator.
+                        eprintln!("wire: token expired (109) — rotating the session's token");
+                        keeper_for_wire.nudge();
                     }
                     tfg::backend::LiveEvent::Message(m) => {
                         // A MESSAGE ARRIVED. It is handed to the shell,
@@ -3560,26 +3642,31 @@ fn roster_with_token(host: &str, token: &str) -> Option<Vec<tfg::shell_gpui::Ros
     )
 }
 
+/// The pair, not just its access token: the session's keeper needs the
+/// refresh chain and the lifetime, and a caller that only took the token
+/// would throw the other two away — which is how a console ended up unable to
+/// renew itself.
 fn fetch_roster(
     host: &str,
     user: &str,
     pass: &str,
-) -> Option<(Vec<tfg::shell_gpui::RosterRow>, String, Option<String>)> {
+) -> Option<(Vec<tfg::shell_gpui::RosterRow>, tfg::backend::TokenPair)> {
     let auth = tfg::backend::MinosAuth::new(host).ok()?;
     let pair = auth.login(user, pass).ok()?;
     let rows = roster_with_token(host, &pair.access_token)?;
-    Some((rows, pair.access_token, pair.refresh_token))
+    Some((rows, pair))
 }
 
 /// The keyring's stored refresh token for the last user, rotated into a
 /// live session so a returning launch skips the card. `None` when
 /// nothing is stored, the store is unreadable, or the rotation is
 /// refused — each a fresh card, never a crash. The rotation mints a new
-/// refresh token; storing it back keeps the next launch on the keyring.
+/// refresh token; the caller hands the pair to the keeper, which owns the
+/// chain (and writes each new link back) from then on.
 fn try_keyring_login(
     host: &str,
     last_user_path: &Path,
-) -> Option<(Vec<tfg::shell_gpui::RosterRow>, String, String)> {
+) -> Option<(Vec<tfg::shell_gpui::RosterRow>, tfg::backend::TokenPair, String)> {
     let user = tfg::backend::last_user_load(last_user_path)?;
     let stored = match tfg::backend::keyring_load(&user) {
         Ok(Some(rt)) => rt,
@@ -3587,11 +3674,8 @@ fn try_keyring_login(
     };
     let auth = tfg::backend::MinosAuth::new(host).ok()?;
     let pair = auth.refresh(&stored).ok()?;
-    if let Some(rt) = &pair.refresh_token {
-        let _ = tfg::backend::keyring_save(&user, rt);
-    }
     let rows = roster_with_token(host, &pair.access_token)?;
-    Some((rows, pair.access_token, user))
+    Some((rows, pair, user))
 }
 
 /// The store's resolved picture, read once: the id-keyed symbol resolver, the
@@ -3711,6 +3795,58 @@ fn sync_session(
     // held.
     tfg::gamefeed::set_user(hold, user_id);
     tfg::gamefeed::sync_watch(live_ctl, hold);
+}
+
+/// Push the session's rotations to every holder of the access token.
+///
+/// Three places hold a copy of it, and each has to be told, because a token
+/// this console renews and the rest of the console does not is worse than no
+/// renewal at all — half the console keeps working and half answers 401.
+///
+/// - **The hold cell**, which the plot reader reads every tick. It is the
+///   first thing to go stale, and a 401 there is what an operator sees as
+///   `game feed: plot read failed: unauthorized`.
+/// - **The socket's connect data**, pushed as a command rather than a
+///   reconnect. The actor applies it to the next handshake, which a refused
+///   (109) socket is about to make anyway.
+/// - **Nothing else.** The write path and the shell's sign-in state read the
+///   keeper itself (`keeper.current()`), so they cannot hold a stale copy.
+///
+/// A refusal is not a rotation: the chain is dead and the server will refuse
+/// every later request. That is handled as the same teardown a sign-out
+/// performs, because a token nobody can renew is a session that has ended.
+fn spawn_token_follower(
+    events: mpsc::Receiver<tfg::backend::TokenEvent>,
+    hold: tfg::gamefeed::GameHoldCell,
+    live_ctl: tfg::gamefeed::LiveCtl,
+    wire_ctl: mpsc::Sender<tfg::shell_threads::WireKind>,
+) {
+    std::thread::spawn(move || {
+        while let Ok(event) = events.recv() {
+            match event {
+                tfg::backend::TokenEvent::Rotated { access_token } => {
+                    tfg::gamefeed::set_token(&hold, &access_token);
+                    if let Ok(slot) = live_ctl.lock() {
+                        if let Some(cmd_tx) = slot.as_ref() {
+                            let _ = cmd_tx
+                                .send(tfg::backend::LiveCmd::SetToken(access_token.clone()));
+                        }
+                    }
+                }
+                tfg::backend::TokenEvent::Expired => {
+                    tfg::gamefeed::set_token(&hold, "");
+                    // The socket goes too: an idle wire that still holds a
+                    // session is a wire the server refuses on the next
+                    // reconnect, and this console has no token to give it.
+                    if let Ok(mut slot) = live_ctl.lock() {
+                        *slot = None;
+                    }
+                    let _ = wire_ctl.send(tfg::shell_threads::WireKind::Empty);
+                    eprintln!("session: signed out \u{2014} sign in again to hold a session");
+                }
+            }
+        }
+    });
 }
 
 /// The held session: the game this account is SEATED in, and its room.

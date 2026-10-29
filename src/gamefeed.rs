@@ -206,6 +206,24 @@ pub fn kick(hold: &GameHoldCell) {
     }
 }
 
+/// Replace the session's access token, leaving the game and its state alone.
+///
+/// The token is the one thing about a session that changes UNDER the reader:
+/// it expires after an hour and the keeper rotates it, while the held game and
+/// its state stay what the operator chose. Writing it through [`set_hold`]
+/// would have to restate those, and a stale copy of them is a read of the
+/// wrong exercise.
+///
+/// The kick rides along because a rotated token means the last read was
+/// refused — the new one is worth trying immediately rather than a second
+/// from now.
+pub fn set_token(hold: &GameHoldCell, token: &str) {
+    if let Ok(mut h) = hold.lock() {
+        h.token = token.to_string();
+        h.kick = h.kick.wrapping_add(1);
+    }
+}
+
 /// Record the state alone, without touching the token or the game.
 ///
 /// The reader uses it: a plot with hulls in it IS the server's word that the
@@ -286,6 +304,11 @@ pub struct PlotThreadConfig {
     /// declares the positions channel on it the moment the exercise proves
     /// it is running, because a plot with hulls in it is that proof.
     pub live: Option<LiveCtl>,
+    /// The session's credential keeper, when there is one. A read refused with
+    /// 401 is the server saying the access token has run out — the reader says
+    /// so to the keeper, which rotates it, rather than waiting out the clock.
+    /// `None` in a capture with no session at all: then a 401 is just a 401.
+    pub refresh: Option<Arc<crate::backend::TokenKeeper>>,
     /// The console's shutdown flag.
     pub shutdown: Arc<AtomicBool>,
 }
@@ -412,6 +435,16 @@ pub fn spawn_plot_thread(cfg: PlotThreadConfig) -> JoinHandle<()> {
                 }
                 Err(e) => {
                     fails = fails.saturating_add(1);
+                    // A 401 is not the operator's problem and not a failing
+                    // server: it is the access token running out. The keeper
+                    // rotates it, and the hold carries the new one within a
+                    // tick — so this line is the last one that says
+                    // "unauthorized" for that token.
+                    if matches!(e, crate::backend::BackendError::Unauthorized { .. }) {
+                        if let Some(keeper) = &cfg.refresh {
+                            keeper.nudge();
+                        }
+                    }
                     eprintln!("game feed: plot read failed: {e}");
                     last = Some((game_id, now, kick));
                 }
