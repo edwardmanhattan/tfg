@@ -8,17 +8,23 @@
 //! dead channel — the console stays silent, never broken.
 //!
 //! The contract the UI relies on:
-//! - any primary click → `Sfx::Click` (polled once per frame, so it covers
-//!   every button without touching a hundred call sites),
-//! - an interaction that landed → `Sfx::Ding` (embark, placement),
-//! - an interaction the client refused → `Sfx::Buzz` (embark rejected,
-//!   placement refused).
+//! - any primary click → `Sfx::Click`, from the click hook every ROOT carries
+//!   (the console, the composer, the sign-in card) and from every card that
+//!   is its own mouse boundary (the basket, the pickers),
+//! - an interaction that landed → `Sfx::Ding`, from the console's `Status`
+//!   vocabulary and from the composer's `settle_note`,
+//! - an interaction the client refused → `Sfx::Buzz`, the same two hooks.
+//!
+//! ONE INTERACTION IS ONE SOUND. A drop reaches the verdict seam and the
+//! status vocabulary both, so `play` collapses the same kind fired twice
+//! inside [`SAME_EVENT_MS`].
 //!
 //! Server refusals (a 4xx landing through the REST pump) stay loud on the
 //! status line and do NOT buzz: the pump's error path owns that meaning.
 
 use std::num::{NonZeroU16, NonZeroU32};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 /// What happened, as the operator's ears hear it.
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +51,15 @@ pub enum Sfx {
 }
 
 const RATE: u32 = 22_050;
+
+impl Sfx {
+    /// The family this sound belongs to, for the one-event-one-sound rule.
+    /// Every kind is its own family today; the method is what a future
+    /// variant with two renderings would override.
+    fn same_wave(self, other: Sfx) -> bool {
+        std::mem::discriminant(&self) == std::mem::discriminant(&other)
+    }
+}
 
 /// One sine burst: `freq` Hz for `ms` milliseconds with an exponential
 /// decay so it ends in silence rather than a click of its own.
@@ -134,9 +149,32 @@ fn player() -> &'static std::sync::mpsc::Sender<Sfx> {
     })
 }
 
+/// How close two identical sounds must be to be the same event.
+///
+/// ONE INTERACTION CAN REACH TWO OWNERS. A drop's staging sets a status line
+/// (the vocabulary hook) and the verdict seam plays the same sound, so without
+/// this the operator hears the landing twice. Thirty milliseconds is shorter
+/// than any hand moves between two gestures and longer than a frame's worth of
+/// dispatch.
+const SAME_EVENT_MS: u128 = 30;
+
 /// Play one sound, never blocking. A dead player (no device, hung-up
 /// thread) drops the send silently — audio is garnish, and garnish must
 /// not fail a console.
+///
+/// The last kind and instant are remembered so the same sound fired twice for
+/// one event is heard once. Different sounds never collapse: a refusal after a
+/// landing is two answers and the ear should hear both.
 pub fn play(kind: Sfx) {
+    static LAST: OnceLock<Mutex<Option<(Sfx, Instant)>>> = OnceLock::new();
+    let gate = LAST.get_or_init(|| Mutex::new(None));
+    if let Ok(mut last) = gate.lock() {
+        if let Some((previous, at)) = *last {
+            if previous.same_wave(kind) && at.elapsed().as_millis() < SAME_EVENT_MS {
+                return;
+            }
+        }
+        *last = Some((kind, Instant::now()));
+    }
     let _ = player().send(kind);
 }

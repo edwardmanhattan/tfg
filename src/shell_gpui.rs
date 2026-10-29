@@ -32,12 +32,12 @@
 //! `ShipApp` port starts from this shell and grows into it.
 
 use gpui::{
-    AnimationExt, AnyElement, App, AppContext, Application, AssetSource, AsyncApp, Bounds, Context, Corners,
-    CursorStyle, Div, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathBuilder, Render,
-    ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, fill, img, point,
-    prelude::*, px, relative, size,
+    AnimationExt, AnyElement, App, AppContext, Application, AssetSource, AsyncApp, Bounds, ClipboardItem,
+    Context, Corners, CursorStyle, Div, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathBuilder,
+    Render, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, fill, img, point, prelude::*,
+    px, relative, size,
 };
 
 use std::borrow::Cow;
@@ -104,13 +104,25 @@ impl Status {
             kind: StatusKind::Neutral,
         }
     }
+    /// An interaction that LANDED, and the sound of one.
+    ///
+    /// THE CONSTRUCTOR IS THE CHOKE POINT. Every landing in this console ends
+    /// as a good status — a hull staged, a seat taken, a write through — so the
+    /// ding is played here rather than at a hundred call sites, and a new verb
+    /// that reports its outcome the console's way is heard without anyone
+    /// remembering to wire a sound to it.
     fn good(text: impl Into<String>) -> Self {
+        crate::sfx::play(crate::sfx::Sfx::Ding);
         Self {
             text: text.into(),
             kind: StatusKind::Good,
         }
     }
+    /// An interaction the console REFUSED, and the sound of one. See
+    /// [`Self::good`]: the vocabulary is the hook, so a refusal cannot be
+    /// silent by omission.
     fn bad(text: impl Into<String>) -> Self {
+        crate::sfx::play(crate::sfx::Sfx::Buzz);
         Self {
             text: text.into(),
             kind: StatusKind::Bad,
@@ -259,6 +271,20 @@ fn note_input_at(kind: &str, ev: &ScrollWheelEvent) {
         let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
         eprintln!("TFG_INPUT {kind} at {x:.0},{y:.0}");
     }
+}
+
+/// THE CLICK, for a surface that is its own mouse boundary.
+///
+/// The console's root carries this hook, and it hears every press that bubbles
+/// to it. Two kinds of surface are, by design, not those: the COMPOSER, which
+/// `render` returns instead of the console and has its own root, and any card
+/// that `block_mouse_except_scroll`s — the basket and the pickers — because
+/// that call truncates dispatch at the edge. Each of them carries the same
+/// hook, so a button inside one is heard ONCE and no call site has to remember
+/// a sound.
+fn hear_click(_ev: &MouseDownEvent, _window: &mut Window, _cx: &mut gpui::App) {
+    note_input("click");
+    crate::sfx::play(crate::sfx::Sfx::Click);
 }
 
 /// A wheel handler that swallows the gesture where it happened.
@@ -1256,7 +1282,7 @@ struct IslandDemo {
     /// pane then opens on the seeded SWEEP, which is the sheet's own state.
     flow_step: Option<i64>,
     /// The sub-step command currently receiving keyboard edits.
-    flow_edit_substep: Option<(i64, i64)>,
+    flow_edit_substep: Option<SubstepEditKey>,
     /// The hand-rolled sub-step editor's keyboard target. One handle is enough
     /// because only one command can be edited at a time.
     flow_edit_substep_handle: Option<gpui::FocusHandle>,
@@ -1442,15 +1468,26 @@ struct IslandDemo {
     /// area, map tag — and the mode and the pace ride radios, not fields.
     /// The window's five fields are the twentieth through the twenty-fourth
     /// of the shared index space, because they are the WINDOW's and the
-    /// window is its own draft (`crate::window::WindowDraft`).
+    /// window is its own draft (`crate::window::WindowDraft`). The join key
+    /// is the twenty-sixth: an invited player pastes it on the launcher.
     sessions_open: bool,
     /// Which hand-rolled field has the keyboard, across the forms that share
     /// the `compose_*` plumbing: the scenario composer, the book's step row,
     /// the telegram and the planning card's window.
     compose_focus: usize,
-    compose_handles: [Option<gpui::FocusHandle>; 25],
+    compose_handles: [Option<gpui::FocusHandle>; 26],
     compose_busy: bool,
     compose_status: Status,
+    /// JOIN A ROOM: the invitation key an invited player pastes on the
+    /// launcher. The key IS the credential a participant has — the roster is
+    /// staff-only, so `POST /games/join` is the one read that says what seat
+    /// this account holds.
+    join_key: String,
+    join_busy: bool,
+    join_status: Status,
+    /// The preparation card's invitation key has been copied this opening.
+    /// A readout, not a write: it says the clipboard took it.
+    room_key_copied: bool,
     /// The Book panel: the held game's scenarios and their steps (read), plus
     /// the new-scenario title row (the one write). Its own modal, for the
     /// same reason the composer has one. The title rides field index 6 of the
@@ -1707,6 +1744,29 @@ struct IslandDemo {
     /// many of each kind. Read once per host, and the rule a drop is checked
     /// against: a host that declares no complements carries nothing.
     embark_caps: HashMap<i64, Vec<crate::backend::UnitCapacity>>,
+    /// WHAT THE FLEET REGISTER SAYS EACH HULL CARRIES, by hull id — the
+    /// pre-embarked units a deployment brings with her
+    /// (`GET /units/{id}/embarkations`).
+    ///
+    /// A hull already in the exercise carries the same list on her piece row
+    /// (`register_contents`), so this is read only for a hull the session
+    /// does not hold — which is exactly the hull about to be deployed. The
+    /// answer is what the draft stages beside her, so the operator sees the
+    /// boats arrive with the ship instead of finding them in the next read.
+    register_carries: HashMap<i64, Vec<crate::backend::EmbarkedUnit>>,
+    /// The hulls whose register copy has already been asked for, so a drag
+    /// that wanders costs one read rather than one per frame.
+    register_carries_asked: Vec<i64>,
+    /// WHETHER A DEPLOYMENT BRINGS WHAT THE REGISTER SAYS THE HULL CARRIES.
+    ///
+    /// The picker's toggle, and the operator's decision rather than the
+    /// client's: a hull's pre-embarked units arrive with her assignment when
+    /// this is on, and she arrives bare when it is off — which is a different
+    /// force, and one the operator is entitled to ask for. The choice is
+    /// copied onto each hull as it is deployed (so one hull's deployment can
+    /// be changed without changing the next), and this is the default it is
+    /// copied from.
+    bring_contents: bool,
     /// The register's read of every hull's place in the taxonomy, by unit id.
     ///
     /// The console resolved this from its own store on the spot; the GPUI
@@ -2117,6 +2177,31 @@ const BOARD_H: f32 = 580.0;
 const CREW_W: f32 = 720.0;
 const CREW_H: f32 = 600.0;
 
+/// The preparation card: the planning summary + invitation key on the left, the
+/// whole roster and its readiness gate on the right.
+///
+/// MUCH WIDER THAN THE CREW CARD, and that is a requirement rather than a
+/// taste: the left half answers "what was planned" and the right half answers
+/// "who is in the room", and a roster that may hold a hundred seats cannot be
+/// read in a 320pt column. The height is the crew card's plus the readiness
+/// band docked at the foot of the roster.
+const PREP_W: f32 = 1240.0;
+const PREP_H: f32 = 720.0;
+/// The summary's column inside the preparation card. The roster takes the rest.
+const PREP_LEFT_W: f32 = 452.0;
+/// One roster row. Compact on purpose: a hundred seats is an ordinary exercise,
+/// and a row that reads comfortably at three is a page nobody scrolls at a
+/// hundred.
+const PREP_ROW_H: f32 = 29.0;
+/// The roster's three fixed columns, as SHARES of the row.
+///
+/// A column is a width, not a text run, but at 760pt the card is narrower than
+/// its full 1240 and three point widths would leave the command column with
+/// nothing. Shares keep the same column under the same header at any window.
+const PREP_NAME_FRAC: f32 = 0.24;
+const PREP_ROLE_FRAC: f32 = 0.22;
+const PREP_STATE_FRAC: f32 = 0.18;
+
 // ---------------------------------------------------------------------------
 // The commander's rail
 //
@@ -2444,7 +2529,7 @@ fn rail_widths(viewport_w: f32) -> RailWidths {
         // the picture, then the facts, then the compass's face, and the verb
         // LAST. Every one of them gives only what it has above its floor.
         let mut excess = SCALE_FLOOR - scale;
-        let mut take = |room: f32, excess: &mut f32| {
+        let take = |room: f32, excess: &mut f32| {
             let taken = room.max(0.0).min(*excess);
             *excess -= taken;
             taken
@@ -4000,6 +4085,12 @@ impl IslandDemo {
                 view::set_text_scale(scale);
             }
         }
+        // PREPARATION IS THE ROOM: a launch that already holds a preparation
+        // exercise opens the card rather than a map with a door on it. The
+        // execution crew screen is still the capture seed's (`=1`), and `=0`
+        // closes the card in either phase for a capture of the map.
+        let session_is_preparation = session.state == "preparation";
+        let crew_seed = std::env::var("TFG_CREW_MODAL").ok();
         let mut demo = IslandDemo {
             islands: view::COLUMN_ISLANDS
                 .iter()
@@ -4111,8 +4202,9 @@ impl IslandDemo {
             msg_audience_target: AudienceTarget::default(),
             // `TFG_CREW_MODAL=1` opens the execution Crew window for a
             // headless capture, the same seed-the-state precedent as
-            // `TFG_BOARD`.
-            crew_modal_open: std::env::var("TFG_CREW_MODAL").as_deref() == Ok("1"),
+            // `TFG_BOARD`; `=0` closes preparation's card.
+            crew_modal_open: crew_seed.as_deref() != Some("0")
+                && (session_is_preparation || crew_seed.as_deref() == Some("1")),
             // `TFG_UNIT` names the unit the details panel opens on, and
             // opens it. The same precedent as `TFG_SEL`: pin the state,
             // never the gesture — the compositor makes a synthetic click
@@ -4455,10 +4547,14 @@ impl IslandDemo {
             compose_focus: 0,
             compose_handles: [
                 None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None,
             ],
             compose_busy: false,
             compose_status: Status::empty(),
+            join_key: String::new(),
+            join_busy: false,
+            join_status: Status::empty(),
+            room_key_copied: false,
             // `TFG_BOOK` opens the book for a headless capture; `TFG_GAME`
             // picks the game whose shelf it shows, because the default hold
             // (a preparation game) keeps an empty book.
@@ -4521,6 +4617,12 @@ impl IslandDemo {
             embarked: HashMap::new(),
             embark_over: HashMap::new(),
             embark_caps: HashMap::new(),
+            register_carries: HashMap::new(),
+            register_carries_asked: Vec::new(),
+            // ON, because a parent's boats are the deployment the operator
+            // described; the toggle is there for the hull that should arrive
+            // bare, and it is remembered per hull once deployed.
+            bring_contents: true,
             unit_taxonomy: BTreeMap::new(),
             embark_pending: None,
             embark_spec_busy: false,
@@ -4796,7 +4898,8 @@ impl IslandDemo {
             let staged = demo.flow_draft.as_ref().and_then(|draft| {
                 let group = draft
                     .groups
-                    .staged_groups()
+                    .visible_groups()
+                    .into_iter()
                     .find(|group| group.name.eq_ignore_ascii_case(name.trim()))?;
                 let body = formation_body(draft, group.local_id);
                 // The body's hulls, not only its direct ones: a gugus musters
@@ -5605,11 +5708,17 @@ impl IslandDemo {
         // no way out. The game's name is not lost by this: the Step island's
         // body and the Inspector both carry it.
         if !self.session.game.is_empty() && viewport_w > view::BAND_READOUT_BUDGET {
-            left = left.child(sep());
-            left = left.child(readout(format!(
-                "{}/{} in the room \u{00b7} {} ready",
-                self.session.present, self.session.seats, self.session.ready
-            )));
+            // A joined participant cannot read the roster, so the band has no
+            // headcount to state. `0/0` is not "an empty room" — it is a read
+            // this seat may not make — and the band must not say the wrong
+            // one. The phase and the game's name are facts it does hold.
+            if self.session.joined.is_none() {
+                left = left.child(sep());
+                left = left.child(readout(format!(
+                    "{}/{} in the room \u{00b7} {} ready",
+                    self.session.present, self.session.seats, self.session.ready
+                )));
+            }
             left = left.child(sep());
             // The phase is the other thing the band reads at a glance, so it
             // gets the same tracked-caps stamp the link does — and it is a
@@ -5625,6 +5734,28 @@ impl IslandDemo {
                 view::BODY_PT,
                 kit::MUTED_INK,
             ));
+        }
+        // THE ROOM'S DOOR, in every width. Preparation is the centred card
+        // and the column is empty in this phase, so a closed card would
+        // otherwise leave the operator with a map and no way back to the
+        // roster or the advance. The door is outside the width gate above
+        // because it is a VERB, and the band's rule is that readouts yield
+        // before doors do.
+        if !self.session.game.is_empty()
+            && self.phase() == crate::gamestate::GameState::Preparation
+        {
+            left = left.child(sep());
+            left = left.child(
+                div()
+                    .id("preparation-door")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.crew_modal_open = true;
+                        view.room_key_copied = false;
+                        cx.notify();
+                    }))
+                    .child(kit::verb("ROOM", kit::VerbLook::Live)),
+            );
         }
         // The create door, where the console keeps it: among the session
         // readouts, never in a side island — the islands work the HELD
@@ -7121,7 +7252,7 @@ impl IslandDemo {
     /// The details panel's own ladders, stacked rather than side by side,
     /// because this cell is a third of the window wide and three ladders
     /// across it is three unreadable columns.
-    fn planning_unit_body(&mut self, cx: &mut Context<Self>, cell_w: f32) -> AnyElement {
+    fn planning_unit_body(&mut self, _cx: &mut Context<Self>, cell_w: f32) -> AnyElement {
         let unit_id = self.selected_unit.clone();
         let mut col = self.grid_body(cell_w);
         let Some(f) = unit_id.as_deref().map(|id| self.unit_facts(id)) else {
@@ -8174,6 +8305,7 @@ impl IslandDemo {
         // the island's cannot disagree about how many hulls are deployed.
         let pieces = self.deployed_pieces();
         force = force.child(small(format!("IN THE EXERCISE \u{2014} {}", pieces.len())));
+        force = force.child(self.bring_toggle(cx));
         let crew = self.crew_choices();
         // The pills show when the operator holds no PLAYER-side seat: the
         // room is empty, or the operator's own seat is judge-side — which
@@ -8229,6 +8361,12 @@ impl IslandDemo {
         if pieces.is_empty() {
             force = force.child(small("No pieces yet.".to_string()));
         }
+        // The hulls by id, so a piece can be named as somebody's rider or
+        // somebody's host without a second read.
+        let labels: std::collections::HashMap<i64, String> = pieces
+            .iter()
+            .map(|p| (p.id, p.label.clone()))
+            .collect();
         for p in pieces {
             let p_label = p.label.clone();
             // The row is a COLUMN: the hull, its state and its commander on
@@ -8310,7 +8448,84 @@ impl IslandDemo {
                     }))
                     .child(button("remove", true, false, false)),
             );
-            row = row.child(head).child(pills);
+            // WHAT SHE BRINGS, AND WHERE SHE IS. Two facts about embarkation
+            // that the piece row carries: the hull riding this one, and the
+            // units the register says this one carries — which a deployment
+            // brings aboard her. The row used to say neither, so a ship that
+            // arrived with two boats looked like a ship and the boats looked
+            // like pieces nobody deployed.
+            row = row.child(head);
+            if let Some(host) = p.host {
+                let aboard = labels
+                    .get(&host)
+                    .cloned()
+                    .unwrap_or_else(|| format!("#{host}"));
+                row = row.child(
+                    div()
+                        .text_size(px(view::pt(view::LABEL_PT)))
+                        .text_color(rgba(DATA_AMBER))
+                        .child(format!("ABOARD {}", aboard.to_uppercase())),
+                );
+            } else if !p.register_contents.is_empty() {
+                let names: Vec<String> = p
+                    .register_contents
+                    .iter()
+                    .map(|c| {
+                        if c.in_game {
+                            format!("{} \u{2713}", c.unit_name)
+                        } else {
+                            c.unit_name.clone()
+                        }
+                    })
+                    .collect();
+                // A HULL'S OWN CHOICE, and clickable: the toggle above is the
+                // default for the next deployment, and this is the one hull it
+                // is being made for. A hull the server already holds has no
+                // choice left — her assignment ran.
+                let unit = p.id;
+                let decided = self.force.get(unit).map(|hull| hull.with_contents);
+                let brings = decided.unwrap_or(false);
+                let label = match decided {
+                    Some(true) => format!(
+                        "BRINGS {} \u{b7} {} \u{b7} WITH HER",
+                        plural(p.register_contents.len(), "PRE-EMBARKED UNIT"),
+                        names.join(", ")
+                    ),
+                    Some(false) => format!(
+                        "BRINGS {} \u{b7} {} \u{b7} ARRIVES BARE \u{b7} CLICK TO BRING THEM",
+                        plural(p.register_contents.len(), "PRE-EMBARKED UNIT"),
+                        names.join(", ")
+                    ),
+                    None => format!(
+                        "BRINGS {} \u{b7} {} \u{b7} ASSIGNED ALREADY",
+                        plural(p.register_contents.len(), "PRE-EMBARKED UNIT"),
+                        names.join(", ")
+                    ),
+                };
+                let ink = if brings { SIGNAL_GREEN } else { BODY_SILVER };
+                if decided.is_some() {
+                    row = row.child(
+                        div()
+                            .id(("piece-brings", unit as usize))
+                            .cursor_pointer()
+                            .text_size(px(view::pt(view::LABEL_PT)))
+                            .text_color(rgba(ink))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.set_bring_contents(unit);
+                                cx.notify();
+                            }))
+                            .child(label),
+                    );
+                } else {
+                    row = row.child(
+                        div()
+                            .text_size(px(view::pt(view::LABEL_PT)))
+                            .text_color(rgba(ink))
+                            .child(label),
+                    );
+                }
+            }
+            row = row.child(pills);
             // The piece as a drop target and a drag source: a hull dropped
             // here embarks aboard THIS hull, and this row's hull can be
             // dragged away onto another. The one vocabulary, on the row.
@@ -9000,6 +9215,12 @@ impl IslandDemo {
             hierarchy_node: None,
             start: h.start.map(|s| (s.lat, s.lon)),
             placed: h.start.is_some(),
+            // A staged hull has no server row, so it has no register copy
+            // either: what it carries is the shell's own read, held beside
+            // this list rather than on it.
+            host: h.host,
+            register_host: None,
+            register_contents: Vec::new(),
         }));
         pieces
     }
@@ -9770,7 +9991,14 @@ impl IslandDemo {
     /// EMBARKATION IS A NEST, NOT A NOTE: a ridden hull lists its riders
     /// under it, indented, because that is the fact — the host is the hull
     /// the rider follows, and it has no ground of its own.
-    fn crew_modal_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn crew_modal_body(&mut self, card_w: f32, cx: &mut Context<Self>) -> AnyElement {
+        // PREPARATION IS ITS OWN CARD. The crew screen is the order of
+        // battle for execution and closure; in preparation the question is
+        // "what was planned, and is the room ready", and that is two columns
+        // — the summary and the roster — rather than one list of people.
+        if self.phase() == crate::gamestate::GameState::Preparation {
+            return self.preparation_body(card_w, cx);
+        }
         // The head is the modal's own: the surface's name, what it holds, and
         // the one way out.
         let mut col = div()
@@ -9912,6 +10140,873 @@ impl IslandDemo {
             }
         }
         col.child(list).into_any_element()
+    }
+
+    // -----------------------------------------------------------------
+    // PREPARATION — the room as a card
+    // -----------------------------------------------------------------
+
+    /// THE PREPARATION CARD: the plan read back on the left, the room on the
+    /// right.
+    ///
+    /// WHY IT IS A CARD AND NOT A COLUMN. The phase used to carry a one-island
+    /// column (Crew) beside this screen, which said the same thing twice. The
+    /// owner's direction removed the column: preparation is the room, and the
+    /// room is one surface wide enough to hold the summary, the invitation
+    /// key, the roster and the readiness gate.
+    ///
+    /// TWO FACES, ONE CARD. The Game Master sees the whole roster and the verb
+    /// that starts the exercise; an invited player sees their own seat and the
+    /// one verb they own — declare, or take the declaration back. The left
+    /// half is the same on both sides, minus the invitation key (a participant
+    /// does not hand out the room they were invited into).
+    fn preparation_body(&mut self, card_w: f32, cx: &mut Context<Self>) -> AnyElement {
+        let stats = preparation_stats(&self.session);
+        let own = self.own_seat().cloned();
+        // The console's own rule: a seat held by somebody on the exercise
+        // side is a player station. A judge, or no seat at all, is the Game
+        // Master. `TFG_ORGANIZER=1` forces the Game Master face for a capture,
+        // the same seed the side column reads.
+        let is_player = self.player_station();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(view::PANEL_GAP))
+            .size_full()
+            .overflow_hidden()
+            .p(px(view::PANEL_PAD));
+        let count = if is_player {
+            let role = own.as_ref().map(|p| p.role.clone()).unwrap_or_default();
+            if role.is_empty() {
+                "YOUR SEAT".to_string()
+            } else {
+                format!("YOUR SEAT \u{b7} {}", role.to_uppercase())
+            }
+        } else {
+            format!(
+                "{} SEATED \u{b7} {} IN ROOM \u{b7} {}/{} READY",
+                self.session.seats, self.session.present, stats.ready, stats.required
+            )
+        };
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .h(px(view::title_h()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(kit::mono_caps(
+                            "PREPARATION",
+                            view::TITLE_PT,
+                            kit::VALUE_INK,
+                        ))
+                        .child(kit::machine(count, view::LABEL_PT, kit::MUTED_INK)),
+                )
+                .child(
+                    div()
+                        .id("close-preparation")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.crew_modal_open = false;
+                            view.room_key_copied = false;
+                            cx.notify();
+                        }))
+                        .child(kit::mono_caps("CLOSE", view::LABEL_PT, kit::MUTED_INK)),
+                ),
+        );
+        col = col.child(kit::edge_rule());
+        if self.session.game_id == 0 {
+            return col.child(note("No session held.")).into_any_element();
+        }
+        let right = if is_player {
+            self.preparation_player_seat(cx)
+        } else {
+            self.preparation_roster(&stats, cx)
+        };
+        // THE CARD IS AS WIDE AS THE WINDOW ALLOWS. The console opens at 760
+        // and a 1240 card on that frame would be a card whose right edge is
+        // off screen. The summary is proportional below the full width, and
+        // the roster's columns are fractions of what is left — a column is a
+        // share of the row rather than a number of points.
+        let left_w = if card_w >= PREP_W - 1.0 {
+            PREP_LEFT_W
+        } else {
+            (card_w * 0.38).max(240.0)
+        };
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(14.0))
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(self.preparation_summary(&stats, !is_player, left_w, cx))
+                .child(right),
+        );
+        col.into_any_element()
+    }
+
+    /// The left half: what was planned, and (for the Game Master) the key that
+    /// lets people into the room.
+    fn preparation_summary(
+        &mut self,
+        stats: &PreparationStats,
+        show_key: bool,
+        left_w: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let people = preparation_visible_people(&self.session);
+        let roles = preparation_role_counts(&people);
+        let max_role = roles.iter().map(|(_, _, n)| *n).max().unwrap_or(1).max(1);
+        let window = view::window_label(
+            &self.session.facts.actual_start,
+            &self.session.facts.actual_end,
+            &self.session.facts.assumed_start,
+            &self.session.facts.assumed_end,
+        );
+        let cell = |value: String,
+                    label: &'static str,
+                    detail: String,
+                    leads: bool|
+         -> AnyElement {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .flex_1()
+                .min_w_0()
+                .p(px(8.0))
+                .border(px(kit::EDGE_WIDTH))
+                .border_color(rgba(HAIRLINE_SLATE))
+                .bg(rgba(DEEP_WELL))
+                .child(figure(&value, leads, kit::VALUE_INK))
+                .child(kit::mono_caps(label, view::LABEL_PT, kit::MUTED_INK))
+                // A sentence, not a one-line value: `kit::machine` ellipsizes
+                // to "..." when a stretched column cannot resolve its own
+                // width against the text, and a detail nobody can read is
+                // worse than one that wraps.
+                .child(kit::note(detail, kit::MUTED_INK))
+                .into_any_element()
+        };
+        let mut col = div()
+            .id("preparation-summary")
+            .flex()
+            .flex_col()
+            .gap(px(9.0))
+            .w(px(left_w))
+            .flex_shrink_0()
+            .h_full()
+            .overflow_y_scroll()
+            .pr(px(6.0));
+        col = col
+            .child(kit::mono_caps(
+                "PLANNING SUMMARY",
+                view::TITLE_PT,
+                kit::VALUE_INK,
+            ))
+            .child(kit::remark(
+                "READ BACK BEFORE THE ROOM RUNS",
+                kit::MUTED_INK,
+            ));
+        // THE INVITATION KEY COMES FIRST. It is the one thing on this card
+        // somebody has to hand to somebody else, and a key below a page of
+        // readouts is a key the Game Master scrolls to find.
+        if show_key {
+            col = col.child(kit::edge_rule());
+            col = col.child(self.preparation_invite(cx));
+        }
+        // THE THREE NUMBERS THE PLAN IS ABOUT, AND WHAT THE ROOM IS FOR. A
+        // deployed force, the groups it is organised into, the steps a
+        // scenario will play — then the exercise's own name and the sentence
+        // that says what it is. The readiness count is NOT one of them: the
+        // roster's own foot states it as the gate it is (`{ready} / {required}
+        // READY`, and what is outstanding under it), and a player's seat card
+        // states their own declaration — a card that says 4/6 twice is a card
+        // with a cell nobody reads. They are figures rather than sentences for
+        // the same reason the console's own readouts are: a count is what an
+        // operator scans for.
+        let steps = if self.session.facts.mode == crate::gamestate::GameMode::Scenario {
+            cell(
+                stats.steps.to_string(),
+                "STEPS",
+                format!("{} SCENARIOS", self.session.book.len()),
+                true,
+            )
+        } else {
+            cell(
+                "\u{2014}".to_string(),
+                "STEPS",
+                "NO BOOK IN THIS MODE".to_string(),
+                true,
+            )
+        };
+        // The name is a VALUE and the description is a SENTENCE, so the cell
+        // is built rather than borrowed: `figure` sets tabular figures, and a
+        // game's name drawn as a quantity would be a title pretending to be a
+        // number.
+        let name = if self.session.game.is_empty() {
+            "\u{2014}".to_string()
+        } else {
+            self.session.game.clone()
+        };
+        let about = if !self.session.facts.description.is_empty() {
+            self.session.facts.description.clone()
+        } else if self.session.facts.read {
+            "NO DESCRIPTION WRITTEN".to_string()
+        } else {
+            "THE TERMS COULD NOT BE READ".to_string()
+        };
+        let named = div()
+            .flex()
+            .flex_col()
+            .gap(px(1.0))
+            .flex_1()
+            .min_w_0()
+            .p(px(8.0))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .bg(rgba(DEEP_WELL))
+            .child(
+                // A raw line rather than the `kit` text helpers: theirs clip
+                // with an ellipsis, and the helper's ellipsis resolves to
+                // "..." when a stretched column cannot resolve its own width
+                // against the text — which is what a name inside this cell
+                // did. It WRAPS instead, like the description under it: a
+                // truncated exercise name is a name the operator cannot check.
+                div()
+                    .w_full()
+                    .font_family(view::FACE_HUMAN)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(view::pt(view::READOUT_SM_PT)))
+                    .text_color(rgba(kit::VALUE_INK))
+                    .child(name),
+            )
+            .child(kit::mono_caps("NAME", view::LABEL_PT, kit::MUTED_INK))
+            .child(kit::note(about, kit::MUTED_INK));
+        col = col.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .w_full()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .w_full()
+                        .child(cell(
+                            stats.hulls.to_string(),
+                            "HULLS",
+                            format!("{} PLACED", stats.placed),
+                            true,
+                        ))
+                        .child(cell(
+                            stats.groups.to_string(),
+                            "GROUPS",
+                            format!("{} HULLS IN THEM", stats.grouped_hulls),
+                            true,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .w_full()
+                        .child(steps)
+                        .child(named),
+                ),
+        );
+        // CREW BY ROLE. A bar as well as a count, because the shape of a room
+        // — nine commandos and one referee — is a fact a list of names does
+        // not show at a glance.
+        col = col.child(kit::edge_rule());
+        col = col.child(kit::mono_caps(
+            "CREW BY ROLE",
+            view::LABEL_PT,
+            kit::MUTED_INK,
+        ));
+        if roles.is_empty() {
+            col = col.child(kit::note("Nobody seated yet.", kit::MUTED_INK));
+        } else {
+            for (role, judge, count) in &roles {
+                let ink = if *judge { IDLE_GREY } else { RADAR_CYAN };
+                col = col.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .w_full()
+                        .child(div().flex_1().min_w_0().child(kit::human(
+                            if role.is_empty() {
+                                "\u{2014}".to_string()
+                            } else {
+                                role.clone()
+                            },
+                            view::DENSE_PT,
+                            kit::VALUE_INK,
+                        )))
+                        .child(
+                            div()
+                                .w(px(110.0))
+                                .h(px(3.0))
+                                .bg(rgba(HAIRLINE_SLATE))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(px(110.0 * (*count as f32) / (max_role as f32)))
+                                        .bg(rgba(ink)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(24.0))
+                                .flex()
+                                .justify_end()
+                                .child(kit::machine(
+                                    count.to_string(),
+                                    view::DENSE_PT,
+                                    kit::VALUE_INK,
+                                )),
+                        ),
+                );
+            }
+        }
+        // THE EXERCISE'S OWN TERMS, read back rather than edited. An operator
+        // arriving here from planning is checking the answer, not retyping it.
+        col = col.child(kit::edge_rule());
+        col = col.child(kit::mono_caps(
+            "EXERCISE",
+            view::LABEL_PT,
+            kit::MUTED_INK,
+        ));
+        col = col
+            .child(kv(
+                "MODE",
+                self.session.facts.mode.label(),
+                kit::VALUE_INK,
+            ))
+            .child(kv(
+                "WINDOW",
+                window.0,
+                if window.1 {
+                    kit::VALUE_INK
+                } else {
+                    ALERT_YELLOW
+                },
+            ))
+            .child(kv(
+                "GAME TIME",
+                format!("{:.0}\u{00d7}", self.session.facts.time_factor),
+                kit::VALUE_INK,
+            ));
+        col.into_any_element()
+    }
+
+    /// The invitation key, and the one verb it earns.
+    fn preparation_invite(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let key = self.session.facts.room_key.clone();
+        let copied = self.room_key_copied;
+        let mut block = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .w_full()
+            .p(px(10.0))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(if copied { SIGNAL_GREEN } else { kit::LIVE_INK }))
+            .bg(rgba(CONSOLE_NIGHT.with_alpha(kit::PANEL_ALPHA)));
+        if key.is_empty() {
+            block = block
+                .child(kit::mono_caps(
+                    "INVITATION CODE",
+                    view::LABEL_PT,
+                    kit::MUTED_INK,
+                ))
+                .child(kit::machine("\u{2014}", view::READOUT_SM_PT, kit::MUTED_INK))
+                .child(kit::note(
+                    "The room key is issued when the exercise enters preparation.",
+                    kit::MUTED_INK,
+                ));
+            return block.into_any_element();
+        }
+        let to_copy = key.clone();
+        // THE COPY VERB SITS ON THE LABEL ROW, not beside the key: the key is
+        // as wide as the room it names, and a verb beside it is a verb the
+        // key pushes off the edge on a narrow window.
+        block = block
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .w_full()
+                    .child(kit::mono_caps(
+                        "INVITATION CODE",
+                        view::LABEL_PT,
+                        kit::MUTED_INK,
+                    ))
+                    .child(
+                        div()
+                            .id("copy-room-key")
+                            .flex_shrink_0()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    to_copy.clone(),
+                                ));
+                                view.room_key_copied = true;
+                                cx.notify();
+                            }))
+                            .child(kit::verb(
+                                if copied { "COPIED" } else { "COPY" },
+                                kit::VerbLook::Live,
+                            )),
+                    ),
+            )
+            // A raw machine line rather than `kit::machine`: the helper's
+            // ellipsis resolves to "..." when it stretches inside a flex
+            // column, and a key nobody can read is not a key. This form has
+            // no ellipsis to fall back to.
+            .child(
+                div()
+                    .w_full()
+                    .font_family(view::FACE_MACHINE)
+                    .text_size(px(view::pt(view::BODY_PT)))
+                    .text_color(rgba(kit::VALUE_INK))
+                    .child(key),
+            )
+            .child(kit::note(
+                "Invited players paste this into JOIN A ROOM on the launcher.",
+                kit::MUTED_INK,
+            ));
+        block.into_any_element()
+    }
+
+    /// The right half for a Game Master: every seat, compactly, and the gate.
+    fn preparation_roster(
+        &mut self,
+        stats: &PreparationStats,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut people = preparation_visible_people(&self.session);
+        people.sort_by_key(|p| {
+            (
+                p.judge,
+                p.role.to_lowercase(),
+                p.name.to_lowercase(),
+            )
+        });
+        let pieces = self.session.pieces.clone();
+        let groups = self.session.groups.clone();
+        let required = stats.required;
+        let ready = stats.ready;
+        let all_ready = preparation_gate_open(stats, self.readiness_clear());
+        let gate = all_ready && !self.advance_busy;
+        let blockers = self
+            .session
+            .readiness
+            .as_ref()
+            .map(|r| r.blockers.clone())
+            .unwrap_or_default();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .flex_1()
+            .min_w_0()
+            .h_full();
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .child(kit::mono_caps("PLAYERS", view::TITLE_PT, kit::VALUE_INK))
+                .child(kit::machine(
+                    plural(stats.seats, "seat").to_uppercase(),
+                    view::LABEL_PT,
+                    kit::MUTED_INK,
+                )),
+        );
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .w_full()
+                .pb(px(4.0))
+                .border_b(px(kit::EDGE_WIDTH))
+                .border_color(rgba(kit::EDGE_INK))
+                .child(
+                    div()
+                        .w(relative(PREP_NAME_FRAC))
+                        .flex_shrink_0()
+                        .child(kit::mono_caps("NAME", view::LABEL_PT, kit::MUTED_INK)),
+                )
+                .child(
+                    div()
+                        .w(relative(PREP_ROLE_FRAC))
+                        .flex_shrink_0()
+                        .child(kit::mono_caps("ROLE", view::LABEL_PT, kit::MUTED_INK)),
+                )
+                .child(div().flex_1().min_w_0().child(kit::mono_caps(
+                    "HULL / GROUP",
+                    view::LABEL_PT,
+                    kit::MUTED_INK,
+                )))
+                .child(
+                    div()
+                        .w(relative(PREP_STATE_FRAC))
+                        .flex_shrink_0()
+                        .child(kit::mono_caps("STATE", view::LABEL_PT, kit::MUTED_INK)),
+                ),
+        );
+        let mut list = div()
+            .id("preparation-roster")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scroll();
+        if people.is_empty() {
+            list = list.child(kit::note("Nobody seated.", kit::MUTED_INK));
+        }
+        for person in &people {
+            list = list.child(self.preparation_person_row(person, &pieces, &groups));
+        }
+        col = col.child(list);
+        // THE GATE, DOCKED. The count is the server's own arithmetic (every
+        // exercise-side seat, judges exempt) and the verb is disabled until it
+        // reads closed — a button that let the press through would ask Minos a
+        // question whose answer we already know.
+        let mut foot = div()
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .w_full()
+            .flex_shrink_0()
+            .pt(px(8.0))
+            .border_t(px(kit::EDGE_WIDTH))
+            .border_color(rgba(HAIRLINE_SLATE));
+        let outstanding = required.saturating_sub(ready);
+        foot = foot.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(12.0))
+                .w_full()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_baseline()
+                        .gap(px(7.0))
+                        .child(figure(
+                            &format!("{ready} / {required}"),
+                            false,
+                            if all_ready { SIGNAL_GREEN } else { kit::VALUE_INK },
+                        ))
+                        .child(kit::mono_caps("READY", view::LABEL_PT, kit::MUTED_INK))
+                        .child(kit::machine(
+                            if outstanding == 0 {
+                                "EVERY SEAT HAS DECLARED".to_string()
+                            } else {
+                                format!("{outstanding} OUTSTANDING")
+                            },
+                            view::LABEL_PT,
+                            if outstanding == 0 {
+                                SIGNAL_GREEN
+                            } else {
+                                ALERT_YELLOW
+                            },
+                        )),
+                )
+                .child({
+                    let mut button = div().id("preparation-advance").flex_shrink_0();
+                    if gate {
+                        button = button
+                            .cursor_pointer()
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.advance_execution(cx);
+                            }));
+                    }
+                    let look = if self.advance_busy {
+                        kit::VerbLook::Busy
+                    } else if gate {
+                        kit::VerbLook::Live
+                    } else {
+                        kit::VerbLook::Disabled
+                    };
+                    button.child(kit::verb(
+                        if self.advance_busy {
+                            "ADVANCING\u{2026}"
+                        } else {
+                            "ENTER EXECUTION"
+                        },
+                        look,
+                    ))
+                }),
+        );
+        if required == 0 {
+            foot = foot.child(kit::remark(
+                "NOBODY IS ON THE EXERCISE SIDE \u{b7} THE SERVER WILL REFUSE THE ADVANCE",
+                WARNING_SAND,
+            ));
+        } else if outstanding > 0 {
+            foot = foot.child(kit::remark(
+                format!("{outstanding} SEAT(S) HAVE NOT DECLARED READY"),
+                WARNING_SAND,
+            ));
+        } else if let Some(why) = blockers.first() {
+            foot = foot.child(kit::remark(
+                format!("MINOS: {}", why.to_uppercase()),
+                WARNING_SAND,
+            ));
+        }
+        if !self.advance_status.is_empty() {
+            foot = foot.child(kit::remark(
+                self.advance_status.text.clone().to_uppercase(),
+                self.advance_status.ink(),
+            ));
+        }
+        col.child(foot).into_any_element()
+    }
+
+    /// One compact roster row: who, what role, what they command, and whether
+    /// they have declared.
+    fn preparation_person_row(
+        &mut self,
+        person: &PersonView,
+        pieces: &[PieceView],
+        groups: &[crate::groups::LiveGroup],
+    ) -> AnyElement {
+        let command = preparation_command_text(person.id, pieces, groups);
+        // The column answers READINESS, and the judge side is not a seat that
+        // has failed to declare — it is a seat the gate never asks.
+        let (mark, ink) = if person.judge {
+            ("EXEMPT".to_string(), IDLE_GREY)
+        } else {
+            crew_state(person)
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .w_full()
+            .h(px(PREP_ROW_H))
+            .flex_shrink_0()
+            .px(px(4.0))
+            .border_b(px(kit::EDGE_WIDTH))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .child(
+                div()
+                    .w(relative(PREP_NAME_FRAC))
+                    .flex_shrink_0()
+                    .child(kit::human(
+                        if person.name.is_empty() {
+                            "\u{2014}".to_string()
+                        } else {
+                            person.name.clone()
+                        },
+                        view::DENSE_PT,
+                        kit::VALUE_INK,
+                    )),
+            )
+            .child(
+                div()
+                    .w(relative(PREP_ROLE_FRAC))
+                    .flex_shrink_0()
+                    .child(kit::machine(
+                        if person.role.is_empty() {
+                            "\u{2014}".to_string()
+                        } else {
+                            person.role.to_uppercase()
+                        },
+                        view::LABEL_PT,
+                        kit::MUTED_INK,
+                    )),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(kit::machine(
+                        command,
+                        view::DENSE_PT,
+                        kit::VALUE_INK,
+                    )),
+            )
+            .child(
+                div()
+                    .w(relative(PREP_STATE_FRAC))
+                    .flex_shrink_0()
+                    .child(kit::machine(mark, view::LABEL_PT, ink)),
+            )
+            .into_any_element()
+    }
+
+    /// The right half for an invited player: their own seat, and the one verb
+    /// the seat owns.
+    fn preparation_player_seat(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(seat) = self.own_seat().cloned() else {
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(kit::note(
+                    "No participant row for this account \u{2014} paste the invitation key on the launcher.",
+                    kit::MUTED_INK,
+                ))
+                .into_any_element();
+        };
+        let (mark, ink) = crew_state(&seat);
+        let command = preparation_command_text(
+            seat.id,
+            &self.session.pieces,
+            &self.session.groups,
+        );
+        let busy = self.readiness_busy;
+        let status = self.readiness_status.clone();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(kit::mono_caps(
+                "YOUR SEAT",
+                view::TITLE_PT,
+                kit::VALUE_INK,
+            ));
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .w_full()
+            .p(px(14.0))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(if seat.judge {
+                HAIRLINE_SLATE
+            } else if seat.ready {
+                SIGNAL_GREEN
+            } else {
+                kit::LIVE_INK
+            }))
+            .bg(rgba(CONSOLE_NIGHT.with_alpha(kit::PANEL_ALPHA)))
+            .child(kit::prose(
+                if seat.name.is_empty() {
+                    "\u{2014}".to_string()
+                } else {
+                    seat.name.clone()
+                },
+                view::TITLE_PT,
+                kit::VALUE_INK,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.0))
+                    .child(kit::mono_caps(
+                        if seat.role.is_empty() {
+                            "\u{2014}".to_string()
+                        } else {
+                            seat.role.to_uppercase()
+                        },
+                        view::LABEL_PT,
+                        kit::MUTED_INK,
+                    ))
+                    .child(kit::machine(mark, view::LABEL_PT, ink)),
+            );
+        if !command.is_empty() {
+            // A hull name is long and the card is not infinite. `kv` keeps the
+            // value on one line and would paint the tail past the card's own
+            // edge, so the command gets a labelled block that WRAPS.
+            card = card.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .w_full()
+                    .child(kit::mono_caps(
+                        "HULL / GROUP",
+                        view::LABEL_PT,
+                        kit::MUTED_INK,
+                    ))
+                    .child(
+                        div()
+                            .w_full()
+                            .font_family(view::FACE_MACHINE)
+                            .text_size(px(view::pt(view::DENSE_PT)))
+                            .text_color(rgba(kit::VALUE_INK))
+                            .child(command),
+                    ),
+            );
+        }
+        col = col.child(card);
+        if seat.judge {
+            col = col.child(kit::remark(
+                "JUDGE SIDE \u{b7} EXEMPT FROM READINESS",
+                kit::MUTED_INK,
+            ));
+        } else {
+            let ready = seat.ready;
+            let mut button = div().id("preparation-readiness").w_full().flex();
+            if !busy {
+                button = button.cursor_pointer().on_click(cx.listener(
+                    move |view, _, _, cx| {
+                        view.set_readiness(!ready, cx);
+                    },
+                ));
+            }
+            col = col.child(button.child(kit::verb(
+                if busy {
+                    "SENDING\u{2026}"
+                } else if ready {
+                    "WITHDRAW READINESS"
+                } else {
+                    "DECLARE READY"
+                },
+                if busy {
+                    kit::VerbLook::Busy
+                } else {
+                    kit::VerbLook::Live
+                },
+            )));
+            if !status.is_empty() {
+                col = col.child(kit::remark(
+                    status.text.to_uppercase(),
+                    status.ink(),
+                ));
+            }
+        }
+        col = col.child(kit::edge_rule());
+        col = col.child(kit::remark(
+            "THE GAME MASTER ADVANCES THE EXERCISE WHEN THE ROOM IS READY.",
+            kit::MUTED_INK,
+        ));
+        col.into_any_element()
     }
 
     /// The operator's own readiness, in the crew screen.
@@ -10346,10 +11441,14 @@ impl IslandDemo {
             let name = g.name.clone();
             let kind = format!("{:?}", g.kind);
             let members = g.units.len();
-            let commander = g
-                .commander_id
-                .map(|u| format!("seat {u}"))
-                .unwrap_or_else(|| "\u{2014}".to_string());
+            // THE COMMANDER BY NAME, and "NO COMMANDER" in sand: a group is
+            // somebody who orders it, and the game may not advance while one
+            // is nobody. A seat number told the operator which row to hunt;
+            // the name says who it is.
+            let (commander, commanded) = match g.commander_id {
+                Some(id) => (self.person_name(id), true),
+                None => ("NO COMMANDER".to_string(), false),
+            };
             let target = crate::dnd::DropTarget::Group { group_id: gid };
             let accent = crate::shell_gpui::drop_ink(
                 self.drop_hover.as_ref(),
@@ -10391,7 +11490,7 @@ impl IslandDemo {
                 .child(
                     div()
                         .text_size(px(view::pt(view::LABEL_PT)))
-                        .text_color(rgba(BODY_SILVER))
+                        .text_color(rgba(if commanded { BODY_SILVER } else { DATA_AMBER }))
                         .child(commander),
                 );
             col = col.child(Self::take_entity_drop(
@@ -10406,7 +11505,7 @@ impl IslandDemo {
         // A small create affordance: a new root group at the lowest echelon.
         // `view_ids` is private to the draft, so count staged rows instead.
         if let Some(ec) = self.session.echelons.first().cloned() {
-            let name = format!("New group {}", self.groups.staged_groups().count() + 1);
+            let _name = format!("New group {}", self.groups.staged_groups().count() + 1);
             let kind = crate::groups::GroupKind::from_echelon(&ec.name);
             if let Some(kind) = kind {
                 let ec_id = ec.id;
@@ -11015,7 +12114,19 @@ impl IslandDemo {
     /// binary uses to find commanded hulls, so the panel and the wire never
     /// disagree about who is seated.
     fn own_seat(&self) -> Option<&PersonView> {
-        self.session.people.iter().find(|p| p.id == self.session.me)
+        self.session
+            .people
+            .iter()
+            .find(|p| p.id == self.session.me)
+            .or_else(|| {
+                // A participant's only seat read is the join answer, and it
+                // is this one. The roster above is tried first because it is
+                // the authoritative read when it was permitted.
+                self.session
+                    .joined
+                    .as_ref()
+                    .filter(|p| p.id == self.session.me)
+            })
     }
 
     /// The hulls this account commands in the held game, as unit ids.
@@ -11320,10 +12431,17 @@ impl IslandDemo {
                 commander_id: Some(commander_id),
                 host: None,
                 course_deg: None,
+                brought_by: None,
+                with_contents: self.bring_contents,
             });
             self.force = draft;
         }
         if self.staging() {
+            // WHAT THE REGISTER SAYS SHE CARRIES, asked once: the answer
+            // stages her pre-embarked units beside her in the same draft, and
+            // the advance writes them through with her assignment — when the
+            // picker's toggle is on for this hull.
+            self.register_carries_look(unit_id);
             return Ok(());
         }
         self.sync_force()
@@ -11466,6 +12584,7 @@ impl IslandDemo {
                 host,
                 child: unit_id,
                 commander_id: who,
+                with_contents: self.bring_contents,
             });
         } else {
             self.deploy_busy = true;
@@ -11477,6 +12596,7 @@ impl IslandDemo {
                 commander_id: who,
                 fx,
                 fy,
+                with_contents: self.bring_contents,
             });
         }
         cx.notify();
@@ -11628,6 +12748,8 @@ impl IslandDemo {
                 commander_id: None,
                 host: None,
                 course_deg: None,
+                brought_by: None,
+                with_contents: self.bring_contents,
             });
             self.force = draft;
         }
@@ -11671,11 +12793,18 @@ impl IslandDemo {
                 commander_id: None,
                 host: None,
                 course_deg: None,
+                brought_by: None,
+                with_contents: false,
             });
             self.force = draft;
         }
         self.force.set_host(child, Some(host));
         self.force.set_start(child, None);
+        // A BOAT THE REGISTER SAYS THE HOST CARRIES IS THE HOST'S TO BRING.
+        // The drag may land after the register's copy was read, and a piece
+        // the parent's assignment will create must not also be attached here:
+        // the server refuses the second one as `already aboard this hull`.
+        self.mark_brought_if_register(host, child);
         self.force_status = Status::good(format!(
             "{name} staged aboard {host} locally \u{2014} move to preparation writes it"
         ));
@@ -11857,6 +12986,149 @@ impl IslandDemo {
         cx.notify();
     }
 
+    /// ASK WHAT THE REGISTER SAYS A HULL CARRIES, once per hull.
+    ///
+    /// THE MECHANISM IS THE SERVER'S, AND THE DRAFT HAS TO SHOW IT. Deploying
+    /// a hull deploys the units the fleet register says she carries, in the
+    /// same write; a hull already in the exercise has that list on her piece
+    /// row, and one that is not has it only through
+    /// `/units/{id}/embarkations`. So a drop asks once, and the answer is
+    /// what the draft stages beside the ship — the console's half of a
+    /// mechanism the press completes.
+    fn register_carries_look(&mut self, unit: i64) {
+        if self.register_carries.contains_key(&unit) || self.register_carries_asked.contains(&unit)
+        {
+            return;
+        }
+        self.register_carries_asked.push(unit);
+        let _ = self.order_tx.send(ToBinary::ReadRegisterCarries { unit });
+    }
+
+    /// THE REGISTER'S COPY, ARRIVED: stage the pre-embarked units beside the
+    /// hull that brings them, in every draft that holds her.
+    ///
+    /// A child is marked `brought_by` in the force draft, which is what keeps
+    /// the plan from writing hulls the parent's own assignment creates. A
+    /// hull the operator has already placed, removed or moved is left as they
+    /// have it: the register says what the world contains, never what the
+    /// plan should say.
+    fn apply_register_carries(
+        &mut self,
+        outcome: Result<(i64, Vec<crate::backend::EmbarkedUnit>), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok((parent, carries)) = outcome else {
+            cx.notify();
+            return;
+        };
+        let children: Vec<(i64, String, String)> = carries
+            .iter()
+            .map(|c| (c.id, c.name.clone(), c.hull_number.clone()))
+            .collect();
+        self.register_carries.insert(parent, carries);
+        let mut added = 0usize;
+        // ONLY A HULL THAT ASKED FOR THEM BRINGS THEM. The toggle is the
+        // operator's, so a hull deployed bare stays bare even though the
+        // register's copy has just arrived.
+        if self.force.get(parent).is_some_and(|hull| hull.with_contents) {
+            added += self.force.bring_contents(parent, &children);
+        }
+        if let Some(draft) = &mut self.flow_draft {
+            if draft
+                .force
+                .get(parent)
+                .is_some_and(|hull| hull.with_contents)
+            {
+                added += draft.force.bring_contents(parent, &children);
+            }
+        }
+        if added > 0 {
+            let name = self
+                .force
+                .get(parent)
+                .or_else(|| {
+                    self.flow_draft
+                        .as_ref()
+                        .and_then(|draft| draft.force.get(parent))
+                })
+                .map(|hull| hull.name.to_uppercase())
+                .unwrap_or_else(|| format!("#{parent}"));
+            let sentence = format!(
+                "{name} BRINGS {} \u{b7} DEPLOYED ABOARD HER WITH THE SHIP",
+                plural(added, "PRE-EMBARKED UNIT")
+            );
+            self.flow_drop_note = Some(sentence.clone());
+            if !self.staging() {
+                self.force_status = Status::good(sentence);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Claim a boat for the hull the register says carries her, in every
+    /// draft that holds the pair.
+    ///
+    /// Called from the embark gestures, because the gesture can land after
+    /// the register's copy was read: the answer to "does this host carry this
+    /// boat" is already in hand, and the press must not attach a unit the
+    /// host's own assignment is about to create (`unit_ids[0]: already aboard
+    /// this hull`).
+    fn mark_brought_if_register(&mut self, host: i64, child: i64) {
+        let listed = self
+            .register_carries
+            .get(&host)
+            .is_some_and(|carries| carries.iter().any(|c| c.id == child));
+        if !listed {
+            return;
+        }
+        self.force.mark_brought(host, child);
+        if let Some(draft) = &mut self.flow_draft {
+            draft.force.mark_brought(host, child);
+        }
+    }
+
+    /// Flip ONE hull's choice, and stage or unstage what it means.
+    ///
+    /// The toggle in the picker is the default for the next deployment; this
+    /// is the same decision asked of a hull already in the draft, because the
+    /// boats are the operator's to want and one ship's answer is not the
+    /// next one's. Bringing them stages the register's copy beside her;
+    /// leaving them takes back the hulls that copy put there, and only those.
+    fn set_bring_contents(&mut self, unit: i64) {
+        let Some(hull) = self.force.get(unit).cloned() else {
+            return;
+        };
+        let want = !hull.with_contents;
+        let children: Vec<(i64, String, String)> = self
+            .register_carries
+            .get(&unit)
+            .map(|carries| {
+                carries
+                    .iter()
+                    .map(|c| (c.id, c.name.clone(), c.hull_number.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut changed = self.force.set_bring_contents(unit, want, &children);
+        if let Some(draft) = &mut self.flow_draft {
+            draft
+                .force
+                .set_bring_contents(unit, want, &children);
+        }
+        // The register's copy has not been read for this hull yet: ask, and
+        // the answer stages them if the flag is on by then.
+        if want && children.is_empty() {
+            self.register_carries_look(unit);
+        }
+        changed = changed.max(0);
+        let name = hull.name.to_uppercase();
+        self.force_status = Status::good(if want {
+            format!("{name} brings her pre-embarked units")
+        } else {
+            format!("{name} arrives bare \u{2014} {changed} taken back")
+        });
+    }
+
     /// Whether the held game is still being PLANNED — the one state where an
     /// edit stages locally and the Session island's advance writes the draft
     /// through.
@@ -12031,6 +13303,16 @@ impl IslandDemo {
     /// one owner for the drag's lifetime, set by the source, cleared by the
     /// poll, so neither can leave the other's half behind.
     fn begin_drag(&mut self, entity: DragEntity, cx: &mut Context<Self>) {
+        // WHAT SHE BRINGS, ASKED ONCE, WHEN SHE IS PICKED UP. The register's
+        // copy of a hull's pre-embarked units is not on her piece row until
+        // she is in the exercise, so a hull being dragged is the moment to
+        // ask: the answer stages her boats beside her, and the press writes
+        // them through with her. Asking on the drag rather than the drop
+        // means the drop itself posts nothing while planning — the gesture
+        // is a read, the act is the write.
+        if let DragEntity::Unit { unit_id, .. } = &entity {
+            self.register_carries_look(*unit_id);
+        }
         self.drag_entity = Some(entity);
         cx.notify();
     }
@@ -13315,6 +14597,60 @@ impl IslandDemo {
         true
     }
 
+    /// THE PRE-EMBARKED TOGGLE.
+    ///
+    /// One control for both surfaces that deploy — the console's fleet picker
+    /// and the composer's register — because it is one rule: whether a hull
+    /// arrives with the units the fleet register says she carries, or arrives
+    /// bare. The server puts them aboard in the same assignment when asked;
+    /// the console asks on the operator's word, because the difference is the
+    /// force the exercise will have.
+    ///
+    /// It is the DEFAULT for the next deployment. A hull already in the draft
+    /// carries its own answer, and the picker's row for that hull flips it.
+    fn bring_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let on = self.bring_contents;
+        let small = |t: String| {
+            div()
+                .font_family(view::FACE_HUMAN)
+                .text_size(px(view::pt(view::DENSE_PT)))
+                .text_color(rgba(BODY_SILVER))
+                .child(t)
+        };
+        div()
+            .id("bring-contents")
+            .cursor_pointer()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(4.0))
+            .py(px(2.0))
+            .rounded(px(3.0))
+            .on_click(cx.listener(|view, _, _, cx| {
+                view.bring_contents = !view.bring_contents;
+                view.force_status = Status::good(if view.bring_contents {
+                    "deployments bring their pre-embarked units".to_string()
+                } else {
+                    "deployments arrive bare".to_string()
+                });
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_size(px(view::pt(view::LABEL_PT)))
+                    .text_color(rgba(if on { SIGNAL_GREEN } else { BODY_SILVER }))
+                    .child(if on { "[x]" } else { "[ ]" }),
+            )
+            .child(small(if on {
+                "bring pre-embarked units \u{2014} a deployed hull arrives with the register's list"
+                    .to_string()
+            } else {
+                "bring pre-embarked units \u{2014} off: hulls arrive bare".to_string()
+            }))
+            .into_any_element()
+    }
+
     /// Apply one host's passengers: filed under the answer's own host, not
     /// the open one — answers can overtake opens, and one hull's passengers
     /// under another's is the misfile this shape exists to prevent. A
@@ -13511,6 +14847,20 @@ impl IslandDemo {
         if self.session.game_id == 0 {
             return false;
         }
+        // A TASK GROUP IS SOMEBODY. The server refuses the move to
+        // preparation with a group nobody commands, and it is the operator's
+        // own plan that says so — refusing here names the groups while the
+        // board they are on is still the surface, rather than after a flush
+        // that would have written everything else.
+        let nameless = self.groups.uncommanded();
+        if !nameless.is_empty() {
+            self.prepare_status = Status::bad(format!(
+                "{} \u{2014} every group needs a commander before the game moves to preparation.",
+                nameless.join(", ")
+            ));
+            cx.notify();
+            return false;
+        }
         self.prepare_busy = true;
         self.prepare_status = Status::pending("moving the plan to preparation\u{2026}".to_string());
         let live_hulls = self.live_hulls();
@@ -13629,6 +14979,8 @@ impl IslandDemo {
         self.end_busy = false;
         self.end_status.clear();
         self.session = session;
+        self.crew_modal_open = false;
+        self.room_key_copied = false;
     }
 
     /// Hold the picked game — the picker's verb, as a message. The binary
@@ -13646,6 +14998,46 @@ impl IslandDemo {
         let _ = self.order_tx.send(ToBinary::HoldSession { game_id });
         cx.notify();
         true
+    }
+
+    /// Enter a game room by the invitation key an invited player was given.
+    ///
+    /// The binary owns the `POST /games/join` and the re-read; the shell only
+    /// collects what was typed. This is the ONE route that tells a participant
+    /// their own seat: the roster read is staff-only, so a player who holds a
+    /// game without a key has no participant row to read.
+    ///
+    /// Returns whether a request went out, so a test exercises exactly what
+    /// the click does.
+    fn send_join(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.join_busy {
+            return false;
+        }
+        let key = self.join_key.trim().to_string();
+        if key.is_empty() {
+            self.join_status = Status::bad("paste the invitation key first".to_string());
+            cx.notify();
+            return false;
+        }
+        self.join_busy = true;
+        self.join_status = Status::pending("entering the room\u{2026}".to_string());
+        let _ = self.order_tx.send(ToBinary::JoinGame { room_key: key });
+        cx.notify();
+        true
+    }
+
+    /// Apply the room entered by key. The session comes back read (with the
+    /// caller's own seat adopted from the join answer), and the preparation
+    /// card is the surface a fresh participant lands on.
+    fn apply_join(&mut self, session: SessionView) {
+        self.join_busy = false;
+        self.join_status.clear();
+        self.join_key.clear();
+        // A JOIN IS A HOLD, and deliberately one: the same session-replacing
+        // read, the same forgotten drafts, the same baseline. The only
+        // difference is that the answer carries a participant row, which the
+        // session has already adopted.
+        self.apply_hold(session);
     }
 
     /// Hold the re-read session a hold answer returned: the picked game
@@ -13712,11 +15104,12 @@ impl IslandDemo {
             // that exercise — the execution and closure surfaces.
             self.sessions_open = false;
         }
-        // PREPARATION IS THE ROOM, so the centred screen is the order of
-        // battle: a hold into preparation opens it. Planning keeps the flow
+        // PREPARATION IS THE ROOM, so the centred screen is the preparation
+        // card: a hold into preparation opens it. Planning keeps the flow
         // (above), and execution has its own surfaces.
         if self.flow_draft.is_none() && self.session.state == "preparation" {
             self.crew_modal_open = true;
+            self.room_key_copied = false;
         }
         // The same baseline as a created session: a new hold's traffic is
         // what the console holds, not what arrived since the operator last
@@ -14747,6 +16140,82 @@ impl IslandDemo {
         self.readiness_busy = false;
         self.session = session;
         self.readiness_status.clear();
+    }
+
+    /// Apply the room's own movement — the preparation card's poll.
+    ///
+    /// The answer PATCHES the held session (see [`PreparationPulse`]) and
+    /// touches nothing else: no draft is re-seeded, because a poll is not a
+    /// write's answer and the operator may be mid-edit; the comms baseline
+    /// stands, because nothing arrived; and a refused roster read leaves a
+    /// room full of names exactly as it was instead of emptying it.
+    ///
+    /// A pulse that saw the room END carries the whole session (`left_room`),
+    /// because execution's surfaces read things the narrow poll never asks
+    /// for. That answer is applied, the drafts are re-seeded from it (a merge,
+    /// so staged work survives), and the card goes: a room of names over a
+    /// running exercise is the wrong surface entirely.
+    fn apply_preparation(&mut self, pulse: PreparationPulse, cx: &mut Context<Self>) {
+        if let Some(mut session) = pulse.left_room {
+            // A PARTICIPANT'S SEAT SURVIVES THE RE-READ, exactly as it does on
+            // every write's answer: the roster is staff-only, so the player
+            // who declared their readiness would otherwise lose the seat that
+            // declared the moment the room ended.
+            session.inherit_joined(&self.session);
+            self.session = session;
+            self.reseed_drafts();
+            self.crew_modal_open = false;
+            self.room_key_copied = false;
+            cx.notify();
+            return;
+        }
+        let mut moved = false;
+        if !pulse.state.is_empty() && pulse.state != self.session.state {
+            self.session.state = pulse.state;
+            moved = true;
+        }
+        if !pulse.name.is_empty() && pulse.name != self.session.game {
+            self.session.game = pulse.name;
+            moved = true;
+        }
+        if pulse.description != self.session.facts.description {
+            self.session.facts.description = pulse.description;
+            moved = true;
+        }
+        if let Some(people) = pulse.people {
+            // Compared before adopting: a room where nobody moved must not
+            // re-render the card every few seconds. The rows are `PartialEq`
+            // for exactly this, so a seat that declared is a difference and a
+            // poll that changed nothing is not.
+            if people != self.session.people {
+                self.session.adopt_roster(people);
+                moved = true;
+            }
+        }
+        if let Some(readiness) = pulse.readiness {
+            let changed = match &self.session.readiness {
+                Some(held) => {
+                    held.can_execute != readiness.can_execute
+                        || held.blockers != readiness.blockers
+                }
+                None => true,
+            };
+            if changed {
+                self.session.readiness = Some(readiness);
+                moved = true;
+            }
+        }
+        if !moved {
+            return;
+        }
+        // The state left preparation and the whole re-read has not landed yet
+        // (or it failed): the card is still the wrong surface. Closing it here
+        // means the poll's first word is already enough to leave the room.
+        if self.session.state != "preparation" {
+            self.crew_modal_open = false;
+            self.room_key_copied = false;
+        }
+        cx.notify();
     }
 
     /// Apply a Closure timeline page, from the Assessment island's Timeline
@@ -20827,6 +22296,31 @@ impl IslandDemo {
         if carrying > 0 {
             parts.push(format!("carrying {carrying}"));
         }
+        // WHAT THE REGISTER SAYS SHE BRINGS, when it is not in the exercise
+        // yet: the pre-embarked units her deployment puts aboard her. A
+        // piece already in the game has the same list on her piece row, and
+        // the ones already here are counted by `carrying` above.
+        let awaited = self
+            .session
+            .pieces
+            .iter()
+            .find(|piece| piece.id == id)
+            .map(|piece| {
+                piece
+                    .register_contents
+                    .iter()
+                    .filter(|content| !content.in_game)
+                    .count()
+            })
+            .or_else(|| {
+                self.register_carries
+                    .get(&id)
+                    .map(|carries| carries.len())
+            })
+            .unwrap_or(0);
+        if awaited > 0 {
+            parts.push(format!("brings {awaited}"));
+        }
         if let Some((host, cleared)) = aboard {
             parts.push(if cleared {
                 format!("aboard {host} \u{00b7} cleared")
@@ -21183,7 +22677,13 @@ impl IslandDemo {
     /// the theatre the operator is signing in to see is the theatre the
     /// console will draw when the session opens.
     fn signed_out(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let mut root = div().relative().size_full().bg(rgba(CONSOLE_NIGHT));
+        let mut root = div()
+            .relative()
+            .size_full()
+            .bg(rgba(CONSOLE_NIGHT))
+            // Its own root, so its own click hook: the console's is not behind
+            // the sign-in card.
+            .on_mouse_down(MouseButton::Left, hear_click);
         if let Some(frame) = self.gate.image() {
             // The theatre's arrival: the clock starts with the PICTURE, not
             // with the launch, so the fade is always onto a map that is
@@ -21737,7 +23237,7 @@ impl IslandDemo {
                 other => self.stage_absent_body(other),
             }
         };
-        let lifted = self.flow_peel.as_ref().map(|p| p.lifted).unwrap_or(false);
+        let lifted = self.peel_lifted();
         // THE GESTURE LIVES ON THE SURFACE, not on the card: once a card lifts,
         // the pointer is over the map and no card is under it. The card starts
         // the peel, the surface advances and ends it.
@@ -21785,11 +23285,24 @@ impl IslandDemo {
             // not drawn at all, so the chart behind the surface is what the
             // operator is aiming at.
             surface = surface
-                .bg(rgba(Rgba::black_alpha(40)))
+                // A LIGHT veil, not the register's 40: what is under it now is
+                // the chart and the draft's own pins — the thing the operator
+                // is aiming at — and dimming a target to 60% is how the force
+                // went missing in the first place.
+                .bg(rgba(Rgba::black_alpha(12)))
                 .child(chrome)
                 .child(kit::strip_rules())
+                // THE BASKET STAYS. It is where a hull already in the draft
+                // lives, and dropping the card in the air onto one of them is
+                // how a register hull goes aboard a ship that is already
+                // deployed — the embarkation the map alone cannot express,
+                // because there is no host card on the chart to aim at.
+                .children(self.flow_basket(cx))
                 .child(self.peel_readout(cx));
-            return surface.children(self.peel_ghost()).into_any_element();
+            return surface
+                .children(self.peel_ghost())
+                .children(self.basket_drag_capture(cx))
+                .into_any_element();
         }
         surface
             .child(chrome)
@@ -21834,19 +23347,28 @@ impl IslandDemo {
     }
 
     fn flow_edit_key(&mut self, ev: &KeyDownEvent) -> bool {
-        let Some((step, substep)) = self.flow_edit_substep else {
+        let Some(edit) = self.flow_edit_substep else {
             return false;
         };
         let key = ev.keystroke.key.as_str();
         let Some(draft) = &mut self.flow_draft else {
             return false;
         };
-        let current = draft
-            .book
-            .substeps_of(step)
-            .iter()
-            .find(|s| s.local_id == substep)
-            .map(|s| s.content.clone());
+        let current = if edit.live {
+            draft
+                .book
+                .live_substeps_of(edit.scenario, edit.step)
+                .iter()
+                .find(|command| command.id == edit.substep)
+                .map(|command| command.content.clone())
+        } else {
+            draft
+                .book
+                .substeps_of(edit.step)
+                .iter()
+                .find(|sub| sub.local_id == edit.substep)
+                .map(|sub| sub.content.clone())
+        };
         let Some(mut text) = current else {
             self.flow_edit_substep = None;
             return false;
@@ -21862,7 +23384,13 @@ impl IslandDemo {
                 if ch.chars().all(|c| !c.is_control()) { text.push_str(ch); } else { return false; }
             }
         }
-        draft.book.set_substep_content(step, substep, text);
+        if edit.live {
+            draft
+                .book
+                .set_live_substep_content(edit.scenario, edit.step, edit.substep, &text);
+        } else {
+            draft.book.set_substep_content(edit.step, edit.substep, text);
+        }
         true
     }
 
@@ -21872,6 +23400,27 @@ impl IslandDemo {
     /// door a hull enters by. The card records what it says (the ghost needs
     /// the words) and nothing else; whether the gesture becomes a command is
     /// decided by the pointer's own movement.
+    /// Whether a peeled card is in the air, past the click threshold.
+    fn peel_lifted(&self) -> bool {
+        self.flow_peel
+            .as_ref()
+            .map(|peel| peel.lifted)
+            .unwrap_or(false)
+    }
+
+    /// Whether the chart is drawn WITH THE DRAFT'S PINS.
+    ///
+    /// Map mode is one reason. A LIFTED CARD IS THE OTHER, and it is the one
+    /// that was missing: while a register card is in the air the flow's body is
+    /// not drawn at all — the chart is the target — and the operator is aiming
+    /// a hull at a piece of water chosen RELATIVE TO THE HULLS ALREADY THERE.
+    /// A bare chart gave them nothing to aim by, so the force they had just
+    /// deployed was invisible at exactly the moment they were placing the next
+    /// one.
+    fn map_shows_pins(&self) -> bool {
+        self.flow_map || self.peel_lifted()
+    }
+
     fn peel_start(&mut self, hull: &crate::register::Hull, at: (f32, f32), cx: &mut Context<Self>) {
         self.flow_peel = Some(FlowPeel {
             unit_id: hull.id,
@@ -21949,6 +23498,7 @@ impl IslandDemo {
         let Some((lat, lon)) = ground else {
             self.flow_drop_note =
                 Some("NO GROUND UNDER THE POINTER \u{b7} NOTHING WAS STAGED".into());
+            crate::sfx::play(crate::sfx::Sfx::Buzz);
             cx.notify();
             return;
         };
@@ -21975,6 +23525,14 @@ impl IslandDemo {
             commander_id: existing.as_ref().and_then(|h| h.commander_id),
             host: existing.as_ref().and_then(|h| h.host),
             course_deg: existing.as_ref().and_then(|h| h.course_deg),
+            brought_by: existing.as_ref().and_then(|h| h.brought_by),
+            // A HULL ARRIVING HERE IS A DEPLOYMENT, so it takes the picker's
+            // toggle — the composer's register carries the same control — and
+            // a hull already in the draft keeps the answer it was given.
+            with_contents: existing
+                .as_ref()
+                .map(|h| h.with_contents)
+                .unwrap_or(self.bring_contents),
         });
         let commander_known = draft
             .force
@@ -21989,6 +23547,9 @@ impl IslandDemo {
                 "A PIECE NEEDS A COMMANDER"
             }
         ));
+        // THE HULL IS IN THE FORCE: a deployment that landed dings, the same
+        // as the console's own drop.
+        crate::sfx::play(crate::sfx::Sfx::Ding);
         cx.notify();
     }
 
@@ -22068,6 +23629,22 @@ impl IslandDemo {
         cx.notify();
     }
 
+    /// Settle the flow's line, and the sound of it.
+    ///
+    /// The composer keeps its verdict as a note rather than a `Status`, so this
+    /// is where the console's one sound rule is applied to it: a gesture that
+    /// LANDED dings, one the draft REFUSED buzzes. Every verb in the flow ends
+    /// here, so nothing lands silently by forgetting to name a sound.
+    fn settle_note(&mut self, note: impl Into<String>, landed: bool) {
+        self.flow_drop_note = Some(note.into());
+        crate::sfx::play(if landed {
+            crate::sfx::Sfx::Ding
+        } else {
+            crate::sfx::Sfx::Buzz
+        });
+    }
+
+    /// A CARD PUT ABOARD THIS ONE (`§5.7`).
     /// THE EMBARK VERDICT, from the draft alone (`§5.7`).
     ///
     /// THE RULE HAS FOUR PARTS and three of them are the draft's: a hull does
@@ -22175,6 +23752,16 @@ impl IslandDemo {
             return true;
         }
         self.flow_carry = None;
+        self.embark_draft_hull(host, child, cx).is_some()
+    }
+
+    /// PUT A HULL THAT IS ALREADY IN THE DRAFT ABOARD `host`.
+    ///
+    /// One verb for the two gestures that mean it: a basket card let go on a
+    /// card, and a REGISTER card let go on one — the peel, which stages the
+    /// hull first and then arrives here. The verdict is the draft's, the
+    /// sentence is the sheet's, and the sound is the gesture's.
+    fn embark_draft_hull(&mut self, host: i64, child: i64, cx: &mut Context<Self>) -> Option<bool> {
         match self.flow_embark_verdict(host, child) {
             FlowEmbark::Refused(why) => {
                 let name = self
@@ -22193,6 +23780,9 @@ impl IslandDemo {
                     "{name} CANNOT EMBARK ABOARD {host_name} \u{b7} {why}"
                 ));
                 crate::sfx::play(crate::sfx::Sfx::Buzz);
+                self.flow_manifest = None;
+                cx.notify();
+                return Some(false);
             }
             FlowEmbark::Allowed | FlowEmbark::Unread => {
                 let unread = matches!(
@@ -22200,13 +23790,22 @@ impl IslandDemo {
                     FlowEmbark::Unread
                 );
                 let Some(draft) = &mut self.flow_draft else {
-                    return true;
+                    return Some(false);
                 };
                 // Aboard, a hull has no water of its own: the placement is
                 // lifted in the same edit, so the plan writes one lift and one
                 // embark rather than leaving a position the server refuses.
                 draft.force.set_start(child, None);
                 draft.force.set_host(child, Some(host));
+                // A boat the register says this host carries is the host's to
+                // bring, and the press must not attach it a second time.
+                if self
+                    .register_carries
+                    .get(&host)
+                    .is_some_and(|carries| carries.iter().any(|c| c.id == child))
+                {
+                    draft.force.mark_brought(host, child);
+                }
                 let child_name = draft
                     .force
                     .get(child)
@@ -22230,6 +23829,59 @@ impl IslandDemo {
         }
         self.flow_manifest = Some(host);
         cx.notify();
+        Some(true)
+    }
+
+    /// A REGISTER CARD LET GO ON A CARD IS AN EMBARKATION (`§5.7`).
+    ///
+    /// The hull is not in the draft yet — it is being taken out of the register
+    /// — so this stages it with no ground of its own and hands it to the same
+    /// verb a basket card uses. Aboard a host is the one deployment a bare
+    /// chart cannot express: there is no host card on the water to aim at, so
+    /// the deck is where the boat is dropped.
+    fn peel_into_card(&mut self, host: i64, cx: &mut Context<Self>) -> bool {
+        let Some(peel) = self.flow_peel.clone() else {
+            return false;
+        };
+        if !peel.lifted {
+            return false;
+        }
+        if peel.unit_id == host {
+            self.flow_peel = None;
+            self.flow_drop_note = Some("A HULL DOES NOT EMBARK ON ITSELF".to_string());
+            crate::sfx::play(crate::sfx::Sfx::Buzz);
+            cx.notify();
+            return true;
+        }
+        self.flow_peel = None;
+        // A REFUSED DECK LEAVES THE REGISTER AS IT WAS: the hull that was not in
+        // the draft before this gesture is not in it after a refusal either, so
+        // the draft is put back rather than left holding a piece the operator
+        // never got aboard.
+        let before = self.flow_draft.clone();
+        let Some(draft) = &mut self.flow_draft else {
+            return true;
+        };
+        if !draft.force.contains(peel.unit_id) {
+            let mut next = draft.clone();
+            next.force.upsert(crate::force::DraftHull {
+                unit_id: peel.unit_id,
+                name: peel.name.clone(),
+                hull_number: peel.number.clone(),
+                class_id: peel.class_label.clone(),
+                // A rider has no water of her own: the host's is hers.
+                start: None,
+                commander_id: None,
+                host: None,
+                course_deg: None,
+                brought_by: None,
+                with_contents: self.bring_contents,
+            });
+            self.flow_draft = Some(next);
+        }
+        if self.embark_draft_hull(host, peel.unit_id, cx) == Some(false) {
+            self.flow_draft = before;
+        }
         true
     }
 
@@ -22302,8 +23954,9 @@ impl IslandDemo {
         // refused with the gesture that would work instead.
         if carry.group_id.is_some() {
             self.flow_carry = None;
-            self.flow_drop_note = Some(
-                "A GROUP IS NOT A HULL \u{b7} DROP IT ON ITS UPPER LEVEL, OR ON A RUNG".into(),
+            self.settle_note(
+                "A GROUP IS NOT A HULL \u{b7} DROP IT ON ITS UPPER LEVEL, OR ON A RUNG",
+                false,
             );
             cx.notify();
             return true;
@@ -22318,6 +23971,78 @@ impl IslandDemo {
         let (added, total) = draft
             .book
             .add_substep_units(step_id, substep, &carry.unit_ids);
+        self.settle_note(
+            if added == 0 {
+                format!("RELEASE ADDS 0 \u{b7} {total} HULLS, ALL ALREADY COMMANDED")
+            } else {
+                format!(
+                    "RELEASE ADDS {added} \u{b7} {total} HULLS, ONE COMMAND \u{b7} {}",
+                    carry.label.to_uppercase()
+                )
+            },
+            added > 0,
+        );
+        cx.notify();
+        true
+    }
+
+    /// Release on a command the server already holds: the same gesture, one
+    /// list of commands the draft now owns. The list is seeded whole, so a
+    /// hull moved here leaves the other commands of the SAME step.
+    fn carry_into_live_substep(
+        &mut self,
+        scenario_id: i64,
+        step_id: i64,
+        substep_id: i64,
+        commands: Vec<crate::book::LiveSubstepDraft>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(carry) = self.flow_carry.clone() else {
+            return false;
+        };
+        if !carry.lifted {
+            return false;
+        }
+        if carry.group_id.is_some() {
+            self.flow_carry = None;
+            self.flow_drop_note = Some(
+                "A GROUP IS NOT A HULL \u{b7} DROP IT ON ITS UPPER LEVEL, OR ON A RUNG".into(),
+            );
+            cx.notify();
+            return true;
+        }
+        self.flow_carry = None;
+        let Some(draft) = &mut self.flow_draft else {
+            return true;
+        };
+        draft
+            .book
+            .begin_live_substeps(scenario_id, step_id, commands);
+        let before = draft
+            .book
+            .live_substeps_of(scenario_id, step_id)
+            .iter()
+            .find(|command| command.id == substep_id)
+            .map(|command| command.units.len())
+            .unwrap_or(0);
+        let mut units = draft
+            .book
+            .live_substeps_of(scenario_id, step_id)
+            .iter()
+            .find(|command| command.id == substep_id)
+            .map(|command| command.units.clone())
+            .unwrap_or_default();
+        for unit in &carry.unit_ids {
+            if !units.contains(unit) {
+                units.push(*unit);
+            }
+        }
+        units.sort_unstable();
+        let total = units.len();
+        draft
+            .book
+            .set_live_substep_units(scenario_id, step_id, substep_id, units);
+        let added = total.saturating_sub(before);
         self.flow_drop_note = Some(if added == 0 {
             format!("RELEASE ADDS 0 \u{b7} {total} HULLS, ALL ALREADY COMMANDED")
         } else {
@@ -22339,6 +24064,10 @@ impl IslandDemo {
         if carry.lifted {
             self.flow_drop_note =
                 Some("RELEASED ON NOTHING \u{b7} THE CARDS RETURN TO THE BASKET".to_string());
+            // A LIFTED CARD LET GO ON NOTHING IS A REFUSAL the operator made
+            // by missing: the buzz is how they know the gesture did not land
+            // without reading the footer.
+            crate::sfx::play(crate::sfx::Sfx::Buzz);
         }
         cx.notify();
     }
@@ -22368,7 +24097,7 @@ impl IslandDemo {
         // ── a body in the hand: nest it ───────────────────────────────
         if let Some(child_id) = carry.group_id {
             if child_id == group_id {
-                self.flow_drop_note = Some("A GROUP DOES NOT SIT INSIDE ITSELF".to_string());
+                self.settle_note("A GROUP DOES NOT SIT INSIDE ITSELF", false);
                 cx.notify();
                 return true;
             }
@@ -22385,9 +24114,9 @@ impl IslandDemo {
                         .map(|g| g.name.clone())
                         .unwrap_or_default();
                     self.flow_group = Some(group_id);
-                    self.flow_drop_note = Some(format!("{child_name} UNDER {parent_name}"));
+                    self.settle_note(format!("{child_name} UNDER {parent_name}"), true);
                 }
-                Err(why) => self.flow_drop_note = Some(why.to_uppercase()),
+                Err(why) => self.settle_note(why.to_uppercase(), false),
             }
             cx.notify();
             return true;
@@ -22417,14 +24146,17 @@ impl IslandDemo {
                     .map(|g| g.name.clone())
                     .unwrap_or_default();
                 self.flow_group = Some(group_id);
-                self.flow_drop_note = Some(format!(
-                    "{} CARD{} INTO {name} \u{b7} {} HULLS IN THE GROUP",
-                    carry.unit_ids.len(),
-                    if carry.unit_ids.len() == 1 { "" } else { "S" },
-                    units.len()
-                ));
+                self.settle_note(
+                    format!(
+                        "{} CARD{} INTO {name} \u{b7} {} HULLS IN THE GROUP",
+                        carry.unit_ids.len(),
+                        if carry.unit_ids.len() == 1 { "" } else { "S" },
+                        units.len()
+                    ),
+                    true,
+                );
             }
-            Err(why) => self.flow_drop_note = Some(why.to_uppercase()),
+            Err(why) => self.settle_note(why.to_uppercase(), false),
         }
         cx.notify();
         true
@@ -22470,10 +24202,13 @@ impl IslandDemo {
         };
         let pack = crate::formation::pack(&body, crate::force::Start { lat, lon });
         if pack.is_empty() {
-            self.flow_drop_note = Some(format!(
-                "{} HOLDS NO HULLS \u{b7} NOTHING TO PACK",
-                carry.label.to_uppercase()
-            ));
+            self.settle_note(
+                format!(
+                    "{} HOLDS NO HULLS \u{b7} NOTHING TO PACK",
+                    carry.label.to_uppercase()
+                ),
+                false,
+            );
             cx.notify();
             return true;
         }
@@ -22529,9 +24264,9 @@ impl IslandDemo {
             match draft.groups.set_parent(child_id, None) {
                 Ok(()) => {
                     self.flow_group = Some(child_id);
-                    self.flow_drop_note = Some(format!("{name} IS A ROOT"));
+                    self.settle_note(format!("{name} IS A ROOT"), true);
                 }
-                Err(why) => self.flow_drop_note = Some(why.to_uppercase()),
+                Err(why) => self.settle_note(why.to_uppercase(), false),
             }
             cx.notify();
             return true;
@@ -22546,7 +24281,7 @@ impl IslandDemo {
                 .map(|g| kind.sits_under(g.kind))
                 .unwrap_or(false)
         });
-        let n = draft.groups.staged_groups().count() + 1;
+        let n = draft.groups.visible_groups().len() + 1;
         let name = format!("{} {n}", Self::echelon_word(kind));
         match draft
             .groups
@@ -22554,14 +24289,17 @@ impl IslandDemo {
         {
             Ok(id) => {
                 self.flow_group = Some(id);
-                self.flow_drop_note = Some(format!(
-                    "NEW {} \u{b7} {} HULL{} IN IT",
-                    name,
-                    carry.unit_ids.len(),
-                    if carry.unit_ids.len() == 1 { "" } else { "S" }
-                ));
+                self.settle_note(
+                    format!(
+                        "NEW {} \u{b7} {} HULL{} IN IT",
+                        name,
+                        carry.unit_ids.len(),
+                        if carry.unit_ids.len() == 1 { "" } else { "S" }
+                    ),
+                    true,
+                );
             }
-            Err(why) => self.flow_drop_note = Some(why.to_uppercase()),
+            Err(why) => self.settle_note(why.to_uppercase(), false),
         }
         cx.notify();
         true
@@ -22606,11 +24344,14 @@ impl IslandDemo {
                 .above()
                 .map(Self::echelon_word)
                 .unwrap_or("NOTHING");
-            self.flow_drop_note = Some(format!(
-                "{} SITS ONLY UNDER {wants}, NOT {}",
-                Self::echelon_word(child.kind),
-                Self::echelon_word(kind),
-            ));
+            self.settle_note(
+                format!(
+                    "{} SITS ONLY UNDER {wants}, NOT {}",
+                    Self::echelon_word(child.kind),
+                    Self::echelon_word(kind),
+                ),
+                false,
+            );
             cx.notify();
             return true;
         }
@@ -22628,22 +24369,22 @@ impl IslandDemo {
         let existing = chosen.or_else(|| {
             draft
                 .groups
-                .staged_groups()
+                .visible_groups()
+                .into_iter()
                 .find(|g| g.local_id != child_id && g.kind == kind)
                 .map(|g| g.local_id)
         });
+        let mut created: Option<String> = None;
         let parent = match existing {
             Some(id) => Ok(id),
             None => {
-                let n = draft.groups.staged_groups().count() + 1;
+                let n = draft.groups.visible_groups().len() + 1;
                 let name = format!("{} {n}", Self::echelon_word(kind));
-                draft
-                    .groups
-                    .stage_group(0, &name, kind, None, None, vec![])
-                    .map(|id| {
-                        self.flow_drop_note = Some(format!("NEW {name}"));
-                        id
-                    })
+                let staged = draft.groups.stage_group(0, &name, kind, None, None, vec![]);
+                if staged.is_ok() {
+                    created = Some(name);
+                }
+                staged
             }
         };
         match parent {
@@ -22655,11 +24396,17 @@ impl IslandDemo {
                         .map(|g| g.name.clone())
                         .unwrap_or_default();
                     self.flow_group = Some(parent_id);
-                    self.flow_drop_note = Some(format!("{} UNDER {parent_name}", child.name));
+                    self.settle_note(
+                        match &created {
+                            Some(name) => format!("NEW {name} \u{b7} {} UNDER IT", child.name),
+                            None => format!("{} UNDER {parent_name}", child.name),
+                        },
+                        true,
+                    );
                 }
-                Err(why) => self.flow_drop_note = Some(why.to_uppercase()),
+                Err(why) => self.settle_note(why.to_uppercase(), false),
             },
-            Err(why) => self.flow_drop_note = Some(why.to_uppercase()),
+            Err(why) => self.settle_note(why.to_uppercase(), false),
         }
         cx.notify();
         true
@@ -22705,7 +24452,7 @@ impl IslandDemo {
     /// THE PEEL'S READOUT: the ground under the pointer, and what a release
     /// will do (`§5.3`). It sits at the foot of a dimmed surface, because the
     /// thing being aimed at is the map, not this bar.
-    fn peel_readout(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn peel_readout(&mut self, _cx: &mut Context<Self>) -> AnyElement {
         let Some(peel) = self.flow_peel.clone() else {
             return div().into_any_element();
         };
@@ -22854,6 +24601,21 @@ impl IslandDemo {
             .flex_col()
             .items_end()
             .block_mouse_except_scroll()
+            // A CARD'S PRESS IS STILL A CLICK. The blocker truncates dispatch
+            // at its edge, so the surface's hook would not hear a press on a
+            // card, the band or the chip.
+            .on_mouse_down(MouseButton::Left, hear_click)
+            // A WHEEL OVER THE BASKET IS THE BASKET'S. `block_mouse_except_scroll`
+            // deliberately lets the wheel through — that is what makes a scroll
+            // column scroll — but the map behind is a full-window hitbox with
+            // its own zoom handler, so the same wheel ALSO panned and zoomed the
+            // chart under the panel. Scrolling the basket moved the world.
+            //
+            // The swallow is on the WRAPPER, not on the scroll column: a
+            // child's own wheel handler runs first (the column scrolls), and
+            // stopping propagation here keeps the gesture from reaching the
+            // map without taking the column's answer away from it.
+            .on_scroll_wheel(swallow_wheel)
             .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, window, cx| {
                 let at = (f32::from(ev.position.x), f32::from(ev.position.y));
                 if ev.pressed_button == Some(MouseButton::Left) {
@@ -23505,7 +25267,8 @@ impl IslandDemo {
                     let carrying = view
                         .flow_carry
                         .as_ref()
-                        .is_some_and(|carry| carry.lifted && carry.group_id.is_none());
+                        .is_some_and(|carry| carry.lifted && carry.group_id.is_none())
+                        || view.peel_lifted();
                     if carrying {
                         view.flow_caps_look(unit_id);
                     }
@@ -23522,6 +25285,13 @@ impl IslandDemo {
                     // and a seat in the air is the command one — they cannot
                     // both be released here.
                     if view.carry_into_card(unit_id, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    // A REGISTER CARD IN THE AIR IS THE SAME GESTURE: the
+                    // basket stays open during a peel so a hull can be dropped
+                    // straight aboard a ship that is already deployed.
+                    if view.peel_into_card(unit_id, cx) {
                         cx.stop_propagation();
                         return;
                     }
@@ -23742,6 +25512,7 @@ impl IslandDemo {
             let number = rider.number.clone();
             let commander = rider.commander.map(|id| self.person_name(id));
             let carries = rider.aboard_count();
+            let brought = rider.brought;
             let mut row = div()
                 .id(("flow-manifest-row", unit_id as usize))
                 .flex()
@@ -23820,6 +25591,13 @@ impl IslandDemo {
                         .flex_shrink_0()
                         .child(kit::machine(number, view::LABEL_PT, kit::MUTED_INK)),
                 );
+            if brought {
+                row = row.child(kit::mono_caps(
+                    "WITH THE SHIP",
+                    view::LABEL_PT,
+                    view::RADAR_CYAN,
+                ));
+            }
             if carries > 0 {
                 let inner = unit_id;
                 row = row.child(
@@ -24181,7 +25959,7 @@ impl IslandDemo {
                 )
             }
             Some(draft) if self.flow_stage == crate::draft::Stage::Groups => {
-                let groups: Vec<_> = draft.groups.staged_groups().collect();
+                let groups: Vec<_> = draft.groups.visible_groups();
                 let in_groups: usize = groups.iter().map(|g| g.units.len()).sum();
                 format!(
                     "{clock} \u{b7} {} GROUPS \u{b7} {in_groups} IN THEM \u{b7} {} FREE",
@@ -24395,11 +26173,27 @@ impl IslandDemo {
     // -----------------------------------------------------------------
 
     /// F1a/F1b: the history on the left, the one question on the right, and
-    /// the map's own charts still on the surface as the placeholders the sheet
-    /// dashes in.
+    /// the invited player's door under the history.
+    ///
+    /// THE BOTTOM STRIP IS GONE. It drew three hollow charts (READINESS,
+    /// FLEET, LIVE LOG) as placeholders on the launcher, where none of the
+    /// three is a launcher question. The room is where readiness lives, the
+    /// register is planning's, and the feed is the console's — so the strip
+    /// now carries the one thing the launcher does owe an invited player:
+    /// JOIN A ROOM, by the key their Game Master read out. The creation
+    /// wizard takes the height the strip gave back and fills to the foot.
     fn landing_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let row = kit::content_row()
+        let left = div()
+            .flex()
+            .flex_col()
+            .gap(px(pt(kit::GAP)))
+            .flex_1()
+            .min_w_0()
+            .h_full()
             .child(self.landing_history(cx))
+            .child(self.landing_join(cx));
+        let row = kit::content_row()
+            .child(left)
             .child(self.landing_wizard(cx));
         div()
             .flex()
@@ -24409,8 +26203,78 @@ impl IslandDemo {
             .min_h_0()
             .w_full()
             .child(row)
-            .child(self.landing_zones())
             .into_any_element()
+    }
+
+    /// JOIN A ROOM: the invited player's one door.
+    ///
+    /// The key is the credential a participant has. The roster read is
+    /// staff-only, so this is also the only way this client learns which seat
+    /// the account holds — `POST /games/join` answers with the game and the
+    /// caller's own participant row, and the preparation card opens on the
+    /// room it entered.
+    fn landing_join(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let key = self.join_key.trim().to_string();
+        let live = !key.is_empty() && !self.join_busy;
+        let panel = kit::panel()
+            .flex_shrink_0()
+            .child(kit::band(
+                "JOIN A ROOM",
+                Some("INVITED PLAYERS".to_string()),
+            ));
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(pt(view::PANEL_GAP)))
+            .w_full()
+            .p(px(pt(view::PANEL_PAD)));
+        body = body.child(kit::note(
+            "The key your Game Master read out. It enters the room directly.",
+            kit::MUTED_INK,
+        ));
+        let mut button = div().id("flow-join").flex_shrink_0();
+        if live {
+            button = button
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.send_join(cx);
+                }));
+        }
+        body = body.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(pt(8.0)))
+                .w_full()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.compose_field(25, cx)),
+                )
+                .child(button.child(kit::verb(
+                    if self.join_busy {
+                        "ENTERING\u{2026}"
+                    } else {
+                        "JOIN"
+                    },
+                    if self.join_busy {
+                        kit::VerbLook::Busy
+                    } else if live {
+                        kit::VerbLook::Live
+                    } else {
+                        kit::VerbLook::Disabled
+                    },
+                ))),
+        );
+        if !self.join_status.is_empty() {
+            body = body.child(kit::remark(
+                self.join_status.text.to_uppercase(),
+                self.join_status.ink(),
+            ));
+        }
+        panel.child(body).into_any_element()
     }
 
     /// The history: the games this account can hold. Tabs filter the drawing
@@ -24422,7 +26286,6 @@ impl IslandDemo {
         let mut panel = kit::panel()
             .flex_1()
             .min_w_0()
-            .h_full()
             .child(kit::band("GAME SESSIONS", Some(format!("{total:02}"))));
 
         let mut body = kit::body("flow-history").py(px(0.0));
@@ -24736,38 +26599,6 @@ impl IslandDemo {
 
     /// The map's own charts, still on the surface: dashed, because this frame
     /// is not about them (`MAP · LIVE TILE LAYER, UNCHANGED`).
-    fn landing_zones(&mut self) -> AnyElement {
-        let zone = |label: &'static str| {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(pt(4.0)))
-                .flex_1()
-                .min_w_0()
-                .child(kit::mono_caps(label, view::LABEL_PT, kit::MUTED_INK))
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(pt(64.0)))
-                        .border(px(kit::EDGE_WIDTH))
-                        .border_dashed()
-                        .border_color(rgba(HAIRLINE_SLATE))
-                        .p(px(pt(6.0)))
-                        .child(kit::machine("\u{2014}", view::DENSE_PT, kit::MUTED_INK)),
-                )
-        };
-        div()
-            .flex()
-            .flex_row()
-            .items_end()
-            .gap(px(pt(kit::GAP)))
-            .w_full()
-            .child(zone("READINESS"))
-            .child(zone("FLEET"))
-            .child(zone("LIVE LOG"))
-            .into_any_element()
-    }
-
     /// What `PROCEED` does with the answer (`§3.1`).
     ///
     /// A `Blank` draft and a draft seeded from a Saved Scenario open here; a
@@ -25435,7 +27266,7 @@ impl IslandDemo {
     }
 
     fn stage_one_form(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(draft) = self.flow_draft.clone() else {
+        let Some(_draft) = self.flow_draft.clone() else {
             return div().into_any_element();
         };
         let reached = self.stage_one_reached.min(10).max(1);
@@ -26096,7 +27927,7 @@ impl IslandDemo {
             .cursor(CursorStyle::IBeam)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |view, _, window, cx| {
+                cx.listener(move |_view, _, window, cx| {
                     window.focus(&handle);
                     cx.notify();
                 }),
@@ -26148,6 +27979,10 @@ impl IslandDemo {
             )))
         };
         body = body.child(well);
+        // THE SAME TOGGLE THE FLEET PICKER CARRIES: a hull picked here is
+        // deployed with the register's list or bare, and the composer is where
+        // the plan is made, so the choice has to be here too.
+        body = body.child(self.bring_toggle(cx));
 
         if searching {
             // SEARCH IGNORES THE CASCADE (`§5.2`): it searches the register,
@@ -26587,7 +28422,7 @@ impl IslandDemo {
             return div().into_any_element();
         };
         let rail = self.draft_rail(cx);
-        let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
+        let groups = draft.groups.visible_groups();
         let in_groups: usize = groups.iter().map(|g| g.units.len()).sum();
         let mut panel = kit::panel().flex_1().min_w_0().h_full().child(kit::band(
             format!(
@@ -26699,6 +28534,7 @@ impl IslandDemo {
             let group_name = node.group.name.clone();
             let group_kind = node.group.kind;
             let commander = node.group.commander_id;
+            let commander_name = commander.map(|id| self.person_name(id)).unwrap_or_default();
             let units = node.group.units.clone();
             let depth = node.depth;
             let carried_name = node.group.name.clone();
@@ -26785,14 +28621,25 @@ impl IslandDemo {
                         )
                         .child(
                             div()
-                                .w(px(pt(96.0)))
+                                .id(("flow-group-cdr", group_id.unsigned_abs() as usize))
                                 .flex_shrink_0()
                                 .flex()
                                 .justify_end()
+                                .cursor_pointer()
+                                // APPOINTING IS A CLICK ON THE NAME. The band
+                                // already selects the group; this control
+                                // opens the strip of seats, so the operator
+                                // can say WHO orders it without a second
+                                // surface — a group with no commander is a
+                                // body the game may not advance with.
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.flow_group = Some(group_id);
+                                    cx.notify();
+                                }))
                                 .child(kit::machine(
                                     match commander {
-                                        Some(id) => format!("CDR {id}"),
-                                        None => "NO COMMANDER".to_string(),
+                                        Some(_) => format!("CDR {commander_name}"),
+                                        None => "NO COMMANDER \u{b7} APPOINT".to_string(),
                                     },
                                     view::LABEL_PT,
                                     if commander.is_some() {
@@ -26803,6 +28650,98 @@ impl IslandDemo {
                                 )),
                         ),
                 );
+            // THE SEATS THIS GROUP MAY BE GIVEN, drawn only while it is
+            // selected: a task group is somebody, and who that is comes from
+            // the room. A person commands one thing, so a seat already
+            // holding a hull or another group is not offered.
+            if chosen {
+                let mut taken: Vec<i64> = draft
+                    .force
+                    .hulls()
+                    .filter_map(|hull| hull.commander_id)
+                    .collect();
+                for other in draft.groups.visible_groups() {
+                    if other.local_id != group_id {
+                        if let Some(who) = other.commander_id {
+                            taken.push(who);
+                        }
+                    }
+                }
+                let seats: Vec<(i64, String)> = draft
+                    .roster
+                    .staged()
+                    .filter(|seat| !seat.judge && !taken.contains(&seat.user_id))
+                    .map(|seat| (seat.user_id, seat.user_name.clone()))
+                    .collect();
+                let mut strip = div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(pt(6.0)))
+                    .w_full()
+                    .px(px(pt(8.0)))
+                    .py(px(pt(5.0)))
+                    .bg(rgba(DEEP_WELL))
+                    .border_b(px(kit::EDGE_WIDTH))
+                    .border_color(rgba(kit::EDGE_INK))
+                    .child(kit::mono_caps("COMMANDER", view::LABEL_PT, kit::MUTED_INK));
+                if seats.is_empty() {
+                    strip = strip.child(kit::note(
+                        "No free seat \u{2014} a person commands one thing.",
+                        kit::MUTED_INK,
+                    ));
+                }
+                for (who, who_name) in seats {
+                    let held = commander == Some(who);
+                    let label = who_name.clone();
+                    strip = strip.child(
+                        div()
+                            .id(("flow-group-seat", who as usize))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                let Some(draft) = &mut view.flow_draft else {
+                                    return;
+                                };
+                                match draft.groups.set_commander(group_id, Some(who)) {
+                                    Ok(()) => {
+                                        view.flow_drop_note =
+                                            Some(format!("{who_name} COMMANDS THIS GROUP"));
+                                    }
+                                    Err(why) => {
+                                        view.flow_drop_note = Some(why);
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                            .child(button(label, true, held, held)),
+                    );
+                }
+                if commander.is_some() {
+                    strip = strip.child(
+                        div()
+                            .id(("flow-group-seat", group_id.unsigned_abs() as usize))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                let Some(draft) = &mut view.flow_draft else {
+                                    return;
+                                };
+                                match draft.groups.set_commander(group_id, None) {
+                                    Ok(()) => {
+                                        view.flow_drop_note =
+                                            Some("THE GROUP IS UNCOMMANDED".to_string());
+                                    }
+                                    Err(why) => {
+                                        view.flow_drop_note = Some(why);
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                            .child(button("clear", true, false, false)),
+                    );
+                }
+                row = row.child(strip);
+            }
             // A group that holds hulls draws them: the board's leaf is a card,
             // and the band's count is the same list.
             if !units.is_empty() {
@@ -26913,48 +28852,152 @@ impl IslandDemo {
             return div().into_any_element();
         };
         let rail = self.draft_rail(cx);
-        let scenario = draft.book.staged_news().map(|s| s.local_id).next();
-        let steps: Vec<(i64, crate::book::StepKind, String, String)> = match scenario {
-            Some(id) => draft
-                .book
-                .get_new(id)
-                .map(|s| {
-                    s.steps
-                        .iter()
-                        .map(|step| {
-                            let window = match (&step.start, &step.end) {
-                                (Some(a), Some(b)) => format!("{a}\u{2013}{b}"),
-                                _ => String::new(),
-                            };
-                            (step.local_id, step.kind, step.content.clone(), window)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            None => Vec::new(),
+        // THE BOOK IS TWO BOOKS IN ONE LIST.
+        //
+        // A blank draft authors a staged-new scenario. A REOPENED game already
+        // has its scenarios and steps on the server, and the draft holds only
+        // the adds and cuts against them — showing `staged_news` alone is why a
+        // saved session's stage 04 read `0 STEPS` with a whole book in the
+        // game. The list below merges both, and a row says which it is.
+        #[derive(Clone)]
+        struct StepRow {
+            id: i64,
+            /// Negative while staged-new, the server's id for a saved one.
+            scenario: i64,
+            /// `None` for a server-held step: the session read carries its
+            /// text and window, not the kind.
+            kind: Option<crate::book::StepKind>,
+            name: String,
+            window: Option<(String, String)>,
+            live: bool,
+        }
+        let window_text = |window: &Option<(String, String)>| match window {
+            Some((start, end)) => format!("{start}\u{2013}{end}"),
+            None => String::new(),
         };
+        let mut steps: Vec<StepRow> = Vec::new();
+        for scenario in &self.session.book {
+            for step in &scenario.steps {
+                if draft.book.is_cut(scenario.id, step.id) {
+                    continue;
+                }
+                steps.push(StepRow {
+                    id: step.id,
+                    scenario: scenario.id,
+                    // The saved kind, with this draft's edit laid over it.
+                    kind: Some(
+                        draft
+                            .book
+                            .live_step_edit(scenario.id, step.id)
+                            .and_then(|edit| edit.kind)
+                            .unwrap_or(step.kind),
+                    ),
+                    name: step.content.clone(),
+                    // The saved window, with this draft's edit laid over it.
+                    window: draft
+                        .book
+                        .live_step_edit(scenario.id, step.id)
+                        .and_then(|edit| edit.window())
+                        .or_else(|| step.window.clone()),
+                    live: true,
+                });
+            }
+            // A step staged onto the saved scenario sits after the server's own,
+            // because that is where it will post. One the journal already made
+            // is in the session now: showing it from both sides would double
+            // the row.
+            for step in draft
+                .book
+                .added_steps(scenario.id)
+                .filter(|step| draft.journal.step(step.local_id).is_none())
+            {
+                steps.push(StepRow {
+                    id: step.local_id,
+                    scenario: scenario.id,
+                    kind: Some(step.kind),
+                    name: step.content.clone(),
+                    window: step.start.clone().zip(step.end.clone()),
+                    live: false,
+                });
+            }
+        }
+        for scenario in draft
+            .book
+            .staged_news()
+            .filter(|scenario| draft.journal.book(scenario.local_id).is_none())
+        {
+            for step in &scenario.steps {
+                steps.push(StepRow {
+                    id: step.local_id,
+                    scenario: scenario.local_id,
+                    kind: Some(step.kind),
+                    name: step.content.clone(),
+                    window: step.start.clone().zip(step.end.clone()),
+                    live: false,
+                });
+            }
+        }
         // The selected step: the seeded one, else the first.
         let selected = self
             .flow_step
-            .filter(|id| steps.iter().any(|(at, ..)| at == id))
+            .filter(|id| steps.iter().any(|row| row.id == *id))
             .or_else(|| {
                 steps
                     .iter()
-                    .find(|(_, _, name, _)| name == "SWEEP")
-                    .map(|(id, ..)| *id)
+                    .find(|row| row.name == "SWEEP")
+                    .map(|row| row.id)
             })
-            .or_else(|| steps.first().map(|(id, ..)| *id));
-        let subs: Vec<crate::book::StagedSubStep> = selected
-            .map(|id| draft.book.substeps_of(id).to_vec())
+            .or_else(|| steps.first().map(|row| row.id));
+        let selected_row = selected.and_then(|id| steps.iter().find(|row| row.id == id).cloned());
+        // What the header's controls need: the scenario a saved step belongs
+        // to, and whether the row is the server's or this draft's.
+        let selected_scenario = selected_row
+            .as_ref()
+            .map(|row| row.scenario)
             .unwrap_or_default();
-        let has_subs = !subs.is_empty();
+        let selected_live = selected_row.as_ref().map(|row| row.live).unwrap_or(false);
+        let live_step: Option<&BookStep> = selected_row
+            .as_ref()
+            .filter(|row| row.live)
+            .and_then(|row| {
+                self.session
+                    .book
+                    .iter()
+                    .find(|scenario| scenario.id == row.scenario)
+                    .and_then(|scenario| scenario.steps.iter().find(|step| step.id == row.id))
+            });
+        // THE SUB-STEPS ARE ONE SET OR THE OTHER, never both: a row is a step
+        // the draft is authoring, or one the server already holds.
+        let staged_subs: Vec<crate::book::StagedSubStep> = match &selected_row {
+            Some(row) if !row.live => draft.book.substeps_of(row.id).to_vec(),
+            _ => Vec::new(),
+        };
+        let live_subs: Vec<BookSubstep> = live_step
+            .map(|step| step.substeps.clone())
+            .unwrap_or_default();
+        let live_adds = selected_row
+            .as_ref()
+            .filter(|row| row.live)
+            .map(|row| {
+                draft
+                    .book
+                    .live_substeps_of(row.scenario, row.id)
+                    .iter()
+                    .filter(|command| {
+                        command.id < 0 && draft.journal.substep(command.id).is_none()
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let sub_count = staged_subs.len() + live_subs.len() + live_adds;
+        let has_subs = sub_count > 0;
         let mut panel = kit::panel().flex_1().min_w_0().h_full().child(kit::band(
             format!(
                 "04 {} \u{b7} STEPS AND SUB-STEPS",
                 crate::draft::Stage::Scenario.label()
             ),
             Some(match selected {
-                Some(_) => format!("{} SUB-STEPS", subs.len()),
+                Some(_) => format!("{sub_count} SUB-STEPS"),
                 None => String::new(),
             }),
         ));
@@ -26988,12 +29031,13 @@ impl IslandDemo {
                         kit::MUTED_INK,
                     )),
             );
-        for (number, (step_id, kind, name, window)) in steps.iter().enumerate() {
-            let on = selected == Some(*step_id);
-            let id = *step_id;
+        for (number, row) in steps.iter().enumerate() {
+            let on = selected == Some(row.id);
+            let id = row.id;
+            let kind = row.kind.map(|kind| kind.label()).unwrap_or("SAVED");
             left = left.child(
                 div()
-                    .id(("flow-step", step_id.unsigned_abs() as usize))
+                    .id(("flow-step", row.id.unsigned_abs() as usize))
                     .flex()
                     .flex_col()
                     .gap(px(pt(2.0)))
@@ -27021,13 +29065,13 @@ impl IslandDemo {
                                 kit::MUTED_INK,
                             ))
                             .child(kit::mono_caps(
-                                name.clone(),
+                                row.name.clone(),
                                 view::MACHINE_PT,
                                 kit::VALUE_INK,
                             )),
                     )
                     .child(div().w_full().child(kit::machine(
-                        format!("{} \u{b7} {}", kind.label(), window),
+                        format!("{} \u{b7} {}", kind, window_text(&row.window)),
                         view::LABEL_PT,
                         kit::MUTED_INK,
                     ))),
@@ -27073,18 +29117,17 @@ impl IslandDemo {
             .min_h_0()
             .p(px(pt(PANEL_PAD)))
             .overflow_y_scroll();
-        let step_title = steps
-            .iter()
-            .position(|(id, ..)| Some(*id) == selected)
-            .map(|at| {
-                let (_, kind, name, window) = &steps[at];
-                (
-                    format!("{:02}", at + 1),
-                    name.clone(),
-                    kind.label(),
-                    window.clone(),
-                )
-            });
+        let step_title = selected_row.as_ref().and_then(|row| {
+            let at = steps.iter().position(|step| step.id == row.id)?;
+            let kind = row.kind.map(|kind| kind.label()).unwrap_or("SAVED");
+            Some((
+                format!("{:02}", at + 1),
+                row.name.clone(),
+                kind.to_string(),
+                window_text(&row.window),
+                row.live,
+            ))
+        });
         match step_title {
             None => {
                 right = right.child(kit::note(
@@ -27092,7 +29135,7 @@ impl IslandDemo {
                     kit::MUTED_INK,
                 ));
             }
-            Some((number, name, kind, window)) => {
+            Some((number, name, kind, window, live)) => {
                 right = right
                     .child(
                         div()
@@ -27114,7 +29157,34 @@ impl IslandDemo {
                             // property: a beat is an ORDERS step that pauses
                             // for an event, and the property is set here, on
                             // the step itself.
-                            .child(
+                            //
+                            // A SAVED STEP'S KIND IS A `PATCH`, not a staged
+                            // step: the handler branches on which book the row
+                            // came from. Its commands are editable too, so the
+                            // same `+ SUB-STEP` verb is drawn for both.
+                            .child({
+                                let add_substep = Some(
+                                    div()
+                                        .id("flow-add-substep")
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .h(px(pt(26.0)))
+                                        .px(px(pt(10.0)))
+                                        .flex_shrink_0()
+                                        .cursor_pointer()
+                                        .border(px(kit::EDGE_WIDTH))
+                                        .border_dashed()
+                                        .border_color(rgba(kit::LIVE_INK))
+                                        .on_click(cx.listener(move |view, _, _, cx| {
+                                            view.add_substep(cx);
+                                        }))
+                                        .child(kit::mono_caps(
+                                            "+ SUB-STEP",
+                                            view::LABEL_PT,
+                                            kit::LIVE_INK,
+                                        ))
+                                );
                                 div()
                                     .flex()
                                     .flex_row()
@@ -27137,11 +29207,20 @@ impl IslandDemo {
                                                 kit::EDGE_INK
                                             }))
                                             .on_click(cx.listener(move |view, _, _, cx| {
+                                                let step = selected.unwrap_or_default();
                                                 if let Some(draft) = &mut view.flow_draft {
-                                                    draft.book.set_kind(
-                                                        selected.unwrap_or_default(),
-                                                        crate::book::StepKind::Orders,
-                                                    );
+                                                    if selected_live {
+                                                        draft.book.set_live_step_kind(
+                                                            selected_scenario,
+                                                            step,
+                                                            crate::book::StepKind::Orders,
+                                                        );
+                                                    } else {
+                                                        draft.book.set_kind(
+                                                            step,
+                                                            crate::book::StepKind::Orders,
+                                                        );
+                                                    }
                                                 }
                                                 cx.notify();
                                             }))
@@ -27183,11 +29262,20 @@ impl IslandDemo {
                                                     cx.notify();
                                                     return;
                                                 }
+                                                let step = selected.unwrap_or_default();
                                                 if let Some(draft) = &mut view.flow_draft {
-                                                    draft.book.set_kind(
-                                                        selected.unwrap_or_default(),
-                                                        crate::book::StepKind::Beat,
-                                                    );
+                                                    if selected_live {
+                                                        draft.book.set_live_step_kind(
+                                                            selected_scenario,
+                                                            step,
+                                                            crate::book::StepKind::Beat,
+                                                        );
+                                                    } else {
+                                                        draft.book.set_kind(
+                                                            step,
+                                                            crate::book::StepKind::Beat,
+                                                        );
+                                                    }
                                                 }
                                                 cx.notify();
                                             }))
@@ -27200,32 +29288,30 @@ impl IslandDemo {
                                                     kit::MUTED_INK
                                                 },
                                             )),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("flow-add-substep")
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .h(px(pt(26.0)))
-                                    .px(px(pt(10.0)))
-                                    .flex_shrink_0()
-                                    .cursor_pointer()
-                                    .border(px(kit::EDGE_WIDTH))
-                                    .border_dashed()
-                                    .border_color(rgba(kit::LIVE_INK))
-                                    .on_click(cx.listener(move |view, _, _, cx| {
-                                        view.add_substep(cx);
-                                    }))
-                                    .child(kit::mono_caps(
-                                        "+ SUB-STEP",
-                                        view::LABEL_PT,
-                                        kit::LIVE_INK,
-                                    )),
-                            ),
+                                    )
+                                    .children(add_substep)
+                            }),
                     )
-                    .child({
+                    .child(if live && window.is_empty() {
+                        // A SAVED STEP WITH NO WINDOW has no other end for a
+                        // picker to complete: show the absence rather than a
+                        // control that cannot stage a legal pair.
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(pt(4.0)))
+                            .child(kit::machine(
+                                format!("{kind} \u{b7}"),
+                                view::DENSE_PT,
+                                kit::MUTED_INK,
+                            ))
+                            .child(kit::machine(
+                                "\u{2014}".to_string(),
+                                view::DENSE_PT,
+                                kit::VALUE_INK,
+                            ))
+                    } else {
                         let (start, end) = window
                             .split_once('\u{2013}')
                             .map(|(a, b)| (a.to_string(), b.to_string()))
@@ -27288,9 +29374,309 @@ impl IslandDemo {
                         view::LABEL_PT,
                         kit::MUTED_INK,
                     )));
-                for (at, sub) in subs.iter().cloned().enumerate() {
+                if live {
+                    // THE COMMANDS AND THEIR AUDIENCES. Each saved command's
+                    // hulls are read with the book, and the command's text and
+                    // audience are staged in this draft until the press.
+                    #[derive(Clone)]
+                    struct LiveRow {
+                        id: i64,
+                        content: String,
+                        units: Vec<i64>,
+                    }
+                    let step_id = selected.unwrap_or_default();
+                    let drafts = draft.book.live_substeps_of(selected_scenario, step_id);
+                    let mut rows: Vec<LiveRow> = live_subs
+                        .iter()
+                        .map(|sub| {
+                            let edited = drafts.iter().find(|command| command.id == sub.id);
+                            LiveRow {
+                                id: sub.id,
+                                content: edited
+                                    .map(|command| command.content.clone())
+                                    .unwrap_or_else(|| sub.content.clone()),
+                                units: edited
+                                    .map(|command| command.units.clone())
+                                    .unwrap_or_else(|| sub.units.clone()),
+                            }
+                        })
+                        .collect();
+                    for command in drafts.iter().filter(|command| {
+                        command.id < 0 && draft.journal.substep(command.id).is_none()
+                    }) {
+                        rows.push(LiveRow {
+                            id: command.id,
+                            content: command.content.clone(),
+                            units: command.units.clone(),
+                        });
+                    }
+                    if rows.is_empty() {
+                        right = right.child(kit::note(
+                            "This step has no commands yet \u{2014} add one above.",
+                            kit::MUTED_INK,
+                        ));
+                    }
+                    let seed: Vec<crate::book::LiveSubstepDraft> = rows
+                        .iter()
+                        .map(|row| crate::book::LiveSubstepDraft {
+                            id: row.id,
+                            content: row.content.clone(),
+                            units: row.units.clone(),
+                            dirty: false,
+                        })
+                        .collect();
+                    for (at, row) in rows.iter().enumerate() {
+                        let row_id = row.id;
+                        let row_content = row.content.clone();
+                        let row_units = row.units.clone();
+                        let edit_key = SubstepEditKey {
+                            scenario: selected_scenario,
+                            step: step_id,
+                            substep: row_id,
+                            live: true,
+                        };
+                        let editing = self.flow_edit_substep == Some(edit_key);
+                        let edit_handle = match self.flow_edit_substep_handle.clone() {
+                            Some(handle) => handle,
+                            None => {
+                                let handle = cx.focus_handle();
+                                self.flow_edit_substep_handle = Some(handle.clone());
+                                handle
+                            }
+                        };
+                        let seed_for_edit = seed.clone();
+                        let content_for_edit = row_content.clone();
+                        let mut value = div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(3.0))
+                            .min_w_0()
+                            .child(kit::mono_caps(
+                                row_content.clone(),
+                                view::MACHINE_PT,
+                                kit::VALUE_INK,
+                            ));
+                        if editing {
+                            value = value.child(
+                                div()
+                                    .w(px(1.0))
+                                    .h(px(14.0))
+                                    .flex_shrink_0()
+                                    .bg(rgba(RADAR_CYAN)),
+                            );
+                        }
+                        let seed_for_drop = seed.clone();
+                        let mut block = div()
+                            .id(("flow-saved-substep", row_id.unsigned_abs() as usize))
+                            .flex()
+                            .flex_col()
+                            .gap(px(pt(4.0)))
+                            .w_full()
+                            .p(px(pt(6.0)))
+                            .flex_shrink_0()
+                            .border(px(kit::EDGE_WIDTH))
+                            .border_color(rgba(
+                                if self.flow_carry.as_ref().map(|c| c.lifted).unwrap_or(false) {
+                                    kit::LIVE_INK
+                                } else {
+                                    HAIRLINE_SLATE
+                                },
+                            ))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |view, _, _, cx| {
+                                    if view.carry_into_live_substep(
+                                        selected_scenario,
+                                        step_id,
+                                        row_id,
+                                        seed_for_drop.clone(),
+                                        cx,
+                                    ) {
+                                        cx.stop_propagation();
+                                    }
+                                }),
+                            );
+                        let mut header = div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(pt(8.0)))
+                            .w_full()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(pt(6.0)))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .child(div().flex_shrink_0().child(kit::machine(
+                                        format!("{:02}", at + 1),
+                                        view::LABEL_PT,
+                                        kit::MUTED_INK,
+                                    )))
+                                    .child(div().flex_1().min_w_0().overflow_hidden().child(
+                                        div()
+                                            .id((
+                                                "flow-edit-saved-substep",
+                                                row_id.unsigned_abs() as usize,
+                                            ))
+                                            .track_focus(&edit_handle)
+                                            .cursor(CursorStyle::IBeam)
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |view, _, window, cx| {
+                                                    if let Some(draft) = &mut view.flow_draft {
+                                                        draft.book.begin_live_substeps(
+                                                            selected_scenario,
+                                                            step_id,
+                                                            seed_for_edit.clone(),
+                                                        );
+                                                        draft.book.set_live_substep_content(
+                                                            selected_scenario,
+                                                            step_id,
+                                                            row_id,
+                                                            &content_for_edit,
+                                                        );
+                                                    }
+                                                    window.focus(&edit_handle);
+                                                    view.flow_edit_substep = Some(edit_key);
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(value),
+                                    )),
+                            )
+                            .child(div().flex_shrink_0().child(kit::machine(
+                                format!("{} UNITS", row_units.len()),
+                                view::LABEL_PT,
+                                kit::MUTED_INK,
+                            )));
+                        if row_id < 0 {
+                            header = header.child(
+                                div()
+                                    .id((
+                                        "flow-drop-saved-substep",
+                                        row_id.unsigned_abs() as usize,
+                                    ))
+                                    .flex_shrink_0()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        if let Some(draft) = &mut view.flow_draft {
+                                            draft.book.remove_live_substep(
+                                                selected_scenario,
+                                                step_id,
+                                                row_id,
+                                            );
+                                        }
+                                        if view.flow_edit_substep == Some(edit_key) {
+                                            view.flow_edit_substep = None;
+                                        }
+                                        view.flow_drop_note = Some("SUB-STEP REMOVED".into());
+                                        cx.notify();
+                                    }))
+                                    .child(kit::machine("\u{2715}", view::LABEL_PT, kit::MUTED_INK)),
+                            );
+                        }
+                        block = block.child(header);
+                        let mut cards = div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(px(pt(4.0)))
+                            .w_full();
+                        for unit_id in &row_units {
+                            let carried_id = *unit_id;
+                            let (name, number, class_id) = match draft.force.get(*unit_id) {
+                                Some(hull) => (
+                                    hull.name.clone(),
+                                    hull.hull_number.clone(),
+                                    hull.class_id.clone(),
+                                ),
+                                None => {
+                                    (format!("UNIT {unit_id}"), String::new(), String::new())
+                                }
+                            };
+                            let carried_name = name.clone();
+                            cards = cards.child(
+                                div()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
+                                            view.carry_start(
+                                                vec![carried_id],
+                                                carried_name.clone(),
+                                                (
+                                                    f32::from(ev.position.x),
+                                                    f32::from(ev.position.y),
+                                                ),
+                                                cx,
+                                            );
+                                        }),
+                                    )
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(pt(1.0)))
+                                    .w(px(pt(160.0)))
+                                    .flex_shrink_0()
+                                    .p(px(pt(4.0)))
+                                    .border(px(kit::EDGE_WIDTH))
+                                    .border_color(rgba(HAIRLINE_SLATE))
+                                    .child(self.hull_face(
+                                        *unit_id,
+                                        &class_id,
+                                        pt(148.0),
+                                        pt(26.0),
+                                    ))
+                                    .child(div().w_full().child(kit::human(
+                                        name,
+                                        view::DENSE_PT,
+                                        kit::VALUE_INK,
+                                    )))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .justify_between()
+                                            .child(kit::machine(
+                                                number,
+                                                view::LABEL_PT,
+                                                kit::MUTED_INK,
+                                            ))
+                                            .child(kit::machine(
+                                                format!("{unit_id}"),
+                                                view::LABEL_PT,
+                                                kit::MUTED_INK,
+                                            )),
+                                    ),
+                            );
+                        }
+                        if row_units.is_empty() {
+                            cards = cards.child(kit::note(
+                                "No audience yet \u{2014} drop hulls here.",
+                                kit::MUTED_INK,
+                            ));
+                        }
+                        block = block.child(cards);
+                        right = right.child(block);
+                    }
+                    right = right.child(kit::note(
+                        "COMMANDS AND AUDIENCES ARE WRITTEN WHEN THE PRESS RUNS.",
+                        kit::MUTED_INK,
+                    ));
+                } else {
+                for (at, sub) in staged_subs.iter().cloned().enumerate() {
                     let sub_id = sub.local_id;
-                    let editing = self.flow_edit_substep == Some((sub.step, sub.local_id));
+                    let edit_key = SubstepEditKey {
+                        scenario: selected_scenario,
+                        step: sub.step,
+                        substep: sub.local_id,
+                        live: false,
+                    };
+                    let editing = self.flow_edit_substep == Some(edit_key);
                     let edit_handle = match self.flow_edit_substep_handle.clone() {
                         Some(handle) => handle,
                         None => {
@@ -27376,7 +29762,7 @@ impl IslandDemo {
                                                      MouseButton::Left,
                                                      cx.listener(move |view, _, window, cx| {
                                                          window.focus(&edit_handle);
-                                                         view.flow_edit_substep = Some((sub.step, sub.local_id));
+                                                         view.flow_edit_substep = Some(edit_key);
                                                          cx.notify();
                                                      }),
                                                  )
@@ -27394,7 +29780,37 @@ impl IslandDemo {
                                     format!("{} UNITS", sub.units.len()),
                                     view::LABEL_PT,
                                     kit::MUTED_INK,
-                                ))),
+                                )))
+                                // A SUB-STEP IS STAGED UNTIL THE FLUSH POSTS
+                                // IT, so removing one is local: the next plan
+                                // simply does not name it.
+                                .child(
+                                    div()
+                                        .id((
+                                            "flow-drop-substep",
+                                            sub.local_id.unsigned_abs() as usize,
+                                        ))
+                                        .flex_shrink_0()
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |view, _, _, cx| {
+                                            if let Some(draft) = &mut view.flow_draft {
+                                                draft.book.drop_substep(sub.step, sub_id);
+                                            }
+                                            if view.flow_edit_substep
+                                                == Some(edit_key)
+                                            {
+                                                view.flow_edit_substep = None;
+                                            }
+                                            view.flow_drop_note =
+                                                Some("SUB-STEP REMOVED".into());
+                                            cx.notify();
+                                        }))
+                                        .child(kit::machine(
+                                            "\u{2715}",
+                                            view::LABEL_PT,
+                                            kit::MUTED_INK,
+                                        )),
+                                ),
                         );
                     let mut cards = div()
                         .flex()
@@ -27470,7 +29886,7 @@ impl IslandDemo {
                 }
                 // The idle bucket: derived, read-only in this slice.
                 let force_ids: Vec<i64> = draft.force.hulls().map(|h| h.unit_id).collect();
-                let refs: Vec<&crate::book::StagedSubStep> = subs.iter().collect();
+                let refs: Vec<&crate::book::StagedSubStep> = staged_subs.iter().collect();
                 let idle = crate::book::idle_in_step(&force_ids, &refs);
                 let mut idle_cards = div()
                     .flex()
@@ -27547,6 +29963,7 @@ impl IslandDemo {
                         "A HULL CAN BE IDLE IN ONE STEP AND BUSY IN THE NEXT \u{2014} THE WINDOW STILL COVERS IT.",
                         kit::MUTED_INK,
                     ));
+                }
             }
         }
 
@@ -27558,39 +29975,120 @@ impl IslandDemo {
             .into_any_element()
     }
 
-    /// `+ STEP`: append to the staged scenario, making it on the first step.
+    /// `+ STEP`: append to the draft's scenario, or to the saved one when a
+    /// game is reopened. The first step of an empty book makes the scenario.
     fn add_step(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = &mut self.flow_draft else {
             return;
         };
+        // A SAVED GAME'S SCENARIO IS APPENDED TO, NOT DUPLICATED. `staged_news`
+        // is empty in a reopened draft — its book is on the server — so the old
+        // answer made a SECOND scenario for a game that already had one.
+        let staged_new = draft.book.staged_news().map(|s| s.local_id).next();
+        if let Some(scenario) = staged_new {
+            let count = draft
+                .book
+                .get_new(scenario)
+                .map(|s| s.steps.len())
+                .unwrap_or(0);
+            let window = Some(draft.book.next_step_window(scenario));
+            if let Some(local) =
+                draft
+                    .book
+                    .stage_step_new(scenario, &format!("STEP {}", count + 1), window)
+            {
+                self.flow_step = Some(local);
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(live) = self
+            .session
+            .book
+            .iter()
+            .find(|scenario| {
+                scenario
+                    .steps
+                    .iter()
+                    .any(|step| Some(step.id) == self.flow_step)
+            })
+            .map(|scenario| scenario.id)
+            .or_else(|| self.session.book.first().map(|scenario| scenario.id))
+        {
+            // THE LAST WINDOW IS THE SESSION'S when the draft has not appended
+            // anything yet; after an append, the last staged step is the end of
+            // the book.
+            // THE LAST WINDOW IS THE SESSION'S, WITH THIS DRAFT'S EDIT LAID
+            // OVER IT; after an append, the last staged step is the end of the
+            // book.
+            let last_staged = draft
+                .book
+                .added_steps(live)
+                .filter(|step| draft.journal.step(step.local_id).is_none())
+                .last()
+                .and_then(|step| step.start.clone().zip(step.end.clone()));
+            let last_live = self
+                .session
+                .book
+                .iter()
+                .find(|scenario| scenario.id == live)
+                .and_then(|scenario| scenario.steps.last())
+                .and_then(|step| {
+                    draft
+                        .book
+                        .live_step_edit(live, step.id)
+                        .and_then(|edit| edit.window())
+                        .or_else(|| step.window.clone())
+                });
+            let last_window = last_staged.or(last_live);
+            let window = Some(crate::book::BookDraft::window_after(
+                last_window
+                    .as_ref()
+                    .map(|(start, end)| (start.as_str(), end.as_str())),
+            ));
+            let held = self
+                .session
+                .book
+                .iter()
+                .find(|scenario| scenario.id == live)
+                .map(|scenario| {
+                    scenario
+                        .steps
+                        .iter()
+                        .filter(|step| !draft.book.is_cut(live, step.id))
+                        .count()
+                })
+                .unwrap_or(0);
+            let count = held
+                + draft
+                    .book
+                    .added_steps(live)
+                    .filter(|step| draft.journal.step(step.local_id).is_none())
+                    .count();
+            let local = draft
+                .book
+                .stage_step_add(live, &format!("STEP {}", count + 1), window);
+            self.flow_step = Some(local);
+            cx.notify();
+            return;
+        }
         // THE FIRST STEP MAKES THE SCENARIO. A scenario draft opens stage 04
         // with a book that has no scenario yet, and the button used to answer
         // nothing at all — a control that looks live and does nothing. The
         // exercise's own name is the scenario's name, which is what the
         // operator would have typed anyway.
-        let existing = draft.book.staged_news().map(|s| s.local_id).next();
-        let scenario = match existing {
-            Some(scenario) => scenario,
-            None => {
-                let title = draft.terms.name.trim().to_string();
-                let title = if title.is_empty() {
-                    "SCENARIO".to_string()
-                } else {
-                    title
-                };
-                draft.book.stage_scenario(&title)
-            }
+        let title = draft.terms.name.trim().to_string();
+        let title = if title.is_empty() {
+            "SCENARIO".to_string()
+        } else {
+            title
         };
-        let count = draft
-            .book
-            .get_new(scenario)
-            .map(|s| s.steps.len())
-            .unwrap_or(0);
-        let window = Some(("1200".to_string(), "1230".to_string()));
+        let scenario = draft.book.stage_scenario(&title);
+        let window = Some(draft.book.next_step_window(scenario));
         if let Some(local) =
             draft
                 .book
-                .stage_step_new(scenario, &format!("STEP {}", count + 1), window)
+                .stage_step_new(scenario, "STEP 1", window)
         {
             self.flow_step = Some(local);
         }
@@ -27606,6 +30104,46 @@ impl IslandDemo {
         let Some(step) = self.flow_step else {
             return;
         };
+        // A SAVED STEP'S COMMANDS LIVE IN THEIR OWN LIST, because they post
+        // against a step the server already holds. The beat refusal is the
+        // same sentence on both sides.
+        let live = self.session.book.iter().find_map(|scenario| {
+            scenario
+                .steps
+                .iter()
+                .find(|saved| saved.id == step)
+                .map(|saved| (scenario.id, saved.substeps.len(), saved.kind))
+        });
+        if let Some((scenario_id, saved, saved_kind)) = live {
+            let kind = draft
+                .book
+                .live_step_edit(scenario_id, step)
+                .and_then(|edit| edit.kind)
+                .unwrap_or(saved_kind);
+            if kind == crate::book::StepKind::Beat {
+                self.flow_drop_note = Some(crate::book::StepKind::BEAT_REFUSAL.into());
+                cx.notify();
+                return;
+            }
+            let added = draft
+                .book
+                .live_substeps_of(scenario_id, step)
+                .iter()
+                .filter(|command| {
+                    command.id < 0 && draft.journal.substep(command.id).is_none()
+                })
+                .count();
+            let count = saved + added;
+            draft.book.stage_live_substep(
+                scenario_id,
+                step,
+                &format!("SUB-STEP {}", count + 1),
+            );
+            self.flow_drop_note =
+                Some("SUB-STEP ADDED \u{b7} DROP HULLS TO GIVE IT AN AUDIENCE".into());
+            cx.notify();
+            return;
+        }
         let count = draft.book.substeps_of(step).len();
         match draft
             .book
@@ -27624,13 +30162,16 @@ impl IslandDemo {
     // F6 — STAGE 05, THE SEATS
     // -----------------------------------------------------------------
 
-    /// The roles this stage offers, and whether each sits on the judge side.
+    /// The roles this stage offers when the server has not answered.
     ///
-    /// A ROLE IS THE GAME'S OWN COPY (`§12.3`), and a blank draft has no game
-    /// yet — so the id here is zero and the NAME is the intent: the press's
-    /// seat position resolves name → id against the game it just created, which
-    /// is what `MasterTransport`'s role map is for. Sending a fabricated id
-    /// would be a 409 the operator could not have predicted.
+    /// A ROLE IS THE GAME'S OWN COPY (`§12.3`). A signed-in draft reads the
+    /// deployment's templates (`GET /game-roles`) into `SessionView::roles`,
+    /// and a held game replaces them with the game's own rows — so this list
+    /// is the LAST resort, for a shell with no session at all (the tests, the
+    /// parity proto). The id here is zero and the NAME is the intent: the
+    /// press's seat position resolves name → id against the game it just
+    /// created, which is what `MasterTransport`'s role map is for. Sending a
+    /// fabricated id would be a 409 the operator could not have predicted.
     fn stage_roles() -> [(&'static str, bool); 3] {
         [
             ("GAME MASTER", false),
@@ -27802,7 +30343,7 @@ impl IslandDemo {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |view, _, window, cx| {
+                cx.listener(move |_view, _, window, cx| {
                     window.focus(&handle);
                     cx.notify();
                 }),
@@ -27847,6 +30388,40 @@ impl IslandDemo {
 
         for (user_id, name) in matches.iter().take(12).cloned().collect::<Vec<_>>() {
             let seat = seats.iter().find(|s| s.user_id == user_id).cloned();
+            // THE ROW IS THE HANDLE. A directory row is not a seat yet, and
+            // dragging it onto a hull or a group is how it becomes one — so
+            // the press starts the carry the same way a seat row does.
+            let drag_id = user_id;
+            let drag_name = name.clone();
+            let mut line = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(pt(8.0)))
+                .w_full()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
+                                view.person_carry_start(
+                                    drag_id,
+                                    drag_name.clone(),
+                                    (f32::from(ev.position.x), f32::from(ev.position.y)),
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child(kit::human(
+                            name.clone(),
+                            view::DENSE_PT,
+                            kit::VALUE_INK,
+                        )),
+                );
             let mut row = div()
                 .id(("flow-person", user_id as usize))
                 .flex()
@@ -27856,33 +30431,7 @@ impl IslandDemo {
                 .flex_shrink_0()
                 .py(px(pt(3.0)))
                 .border_b(px(kit::EDGE_WIDTH))
-                .border_color(rgba(HAIRLINE_SLATE))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(pt(8.0)))
-                        .w_full()
-                        .child(div().flex_1().min_w_0().child(kit::human(
-                            name.clone(),
-                            view::DENSE_PT,
-                            kit::VALUE_INK,
-                        )))
-                        .child(div().flex_shrink_0().child(kit::mono_caps(
-                            match &seat {
-                                Some(seat) => format!("SEATED \u{b7} {}", seat.role_name),
-                                None => "NOT SEATED".to_string(),
-                            },
-                            view::LABEL_PT,
-                            if seat.is_some() {
-                                kit::LIVE_INK
-                            } else {
-                                kit::MUTED_INK
-                            },
-                        ))),
-                );
+                .border_color(rgba(HAIRLINE_SLATE));
             // The picker REFLECTS THE CURRENT SEAT (`§8.1`), and NOT PLAYING is
             // a value, not a default painted over one (erratum 5).
             // A ROLE IS THE GAME'S, AND THE GAME CAN HAVE MORE THAN TEN:
@@ -27898,7 +30447,7 @@ impl IslandDemo {
                 .flex()
                 .flex_col()
                 .gap(px(pt(2.0)))
-                .w_full()
+                .w(px(pt(170.0)))
                 .flex_shrink_0();
             roles = roles.child(
                 div()
@@ -27908,7 +30457,7 @@ impl IslandDemo {
                     .items_center()
                     .justify_between()
                     .gap(px(pt(8.0)))
-                    .w(px(pt(200.0)))
+                    .w_full()
                     .h(px(pt(22.0)))
                     .px(px(pt(6.0)))
                     .flex_shrink_0()
@@ -27928,26 +30477,31 @@ impl IslandDemo {
                         };
                         cx.notify();
                     }))
-                    .child(kit::mono_caps(
-                        shown,
-                        view::LABEL_PT,
-                        if current.is_some() {
-                            kit::VALUE_INK
-                        } else {
-                            kit::MUTED_INK
-                        },
-                    ))
+                    .child(
+                        div().flex_1().min_w_0().overflow_hidden().child(
+                            kit::mono_caps(
+                                shown,
+                                view::LABEL_PT,
+                                if current.is_some() {
+                                    kit::VALUE_INK
+                                } else {
+                                    kit::MUTED_INK
+                                },
+                            ),
+                        ),
+                    )
                     .child(kit::machine(
                         if open { "\u{25b4}" } else { "\u{25be}" },
                         view::LABEL_PT,
                         kit::MUTED_INK,
                     )),
             );
+            let mut menu = None;
             if open {
-                let mut menu = div()
+                let mut picks = div()
                     .flex()
                     .flex_col()
-                    .w(px(pt(200.0)))
+                    .w(px(pt(170.0)))
                     .flex_shrink_0()
                     .border(px(kit::EDGE_WIDTH))
                     .border_color(rgba(kit::LIVE_INK))
@@ -27957,7 +30511,7 @@ impl IslandDemo {
                     let role_name = role.clone();
                     let user_name = name.clone();
                     let judge = *judge;
-                    menu = menu.child(
+                    picks = picks.child(
                         div()
                             .id(("flow-role-pick", user_id as usize * 100 + at))
                             .flex()
@@ -27998,9 +30552,13 @@ impl IslandDemo {
                 // deletes a participant row when there is one, and still
                 // counts as a decision. Dashed, because it is not a role.
                 let declining = draft.roster.is_declined(user_id);
-                let on_server = seats.iter().any(|s| s.user_id == user_id);
+                // THE SERVER'S ROW, not the staged list: a seat staged in this
+                // draft has nothing to delete, and marking it for removal
+                // would write an unseat for somebody who was never there.
+                let on_server = draft.roster.is_on_server(user_id)
+                    || self.session.people.iter().any(|p| p.id == user_id);
                 let decline_name = name.clone();
-                menu = menu.child(
+                picks = picks.child(
                     div()
                         .id(("flow-not-playing", user_id as usize))
                         .flex()
@@ -28035,9 +30593,22 @@ impl IslandDemo {
                         ))
                         .child(kit::machine("DEFAULT", view::LABEL_PT, kit::MUTED_INK)),
                 );
-                roles = roles.child(menu);
+                menu = Some(picks);
             }
-            row = row.child(roles);
+            line = line.child(roles);
+            row = row.child(line);
+            if let Some(menu) = menu {
+                // The menu opens under the control, on the RIGHT, so it stays
+                // under the thing that opened it rather than under the name.
+                row = row.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .w_full()
+                        .child(menu),
+                );
+            }
             left = left.child(row);
         }
         if matches.is_empty() {
@@ -28176,9 +30747,20 @@ impl IslandDemo {
                             .id(("flow-unseat", user_id as usize))
                             .cursor_pointer()
                             .on_click(cx.listener(move |view, _, _, cx| {
+                                // THE HALF THAT OWES A DELETE is the server's
+                                // row, not the staged one: an unseat for
+                                // somebody who was never on the roster writes
+                                // a 404.
+                                let on_server = view.flow_draft.as_ref().is_some_and(|draft| {
+                                    draft.roster.is_on_server(user_id)
+                                }) || view.session.people.iter().any(|p| p.id == user_id);
                                 if let Some(draft) = &mut view.flow_draft {
-                                    draft.roster.remove(user_id, false);
+                                    draft.roster.remove(user_id, on_server);
                                 }
+                                // And the command goes with the seat: a
+                                // removed person still steering a hull is a
+                                // scope held by nobody the picker can see.
+                                view.release_scope(user_id);
                                 cx.notify();
                             }))
                             .child(kit::machine("\u{2715}", view::LABEL_PT, kit::MUTED_INK)),
@@ -28201,7 +30783,7 @@ impl IslandDemo {
     /// already commands, if any.
     fn seat_scope_of(&self, user_id: i64) -> Option<crate::roster::ScopeTarget> {
         let draft = self.flow_draft.as_ref()?;
-        for group in draft.groups.staged_groups() {
+        for group in draft.groups.visible_groups() {
             if group.commander_id == Some(user_id) {
                 return Some(crate::roster::ScopeTarget::Group(group.local_id));
             }
@@ -28230,8 +30812,63 @@ impl IslandDemo {
             from: at,
             at,
             lifted: false,
+            fresh_role: None,
         });
         cx.notify();
+    }
+
+    /// Start carrying a PERSON OUT OF THE DIRECTORY.
+    ///
+    /// A directory row is not a seat yet, so the drag is the seating decision:
+    /// the drop stages a seat with the deployment's Commando role, which is
+    /// the role that takes a command. A person already in the roster carries
+    /// their own role and judge side, and the drop only moves their scope.
+    fn person_carry_start(
+        &mut self,
+        user_id: i64,
+        name: String,
+        at: (f32, f32),
+        cx: &mut Context<Self>,
+    ) {
+        let (judge, fresh_role) = match self
+            .flow_draft
+            .as_ref()
+            .and_then(|draft| draft.roster.get(user_id))
+        {
+            Some(seat) => (seat.judge, None),
+            None => {
+                let (role, judge) = self.commando_role();
+                (judge, Some((role, judge)))
+            }
+        };
+        self.flow_seat_carry = Some(SeatCarry {
+            user_id,
+            name,
+            judge,
+            from: at,
+            at,
+            lifted: false,
+            fresh_role,
+        });
+        cx.notify();
+    }
+
+    /// The role a directory row is seated as: the deployment's own Commando
+    /// when it names one, otherwise the first exercise-side role it offers.
+    /// The hardcoded word is the last resort, not the first answer.
+    fn commando_role(&self) -> (String, bool) {
+        let roles = self.flow_roles();
+        roles
+            .iter()
+            .find(|(name, judge)| {
+                !judge && {
+                    let name = name.to_lowercase();
+                    name.contains("commando") || name.contains("komando")
+                }
+            })
+            .or_else(|| roles.iter().find(|(_, judge)| !judge))
+            .cloned()
+            .unwrap_or_else(|| ("COMMANDO".to_string(), false))
     }
 
     fn seat_carry_move(&mut self, at: (f32, f32), cx: &mut Context<Self>) {
@@ -28289,6 +30926,33 @@ impl IslandDemo {
             return true;
         }
         if let Some(draft) = &mut self.flow_draft {
+            // A MOVE, NOT A SECOND SCOPE: the command the seat already holds
+            // is released before the new one is set, so the result is still
+            // one person, one scope.
+            if let Some(held) = held {
+                match held {
+                    crate::roster::ScopeTarget::Group(id) => {
+                        let _ = draft.groups.set_commander(id, None);
+                    }
+                    crate::roster::ScopeTarget::Hull(id) => {
+                        draft.force.set_commander(id, None);
+                    }
+                }
+            }
+            // A DIRECTORY ROW IS SEATED BY THE DROP. The role was chosen when
+            // the drag started, from the deployment's own vocabulary.
+            let mut seated_as = None;
+            if let Some((role, judge)) = &carry.fresh_role {
+                draft.roster.stage(crate::roster::StagedSeat {
+                    user_id: carry.user_id,
+                    user_name: carry.name.clone(),
+                    role_id: 0,
+                    role_name: role.clone(),
+                    call_sign: carry.name.clone(),
+                    judge: *judge,
+                });
+                seated_as = Some(role.clone());
+            }
             match target {
                 crate::roster::ScopeTarget::Group(id) => {
                     let _ = draft.groups.set_commander(id, Some(carry.user_id));
@@ -28297,15 +30961,55 @@ impl IslandDemo {
                     draft.force.set_commander(id, Some(carry.user_id));
                 }
             }
+            self.flow_drop_note = Some(match seated_as {
+                Some(role) => format!(
+                    "{} SEATED AS {} AND COMMANDS {}",
+                    carry.name.to_uppercase(),
+                    role,
+                    target_label.to_uppercase()
+                ),
+                None => format!(
+                    "{} COMMANDS {} \u{b7} ONE PERSON, ONE SCOPE",
+                    carry.name.to_uppercase(),
+                    target_label.to_uppercase()
+                ),
+            });
         }
-        self.flow_drop_note = Some(format!(
-            "{} COMMANDS {} \u{b7} ONE PERSON, ONE SCOPE",
-            carry.name.to_uppercase(),
-            target_label.to_uppercase()
-        ));
         self.flow_seat_carry = None;
         cx.notify();
         true
+    }
+
+    /// Release every scope this person commands.
+    ///
+    /// UNSEATING IS NOT ONLY A ROSTER WRITE. The command links live on the
+    /// groups and the force, so a seat taken out of the roster that kept its
+    /// hulls left a commander the picker could no longer see — and dropping
+    /// somebody else onto that hull refused with "held by" a person who was
+    /// not in the room. Both halves go together.
+    fn release_scope(&mut self, user_id: i64) {
+        let Some(draft) = &mut self.flow_draft else {
+            return;
+        };
+        let groups: Vec<i64> = draft
+            .groups
+            .visible_groups()
+            .into_iter()
+            .filter(|group| group.commander_id == Some(user_id))
+            .map(|group| group.local_id)
+            .collect();
+        for id in groups {
+            let _ = draft.groups.set_commander(id, None);
+        }
+        let hulls: Vec<i64> = draft
+            .force
+            .hulls()
+            .filter(|hull| hull.commander_id == Some(user_id))
+            .map(|hull| hull.unit_id)
+            .collect();
+        for id in hulls {
+            draft.force.set_commander(id, None);
+        }
     }
 
     /// The ghost of a carried seat.
@@ -28348,6 +31052,10 @@ impl IslandDemo {
         if let Some(draft) = &mut self.flow_draft {
             draft.roster.remove(user_id, on_server);
         }
+        // NOT PLAYING ALSO RELEASES THE COMMAND. A person taken out of the
+        // seats cannot keep a hull: the scope would be held by somebody the
+        // room no longer contains.
+        self.release_scope(user_id);
         self.flow_drop_note = Some(format!(
             "{} IS NOT PLAYING \u{b7} IT WRITES NOTHING",
             name.to_uppercase()
@@ -28378,6 +31086,13 @@ impl IslandDemo {
             call_sign: user_name.to_string(),
             judge,
         });
+        // A JUDGE-SIDE SEAT HOLDS NO SCOPE. Moving somebody onto the judge
+        // side releases whatever they commanded, instead of leaving the
+        // advance to refuse the role write on a hazard the picker could have
+        // cleared.
+        if judge {
+            self.release_scope(user_id);
+        }
         self.flow_drop_note = Some(format!(
             "SEATED {} AS {} \u{b7} CHANGING A ROLE CLEARS READINESS",
             user_name.to_uppercase(),
@@ -28582,7 +31297,7 @@ impl IslandDemo {
         };
         let (placed, unplaced) = draft.placement_counts();
         let size = self.map_window;
-        let (win_w, win_h) = (f64::from(size.0), f64::from(size.1));
+        let (_win_w, _win_h) = (f64::from(size.0), f64::from(size.1));
 
         // The header strip: the sheet's own words.
         let header = div()
@@ -29057,7 +31772,7 @@ impl IslandDemo {
     fn flow_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let size = window.viewport_size();
         self.map_window = (f32::from(size.width), f32::from(size.height));
-        let map = if self.flow_map {
+        let map = if self.map_shows_pins() {
             self.flow_map_layer()
         } else {
             self.flow_backdrop()
@@ -29066,6 +31781,9 @@ impl IslandDemo {
         div()
             .relative()
             .size_full()
+            // THE COMPOSER IS ITS OWN ROOT (see `render`): the console's click
+            // hook is not behind it, so the flow carries the hook itself.
+            .on_mouse_down(MouseButton::Left, hear_click)
             .children(map)
             .child(surface)
             .children(self.picker_popup(cx))
@@ -29136,7 +31854,7 @@ impl IslandDemo {
     }
 
     fn flow_map_layer(&mut self) -> Option<AnyElement> {
-        if !self.flow_map {
+        if !self.map_shows_pins() {
             return None;
         }
         let draft = self.flow_draft.clone()?;
@@ -29477,7 +32195,8 @@ impl IslandDemo {
         // that is what a drag of a cluster means; a loose hull is its own.
         let group = draft
             .groups
-            .staged_groups()
+            .visible_groups()
+            .into_iter()
             .find(|g| g.units.contains(&selected))
             .map(|g| g.units.clone());
         let units = group.unwrap_or_else(|| vec![selected]);
@@ -29603,6 +32322,9 @@ impl IslandDemo {
             16 => &self.composer_step.content,
             17 => &self.composer_step.start_hour,
             18 => &self.composer_step.end_hour,
+            // The launcher's JOIN A ROOM key. It is the last field so the
+            // existing index space keeps its numbers.
+            25 => &self.join_key,
             _ => &self.book_title,
         }
     }
@@ -29622,6 +32344,7 @@ impl IslandDemo {
             16 => &mut self.composer_step.content,
             17 => &mut self.composer_step.start_hour,
             18 => &mut self.composer_step.end_hour,
+            25 => &mut self.join_key,
             // The window's five fields, at the END of the index space so the
             // twenty the other forms own keep their numbers. The order is
             // `WindowDraft::fields`' order — the day, the real clock's two
@@ -29715,6 +32438,23 @@ impl IslandDemo {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // CTRL/CMD+V PASTES. The hand-rolled field only saw printable
+        // characters, so an operator who copied an invitation key — the one
+        // string on this console that is COPIED rather than typed — had to
+        // retype twenty-two characters by hand. The clipboard is read here,
+        // control characters filtered exactly as the typing path filters
+        // them, so the field's rule is one rule.
+        if k.modifiers.secondary() && k.key.eq_ignore_ascii_case("v") {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let pasted: String = text
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect();
+                self.draft_field_mut(idx).push_str(&pasted);
+            }
+            cx.notify();
+            return;
+        }
         match k.key.as_str() {
             "enter" => {
                 // The row decides the verb: the draft submits the session,
@@ -29731,6 +32471,8 @@ impl IslandDemo {
                     self.create_scenario(cx);
                 } else if idx == 19 {
                     self.submit_book(cx);
+                } else if idx == 25 {
+                    self.send_join(cx);
                 }
                 return;
             }
@@ -29748,6 +32490,7 @@ impl IslandDemo {
                     12 => 12,
                     13..=15 => 13 + (idx - 13 + 1) % 3,
                     16..=18 => 16 + (idx - 16 + 1) % 3,
+                    25 => 25,
                     _ => 19,
                 };
                 self.compose_focus = next;
@@ -29773,11 +32516,17 @@ impl IslandDemo {
 
     fn apply_answer(&mut self, created: CreatedSession) {
         let CreatedSession {
-            session,
+            mut session,
             note,
             refusal,
             write,
         } = created;
+        // A PARTICIPANT'S SEAT SURVIVES THE RE-READ. The roster is staff-only,
+        // so every answer that re-reads a player's session arrives without
+        // their participant row; without this carry, declaring readiness
+        // would erase the very seat that declared. Same game only, and a
+        // roster that HAS the caller always wins.
+        session.inherit_joined(&self.session);
         match write {
             WriteId::Book => self.apply_book(session),
             WriteId::Step => self.apply_step(session),
@@ -29888,6 +32637,11 @@ impl IslandDemo {
                 self.advance_busy = false;
                 self.advance_status.clear();
                 self.session = session;
+                // The preparation card was the phase's surface; execution has
+                // its own. Leaving it open would put a room full of names over
+                // a running exercise.
+                self.crew_modal_open = false;
+                self.room_key_copied = false;
                 // THE EXERCISE IS PLAYING. A staged course has no write of
                 // its own — Minos's placement takes a position and nothing
                 // else — so the course the operator turned on the map goes
@@ -29897,6 +32651,7 @@ impl IslandDemo {
             }
             WriteId::End => self.apply_end(session),
             WriteId::Hold => self.apply_hold(session),
+            WriteId::Join => self.apply_join(session),
             WriteId::Session => self.apply_created(session),
         }
     }
@@ -30069,6 +32824,10 @@ impl IslandDemo {
             WriteId::Hold => {
                 self.hold_busy = false;
                 self.hold_status = Status::bad(why);
+            }
+            WriteId::Join => {
+                self.join_busy = false;
+                self.join_status = Status::bad(why);
             }
             WriteId::Session => {
                 self.compose_busy = false;
@@ -30938,14 +33697,51 @@ impl IslandDemo {
                 self.composer_step.end_hour = text.replace(':', "");
             }
             PickerTarget::FlowStep { step, field } => {
+                let start = matches!(field, StepField::Start);
+                // A SAVED STEP IS EDITED AGAINST THE SCENARIO IT BELONGS TO.
+                // The live windows are the session's; the draft holds only the
+                // edit, and the book needs the chain to shift the tail.
+                let live = self.session.book.iter().find_map(|scenario| {
+                    scenario
+                        .steps
+                        .iter()
+                        .any(|saved| saved.id == step)
+                        .then(|| {
+                            (
+                                scenario.id,
+                                scenario
+                                    .steps
+                                    .iter()
+                                    .map(|saved| crate::book::LiveStepWindow {
+                                        step_id: saved.id,
+                                        start: saved
+                                            .window
+                                            .as_ref()
+                                            .map(|(start, _)| start.clone()),
+                                        end: saved
+                                            .window
+                                            .as_ref()
+                                            .map(|(_, end)| end.clone()),
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                });
                 if let Some(draft) = self.flow_draft.as_mut() {
-                    let value = text.replace(':', "");
-                    if let Some(scenario) = draft.book.staged_news_mut().find(|s| s.steps.iter().any(|st| st.local_id == step)) {
-                        if let Some(st) = scenario.steps.iter_mut().find(|st| st.local_id == step) {
-                            match field {
-                                StepField::Start => st.start = Some(value),
-                                StepField::End => st.end = Some(value),
-                            }
+                    match live {
+                        Some((scenario_id, windows)) => {
+                            draft.book.set_live_step_time(
+                                scenario_id,
+                                step,
+                                start,
+                                &text,
+                                &windows,
+                            );
+                        }
+                        // A staged step is the draft's own: the existing rule
+                        // re-chains the staged tail.
+                        None => {
+                            draft.book.set_step_time(step, start, &text);
                         }
                     }
                 }
@@ -35284,6 +38080,7 @@ impl Render for IslandDemo {
                             // child's own hitbox is in front of the card's,
                             // so the drop still lands where it should.
                             .block_mouse_except_scroll()
+                            .on_mouse_down(MouseButton::Left, hear_click)
                             .child(modal_silhouette_at(PLAYER_W, PLAYER_H))
                             .child(self.player_picker_body(cx)),
                     )
@@ -35317,6 +38114,7 @@ impl Render for IslandDemo {
                             // columns' own scrolling, the way the island edge
                             // keeps its body's.
                             .block_mouse_except_scroll()
+                            .on_mouse_down(MouseButton::Left, hear_click)
                             .child(modal_silhouette_at(FLEET_W, FLEET_H))
                             .child(self.fleet_picker_body(cx)),
                     )
@@ -35371,6 +38169,7 @@ impl Render for IslandDemo {
                             // PIN, dragged out) started life with a pan
                             // attached, and the map followed the drag.
                             .block_mouse_except_scroll()
+                            .on_mouse_down(MouseButton::Left, hear_click)
                             .child(modal_silhouette_at(book_w, book_h))
                             // The header stays put and the body scrolls: the
                             // composer's three sections are taller than the
@@ -35448,15 +38247,30 @@ impl Render for IslandDemo {
                             // it, or every press on a verb would leave the
                             // map's pan handle set.
                             .block_mouse_except_scroll()
+                            .on_mouse_down(MouseButton::Left, hear_click)
                             .child(modal_silhouette_at(BOARD_W, BOARD_H))
                             .child(self.board_body(cx)),
                     )
                     .into_any_element(),
             )
         } else if self.crew_modal_open {
-            // The execution crew screen: players by role, and the force each
-            // commander holds. The same authoring card as the other modals;
-            // the list does the scrolling.
+            // The crew screen in execution and closure, and the PREPARATION
+            // card in preparation — one open flag, two surfaces, because they
+            // are the same question asked in two phases. The card is capped by
+            // the window: a 1240pt surface on a 760pt frame would draw its
+            // right edge off screen, and preparation is the one card that is
+            // wider than every other.
+            let vp = window.viewport_size();
+            let vw = f32::from(vp.width);
+            let vh = f32::from(vp.height);
+            let (card_w, card_h) = if self.phase() == crate::gamestate::GameState::Preparation {
+                (
+                    PREP_W.min((vw - 32.0).max(420.0)),
+                    PREP_H.min((vh - 32.0).max(360.0)),
+                )
+            } else {
+                (CREW_W, CREW_H)
+            };
             Some(
                 div()
                     .absolute()
@@ -35473,11 +38287,12 @@ impl Render for IslandDemo {
                     .child(
                         div()
                             .relative()
-                            .w(px(CREW_W))
-                            .h(px(CREW_H))
+                            .w(px(card_w))
+                            .h(px(card_h))
                             .block_mouse_except_scroll()
-                            .child(modal_silhouette_at(CREW_W, CREW_H))
-                            .child(self.crew_modal_body(cx)),
+                            .on_mouse_down(MouseButton::Left, hear_click)
+                            .child(modal_silhouette_at(card_w, card_h))
+                            .child(self.crew_modal_body(card_w, cx)),
                     )
                     .into_any_element(),
             )
@@ -36627,7 +39442,11 @@ const UNIT_PICK_PT: f32 = 30.0;
 /// exactly these counts. Empty is a real state — no session held — not a
 /// missing one, and the bar says so.
 /// One seat in the session's room, as the roster shows it.
-#[derive(Clone, Debug)]
+///
+/// Compared (not just read) by the room's poll, which must not re-render a
+/// card where nobody moved: `PartialEq` on the whole row is what makes "this
+/// seat changed" a fact rather than a guess.
+#[derive(Clone, Debug, PartialEq)]
 pub struct PersonView {
     pub id: i64,
     pub name: String,
@@ -36681,6 +39500,129 @@ fn crew_state(person: &PersonView) -> (String, Rgba) {
     } else {
         ("IN ROOM".to_string(), ALERT_YELLOW)
     }
+}
+
+// ---------------------------------------------------------------------------
+// PREPARATION's arithmetic
+//
+// Pure functions over the session, so the card's counts are testable without a
+// window and the left half and the right half cannot disagree about the room.
+// ---------------------------------------------------------------------------
+
+/// What the preparation card reads back about the plan and the gate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PreparationStats {
+    /// Hulls assigned to the exercise.
+    hulls: usize,
+    /// How many of them have a starting position.
+    placed: usize,
+    /// Task-organisation nodes.
+    groups: usize,
+    /// Hulls that sit in one of those nodes.
+    grouped_hulls: usize,
+    /// Steps the scenario book holds.
+    steps: usize,
+    /// Every seat this caller may see.
+    seats: usize,
+    /// Exercise-side seats that have declared ready.
+    ready: usize,
+    /// Exercise-side seats the gate waits for (judges are exempt).
+    required: usize,
+    /// Judge-side seats.
+    judges: usize,
+}
+
+/// The seats this caller may see.
+///
+/// The roster is the authoritative read when it was permitted. A participant
+/// cannot read it, and the join answer is then the only participant row there
+/// is — so it is added here rather than pushed into `people`, which is what the
+/// roster read said and nothing else.
+fn preparation_visible_people(session: &SessionView) -> Vec<PersonView> {
+    let mut out = session.people.clone();
+    if let Some(joined) = &session.joined {
+        if !out.iter().any(|p| p.id == joined.id) {
+            out.push(joined.clone());
+        }
+    }
+    out
+}
+
+/// The plan and the gate, counted once.
+fn preparation_stats(session: &SessionView) -> PreparationStats {
+    let people = preparation_visible_people(session);
+    let required = people.iter().filter(|p| !p.judge).count();
+    PreparationStats {
+        hulls: session.pieces.len(),
+        placed: session.pieces.iter().filter(|p| p.placed).count(),
+        groups: session.groups.len(),
+        grouped_hulls: session.groups.iter().map(|g| g.units.len()).sum(),
+        steps: session.book.iter().map(|s| s.steps.len()).sum(),
+        seats: people.len(),
+        ready: people.iter().filter(|p| !p.judge && p.ready).count(),
+        required,
+        judges: people.iter().filter(|p| p.judge).count(),
+    }
+}
+
+/// Whether the readiness gate is open.
+///
+/// Two answers, and both must be true: every exercise-side seat has declared
+/// (the owner's rule for the verb), and the server's own checklist is clear.
+/// An exercise with no exercise-side seat is CLOSED, not vacuously ready —
+/// Minos refuses that transition and a green button would be the lie.
+fn preparation_gate_open(stats: &PreparationStats, server_clear: bool) -> bool {
+    stats.required > 0 && stats.ready == stats.required && server_clear
+}
+
+/// The roles in the room, exercise side first, with their counts.
+fn preparation_role_counts(people: &[PersonView]) -> Vec<(String, bool, usize)> {
+    let mut out: Vec<(String, bool, usize)> = Vec::new();
+    for person in people {
+        let role = if person.role.is_empty() {
+            "\u{2014}".to_string()
+        } else {
+            person.role.clone()
+        };
+        match out
+            .iter_mut()
+            .find(|(r, judge, _)| *judge == person.judge && r.eq_ignore_ascii_case(&role))
+        {
+            Some((_, _, count)) => *count += 1,
+            None => out.push((role, person.judge, 1)),
+        }
+    }
+    out.sort_by_key(|(role, judge, _)| (*judge, role.to_lowercase()));
+    out
+}
+
+/// What one seat commands, in one line: the groups it holds and the hulls it
+/// steers.
+///
+/// A COMMANDO'S FACT IS THE HULL, a group commander's is the node. One hull is
+/// named; several are counted, because a roster row that listed eight hulls
+/// would stop being a roster row. Empty is the ordinary answer for a seat that
+/// commands nothing, and it is drawn as nothing.
+fn preparation_command_text(
+    person_id: i64,
+    pieces: &[PieceView],
+    groups: &[crate::groups::LiveGroup],
+) -> String {
+    let mut parts: Vec<String> = groups
+        .iter()
+        .filter(|group| group.commander_id == Some(person_id))
+        .map(|group| group.name.clone())
+        .collect();
+    let hulls: Vec<&PieceView> = pieces
+        .iter()
+        .filter(|piece| piece.commander_id == Some(person_id))
+        .collect();
+    match hulls.len() {
+        0 => {}
+        1 => parts.push(hulls[0].label.clone()),
+        n => parts.push(format!("{n} HULLS")),
+    }
+    parts.join(" \u{b7} ")
 }
 
 /// A section head in the crew screen: the name, a rule, and the count — the
@@ -36840,6 +39782,16 @@ pub struct SessionView {
     pub my_role: String,
     /// Every seat in the room, exercise side first (the server's order).
     pub people: Vec<PersonView>,
+    /// The caller's own seat, when the roster could not be read.
+    ///
+    /// THE ROSTER IS STAFF-ONLY, and a participant is not staff. The one
+    /// route that tells a participant who they are in a room is
+    /// `POST /games/join`, whose answer carries their participant row. When
+    /// that row is the only one this client may see, it lives here rather
+    /// than being pushed into `people` — `people` is what the roster read
+    /// said, and a client that invented a roster of one would be claiming a
+    /// read it never made.
+    pub joined: Option<PersonView>,
     /// The caller's own readiness, and whether the held game is executing.
     /// The console's dashboard opens on these: a commander plans first and
     /// declares after, so the helm waits for execution while readiness does
@@ -37043,6 +39995,51 @@ pub struct ReadinessView {
     pub blockers: Vec<String>,
 }
 
+/// What a room changes while it waits.
+///
+/// The preparation card POLLS this, because a room is other people's doing: a
+/// commander presses READY on their own console, and a console that only
+/// learned about it at sign-in was a photograph. Minos publishes no readiness
+/// event, so a card that waited for the wire waited forever.
+///
+/// It is deliberately NARROWER than [`SessionView`]. The full read fans out
+/// per hull and per step (embarkations, related lists, the steps' gates), and
+/// a room polled every few seconds must not pay that fan-out to learn that
+/// four seats are ready. The answer PATCHES the held session and nothing
+/// else: it is not a write's answer, so it cannot re-seed a draft, move the
+/// comms baseline or reopen a card the operator closed.
+#[derive(Clone, Debug, Default)]
+pub struct PreparationPulse {
+    /// The exercise's state, as `GET /games/{id}` states it. Anything but
+    /// `preparation` is the room ENDING, which is why the state rides here at
+    /// all — execution and closure have their own surfaces.
+    pub state: String,
+    /// The exercise's name, from the same read, because the detail route is
+    /// what says the state and a row half-updated would name the room by the
+    /// answer to a different question. (The server refuses terms writes
+    /// outside `planning` — "A game's terms may only be changed while it is in
+    /// `planning`" — so this is the card's own headline, not a fact that moves
+    /// mid-room.)
+    pub name: String,
+    /// The description, which the card's fourth cell reads back. Carried for
+    /// the same reason as the name.
+    pub description: String,
+    /// The roster, or `None` when the read was REFUSED. The roster is
+    /// staff-only, so a participant's poll answers nothing — and nothing is
+    /// not an empty room: `None` leaves the seats exactly as they were.
+    pub people: Option<Vec<PersonView>>,
+    /// The published checklist. `None` for a planning room (the route 404s
+    /// until preparation) or a refused read; both leave the held one alone.
+    pub readiness: Option<ReadinessView>,
+    /// The WHOLE session, when the poll saw the room end.
+    ///
+    /// Execution's surfaces read things this narrow answer does not carry —
+    /// the current step, the steps' gates, the placements — so the thread
+    /// that noticed the transition re-reads the session once and sends it
+    /// here. `None` on an ordinary pulse.
+    pub left_room: Option<SessionView>,
+}
+
 /// One scenario in the held game's book, steps nested in book order.
 ///
 /// There is deliberately no staged half here: the console authors through
@@ -37063,6 +40060,8 @@ pub struct BookScenario {
 #[derive(Clone, Debug, Default)]
 pub struct BookStep {
     pub id: i64,
+    /// Orders or a beat (`StepKind`), read from the server.
+    pub kind: crate::book::StepKind,
     pub content: String,
     pub window: Option<(String, String)>,
     /// The commands inside the step, in the server's order. The nested read
@@ -37076,6 +40075,9 @@ pub struct BookStep {
 pub struct BookSubstep {
     pub id: i64,
     pub content: String,
+    /// The hulls this command addresses, read from the server's related route.
+    /// Empty is a real answer: a command with no audience yet.
+    pub units: Vec<i64>,
 }
 
 /// One helm order, from the panel to the wire. The shell's only write.
@@ -37401,6 +40403,9 @@ pub enum ToBinary {
         commander_id: i64,
         fx: f64,
         fy: f64,
+        /// The picker's toggle: bring the register's pre-embarked units
+        /// aboard her in the same assignment.
+        with_contents: bool,
     },
     /// Embark a dragged hull aboard a placed host: the host the drop's
     /// fractions landed nearest, plus the dragged hull. The binary owns the
@@ -37415,6 +40420,9 @@ pub enum ToBinary {
         host: i64,
         child: i64,
         commander_id: i64,
+        /// The same toggle, for the hull being put aboard: her own
+        /// pre-embarked units arrive with her assignment.
+        with_contents: bool,
     },
     /// Sign out. The shell clears its own session and shows the card; the
     /// binary drops its token copy so nothing else posts on it. The binary
@@ -37584,6 +40592,13 @@ pub enum ToBinary {
     /// `ensure_embarked`. The binary owns the GET; the shell only asks,
     /// naming the host the modal drew.
     ReadEmbarked { host: i64 },
+    /// Read what the FLEET REGISTER says a hull carries — the pre-embarked
+    /// units a deployment brings with her (`GET /units/{id}/embarkations`).
+    ///
+    /// A read of the register rather than of the exercise: it is what the
+    /// console stages the moment a parent is dropped, before any write
+    /// exists to read back. Asked once per hull and cached.
+    ReadRegisterCarries { unit: i64 },
     /// One hull's published figures, read from the server.
     ///
     /// The details panel asks for the hull it is about. The figures are
@@ -37616,6 +40631,12 @@ pub enum ToBinary {
     /// (`fetch_session` pinned, the same read startup holds); the shell
     /// only names the id the row drew.
     HoldSession { game_id: i64 },
+    /// Enter a game room with its invitation key. The binary owns the POST
+    /// and the re-read; the shell only collects what was typed. This is the
+    /// ONE route that tells a participant their own seat — the roster is
+    /// staff-only, so a player who holds a game without a key has no
+    /// participant row to read.
+    JoinGame { room_key: String },
     /// A step's whole related list, from the relate editor's working set:
     /// hulls of the exercise (nodes ride the same list when the task
     /// organisation exists — it does not in any dev game). Posted at once,
@@ -37735,6 +40756,17 @@ pub struct SignedIn {
     pub session: SessionView,
 }
 
+/// Which command the keyboard is editing: a staged command, or one on a step
+/// the server already holds. The scenario rides along because a saved command's
+/// audience is addressed through it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SubstepEditKey {
+    scenario: i64,
+    step: i64,
+    substep: i64,
+    live: bool,
+}
+
 /// What a created session unlocked: the new game, read back and held — never
 /// assumed from the draft, because the server names the id and the state.
 /// What a press answered: the draft the journal grew, and the engine's outcome.
@@ -37750,6 +40782,13 @@ pub struct SeatCarry {
     pub from: (f32, f32),
     pub at: (f32, f32),
     pub lifted: bool,
+    /// The role a directory row will be seated as when it is dropped.
+    ///
+    /// `None` for a person who is already seated: their seat is the draft's,
+    /// and the drop only moves the scope. `Some` is a person who is not in the
+    /// roster yet — dragging them out of the directory IS the seating
+    /// decision, so the drop stages a Commando seat.
+    pub fresh_role: Option<(String, bool)>,
 }
 
 /// Cards in the air: the carry's whole state (`§7.2`).
@@ -37824,6 +40863,10 @@ pub struct BasketCard {
     pub host: Option<i64>,
     /// The hulls aboard this one, in unit-id order.
     pub aboard: Vec<BasketCard>,
+    /// THE REGISTER BROUGHT THIS ONE. True while the hull is in the draft
+    /// only because its bringer's deployment carries it — the card says so
+    /// rather than reading as a piece the operator placed by hand.
+    pub brought: bool,
 }
 
 impl BasketCard {
@@ -37849,7 +40892,7 @@ impl BasketCard {
 /// board cannot disagree about what sits under what. `UNGROUPED` is appended
 /// last, holding the hulls no body claims.
 pub fn basket_channels(draft: &crate::draft::Draft) -> Vec<BasketChannel> {
-    let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
+    let groups: Vec<_> = draft.groups.visible_groups();
     let children_of = crate::groups::children_map(&groups);
 
     // WHO IS ABOARD WHOM, in unit-id order. A hull with a host the force
@@ -37906,6 +40949,7 @@ pub fn basket_channels(draft: &crate::draft::Draft) -> Vec<BasketChannel> {
             commander: hull.commander_id,
             host: hull.host,
             aboard,
+            brought: hull.brought_by.is_some(),
         })
     }
 
@@ -38014,7 +41058,7 @@ fn card_of(cards: &[BasketCard], unit_id: i64) -> Option<&BasketCard> {
 /// are placed: a pack DEPLOYS a body, and a hull with no ground is exactly the
 /// one a drop should put somewhere.
 pub fn formation_body(draft: &crate::draft::Draft, id: i64) -> crate::formation::Body {
-    let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
+    let groups: Vec<_> = draft.groups.visible_groups();
     let children_of = crate::groups::children_map(&groups);
     let by_id: std::collections::BTreeMap<i64, &crate::groups::StagedGroup> =
         groups.iter().map(|group| (group.local_id, group)).collect();
@@ -38091,7 +41135,7 @@ pub struct HierarchyLink {
 /// has no ground to join, so it is not on the picture — the map draws what is
 /// placed, and the basket draws what is not.
 pub fn hierarchy_links(draft: &crate::draft::Draft) -> Vec<HierarchyLink> {
-    let groups: Vec<_> = draft.groups.staged_groups().cloned().collect();
+    let groups: Vec<_> = draft.groups.visible_groups();
     if groups.is_empty() {
         return Vec::new();
     }
@@ -38343,6 +41387,9 @@ pub enum WriteId {
     End,
     /// A hold of another game.
     Hold,
+    /// An entry into a room by its invitation key. Its own name because it
+    /// is the one answer that carries a participant's own seat.
+    Join,
     /// A new session. The catch-all's own name, for the one write that
     /// really is "a new hold".
     Session,
@@ -38399,6 +41446,12 @@ pub type SignInFeed =
 /// failure — and the write the refusal belongs to.
 pub type CreateFeed =
     std::boxed::Box<dyn FnMut() -> Option<Result<CreatedSession, WriteRefusal>> + Send + 'static>;
+
+/// The preparation room's poll, drained like every other feed. `None` on a
+/// quiet tick; one answer carries the room's movement (see
+/// [`PreparationPulse`]).
+pub type PreparationFeed =
+    std::boxed::Box<dyn FnMut() -> Option<PreparationPulse> + Send + 'static>;
 
 /// The shell's sink: the binary owns the other end and every effect.
 pub type OrderSink = std::sync::mpsc::Sender<ToBinary>;
@@ -38473,6 +41526,16 @@ pub type EmbarkedFeed = std::boxed::Box<
         + 'static,
 >;
 
+/// What the fleet register says one hull carries, drained like the other
+/// feeds. The hull rides the answer back for the same reason the embarked
+/// read does: a slow answer must be filed under the hull that was asked
+/// about, never under whatever the panel shows now.
+pub type RegisterCarriesFeed = std::boxed::Box<
+    dyn FnMut() -> Option<Result<(i64, Vec<crate::backend::EmbarkedUnit>), String>>
+        + Send
+        + 'static,
+>;
+
 /// An embark-write answer, drained like the other feeds. Carries the host
 /// back with the write's result — the host's contents after the act plus
 /// the capacity warnings, if any — for the same overtaking reason as the
@@ -38521,6 +41584,7 @@ impl Default for SessionView {
             msg_audience: Vec::new(),
             step: None,
             people: Vec::new(),
+            joined: None,
             book: Vec::new(),
             // Empty, and NOT because a session with no game has no debrief:
             // because `fetch_session` does not ask for one outside Closure.
@@ -38541,6 +41605,64 @@ impl Default for SessionView {
             directory: Vec::new(),
             roles: Vec::new(),
         }
+    }
+}
+
+impl SessionView {
+    /// Carry a participant's join-adopted seat across a session re-read.
+    ///
+    /// THE ROSTER IS STAFF-ONLY, so every re-read of a participant's session
+    /// arrives with no `people` at all. Without this, a player who declared
+    /// readiness would watch their own seat disappear from the card: the write
+    /// answered by re-reading the game, and the re-read cannot see the roster.
+    ///
+    /// The carry is gated on the SAME GAME, and it yields the moment the new
+    /// read has a roster that contains the caller — the authoritative read is
+    /// never overridden by the fallback. The readiness path sets a FRESH
+    /// joined row from the write's own answer before this runs, so a
+    /// declaration's new state wins over the old seat here.
+    fn inherit_joined(&mut self, old: &SessionView) {
+        if self.game_id == 0 || self.game_id != old.game_id {
+            return;
+        }
+        let Some(seat) = old.joined.as_ref() else {
+            return;
+        };
+        if self.people.iter().any(|p| p.id == seat.id) {
+            return;
+        }
+        if self.me == 0 {
+            self.me = old.me;
+        }
+        if self.my_role.is_empty() {
+            self.my_role = old.my_role.clone();
+        }
+        if self.joined.is_none() {
+            self.joined = Some(seat.clone());
+            self.my_ready = old.my_ready;
+        }
+        if self.pieces.is_empty() {
+            self.pieces = old.pieces.clone();
+        }
+        if self.mine.is_empty() {
+            self.mine = old.mine.clone();
+        }
+    }
+
+    /// Install a roster, and count the room from it.
+    ///
+    /// SEATED, IN ROOM, READY AND JUDGES are four numbers over the same rows,
+    /// and the band, the Players island and the preparation card all read
+    /// them. Counting them HERE — at the one point a roster arrives — is what
+    /// keeps the room's poll from moving the seats and leaving the counts
+    /// behind; a second derivation at the call site is how the header and the
+    /// roster come to disagree about how many people are in the room.
+    pub fn adopt_roster(&mut self, people: Vec<PersonView>) {
+        self.seats = people.len();
+        self.present = people.iter().filter(|p| p.present).count();
+        self.ready = people.iter().filter(|p| p.ready).count();
+        self.judges = people.iter().filter(|p| p.judge).count();
+        self.people = people;
     }
 }
 
@@ -38592,7 +41714,7 @@ fn seat_scope(draft: &crate::draft::Draft, seat: &crate::roster::StagedSeat) -> 
     if seat.judge {
         return "JUDGE SIDE \u{b7} NO SCOPE".to_string();
     }
-    for group in draft.groups.staged_groups() {
+    for group in draft.groups.visible_groups() {
         if group.commander_id == Some(seat.user_id) {
             return format!("COMMANDS {}", group.name);
         }
@@ -38667,6 +41789,17 @@ pub struct PieceView {
     /// island), so the fact comes from `GET /games/{id}/placements`, which is
     /// the same answer Minos would give the console's staged copy.
     pub placed: bool,
+    /// The hull carrying this piece, when one does. The exercise's own
+    /// composition, read from the piece row.
+    pub host: Option<i64>,
+    /// Where the fleet register says this piece belongs. Different from
+    /// `host` on purpose: a boat the register puts aboard a ship is a fact
+    /// about the fleet, and a boat the operator has taken off her is a fact
+    /// about this exercise.
+    pub register_host: Option<i64>,
+    /// What the register says this hull carries — the pre-embarked units a
+    /// deployment brings with her. `in_game` says which are already pieces.
+    pub register_contents: Vec<crate::backend::RegisterContent>,
 }
 
 /// One step's related list, as the server resolved it: the posts it names
@@ -40550,6 +43683,9 @@ mod fleet_taxonomy_tests {
             hierarchy_node: None,
             start: None,
             placed: true,
+            host: None,
+            register_host: None,
+            register_contents: Vec::new(),
         }];
         let mut demo = IslandDemo::new(
             fixture_roster(),
@@ -40930,6 +44066,10 @@ pub fn run_replay(dir: String, burst_ms: u64, looping: bool) {
         std::boxed::Box::new(|| None),
         std::boxed::Box::new(|| None),
         std::boxed::Box::new(|| None),
+        std::boxed::Box::new(|| None),
+        // The replay has no room behind it: a PNG directory is not a
+        // preparation card.
+        std::boxed::Box::new(|| None),
         std::sync::mpsc::channel().0,
         fixture_roster(),
         125,
@@ -40961,12 +44101,16 @@ pub fn run(
     mut review_write_feed: ReviewWriteFeed,
     mut clock_feed: ClockFeed,
     mut embarked_feed: EmbarkedFeed,
+    mut register_carries_feed: RegisterCarriesFeed,
     mut embark_write_feed: EmbarkWriteFeed,
     mut embark_spec_feed: EmbarkSpecFeed,
     mut thumb_feed: ThumbFeed,
     mut spec_feed: SpecFeed,
     mut live_message_feed: LiveMessageFeed,
     mut control_feed: crate::control::CommandFeed,
+    // The room's own movement: the preparation card polls it, because
+    // readiness is other people's doing and Minos publishes no event for it.
+    mut preparation_feed: PreparationFeed,
     order_tx: OrderSink,
     roster: Vec<RosterRow>,
     roster_total: usize,
@@ -41117,12 +44261,14 @@ pub fn run(
             let review_write_drain = entity.clone();
             let clock_drain = entity.clone();
             let embarked_drain = entity.clone();
+            let register_carries_drain = entity.clone();
             let embark_write_drain = entity.clone();
             let embark_spec_drain = entity.clone();
             let thumb_drain = entity.clone();
             let spec_drain = entity.clone();
             let drag_drain = entity.clone();
             let control_drain = entity.clone();
+            let preparation_drain = entity.clone();
             cx.spawn(async move |cx: &mut AsyncApp| {
                 loop {
                     cx.background_executor()
@@ -41197,6 +44343,17 @@ pub fn run(
                             drain.update(app, |root: &mut IslandDemo, cx| {
                                 root.incoming = Some((no, w, h, bgra, at, zoom));
                                 cx.notify();
+                            })
+                        });
+                    }
+                    // The room's own movement. The preparation card is the one
+                    // surface nobody can work alone — a seat that has declared
+                    // is another person's press — so this feed arrives on a
+                    // cadence the binary set, not on a write of ours.
+                    if let Some(pulse) = preparation_feed() {
+                        let _ = cx.update(|app| {
+                            preparation_drain.update(app, |root: &mut IslandDemo, cx| {
+                                root.apply_preparation(pulse, cx);
                             })
                         });
                     }
@@ -41421,6 +44578,16 @@ pub fn run(
                             })
                         });
                     }
+                    // What the register says one hull carries: the children a
+                    // deployment stages beside her.
+                    if let Some(outcome) = register_carries_feed() {
+                        let _ = cx.update(|app| {
+                            register_carries_drain.update(app, |root: &mut IslandDemo, cx| {
+                                root.apply_register_carries(outcome, cx);
+                                cx.notify();
+                            })
+                        });
+                    }
                     // A host's real spec — the complements it declares and the
                     // hulls it holds. A drop parked on this host is decided by
                     // the answer, never before it.
@@ -41443,6 +44610,26 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Assert that a gesture posted no WRITE, tolerating the reads it is
+    /// allowed to make.
+    ///
+    /// The shell reads the register's copy of a hull's pre-embarked units
+    /// when the hull is picked up, and a read records nothing: what a
+    /// local-first test is about is that no edit reached the server while
+    /// planning. Draining reads keeps the assertion about that and not about
+    /// the order a gesture happens to fire them in.
+    fn assert_no_writes(rx: &std::sync::mpsc::Receiver<ToBinary>, what: &str) {
+        while let Ok(msg) = rx.try_recv() {
+            assert!(
+                matches!(
+                    msg,
+                    ToBinary::ReadRegisterCarries { .. } | ToBinary::ReadEmbarkSpec { .. }
+                ),
+                "{what}: {msg:?}"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // The signed-out surface: the theatre's arrival. It is pure, and it is a
@@ -41745,6 +44932,8 @@ mod tests {
                     commander_id: None,
                     host: None,
                     course_deg: None,
+                    brought_by: None,
+                    with_contents: false,
                 });
                 // The commander is named in the Players stage, later: a
                 // planning save writes the hull without one.
@@ -41801,6 +44990,9 @@ mod tests {
                 hierarchy_node: None,
                 start: None,
                 placed: true,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             }],
             ..SessionView::default()
         };
@@ -42013,10 +45205,7 @@ mod tests {
                 assert_eq!(demo.force.get(1).and_then(|h| h.commander_id), Some(2));
             })
         });
-        assert!(
-            rx.try_recv().is_err(),
-            "planning stages: nothing is posted until the advance"
-        );
+        assert_no_writes(&rx, "planning stages: nothing is posted until the advance");
     }
 
     /// The picker's three steps, local-first: an account is SEATED with a
@@ -42053,6 +45242,9 @@ mod tests {
                 hierarchy_node: None,
                 start: None,
                 placed: true,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             }],
             ..SessionView::default()
         };
@@ -42209,6 +45401,9 @@ mod tests {
                 hierarchy_node: None,
                 start: None,
                 placed: true,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             }],
             ..SessionView::default()
         };
@@ -42222,7 +45417,14 @@ mod tests {
             })
         });
         assert!(sent, "an advance from a held game sends");
-        match rx.try_recv().expect("the advance reached the sink") {
+        // The register read the assignment fires is not the advance.
+        let advanced = loop {
+            match rx.try_recv().expect("the advance reached the sink") {
+                ToBinary::ReadRegisterCarries { .. } => continue,
+                other => break other,
+            }
+        };
+        match advanced {
             ToBinary::AdvancePreparation {
                 force,
                 live_hulls,
@@ -42378,6 +45580,161 @@ mod tests {
         });
     }
 
+    /// THE REGISTER'S PRE-EMBARKED UNITS ARRIVE IN THE DRAFT WITH THEIR SHIP.
+    ///
+    /// Deploying a hull brings the units the fleet register says she carries,
+    /// in the same assignment — so the console stages them aboard her the
+    /// moment the register's copy lands, and the operator sees the mechanism
+    /// before the press rather than finding new hulls in the next read.
+    #[gpui::test]
+    fn a_register_copy_stages_its_hulls_aboard_their_bringer(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 2, 0, session, tx);
+            demo.map_dims = (1000.0, 1000.0);
+            demo.map_center = (0.0, 0.0);
+            demo.map_zoom = 4.0;
+            demo
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(1, "KRI Ahmad Yani", 0.5, 0.5, None, cx);
+            })
+        });
+        assert!(rx.try_recv().is_err(), "a planning drop posts nothing");
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.apply_register_carries(
+                    Ok((
+                        1,
+                        vec![crate::backend::EmbarkedUnit {
+                            id: 9,
+                            name: "KRI Nanggala".to_string(),
+                            hull_number: "H9".to_string(),
+                            class_name: "Submarine".to_string(),
+                            is_cleared: false,
+                            cleared_at: None,
+                        }],
+                    )),
+                    cx,
+                );
+            })
+        });
+        cx.update(|_window, app| {
+            let demo = view.read(app);
+            let boat = demo.force.get(9).expect("the boat is in the draft");
+            assert_eq!(boat.host, Some(1), "aboard the hull that brought her");
+            assert_eq!(
+                boat.brought_by,
+                Some(1),
+                "and the plan lets her assignment create it"
+            );
+            assert!(
+                demo.flow_drop_note
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("PRE-EMBARKED UNIT"),
+                "the mechanism says so: {:?}",
+                demo.flow_drop_note
+            );
+        });
+    }
+
+    /// A HULL DEPLOYED BARE STAYS BARE, and the toggle is how it comes back.
+    ///
+    /// The register's copy says what she COULD bring; the picker's toggle says
+    /// whether she does. A hull dropped with it off stages no boats, and the
+    /// same hull toggled on stages them from the copy already read — the
+    /// decision is reversible until the press.
+    #[gpui::test]
+    fn a_hull_deployed_bare_stays_bare(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 2, 0, session, tx);
+            demo.map_dims = (1000.0, 1000.0);
+            demo.map_center = (0.0, 0.0);
+            demo.map_zoom = 4.0;
+            demo.bring_contents = false;
+            demo
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.drop_unit(1, "KRI Ahmad Yani", 0.5, 0.5, None, cx);
+                let carries = vec![crate::backend::EmbarkedUnit {
+                    id: 9,
+                    name: "KRI Nanggala".to_string(),
+                    hull_number: "H9".to_string(),
+                    class_name: "Submarine".to_string(),
+                    is_cleared: false,
+                    cleared_at: None,
+                }];
+                demo.apply_register_carries(Ok((1, carries)), cx);
+                assert!(
+                    !demo.force.contains(9),
+                    "the hull was deployed bare and stays bare"
+                );
+
+                // The same hull, asked to bring her boats.
+                demo.set_bring_contents(1);
+                assert!(demo.force.contains(9), "and the toggle brings them in");
+                assert_eq!(
+                    demo.force.get(1).map(|hull| hull.with_contents),
+                    Some(true)
+                );
+            })
+        });
+    }
+
+    /// A GROUP WITH NO COMMANDER STOPS THE ADVANCE, and the refusal names it
+    /// before anything is written: the server refuses the move to preparation
+    /// with one, and the operator is still on the board that fixes it.
+    #[gpui::test]
+    fn an_uncommanded_group_refuses_the_advance(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            state: "planning".to_string(),
+            game: "Game 15".to_string(),
+            game_id: 45,
+            me: 2,
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| IslandDemo::new(fixture_roster(), 2, 0, session, tx));
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.groups
+                    .stage_group(
+                        0,
+                        "GUS-1",
+                        crate::groups::GroupKind::SatuanTugas,
+                        None,
+                        None,
+                        vec![],
+                    )
+                    .expect("a group");
+                assert!(!demo.prepare_advance(cx), "the advance is refused");
+                assert!(
+                    demo.prepare_status.text().contains("GUS-1"),
+                    "and it names the group: {:?}",
+                    demo.prepare_status
+                );
+            })
+        });
+    }
+
     /// The Fleet island lists what has been DEPLOYED, not only what the
     /// backend has acknowledged: a hull dropped while planning is in the
     /// exercise the moment it lands, and an island that waits for the advance
@@ -42451,6 +45808,9 @@ mod tests {
                 hierarchy_node: None,
                 start: None,
                 placed: false,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             }],
             ..SessionView::default()
         };
@@ -42510,6 +45870,9 @@ mod tests {
                 hierarchy_node: None,
                 start: None,
                 placed: true,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             }],
             ..SessionView::default()
         };
@@ -42841,10 +46204,7 @@ mod tests {
                 )
             })
         });
-        assert!(
-            rx.try_recv().is_err(),
-            "planning stages: the hand-over posts nothing"
-        );
+        assert_no_writes(&rx, "planning stages: the hand-over posts nothing");
         cx.update(|_window, app| {
             let demo = view.read(app);
             assert_eq!(
@@ -43298,6 +46658,8 @@ mod tests {
             commander_id: Some(2),
             host: None,
             course_deg: None,
+            brought_by: None,
+            with_contents: false,
         });
         demo
     }
@@ -43600,6 +46962,8 @@ mod tests {
             commander_id: Some(2),
             host: None,
             course_deg: None,
+            brought_by: None,
+            with_contents: false,
         });
         let marks = demo.planned_marks();
         assert_eq!(
@@ -43774,6 +47138,9 @@ mod tests {
                 hierarchy_node: None,
                 start: None,
                 placed: i % 2 == 0,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             })
             .collect();
         column_demo_with(cx, pieces)
@@ -44110,6 +47477,8 @@ mod tests {
                 commander_id: None,
                 host: None,
                 course_deg: None,
+                brought_by: None,
+                with_contents: false,
             });
             demo
         });
@@ -44410,6 +47779,7 @@ mod tests {
             title: "Scen 1".to_string(),
             steps: vec![BookStep {
                 id: 1,
+                kind: Default::default(),
                 content: "Hold the river".to_string(),
                 window: Some(("1000".to_string(), "1030".to_string())),
                 substeps: Vec::new(),
@@ -44492,12 +47862,14 @@ mod tests {
         let steps = vec![
             BookStep {
                 id: 1,
+                kind: Default::default(),
                 content: "Cross".to_string(),
                 window: Some(("1000".to_string(), "1030".to_string())),
                 substeps: Vec::new(),
             },
             BookStep {
                 id: 2,
+                kind: Default::default(),
                 content: "Hold".to_string(),
                 window: Some(("1100".to_string(), "1130".to_string())),
                 substeps: Vec::new(),
@@ -44732,6 +48104,7 @@ mod tests {
             title: "Scenario 1".to_string(),
             steps: vec![BookStep {
                 id: 7,
+                kind: Default::default(),
                 content: "Do A then B".to_string(),
                 window: Some(("1000".to_string(), "1030".to_string())),
                 substeps: Vec::new(),
@@ -44922,6 +48295,428 @@ mod tests {
         }
     }
 
+    /// THE PREPARATION CARD'S ARITHMETIC. The left half reads the plan back and
+    /// the foot reads the gate; both count from one place so they cannot
+    /// disagree about the room.
+    #[test]
+    fn preparation_counts_the_plan_and_the_gate() {
+        use crate::groups::{GroupKind, LiveGroup};
+        let person = |id: i64, judge: bool, ready: bool| PersonView {
+            id,
+            name: format!("user {id}"),
+            call_sign: String::new(),
+            role: if judge { "Referee" } else { "Commando" }.to_string(),
+            role_id: 1,
+            judge,
+            ready,
+            present: true,
+        };
+        let piece = |id: i64, commander: Option<i64>, placed: bool| PieceView {
+            id,
+            class_name: "Frigate".to_string(),
+            label: format!("KRI Hull {id} (00{id})"),
+            commander_id: commander,
+            commander_name: String::new(),
+            hierarchy_node: None,
+            start: placed.then_some((-6.2, 106.8)),
+            placed,
+            host: None,
+            register_host: None,
+            register_contents: Vec::new(),
+        };
+        let session = SessionView {
+            pieces: vec![piece(1, Some(2), true), piece(2, None, false)],
+            groups: vec![LiveGroup {
+                group_id: 10,
+                name: "GUGUS 3".to_string(),
+                kind: GroupKind::Gugus,
+                parent: None,
+                commander_id: Some(2),
+                units: vec![1],
+            }],
+            book: vec![BookScenario {
+                id: 4,
+                title: "Surface".to_string(),
+                steps: vec![
+                    BookStep {
+                        id: 1,
+                        kind: Default::default(),
+                        content: "a".to_string(),
+                        window: None,
+                        substeps: Vec::new(),
+                    },
+                    BookStep {
+                        id: 2,
+                        kind: Default::default(),
+                        content: "b".to_string(),
+                        window: None,
+                        substeps: Vec::new(),
+                    },
+                ],
+            }],
+            people: vec![person(2, false, true), person(3, false, false), person(4, true, false)],
+            ..SessionView::default()
+        };
+        let stats = preparation_stats(&session);
+        assert_eq!(stats.hulls, 2, "both assigned hulls count");
+        assert_eq!(stats.placed, 1, "only the placed one is deployed");
+        assert_eq!(stats.groups, 1, "one task-organisation node");
+        assert_eq!(stats.grouped_hulls, 1, "one hull sits in it");
+        assert_eq!(stats.steps, 2, "the book's steps, summed");
+        assert_eq!(stats.seats, 3, "every seat the caller may see");
+        assert_eq!(stats.ready, 1, "one exercise-side seat has declared");
+        assert_eq!(stats.required, 2, "two exercise-side seats are waited for");
+        assert_eq!(stats.judges, 1, "the judge is exempt, not outstanding");
+        assert!(
+            !preparation_gate_open(&stats, true),
+            "one seat outstanding holds the verb closed"
+        );
+        let mut all = stats;
+        all.ready = all.required;
+        assert!(
+            preparation_gate_open(&all, true),
+            "every seat declared opens the verb"
+        );
+        assert!(
+            !preparation_gate_open(&all, false),
+            "the server's own checklist keeps it closed"
+        );
+        let empty = PreparationStats::default();
+        assert!(
+            !preparation_gate_open(&empty, true),
+            "an exercise with nobody on its side is not vacuously ready"
+        );
+    }
+
+    /// THE ROOM'S POLL. A commander presses READY on their own console, and
+    /// this one only learns it by asking — so the pulse patches the seats and
+    /// the published gate, a refused roster leaves the room exactly as it was,
+    /// and a state this console does not expect takes the card down.
+    #[gpui::test]
+    fn the_room_poll_moves_the_seats(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let person = |id: i64, ready: bool| PersonView {
+            id,
+            name: format!("user {id}"),
+            call_sign: String::new(),
+            role: "Commando".to_string(),
+            role_id: 19,
+            judge: false,
+            ready,
+            present: true,
+        };
+        let session = SessionView {
+            state: "preparation".to_string(),
+            game: "Latma Yudha".to_string(),
+            game_id: 41,
+            people: vec![person(2, false), person(3, false)],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 2, 0, session, tx);
+            demo.crew_modal_open = true;
+            demo
+        });
+        // A third seat arrives and one of them declares: the rows, the
+        // headcount and the checklist all follow the answer.
+        let (counts, open) = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.apply_preparation(
+                    PreparationPulse {
+                        state: "preparation".to_string(),
+                        people: Some(vec![person(2, true), person(3, false), person(4, false)]),
+                        readiness: Some(ReadinessView {
+                            can_execute: false,
+                            blockers: vec!["2 of 3 seats have not declared".to_string()],
+                        }),
+                        ..PreparationPulse::default()
+                    },
+                    cx,
+                );
+                (
+                    (demo.session.seats, demo.session.present, demo.session.ready),
+                    demo.session.readiness.is_some(),
+                )
+            })
+        });
+        assert_eq!(counts, (3, 3, 1), "the room's own movement is adopted");
+        assert!(open, "the published checklist is installed");
+        let held = cx.update(|_window, app| view.read(app).crew_modal_open);
+        assert!(held, "a room still preparing keeps its card");
+        // A roster this account may not read answers `None`, and `None` is not
+        // an empty room: the seats stand.
+        let seats = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.apply_preparation(
+                    PreparationPulse {
+                        state: "preparation".to_string(),
+                        people: None,
+                        ..PreparationPulse::default()
+                    },
+                    cx,
+                );
+                demo.session.seats
+            })
+        });
+        assert_eq!(seats, 3, "a refused roster leaves the room as it was");
+        // The exercise left the room. Even with the whole re-read still to
+        // come, the card is no longer the right surface.
+        let open = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.apply_preparation(
+                    PreparationPulse {
+                        state: "execution".to_string(),
+                        ..PreparationPulse::default()
+                    },
+                    cx,
+                );
+                (demo.crew_modal_open, demo.session.state.clone())
+            })
+        });
+        assert_eq!(open, (false, "execution".to_string()), "the card comes down");
+
+        // THE WHOLE SESSION THE TRANSITION CARRIES. It replaces the held one,
+        // re-seeds the drafts from it, and keeps a participant's own seat —
+        // the roster is staff-only, so the re-read cannot see the row the
+        // player holds.
+        let (state, seat, open) = cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.crew_modal_open = true;
+                demo.session.state = "preparation".to_string();
+                demo.session.joined = Some(person(9, false));
+                demo.session.me = 9;
+                demo.apply_preparation(
+                    PreparationPulse {
+                        state: "execution".to_string(),
+                        left_room: Some(SessionView {
+                            game_id: 41,
+                            state: "execution".to_string(),
+                            me: 9,
+                            ..SessionView::default()
+                        }),
+                        ..PreparationPulse::default()
+                    },
+                    cx,
+                );
+                (
+                    demo.session.state.clone(),
+                    demo.session.joined.as_ref().map(|p| p.id),
+                    demo.crew_modal_open,
+                )
+            })
+        });
+        assert_eq!(state, "execution", "the room's end is the session's state");
+        assert_eq!(seat, Some(9), "the participant's seat survives the re-read");
+        assert!(!open, "and the card stays down");
+    }
+
+    /// A participant's only seat read is the join answer, and it is added to
+    /// the visible roster exactly once.
+    #[test]
+    fn a_joined_seat_is_visible_once() {
+        let joined = PersonView {
+            id: 7,
+            name: "Invited".to_string(),
+            call_sign: String::new(),
+            role: "Commando".to_string(),
+            role_id: 19,
+            judge: false,
+            ready: false,
+            present: true,
+        };
+        let mut session = SessionView {
+            me: 7,
+            joined: Some(joined.clone()),
+            ..SessionView::default()
+        };
+        assert_eq!(
+            preparation_visible_people(&session).len(),
+            1,
+            "a roster this caller cannot read still shows their own seat"
+        );
+        session.people = vec![joined];
+        assert_eq!(
+            preparation_visible_people(&session).len(),
+            1,
+            "the join row does not double the roster's own copy"
+        );
+    }
+
+    /// A participant's seat survives the re-read that every write answers
+    /// with. The roster is staff-only, so the fresh read cannot see it.
+    #[test]
+    fn a_joined_seat_survives_a_re_read() {
+        let seat = PersonView {
+            id: 7,
+            name: "Invited".to_string(),
+            call_sign: String::new(),
+            role: "Commando".to_string(),
+            role_id: 19,
+            judge: false,
+            ready: true,
+            present: true,
+        };
+        let old = SessionView {
+            game_id: 4,
+            me: 7,
+            my_role: "Commando".to_string(),
+            my_ready: true,
+            joined: Some(seat.clone()),
+            pieces: vec![PieceView {
+                id: 1,
+                class_name: "Frigate".to_string(),
+                label: "KRI Ahmad Yani (351)".to_string(),
+                commander_id: Some(7),
+                commander_name: "Invited".to_string(),
+                hierarchy_node: None,
+                start: None,
+                placed: false,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
+            }],
+            ..SessionView::default()
+        };
+        // The write answer: same game, no roster, no joined row.
+        let mut fresh = SessionView {
+            game_id: 4,
+            ..SessionView::default()
+        };
+        fresh.inherit_joined(&old);
+        assert_eq!(fresh.me, 7, "the caller's own id survives");
+        assert!(fresh.joined.is_some(), "the seat survives");
+        assert!(fresh.my_ready, "the declaration survives");
+        assert_eq!(fresh.pieces.len(), 1, "the commanded hull survives");
+        // Another game does not inherit the seat.
+        let mut other = SessionView {
+            game_id: 5,
+            ..SessionView::default()
+        };
+        other.inherit_joined(&old);
+        assert!(other.joined.is_none(), "a different game carries nothing");
+        // A readable roster always wins over the fallback.
+        let mut rostered = SessionView {
+            game_id: 4,
+            me: 7,
+            people: vec![seat],
+            ..SessionView::default()
+        };
+        rostered.inherit_joined(&old);
+        assert!(
+            rostered.joined.is_none(),
+            "the authoritative roster is not replaced by the joined fallback"
+        );
+    }
+
+    /// The roster's command column: a group and a hull named, several hulls
+    /// counted, and nothing at all for a seat that commands nothing.
+    #[test]
+    fn a_seats_command_fits_on_one_line() {
+        use crate::groups::{GroupKind, LiveGroup};
+        let piece = |id: i64, label: &str, commander: i64| PieceView {
+            id,
+            class_name: "Frigate".to_string(),
+            label: label.to_string(),
+            commander_id: Some(commander),
+            commander_name: String::new(),
+            hierarchy_node: None,
+            start: None,
+            placed: false,
+            host: None,
+            register_host: None,
+            register_contents: Vec::new(),
+        };
+        let groups = vec![LiveGroup {
+            group_id: 10,
+            name: "GUGUS 3".to_string(),
+            kind: GroupKind::Gugus,
+            parent: None,
+            commander_id: Some(2),
+            units: Vec::new(),
+        }];
+        let one = vec![piece(1, "KRI Ahmad Yani (351)", 2)];
+        assert_eq!(
+            preparation_command_text(2, &one, &groups),
+            "GUGUS 3 \u{b7} KRI Ahmad Yani (351)"
+        );
+        let many = vec![
+            piece(1, "KRI Ahmad Yani (351)", 2),
+            piece(3, "KRI Makassar (590)", 2),
+        ];
+        assert_eq!(
+            preparation_command_text(2, &many, &[]),
+            "2 HULLS",
+            "several hulls are counted, not listed"
+        );
+        assert_eq!(
+            preparation_command_text(99, &many, &groups),
+            "",
+            "a seat that commands nothing reads as nothing"
+        );
+    }
+
+    /// The launcher's JOIN A ROOM: a pasted key is sent, and an empty one is
+    /// refused before the wire with a sentence.
+    #[gpui::test]
+    fn a_pasted_invitation_key_is_sent_and_an_empty_one_is_refused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                assert!(!demo.send_join(cx), "an empty key sends nothing");
+                assert!(demo.join_status.contains("invitation key"));
+                demo.join_key = "  room-key-7  ".to_string();
+                assert!(demo.send_join(cx));
+                assert!(demo.join_busy, "the latch waits for the answer");
+                assert!(
+                    !demo.send_join(cx),
+                    "a second press while one is in flight sends nothing"
+                );
+            })
+        });
+        match rx.try_recv().expect("the key reached the sink") {
+            ToBinary::JoinGame { room_key } => {
+                assert_eq!(room_key, "room-key-7", "the field is trimmed before the wire")
+            }
+            other => panic!("expected a join, got {other:?}"),
+        }
+    }
+
+    /// A copied invitation key lands in the join field with CTRL+V. The field
+    /// is the one string on this console a person PASTES, and a paste that did
+    /// nothing would send them retyping twenty-two characters.
+    #[gpui::test]
+    fn a_copied_key_pastes_into_the_join_field(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx)
+        });
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            "2D1DE9DCE16DC34CFF0EFB56".to_string(),
+        ));
+        let paste = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            key: "v".to_string(),
+            key_char: None,
+        };
+        cx.update(|window, app| {
+            view.update(app, |demo, cx| {
+                demo.compose_key(25, &paste, window, cx);
+                assert_eq!(
+                    demo.join_key, "2D1DE9DCE16DC34CFF0EFB56",
+                    "the clipboard's text lands in the key field"
+                );
+            })
+        });
+    }
+
     /// THE composition test, and the one the prototype could not have passed.
     ///
     /// The column's membership is a function of where the exercise is: a
@@ -44969,8 +48764,8 @@ mod tests {
         set_state(&view, cx, "preparation");
         assert_eq!(
             read(&view, cx),
-            vec!["crew"],
-            "preparation is the room: the order of battle, and its door"
+            Vec::<String>::new(),
+            "preparation is the centred card: the column would be a second copy of the room"
         );
         set_state(&view, cx, "execution");
         assert_eq!(
@@ -46613,6 +50408,46 @@ mod tests {
         assert_eq!(channels.last().and_then(|c| c.group_id), None, "loose last");
     }
 
+    /// A REOPENED BASKET USES THE SERVER'S GROUPS. The board and the basket
+    /// read `visible_groups`, not `staged_groups`: the frame is not work, but
+    /// it is still the organisation the operator is looking at.
+    #[test]
+    fn a_reopened_basket_uses_the_servers_groups() {
+        use crate::groups::{GroupKind, LiveGroup};
+        let mut draft = crate::fixtures::groups_draft().expect("the groups fixture");
+        draft.groups.clear();
+        draft.groups.seed(&[
+            LiveGroup {
+                group_id: 10,
+                name: "GUS-1".to_string(),
+                kind: GroupKind::Gugus,
+                parent: None,
+                commander_id: Some(2),
+                units: Vec::new(),
+            },
+            LiveGroup {
+                group_id: 11,
+                name: "TG-1".to_string(),
+                kind: GroupKind::SatuanTugas,
+                parent: Some(10),
+                commander_id: Some(3),
+                units: vec![351, 352],
+            },
+        ]);
+        let channels = basket_channels(&draft);
+        let tg1 = channels
+            .iter()
+            .find(|channel| channel.label == "TG-1")
+            .expect("the saved group is a channel");
+        assert_eq!(tg1.cards.len(), 2, "its hulls are under it");
+        assert_eq!(tg1.depth, 1, "and it sits under GUS-1");
+        assert_eq!(
+            channels.last().and_then(|channel| channel.group_id),
+            None,
+            "the loose hulls are still last"
+        );
+    }
+
     /// A HULL TAKEN OUT SEVERS EVERY TIE IT HAS (`§7.2`).
     ///
     /// The bug this pins: the force dropped the hull, the body went on
@@ -47595,6 +51430,259 @@ mod tests {
         });
     }
 
+    /// `+ STEP` FOLLOWS THE LAST STEP: the new window opens where the book
+    /// ended and runs thirty minutes.
+    #[gpui::test]
+    fn adding_a_step_follows_the_book(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
+            demo.flow_draft = crate::fixtures::book_draft();
+            demo.flow_stage = crate::draft::Stage::Scenario;
+            demo
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                demo.add_step(cx);
+                let draft = demo.flow_draft.clone().expect("a draft");
+                let scenario = draft.book.staged_news().next().expect("a scenario");
+                let last = scenario.steps.last().expect("the new step");
+                assert_eq!(
+                    (last.start.as_deref(), last.end.as_deref()),
+                    (Some("1130"), Some("1200")),
+                    "it begins where RECOVER ended, half an hour long"
+                );
+            });
+        });
+    }
+
+    /// EDITING A MIDDLE STEP'S WINDOW MOVES THE TAIL. The picker writes the
+    /// field, and the book owns the shift — one rule, not one per call site.
+    #[gpui::test]
+    fn editing_a_window_moves_the_steps_behind_it(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
+            demo.flow_draft = crate::fixtures::book_draft();
+            demo.flow_stage = crate::draft::Stage::Scenario;
+            demo
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                let draft = demo.flow_draft.clone().expect("a draft");
+                let scenario = draft.book.staged_news().next().expect("a scenario");
+                let transit = scenario
+                    .steps
+                    .iter()
+                    .find(|step| step.content == "TRANSIT")
+                    .expect("TRANSIT")
+                    .local_id;
+                demo.set_target_time(
+                    PickerTarget::FlowStep {
+                        step: transit,
+                        field: StepField::End,
+                    },
+                    "09:45".into(),
+                );
+                let after = demo.flow_draft.clone().expect("a draft");
+                let steps = &after
+                    .book
+                    .get_new(scenario.local_id)
+                    .expect("scenario")
+                    .steps;
+                assert_eq!(
+                    (steps[1].start.as_deref(), steps[1].end.as_deref()),
+                    (Some("0820"), Some("0945"))
+                );
+                assert_eq!(
+                    (steps[2].start.as_deref(), steps[2].end.as_deref()),
+                    (Some("0945"), Some("1030")),
+                    "SWEEP keeps its 45 minutes and follows the edit"
+                );
+                assert_eq!(
+                    (steps[4].start.as_deref(), steps[4].end.as_deref()),
+                    (Some("1055"), Some("1125")),
+                    "and the shift reaches the end of the book"
+                );
+            });
+        });
+    }
+
+    /// A SAVED STEP'S PICKER WRITES A LIVE EDIT, and the tail follows.
+    #[gpui::test]
+    fn a_saved_step_window_is_edited_through_the_picker(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            book: vec![BookScenario {
+                id: 7,
+                title: "Scen 1".to_string(),
+                steps: vec![
+                    BookStep {
+                        id: 1,
+                        kind: Default::default(),
+                        content: "Hold the river".to_string(),
+                        window: Some(("1000".to_string(), "1030".to_string())),
+                        substeps: Vec::new(),
+                    },
+                    BookStep {
+                        id: 2,
+                        kind: Default::default(),
+                        content: "Recover".to_string(),
+                        window: Some(("1100".to_string(), "1130".to_string())),
+                        substeps: Vec::new(),
+                    },
+                ],
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.flow_draft = crate::fixtures::reopened_twelve();
+            demo.flow_stage = crate::draft::Stage::Scenario;
+            demo
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, _cx| {
+                demo.set_target_time(
+                    PickerTarget::FlowStep {
+                        step: 1,
+                        field: StepField::End,
+                    },
+                    "10:45".into(),
+                );
+                let draft = demo.flow_draft.clone().expect("a draft");
+                assert_eq!(
+                    draft.book.live_step_edit(7, 1).and_then(|edit| edit.window()),
+                    Some(("1000".into(), "1045".into()))
+                );
+                assert_eq!(
+                    draft.book.live_step_edit(7, 2).and_then(|edit| edit.window()),
+                    Some(("1045".into(), "1115".into())),
+                    "the saved tail follows"
+                );
+                // A start edit changes this step's own length only.
+                demo.set_target_time(
+                    PickerTarget::FlowStep {
+                        step: 1,
+                        field: StepField::Start,
+                    },
+                    "09:30".into(),
+                );
+                let draft = demo.flow_draft.clone().expect("a draft");
+                assert_eq!(
+                    draft.book.live_step_edit(7, 1).and_then(|edit| edit.window()),
+                    Some(("0930".into(), "1045".into()))
+                );
+                assert_eq!(
+                    draft.book.live_step_edit(7, 2).and_then(|edit| edit.window()),
+                    Some(("1045".into(), "1115".into())),
+                    "the tail is anchored to the end"
+                );
+            });
+        });
+    }
+
+    /// `+ SUB-STEP` ON A SAVED STEP STAGES A COMMAND in the live list, not in
+    /// the staged-new one — the press writes it against the server's step.
+    #[gpui::test]
+    fn adding_a_substep_to_a_saved_step_stages_it(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            book: vec![BookScenario {
+                id: 7,
+                title: "Scen 1".to_string(),
+                steps: vec![BookStep {
+                    id: 1,
+                    kind: Default::default(),
+                    content: "Hold".to_string(),
+                    window: Some(("1000".to_string(), "1030".to_string())),
+                    substeps: vec![BookSubstep {
+                        id: 100,
+                        content: "OLD".to_string(),
+                        units: vec![351],
+                    }],
+                }],
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.flow_draft = crate::fixtures::reopened_twelve();
+            demo.flow_stage = crate::draft::Stage::Scenario;
+            demo.flow_step = Some(1);
+            demo
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                demo.add_substep(cx);
+                let draft = demo.flow_draft.clone().expect("a draft");
+                let commands = draft.book.live_substeps_of(7, 1);
+                assert_eq!(commands.len(), 1);
+                assert!(commands[0].id < 0, "a command this draft adds");
+                assert_eq!(commands[0].content, "SUB-STEP 2");
+                assert!(commands[0].units.is_empty());
+                assert!(
+                    demo.flow_drop_note
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("SUB-STEP ADDED")
+                );
+            });
+        });
+    }
+
+    /// `+ STEP` ON A SAVED GAME APPENDS TO ITS SCENARIO. A reopened draft's
+    /// `staged_news` is empty — the book is on the server — so the old answer
+    /// made a second scenario for a game that already had one, and the saved
+    /// steps stayed invisible behind it.
+    #[gpui::test]
+    fn adding_a_step_to_a_saved_scenario_appends_to_it(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            book: vec![BookScenario {
+                id: 7,
+                title: "Scen 1".to_string(),
+                steps: vec![BookStep {
+                    id: 1,
+                    kind: Default::default(),
+                    content: "Hold the river".to_string(),
+                    window: Some(("1000".to_string(), "1030".to_string())),
+                    substeps: Vec::new(),
+                }],
+            }],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.flow_draft = crate::fixtures::reopened_twelve();
+            demo.flow_stage = crate::draft::Stage::Scenario;
+            demo
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                demo.add_step(cx);
+                let draft = demo.flow_draft.clone().expect("a draft");
+                assert_eq!(
+                    draft.book.staged_news().count(),
+                    0,
+                    "the saved scenario is not duplicated"
+                );
+                let added: Vec<_> = draft.book.added_steps(7).collect();
+                assert_eq!(added.len(), 1, "the step is staged onto the saved scenario");
+                assert_eq!(added[0].content, "STEP 2");
+                assert_eq!(
+                    (
+                        added[0].start.as_deref(),
+                        added[0].end.as_deref()
+                    ),
+                    (Some("1030"), Some("1100")),
+                    "it follows the saved step's end, half an hour long"
+                );
+                assert_eq!(demo.flow_step, Some(added[0].local_id));
+            });
+        });
+    }
+
     /// THE TWO SEARCHES ARE TWO FIELDS (`§5.2`, `§8.1`).
     ///
     /// A term typed in the register used to survive into stage 05 and filter
@@ -47919,6 +52007,10 @@ mod tests {
     /// A ROW TAKES A GROUP COMMANDER, A CARD A HULL COMMANDER — the same seat
     /// either way — and the refusals are local, named, and never reach a write
     /// (`§8.3`).
+    ///
+    /// A SEAT ALREADY HOLDING A SCOPE MOVES when it is dropped on a free one:
+    /// the old command is released rather than refused, because one person /
+    /// one scope is a rule about the result, not about the gesture.
     #[gpui::test]
     fn a_seat_drop_sets_a_scope_or_names_its_refusal(cx: &mut gpui::TestAppContext) {
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -47931,29 +52023,17 @@ mod tests {
         cx.update(|_, app| {
             view.update(app, |demo, cx| {
                 let draft = demo.flow_draft.clone().expect("a draft");
-                // Rina Wijaya (5) commands a hull already; TG-2 has no commander.
+                // Rina Wijaya (5) commands TG-2; TG-2 has no other commander.
                 let tg2 = draft
                     .groups
                     .staged_groups()
                     .find(|g| g.name == "TG-2")
                     .expect("TG-2")
                     .local_id;
-                // The fixture makes her TG-2's commander, so a GROUP is the
-                // scope she already holds; a hull is therefore a second scope.
                 assert_eq!(
                     demo.seat_scope_of(5),
                     Some(crate::roster::ScopeTarget::Group(tg2))
                 );
-                let a_hull = 354;
-
-                // ONE PERSON, ONE SCOPE: refused, and the sentence names the
-                // scope she holds.
-                demo.seat_carry_start(5, "Rina Wijaya".into(), false, (10.0, 10.0), cx);
-                demo.flow_seat_carry.as_mut().unwrap().lifted = true;
-                assert!(demo.seat_drop(crate::roster::ScopeTarget::Hull(a_hull), cx));
-                let note = demo.flow_drop_note.clone().unwrap_or_default();
-                assert!(note.contains("ONE PERSON COMMANDS ONE SCOPE"), "{note}");
-                assert!(demo.flow_seat_carry.is_none(), "a refusal returns the seat");
 
                 // THE SAME SEAT ON ITS OWN SCOPE says so, without a write.
                 demo.seat_carry_start(5, "Rina Wijaya".into(), false, (10.0, 10.0), cx);
@@ -47983,43 +52063,119 @@ mod tests {
                     "the judge staged nothing: 5 still holds TG-2"
                 );
 
-                // A FREE SCOPE TAKES THE SEAT, and the group's commander is set.
-                demo.seat_carry_start(2, "Cdr. Anwar".into(), false, (10.0, 10.0), cx);
-                demo.flow_seat_carry.as_mut().unwrap().lifted = true;
-                // He already commands OPGAB JAYA: refused. Use a seat with no
-                // scope instead — the fixture's Lt. Fitri commands GUS-1, so
-                // seat a fresh person.
-                demo.flow_seat_carry = None;
+                // A MOVE: free a hull, then drop the seat that already commands
+                // a group onto it. The hull takes the seat and the group is
+                // released — one person, one scope, in the result.
                 if let Some(draft) = &mut demo.flow_draft {
-                    draft.roster.stage(crate::roster::StagedSeat {
-                        user_id: 30,
-                        user_name: "New Person".into(),
-                        role_id: 0,
-                        role_name: "COMMANDO".into(),
-                        call_sign: "NP".into(),
-                        judge: false,
-                    });
+                    draft.force.set_commander(524, None);
                 }
-                // Free the scope: a group with no commander is what a drop
-                // onto it is for.
-                if let Some(draft) = &mut demo.flow_draft {
-                    let _ = draft.groups.set_commander(tg2, None);
-                }
-                demo.seat_carry_start(30, "New Person".into(), false, (10.0, 10.0), cx);
+                demo.seat_carry_start(5, "Rina Wijaya".into(), false, (10.0, 10.0), cx);
                 demo.flow_seat_carry.as_mut().unwrap().lifted = true;
-                assert!(demo.seat_drop(crate::roster::ScopeTarget::Group(tg2), cx));
+                assert!(demo.seat_drop(crate::roster::ScopeTarget::Hull(524), cx));
                 let after = demo.flow_draft.clone().expect("a draft");
                 assert_eq!(
+                    after.force.get(524).and_then(|h| h.commander_id),
+                    Some(5),
+                    "the free hull took the seat"
+                );
+                assert_eq!(
                     after.groups.get(tg2).and_then(|g| g.commander_id),
-                    Some(30),
-                    "the free scope took the seat"
+                    None,
+                    "the old scope is released by the move"
                 );
                 assert!(
                     demo.flow_drop_note
                         .as_deref()
                         .unwrap_or_default()
-                        .starts_with("NEW PERSON COMMANDS TG-2")
+                        .starts_with("RINA WIJAYA COMMANDS KRI BINTUNI"),
+                    "{:?}",
+                    demo.flow_drop_note
                 );
+
+                // AN OCCUPIED SCOPE still has one commander: hull 351 is user
+                // 2's, and the refusal names the holder.
+                demo.seat_carry_start(5, "Rina Wijaya".into(), false, (10.0, 10.0), cx);
+                demo.flow_seat_carry.as_mut().unwrap().lifted = true;
+                assert!(demo.seat_drop(crate::roster::ScopeTarget::Hull(351), cx));
+                assert!(
+                    demo.flow_drop_note
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("HELD BY USER 2"),
+                    "{:?}",
+                    demo.flow_drop_note
+                );
+
+                // A DIRECTORY ROW IS SEATED BY THE DROP: the person was never
+                // in the roster, so the drop stages a Commando seat and hands
+                // them the scope in one gesture.
+                if let Some(draft) = &mut demo.flow_draft {
+                    draft.force.set_commander(365, None);
+                }
+                demo.person_carry_start(30, "New Person".into(), (10.0, 10.0), cx);
+                demo.flow_seat_carry.as_mut().unwrap().lifted = true;
+                assert!(demo.seat_drop(crate::roster::ScopeTarget::Hull(365), cx));
+                let after = demo.flow_draft.clone().expect("a draft");
+                let seat = after.roster.get(30).expect("seated by the drop");
+                assert_eq!(seat.role_name, "COMMANDO");
+                assert!(!seat.judge);
+                assert_eq!(
+                    after.force.get(365).and_then(|h| h.commander_id),
+                    Some(30)
+                );
+                assert!(
+                    demo.flow_drop_note
+                        .as_deref()
+                        .unwrap_or_default()
+                        .starts_with("NEW PERSON SEATED AS COMMANDO AND COMMANDS"),
+                    "{:?}",
+                    demo.flow_drop_note
+                );
+            })
+        });
+    }
+
+    /// A DIRECTORY DRAG TAKES ITS ROLE FROM THE BACKEND VOCABULARY: the
+    /// deployment's own Commando, matched by name, never a hardcoded word.
+    #[gpui::test]
+    fn a_directory_drag_seats_the_backends_commando(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            roles: vec![
+                RoleRow {
+                    id: 1,
+                    name: "Game Master".into(),
+                    judge: false,
+                },
+                RoleRow {
+                    id: 2,
+                    name: "Komando".into(),
+                    judge: false,
+                },
+                RoleRow {
+                    id: 3,
+                    name: "Wasit".into(),
+                    judge: true,
+                },
+            ],
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 0, 0, session, tx);
+            demo.flow_draft = crate::fixtures::seats_draft();
+            demo.flow_stage = crate::draft::Stage::Players;
+            demo
+        });
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                demo.person_carry_start(30, "New Person".into(), (10.0, 10.0), cx);
+                let carry = demo.flow_seat_carry.clone().expect("a carry");
+                assert_eq!(
+                    carry.fresh_role,
+                    Some(("Komando".to_string(), false)),
+                    "the backend's Commando, not the hardcoded fallback"
+                );
+                assert!(!carry.judge);
             })
         });
     }
@@ -48165,6 +52321,169 @@ mod tests {
                         .contains("A PIECE NEEDS A COMMANDER"),
                     "the note is stage 05's reason to exist"
                 );
+            })
+        });
+    }
+
+    /// A REGISTER CARD LET GO ON A CARD IS AN EMBARKATION (`§5.7`).
+    ///
+    /// The basket stays open through a peel for exactly this: the deck is the
+    /// only place on the screen a boat can be dropped, because the chart has no
+    /// host card to aim at. The hull joins the force with no ground of her own,
+    /// which is what a rider is.
+    #[gpui::test]
+    fn a_register_card_let_go_on_a_card_embarks(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
+            demo.flow_draft = crate::fixtures::groups_draft();
+            demo.flow_stage = crate::draft::Stage::Units;
+            demo
+        });
+        let hull = crate::fixtures::register()
+            .hulls
+            .iter()
+            .find(|hull| hull.id != 351)
+            .expect("a register hull")
+            .clone();
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                demo.peel_start(&hull, (400.0, 400.0), cx);
+                demo.flow_peel.as_mut().unwrap().lifted = true;
+                assert!(demo.peel_into_card(351, cx), "the deck takes the boat");
+                let rider = demo
+                    .flow_draft
+                    .as_ref()
+                    .and_then(|draft| draft.force.get(hull.id))
+                    .expect("the boat joined the force");
+                assert_eq!(rider.host, Some(351), "aboard the ship she was dropped on");
+                assert!(rider.start.is_none(), "a rider has no water of her own");
+                assert!(demo.flow_peel.is_none(), "the card is spent");
+                assert!(
+                    demo.flow_drop_note
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("ABOARD"),
+                    "{:?}",
+                    demo.flow_drop_note
+                );
+            })
+        });
+    }
+
+    /// A REFUSED DECK LEAVES THE REGISTER AS IT WAS: a hull dropped on herself
+    /// is not left in the draft with no home.
+    #[gpui::test]
+    fn a_card_dropped_on_itself_stages_nothing(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
+            demo.flow_draft = crate::fixtures::groups_draft();
+            demo.flow_stage = crate::draft::Stage::Units;
+            demo
+        });
+        let hull = crate::fixtures::register().hulls[0].clone();
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                let before = demo
+                    .flow_draft
+                    .as_ref()
+                    .map(|draft| draft.unit_count())
+                    .unwrap_or(0);
+                demo.peel_start(&hull, (400.0, 400.0), cx);
+                demo.flow_peel.as_mut().unwrap().lifted = true;
+                assert!(demo.peel_into_card(hull.id, cx));
+                assert_eq!(
+                    demo.flow_draft.as_ref().map(|draft| draft.unit_count()),
+                    Some(before),
+                    "nothing joined the force"
+                );
+                assert!(demo
+                    .flow_drop_note
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("DOES NOT EMBARK ON ITSELF"));
+            })
+        });
+    }
+
+    /// THE COMPOSER'S REGISTER CARRIES THE SAME TOGGLE, so a hull placed from
+    /// it is deployed with the register's list — or bare, when the operator has
+    /// said so.
+    #[gpui::test]
+    fn a_hull_placed_in_the_composer_takes_the_bring_toggle(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
+            demo.flow_draft = crate::fixtures::stage_one(crate::fixtures::Frame::F2b);
+            demo.flow_stage = crate::draft::Stage::Units;
+            demo
+        });
+        let hull = crate::fixtures::register().hulls[0].clone();
+        let second = crate::fixtures::register().hulls[1].clone();
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                demo.peel_start(&hull, (400.0, 400.0), cx);
+                let peel = demo.flow_peel.clone().expect("a peel");
+                demo.stage_hull_at(&peel, -3.28, 108.92, cx);
+                assert_eq!(
+                    demo.flow_draft
+                        .as_ref()
+                        .and_then(|draft| draft.force.get(hull.id))
+                        .map(|h| h.with_contents),
+                    Some(true),
+                    "the toggle is on, so the hull brings her boats"
+                );
+
+                demo.bring_contents = false;
+                demo.peel_start(&second, (420.0, 400.0), cx);
+                let peel = demo.flow_peel.clone().expect("a peel");
+                demo.stage_hull_at(&peel, -3.3, 108.94, cx);
+                assert_eq!(
+                    demo.flow_draft
+                        .as_ref()
+                        .and_then(|draft| draft.force.get(second.id))
+                        .map(|h| h.with_contents),
+                    Some(false),
+                    "toggled off, the next hull arrives bare"
+                );
+            })
+        });
+    }
+
+    /// A CARD IN THE AIR PUTS THE DRAFT'S PINS ON THE CHART.
+    ///
+    /// The peel draws no body — the chart IS the target — and the operator is
+    /// choosing water relative to the hulls already deployed. The pins are
+    /// therefore drawn while the card is lifted, and not while it is merely
+    /// held: a click must not repaint the chart under the hand.
+    #[gpui::test]
+    fn a_lifted_card_puts_the_drafts_pins_on_the_chart(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx);
+            demo.flow_draft = crate::fixtures::stage_one(crate::fixtures::Frame::F2b);
+            demo.flow_stage = crate::draft::Stage::Units;
+            demo
+        });
+        let hull = crate::fixtures::register().hulls[0].clone();
+        cx.update(|_, app| {
+            view.update(app, |demo, cx| {
+                assert!(!demo.map_shows_pins(), "the form is a form, not a map");
+                demo.peel_start(&hull, (400.0, 400.0), cx);
+                assert!(
+                    !demo.map_shows_pins(),
+                    "a press that has not moved is still a click"
+                );
+                demo.flow_peel.as_mut().unwrap().lifted = true;
+                assert!(
+                    demo.map_shows_pins(),
+                    "the chart is the target, and the force is what it is aimed by"
+                );
+                demo.flow_peel = None;
+                assert!(!demo.map_shows_pins(), "and the pins go with the card");
+                demo.flow_map = true;
+                assert!(demo.map_shows_pins(), "map mode draws them too");
             })
         });
     }
@@ -48449,6 +52768,7 @@ mod tests {
                 commander_id,
                 fx,
                 fy,
+                ..
             } => {
                 assert_eq!(unit_id, 13, "the first leaf row drags Yani");
                 assert_eq!(commander_id, 7, "placing assigns to the operator's seat");
@@ -48499,6 +52819,9 @@ mod tests {
                     hierarchy_node: None,
                     start: None,
                     placed: false,
+                    host: None,
+                    register_host: None,
+                    register_contents: Vec::new(),
                 },
                 PieceView {
                     id: 8,
@@ -48510,6 +52833,9 @@ mod tests {
                     hierarchy_node: None,
                     start: None,
                     placed: true,
+                    host: None,
+                    register_host: None,
+                    register_contents: Vec::new(),
                 },
             ];
             let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
@@ -49134,6 +53460,7 @@ mod tests {
                 commander_id,
                 fx,
                 fy,
+                ..
             } => {
                 assert_eq!(unit_id, 13);
                 assert_eq!(commander_id, 7, "the operator's own seat");
@@ -49172,6 +53499,7 @@ mod tests {
                 host,
                 child,
                 commander_id,
+                ..
             } => {
                 assert_eq!(host, 8);
                 assert_eq!(child, 13);
@@ -49200,6 +53528,9 @@ mod tests {
                 hierarchy_node: None,
                 start: None,
                 placed: false,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             }];
             let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
             demo.fleet_tax = super::fleet_taxonomy_tests::fixture_taxonomy();
@@ -49845,6 +54176,7 @@ mod tests {
                 title: "Scenario 1".to_string(),
                 steps: vec![BookStep {
                     id: 7,
+                    kind: Default::default(),
                     content: "Cross the river".to_string(),
                     window: None,
                 substeps: Vec::new(),
@@ -49860,6 +54192,9 @@ mod tests {
                     hierarchy_node: None,
                     start: None,
                     placed: true,
+                    host: None,
+                    register_host: None,
+                    register_contents: Vec::new(),
                 },
                 PieceView {
                     id: 9,
@@ -49870,6 +54205,9 @@ mod tests {
                     hierarchy_node: None,
                     start: None,
                     placed: false,
+                    host: None,
+                    register_host: None,
+                    register_contents: Vec::new(),
                 },
             ],
             related: vec![StepRelatedView {
@@ -50972,12 +55310,14 @@ mod tests {
                     steps: vec![
                         BookStep {
                             id: 7,
+                            kind: Default::default(),
                             content: "Sweep the northern approaches".to_string(),
                             window: Some(("0600".to_string(), "0700".to_string())),
                 substeps: Vec::new(),
             },
                         BookStep {
                             id: 8,
+                            kind: Default::default(),
                             content: "Establish the barrier".to_string(),
                             window: Some(("0700".to_string(), "0930".to_string())),
                 substeps: Vec::new(),
@@ -50989,6 +55329,7 @@ mod tests {
                     title: "Second light".to_string(),
                     steps: vec![BookStep {
                         id: 9,
+                        kind: Default::default(),
                         content: "Screen the traffic lanes".to_string(),
                         window: None,
                 substeps: Vec::new(),
@@ -51160,6 +55501,9 @@ mod tests {
             hierarchy_node: None,
             start: Some((-6.1, 106.9)),
             placed: true,
+            host: None,
+            register_host: None,
+            register_contents: Vec::new(),
         }];
         let (view, cx) =
             cx.add_window_view(|_, _| IslandDemo::new(fixture_roster(), 8, 0, session, tx));
@@ -51259,6 +55603,9 @@ mod tests {
                 hierarchy_node: Some(3),
                 start: None,
                 placed: true,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             },
             PieceView {
                 id: 18,
@@ -51270,6 +55617,9 @@ mod tests {
                 hierarchy_node: Some(3),
                 start: None,
                 placed: true,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             },
             PieceView {
                 id: 84,
@@ -51281,6 +55631,9 @@ mod tests {
                 hierarchy_node: Some(4),
                 start: None,
                 placed: false,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             },
         ];
         session.groups = vec![
@@ -51368,6 +55721,9 @@ mod tests {
             hierarchy_node: Some(3),
             start: None,
             placed: true,
+            host: None,
+            register_host: None,
+            register_contents: Vec::new(),
         }];
         // NO related list for step 7: the gate is the only thing that names
         // the hull, which is exactly the state the console reads at a start.
@@ -51565,6 +55921,9 @@ mod tests {
                 hierarchy_node: Some(3),
                 start: None,
                 placed: true,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             },
             PieceView {
                 id: 84,
@@ -51575,6 +55934,9 @@ mod tests {
                 hierarchy_node: Some(4),
                 start: None,
                 placed: false,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             },
             // In no group at all: the tree says so by sitting it at the root.
             PieceView {
@@ -51586,6 +55948,9 @@ mod tests {
                 hierarchy_node: None,
                 start: None,
                 placed: false,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             },
         ];
         session.groups = vec![
@@ -52689,6 +57054,7 @@ mod tests {
                 title: "First move".to_string(),
                 steps: vec![BookStep {
                     id: 16,
+                    kind: Default::default(),
                     content: "Take station east of the buoy".to_string(),
                     window: Some(("1000".to_string(), "1100".to_string())),
                 substeps: Vec::new(),
@@ -53553,6 +57919,9 @@ mod tests {
                 hierarchy_node: None,
                 start: None,
                 placed: true,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             }],
             ..SessionView::default()
         };
@@ -53629,6 +57998,9 @@ mod tests {
                 hierarchy_node: None,
                 start: None,
                 placed: true,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             }],
             ..SessionView::default()
         };
@@ -53680,6 +58052,9 @@ mod tests {
                 hierarchy_node: None,
                 start: Some((-5.4, 106.2)),
                 placed: true,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             }],
             ..SessionView::default()
         };
@@ -53728,6 +58103,9 @@ mod tests {
                 hierarchy_node: Some(2),
                 start: None,
                 placed: false,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             }],
             groups: vec![crate::groups::LiveGroup {
                 group_id: 2,
@@ -54239,6 +58617,9 @@ mod tests {
                 hierarchy_node: None,
                 start: None,
                 placed: false,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             },
             PieceView {
                 id: 6,
@@ -54249,6 +58630,9 @@ mod tests {
                 hierarchy_node: None,
                 start: None,
                 placed: false,
+                host: None,
+                register_host: None,
+                register_contents: Vec::new(),
             },
         ];
         assert_eq!(
@@ -54286,6 +58670,9 @@ mod tests {
             hierarchy_node: None,
             start: Some((-6.2 - (id % 10) as f64 / 100.0, 106.8)),
             placed: true,
+            host: None,
+            register_host: None,
+            register_contents: Vec::new(),
         }
     }
 

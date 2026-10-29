@@ -1,0 +1,2546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TFG Control Plane — HTTP &amp; WebSocket API v2</title>
+<meta name="description" content="Complete reference for the TFG control plane: authentication, pairing, state and session reads, readiness, hull data, commands, and the WebSocket event stream.">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js" onerror="document.documentElement.classList.add('no-mermaid')"></script>
+<style>
+  :root {
+    --bg: #f5f7fa;
+    --panel: #ffffff;
+    --ink: #15202b;
+    --muted: #5d6b7a;
+    --line: #dde3ea;
+    --line-strong: #c6d0db;
+    --accent: #0d4f78;
+    --accent-2: #b26a00;
+    --accent-soft: #e8f1f7;
+    --code-bg: #101923;
+    --code-ink: #dce6f0;
+    --good: #1c7a4a;
+    --good-soft: #e7f6ee;
+    --warn: #8a5a00;
+    --warn-soft: #fff5df;
+    --bad: #a12a2a;
+    --bad-soft: #fdecec;
+    --radius: 12px;
+    --shadow: 0 1px 2px rgba(21, 32, 43, .05), 0 8px 24px rgba(21, 32, 43, .05);
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1100px 600px at 15% -10%, #e9f2f8 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; text-underline-offset: 2px; }
+  .skip {
+    position: absolute; left: -999px; top: 0; z-index: 100;
+    background: var(--panel); padding: 10px 14px; border-radius: 8px;
+  }
+  .skip:focus { left: 12px; top: 12px; }
+
+  .topbar {
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(245, 247, 250, .86);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line);
+  }
+  .topbar-inner {
+    max-width: 1240px; margin: 0 auto; padding: 14px 24px;
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    font-weight: 750; letter-spacing: .02em; color: var(--accent);
+  }
+  .brand .mark {
+    width: 28px; height: 28px; border-radius: 8px;
+    background: linear-gradient(135deg, var(--accent), #1b7aa8 65%, #2fa0c8);
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,.25);
+  }
+  .brand small { display: block; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+  .topbar .spacer { flex: 1; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    border: 1px solid var(--line-strong); background: var(--panel);
+    color: var(--muted); border-radius: 999px;
+    padding: 3px 10px; font-size: 12px; font-weight: 650; white-space: nowrap;
+  }
+  .badge strong { color: var(--ink); font-weight: 700; }
+  .badge.v2 { border-color: #b7d8e8; background: var(--accent-soft); color: var(--accent); }
+
+  .shell {
+    max-width: 1240px; margin: 0 auto; padding: 30px 24px 70px;
+    display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 46px;
+    align-items: start;
+  }
+  .toc {
+    position: sticky; top: 82px;
+    max-height: calc(100vh - 104px); overflow: auto;
+    padding-right: 8px;
+    border-right: 1px solid var(--line);
+  }
+  .toc-details > summary {
+    display: none; margin: 0 0 10px; font-size: 11px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--muted); font-weight: 700;
+    cursor: pointer; list-style: none;
+  }
+  .toc-details > summary::-webkit-details-marker { display: none; }
+  .toc ol { list-style: none; margin: 0; padding: 0; }
+  .toc li { margin: 1px 0; }
+  .toc a {
+    display: block; padding: 6px 10px; border-left: 2px solid transparent;
+    color: var(--muted); font-size: 13.5px; line-height: 1.35; border-radius: 0 6px 6px 0;
+  }
+  .toc a:hover { color: var(--accent); background: #edf4f9; text-decoration: none; }
+  .toc a.active {
+    color: var(--accent); border-left-color: var(--accent);
+    background: var(--accent-soft); font-weight: 650;
+  }
+  .toc .sub { padding-left: 22px; font-size: 12.5px; }
+
+  main { min-width: 0; }
+  section { scroll-margin-top: 86px; }
+  h1 {
+    font-size: clamp(30px, 4vw, 44px); line-height: 1.12;
+    letter-spacing: -.025em; margin: 0 0 10px; color: var(--accent);
+  }
+  h2 {
+    font-size: 26px; line-height: 1.2; letter-spacing: -.02em;
+    margin: 56px 0 14px; padding-top: 22px;
+    border-top: 1px solid var(--line); color: var(--accent);
+    scroll-margin-top: 86px;
+  }
+  h3 {
+    font-size: 19px; line-height: 1.3; margin: 30px 0 10px;
+    scroll-margin-top: 86px;
+  }
+  h4 { font-size: 15px; margin: 22px 0 8px; letter-spacing: .01em; }
+  p { margin: 0 0 14px; }
+  .lede { font-size: 18.5px; color: #3a4958; max-width: 74ch; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13.5px; }
+  .nowrap { white-space: nowrap; }
+  .hr { height: 1px; background: var(--line); margin: 28px 0; border: 0; }
+
+  code, kbd, samp { font-family: var(--mono); }
+  :not(pre) > code {
+    background: #eaf0f5; border: 1px solid #dbe4ec;
+    padding: 1px 5px; border-radius: 5px;
+    font-size: .88em; color: #123a5c;
+    overflow-wrap: anywhere;
+  }
+  kbd {
+    background: #fff; border: 1px solid var(--line-strong);
+    border-bottom-width: 2px; border-radius: 5px;
+    padding: 0 5px; font-size: .85em;
+  }
+
+  pre {
+    position: relative;
+    margin: 12px 0 18px;
+    padding: 36px 16px 16px;
+    background: var(--code-bg); color: var(--code-ink);
+    border-radius: 10px; overflow: auto;
+    font-family: var(--mono); font-size: 13px; line-height: 1.55;
+    tab-size: 2;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,.04);
+  }
+  pre code {
+    background: none; border: 0; padding: 0; color: inherit;
+    font-size: inherit; white-space: pre;
+  }
+  pre::before {
+    content: attr(data-lang);
+    position: absolute; top: 9px; left: 14px;
+    font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+    color: #7f97ad; font-weight: 700;
+  }
+  pre.no-lang::before { content: none; }
+  pre .copy {
+    position: absolute; top: 7px; right: 8px;
+    border: 1px solid #33475b; background: #182433; color: #a9bccd;
+    border-radius: 6px; padding: 3px 9px;
+    font-family: var(--sans); font-size: 11px; font-weight: 650;
+    cursor: pointer; opacity: .85;
+  }
+  pre .copy:hover { opacity: 1; color: #fff; border-color: #4b6a86; }
+  pre .copy.copied { color: #9ee6b8; border-color: #2f6b4a; }
+  .tok-key { color: #7fd3ff; }
+  .tok-str { color: #b9e68a; }
+  .tok-num { color: #ffcb6b; }
+  .tok-lit { color: #f78c6c; }
+  .tok-punc { color: #8fa3b8; }
+
+  .diagram {
+    margin: 16px 0 22px; padding: 18px;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    overflow-x: auto;
+  }
+  .diagram figcaption {
+    font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--muted); font-weight: 700; margin-bottom: 10px;
+  }
+  .diagram pre.mermaid {
+    margin: 0; padding: 0; background: transparent; color: var(--ink);
+    box-shadow: none; font-family: var(--sans); overflow: visible;
+  }
+  .diagram pre.mermaid::before { content: none; }
+  .no-mermaid .diagram pre.mermaid {
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    white-space: pre-wrap; background: #f2f5f8; padding: 12px; border-radius: 8px;
+  }
+  .no-mermaid .diagram pre.mermaid::before {
+    content: "Mermaid could not load — diagram source follows";
+    display: block; margin-bottom: 8px; font-family: var(--sans);
+    color: var(--warn); font-weight: 700;
+  }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 18px 20px;
+    margin: 14px 0 20px; box-shadow: var(--shadow);
+  }
+  .card > :first-child { margin-top: 0; }
+  .card > :last-child { margin-bottom: 0; }
+  .quickfacts {
+    display: grid; gap: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    margin: 20px 0 8px;
+  }
+  .fact {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 13px 15px;
+  }
+  .fact .k {
+    display: block; font-size: 10.5px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--muted); font-weight: 750;
+    margin-bottom: 4px;
+  }
+  .fact .v { font-size: 14px; overflow-wrap: anywhere; }
+  .fact .v code { font-size: 12.5px; }
+
+  .callout {
+    margin: 16px 0 20px; padding: 14px 16px 14px 46px;
+    border: 1px solid var(--line); border-left-width: 4px;
+    border-radius: 8px; background: var(--panel); position: relative;
+  }
+  .callout::before {
+    position: absolute; left: 14px; top: 13px;
+    font-size: 17px; line-height: 1;
+  }
+  .callout > :last-child { margin-bottom: 0; }
+  .callout > :first-child { margin-top: 0; }
+  .callout.info { border-left-color: #2a7fae; background: #f2f9fd; }
+  .callout.info::before { content: "ℹ"; color: #2a7fae; }
+  .callout.warn { border-left-color: var(--accent-2); background: var(--warn-soft); }
+  .callout.warn::before { content: "⚠"; color: var(--accent-2); }
+  .callout.bad { border-left-color: var(--bad); background: var(--bad-soft); }
+  .callout.bad::before { content: "✕"; color: var(--bad); }
+  .callout.good { border-left-color: var(--good); background: var(--good-soft); }
+  .callout.good::before { content: "✓"; color: var(--good); }
+  .callout strong:first-child { display: inline; }
+
+  .pill {
+    display: inline-block; border-radius: 999px; padding: 1px 8px;
+    font-size: 11.5px; font-weight: 700; letter-spacing: .02em;
+    border: 1px solid transparent; white-space: nowrap;
+  }
+  .pill.scope { background: #eef3f8; border-color: #d6e0ea; color: #34536e; }
+  .pill.scope.admin { background: #f4ecff; border-color: #ddc9f5; color: #5b2f8a; }
+  .pill.scope.control { background: #e9f7ef; border-color: #c6ead6; color: #1c6b43; }
+  .pill.scope.observe { background: #eaf4fb; border-color: #c9e2f3; color: #16597e; }
+  .method {
+    display: inline-block; min-width: 48px; text-align: center;
+    border-radius: 5px; padding: 1px 7px;
+    font-family: var(--mono); font-size: 11px; font-weight: 800;
+    letter-spacing: .02em; white-space: nowrap;
+  }
+  .method.get { background: #e5f2fb; color: #0d5a86; }
+  .method.post { background: #fff1d6; color: #855000; }
+  .method.put { background: #efe9fb; color: #52298a; }
+  .method.del { background: #fde8e8; color: #962020; }
+  .method.ws { background: #e2f7f2; color: #0d6b58; }
+
+  table {
+    width: 100%; border-collapse: collapse; margin: 12px 0 20px;
+    font-size: 14px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+  }
+  thead th {
+    text-align: left; background: #edf2f7; color: #334a5e;
+    font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase;
+    padding: 9px 11px; border-bottom: 1px solid var(--line-strong);
+    white-space: nowrap;
+  }
+  tbody td { padding: 9px 11px; border-top: 1px solid var(--line); vertical-align: top; }
+  tbody tr:nth-child(even) td { background: #fbfcfd; }
+  tbody td code { white-space: nowrap; }
+  .table-wrap { overflow-x: auto; }
+
+  .route-grid td:first-child { white-space: nowrap; }
+  .field-table td:first-child { white-space: nowrap; font-family: var(--mono); font-size: 12.5px; }
+  .field-table td:nth-child(2) { white-space: nowrap; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+
+  .checklist { margin: 10px 0 18px; padding: 0; list-style: none; }
+  .checklist li { position: relative; padding: 4px 0 4px 26px; }
+  .checklist li::before {
+    content: "✓"; position: absolute; left: 2px; top: 3px;
+    color: var(--good); font-weight: 800;
+  }
+  .checklist.deny li::before {
+    content: "—"; color: var(--muted); font-weight: 700;
+  }
+  .steps { counter-reset: step; margin: 12px 0 20px; padding: 0; list-style: none; }
+  .steps li { counter-increment: step; position: relative; padding: 10px 0 10px 42px; border-top: 1px solid var(--line); }
+  .steps li:first-child { border-top: 0; }
+  .steps li::before {
+    content: counter(step); position: absolute; left: 0; top: 12px;
+    width: 26px; height: 26px; border-radius: 50%;
+    display: grid; place-items: center;
+    background: var(--accent-soft); color: var(--accent);
+    font-size: 12px; font-weight: 800;
+  }
+  .steps li > :last-child { margin-bottom: 0; }
+
+  .anchor {
+    margin-left: 8px; color: var(--line-strong); font-weight: 400;
+    opacity: 0; text-decoration: none; font-size: .75em;
+  }
+  h2:hover .anchor, h3:hover .anchor, .anchor:focus { opacity: 1; text-decoration: none; }
+
+  footer {
+    max-width: 1240px; margin: 0 auto; padding: 26px 24px 50px;
+    border-top: 1px solid var(--line); color: var(--muted); font-size: 13.5px;
+  }
+  footer .row { display: flex; gap: 16px; flex-wrap: wrap; justify-content: space-between; }
+
+  @media (max-width: 1040px) {
+    .shell { grid-template-columns: 1fr; gap: 22px; padding-top: 22px; }
+    .toc {
+      position: static; max-height: none; border-right: 0;
+      border: 1px solid var(--line); border-radius: var(--radius);
+      background: var(--panel); padding: 14px 16px;
+    }
+    .toc-details > summary { display: block; }
+    .toc-details > summary::after { content: " ▾"; float: right; }
+    .toc-details[open] > summary::after { content: " ▴"; }
+    .toc-details > summary:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px;
+    }
+    .toc ol { columns: 2; column-gap: 24px; margin-top: 10px; }
+    .toc li { break-inside: avoid; }
+    .toc .sub { display: none; }
+  }
+  @media (max-width: 620px) {
+    .topbar-inner { padding: 12px 16px; }
+    .shell { padding: 18px 16px 50px; }
+    footer { padding-left: 16px; padding-right: 16px; }
+    .toc ol { columns: 1; }
+    table { font-size: 13px; }
+    pre { font-size: 12px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { transition: none !important; animation: none !important; }
+  }
+  @media print {
+    .topbar, .toc, pre .copy, .skip { display: none !important; }
+    .shell { display: block; max-width: none; padding: 0; }
+    body { background: #fff; font-size: 11pt; }
+    h2 { page-break-after: avoid; }
+    pre, .diagram, .callout, table { page-break-inside: avoid; }
+    pre { white-space: pre-wrap; }
+    a { color: inherit; text-decoration: none; }
+  }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <span>TFG Control Plane <small>HTTP &amp; WebSocket API reference</small></span>
+    </div>
+    <span class="spacer"></span>
+    <span class="badge v2"><strong>protocol</strong> v2</span>
+    <span class="badge"><strong>routes</strong> /v1</span>
+    <span class="badge"><strong>format</strong> JSON + WS</span>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="toc" aria-label="Table of contents">
+    <details class="toc-details" open>
+      <summary>On this page</summary>
+      <ol>
+        <li><a href="#overview">Overview</a></li>
+        <li><a href="#enabling">Enabling the endpoint</a></li>
+        <li><a href="#auth">Authentication &amp; scopes</a></li>
+        <li><a href="#routes">Route index</a></li>
+        <li><a href="#pairing">Pairing &amp; devices</a></li>
+        <li><a href="#reads">Reads</a></li>
+        <li><a class="sub" href="#read-state">State</a></li>
+        <li><a class="sub" href="#read-session">Session</a></li>
+        <li><a class="sub" href="#read-views">Views &amp; cameras</a></li>
+        <li><a class="sub" href="#read-displays">Displays &amp; settings</a></li>
+        <li><a class="sub" href="#read-pictures">Hull pictures</a></li>
+        <li><a href="#readiness">Readiness &amp; phases</a></li>
+        <li><a href="#hulls">Sessions &amp; hulls</a></li>
+        <li><a href="#commands">Commands</a></li>
+        <li><a class="sub" href="#command-envelope">Envelope &amp; replies</a></li>
+        <li><a class="sub" href="#command-catalog">Command catalog</a></li>
+        <li><a class="sub" href="#command-gate">Readiness gate</a></li>
+        <li><a href="#stream">Event stream</a></li>
+        <li><a href="#errors">Errors</a></li>
+        <li><a href="#limits">Limits &amp; timings</a></li>
+        <li><a href="#recipes">Client recipes</a></li>
+        <li><a href="#pitfalls">Common pitfalls</a></li>
+        <li><a href="#companions">Companion docs</a></li>
+      </ol>
+    </details>
+  </nav>
+
+  <main id="main">
+
+    <h1>TFG Control Plane API</h1>
+    <p class="lede">
+      A host can expose a small control endpoint so a phone, a command-center wall,
+      or <code>tfgctl</code> can read the shared state, observe a live exercise, and
+      move the observer camera. This page is the wire contract: routes, field names,
+      JSON bodies, event names, and the rules the server actually enforces.
+    </p>
+
+    <div class="quickfacts">
+      <div class="fact">
+        <span class="k">Base URL</span>
+        <span class="v"><code>http://&lt;host&gt;:8787/v1</code></span>
+      </div>
+      <div class="fact">
+        <span class="k">Content type</span>
+        <span class="v"><code>application/json</code></span>
+      </div>
+      <div class="fact">
+        <span class="k">Auth</span>
+        <span class="v"><code>Authorization: Bearer &lt;token&gt;</code></span>
+      </div>
+      <div class="fact">
+        <span class="k">Envelope version</span>
+        <span class="v"><code>protocol_version: 2</code></span>
+      </div>
+      <div class="fact">
+        <span class="k">Realtime</span>
+        <span class="v"><code>GET /v1/ws</code> · bearer on upgrade</span>
+      </div>
+      <div class="fact">
+        <span class="k">Hosts</span>
+        <span class="v"><code>tfg</code> embedded · <code>tfg-server</code> headless</span>
+      </div>
+    </div>
+
+    <div class="callout warn">
+      <strong>There is no <code>GET /v1/sessions</code>.</strong>
+      The control plane exposes the <em>current</em> projection at
+      <code>GET /v1/session</code> (singular). A list of exercises is a Minos
+      concern and is not part of this API.
+    </div>
+
+    <div class="callout info">
+      <strong>Readiness is not a phase test.</strong>
+      <code>readiness.ready</code> means “observation is open”: execution
+      <em>and</em> a live command-center display <em>and</em> a fresh session.
+      To ask whether the console is in execution, read
+      <code>session.phase === "execution"</code>. See
+      <a href="#readiness">Readiness &amp; phases</a>.
+    </div>
+
+    <section id="overview">
+      <h2>Overview</h2>
+      <p>
+        The control plane is a projection, not a second game server. The console
+        is the only process that holds a Minos credential and reads Minos; it
+        publishes what a viewer needs to a shared <strong>hub</strong>. The hub
+        owns the cameras, the exercise projection, the readiness verdict, and the
+        list of attached displays. HTTP reads and the WebSocket stream both come
+        from that one state.
+      </p>
+
+      <figure class="diagram">
+        <figcaption>Deployment shapes</figcaption>
+        <pre class="mermaid">
+flowchart TB
+  Minos["Minos backend"]
+  subgraph Console["tfg · console host"]
+    Shell["GPUI shell + fix registry"] --> Hub["ControlHub"]
+    Hub --- API["HTTP + WebSocket /v1"]
+  end
+  subgraph Headless["tfg-server · headless host"]
+    HHub["ControlHub"] --- HAPI["HTTP + WebSocket /v1"]
+  end
+  Phone["phone · paired device"]
+  Wall["command center · --mode command-center"]
+  Minos -->|console reads only| Shell
+  API -->|HTTP + WS| Phone
+  API -->|WS| Wall
+  HAPI -.-> Phone
+  HAPI -.-> Wall
+  Shell -.->|PUT /v1/session while following| HAPI
+        </pre>
+      </figure>
+
+      <h3>The two hosts</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Host</th><th>What it owns</th><th>What it does not do</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong><code>tfg</code></strong> (embedded)</td>
+              <td>The operator's window, the map picture, the Minos session, and
+                  the control server bound to that running console.</td>
+              <td>It does not attach itself as a command-center display. A wall is
+                  a separate process.</td>
+            </tr>
+            <tr>
+              <td><strong><code>tfg-server</code></strong> (headless)</td>
+              <td>The camera state and the control endpoint. It owns the same
+                  Mercator arithmetic and zoom rails as the console.</td>
+              <td>No tiles, no marks, no picture, and no Minos session of its own.
+                  A session appears only when a console publishes one.</td>
+            </tr>
+            <tr>
+              <td><strong><code>tfg --mode command-center</code></strong></td>
+              <td>A display: it follows a host over <code>/v1/ws</code>, renders the
+                  <code>observer</code> view, and announces itself as a
+                  <code>command_center</code>.</td>
+              <td>It opens no listener and takes no camera gesture. It is what the
+                  phone remotes.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>What this API is — and is not</h3>
+      <div class="card">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>The API carries</th><th>The API never carries</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>
+                  <ul class="checklist">
+                    <li>Cameras: <code>main</code> and <code>observer</code>.</li>
+                    <li>The console's projection of the exercise: phase, mode,
+                        scenario, units, participants, recent traffic.</li>
+                    <li>A computed readiness verdict and the attached displays.</li>
+                    <li>Semantic commands: nudge, zoom, set, focus, panel toggles,
+                        text size, viewport reports.</li>
+                    <li>Hull photographs, as PNG.</li>
+                  </ul>
+                </td>
+                <td>
+                  <ul class="checklist deny">
+                    <li>Minos credentials or direct Minos access.</li>
+                    <li>Map tiles or a rendered map image.</li>
+                    <li>The full game state beyond the projection.</li>
+                    <li>Console widget state: hover, drag, caret,
+                        pickers, animations.</li>
+                    <li>A session list or a command-status endpoint.</li>
+                  </ul>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="enabling">
+      <h2>Enabling the endpoint</h2>
+      <p>
+        The endpoint is off unless the operator turns it on. The same variables
+        configure the embedded console and the headless server.
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Variable</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>TFG_CONTROL_LISTEN</code></td><td>Address to bind, e.g.
+              <code>127.0.0.1:8787</code> or <code>0.0.0.0:8787</code>. Loopback is
+              the safe default; binding the LAN is an explicit choice.</td></tr>
+            <tr><td><code>TFG_CONTROL_TOKEN</code></td><td>The operator bearer token.
+              At least 32 characters, or the server refuses to start. Generate with
+              <code>openssl rand -hex 32</code>.</td></tr>
+            <tr><td><code>TFG_CONTROL_SERVER</code></td><td>An
+              <code>http://host:port</code> to follow instead of hosting. The console
+              becomes a display client for that host.</td></tr>
+            <tr><td><code>TFG_CONTROL_DEVICES</code></td><td>Paired-device table.
+              Default <code>$XDG_DATA_HOME/tfg/control-devices.json</code>.</td></tr>
+            <tr><td><code>TFG_DISPLAY_ID</code> / <code>TFG_DISPLAY_LABEL</code></td>
+              <td>Identity of a command-center display. A stable id replaces the old
+              record on reconnect instead of stacking a second one.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout info">
+        <strong><code>TFG_CONTROL_SERVER</code> wins when both directions are set.</strong>
+        A console cannot host and follow at the same time. With
+        <code>TFG_CONTROL_SERVER</code> present, <code>TFG_CONTROL_LISTEN</code> is
+        ignored and the console says so.
+      </div>
+
+      <h3>Start a host</h3>
+      <pre data-lang="bash"><code># Embedded console host
+TFG_CONTROL_LISTEN=127.0.0.1:8787 \
+TFG_CONTROL_TOKEN="$(openssl rand -hex 32)" \
+cargo run
+
+# Headless host, with no window at all
+cargo run --bin tfg-server -- \
+  --listen 0.0.0.0:8787 \
+  --token "$(openssl rand -hex 32)"</code></pre>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th><code>tfg-server</code> flag</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>--listen ADDR</code></td><td>Default <code>127.0.0.1:8787</code>
+              (or <code>TFG_CONTROL_LISTEN</code>).</td></tr>
+            <tr><td><code>--token TOKEN</code></td><td>The operator token
+              (or <code>TFG_CONTROL_TOKEN</code>). Generated and printed when absent
+              on loopback; required on a LAN bind.</td></tr>
+            <tr><td><code>--devices PATH</code></td><td>The device table.</td></tr>
+            <tr><td><code>--ephemeral</code></td><td>Keep the table in memory; nothing
+              survives exit.</td></tr>
+            <tr><td><code>--lat</code> / <code>--lon</code> / <code>--zoom</code></td>
+              <td>The starting camera. Defaults to the console's opening camera.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Start the wall the phone remotes</h3>
+      <pre data-lang="bash"><code>TFG_CONTROL_SERVER=http://192.168.1.15:8787 \
+TFG_CONTROL_TOKEN="$OPERATOR_TOKEN" \
+TFG_DISPLAY_ID=wall-1 \
+TFG_DISPLAY_LABEL=wall-1 \
+cargo run -- --mode command-center</code></pre>
+      <p>
+        From this checkout the two roles have scripts. Run them in separate
+        terminals, host first:
+      </p>
+      <pre data-lang="bash"><code># Terminal 1 - the host (console, Minos session, /v1 endpoint)
+scripts/tfg-host.sh
+
+# Terminal 2 - the wall (observer view, attaches as command_center)
+scripts/tfg-command-center.sh</code></pre>
+      <div class="callout info">
+        <strong><code>tfg-host.sh --mode command-center</code> is the wall, not the host.</strong>
+        The host script delegates that spelling to
+        <code>tfg-command-center.sh</code>, because one process cannot host and
+        follow itself. The host still has to be running.
+      </div>
+
+      <div class="callout info">
+        <strong>One host per devices file.</strong>
+        Two processes sharing a <code>TFG_CONTROL_DEVICES</code> path each hold
+        their own copy in memory, and the last writer wins. Do not run a console
+        host and a headless host against the same file at the same time;
+        <code>--ephemeral</code> is the throwaway option.
+      </div>
+
+      <div class="callout warn">
+        <strong>The console window is not a command center.</strong>
+        Readiness requires a <code>command_center</code> display, and a console
+        does not attach itself as one. Run the wall above, or use
+        <code>tfgctl display attach</code> as a headless stand-in.
+      </div>
+    </section>
+
+    <section id="auth">
+      <h2>Authentication &amp; scopes</h2>
+      <p>
+        Every route except <code>GET /v1/hello</code> and <code>POST /v1/pair</code>
+        requires a bearer token:
+      </p>
+      <pre data-lang="http"><code>Authorization: Bearer &lt;token&gt;</code></pre>
+
+      <p>
+        A missing or wrong token is <code>401 unauthorized</code> with
+        <code>WWW-Authenticate: Bearer</code>. A token that is real but lacks the
+        scope is <code>403 forbidden</code> — “not this token's job” rather than
+        “not a token”.
+      </p>
+
+      <h3>Two kinds of credential</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Credential</th><th>Grant id</th><th>Scopes</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>TFG_CONTROL_TOKEN</code></td>
+              <td><code>operator</code></td>
+              <td><span class="pill scope observe">observe</span>
+                  <span class="pill scope control">control_view</span>
+                  <span class="pill scope admin">admin</span></td>
+              <td>Environment-only. Never written to disk, never returned by a
+                  route, cannot be rotated over HTTP.</td>
+            </tr>
+            <tr>
+              <td>A paired device</td>
+              <td><code>dev-…</code></td>
+              <td>Whatever the pairing window granted</td>
+              <td>Token returned once at pairing, stored as a SHA-256 hash.
+                  <code>admin</code> is refused to paired devices on purpose.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>What each scope allows</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Scope</th><th>Allows</th><th>Implies</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><span class="pill scope observe">observe</span></td>
+              <td><code>GET /v1/state</code>, <code>/v1/views*</code>,
+                  <code>/v1/session</code>, <code>/v1/displays</code>,
+                  <code>/v1/settings</code>, hull picture reads,
+                  <code>GET /v1/ws</code></td>
+              <td>—</td>
+            </tr>
+            <tr>
+              <td><span class="pill scope control">control_view</span></td>
+              <td>Every command in <code>POST /v1/commands</code>, including
+                  <code>view.report</code> and <code>settings.font</code></td>
+              <td><span class="pill scope observe">observe</span></td>
+            </tr>
+            <tr>
+              <td><span class="pill scope admin">admin</span></td>
+              <td>Open a pairing window, list and revoke devices, publish or clear
+                  the session projection, publish hull pictures</td>
+              <td>everything</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout info">
+        <strong>A phone never carries <code>admin</code>.</strong>
+        <code>POST /v1/pairing</code> refuses a request for
+        <code>admin</code> with <code>422 invalid_command</code>. That is also why a
+        phone cannot fake the display presence that satisfies readiness.
+      </div>
+
+      <h3>Version negotiation</h3>
+      <p>
+        Routes live under <code>/v1/</code>; the envelope version is
+        <code>2</code>. Send <code>"protocol_version": 2</code> in command bodies.
+        If the field is present and differs, the server refuses with
+        <code>409 unsupported_protocol</code>. An absent field is currently
+        accepted, but clients should still send <code>2</code>: being refused is
+        better than being misread.
+      </p>
+      <p class="small muted">
+        The API version and the envelope version are separate on purpose: a path is
+        a place, a version is a language. <code>GET /v1/hello</code> reports both.
+      </p>
+
+      <div class="callout warn">
+        <strong>Never ship the operator token in the phone.</strong>
+        The phone pairs for its own <code>dev-…</code> token. Store that token in the
+        platform keystore, never in source or logs, and revoke it when the device is
+        lost. There is no TLS on this endpoint yet: run it on a trusted LAN or a
+        VPN, not across the open internet.
+      </div>
+    </section>
+
+    <section id="routes">
+      <h2>Route index</h2>
+      <p>
+        Every route the server serves. “Bearer” means any valid token;
+        the scope column is the additional permission required. JSON responses are
+        UTF-8 <code>application/json</code>; the hull picture route is
+        <code>image/png</code>.
+      </p>
+      <div class="table-wrap">
+        <table class="route-grid">
+          <thead>
+            <tr><th>Method</th><th>Path</th><th>Permission</th><th>Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><span class="method get">GET</span></td><td><code>/v1/hello</code></td><td>none</td>
+              <td>Protocol version, current revision, whether a pairing window is open.</td></tr>
+            <tr><td><span class="method post">POST</span></td><td><code>/v1/pair</code></td><td>pairing code</td>
+              <td>Spend a one-time code, receive a device token.</td></tr>
+            <tr><td><span class="method get">GET</span></td><td><code>/v1/whoami</code></td><td>bearer</td>
+              <td>Which grant and scopes this token resolved to.</td></tr>
+            <tr><td><span class="method get">GET</span></td><td><code>/v1/state</code></td><td><span class="pill scope observe">observe</span></td>
+              <td>Whole shared state: views, session, readiness, displays, UI.</td></tr>
+            <tr><td><span class="method get">GET</span></td><td><code>/v1/views</code></td><td><span class="pill scope observe">observe</span></td>
+              <td>All named views and their cameras.</td></tr>
+            <tr><td><span class="method get">GET</span></td><td><code>/v1/views/{view_id}/camera</code></td><td><span class="pill scope observe">observe</span></td>
+              <td>One camera. Unknown view is <code>404</code>.</td></tr>
+            <tr><td><span class="method get">GET</span></td><td><code>/v1/session</code></td><td><span class="pill scope observe">observe</span></td>
+              <td>Current exercise projection, readiness, displays, observer UI.</td></tr>
+            <tr><td><span class="method put">PUT</span></td><td><code>/v1/session</code></td><td><span class="pill scope admin">admin</span></td>
+              <td>Publish or replace the projection. Same body is a heartbeat.</td></tr>
+            <tr><td><span class="method del">DELETE</span></td><td><code>/v1/session</code></td><td><span class="pill scope admin">admin</span></td>
+              <td>The console no longer holds an exercise.</td></tr>
+            <tr><td><span class="method get">GET</span></td><td><code>/v1/displays</code></td><td><span class="pill scope observe">observe</span></td>
+              <td>Live command centers and readiness.</td></tr>
+            <tr><td><span class="method get">GET</span></td><td><code>/v1/settings</code></td><td><span class="pill scope observe">observe</span></td>
+              <td>The host's text-size ladder.</td></tr>
+            <tr><td><span class="method get">GET</span></td><td><code>/v1/units/{unit_id}/picture</code></td><td><span class="pill scope observe">observe</span></td>
+              <td>Hull photograph as <code>image/png</code>.</td></tr>
+            <tr><td><span class="method put">PUT</span></td><td><code>/v1/units/{unit_id}/picture</code></td><td><span class="pill scope admin">admin</span></td>
+              <td>Publish a hull photograph. PNG body, up to 4 MiB.</td></tr>
+            <tr><td><span class="method post">POST</span></td><td><code>/v1/commands</code></td><td><span class="pill scope control">control_view</span></td>
+              <td>Send one command. <code>202</code> accepted or <code>200</code> duplicate.</td></tr>
+            <tr><td><span class="method post">POST</span></td><td><code>/v1/pairing</code></td><td><span class="pill scope admin">admin</span></td>
+              <td>Open a pairing window and get a code.</td></tr>
+            <tr><td><span class="method get">GET</span></td><td><code>/v1/devices</code></td><td><span class="pill scope admin">admin</span></td>
+              <td>List paired devices. Hashes are never included.</td></tr>
+            <tr><td><span class="method del">DELETE</span></td><td><code>/v1/devices/{id}</code></td><td><span class="pill scope admin">admin</span></td>
+              <td>Revoke a device immediately and remove it from the table.</td></tr>
+            <tr><td><span class="method post">POST</span></td><td><code>/v1/auth/rotate</code></td><td>bearer</td>
+              <td>Rotate the caller's own device token. Operator is refused.</td></tr>
+            <tr><td><span class="method ws">WS</span></td><td><code>/v1/ws</code></td><td><span class="pill scope observe">observe</span></td>
+              <td>WebSocket stream: snapshot, camera and session events.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small muted">
+        An unknown path or an unmatched method returns <code>404 not_found</code>.
+        The server does not return <code>405</code>.
+      </p>
+    </section>
+
+    <section id="pairing">
+      <h2>Pairing &amp; devices</h2>
+      <p>
+        Pairing is built for a LAN and a phone. The operator holds the operator
+        token and opens a short window; the phone spends the code and receives its
+        own long-lived device token.
+      </p>
+
+      <figure class="diagram">
+        <figcaption>Pairing sequence</figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant Op as Operator
+  participant Host as TFG host
+  participant QR as Code / QR display
+  participant Phone as Phone
+
+  Op->>Host: POST /v1/pairing
+  Host-->>Op: code, url, scopes
+  Op->>QR: show code or QR
+  Phone->>QR: scan or type code
+  Phone->>Host: POST /v1/pair
+  alt code valid
+    Host-->>Phone: device token
+    Phone->>Host: GET /v1/state
+    Host-->>Phone: snapshot
+  else wrong or expired
+    Host-->>Phone: 401 / 410 / 429
+  end
+        </pre>
+      </figure>
+
+      <h3>Step 1 — the operator opens a window</h3>
+      <p>
+        <span class="method post">POST</span> <code>/v1/pairing</code>
+        <span class="pill scope admin">admin</span>
+      </p>
+      <pre data-lang="json"><code>{
+  "scopes": ["observe", "control_view"],
+  "ttl_seconds": 120
+}</code></pre>
+      <pre data-lang="json"><code>{
+  "code": "K7QM-3XPD",
+  "expires_in": 120,
+  "uri": "tfg-control://pair?url=http://192.168.1.20:8787&amp;code=K7QM-3XPD",
+  "payload": "{\"protocol\":\"tfg-control\",\"version\":1,\"url\":\"http://192.168.1.20:8787\",\"pairing_code\":\"K7QM-3XPD\"}",
+  "url": "http://192.168.1.20:8787",
+  "scopes": ["observe", "control_view"]
+}</code></pre>
+      <ul>
+        <li><code>scopes</code> defaults to <code>["observe", "control_view"]</code>.</li>
+        <li><code>ttl_seconds</code> is clamped to <code>30 to 600</code>; default
+          <code>120</code>.</li>
+        <li><code>admin</code> in the requested scopes is refused with
+          <code>422 invalid_command</code>.</li>
+        <li>Opening a window replaces any window already open: one code is live at
+          a time.</li>
+        <li><code>url</code> is the direct base URL a client should use.
+          <code>uri</code> and <code>payload</code> are the same offer for a QR code
+          or deep link. The server does not render a QR image.</li>
+        <li>A <code>0.0.0.0</code> bind advertises the machine's first non-loopback
+          IPv4, not <code>0.0.0.0</code>.</li>
+      </ul>
+
+      <h3>Step 2 — the phone spends the code</h3>
+      <p>
+        <span class="method post">POST</span> <code>/v1/pair</code> — no bearer
+        token. The code <em>is</em> the credential.
+      </p>
+      <pre data-lang="json"><code>{
+  "code": "k7qm 3xpd",
+  "label": "phone"
+}</code></pre>
+      <pre data-lang="json"><code>{
+  "device": {
+    "id": "dev-4b2379bfa714",
+    "label": "phone",
+    "scopes": ["observe", "control_view"],
+    "created_at": 1793084168,
+    "last_seen": 1793084168
+  },
+  "token": "9f2c4a7d1e8b3f6a0c5d9e2b7a4f1c8d6e3b9a0f5c2d7e4b1a8f6c3d9e0b2a47",
+  "url": "http://192.168.1.20:8787"
+}</code></pre>
+      <ul>
+        <li>The code is single-use and is spent on success.</li>
+        <li>Case, spaces and the dash do not matter; <code>I</code>/<code>L</code>
+          fold to <code>1</code>, and <code>O</code> folds to <code>0</code>, because
+          a code is read off a screen.</li>
+        <li>Five wrong guesses close the window (<code>429 too_many_attempts</code>).</li>
+        <li>The token is 64 hex characters, returned <strong>once</strong>, and
+          stored only as a SHA-256 hash. Store it in the platform keystore.</li>
+      </ul>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Pairing failure</th><th>HTTP</th><th><code>error.code</code></th></tr></thead>
+          <tbody>
+            <tr><td>No window is open</td><td>404</td><td><code>no_pairing_window</code></td></tr>
+            <tr><td>Wrong code; window still open</td><td>401</td><td><code>invalid_pairing_code</code></td></tr>
+            <tr><td>Code lived out its TTL</td><td>410</td><td><code>pairing_expired</code></td></tr>
+            <tr><td>Five wrong guesses</td><td>429</td><td><code>too_many_attempts</code></td></tr>
+            <tr><td>Token generation failed</td><td>500</td><td><code>server_error</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>List, revoke, rotate</h3>
+      <p>
+        <span class="method get">GET</span> <code>/v1/devices</code>
+        <span class="pill scope admin">admin</span>
+      </p>
+      <pre data-lang="json"><code>{
+  "devices": [
+    {
+      "id": "dev-4b2379bfa714",
+      "label": "phone",
+      "scopes": ["observe", "control_view"],
+      "created_at": 1793084168,
+      "last_seen": 1793084199
+    }
+  ]
+}</code></pre>
+
+      <p>
+        <span class="method del">DELETE</span> <code>/v1/devices/{id}</code>
+        <span class="pill scope admin">admin</span>
+      </p>
+      <pre data-lang="json"><code>{
+  "device": "dev-4b2379bfa714",
+  "status": "revoked"
+}</code></pre>
+
+      <p>
+        <span class="method post">POST</span> <code>/v1/auth/rotate</code> — no
+        request body; the bearer token identifies the device.
+      </p>
+      <pre data-lang="json"><code>{
+  "device": "dev-4b2379bfa714",
+  "token": "0a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef"
+}</code></pre>
+      <div class="callout warn">
+        <strong>Called with the operator token, rotate is refused.</strong>
+        It answers <code>422</code> with <code>error.code = "forbidden"</code> and a
+        message saying to change <code>TFG_CONTROL_TOKEN</code> and restart. An
+        environment variable cannot be rotated by a request.
+      </div>
+    </section>
+
+    <section id="reads">
+      <h2>Reads</h2>
+      <p>
+        Reads are cheap and safe to poll. The mobile app should use
+        <code>GET /v1/state</code> at launch, then keep the WebSocket open and treat
+        every <code>snapshot</code> and <code>session.changed</code> as authoritative.
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Read</th><th>Use it for</th><th>Returns</th></tr></thead>
+          <tbody>
+            <tr><td><code>GET /v1/state</code></td><td>Launch and full refresh; same shape as the WS snapshot.</td><td>Views, session, readiness, displays, ui.</td></tr>
+            <tr><td><code>GET /v1/session</code></td><td>The waiting screen and a lightweight session poll.</td><td>Session, readiness, displays, ui.</td></tr>
+            <tr><td><code>GET /v1/displays</code></td><td>Which walls are attached.</td><td>Displays and readiness.</td></tr>
+            <tr><td><code>GET /v1/views</code></td><td>Camera positions only.</td><td>Named views and their cameras.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="read-hello"><span class="method get">GET</span> <code>/v1/hello</code></h3>
+      <p>Unauthenticated. Reports the envelope, the current revision, and whether a pairing window is live.</p>
+      <pre data-lang="json"><code>{
+  "protocol_version": 2,
+  "api_version": "v1",
+  "service": "tfg-control",
+  "revision": 42,
+  "pairing_open": false
+}</code></pre>
+
+      <h3 id="read-whoami"><span class="method get">GET</span> <code>/v1/whoami</code></h3>
+      <p>Any valid bearer. The first thing to call when a command is refused.</p>
+      <pre data-lang="json"><code>{
+  "client": "dev-4b2379bfa714",
+  "label": "phone",
+  "scopes": ["observe", "control_view"]
+}</code></pre>
+
+      <h3 id="read-state"><span class="method get">GET</span> <code>/v1/state</code></h3>
+      <p>
+        The whole shared state, and the same shape the WebSocket sends on connect.
+        This is the one call the phone needs for a first screen: cameras, the
+        exercise projection (including hulls), readiness, and displays.
+      </p>
+      <pre data-lang="json"><code>{
+  "type": "snapshot",
+  "protocol_version": 2,
+  "revision": 42,
+  "views": {
+    "main": {
+      "id": "main",
+      "camera": {
+        "center": { "latitude": -6.108, "longitude": 106.91 },
+        "zoom": 11.0,
+        "width": 1600,
+        "height": 900
+      }
+    },
+    "observer": {
+      "id": "observer",
+      "camera": {
+        "center": { "latitude": -5.9123, "longitude": 105.8412 },
+        "zoom": 12.0,
+        "width": 1280,
+        "height": 720
+      }
+    }
+  },
+  "session": {
+    "game_id": 4127,
+    "name": "Sunda Strait Watch",
+    "phase": "execution",
+    "mode": "maneuver",
+    "scenario": {
+      "id": 88,
+      "title": "Sunda Strait, first light",
+      "step": "Step 3 of 7: shadow the contact"
+    },
+    "units": [
+      {
+        "index": 1,
+        "id": 9001,
+        "name": "Evertsen",
+        "hull_number": "F805",
+        "class_name": "Karel Doorman frigate",
+        "commander": { "id": 501, "name": "Lt Cdr Halvorsen" },
+        "embarked": [
+          { "id": 9101, "name": "NH90 N-110", "hull_number": "N-110" }
+        ],
+        "position": { "latitude": -5.9123, "longitude": 105.8412 },
+        "heading_deg": 72.0,
+        "speed_kn": 18.4,
+        "stale": false,
+        "loa_m": 122.3,
+        "beam_m": 14.4,
+        "affiliation": "friendly",
+        "symbol": "frigate"
+      }
+    ],
+    "participants": [
+      {
+        "id": 501,
+        "name": "Lt Cdr Halvorsen",
+        "role": "Commanding Officer",
+        "judge": false,
+        "ready": true
+      }
+    ],
+    "messages": [
+      {
+        "id": 7001,
+        "kind": "telegram",
+        "class_label": "OPERATIONAL",
+        "sender": "CTF",
+        "assumed": false,
+        "broadcast": true,
+        "content": "Assume shadowing station at 12 nautical miles.",
+        "at": "2026-10-29T04:12:00Z",
+        "degree": "FLASH"
+      }
+    ]
+  },
+  "readiness": { "ready": true },
+  "displays": [
+    {
+      "id": "wall-1",
+      "label": "wall-1",
+      "role": "command_center",
+      "viewport": { "width": 1280, "height": 720 }
+    }
+  ],
+  "ui": {
+    "panels": { "crew": true, "scenario": false, "comms": false },
+    "focus": 9001
+  }
+}</code></pre>
+
+      <h4>Snapshot fields</h4>
+      <div class="table-wrap">
+        <table class="field-table">
+          <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td>type</td><td>string</td><td>Always <code>"snapshot"</code>.</td></tr>
+            <tr><td>protocol_version</td><td>number</td><td><code>2</code>.</td></tr>
+            <tr><td>revision</td><td>number</td><td>Monotonic over shared-state changes. Only real changes bump it; acknowledgements repeat a revision.</td></tr>
+            <tr><td>views</td><td>object</td><td>Map of view id to <code>{ id, camera }</code>. <code>main</code> always exists; <code>observer</code> exists after the first command center attaches.</td></tr>
+            <tr><td>session</td><td>object | null</td><td>The console's projection, or <code>null</code> when it holds no exercise. Still present when stale.</td></tr>
+            <tr><td>readiness</td><td>object</td><td><code>{ ready, reason? }</code>, computed live.</td></tr>
+            <tr><td>displays</td><td>array</td><td>Live command centers only; expired records are filtered.</td></tr>
+            <tr><td>ui</td><td>object</td><td>The observer's open panels and focused hull. Host-owned so every wall agrees; a new game id resets it.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="read-views"><span class="method get">GET</span> <code>/v1/views</code></h3>
+      <pre data-lang="json"><code>{
+  "views": {
+    "main": {
+      "id": "main",
+      "camera": {
+        "center": { "latitude": -6.108, "longitude": 106.91 },
+        "zoom": 11.0,
+        "width": 1600,
+        "height": 900
+      }
+    },
+    "observer": {
+      "id": "observer",
+      "camera": {
+        "center": { "latitude": -5.9123, "longitude": 105.8412 },
+        "zoom": 12.0,
+        "width": 1280,
+        "height": 720
+      }
+    }
+  }
+}</code></pre>
+
+      <h3><span class="method get">GET</span> <code>/v1/views/{view_id}/camera</code></h3>
+      <pre data-lang="json"><code>{
+  "id": "main",
+  "camera": {
+    "center": { "latitude": -6.108, "longitude": 106.91 },
+    "zoom": 11.0,
+    "width": 1600,
+    "height": 900
+  }
+}</code></pre>
+      <ul>
+        <li><code>main</code> is the operator's camera.</li>
+        <li><code>observer</code> is the camera a phone may move. It is a separate
+          view, so a remote move cannot drag the game master's map.</li>
+        <li>An unknown view is <code>404 not_found</code>.</li>
+        <li><code>width</code>/<code>height</code> are the rendering surface's
+          viewport in device pixels. A fraction-of-viewport nudge is resolved
+          against them.</li>
+      </ul>
+
+      <h3 id="read-session"><span class="method get">GET</span> <code>/v1/session</code></h3>
+      <p>
+        The exercise the console projected, whether observation is open, which
+        command centers are attached, and the observer's UI. This is the read a
+        waiting screen polls.
+      </p>
+      <pre data-lang="json"><code>{
+  "session": {
+    "game_id": 4127,
+    "name": "Sunda Strait Watch",
+    "phase": "execution",
+    "mode": "maneuver",
+    "scenario": {
+      "id": 88,
+      "title": "Sunda Strait, first light",
+      "step": "Step 3 of 7: shadow the contact"
+    },
+    "units": [],
+    "participants": [],
+    "messages": []
+  },
+  "readiness": { "ready": false, "reason": "no_display" },
+  "displays": [],
+  "ui": {
+    "panels": { "crew": true, "scenario": false, "comms": false }
+  }
+}</code></pre>
+
+      <div class="callout info">
+        <strong>The session is nested, not flat.</strong>
+        The response is
+        <code>{ session, readiness, displays, ui }</code>. The phase is
+        <code>session.phase</code>, not a top-level field. A flat response like
+        <code>{ "game_id": 45, "phase": "execution" }</code> belongs to no version
+        of this server.
+      </div>
+
+      <h4>SessionState fields</h4>
+      <div class="table-wrap">
+        <table class="field-table">
+          <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td>game_id</td><td>number</td><td>Minos game id. Always positive when a session exists.</td></tr>
+            <tr><td>name</td><td>string</td><td>The exercise's name.</td></tr>
+            <tr><td>phase</td><td>string</td><td><code>planning</code>, <code>preparation</code>, <code>execution</code>, or <code>closure</code>. Sent as the server's own word; unknown words are shown as-is.</td></tr>
+            <tr><td>mode</td><td>string</td><td><code>maneuver</code>, <code>static</code>, or <code>scenario</code>. Empty when the mode could not be named.</td></tr>
+            <tr><td>scenario</td><td>object?</td><td><code>{ id, title, step? }</code> — the scenario being played, never the whole book.</td></tr>
+            <tr><td>units</td><td>array</td><td>The hulls a viewer may see. This is the grid's data. See <a href="#hulls">Sessions &amp; hulls</a>.</td></tr>
+            <tr><td>participants</td><td>array</td><td>The exercise's seats: <code>{ id, name, role, judge, ready }</code>.</td></tr>
+            <tr><td>messages</td><td>array</td><td>The most recent traffic, newest first, bounded to 40. <code>{ id, kind, class_label, sender, assumed, broadcast, content, at, degree }</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>UnitState fields</h4>
+      <div class="table-wrap">
+        <table class="field-table">
+          <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td>index</td><td>number</td><td>1-based number shared by the phone's grid and the wall's marker. Assigned by the hub from array order.</td></tr>
+            <tr><td>id</td><td>number</td><td>The unit id to send in <code>camera.focus</code>. Not the grid number.</td></tr>
+            <tr><td>name</td><td>string</td><td>Hull name.</td></tr>
+            <tr><td>hull_number</td><td>string</td><td>Pennant / hull number, or <code>""</code>.</td></tr>
+            <tr><td>class_name</td><td>string</td><td>Class name, or <code>""</code>.</td></tr>
+            <tr><td>commander</td><td>object?</td><td><code>{ id, name }</code>, or <code>null</code>/absent when uncommanded.</td></tr>
+            <tr><td>embarked</td><td>array</td><td>Direct children aboard this hull: <code>{ id, name, hull_number }</code>.</td></tr>
+            <tr><td>embarked_in</td><td>object?</td><td>The hull this one is aboard, when it is.</td></tr>
+            <tr><td>position</td><td>object?</td><td><code>{ latitude, longitude }</code>. Absent when nothing has placed or fixed the hull.</td></tr>
+            <tr><td>heading_deg</td><td>number?</td><td>Live heading, when a fix carries one.</td></tr>
+            <tr><td>speed_kn</td><td>number?</td><td>Live speed, when a fix carries one.</td></tr>
+            <tr><td>stale</td><td>boolean</td><td>No live fix within the registry's staleness window. A placement is not a live fix.</td></tr>
+            <tr><td>loa_m</td><td>number?</td><td>Length overall, used to size the photograph.</td></tr>
+            <tr><td>beam_m</td><td>number?</td><td>Beam, used to size the photograph.</td></tr>
+            <tr><td>affiliation</td><td>string</td><td><code>friendly</code>, <code>neutral</code>, <code>hostile</code>, <code>unknown</code>, or <code>""</code>.</td></tr>
+            <tr><td>symbol</td><td>string</td><td>Taxonomy wire word, e.g. <code>frigate</code>, <code>destroyer</code>, or <code>""</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="read-displays"><span class="method get">GET</span> <code>/v1/displays</code></h3>
+      <pre data-lang="json"><code>{
+  "displays": [
+    {
+      "id": "wall-1",
+      "label": "wall-1",
+      "role": "command_center",
+      "viewport": { "width": 1280, "height": 720 }
+    }
+  ],
+  "readiness": { "ready": true }
+}</code></pre>
+      <p>
+        A display is present while its WebSocket lives, refreshed by a heartbeat,
+        and reaped after 30 seconds of silence. <code>viewport</code> is absent
+        until the display reports a size.
+      </p>
+
+      <h3 id="read-settings"><span class="method get">GET</span> <code>/v1/settings</code></h3>
+      <pre data-lang="json"><code>{
+  "step": 1,
+  "text_scale": 1.15,
+  "steps": [1.0, 1.15, 1.3, 1.45],
+  "names": ["Small", "Normal", "Large", "Largest"]
+}</code></pre>
+
+      <h3 id="read-pictures"><span class="method get">GET</span> <code>/v1/units/{unit_id}/picture</code></h3>
+      <p>
+        The hull's photograph as <code>image/png</code>. The console is the only
+        process that may read Minos, so it is the only thing that fetches pictures;
+        a wall has no Minos credential and asks here instead.
+      </p>
+      <ul>
+        <li><code>404 not_found</code> is the ordinary answer for a hull with no
+          photograph. Draw the symbol instead.</li>
+        <li><code>loa_m</code>/<code>beam_m</code> on the unit are what size the
+          photograph: draw the hull at its published length and beam, not at
+          whatever pixels the upload happened to have.</li>
+        <li>The console publishes a picture with
+          <code>PUT /v1/units/{id}/picture</code> (admin, PNG, max 4 MiB). A client
+          never needs to call that; it is the console's route.</li>
+      </ul>
+      <pre data-lang="json"><code>{
+  "status": "stored",
+  "unit_id": 9001,
+  "bytes": 48213
+}</code></pre>
+
+      <h3><span class="method put">PUT</span> / <span class="method del">DELETE</span> <code>/v1/session</code></h3>
+      <p>
+        These are the console's routes, not a phone's. They need
+        <span class="pill scope admin">admin</span>. A client that is not the
+        console has nothing to put here.
+      </p>
+      <pre data-lang="json"><code>{
+  "game_id": 4127,
+  "name": "Sunda Strait Watch",
+  "phase": "execution",
+  "mode": "maneuver",
+  "units": [
+    {
+      "id": 9001,
+      "name": "Evertsen",
+      "position": { "latitude": -5.9123, "longitude": 105.8412 }
+    }
+  ]
+}</code></pre>
+      <pre data-lang="json"><code>{
+  "status": "changed",
+  "revision": 43,
+  "readiness": { "ready": true }
+}</code></pre>
+      <p>
+        A <code>PUT</code> replaces the projection and refreshes its clock. The same
+        body sent again is a heartbeat: the status is <code>unchanged</code>, no
+        revision is spent, and the session is kept fresh. A <code>DELETE</code>
+        answers:
+      </p>
+      <pre data-lang="json"><code>{
+  "status": "cleared",
+  "revision": 44,
+  "readiness": { "ready": false, "reason": "no_session" }
+}</code></pre>
+      <p class="small muted">
+        Validation: <code>game_id</code> must be positive, <code>phase</code> must
+        be non-empty, unit ids must be positive and unique, and any published
+        position must be finite and inside the latitude/longitude ranges. A bad
+        body is <code>422 invalid_command</code>.
+      </p>
+    </section>
+
+    <section id="readiness">
+      <h2>Readiness &amp; phases</h2>
+      <p>
+        Readiness is a <em>computed verdict about whether observation is open</em>,
+        not a stored flag. It answers: may a remote client steer the observer view,
+        and is there a wall to see it?
+      </p>
+
+      <div class="callout bad">
+        <strong>Do not use <code>ready</code> to test the phase.</strong>
+        A console can be in execution and still report
+        <code>ready: false</code>, because no command center is attached. Read
+        <code>session.phase</code> for the phase; read
+        <code>readiness.reason</code> for what observation is waiting on.
+      </div>
+
+      <h3>The four conditions</h3>
+      <p>
+        The verdict is <code>ready: true</code> only when all four hold. The server
+        evaluates them in this order, and the first failure names the reason:
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>#</th><th>Condition</th><th>If it fails</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>A session exists.</td><td><code>no_session</code></td></tr>
+            <tr><td>2</td><td>The session was refreshed within the last 15 seconds.</td><td><code>stale</code></td></tr>
+            <tr><td>3</td><td><code>session.phase === "execution"</code>.</td><td><code>not_execution</code></td></tr>
+            <tr><td>4</td><td>At least one live <code>command_center</code> display is attached.</td><td><code>no_display</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <figure class="diagram">
+        <figcaption>Readiness decision order</figcaption>
+        <pre class="mermaid">
+flowchart TD
+  Start["GET /v1/session or a snapshot"] --> HasSession{"session exists?"}
+  HasSession -->|no| NoSession["ready false · reason no_session"]
+  HasSession -->|yes| Fresh{"refreshed within 15 seconds?"}
+  Fresh -->|no| Stale["ready false · reason stale"]
+  Fresh -->|yes| Execution{"phase is execution?"}
+  Execution -->|no| NotExecution["ready false · reason not_execution"]
+  Execution -->|yes| Display{"live command_center display?"}
+  Display -->|no| NoDisplay["ready false · reason no_display"]
+  Display -->|yes| Ready["ready true"]
+        </pre>
+      </figure>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th><code>ready</code></th><th><code>reason</code></th><th>What it means</th><th>What a waiting screen says</th></tr></thead>
+          <tbody>
+            <tr><td><code>false</code></td><td><code>no_session</code></td>
+              <td>Nothing has been published.</td>
+              <td>“No exercise open. Waiting for the game master to start one.”</td></tr>
+            <tr><td><code>false</code></td><td><code>not_execution</code></td>
+              <td>A session exists in another phase.</td>
+              <td>“«name» is in «phase». Observation opens at execution.”</td></tr>
+            <tr><td><code>false</code></td><td><code>no_display</code></td>
+              <td>Execution is running, but no command center is attached.</td>
+              <td>“Execution is running, but no command center is attached.”</td></tr>
+            <tr><td><code>false</code></td><td><code>stale</code></td>
+              <td>The console stopped refreshing (crash or lost network).</td>
+              <td>“The host stopped reporting. Reconnecting…”</td></tr>
+            <tr><td><code>true</code></td><td>absent</td>
+              <td>Observation is open. The observer view may be steered.</td>
+              <td>No card. The unit grid and d-pad are live.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Why a phone usually sees <code>no_display</code></h3>
+      <p>
+        The “display” readiness requires is a <code>command_center</code>, and
+        <code>display.hello</code> needs the <code>admin</code> scope. A paired
+        phone is refused <code>admin</code> on purpose, so the device being remoted
+        cannot itself satisfy the gate. A wall must be running:
+      </p>
+      <ul>
+        <li><code>tfg --mode command-center</code> on the operator's network, or</li>
+        <li><code>tfgctl display attach --id wall-1 --width 1920 --height 1080</code>
+          as a headless stand-in for testing.</li>
+      </ul>
+      <p>
+        Without a wall, the phone can still read the session and draw the hull grid
+        while <code>ready: false</code>. It just cannot send observer commands: they
+        are refused <code>409 not_ready</code> until the reason clears.
+      </p>
+
+      <h3>Stale is not empty</h3>
+      <p>
+        An expired session is kept and reported <code>stale</code> rather than
+        deleted. Its units remain in the projection. Show the grid greyed out with
+        the last known roster; a stale map beats an empty one. Only
+        <code>no_session</code> means <code>session: null</code>.
+      </p>
+
+      <h3>Phase values</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th><code>phase</code></th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>planning</code></td><td>The exercise is being designed; the roster and force are open.</td></tr>
+            <tr><td><code>preparation</code></td><td>The room is assembled; readiness is declared here.</td></tr>
+            <tr><td><code>execution</code></td><td>The exercise is playing. Observation can open.</td></tr>
+            <tr><td><code>closure</code></td><td>The exercise is ending or ended. Observation does not open.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small muted">
+        The comparison is exact and lowercase:
+        <code>session.phase == "execution"</code>. The server sends Minos's own
+        wire word; a value this build has not heard of is shown as-is rather than
+        guessed.
+      </p>
+    </section>
+
+    <section id="hulls">
+      <h2>Sessions &amp; hulls</h2>
+      <p>
+        <strong>Yes, there is hull data.</strong> It is not a separate
+        <code>/v1/units</code> list: the hulls are <code>session.units[]</code> inside
+        <code>GET /v1/state</code>, <code>GET /v1/session</code>, and every
+        <code>session.changed</code> event. The only per-unit route is the
+        photograph.
+      </p>
+
+      <figure class="diagram">
+        <figcaption>From session units to a remote grid</figcaption>
+        <pre class="mermaid">
+flowchart LR
+  State["GET /v1/state or /v1/session"] --> Units["session.units array"]
+  Units --> Index["index = 1-based tile number"]
+  Units --> Id["id = camera.focus unit_id"]
+  Id --> Camera["observer camera"]
+  Camera --> Wall["wall marker with the same index"]
+  Units --> Pic["GET /v1/units/id/picture"]
+        </pre>
+      </figure>
+
+      <h3>The grid contract</h3>
+      <ul>
+        <li><code>units</code> is ordered by the server. Render the tiles in array
+          order.</li>
+        <li><code>unit.index</code> is the number to print on the tile. It is
+          1-based and matches the wall's marker.</li>
+        <li><code>unit.id</code> is what <code>camera.focus</code> takes. Never send
+          <code>index</code> as a focus id.</li>
+        <li><code>embarked</code> lists direct children. Render them as children of
+          the host, or as their own tiles if the UI calls for it. A child may also
+          carry <code>embarked_in</code>.</li>
+        <li><code>position</code> may be absent. The tile still exists; focus will be
+          <code>422</code> until the hull has a position.</li>
+        <li><code>stale: true</code> means the last fix is old. The hull still has a
+          position and focus still works; the popup should say the fix is stale.</li>
+        <li><code>affiliation</code> and <code>symbol</code> let a client with no
+          taxonomy store draw the console's mark.</li>
+      </ul>
+
+      <h3>Example: three hulls for a grid</h3>
+      <pre data-lang="json"><code>[
+  {
+    "index": 1,
+    "id": 9001,
+    "name": "Evertsen",
+    "hull_number": "F805",
+    "class_name": "Karel Doorman frigate",
+    "commander": { "id": 501, "name": "Lt Cdr Halvorsen" },
+    "embarked": [
+      { "id": 9101, "name": "NH90 N-110", "hull_number": "N-110" }
+    ],
+    "position": { "latitude": -5.9123, "longitude": 105.8412 },
+    "heading_deg": 72.0,
+    "speed_kn": 18.4,
+    "stale": false,
+    "loa_m": 122.3,
+    "beam_m": 14.4,
+    "affiliation": "friendly",
+    "symbol": "frigate"
+  },
+  {
+    "index": 2,
+    "id": 9002,
+    "name": "Tromp",
+    "hull_number": "F801",
+    "class_name": "Karel Doorman frigate",
+    "commander": { "id": 502, "name": "Cdr Okafor" },
+    "embarked": [],
+    "position": { "latitude": -5.8764, "longitude": 106.0122 },
+    "heading_deg": 68.0,
+    "speed_kn": 19.1,
+    "stale": false,
+    "affiliation": "friendly",
+    "symbol": "frigate"
+  },
+  {
+    "index": 3,
+    "id": 9003,
+    "name": "KRI Diponegoro",
+    "hull_number": "365",
+    "class_name": "Diponegoro corvette",
+    "commander": { "id": 503, "name": "Cdr Santoso" },
+    "embarked": [],
+    "position": { "latitude": -6.0211, "longitude": 105.7733 },
+    "heading_deg": 95.5,
+    "speed_kn": 12.8,
+    "stale": false,
+    "affiliation": "friendly",
+    "symbol": "corvette"
+  }
+]</code></pre>
+
+      <h3>Focus a tile</h3>
+      <pre data-lang="json"><code>{
+  "protocol_version": 2,
+  "view": "observer",
+  "client_id": "phone-7",
+  "command_id": "focus-9001",
+  "type": "camera.focus",
+  "payload": { "unit_id": 9001, "zoom": 12.0 }
+}</code></pre>
+      <p>
+        <code>zoom</code> is optional. The host resolves the unit against the
+        session it owns, centres the observer view on the hull's last known
+        position, and sets <code>ui.focus</code>. An unknown unit or a unit with no
+        position is <code>422 invalid_command</code>.
+      </p>
+
+      <h3>Hull photographs</h3>
+      <pre data-lang="http"><code>GET /v1/units/9001/picture
+Authorization: Bearer &lt;token&gt;
+
+200 OK
+Content-Type: image/png</code></pre>
+      <p>
+        The picture is optional and cached by the console. Draw the
+        <code>symbol</code> when the response is <code>404</code>. Use
+        <code>loa_m</code>/<code>beam_m</code> for the ground footprint at the
+        picture's zoom, not the PNG's pixel size.
+      </p>
+
+      <h3>How the session gets there</h3>
+      <figure class="diagram">
+        <figcaption>Session publication</figcaption>
+        <pre class="mermaid">
+flowchart TD
+  Shell["console shell SessionView"] -->|session update| Pub["session publisher"]
+  Fixes["fix registry"] -->|newest fix per hull| Pub
+  Pub -->|hub sink, embedded host| Hub["ControlHub"]
+  Pub -->|PUT /v1/session, following a host| Host["remote host"]
+  Hub -->|snapshot and session.changed| Clients["phones and walls"]
+        </pre>
+      </figure>
+      <ul>
+        <li>The console publishes when the roster changes, plus a heartbeat every
+          5 seconds.</li>
+        <li>The publisher joins the console's roster with the fix registry: a live
+          fix wins; otherwise the recorded placement stands. A hull with a placement
+          but no live fix is marked <code>stale</code>; a hull with neither keeps no
+          position.</li>
+        <li>The hub assigns <code>index</code> from array order, so the phone's grid
+          and the wall's markers cannot disagree.</li>
+        <li>The session TTL is 15 seconds. If the console stops refreshing, the
+          session is kept and reported <code>stale</code>.</li>
+        <li>On a clean console exit, the publisher sends
+          <code>DELETE /v1/session</code> so a waiting phone is told rather than
+          left guessing.</li>
+      </ul>
+    </section>
+
+    <section id="commands">
+      <h2>Commands</h2>
+      <p>
+        <code>POST /v1/commands</code> takes exactly one command. The HTTP reply
+        says whether it was understood; for a camera command, the WebSocket says
+        when it took effect. Commands are not accepted over the WebSocket: they go
+        over HTTP, where a refusal can be a reply.
+      </p>
+
+      <h3 id="command-envelope">Envelope &amp; replies</h3>
+      <pre data-lang="json"><code>{
+  "protocol_version": 2,
+  "view": "observer",
+  "client_id": "phone-7",
+  "command_id": "01J8Z6Q0K3",
+  "type": "camera.nudge",
+  "payload": { "dx_fraction": 0.25, "dy_fraction": 0.0 }
+}</code></pre>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Field</th><th>Required</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>type</code></td><td>yes</td><td>Command name.</td></tr>
+            <tr><td><code>payload</code></td><td>yes</td><td>Arguments; the shape belongs to the type.</td></tr>
+            <tr><td><code>view</code></td><td>no</td><td><code>observer</code> for a phone. Absent or empty means <code>main</code> — the operator's camera. <strong>Always send <code>observer</code>.</strong></td></tr>
+            <tr><td><code>command_id</code></td><td>no</td><td>Unique id. A retry with the same id is answered <code>duplicate</code> and does not act twice. Generated by the server when omitted.</td></tr>
+            <tr><td><code>client_id</code></td><td>no</td><td>Attribution only, not authorization. Bounded to 64 printable characters; <code>remote</code> when absent.</td></tr>
+            <tr><td><code>protocol_version</code></td><td>recommended</td><td><code>2</code>. A different value is <code>409 unsupported_protocol</code>; an absent value is currently accepted.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong><code>view</code> defaults to <code>main</code>.</strong>
+        A phone that omits it sends a <em>console</em> command. That is why every
+        observer command in this document carries
+        <code>"view": "observer"</code>. On a console, a
+        <code>camera.focus</code> addressed to <code>main</code> is ignored, and a
+        nudge moves the game master's map. On a headless host, <code>main</code> is
+        the host's own camera; a phone still has no business moving it.
+      </div>
+
+      <h4>Accepted — <code>202 Accepted</code></h4>
+      <pre data-lang="json"><code>{
+  "command_id": "01J8Z6Q0K3",
+  "status": "accepted",
+  "view": "observer",
+  "revision": 42
+}</code></pre>
+      <p>
+        The reply echoes <code>view</code> only for a non-<code>main</code> view.
+        The revision is the state at acceptance, before the command has been
+        applied. <strong>For a camera command, a <code>202</code> is not proof that
+        anything moved.</strong> The <code>camera.changed</code> event is the proof.
+      </p>
+
+      <h4>Retry of a known id — <code>200 OK</code></h4>
+      <pre data-lang="json"><code>{
+  "command_id": "01J8Z6Q0K3",
+  "status": "duplicate",
+  "view": "observer",
+  "revision": 42
+}</code></pre>
+      <p>
+        The server remembers recent ids for five minutes, up to 512 of them. An id
+        older than that is a new command; the operator's hand has moved on.
+      </p>
+
+      <p>
+        A command that would change nothing — a zoom already at its rail, a nudge
+        of zero, the camera it already has — is still <em>accepted</em> and spends
+        no revision. “Accepted” means “understood”; the event stream is where “and
+        it moved” lives.
+      </p>
+
+      <h3 id="command-catalog">Command catalog</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th><code>type</code></th><th>View</th><th>Readiness gate</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>camera.nudge</code></td><td><code>observer</code> on a phone</td><td>yes</td><td>Move by a fraction of the viewport.</td></tr>
+            <tr><td><code>camera.zoom</code></td><td><code>observer</code> on a phone</td><td>yes</td><td>Zoom by a delta, centre-anchored.</td></tr>
+            <tr><td><code>camera.set</code></td><td><code>observer</code> on a phone</td><td>yes</td><td>Set an absolute centre and zoom.</td></tr>
+            <tr><td><code>camera.focus</code></td><td><code>observer</code> only on a phone</td><td>yes</td><td>Centre on a session unit and set the popup.</td></tr>
+            <tr><td><code>ui.set</code></td><td><code>observer</code></td><td>yes</td><td>Open or close a wall panel.</td></tr>
+            <tr><td><code>settings.font</code></td><td>host-wide; omit <code>view</code></td><td>no on <code>main</code></td><td>Set the console's text size.</td></tr>
+            <tr><td><code>view.report</code></td><td><code>observer</code> or <code>main</code></td><td><strong>exempt</strong></td><td>Report a rendering viewport in device pixels.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3><code>camera.nudge</code></h3>
+      <pre data-lang="json"><code>{
+  "protocol_version": 2,
+  "view": "observer",
+  "type": "camera.nudge",
+  "payload": { "dx_fraction": 0.25, "dy_fraction": -0.5 }
+}</code></pre>
+      <ul>
+        <li>Positive <code>dx_fraction</code> moves the camera <strong>west</strong>
+          (the picture moves east); negative moves it east.</li>
+        <li>Positive <code>dy_fraction</code> moves the camera <strong>north</strong>;
+          negative moves it south.</li>
+        <li>The sense matches dragging the map: <code>0.25</code> is the same move
+          as a hand pulling the map a quarter of a frame to the right.</li>
+        <li>Each fraction is bounded to <code>±2</code>.</li>
+        <li>A nudge before any viewport is known is a no-op rather than a guess.
+          On a headless host, send <code>view.report</code> first.</li>
+      </ul>
+
+      <h3><code>camera.zoom</code></h3>
+      <pre data-lang="json"><code>{
+  "protocol_version": 2,
+  "view": "observer",
+  "type": "camera.zoom",
+  "payload": { "delta": 1.0 }
+}</code></pre>
+      <ul>
+        <li>Centre-anchored: the point in the middle of the view stays in the middle.</li>
+        <li><code>delta</code> is bounded to <code>±10</code> per command.</li>
+        <li>The host clamps the resulting zoom to its own rails,
+          <code>3.0 to 18.0</code>. The console's wheel zoom is cursor-anchored; a
+          remote command has no cursor to anchor to.</li>
+      </ul>
+
+      <h3><code>camera.set</code></h3>
+      <pre data-lang="json"><code>{
+  "protocol_version": 2,
+  "view": "observer",
+  "type": "camera.set",
+  "payload": {
+    "center": { "latitude": -6.2, "longitude": 106.8 },
+    "zoom": 12.0
+  }
+}</code></pre>
+      <ul>
+        <li>Latitude <code>-90 to 90</code>, longitude <code>-180 to 180</code>, zoom
+          <code>-30 to 30</code>, all finite. Values outside these bounds are
+          refused, not clamped.</li>
+        <li>The host's own rails are narrower: the applied zoom is clamped to
+          <code>3.0 to 18.0</code>, so a value of <code>25</code> is accepted and
+          lands at <code>18</code>.</li>
+        <li>Absolute and idempotent: sending the same camera twice publishes
+          nothing the second time.</li>
+      </ul>
+
+      <h3><code>camera.focus</code></h3>
+      <pre data-lang="json"><code>{
+  "protocol_version": 2,
+  "view": "observer",
+  "type": "camera.focus",
+  "payload": { "unit_id": 9001, "zoom": 12.0 }
+}</code></pre>
+      <ul>
+        <li><code>unit_id</code> is <code>session.units[].id</code>, not the grid
+          number.</li>
+        <li><code>zoom</code> is optional; omitted keeps the observer view's current
+          zoom.</li>
+        <li>An unknown unit or a unit with no position is
+          <code>422 invalid_command</code>.</li>
+        <li>On a console, a focus addressed to <code>main</code> is ignored; on a
+          headless host it would move the host's own camera. Send
+          <code>observer</code>.</li>
+        <li>It also sets <code>ui.focus</code>, which opens the unit card on the
+          wall.</li>
+      </ul>
+
+      <h3><code>ui.set</code></h3>
+      <pre data-lang="json"><code>{
+  "protocol_version": 2,
+  "view": "observer",
+  "type": "ui.set",
+  "payload": { "panel": "crew", "open": true }
+}</code></pre>
+      <ul>
+        <li><code>panel</code> is <code>crew</code>, <code>scenario</code>, or
+          <code>comms</code>. There is no <code>units</code> panel: the unit grid is
+          a control, not a window.</li>
+        <li>Idempotent: the same <code>open</code> twice changes nothing and
+          advances no revision.</li>
+        <li>Must be addressed to <code>observer</code>. The console ignores a
+          panel toggle addressed to <code>main</code>; the observer's windows
+          belong to the wall.</li>
+        <li>Carried to every wall in <code>session.changed</code> and in the
+          snapshot, so a reconnect restores the same screen.</li>
+      </ul>
+
+      <h3><code>settings.font</code></h3>
+      <pre data-lang="json"><code>{
+  "protocol_version": 2,
+  "type": "settings.font",
+  "payload": { "step": 1 }
+}</code></pre>
+      <ul>
+        <li><code>step</code> is <code>0 to 3</code>:
+          <code>Small</code>, <code>Normal</code>, <code>Large</code>,
+          <code>Largest</code>. Anything else is <code>422</code>.</li>
+        <li>Host-wide, not a view. Send it without <code>view</code> (the default
+          <code>main</code>); the console applies and remembers it, and a headless
+          host records it for <code>GET /v1/settings</code>.</li>
+      </ul>
+
+      <h3><code>view.report</code></h3>
+      <pre data-lang="json"><code>{
+  "protocol_version": 2,
+  "view": "observer",
+  "type": "view.report",
+  "payload": { "width": 1920, "height": 1200 }
+}</code></pre>
+      <ul>
+        <li>Reports the display's viewport in device pixels.</li>
+        <li><code>width</code> and <code>height</code> are <code>1 to 8192</code>.
+          Zero is the state before a first frame, not a report.</li>
+        <li>This is the <strong>only observer-addressed command exempt from the
+          readiness gate</strong>: a waiting display still has to say how big it
+          is.</li>
+        <li>On a console, the window is the authority; a report is accepted and
+          ignored. On a headless host, it sets the size every later nudge resolves
+          against.</li>
+      </ul>
+
+      <h3 id="command-gate">The readiness gate</h3>
+      <p>
+        Commands addressed to a non-<code>main</code> view are refused until
+        observation is open:
+      </p>
+      <pre data-lang="json"><code>{
+  "error": {
+    "code": "not_ready",
+    "message": "observation is not open yet: no_display"
+  }
+}</code></pre>
+      <ul>
+        <li><code>409 not_ready</code>, with the same four reasons the read uses.</li>
+        <li><code>view.report</code> is the one exemption.</li>
+        <li><code>main</code> commands are not gated: the operator's own gestures
+          are not a remote client.</li>
+        <li>The gate is server-side because a phone that has not read
+          <code>GET /v1/session</code> yet must not be able to steer.</li>
+      </ul>
+    </section>
+
+    <section id="stream">
+      <h2>Event stream</h2>
+      <p>
+        <span class="method ws">WS</span> <code>/v1/ws</code> — a WebSocket, with
+        the same <code>Authorization: Bearer</code> header on the upgrade request.
+        Needs <code>observe</code>.
+      </p>
+
+      <figure class="diagram">
+        <figcaption>Connect, snapshot, then changes</figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+  participant Client
+  participant Host
+  Client->>Host: GET /v1/ws with Bearer token
+  Host-->>Client: snapshot
+  loop while connected
+    Host-->>Client: camera.changed or session.changed
+  end
+  Client->>Host: request.snapshot
+  Host-->>Client: snapshot
+        </pre>
+      </figure>
+
+      <p>
+        On connect the server sends the whole state. Then one event per change.
+        A client that falls more than 64 events behind is sent a fresh
+        <code>snapshot</code> instead of a guessed patch.
+      </p>
+
+      <h3>Events</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th><code>type</code></th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>snapshot</code></td><td>The whole state at <code>revision</code>: views, session, readiness, displays, ui. Sent on connect, after a gap, and on request.</td></tr>
+            <tr><td><code>camera.changed</code></td><td>A camera moved. <code>view.id</code> says which. <code>source</code> names the client, or <code>desktop</code> for the operator's hand. <code>command_id</code> is present when a command caused it.</td></tr>
+            <tr><td><code>session.changed</code></td><td>The session, its phase, its units, the readiness verdict, the attached displays, or the observer's windows changed. One event, because they all answer the same question.</td></tr>
+            <tr><td><code>display.attached</code></td><td>This socket's <code>display.hello</code> was accepted. Carries the id the host recorded.</td></tr>
+            <tr><td><code>display.rejected</code></td><td>This socket's <code>display.hello</code> was refused. The socket stays open, so the client can retry or show the reason.</td></tr>
+            <tr><td><code>command.accepted</code></td><td>The server accepted a command. For a <code>main</code> command it reached the host's channel; for an observer command it was applied server-side. The proof it moved is the <code>camera.changed</code> that follows.</td></tr>
+            <tr><td><code>command.rejected</code></td><td>A command was refused at the boundary. The HTTP reply carried the same code.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4><code>camera.changed</code></h4>
+      <pre data-lang="json"><code>{
+  "type": "camera.changed",
+  "revision": 43,
+  "source": "phone-7",
+  "command_id": "01J8Z6Q0K3",
+  "view": {
+    "id": "observer",
+    "camera": {
+      "center": { "latitude": -5.9123, "longitude": 105.8412 },
+      "zoom": 12.0,
+      "width": 1280,
+      "height": 720
+    }
+  }
+}</code></pre>
+      <p>
+        Ignore a <code>camera.changed</code> addressed to <code>main</code> unless
+        you are the console: that is the operator's camera.
+      </p>
+
+      <h4><code>session.changed</code></h4>
+      <pre data-lang="json"><code>{
+  "type": "session.changed",
+  "revision": 44,
+  "session": {
+    "game_id": 4127,
+    "name": "Sunda Strait Watch",
+    "phase": "execution",
+    "mode": "maneuver",
+    "units": [],
+    "participants": [],
+    "messages": []
+  },
+  "readiness": { "ready": false, "reason": "no_display" },
+  "displays": [],
+  "ui": {
+    "panels": { "crew": true, "scenario": false, "comms": false }
+  }
+}</code></pre>
+
+      <h4><code>display.attached</code> and <code>display.rejected</code></h4>
+      <pre data-lang="json"><code>{
+  "type": "display.attached",
+  "id": "wall-1"
+}</code></pre>
+      <pre data-lang="json"><code>{
+  "type": "display.rejected",
+  "code": "forbidden",
+  "message": "a command_center display needs the admin scope"
+}</code></pre>
+
+      <h4><code>command.accepted</code> and <code>command.rejected</code></h4>
+      <pre data-lang="json"><code>{
+  "type": "command.accepted",
+  "command_id": "01J8Z6Q0K3",
+  "revision": 43
+}</code></pre>
+      <pre data-lang="json"><code>{
+  "type": "command.rejected",
+  "command_id": "01J8Z6Q0K3",
+  "code": "not_ready",
+  "message": "observation is not open yet: no_display"
+}</code></pre>
+
+      <h3>Client → server messages</h3>
+      <p>These are facts about the socket, not commands. Unknown message types are ignored rather than closing the socket.</p>
+
+      <h4><code>request.snapshot</code></h4>
+      <pre data-lang="json"><code>{ "type": "request.snapshot" }</code></pre>
+
+      <h4><code>display.hello</code></h4>
+      <p>
+        A command center announces itself. Needs
+        <span class="pill scope admin">admin</span>; a paired phone is refused.
+      </p>
+      <pre data-lang="json"><code>{
+  "type": "display.hello",
+  "payload": {
+    "id": "wall-1",
+    "role": "command_center",
+    "label": "wall-1",
+    "viewport": { "width": 1920, "height": 1080 }
+  }
+}</code></pre>
+      <ul>
+        <li><code>role</code> must be exactly <code>command_center</code>. An
+          unknown role is <code>display.rejected</code> with
+          <code>invalid_command</code>.</li>
+        <li><code>id</code> is stable across reconnects. Re-announcing the same id
+          replaces the record rather than stacking a second one. A missing or
+          empty id becomes <code>display</code>.</li>
+        <li><code>viewport</code> is optional. It is also how a display reports a
+          resize.</li>
+        <li>On success the host replies <code>display.attached</code> and then
+          sends a fresh <code>snapshot</code>, so the new display list is current
+          without a second read.</li>
+        <li>Presence is the socket: the attachment dies with it, and a display that
+          stops beating is reaped after 30 seconds.</li>
+        <li>Every command center shares one <code>observer</code> view. There are no
+          per-display cameras: the last <code>view.report</code> wins the size, and
+          every wall draws the same camera.</li>
+      </ul>
+
+      <h4><code>display.heartbeat</code></h4>
+      <pre data-lang="json"><code>{
+  "type": "display.heartbeat",
+  "payload": { "id": "wall-1" }
+}</code></pre>
+      <p>Every 10 seconds. A heartbeat only counts for the id this socket attached.</p>
+
+      <h3>Remote focus, end to end</h3>
+      <figure class="diagram">
+        <figcaption>Phone → host → hub → wall</figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant Phone
+  participant Host as TFG host
+  participant Hub as ControlHub
+  participant Wall as command center
+
+  Phone->>Host: POST /v1/commands
+  Note over Host: parse, validate, scope, readiness
+  alt not ready
+    Host-->>Phone: 409 not_ready
+  else accepted
+    Host->>Hub: apply_view observer
+    Hub-->>Host: revision
+    Host-->>Phone: 202 accepted
+    Hub-->>Wall: camera.changed
+    Hub-->>Phone: camera.changed
+  end
+        </pre>
+      </figure>
+
+      <h3>Coalescing, revision, reconnect</h3>
+      <ul>
+        <li>Camera changes are coalesced by equality. A drag that produces sixty
+          ticks a second publishes the distinct frames, not the idle ones.</li>
+        <li>Only state changes advance <code>revision</code>. An acknowledgement
+          repeats the revision it was accepted at.</li>
+        <li>A session heartbeat that arrives while healthy publishes nothing. One
+          that revives a <code>stale</code> session is a real change.</li>
+        <li>A snapshot is authoritative. On reconnect, reset local state from it;
+          ignore events from before it.</li>
+        <li>At most 8 WebSocket clients may watch at once. The ninth is refused
+          <code>503 too_many_clients</code>.</li>
+      </ul>
+    </section>
+
+    <section id="errors">
+      <h2>Errors</h2>
+      <p>
+        Errors always use one shape. Branch on <code>error.code</code>; treat
+        <code>message</code> as prose for a human.
+      </p>
+      <pre data-lang="json"><code>{
+  "error": {
+    "code": "not_ready",
+    "message": "observation is not open yet: no_display"
+  }
+}</code></pre>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>HTTP</th><th><code>code</code></th><th>Cause</th></tr></thead>
+          <tbody>
+            <tr><td>400</td><td><code>invalid_json</code></td><td>Body is not JSON, or not the expected shape.</td></tr>
+            <tr><td>401</td><td><code>unauthorized</code></td><td>Missing or wrong bearer token. Carries <code>WWW-Authenticate: Bearer</code>.</td></tr>
+            <tr><td>401</td><td><code>invalid_pairing_code</code></td><td>Wrong pairing code; the window is still open.</td></tr>
+            <tr><td>403</td><td><code>forbidden</code></td><td>The credential is real; this is not its scope.</td></tr>
+            <tr><td>404</td><td><code>not_found</code></td><td>No such route, view, or picture.</td></tr>
+            <tr><td>404</td><td><code>no_pairing_window</code></td><td>No pairing code is live on this host.</td></tr>
+            <tr><td>404</td><td><code>unknown_device</code></td><td>No device has that id.</td></tr>
+            <tr><td>409</td><td><code>unsupported_protocol</code></td><td><code>protocol_version</code> is present and not 2.</td></tr>
+            <tr><td>409</td><td><code>not_ready</code></td><td>An observer command before observation is open. The message names the reason.</td></tr>
+            <tr><td>410</td><td><code>pairing_expired</code></td><td>The pairing code lived out its TTL.</td></tr>
+            <tr><td>413</td><td><code>body_too_large</code></td><td>Body over 64 KiB (or over 4 MiB for a hull picture).</td></tr>
+            <tr><td>422</td><td><code>invalid_command</code></td><td>Parsed, but values cannot be applied; also a pairing request for <code>admin</code>, and an operator rotate.</td></tr>
+            <tr><td>429</td><td><code>too_many_attempts</code></td><td>Five wrong pairing codes closed the window.</td></tr>
+            <tr><td>500</td><td><code>server_error</code></td><td>Pairing could not mint a token from a strong source.</td></tr>
+            <tr><td>503</td><td><code>host_gone</code></td><td>The desktop's command channel is closed; the window is gone.</td></tr>
+            <tr><td>503</td><td><code>too_many_clients</code></td><td>More than 8 WebSocket clients.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout info">
+        <strong><code>401</code> and <code>403</code> are different answers.</strong>
+        The first says “not a token”; the second says “not this token's job”.
+        A paired phone calling an admin route gets <code>403</code>, not
+        <code>401</code>.
+      </div>
+    </section>
+
+    <section id="limits">
+      <h2>Limits &amp; timings</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Thing</th><th>Value</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>Operator token</td><td>≥ 32 characters</td><td>The server refuses to start below this.</td></tr>
+            <tr><td>Device token</td><td>64 hex characters</td><td>Returned once at pairing; stored as a hash.</td></tr>
+            <tr><td>JSON body</td><td>64 KiB</td><td>Commands, pairing, session writes.</td></tr>
+            <tr><td>Hull picture body</td><td>4 MiB</td><td>Must start with the PNG signature.</td></tr>
+            <tr><td>WebSocket clients</td><td>8</td><td>The ninth is <code>503 too_many_clients</code>.</td></tr>
+            <tr><td>Event buffer</td><td>64 events</td><td>A lagging client gets a fresh snapshot.</td></tr>
+            <tr><td>Session TTL</td><td>15 seconds</td><td>Publisher heartbeat every 5 seconds.</td></tr>
+            <tr><td>Display TTL</td><td>30 seconds</td><td>Display heartbeat every 10 seconds.</td></tr>
+            <tr><td>Pairing code TTL</td><td>120 seconds</td><td>Clamped to <code>30 to 600</code>; five attempts.</td></tr>
+            <tr><td>Remembered command ids</td><td>512 ids / 5 minutes</td><td>Retry within the window is <code>duplicate</code>.</td></tr>
+            <tr><td>Camera zoom rails</td><td><code>3.0 to 18.0</code></td><td>Applied commands are clamped into this range.</td></tr>
+            <tr><td>Nudge fraction</td><td><code>±2</code></td><td>Per axis, per command.</td></tr>
+            <tr><td>Zoom delta</td><td><code>±10</code></td><td>Per command.</td></tr>
+            <tr><td>Viewport</td><td>1 to 8192 per side</td><td>Zero is not a report.</td></tr>
+            <tr><td>Font steps</td><td>0 to 3</td><td>Small, Normal, Large, Largest.</td></tr>
+            <tr><td>Published messages</td><td>40</td><td>Newest first; the console's Comms scrollback is longer.</td></tr>
+            <tr><td><code>client_id</code></td><td>64 printable characters</td><td>Control characters are stripped; empty becomes <code>remote</code>.</td></tr>
+            <tr><td>Transport</td><td>HTTP / WS</td><td>No TLS yet; <code>https</code>/<code>wss</code> are refused. No CORS headers: use a native client, not a browser page.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="recipes">
+      <h2>Client recipes</h2>
+
+      <h3>Boot sequence</h3>
+      <figure class="diagram">
+        <figcaption>From unpaired to observing</figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant Phone
+  participant Host
+  Phone->>Host: GET /v1/hello
+  Host-->>Phone: protocol 2 and status
+  Phone->>Host: POST /v1/pair
+  Host-->>Phone: device and token
+  Phone->>Host: GET /v1/state
+  Host-->>Phone: snapshot
+  alt ready
+    Phone->>Host: GET /v1/ws
+    Host-->>Phone: events
+  else waiting
+    Phone->>Host: poll GET /v1/session
+    Host-->>Phone: readiness reason
+  end
+        </pre>
+      </figure>
+
+      <h3>Quick check with curl</h3>
+      <pre data-lang="bash"><code>BASE=http://192.168.1.20:8787
+TOKEN=0000000000000000000000000000000000000000000000000000000000000000
+
+# Version and pairing state
+curl -s "$BASE/v1/hello" | jq
+
+# Who am I
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/whoami" | jq
+
+# Whole state, including session.units for the grid
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/state" | jq
+
+# Readiness without the noise
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/v1/session" \
+  | jq '{phase: .session.phase, ready: .readiness, units: (.session.units | length)}'</code></pre>
+
+      <h3>“Is the console in execution?”</h3>
+      <p>
+        Read the session's phase, not the readiness verdict. A client can make this
+        decision from one <code>GET /v1/state</code> or from the snapshot it already
+        holds:
+      </p>
+      <pre data-lang="javascript"><code>const phase = snapshot.session?.phase ?? null;
+const inExecution = phase === "execution";
+
+// Observation is open only when readiness says so. The reason tells the
+// waiting screen what to show.
+const canSteer = snapshot.readiness.ready === true;
+const waitingOn = snapshot.readiness.reason ?? null;
+
+// A session in execution with no wall still has hulls. Draw the grid;
+// observer commands will be 409 not_ready until a command center attaches.
+const units = snapshot.session?.units ?? [];</code></pre>
+
+      <h3>Build the hull grid</h3>
+      <ol class="steps">
+        <li>
+          <p>Read <code>session.units</code> from <code>GET /v1/state</code>, <code>GET /v1/session</code>, or a <code>session.changed</code> event.</p>
+        </li>
+        <li>
+          <p>Render one tile per unit in array order. Print <code>unit.index</code> as the tile number. Do not sort by <code>id</code>.</p>
+        </li>
+        <li>
+          <p>On tap, send <code>camera.focus</code> with <code>unit.id</code> and <code>"view": "observer"</code>. Open the unit card from the same unit object; do not wait for a second read.</p>
+        </li>
+        <li>
+          <p>Fetch <code>GET /v1/units/{id}/picture</code> for the tile or popup. A <code>404</code> is normal; fall back to <code>symbol</code>.</p>
+        </li>
+        <li>
+          <p>If <code>unit.stale</code>, mark the fix as old. If <code>unit.position</code> is absent, the tile is still listed but focus will be <code>422</code>.</p>
+        </li>
+      </ol>
+
+      <h3>Waiting screen decision</h3>
+      <pre data-lang="javascript"><code>function waitingCard(session, readiness) {
+  if (readiness.ready) return null;
+
+  switch (readiness.reason) {
+    case "no_session":
+      return "No exercise open. Waiting for the game master to start one.";
+    case "not_execution":
+      return `«${session?.name ?? "The exercise"}» is in ` +
+             `${session?.phase ?? "another phase"}. Observation opens at execution.`;
+    case "no_display":
+      return "Execution is running, but no command center is attached.";
+    case "stale":
+      return "The host stopped reporting. Reconnecting…";
+    default:
+      return "Observation is not open yet.";
+  }
+}</code></pre>
+    </section>
+
+    <section id="pitfalls">
+      <h2>Common pitfalls</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>ready: false</code> while the console is in execution</td>
+              <td><code>readiness.reason</code> is <code>no_display</code>: no command-center wall is attached.</td>
+              <td>Start <code>tfg --mode command-center</code>, or use <code>tfgctl display attach</code> for a test. Use <code>session.phase</code> for the phase.</td>
+            </tr>
+            <tr>
+              <td><code>409 not_ready</code> on a camera command</td>
+              <td>The observer view is not open yet; the message names the reason.</td>
+              <td>Read <code>GET /v1/session</code> and show the waiting card. Do not retry blindly.</td>
+            </tr>
+            <tr>
+              <td>A command is accepted but nothing moves</td>
+              <td>The command was addressed to <code>main</code>; or it was a no-op; or it was a duplicate.</td>
+              <td>Send <code>"view": "observer"</code>. Wait for <code>camera.changed</code> as proof.</td>
+            </tr>
+            <tr>
+              <td><code>ready: false</code> with reason <code>not_execution</code> while the console shows execution</td>
+              <td>The app is reading a different host, or the console has not republished after the advance.</td>
+              <td>Check the base URL and <code>GET /v1/session</code> on that host. The phase is the published projection, not what the console window shows locally.</td>
+            </tr>
+            <tr>
+              <td><code>ready: false</code> with reason <code>stale</code> while the console is open</td>
+              <td>The session heartbeat stopped: the console is following a host it cannot reach, or the publisher is off.</td>
+              <td>Check the console's <code>TFG_CONTROL_SERVER</code> / <code>TFG_CONTROL_LISTEN</code> configuration and the 15-second TTL.</td>
+            </tr>
+            <tr>
+              <td><code>camera.focus</code> returns <code>422</code></td>
+              <td>The id is a grid <code>index</code>, or the unit has no position.</td>
+              <td>Send <code>unit.id</code>; render a hull without a position as non-focusable or explain why.</td>
+            </tr>
+            <tr>
+              <td><code>404 not_found</code> on <code>/v1/sessions</code></td>
+              <td>There is no session list.</td>
+              <td>Use <code>GET /v1/session</code> for the current exercise.</td>
+            </tr>
+            <tr>
+              <td><code>403 forbidden</code> on a display hello</td>
+              <td>The token is a paired device, not the operator token.</td>
+              <td>A wall must use the operator token. A phone cannot be a command center.</td>
+            </tr>
+            <tr>
+              <td><code>401 unauthorized</code> after pairing</td>
+              <td>The token was not stored, was revoked, or was rotated.</td>
+              <td>Store the one-shot token; on 401, delete it and pair again.</td>
+            </tr>
+            <tr>
+              <td>Waiting forever because <code>session</code> is null</td>
+              <td>The console is not hosting, or has not published a projection.</td>
+              <td>Check <code>GET /v1/hello</code> and <code>/v1/state</code> on the host the console follows. A headless <code>tfg-server</code> has no session until a console PUTs one.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout good">
+        <strong>The short version.</strong>
+        Phase is <code>session.phase</code>. Steering is
+        <code>readiness.ready</code>. Hulls are <code>session.units[]</code>.
+        A phone always sends <code>"view": "observer"</code>. A <code>202</code> is
+        not movement; <code>camera.changed</code> is.
+      </div>
+    </section>
+
+    <section id="companions">
+      <h2>Companion docs</h2>
+      <div class="card">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Document</th><th>What it is for</th></tr></thead>
+            <tbody>
+              <tr><td><a href="control-api-v1.md">control-api-v1.md</a></td><td>The narrative contract: design rationale, host modes, complete prose.</td></tr>
+              <tr><td><a href="mobile-client-quickstart.md">mobile-client-quickstart.md</a></td><td>The Flutter build brief: pairing, waiting screen, d-pad, unit grid, test harness.</td></tr>
+              <tr><td><a href="observation-mode-plan.md">observation-mode-plan.md</a></td><td>The observation feature plan and its decisions.</td></tr>
+              <tr><td><a href="tfg-control-api-list.md">tfg-control-api-list.md</a></td><td>The flat, one-page route list.</td></tr>
+              <tr><td><a href="adr/0025-control-plane.md">ADR-0025</a> / <a href="adr/0026-observation-is-a-second-view.md">ADR-0026</a></td><td>Why the control plane exists and why observation is a second view.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <h3>The reference CLI</h3>
+      <p><code>tfgctl</code> is a client of this same API, useful for checking a host without writing code.</p>
+      <pre data-lang="bash"><code># Read
+tfgctl --server http://127.0.0.1:8787 --token "$TFG_CONTROL_TOKEN" status
+tfgctl … whoami
+tfgctl … session status
+tfgctl … session watch --until ready
+tfgctl … units
+tfgctl … display list
+
+# A command center with no window
+tfgctl … display attach --id wall-1 --label wall-1 --width 1920 --height 1080
+
+# Commands
+tfgctl … focus 3 --zoom 12
+tfgctl … camera left
+tfgctl … panel crew on
+tfgctl … settings font 3</code></pre>
+
+      <h3>Testing without Minos</h3>
+      <pre data-lang="bash"><code># Terminal 1: a headless host
+./target/debug/tfg-server --listen 0.0.0.0:8787 --token "$OPERATOR_TOKEN"
+
+# Terminal 2: publish the fixture, then keep it fresh (it goes stale in 15 s)
+while true; do
+  tfgctl --server http://127.0.0.1:8787 --token "$OPERATOR_TOKEN" \
+    session set --file fixtures/observation-session.json >/dev/null
+  sleep 5
+done
+
+# Terminal 3: a display, so readiness can open
+tfgctl --server http://127.0.0.1:8787 --token "$OPERATOR_TOKEN" \
+  display attach --id wall-1 --width 1280 --height 720</code></pre>
+
+      <p class="small muted">
+        The fixture is <code>fixtures/observation-session.json</code>: a six-unit
+        execution projection. It has no <code>index</code>; the hub assigns those
+        from array order.
+      </p>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="row">
+    <span>TFG control plane — protocol v2, routes <code>/v1</code>.</span>
+    <span>Verified against the control crate and the v2 contract · 2026-10-29</span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  // --- JSON token colouring -------------------------------------------------
+  // Every JSON block in this document is static. Escape it first, then wrap
+  // tokens so no markup from the source can become live HTML.
+  function escapeHtml(value) {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  document.querySelectorAll('pre[data-lang="json"] code').forEach(function (block) {
+    var source = block.textContent;
+    var escaped = escapeHtml(source);
+    var highlighted = escaped.replace(
+      /("(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*")(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?/g,
+      function (match, stringToken, colon, literalToken) {
+        var cls;
+        if (stringToken) {
+          cls = colon ? "tok-key" : "tok-str";
+        } else if (literalToken) {
+          cls = "tok-lit";
+        } else {
+          cls = "tok-num";
+        }
+        return '<span class="' + cls + '">' + match + "</span>";
+      }
+    );
+    block.innerHTML = highlighted;
+  });
+
+  // --- Copy buttons --------------------------------------------------------
+  document.querySelectorAll("pre:not(.mermaid)").forEach(function (pre) {
+    var text = pre.textContent;
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "copy";
+    button.textContent = "Copy";
+    button.setAttribute("aria-label", "Copy this code block");
+    button.addEventListener("click", function () {
+      function done() {
+        button.textContent = "Copied";
+        button.classList.add("copied");
+        window.setTimeout(function () {
+          button.textContent = "Copy";
+          button.classList.remove("copied");
+        }, 1200);
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () {
+          button.textContent = "Select";
+        });
+      } else {
+        var range = document.createRange();
+        range.selectNodeContents(pre);
+        var selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        button.textContent = "Selected";
+      }
+    });
+    pre.appendChild(button);
+  });
+
+  // --- Heading anchors -----------------------------------------------------
+  document.querySelectorAll("main h2[id], main h3[id]").forEach(function (heading) {
+    var link = document.createElement("a");
+    link.className = "anchor";
+    link.href = "#" + heading.id;
+    link.textContent = "#";
+    link.setAttribute("aria-label", "Link to this section");
+    heading.appendChild(link);
+  });
+
+  // --- Mermaid -------------------------------------------------------------
+  function renderMermaid() {
+    if (!window.mermaid) {
+      document.documentElement.classList.add("no-mermaid");
+      return;
+    }
+    window.mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "loose",
+      theme: "base",
+      themeVariables: {
+        fontFamily: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontSize: "14px",
+        primaryColor: "#e8f1f7",
+        primaryTextColor: "#15202b",
+        primaryBorderColor: "#0d4f78",
+        lineColor: "#6b7c8f",
+        secondaryColor: "#fff5df",
+        tertiaryColor: "#f5f7fa",
+        noteBkgColor: "#fff5df",
+        noteTextColor: "#5b4800",
+        noteBorderColor: "#e2c47a",
+        actorBkg: "#e8f1f7",
+        actorBorder: "#0d4f78",
+        actorTextColor: "#15202b",
+        signalColor: "#334a5e",
+        signalTextColor: "#15202b",
+        labelBoxBkgColor: "#e8f1f7",
+        labelBoxBorderColor: "#0d4f78",
+        labelTextColor: "#15202b",
+        loopTextColor: "#334a5e",
+        activationBkgColor: "#dcecf6",
+        activationBorderColor: "#0d4f78"
+      },
+      flowchart: { curve: "basis", useMaxWidth: true },
+      sequence: { useMaxWidth: true, wrap: true },
+      state: { useMaxWidth: true }
+    });
+    window.mermaid.run({ querySelector: ".mermaid" }).catch(function () {
+      document.documentElement.classList.add("no-mermaid");
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", renderMermaid);
+  } else {
+    renderMermaid();
+  }
+
+  // --- Collapse the table of contents on narrow screens --------------------
+  var toc = document.querySelector(".toc-details");
+  if (toc && window.matchMedia) {
+    var narrow = window.matchMedia("(max-width: 1040px)");
+    function syncToc(event) {
+      toc.open = !event.matches;
+    }
+    syncToc(narrow);
+    if (narrow.addEventListener) {
+      narrow.addEventListener("change", syncToc);
+    } else if (narrow.addListener) {
+      narrow.addListener(syncToc);
+    }
+  }
+
+  // --- Active section in the table of contents -----------------------------
+  var links = Array.prototype.slice.call(
+    document.querySelectorAll('.toc a[href^="#"]')
+  );
+  var byId = {};
+  links.forEach(function (link) {
+    byId[link.getAttribute("href").slice(1)] = link;
+  });
+
+  if ("IntersectionObserver" in window) {
+    var observer = new IntersectionObserver(
+      function (entries) {
+        entries.forEach(function (entry) {
+          if (!entry.isIntersecting) return;
+          links.forEach(function (link) { link.classList.remove("active"); });
+          var link = byId[entry.target.id];
+          if (link) link.classList.add("active");
+        });
+      },
+      { rootMargin: "-18% 0px -68% 0px", threshold: 0 }
+    );
+    document.querySelectorAll("main section[id]").forEach(function (section) {
+      observer.observe(section);
+    });
+  }
+})();
+</script>
+</body>
+</html>

@@ -48,9 +48,9 @@
 #      band showing and everything under it being somebody else's page. This
 #      bit on 2026-10-20, during a sweep against the hosted dev API, when a
 #      full-screen browser had the app's rect. The raise is
-#      `hyprctl eval 'hl.dsp.window.bring_to_top(<address>)'` — the same
-#      dispatcher `hyprctl dispatch` would have reached, through the new
-#      API, because the old CLI cannot parse a multi-word argument here.
+#      `hyprctl eval 'hl.dispatch(hl.dsp.window.bring_to_top(<address>))'` —
+#      the dispatcher has to be DISPATCHED (`hl.dsp.*` only builds it) and the
+#      selector has to be `address:0x…` (a bare address reads as a title).
 #
 # Usage: gpui-capture.sh [RUN_SECS] [OUT] [extra tfg env, e.g. "TFG_COMMS=1"]
 set -euo pipefail
@@ -117,6 +117,12 @@ RUN_LOG="/tmp/gpui_run.$(basename "$PWD").log"
 # shellcheck disable=SC2086
 env $EXTRA_ENV ./target/debug/tfg $APP_ARGS > "$RUN_LOG" 2>&1 &
 PID=$!
+# EXPORTED, because the crop below matches this window by pid inside a
+# `python3 -c` and `PID` is a shell variable, not an environment one. Without
+# this the match silently fell through to the class fallback — and with
+# another console of the same class running (the operator's own, most often)
+# the capture photographed THAT window, sign-in card and all.
+export PID
 echo "launched pid $PID  (env: ${EXTRA_ENV:-none})"
 
 sleep "$RUN_SECS"
@@ -160,14 +166,22 @@ echo "window rect (logical): $X $Y $W $H  on workspace '$WWS'"
 # go there, and re-read the rect: becoming alone on a workspace resizes it.
 CAPTURE_WS="${TFG_CAPTURE_WS:-6}"
 if [ -n "$WADDR" ] && [ -n "$CAPTURE_WS" ] && [ "$WWS" != "$CAPTURE_WS" ]; then
-    # MOVE, THEN FOLLOW. This build's `hyprctl dispatch` takes a Lua
-    # EXPRESSION, not a dispatcher string (`hl.dispatch(movewindow 6)` is a
-    # syntax error), so the old form only ever worked by luck. Two moves are
-    # tried, then focus is put on the window — which is what switches the
-    # compositor to the workspace the window now lives on.
-    if timeout "$T" hyprctl dispatch movetoworkspacesilent "${CAPTURE_WS},address:${WADDR}" >/dev/null 2>&1 \
-        || timeout "$T" hyprctl eval "hl.dsp.window.move({ workspace = \"${CAPTURE_WS}\" })" >/dev/null 2>&1; then
-        timeout "$T" hyprctl eval "hl.dsp.focus({ window = \"${WADDR}\" })" >/dev/null 2>&1 || true
+    # MOVE, THEN FOLLOW — and both in ONE call, because `hl.dsp.window.move`
+    # follows the window to the workspace it names unless `follow = false`.
+    #
+    # THE DISPATCHER MUST BE DISPATCHED, not merely evaluated. `hl.dsp.*`
+    # BUILDS a dispatcher and returns it; nothing happens until
+    # `hl.dispatch(...)` is handed it. The bare `hyprctl eval
+    # 'hl.dsp.window.move(...)'` therefore exited 0 and moved nothing (and so
+    # did the bare `hl.dsp.focus(...)` that was meant to follow it), leaving
+    # the capture to refuse one step later with the window on the wrong
+    # workspace and no hint why. The old `dispatch movetoworkspacesilent`
+    # string form is kept as the fallback for a build whose Lua namespace
+    # differs — it exits 0 either way, which is why the rect is RE-READ below
+    # rather than trusted.
+    if timeout "$T" hyprctl eval "hl.dispatch(hl.dsp.window.move({ window = \"address:${WADDR}\", workspace = \"${CAPTURE_WS}\" }))" >/dev/null 2>&1 \
+        || timeout "$T" hyprctl dispatch movetoworkspacesilent "${CAPTURE_WS},address:${WADDR}" >/dev/null 2>&1; then
+        timeout "$T" hyprctl eval "hl.dispatch(hl.dsp.focus({ window = \"address:${WADDR}\" }))" >/dev/null 2>&1 || true
         sleep 1.5
         RECT=$(timeout "$T" hyprctl -j clients | python3 -c "
 import json,sys
@@ -180,7 +194,7 @@ for c in json.load(sys.stdin):
 " || true)
         if [ -n "$RECT" ]; then
             read -r X Y W H WWS WADDR <<< "$RECT"
-            echo "moved to workspace '$CAPTURE_WS': rect now $X $Y $W $H"
+            echo "moved to workspace '$CAPTURE_WS': rect now $X $Y $W $H (on '$WWS')"
         fi
     else
         echo "note: could not move the window to workspace '$CAPTURE_WS'; capturing where it is" >&2
@@ -204,11 +218,15 @@ restore_workspace() {
 #
 # `hyprctl dispatch` cannot do it on this build (its Lua wrapper rejects a
 # multi-word argument), but `hyprctl eval` reaches the same dispatcher
-# through the new API: `hl.dsp.window.bring_to_top(<address>)`. It raises
+# through the new API: `hl.dispatch(hl.dsp.window.bring_to_top(address:0x…))`.
+# Two things are not optional: `hl.dsp.*` BUILDS a dispatcher and returns it,
+# so it needs `hl.dispatch(...)` around it; and a window selector is
+# `address:0x…`, because a bare address is parsed as a TITLE regex and matches
+# nothing — both exited `ok` while doing nothing. It raises
 # the window in its current workspace without moving it, which is exactly
 # what a capture needs and nothing more.
 if [ -n "$WADDR" ]; then
-    timeout "$T" hyprctl eval "hl.dsp.window.bring_to_top(\"$WADDR\")" >/dev/null 2>&1 || true
+    timeout "$T" hyprctl eval "hl.dispatch(hl.dsp.window.bring_to_top(\"address:$WADDR\"))" >/dev/null 2>&1 || true
     sleep 1
 fi
 

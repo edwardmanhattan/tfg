@@ -103,6 +103,29 @@ pub struct DraftHull {
     /// changed and a placement changed are different edits, and the plan's
     /// writes are the ones the server accepts.
     pub course_deg: Option<f32>,
+    /// THE HULL THAT BROUGHT THIS ONE IN, when the register's pre-embarked
+    /// units are what put it here.
+    ///
+    /// Deploying a parent brings its register contents with it in the same
+    /// write (`with_contents`), so these hulls need no write of their own:
+    /// no assignment, no embarkation, nothing. The mark is what tells [`plan`]
+    /// so, and it is the client's half of a mechanism the server performs
+    /// atomically — the operator sees the boats arrive beside the ship
+    /// instead of finding them in the next read.
+    ///
+    /// It is cleared the moment the operator moves the hull off its bringer,
+    /// because then it is a hull the operator is placing and the plan owes it
+    /// an assignment like any other.
+    pub brought_by: Option<i64>,
+    /// WHETHER DEPLOYING THIS HULL SHOULD BRING WHAT THE REGISTER SAYS IT
+    /// CARRIES — the picker's toggle, carried on the hull it applies to.
+    ///
+    /// The choice is per hull because the deployment is: one hull arrives with
+    /// her boats and the next arrives bare, and the difference is the force the
+    /// exercise will have. `false` for a hull the operator has not asked about,
+    /// and the only thing that makes [`plan`] name `with_contents` at all. It
+    /// is named the wire's word on purpose: one name for one decision.
+    pub with_contents: bool,
 }
 
 impl DraftHull {
@@ -116,6 +139,8 @@ impl DraftHull {
             commander_id: None,
             host: None,
             course_deg: None,
+            brought_by: None,
+            with_contents: false,
         }
     }
 }
@@ -198,7 +223,19 @@ impl ForceDraft {
     /// The removal is MARKED, not merely an absence: a re-read replaces the
     /// draft from the server's frame, and a hull the server still holds
     /// would come back with it.
+    ///
+    /// THE BOATS A HULL BROUGHT STAY IN THE GAME, ON THE WATER. Removing a
+    /// parent does not remove the register's pre-embarked units — Minos has
+    /// no such cascade, and the boats were deployed pieces in their own right
+    /// the moment the parent landed. They are un-hosted here so the plan
+    /// never tries to put one aboard a hull that is about to leave.
     pub fn remove(&mut self, unit_id: i64) -> Option<DraftHull> {
+        for hull in self.hulls.values_mut() {
+            if hull.brought_by == Some(unit_id) {
+                hull.brought_by = None;
+                hull.host = None;
+            }
+        }
         self.removed.insert(unit_id);
         self.hulls.remove(&unit_id)
     }
@@ -232,6 +269,12 @@ impl ForceDraft {
                     // it, which is what keeps the staged course through a
                     // re-seed.
                     course_deg: None,
+                    // A hull the server already holds was not brought in by
+                    // anybody: the mechanism has already happened, and the
+                    // frame is the record of it. Nor does it have a choice
+                    // left about bringing contents: an assignment already ran.
+                    brought_by: None,
+                    with_contents: false,
                 },
             );
         }
@@ -248,6 +291,14 @@ impl ForceDraft {
             .collect();
         self.hulls = frame.clone();
         for hull in kept {
+            // A HULL THE SERVER HOLDS IS NOT "BROUGHT" ANY MORE: the
+            // mechanism already happened, and the draft's mark is what kept
+            // the plan from writing it. Keeping the mark past the write would
+            // leave a hull the server created looking like one it is about to.
+            let mut hull = hull;
+            if frame.contains_key(&hull.unit_id) {
+                hull.brought_by = None;
+            }
             self.hulls.insert(hull.unit_id, hull);
         }
         for id in &removals {
@@ -332,14 +383,167 @@ impl ForceDraft {
     /// Put a hull aboard another, or take it off whatever carries it. `None`
     /// puts it back on the water; the host is named, not the piece, because
     /// that is the thing the operator dragged it onto.
+    ///
+    /// MOVING A BROUGHT HULL MAKES IT THE OPERATOR'S. A hull the register put
+    /// aboard its parent needs no write while it stays there — the parent's
+    /// assignment brings it — but a hull dragged onto another host, or onto
+    /// open water, is a statement of the operator's own and the plan owes it
+    /// an assignment like any other.
     pub fn set_host(&mut self, unit_id: i64, host: Option<i64>) -> bool {
         match self.hulls.get_mut(&unit_id) {
             Some(hull) => {
+                if hull.host != host {
+                    hull.brought_by = None;
+                }
                 hull.host = host;
                 true
             }
             None => false,
         }
+    }
+
+    /// Stage the register's pre-embarked units beside the hull that brings
+    /// them.
+    ///
+    /// A DEPLOYMENT IS ONE ACT. The server puts a parent's register contents
+    /// into the exercise aboard her, in the same transaction as the
+    /// assignment — so the console draws them now, in the draft, rather than
+    /// showing a ship that will be larger in the next read. Each child is
+    /// marked [`DraftHull::brought_by`], which is what keeps [`plan`] from
+    /// writing hulls the server is about to create for itself.
+    ///
+    /// A CHILD THE OPERATOR HAS ALREADY PUT ABOARD IS CLAIMED, not skipped.
+    /// The register's copy often arrives after the drag that put the boat on
+    /// the ship, and a list that only ever added new rows would leave that
+    /// boat looking like an ordinary piece — so the press would assign it and
+    /// then attach it to a hull whose own assignment is about to put it
+    /// there, which the server refuses as `already aboard this hull`. The
+    /// claim only happens when the child is aboard THIS parent and the parent
+    /// is bringing her contents; a boat the operator put somewhere else is
+    /// theirs, and this list is a statement about the world, never an edit to
+    /// the plan.
+    ///
+    /// Answers how many children the draft now owes to this parent's
+    /// assignment.
+    pub fn bring_contents(
+        &mut self,
+        parent: i64,
+        children: &[(i64, String, String)],
+    ) -> usize {
+        let Some(parent_hull) = self.hulls.get(&parent) else {
+            return 0;
+        };
+        if !parent_hull.with_contents {
+            return 0;
+        }
+        let mut claimed = 0usize;
+        for (id, name, hull_number) in children {
+            if *id == parent || self.removed.contains(id) {
+                continue;
+            }
+            match self.hulls.get_mut(id) {
+                Some(child) if child.host == Some(parent) => {
+                    if child.brought_by != Some(parent) {
+                        child.brought_by = Some(parent);
+                        claimed += 1;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.hulls.insert(
+                        *id,
+                        DraftHull {
+                            unit_id: *id,
+                            name: name.clone(),
+                            hull_number: hull_number.clone(),
+                            class_id: String::new(),
+                            start: None,
+                            commander_id: None,
+                            host: Some(parent),
+                            course_deg: None,
+                            brought_by: Some(parent),
+                            // The boats are already the parent's to bring: a
+                            // child is not a deployment of its own.
+                            with_contents: false,
+                        },
+                    );
+                    claimed += 1;
+                }
+            }
+        }
+        claimed
+    }
+
+    /// The hulls standing in the draft only because `parent` brought them.
+    pub fn brought_by(&self, parent: i64) -> Vec<&DraftHull> {
+        self.hulls
+            .values()
+            .filter(|hull| hull.brought_by == Some(parent))
+            .collect()
+    }
+
+    /// Claim ONE child for its parent's assignment, when the register's copy
+    /// is already read and the operator's drag put the boat aboard anyway.
+    ///
+    /// The same rule [`Self::bring_contents`] applies to a whole list, for the
+    /// gesture that lands after the list was read: the press must not attach a
+    /// unit the parent's own assignment is about to put there. Answers whether
+    /// the child is now the parent's to bring.
+    pub fn mark_brought(&mut self, parent: i64, child: i64) -> bool {
+        let brings = self
+            .get(parent)
+            .is_some_and(|hull| hull.with_contents && hull.unit_id != child);
+        if !brings {
+            return false;
+        }
+        match self.hulls.get_mut(&child) {
+            Some(hull) if hull.host == Some(parent) => {
+                hull.brought_by = Some(parent);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// SAY WHETHER A HULL BRINGS WHAT THE REGISTER SAYS SHE CARRIES, and stage
+    /// or take back exactly what that decision is about.
+    ///
+    /// One call because the two halves cannot disagree: a hull that will not
+    /// bring her boats cannot be standing for them in the draft, and a hull
+    /// that will must have them beside her — otherwise the plan either creates
+    /// hulls nobody asked for or leaves the ones it shows unwritten. `children`
+    /// is the register's copy; it is ignored when the answer is `false`.
+    ///
+    /// Answers how many children changed hands.
+    pub fn set_bring_contents(
+        &mut self,
+        unit_id: i64,
+        want: bool,
+        children: &[(i64, String, String)],
+    ) -> usize {
+        let Some(hull) = self.hulls.get_mut(&unit_id) else {
+            return 0;
+        };
+        hull.with_contents = want;
+        if want {
+            self.bring_contents(unit_id, children)
+        } else {
+            self.drop_contents(unit_id)
+        }
+    }
+
+    /// Take back the hulls the register's copy staged beside `parent`.
+    pub fn drop_contents(&mut self, parent: i64) -> usize {
+        let ids: Vec<i64> = self
+            .hulls
+            .values()
+            .filter(|hull| hull.brought_by == Some(parent))
+            .map(|hull| hull.unit_id)
+            .collect();
+        for id in &ids {
+            self.hulls.remove(id);
+        }
+        ids.len()
     }
 
     /// Hulls nobody commands yet, in unit-id order. The refusal names these and
@@ -374,6 +578,9 @@ pub enum ForceWrite {
         /// Named when the operator has named one. A planning save may hold
         /// hulls whose commanders come later.
         commander_id: Option<i64>,
+        /// The picker's toggle, read from the hull being deployed: ask the
+        /// server to bring the register's pre-embarked units aboard her.
+        with_contents: bool,
     },
     /// Change who commands a hull the server already has.
     HandOver {
@@ -642,6 +849,37 @@ fn ring_hulls(draft: &ForceDraft) -> Vec<String> {
         .collect()
 }
 
+/// Whether this hull's presence is the PARENT'S ASSIGNMENT'S doing.
+///
+/// True only when all three hold, because the plan is a statement about what
+/// THIS press writes and nothing more:
+///
+/// - the draft says the hull was brought by a parent (`brought_by`);
+/// - the parent is being assigned by this plan (`with_contents` set, and the
+///   server does not hold the parent yet) — that is the write the server acts
+///   on;
+/// - the server does not hold the child yet.
+///
+/// A hull the server already has is nobody's rider: it exists, and no plan
+/// will create it again. The distinction is what keeps a press from asking the
+/// server to attach a unit its own assignment is about to put aboard —
+/// `unit_ids[0]: already aboard this hull`.
+fn brought_in_this_press(draft: &ForceDraft, live: &[LiveHull], hull: &DraftHull) -> bool {
+    let Some(parent) = hull.brought_by else {
+        return false;
+    };
+    if live.iter().any(|l| l.unit_id == hull.unit_id) {
+        return false;
+    }
+    let Some(parent_hull) = draft.get(parent) else {
+        return false;
+    };
+    if !parent_hull.with_contents {
+        return false;
+    }
+    !live.iter().any(|l| l.unit_id == parent)
+}
+
 /// The writes that carry `draft` onto a server holding `live`, in the order
 /// the server accepts them.
 ///
@@ -669,11 +907,18 @@ pub fn plan(draft: &ForceDraft, live: &[LiveHull]) -> Result<Vec<ForceWrite>, Fo
     // placement rides directly behind the assignment, because the position
     // endpoint 404s on a hull the server has never heard of.
     for hull in draft.hulls() {
+        // A HULL THE REGISTER BROUGHT NEEDS NO WRITE OF ITS OWN: the parent's
+        // assignment creates it aboard her in the same transaction. See
+        // `brought_in_this_press` for the three conditions.
+        if brought_in_this_press(draft, live, hull) {
+            continue;
+        }
         let Some(here) = live.iter().find(|l| l.unit_id == hull.unit_id) else {
             writes.push(ForceWrite::Assign {
                 unit_id: hull.unit_id,
                 name: hull.name.clone(),
                 commander_id: hull.commander_id,
+                with_contents: hull.with_contents,
             });
             if let Some(start) = hull.start {
                 writes.push(ForceWrite::Place {
@@ -727,6 +972,12 @@ pub fn plan(draft: &ForceDraft, live: &[LiveHull]) -> Result<Vec<ForceWrite>, Fo
     // A hull the server does not hold reads as hostless, which is exactly
     // right — it arrives on the water and is put aboard in the same advance.
     for hull in draft.hulls() {
+        // A HULL THE REGISTER PUT ABOARD IS ALREADY THERE: its host is the
+        // bringer, and the bringer's assignment is what puts it there. See
+        // pass 1.
+        if brought_in_this_press(draft, live, hull) {
+            continue;
+        }
         let live_host = live
             .iter()
             .find(|l| l.unit_id == hull.unit_id)
@@ -815,7 +1066,8 @@ mod tests {
                 ForceWrite::Assign {
                     unit_id: 7,
                     name: "KRI Nanggala".into(),
-                    commander_id: Some(3)
+                    commander_id: Some(3),
+                    with_contents: false,
                 },
                 ForceWrite::Place {
                     unit_id: 7,
@@ -1039,7 +1291,8 @@ mod tests {
                 ForceWrite::Assign {
                     unit_id: 7,
                     name: "KRI Nanggala".into(),
-                    commander_id: Some(3)
+                    commander_id: Some(3),
+                    with_contents: false,
                 },
                 ForceWrite::Place {
                     unit_id: 7,
@@ -1050,7 +1303,8 @@ mod tests {
                 ForceWrite::Assign {
                     unit_id: 8,
                     name: "KRI Rangsat".into(),
-                    commander_id: Some(4)
+                    commander_id: Some(4),
+                    with_contents: false,
                 },
             ])
         );
@@ -1224,12 +1478,188 @@ mod tests {
         );
     }
 
+    /// THE REGISTER'S PRE-EMBARKED UNITS NEED NO WRITE OF THEIR OWN.
+    ///
+    /// Deploying a parent puts them in the exercise aboard her, in the same
+    /// assignment (`with_contents`), so a plan that also assigned and embarked
+    /// them would ask the server to create a hull it is creating and to embark
+    /// one it is embarking. The draft shows them; the plan writes the parent.
+    #[test]
+    fn a_register_brought_hull_is_planned_with_its_parent_alone() {
+        let mut draft = ForceDraft::new();
+        let mut parent = hull(5, "KRI Ahmad Yani", None);
+        parent.commander_id = Some(3);
+        parent.with_contents = true;
+        draft.upsert(parent);
+        let added = draft.bring_contents(5, &[(7, "KRI Nanggala".into(), "h7".into())]);
+        assert_eq!(added, 1, "the boat is staged");
+        assert_eq!(draft.get(7).map(|h| h.host), Some(Some(5)), "aboard her");
+        assert_eq!(
+            plan(&draft, &[]),
+            Ok(vec![ForceWrite::Assign {
+                unit_id: 5,
+                name: "KRI Ahmad Yani".into(),
+                commander_id: Some(3),
+                with_contents: true,
+            }]),
+            "the parent is assigned; the boat arrives with her"
+        );
+    }
+
+    /// MOVED OFF ITS BRINGER, A HULL IS THE OPERATOR'S OWN. The mark is the
+    /// client's half of a mechanism the server performed; a hull dragged onto
+    /// open water is a hull the plan owes an assignment like any other.
+    #[test]
+    fn a_hull_moved_off_its_bringer_is_assigned_again() {
+        let mut draft = ForceDraft::new();
+        let mut parent = hull(5, "KRI Ahmad Yani", None);
+        parent.commander_id = Some(3);
+        parent.with_contents = true;
+        draft.upsert(parent);
+        draft.bring_contents(5, &[(7, "KRI Nanggala".into(), "h7".into())]);
+        assert!(draft.set_host(7, None));
+        let writes = plan(&draft, &[]).expect("plans");
+        assert!(
+            writes.contains(&ForceWrite::Assign {
+                unit_id: 7,
+                name: "KRI Nanggala".into(),
+                commander_id: None,
+                with_contents: false,
+            }),
+            "the hull is on the water and needs an assignment: {writes:?}"
+        );
+    }
+
+    /// A BOAT OUTLIVES ITS SHIP IN THE DRAFT TOO: removing the parent leaves
+    /// the register's units in the exercise, on the water, because Minos has
+    /// no cascade and a hull deployed once is a piece of its own.
+    #[test]
+    fn removing_a_bringer_orphans_its_boats_on_the_water() {
+        let mut draft = ForceDraft::new();
+        let mut parent = hull(5, "KRI Ahmad Yani", None);
+        parent.with_contents = true;
+        draft.upsert(parent);
+        draft.bring_contents(5, &[(7, "KRI Nanggala".into(), "h7".into())]);
+        draft.remove(5);
+        let boat = draft.get(7).expect("the boat stays");
+        assert_eq!(boat.host, None, "on the water");
+        assert_eq!(boat.brought_by, None, "and nobody's rider");
+    }
+
+    /// THE TOGGLE IS THE OPERATOR'S, and the plan says what they chose: a hull
+    /// deployed bare is assigned bare, and one asked to bring her boats says
+    /// so — the same draft, two different forces.
+    #[test]
+    fn the_assignment_carries_the_operator_s_choice() {
+        let mut draft = ForceDraft::new();
+        let mut bare = hull(5, "KRI Ahmad Yani", None);
+        bare.with_contents = false;
+        draft.upsert(bare);
+        let mut bringing = hull(6, "KRI Diponegoro", None);
+        bringing.with_contents = true;
+        draft.upsert(bringing);
+        let writes = plan(&draft, &[]).expect("plans");
+        let asked: Vec<(i64, bool)> = writes
+            .iter()
+            .filter_map(|w| match w {
+                ForceWrite::Assign {
+                    unit_id,
+                    with_contents,
+                    ..
+                } => Some((*unit_id, *with_contents)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked, vec![(5, false), (6, true)]);
+    }
+
+    /// SAYING "NO" TAKES BACK WHAT SAID "YES" STAGED — and saying "yes" again
+    /// puts them back, because the toggle is a decision and not a one-way
+    /// door.
+    #[test]
+    fn the_toggle_stages_and_unstages_a_hulls_boats() {
+        let mut draft = ForceDraft::new();
+        let mut parent = hull(5, "KRI Ahmad Yani", None);
+        parent.with_contents = true;
+        draft.upsert(parent);
+        let boats = [(7, "KRI Nanggala".to_string(), "h7".to_string())];
+        assert_eq!(draft.set_bring_contents(5, true, &boats), 1, "brought");
+        assert!(draft.contains(7));
+        assert_eq!(draft.set_bring_contents(5, false, &boats), 1, "taken back");
+        assert!(!draft.contains(7), "and gone from the draft");
+        assert_eq!(draft.set_bring_contents(5, true, &boats), 1, "brought again");
+        assert!(draft.contains(7));
+    }
+
+    /// THE REPORTED 400: a boat the operator dragged aboard a hull that is
+    /// itself being deployed with `with_contents`.
+    ///
+    /// The register's copy lands after the drag, and the boat is already in the
+    /// draft with that host. The press must write the PARENT alone — the
+    /// server creates the boat aboard her — or the attach that follows is
+    /// refused with `unit_ids[0]: that unit is already aboard this hull`.
+    #[test]
+    fn a_boat_dragged_aboard_before_the_register_copy_is_not_embarked_twice() {
+        let mut draft = ForceDraft::new();
+        let mut parent = hull(590, "KRI Makassar", None);
+        parent.with_contents = true;
+        draft.upsert(parent);
+        // The drag: the boat is aboard, and nothing marks it yet.
+        let mut boat = hull(800, "Leopard 2A4", None);
+        boat.host = Some(590);
+        draft.upsert(boat);
+        // The register's copy lands.
+        assert_eq!(
+            draft.bring_contents(590, &[(800, "Leopard 2A4".into(), "h800".into())]),
+            1,
+            "the existing boat is claimed, not skipped"
+        );
+        assert_eq!(
+            plan(&draft, &[]),
+            Ok(vec![ForceWrite::Assign {
+                unit_id: 590,
+                name: "KRI Makassar".into(),
+                commander_id: None,
+                with_contents: true,
+            }]),
+            "the parent's assignment creates the boat: no second write"
+        );
+    }
+
+    /// THE OTHER SIDE OF THAT RULE: when the parent is ALREADY in the exercise
+    /// her assignment does not run, so her boats are ordinary deployments and
+    /// must be written — the skip is about this press, not about the mark.
+    #[test]
+    fn a_boat_of_a_hull_the_server_already_has_is_written_itself() {
+        let mut draft = ForceDraft::new();
+        let mut parent = hull(590, "KRI Makassar", None);
+        parent.with_contents = true;
+        draft.upsert(parent);
+        let mut boat = hull(800, "Leopard 2A4", None);
+        boat.host = Some(590);
+        boat.brought_by = Some(590);
+        draft.upsert(boat);
+        let writes = plan(&draft, &[live(590, "KRI Makassar", None, None)]).expect("plans");
+        assert!(
+            writes.iter().any(|w| matches!(
+                w,
+                ForceWrite::Assign { unit_id: 800, .. }
+            )),
+            "the boat is assigned by this press: {writes:?}"
+        );
+        assert!(
+            writes
+                .iter()
+                .any(|w| matches!(w, ForceWrite::Embark { child: 800, .. })),
+            "and put aboard her: {writes:?}"
+        );
+    }
+
     /// The embarkation endpoint 404s on a hull — or a host — the server has
     /// never heard of, so a new host and a new child are both assigned
     /// before the link that names them is posted.
     #[test]
-    fn an_embark_is_ordered_after_both_hulls_assignments() {
-        let mut draft = ForceDraft::new();
+    fn an_embark_is_ordered_after_both_hulls_assignments() {        let mut draft = ForceDraft::new();
         let mut host = hull(5, "KRI Ahmad Yani", None);
         host.commander_id = Some(3);
         draft.upsert(host);
@@ -1243,12 +1673,14 @@ mod tests {
                 ForceWrite::Assign {
                     unit_id: 5,
                     name: "KRI Ahmad Yani".into(),
-                    commander_id: Some(3)
+                    commander_id: Some(3),
+                    with_contents: false,
                 },
                 ForceWrite::Assign {
                     unit_id: 7,
                     name: "KRI Nanggala".into(),
-                    commander_id: Some(4)
+                    commander_id: Some(4),
+                    with_contents: false,
                 },
                 ForceWrite::Embark {
                     host: 5,
@@ -1552,6 +1984,8 @@ mod cluster_tests {
                 commander_id: None,
                 host: None,
                 course_deg: None,
+                brought_by: None,
+                with_contents: false,
             });
         }
         force

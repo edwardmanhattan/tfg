@@ -16,7 +16,11 @@
 //! and what the port found — including the one shape that must NOT be copied
 //! — is in `assets/symbology/FINDINGS.md` §6.
 
-use super::icons::{BOX_PX, EM_BOX, MIN_ARC_SAGITTA_EM, MIN_ARC_SAGITTA_PX, STROKE_RATIO};
+use super::icons::{BOX_PX, MIN_ARC_SAGITTA_PX, STROKE_RATIO};
+// The tolerance tests compare against the em-authored sagitta, so the two
+// names are read only under `cfg(test)` — a normal build does not.
+#[cfg(test)]
+use super::icons::{EM_BOX, MIN_ARC_SAGITTA_EM};
 use super::svgpath;
 use super::{Affiliation, BattleDimension};
 

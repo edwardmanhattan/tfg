@@ -1403,7 +1403,76 @@ impl Draft {
             });
         }
 
+        // 9. A TASK GROUP IS SOMEBODY, and the move to preparation is where
+        //    Minos stops accepting one that is nobody. A planning save lands
+        //    in `planning` and is left alone; the verb that lands in
+        //    preparation is the one that answers this.
+        if verb == Verb::PlayDirectly {
+            let nameless = self.groups.uncommanded();
+            if !nameless.is_empty() {
+                blockers.push(Blocker {
+                    stage: Stage::Groups,
+                    sentence: format!(
+                        "{} \u{2014} every group needs a commander before the game moves to \
+                         preparation, because a task group is somebody who orders it.",
+                        nameless.join(", ")
+                    ),
+                });
+            }
+        }
+
+        // 10. ONE PERSON COMMANDS ONE THING — a hull OR a task group, never
+        //     both and never two. The server asks it of both tables on every
+        //     write that grants a command; the draft can hold the same
+        //     conflict the moment a group is handed to a hull's commander, so
+        //     it is asked here rather than at the refusal.
+        let doubled = self.doubled_commands();
+        if !doubled.is_empty() {
+            blockers.push(Blocker {
+                stage: Stage::Groups,
+                sentence: format!(
+                    "{} \u{2014} one person commands one thing, so a seat holds a hull or a task \
+                     group, never both.",
+                    doubled.join(", ")
+                ),
+            });
+        }
+
         blockers
+    }
+
+    /// The people the draft gives more than one command to: hulls and task
+    /// groups together, in a stable order.
+    ///
+    /// `force::gap` answers the hulls-only half (two hulls, one seat), because
+    /// the force draft cannot see the tree. A group commander is the other
+    /// half of the same server rule, and this is the only place that holds
+    /// both halves.
+    fn doubled_commands(&self) -> Vec<String> {
+        let mut by_person: std::collections::BTreeMap<i64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for hull in self.force.hulls() {
+            if let Some(commander) = hull.commander_id {
+                by_person
+                    .entry(commander)
+                    .or_default()
+                    .push(hull.name.clone());
+            }
+        }
+        for group in self.groups.visible_groups() {
+            if let Some(commander) = group.commander_id {
+                by_person
+                    .entry(commander)
+                    .or_default()
+                    .push(group.name.clone());
+            }
+        }
+        by_person
+            .values()
+            .filter(|held| held.len() > 1)
+            .flatten()
+            .cloned()
+            .collect()
     }
 
     /// Stage 04's rule, read at stage 06: a step's window is both ends or
@@ -2039,6 +2108,69 @@ mod tests {
         );
         draft.ceiling = Some(40);
         assert!(draft.can_run(Verb::SaveAsGameSession));
+    }
+
+    /// A TASK GROUP IS SOMEBODY: the move to preparation refuses while a
+    /// group has no commander, and names it. A planning save lands in
+    /// `planning` and is left alone.
+    #[test]
+    fn an_uncommanded_group_blocks_the_move_to_preparation() {
+        let mut draft = Draft::blank(GameMode::Maneuver).unwrap();
+        draft.terms.name = "Baltic Shield 26".into();
+        draft.roster.stage(seat(4, "Lt. Fitri"));
+        draft.roster.stage(seat(5, "Lt. Bayu"));
+        draft.force.upsert(hull(351, "KRI AHMAD YANI", Some(4)));
+        draft
+            .groups
+            .stage_group(0, "GUS-1", GroupKind::SatuanTugas, None, None, vec![351])
+            .expect("a group");
+        let blocking = draft.blockers(Verb::PlayDirectly);
+        assert!(
+            blocking
+                .iter()
+                .any(|b| b.stage == Stage::Groups && b.sentence.contains("GUS-1")),
+            "{blocking:?}"
+        );
+        assert!(
+            !draft
+                .blockers(Verb::SaveAsGameSession)
+                .iter()
+                .any(|b| b.sentence.contains("GUS-1")),
+            "a planning save lands in planning, where the rule has not bitten yet"
+        );
+        draft
+            .groups
+            .set_commander(-1, Some(5))
+            .expect("the group's commander");
+        assert!(
+            !draft
+                .blockers(Verb::PlayDirectly)
+                .iter()
+                .any(|b| b.sentence.contains("GUS-1")),
+            "commanded, and the sentence is gone"
+        );
+    }
+
+    /// ONE PERSON COMMANDS ONE THING, and the draft counts hulls and groups
+    /// together: a seat handed both is the conflict the server refuses on
+    /// whichever write lands second.
+    #[test]
+    fn a_seat_cannot_command_a_hull_and_a_group() {
+        let mut draft = Draft::blank(GameMode::Maneuver).unwrap();
+        draft.terms.name = "Baltic Shield 26".into();
+        draft.roster.stage(seat(4, "Lt. Fitri"));
+        draft.force.upsert(hull(351, "KRI AHMAD YANI", Some(4)));
+        draft
+            .groups
+            .stage_group(0, "GUS-1", GroupKind::SatuanTugas, None, Some(4), vec![351])
+            .expect("a group");
+        let blocking = draft.blockers(Verb::SaveAsGameSession);
+        assert!(
+            blocking
+                .iter()
+                .any(|b| b.sentence.contains("one person commands one thing")),
+            "{blocking:?}"
+        );
     }
 
     /// Stage 04's rule reaches stage 06: a step's window is a military pair

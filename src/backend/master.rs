@@ -695,18 +695,52 @@ impl MinosMaster {
             .cloned()
             .unwrap_or_default()
             .iter()
-            .filter_map(|u| {
-                Some(GameUnit {
-                    unit_id: u["id_unit"].as_i64()?,
-                    unit_name: u["unit_name"].as_str().unwrap_or("").to_string(),
-                    hull_number: u["hull_number"].as_str().unwrap_or("").to_string(),
-                    class_name: u["unit_class_name"].as_str().unwrap_or("").to_string(),
-                    commander_id: u["id_commander"].as_i64(),
-                    commander_name: u["commander_name"].as_str().unwrap_or("").to_string(),
-                    hierarchy_node: u["id_hierarchy_node"].as_i64(),
-                })
-            })
+            .filter_map(Self::parse_unit)
             .collect()
+    }
+
+    /// One piece row. The row says THREE things about embarkation and they
+    /// are different facts, so each keeps its own name:
+    ///
+    /// - `id_host` / `host_name` — where the piece IS in this exercise;
+    /// - `register_host_id` / `register_host_name` — where the FLEET
+    ///   REGISTER says it belongs, whether or not it is there;
+    /// - `register_contents` — what the register says THIS hull carries,
+    ///   with `in_game` telling which of those are already pieces here.
+    ///
+    /// The register's copy is what a deployment brings along: assigning a
+    /// hull with `with_contents` puts every one of them in the exercise,
+    /// aboard her, in the same write.
+    fn parse_unit(u: &serde_json::Value) -> Option<GameUnit> {
+        Some(GameUnit {
+            unit_id: u["id_unit"].as_i64()?,
+            unit_name: u["unit_name"].as_str().unwrap_or("").to_string(),
+            hull_number: u["hull_number"].as_str().unwrap_or("").to_string(),
+            class_name: u["unit_class_name"].as_str().unwrap_or("").to_string(),
+            commander_id: u["id_commander"].as_i64(),
+            commander_name: u["commander_name"].as_str().unwrap_or("").to_string(),
+            hierarchy_node: u["id_hierarchy_node"].as_i64(),
+            host: u["id_host"].as_i64(),
+            host_name: u["host_name"].as_str().unwrap_or("").to_string(),
+            register_host: u["register_host_id"].as_i64(),
+            register_host_name: u["register_host_name"].as_str().unwrap_or("").to_string(),
+            register_contents: u["register_contents"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|c| {
+                    Some(RegisterContent {
+                        unit_id: c["id_unit"].as_i64()?,
+                        unit_name: c["unit_name"].as_str().unwrap_or("").to_string(),
+                        hull_number: c["hull_number"].as_str().unwrap_or("").to_string(),
+                        in_game: c["in_game"].as_bool().unwrap_or(false),
+                        host: c["id_host"].as_i64(),
+                        host_name: c["host_name"].as_str().unwrap_or("").to_string(),
+                    })
+                })
+                .collect(),
+        })
     }
 
     /// One game's roster (staff-facing): exercise side first by server order.
@@ -774,6 +808,20 @@ impl MinosMaster {
     /// seating with a helper id answers 409 when they differ.
     pub fn game_roles(&self, token: &str, game_id: i64) -> Result<Vec<GameRole>, BackendError> {
         let data = self.get(token, &format!("/games/{game_id}/roles"))?;
+        Ok(Self::parse_game_roles(&data))
+    }
+
+    /// The game-role TEMPLATES: the vocabulary a draft seats from before a game
+    /// exists (`GET /game-roles`).
+    ///
+    /// A BLANK DRAFT HAS NO GAME, so there is no `/games/{id}/roles` to read —
+    /// yet the picker still has to offer the deployment's own role names, not
+    /// three hardcoded ones. This is that read. The ids here do NOT belong to
+    /// any game and are never sent: the press resolves each seat by NAME
+    /// against the game it creates (`§12.3`), which is what
+    /// `MasterTransport`'s role map is for.
+    pub fn game_role_templates(&self, token: &str) -> Result<Vec<GameRole>, BackendError> {
+        let data = self.get(token, "/game-roles")?;
         Ok(Self::parse_game_roles(&data))
     }
 
@@ -856,12 +904,21 @@ impl MinosMaster {
     /// hull commanded by a participant of this game, never judge-side —
     /// so players seat before fleet assigns. 409 when the hull is
     /// already in this game. Response is the refreshed units array.
+    ///
+    /// `with_contents` is THE OPERATOR'S CHOICE, and it is the register's copy
+    /// of what the hull carries: the server puts every one of them in the
+    /// exercise, aboard her and uncommanded, in the same transaction. It is
+    /// OFF by default on the route because it changes the force's size — each
+    /// arriving hull is one the execution gate wants a commander for — and the
+    /// console passes the picker's toggle rather than deciding for the
+    /// operator.
     pub fn assign_unit(
         &self,
         token: &str,
         game_id: i64,
         unit_id: i64,
         commander_id: Option<i64>,
+        with_contents: bool,
     ) -> Result<Vec<GameUnit>, BackendError> {
         // THE COMMANDER IS OPTIONAL. `POST /games/{id}/units` takes the hull
         // alone (verified against the dev server: 201, and the row comes back
@@ -871,6 +928,9 @@ impl MinosMaster {
         let mut body = serde_json::json!({ "id_unit": unit_id });
         if let Some(commander) = commander_id {
             body["id_commander"] = serde_json::Value::from(commander);
+        }
+        if with_contents {
+            body["with_contents"] = serde_json::Value::Bool(true);
         }
         let data = self.post(token, &format!("/games/{game_id}/units"), body)?;
         Ok(Self::parse_units(&data))
@@ -2656,10 +2716,14 @@ impl MinosMaster {
         game_id: i64,
         scenario_id: i64,
         step_id: i64,
+        kind: Option<&str>,
         content: Option<&str>,
         window: Option<Option<(&str, &str)>>,
     ) -> Result<GameScenario, BackendError> {
         let mut body = serde_json::Map::new();
+        if let Some(kind) = kind {
+            body.insert("kind".into(), serde_json::Value::String(kind.into()));
+        }
         if let Some(c) = content {
             body.insert("content".into(), serde_json::Value::String(c.into()));
         }
@@ -2719,6 +2783,27 @@ impl MinosMaster {
         let data = self.post(
             token,
             &format!("/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}/substeps"),
+            serde_json::json!({ "content": content }),
+        )?;
+        Self::parse_scenario(&data, game_id)
+    }
+
+    /// Rewrite one saved command's text. The body carries `content` alone;
+    /// the audience has its own route because it is a different write.
+    pub fn update_game_substep(
+        &self,
+        token: &str,
+        game_id: i64,
+        scenario_id: i64,
+        step_id: i64,
+        substep_id: i64,
+        content: &str,
+    ) -> Result<GameScenario, BackendError> {
+        let data = self.patch(
+            token,
+            &format!(
+                "/games/{game_id}/scenarios/{scenario_id}/steps/{step_id}/substeps/{substep_id}"
+            ),
             serde_json::json!({ "content": content }),
         )?;
         Self::parse_scenario(&data, game_id)
@@ -3570,6 +3655,11 @@ impl MinosMaster {
                 .as_str()
                 .unwrap_or("")
                 .to_string(),
+            call_sign: v["participant"]["call_sign"]
+                .as_str()
+                .or_else(|| v["participant"]["callsign"].as_str())
+                .unwrap_or("")
+                .to_string(),
             role_id: v["participant"]["id_game_role"].as_i64().unwrap_or(0),
             role_name: v["participant"]["role_name"]
                 .as_str()
@@ -3938,6 +4028,9 @@ pub struct JoinResult {
     pub game_state: String,
     pub user_id: i64,
     pub user_name: String,
+    /// The seat's call sign, as the roster writes it. Empty is an ordinary
+    /// answer: a seat that never had one set reads as its user name.
+    pub call_sign: String,
     pub role_id: i64,
     pub role_name: String,
     pub judge: bool,
@@ -5136,6 +5229,44 @@ pub struct GameUnit {
     /// for pieces in the exercise but outside the tree — absence is
     /// unassigned, never an error.
     pub hierarchy_node: Option<i64>,
+    /// THE HULL THAT CARRIES THIS PIECE, in this exercise. Absent for a
+    /// piece on the water — and absence is "nowhere", not "unknown".
+    ///
+    /// This is the exercise's own composition, which is why it is not the
+    /// same question as `register_host`: a hull can be aboard in the plan
+    /// and on the water in the register, or the other way round.
+    pub host: Option<i64>,
+    pub host_name: String,
+    /// WHERE THE FLEET REGISTER SAYS THIS HULL BELONGS. The register's copy
+    /// of the composition, carried so the console can say "she arrived
+    /// with her boat" rather than "she has a boat somewhere".
+    pub register_host: Option<i64>,
+    pub register_host_name: String,
+    /// WHAT THE REGISTER SAYS THIS HULL CARRIES — the pre-embarked units.
+    ///
+    /// Deploying a hull with `with_contents` puts every one of these in the
+    /// exercise aboard her, so this list is what a deployment will bring
+    /// before anybody presses anything: the client draws the mechanism from
+    /// it rather than discovering it in the next read.
+    pub register_contents: Vec<RegisterContent>,
+}
+
+/// One hull the fleet register says a hull carries.
+///
+/// `in_game` is this exercise's answer for the row: already a piece here, so
+/// an assignment that brings contents has nothing to add for it. The register
+/// read (`GET /units/{id}/embarkations`) has no such flag — what it lists IS
+/// inside the host — and a register row parsed from there says `true`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegisterContent {
+    pub unit_id: i64,
+    pub unit_name: String,
+    pub hull_number: String,
+    pub in_game: bool,
+    /// The child's own host, as the row names it. On a register read this is
+    /// the host being read.
+    pub host: Option<i64>,
+    pub host_name: String,
 }
 
 /// One row of a vessel's command history. The entry with no `to_at`

@@ -573,8 +573,10 @@ mod tests {
                 BookWrite::Create { .. } => "create",
                 BookWrite::AddStep { .. } => "addstep",
                 BookWrite::RemoveStep { .. } => "remove",
+                BookWrite::EditStep { .. } => "edit",
                 BookWrite::SetRelated { .. } => "relate",
                 BookWrite::AddSubstep { .. } => "addsub",
+                BookWrite::EditSubstep { .. } => "editsub",
                 BookWrite::SetAudience { .. } => "audience",
             })
             .collect();

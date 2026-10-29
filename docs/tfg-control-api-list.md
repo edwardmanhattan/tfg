@@ -4,6 +4,8 @@ A flat, list-shaped reference for the TFG control plane (protocol v2). This is t
 
 The full narrative contract lives in [`control-api-v1.md`](control-api-v1.md); this file is the list, and where the two disagree, the list should win for scoping purposes and the narrative should win for meaning. Update both together.
 
+The illustrated developer reference — Mermaid diagrams, field tables, and copyable JSON examples — is [`control-api.html`](control-api.html).
+
 ## Base
 
 - Service: `tfg-control`, API version `v1`, protocol version `2`.

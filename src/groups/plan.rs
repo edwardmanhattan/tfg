@@ -368,9 +368,52 @@ impl GroupsDraft {
         self.news.values().chain(self.edits.values())
     }
 
+    /// Every group the operator can see: the server's frame, the groups this
+    /// draft creates, and the edits, with an edit replacing the held row and a
+    /// removed group gone.
+    ///
+    /// [`Self::staged_groups`] is the WORK — what the flush owes. A REOPENED
+    /// game's groups are the server's frame, not work, and a board that read
+    /// only the work drew `0 GROUPS` for an exercise that already had a whole
+    /// organisation.
+    pub fn visible_groups(&self) -> Vec<StagedGroup> {
+        let mut ids: Vec<i64> = self.frame.keys().copied().collect();
+        ids.extend(self.news.keys().copied());
+        ids.extend(
+            self.edits
+                .keys()
+                .copied()
+                .filter(|id| !self.frame.contains_key(id)),
+        );
+        ids.into_iter()
+            .filter(|id| !self.removed.contains(id))
+            .filter_map(|id| self.view(id).cloned())
+            .collect()
+    }
+
     /// Every group the server holds in the draft's frame.
     pub fn frame_groups(&self) -> impl Iterator<Item = &StagedGroup> {
         self.frame.values()
+    }
+
+    /// The groups with nobody commanding them, by name — the rule Minos
+    /// refuses at the move to preparation, asked where the operator can still
+    /// act on it.
+    ///
+    /// A TASK GROUP IS SOMEBODY. A `Satuan Tugas` is not a caption on a
+    /// diagram: it is a person who orders the units beneath it, so a group
+    /// nobody commands is a body that will never receive an order. Every level
+    /// above `Unsur` is a command post, and `Unsur` is the hull itself rather
+    /// than a node, so every group in the draft needs one.
+    pub fn uncommanded(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .visible_groups()
+            .into_iter()
+            .filter(|group| group.commander_id.is_none())
+            .map(|group| group.name)
+            .collect();
+        names.sort();
+        names
     }
 
     /// Held groups staged for deletion, in id order.
@@ -930,6 +973,70 @@ mod tests {
             vec![("OPGAB", 0), ("GUS-1", 1), ("TG-1", 2), ("TG-2", 2)],
             "a parent is drawn before its children, siblings by name"
         );
+    }
+
+    /// THE FRAME IS VISIBLE, THE WORK IS WHAT IS STAGED. A reopened game's
+    /// organisation lives in the frame; a board that read only `staged_groups`
+    /// drew `0 GROUPS` for an exercise that already had one.
+    /// A TASK GROUP IS SOMEBODY. A group with no commander is the state the
+    /// backend refuses at the move to preparation, and the draft names them
+    /// by name — a count would send the operator hunting.
+    #[test]
+    fn uncommanded_groups_are_named() {
+        let mut draft = GroupsDraft::new();
+        draft.seed(&[live_group(
+            5,
+            "TG-1",
+            GroupKind::SatuanTugas,
+            None,
+            None,
+            &[351],
+        )]);
+        draft
+            .stage_group(0, "GUS-2", GroupKind::Gugus, None, Some(4), vec![])
+            .expect("a gugus");
+        assert_eq!(draft.uncommanded(), vec!["TG-1".to_string()]);
+        draft.set_commander(5, Some(3)).expect("known group");
+        assert!(draft.uncommanded().is_empty(), "commanded, and the list empties");
+    }
+
+    #[test]
+    fn a_seeded_frame_is_visible_but_not_staged_work() {
+        let mut draft = GroupsDraft::new();
+        draft.seed(&[live_group(
+            5,
+            "TG-1",
+            GroupKind::SatuanTugas,
+            None,
+            Some(2),
+            &[351],
+        )]);
+        assert_eq!(draft.staged_groups().count(), 0, "the frame is not work");
+        assert_eq!(draft.visible_groups().len(), 1, "but it is on the board");
+
+        // An edit replaces the frame row rather than adding a second one.
+        draft.set_commander(5, Some(3)).expect("known group");
+        assert_eq!(draft.visible_groups().len(), 1, "one row, not two");
+        assert_eq!(draft.visible_groups()[0].commander_id, Some(3));
+
+        // A new group joins it.
+        let new = draft
+            .stage_group(
+                0,
+                "TG-2",
+                GroupKind::SatuanTugas,
+                None,
+                None,
+                vec![352],
+            )
+            .expect("a new group");
+        assert_eq!(draft.visible_groups().len(), 2);
+
+        // A removed held group leaves the board.
+        assert!(draft.remove_group(5));
+        let visible = draft.visible_groups();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].local_id, new);
     }
 
     /// AN ORPHAN IS A ROOT, not a group that vanishes from the board.

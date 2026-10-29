@@ -652,10 +652,14 @@ impl MasterTransport<'_> {
             Write::AssignUnit {
                 unit_id,
                 commander_id,
-            } => call(
-                self.master
-                    .assign_unit(self.token, game, *unit_id, *commander_id),
-            ),
+                with_contents,
+            } => call(self.master.assign_unit(
+                self.token,
+                game,
+                *unit_id,
+                *commander_id,
+                *with_contents,
+            )),
             Write::PlaceUnitInNode { unit_id, node } => match self.node(*node, journal) {
                 Ok(node) => call(
                     self.master
@@ -732,6 +736,26 @@ impl MasterTransport<'_> {
                 ),
                 Err(answer) => answer,
             },
+            Write::EditStep {
+                scenario_id,
+                step_id,
+                kind,
+                window,
+            } => {
+                let window = window
+                    .as_ref()
+                    .map(|(start, end)| (start.as_str(), end.as_str()))
+                    .map(Some);
+                call(self.master.update_scenario_step(
+                    self.token,
+                    game,
+                    *scenario_id,
+                    *step_id,
+                    kind.map(|kind| kind.wire()),
+                    None,
+                    window,
+                ))
+            }
             Write::CreateSubstep {
                 book,
                 step,
@@ -756,6 +780,19 @@ impl MasterTransport<'_> {
                     Err(e) => answer_of(e),
                 }
             }
+            Write::EditSubstep {
+                scenario_id,
+                step_id,
+                substep_id,
+                content,
+            } => call(self.master.update_game_substep(
+                self.token,
+                game,
+                *scenario_id,
+                *step_id,
+                *substep_id,
+                content,
+            )),
             Write::SetAudience {
                 book,
                 step,

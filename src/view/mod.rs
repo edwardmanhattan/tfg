@@ -1339,30 +1339,19 @@ pub fn zone_islands(state: crate::gamestate::GameState, player: bool) -> Vec<Isl
         // lives in the terms panel now, and a planning room does not say
         // the exercise's name and its clock in two separate places.
         crate::gamestate::GameState::Planning => {}
-        // Preparation is the gate. The console's Readiness island is
-        // exactly what Command carries here.
+        // PREPARATION IS THE ROOM, AND THE ROOM IS A CARD.
         //
-        // The console's SECOND slot is Essentials — the terms whose absence
-        // is what blocks the gate — and this shell has no terms island, so
-        // that slot is filled with Crew rather than left empty: the arrivals
-        // are what the gate is ultimately about, and a column of one island
-        // beside a 360pt gate reads as a page nobody finished.
+        // The column used to carry Crew here: a one-island strip with the
+        // seating list and the door to the order of battle. It said the same
+        // thing as the centred screen, one copy on either side of the map,
+        // and the owner's direction is that the card is enough. So the
+        // column is EMPTY in this state and the preparation card (the
+        // planning summary, the invitation key, the roster and its
+        // readiness gate) is the whole surface.
         //
-        // NOTE this column carries an island the console's does not. The
-        // console's Preparation is Readiness + Essentials and lists no Crew;
-        // Crew is this shell's substitution for the missing terms surface,
-        // not a port. (An earlier version of this comment claimed "Players
-        // rides along" — the code has pushed Crew since, and the comment
-        // described a column that was never built.)
-        crate::gamestate::GameState::Preparation => {
-            // THE COMMAND PANEL IS GONE FROM PREPARATION (the owner's
-            // direction: for a Game Master or a judge seat it only said "no
-            // hull" and "no helm", and readiness is the one verb it carried).
-            // The verb moved into the centred crew screen, and the column
-            // keeps the room: who is here, and the door to the order of
-            // battle.
-            out.push(slot(IslandKey::Crew, 290.0));
-        }
+        // The card is opened by the hold, the arrival and the transition
+        // into preparation — never by a door in a column that is not there.
+        crate::gamestate::GameState::Preparation => {}
         // Execution is the state the console spends its life in, so the
         // column is a working surface rather than a summary: what you can
         // order, who is here, and the feed of what happened.
@@ -2348,10 +2337,11 @@ mod tests {
         // is the grid's six panels now, and the Control island is gone
         // because the clock is part of the exercise's terms.
         assert_eq!(keys(GameState::Planning, false), Vec::<IslandKey>::new());
-        // Preparation is the room: the order of battle, and its door. The
-        // Command panel left the phase with the owner's direction; readiness
-        // moved into the crew screen it opens.
-        assert_eq!(keys(GameState::Preparation, false), [Crew_key()]);
+        // Preparation is the room: the centred preparation card, and no
+        // column beside it. The old Crew island was a second copy of the
+        // roster the card already holds; the owner's direction removed it.
+        assert_eq!(keys(GameState::Preparation, false), Vec::<IslandKey>::new());
+        assert_eq!(keys(GameState::Preparation, true), Vec::<IslandKey>::new());
         // Execution is the working surface, for an organizer. The step is
         // not here: the scenario board takes the middle of the frame.
         assert_eq!(

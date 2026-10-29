@@ -37,7 +37,8 @@ pub use master::{
     GameStepRun, GameUnit, GameUpdate, HierarchyNode, HullSpec, ImageManifest, InboxMsg, InboxPage,
     JoinResult, Judgement, MinosMaster, MissionStep, MissionSubstep, MsgDegree, MsgDraft,
     MsgRecipient, NewGame, OrderOutcome, OverCapacity, Participant, PlacementList, PositionList,
-    PositionSet, RelatedHull, RelatedPerson, RelatedPost, Review, ScenarioMission, ScenarioRole,
+    PositionSet, RegisterContent, RelatedHull, RelatedPerson, RelatedPost, Review,
+    ScenarioMission, ScenarioRole,
     ServiceBranchCount, StagedOrder, StagedOrderList, StagedOrderScope, StepReadiness,
     StepReadinessPerson, StepRelated, StepRewind, TableData, TimeWindow, TimelineEvent,
     TimelinePage, UnitCapacity, UnitCommander, UnitImageEntry, UnitSpeedEntry, UnitSpeeds,
@@ -49,7 +50,7 @@ pub use replay::{FileReplay, now_ts};
 // Shared with live.rs and the tests below; not public API.
 pub(crate) use feed::FeedEvent;
 pub(crate) use feed::{
-    parse_message_event, parse_order_event, parse_positions_event, parse_positions_event_for_game,
+    parse_message_event, parse_order_event, parse_positions_event_for_game,
 };
 
 use serde::{Deserialize, Serialize};
@@ -940,7 +941,9 @@ mod tests {
             .expect("create");
         assert_eq!(game.id, 3);
         assert_eq!(game.state, "planning", "games are born in planning");
-        let pieces = master.assign_unit("AT", 3, 13, Some(6)).expect("assign");
+        let pieces = master
+            .assign_unit("AT", 3, 13, Some(6), false)
+            .expect("assign");
         assert_eq!(pieces[0].commander_id, Some(6), "assign answers with units");
         let pieces = master.remove_unit("AT", 3, 13).expect("remove");
         assert!(pieces.is_empty(), "remove answers with the emptied units");

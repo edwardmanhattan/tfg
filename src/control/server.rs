@@ -138,7 +138,13 @@ struct ServerState {
     command_tx: Sender<AcceptedCommand>,
     clients: Arc<AtomicUsize>,
     generated: AtomicU64,
-    advertised: String,
+    /// Where the listener actually bound.
+    ///
+    /// The ADDRESS, not the URL: the URL a pairing offer names is resolved per
+    /// request, because a laptop moves between networks (office wifi, a phone's
+    /// hotspot) and a URL computed once at startup goes on naming the address
+    /// of the network it was started on.
+    addr: SocketAddr,
 }
 
 /// Start the server on its own thread.
@@ -196,14 +202,13 @@ pub fn spawn_server(
                     }
                 };
                 let _ = ready_tx.send(Ok(addr));
-                let advertised = advertised_url(addr);
                 let state = Arc::new(ServerState {
                     credentials: Arc::new(Credentials::new(config.token.clone(), devices)),
                     hub: hub.clone(),
                     command_tx,
                     clients: Arc::new(AtomicUsize::new(0)),
                     generated: AtomicU64::new(0),
-                    advertised,
+                    addr,
                 });
                 // The readiness verdict is computed from timestamps, so it is
                 // already right the moment a deadline passes. This task exists
@@ -652,10 +657,15 @@ async fn open_pairing(
         .ttl_seconds
         .map(|seconds| Duration::from_secs(seconds.clamp(30, 600)))
         .unwrap_or(super::devices::PAIRING_TTL);
+    // Resolved HERE, per request. The machine's address on the LAN changes
+    // when it joins another network, and an offer that names the address of
+    // the network the process started on sends the phone to a host that is
+    // not there any more.
+    let advertised = advertised_url(state.addr);
     match state
         .credentials
         .devices()
-        .open_pairing(scopes, ttl, &state.advertised)
+        .open_pairing(scopes, ttl, &advertised)
     {
         Ok(offer) => json_response(
             StatusCode::OK,
@@ -704,7 +714,7 @@ async fn pair(request: Request<Incoming>, state: &Arc<ServerState>) -> Response<
             &serde_json::json!({
                 "device": paired.device,
                 "token": paired.token,
-                "url": state.advertised,
+                "url": advertised_url(state.addr),
             }),
         ),
         Err(error) => pair_error(error),

@@ -291,6 +291,12 @@ fn main() {
         if !token.is_empty() && s.directory.is_empty() {
             s.directory = read_directory(&host, &token);
         }
+        // And the role vocabulary a blank draft seats from. A held game's read
+        // replaces it with that game's own ids, but until then the templates
+        // are the only server answer there is.
+        if !token.is_empty() && s.roles.is_empty() {
+            s.roles = read_role_templates(&host, &token);
+        }
         s
     };
 
@@ -481,6 +487,19 @@ fn main() {
         live: Some(live_ctl.clone()),
         shutdown: shutdown.clone(),
     });
+    // The room's own movement: the preparation card is the one surface nobody
+    // can work alone, and Minos publishes no readiness event, so it is polled.
+    // A thread beside the plot reader, for the same reason that one is — the
+    // order loop belongs to the operator's writes.
+    let (preparation_tx, preparation_rx) =
+        mpsc::channel::<tfg::shell_gpui::PreparationPulse>();
+    let _preparation_handle = spawn_preparation_poll(
+        host.clone(),
+        hold.clone(),
+        live_ctl.clone(),
+        shutdown.clone(),
+        preparation_tx,
+    );
     // The watches follow the session: the broadcast channel for the held
     // game, and the positions channel once the exercise is running.
     sync_session(
@@ -522,6 +541,12 @@ fn main() {
     let (clock_tx, clock_rx) =
         mpsc::channel::<Result<tfg::backend::GameClock, tfg::shell_gpui::ClockError>>();
     let (embarked_tx, embarked_rx) =
+        mpsc::channel::<Result<(i64, Vec<tfg::backend::EmbarkedUnit>), String>>();
+    // What the FLEET REGISTER says one hull carries. The same answer shape as
+    // the exercised read, and a different route: `/units/{id}/embarkations`
+    // rather than `/games/{gid}/units/{id}/embarkations`. It is what a
+    // deployment is about to bring with it, so it is read before the press.
+    let (register_carries_tx, register_carries_rx) =
         mpsc::channel::<Result<(i64, Vec<tfg::backend::EmbarkedUnit>), String>>();
     // One hull's published FIGURES, read when the details panel points at
     // it. Its own channel, because the answer is a read with no error
@@ -598,7 +623,12 @@ fn main() {
             }
             match tfg::control::spawn_server(config, control_tx, control_hub.clone()) {
                 Ok(handle) => {
+                    // The BOUND address is `0.0.0.0:8787`, which nobody can
+                    // type into a phone. Say the address a phone should use;
+                    // a pairing offer resolves it afresh, so a laptop that
+                    // moves networks still hands out the current one.
                     eprintln!("control server listening on {}", handle.url());
+                    eprintln!("  reachable at {}", handle.advertised_url());
                     (
                         None,
                         Some(handle),
@@ -1001,6 +1031,7 @@ fn main() {
                         commander_id,
                         fx,
                         fy,
+                        with_contents,
                     } => {
                         // Placing IS assigning: the drop of a hull the
                         // exercise does not hold yet. `assign_unit` first —
@@ -1019,7 +1050,13 @@ fn main() {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
-                            match master.assign_unit(&token2, game_id, unit_id, Some(commander_id)) {
+                            match master.assign_unit(
+                                &token2,
+                                game_id,
+                                unit_id,
+                                Some(commander_id),
+                                with_contents,
+                            ) {
                                 Err(e) => Err(format!("not assigned: {e}")),
                                 Ok(_) => {
                                     let (clat, clon, zoom, mw, mh) = camera2
@@ -1158,6 +1195,11 @@ fn main() {
                                     // participants from.
                                     session: tfg::shell_gpui::SessionView {
                                         directory: read_directory(&host2, &token),
+                                        // The templates, because a fresh
+                                        // sign-in holds no game whose roles
+                                        // could be read. The seat press
+                                        // resolves them by name later.
+                                        roles: read_role_templates(&host2, &token),
                                         ..tfg::shell_gpui::SessionView::default()
                                     },
                                 })
@@ -1235,6 +1277,61 @@ fn main() {
                             return;
                         }
                     }
+                    tfg::shell_gpui::ToBinary::JoinGame { room_key } => {
+                        // THE INVITED PLAYER'S DOOR. The key is the only
+                        // input: the client does not know the game id yet.
+                        // The answer carries the game AND the caller's own
+                        // participant row, which matters because the roster
+                        // is staff-only — this is the only route that tells a
+                        // participant which seat they hold.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to join a room".to_string())
+                        } else {
+                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                                return;
+                            };
+                            match master.join_game(&token2, &room_key) {
+                                Ok(joined) => {
+                                    let joined_game = joined.game_id;
+                                    game_id = joined_game;
+                                    state2 = joined.game_state.clone();
+                                    eprintln!(
+                                        "{} entered {} as {} ({})",
+                                        joined.user_name,
+                                        joined.game_name,
+                                        joined.role_name,
+                                        joined.game_state
+                                    );
+                                    match fetch_session(&host2, &token2, Some(joined_game)) {
+                                        Some(mut s) => {
+                                            adopt_join(&mut s, &joined);
+                                            s.signed_in = true;
+                                            s.zoom = tfg::map_geometry::MAP_ZOOM;
+                                            sync_session(
+                                                &hold2, &live_ctl2, &token2, game_id, &state2,
+                                                s.me,
+                                            );
+                                            Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Join,
+                                            ))
+                                        }
+                                        None => Err(
+                                            "entered the room, but the session could not be read"
+                                                .to_string(),
+                                        ),
+                                    }
+                                }
+                                Err(e) => Err(format!("join refused: {e}")),
+                            }
+                        };
+                        let outcome = outcome.map_err(|why| {
+                            tfg::shell_gpui::WriteRefusal::new(tfg::shell_gpui::WriteId::Join, why)
+                        });
+                        if create_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
                     tfg::shell_gpui::ToBinary::Press { verb, draft } => {
                         // ONE PRESS, ONE LADDER. The engine decides what is
                         // still owed (a resumed press diffs against the
@@ -1292,19 +1389,26 @@ fn main() {
                                         .collect::<std::collections::BTreeMap<i64, tfg::force::Start>>()
                                 })
                                 .unwrap_or_default();
-                            live.units = transport
+                            let units = transport
                                 .game_units_list(&token2, game_id)
-                                .unwrap_or_default()
+                                .unwrap_or_default();
+                            // WHICH PIECE IS ABOARD WHICH. The piece row
+                            // says it (`id_host`) — the exercise's own
+                            // composition, in the same read as everything
+                            // else about the piece. The console used to fan
+                            // out one `/embarkations` read per piece to learn
+                            // this, and every hull read as hostless when one
+                            // of those reads failed, so re-hosting a unit
+                            // planned only the attach and the server refused
+                            // it with "already aboard another hull".
+                            live.units = units
                                 .into_iter()
                                 .map(|u| tfg::force::LiveHull {
                                     unit_id: u.unit_id,
                                     name: u.unit_name,
                                     commander_id: u.commander_id,
                                     start: placements.get(&u.unit_id).copied(),
-                                    // Embarkation is not this flow's business:
-                                    // its ladder has no position for a carrier,
-                                    // and a hull the flow holds is on the water.
-                                    host: None,
+                                    host: u.host,
                                 })
                                 .collect();
                             live.nodes = transport
@@ -1312,6 +1416,20 @@ fn main() {
                                 .map(|tree| flatten_nodes(&tree))
                                 .unwrap_or_default();
                         }
+                        // WHAT THE REGISTER SAYS EACH DEPLOYED HULL CARRIES,
+                        // claimed before the plan is made. The shell stages
+                        // these as the copies land, and this is the same claim
+                        // made where the record matters: without it a hull
+                        // whose copy was never read would let the plan attach a
+                        // unit its own assignment is about to create, and the
+                        // server answers `unit_ids[0]: already aboard this
+                        // hull`.
+                        claim_register_contents(
+                            &mut transport,
+                            &token2,
+                            &mut draft.force,
+                            &live.units,
+                        );
                         // `for_draft` is the game the draft is about: a
                         // reopened game's 01 writes nothing, so the journal
                         // never learns the id and every later write needs it
@@ -1522,10 +1640,20 @@ fn main() {
                                         }
                                     );
                                     match fetch_session(&host2, &token2, Some(game_id)) {
-                                        Some(s) => Ok(tfg::shell_gpui::CreatedSession::for_write(
-                                            s,
-                                            tfg::shell_gpui::WriteId::Readiness,
-                                        )),
+                                        Some(mut s) => {
+                                            // The readiness answer carries the
+                                            // caller's own row, and it is the
+                                            // freshest word on the seat. The
+                                            // session re-read cannot see a
+                                            // participant roster, so without
+                                            // this the toggle would leave the
+                                            // card showing the opposite state.
+                                            adopt_join(&mut s, &j);
+                                            Ok(tfg::shell_gpui::CreatedSession::for_write(
+                                                s,
+                                                tfg::shell_gpui::WriteId::Readiness,
+                                            ))
+                                        }
                                         None => Err("declared, but the session could not be read"
                                             .to_string()),
                                     }
@@ -1661,11 +1789,11 @@ fn main() {
                                     .to_string(),
                             )
                         } else {
-                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                            let Ok(mut master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
                             advance_to_preparation(
-                                &master,
+                                &mut master,
                                 &host2,
                                 &token2,
                                 game_id,
@@ -1720,7 +1848,7 @@ fn main() {
                         let outcome = if token2.is_empty() {
                             Err("signed out \u{2014} sign in to sync the staged writes".to_string())
                         } else {
-                            let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
+                            let Ok(mut master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
                             // THE SERVER'S FRAME, re-read: the same reason the
@@ -1728,6 +1856,8 @@ fn main() {
                             // re-issues the writes the server already took.
                             let live_seats = read_live_seats(&master, &token2, game_id, live_seats);
                             let live_hulls = read_live_hulls(&master, &token2, game_id, live_hulls);
+                            let mut force = force;
+                            claim_register_contents(&mut master, &token2, &mut force, &live_hulls);
                             let book_writes = tfg::book::plan(&book, &live_scenarios);
                             let steps = tfg::advance::plan(
                                 &force,
@@ -2032,6 +2162,26 @@ fn main() {
                             return;
                         }
                     }
+                    tfg::shell_gpui::ToBinary::ReadRegisterCarries { unit } => {
+                        // What the REGISTER says a hull carries — the
+                        // pre-embarked units a deployment brings aboard her.
+                        // A register read, so it needs no game: a draft that
+                        // has not been saved yet still shows them.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to read the register".to_string())
+                        } else {
+                            match tfg::backend::MinosMaster::new(&host2) {
+                                Ok(master) => match master.embarkations(&token2, unit) {
+                                    Ok(units) => Ok((unit, units)),
+                                    Err(e) => Err(format!("register contents failed: {e}")),
+                                },
+                                Err(e) => Err(format!("could not reach the server: {e}")),
+                            }
+                        };
+                        if register_carries_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
                     tfg::shell_gpui::ToBinary::ReadSpec { unit } => {
                         // One hull's published figures, as the server holds
                         // them NOW.
@@ -2251,6 +2401,7 @@ fn main() {
                         host,
                         child,
                         commander_id,
+                        with_contents,
                     } => {
                         // Embarking IS assigning, the host-side twin of the
                         // drop above: `assign_unit` first, then the attach.
@@ -2264,7 +2415,13 @@ fn main() {
                             let Ok(master) = tfg::backend::MinosMaster::new(&host2) else {
                                 return;
                             };
-                            match master.assign_unit(&token2, game_id, child, Some(commander_id)) {
+                            match master.assign_unit(
+                                &token2,
+                                game_id,
+                                child,
+                                Some(commander_id),
+                                with_contents,
+                            ) {
                                 Err(e) => Err(format!("not assigned: {e}")),
                                 Ok(_) => {
                                     match master.game_attach_units(&token2, game_id, host, &[child])
@@ -2906,6 +3063,8 @@ fn main() {
         std::boxed::Box::new(move || clock_rx.try_recv().ok());
     let embarked_feed: tfg::shell_gpui::EmbarkedFeed =
         std::boxed::Box::new(move || embarked_rx.try_recv().ok());
+    let register_carries_feed: tfg::shell_gpui::RegisterCarriesFeed =
+        std::boxed::Box::new(move || register_carries_rx.try_recv().ok());
     let spec_feed: tfg::shell_gpui::SpecFeed =
         std::boxed::Box::new(move || spec_rx.try_recv().ok());
     let embark_write_feed: tfg::shell_gpui::EmbarkWriteFeed =
@@ -2983,6 +3142,10 @@ fn main() {
         std::boxed::Box::new(move || live_msg_rx.try_recv().ok());
     let control_feed: tfg::control::CommandFeed =
         std::boxed::Box::new(move || control_rx.try_recv().ok());
+    // The preparing room's own movement: newest-wins, and a quiet tick leaves
+    // the card exactly as it was.
+    let preparation_feed: tfg::shell_gpui::PreparationFeed =
+        std::boxed::Box::new(move || preparation_rx.try_recv().ok());
     // The HELD game, read live: the personal channel carries traffic for
     // every exercise this account is in, and only the held exercise's
     // traffic belongs in the held exercise's inbox.
@@ -3305,12 +3468,14 @@ fn main() {
         review_write_feed,
         clock_feed,
         embarked_feed,
+        register_carries_feed,
         embark_write_feed,
         embark_spec_feed,
         thumb_feed,
         spec_feed,
         live_message_feed,
         control_feed,
+        preparation_feed,
         order_tx,
         roster,
         roster_total,
@@ -3945,6 +4110,92 @@ fn read_directory(host: &str, token: &str) -> Vec<tfg::shell_gpui::DirectoryRow>
         .collect()
 }
 
+/// The deployment's game-role templates, as the seat picker offers them.
+///
+/// A BLANK DRAFT HAS NO GAME, and the game's own roles do not exist until the
+/// press creates one. The templates are the vocabulary the game is cloned
+/// from, and the names are what the seat write resolves against the game — so
+/// the picker reads them here rather than carrying three hardcoded words.
+fn read_role_templates(host: &str, token: &str) -> Vec<tfg::shell_gpui::RoleRow> {
+    let Ok(master) = tfg::backend::MinosMaster::new(host) else {
+        return Vec::new();
+    };
+    master
+        .game_role_templates(token)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|role| tfg::shell_gpui::RoleRow {
+            id: role.id,
+            name: if role.name.is_empty() {
+                role.id_name
+            } else {
+                role.name
+            },
+            judge: role.judge.unwrap_or(false),
+        })
+        .collect()
+}
+
+/// Adopt the participant row a join answer carries.
+///
+/// The roster read is staff-only, so a participant's session can arrive with
+/// no `people` at all — and the seat they hold is exactly what the preparation
+/// card needs. The join answer is the one read that says it, so this fills the
+/// session from it rather than inventing a roster or guessing a role.
+///
+/// The commanded hulls ride along for the same reason: `GET /games/{id}/units`
+/// refuses a participant, and `commanded_units` is the force that seat may
+/// steer. They are assigned to the caller here because that is the only thing
+/// the route can be saying by listing them under the caller.
+fn adopt_join(session: &mut tfg::shell_gpui::SessionView, joined: &tfg::backend::JoinResult) {
+    session.me = joined.user_id;
+    session.my_role = joined.role_name.clone();
+    session.my_ready = joined.ready;
+    if !session.people.iter().any(|p| p.id == joined.user_id) {
+        session.joined = Some(tfg::shell_gpui::PersonView {
+            id: joined.user_id,
+            name: joined.user_name.clone(),
+            call_sign: joined.call_sign.clone(),
+            role: joined.role_name.clone(),
+            role_id: joined.role_id,
+            judge: joined.judge,
+            ready: joined.ready,
+            // Entering the room IS the arrival. The roster's `joined_at` is
+            // the same fact, but a participant cannot read it.
+            present: true,
+        });
+    }
+    if session.pieces.is_empty() {
+        session.pieces = joined
+            .commanded_units
+            .iter()
+            .map(|unit| tfg::shell_gpui::PieceView {
+                id: unit.unit_id,
+                label: format!("{} ({})", unit.unit_name, unit.hull_number),
+                class_name: unit.class_name.clone(),
+                commander_id: Some(joined.user_id),
+                commander_name: unit.commander_name.clone(),
+                hierarchy_node: unit.hierarchy_node,
+                start: None,
+                placed: false,
+                host: unit.host,
+                register_host: unit.register_host,
+                register_contents: unit.register_contents.clone(),
+            })
+            .collect();
+    }
+    if session.mine.is_empty() {
+        session.mine = joined
+            .commanded_units
+            .iter()
+            .map(|unit| tfg::shell_gpui::MyShip {
+                id: unit.unit_id.to_string(),
+                label: format!("{} ({})", unit.unit_name, unit.hull_number),
+            })
+            .collect();
+    }
+}
+
 fn fetch_session(
     host: &str,
     token: &str,
@@ -3952,7 +4203,11 @@ fn fetch_session(
 ) -> Option<tfg::shell_gpui::SessionView> {
     let master = tfg::backend::MinosMaster::new(host).ok()?;
     let (me, _name) = master.me(token).ok()?;
-    let games = master.games_list(token).ok()?;
+    // A PARTICIPANT MAY NOT READ THE LIST. `GET /games` needs `read` on
+    // `/system/games`; `GET /games/{id}` is readable by anyone holding a
+    // place in that game. So a refused list is not a failed session read —
+    // it is the ordinary shape of a player's console.
+    let games = master.games_list(token).unwrap_or_default();
     // The newest game this account is seated in wins; the newest readable one
     // is the fallback, so a caller seated nowhere still sees the exercise.
     // `pinned` holds one game regardless of seating: `TFG_GAME` at startup
@@ -3961,10 +4216,20 @@ fn fetch_session(
     // the composer holds the way the console's `apply_created_game` does.
     let held: Option<(i64, String, String, Vec<tfg::backend::Participant>)> =
         if let Some(id) = pinned {
-            games.iter().find(|g| g.id == id).map(|g| {
-                let parts = master.game_participants(token, id).unwrap_or_default();
-                (id, g.name.clone(), g.state.clone(), parts)
-            })
+            match games.iter().find(|g| g.id == id) {
+                Some(g) => {
+                    let parts = master.game_participants(token, id).unwrap_or_default();
+                    Some((id, g.name.clone(), g.state.clone(), parts))
+                }
+                // PINNED BUT UNLISTED: a joined player's game, most often.
+                // The detail route is the one a participant may read, so it
+                // supplies the name and state; the roster stays empty because
+                // that read is staff-only (the join answer carries the seat).
+                None => master
+                    .game_detail(token, id)
+                    .ok()
+                    .map(|d| (id, d.name, d.state, Vec::new())),
+            }
         } else {
             // Prefer, in order: a game where this account is seated as a
             // PLAYER (a judge commands nothing, so a judge seat can never fill
@@ -4033,14 +4298,7 @@ fn fetch_session(
     };
     // The published checklist. `None` for a planning room is the ordinary
     // case (the route 404s until preparation), not a failure to report.
-    let readiness =
-        master
-            .game_readiness(token, game_id)
-            .ok()
-            .map(|r| tfg::shell_gpui::ReadinessView {
-                can_execute: r.can_execute,
-                blockers: r.blockers,
-            });
+    let readiness = master.game_readiness(token, game_id).ok().map(readiness_view);
     // The hulls this seat commands: `id_commander` is the same key the seat
     // carries, so the join needs no name lookup — the roster's rule again.
     let units = master.game_units_list(token, game_id).unwrap_or_default();
@@ -4089,6 +4347,9 @@ fn fetch_session(
                 hierarchy_node: u.hierarchy_node,
                 start,
                 placed: start.is_some(),
+                host: u.host,
+                register_host: u.register_host,
+                register_contents: u.register_contents.clone(),
             }
         })
         .collect();
@@ -4138,21 +4399,15 @@ fn fetch_session(
         .filter_map(|p| p.hierarchy_node.map(|node| (p.id, node)))
         .collect();
     tfg::groups::join_members(&mut groups, &members);
-    // WHICH PIECE IS ABOARD WHICH. A hull's host is on no piece row: the
-    // server publishes it as the CONTENTS of the host, and the only route
-    // is `GET /games/{id}/units/{unit_id}/embarkations`. So this is one
-    // read per piece in the exercise — the same fan-out the related read
-    // already makes per step, and paid for ONCE per session read.
-    //
-    // A refused read means "this piece carries nothing", not a broken
-    // session: the route 404s for a piece that was never a host, and the
-    // answer we want for such a piece is exactly "no contents".
+    // WHICH PIECE IS ABOARD WHICH. The piece row says it (`id_host`): the
+    // exercise's own composition, published with the piece rather than as
+    // the contents of a host. The console used to read every piece's
+    // `/embarkations` once per session read — one request per hull, and a
+    // refused one made its piece read as hostless.
     let mut hosts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     for piece in &pieces {
-        if let Ok(contents) = master.game_embarkations(token, game_id, piece.id) {
-            for child in contents {
-                hosts.insert(child.id, piece.id);
-            }
+        if let Some(host) = piece.host {
+            hosts.insert(piece.id, host);
         }
     }
     let echelons = master.echelon_levels(token).unwrap_or_default();
@@ -4265,26 +4520,63 @@ fn fetch_session(
     };
     let book = scenarios
         .into_iter()
-        .map(|s| tfg::shell_gpui::BookScenario {
-            id: s.id,
-            title: s.title,
-            steps: s
-                .steps
-                .into_iter()
-                .map(|st| tfg::shell_gpui::BookStep {
-                    id: st.id,
-                    content: st.content,
-                    window: st.start_hour.zip(st.end_hour),
-                    substeps: st
-                        .substeps
-                        .into_iter()
-                        .map(|sub| tfg::shell_gpui::BookSubstep {
-                            id: sub.id,
-                            content: sub.content,
-                        })
-                        .collect(),
-                })
-                .collect(),
+        .map(|s| {
+            let scenario_id = s.id;
+            tfg::shell_gpui::BookScenario {
+                id: s.id,
+                title: s.title,
+                steps: s
+                    .steps
+                    .into_iter()
+                    .map(|st| {
+                        let step_id = st.id;
+                        tfg::shell_gpui::BookStep {
+                            id: st.id,
+                            kind: if st.kind == "beat" {
+                                tfg::book::StepKind::Beat
+                            } else {
+                                tfg::book::StepKind::Orders
+                            },
+                            content: st.content,
+                            window: st.start_hour.zip(st.end_hour),
+                            substeps: st
+                                .substeps
+                                .into_iter()
+                                .map(|sub| {
+                                    // A COMMAND'S AUDIENCE IS A ROUTE OF ITS
+                                    // OWN. The nested read carries the text and
+                                    // nothing else, so each command pays one
+                                    // read — best-effort, exactly like the
+                                    // book itself: an unreadable audience is an
+                                    // empty list, never no command.
+                                    let units = master
+                                        .game_substep_related(
+                                            token,
+                                            game_id,
+                                            scenario_id,
+                                            step_id,
+                                            sub.id,
+                                        )
+                                        .map(|related| {
+                                            related
+                                                .posts
+                                                .into_iter()
+                                                .filter(|post| post.kind == "hull")
+                                                .map(|post| post.id)
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    tfg::shell_gpui::BookSubstep {
+                                        id: sub.id,
+                                        content: sub.content,
+                                        units,
+                                    }
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect(),
+            }
         })
         .collect();
     // The Assessment island's three reads, and ONLY for a closed game.
@@ -4360,7 +4652,7 @@ fn fetch_session(
             judge: p.judge,
         })
         .collect();
-    Some(tfg::shell_gpui::SessionView {
+    let mut session = tfg::shell_gpui::SessionView {
         detail,
         // The camera's opening zoom is the MAP's constant and the caller sets
         // it: the session read has no business knowing the map's defaults.
@@ -4373,10 +4665,13 @@ fn fetch_session(
         reviews,
         game,
         state: state.clone(),
-        seats: parts.len(),
-        present: parts.iter().filter(|p| p.joined_at.is_some()).count(),
-        ready: parts.iter().filter(|p| p.ready).count(),
-        judges: parts.iter().filter(|p| p.judge).count(),
+        // The room's four counts and its rows arrive together, through
+        // `adopt_roster` below: the poll patches a live room through the same
+        // call, so the header and the roster cannot count the seats two ways.
+        seats: 0,
+        present: 0,
+        ready: 0,
+        judges: 0,
         me,
         my_role: parts
             .iter()
@@ -4422,19 +4717,10 @@ fn fetch_session(
                     you_ready: a.you_ready,
                 }),
             }),
-        people: parts
-            .iter()
-            .map(|p| tfg::shell_gpui::PersonView {
-                id: p.user_id,
-                name: p.user_name.clone(),
-                call_sign: p.call_sign.clone(),
-                role: p.role_name.clone(),
-                role_id: p.role_id,
-                judge: p.judge,
-                ready: p.ready,
-                present: p.joined_at.is_some(),
-            })
-            .collect(),
+        people: Vec::new(),
+        // The roster read is staff-only, so a participant arrives here with
+        // an empty list; the join answer's own row is adopted in `adopt_join`.
+        joined: None,
         // The book, the pieces and the related lists computed above: one
         // session read, three readers — the panel, the relate editor and the
         // step counts all drink from it.
@@ -4449,7 +4735,184 @@ fn fetch_session(
         readiness,
         directory,
         roles,
+    };
+    // The roster, and the four counts taken from it. A roster read this account
+    // may not make answers an empty list, which is the shape a participant's
+    // console has.
+    session.adopt_roster(parts.iter().map(person_view).collect());
+    Some(session)
+}
+
+/// One participant row, as the shell reads a seat.
+///
+/// ONE mapping, because two reads carry this roster: the session read and the
+/// preparation room's poll. A poll that mapped a seat its own way would show
+/// a room the session read does not describe.
+fn person_view(p: &tfg::backend::Participant) -> tfg::shell_gpui::PersonView {
+    tfg::shell_gpui::PersonView {
+        id: p.user_id,
+        name: p.user_name.clone(),
+        call_sign: p.call_sign.clone(),
+        role: p.role_name.clone(),
+        role_id: p.role_id,
+        judge: p.judge,
+        ready: p.ready,
+        present: p.joined_at.is_some(),
+    }
+}
+
+/// The published checklist, as the shell reads it.
+///
+/// The verdict is the server's (`can_execute`), and the blockers keep the
+/// server's own wording: a client that reworded them would be one more copy of
+/// the rule. Shared by the session read and the room's poll for the same reason
+/// as [`person_view`].
+fn readiness_view(r: tfg::backend::GameReadinessView) -> tfg::shell_gpui::ReadinessView {
+    tfg::shell_gpui::ReadinessView {
+        can_execute: r.can_execute,
+        blockers: r.blockers,
+    }
+}
+
+/// How often a PREPARING room is re-read.
+///
+/// Readiness is a person pressing a key on another machine, so three seconds
+/// is fast enough to feel live and slow enough that a room of eight does not
+/// pay for a read every second.
+const PREPARATION_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The longest a failing room read waits before trying again.
+const PREPARATION_BACKOFF: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Read a preparing room's movement, for as long as the console runs.
+///
+/// A room is other people's doing: a commander presses READY on their own
+/// console, and Minos publishes no event for it — `GET /games/{id}` is the
+/// only read that says a transition another client made. So the preparation
+/// card cannot be pushed into, and it is polled instead.
+///
+/// **A thread of its own**, for `spawn_plot_thread`'s reason: the binary's
+/// other loop is the order loop, and a read that takes a second would delay
+/// the operator's writes. **A NARROW read**, for the room's: the detail route
+/// for the state and the two prose fields, the roster for who is present and
+/// ready, and the published checklist. It never reads the book, the
+/// placements or a hull's embarkations — that fan-out belongs to the session
+/// read, and a room polled every three seconds must not pay it.
+///
+/// One transition is not narrow: when the room ENDS, execution's surfaces read
+/// things this poll never asks for (the current step, the steps' gates, the
+/// placements), so the whole session is re-read ONCE and rides the pulse.
+fn spawn_preparation_poll(
+    host: String,
+    hold: tfg::gamefeed::GameHoldCell,
+    live: tfg::gamefeed::LiveCtl,
+    shutdown: Arc<AtomicBool>,
+    pulse_tx: mpsc::Sender<tfg::shell_gpui::PreparationPulse>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let Ok(master) = tfg::backend::MinosMaster::new(&host) else {
+            eprintln!("preparation poll: no Minos client ({host}); the room is not polled");
+            return;
+        };
+        // (game, when) — the last read, so the cadence is judged against it.
+        let mut last: Option<(i64, std::time::Instant)> = None;
+        let mut fails: u32 = 0;
+        loop {
+            if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let (token, game_id, state) = match hold.lock() {
+                Ok(h) => (h.token.clone(), h.game_id, h.state.clone()),
+                Err(_) => return,
+            };
+            // Signed out, nothing held, or a room that is not PREPARING: there
+            // is nothing to poll. The last read is forgotten, so a room entered
+            // later is read at once rather than after a stale interval.
+            if token.is_empty() || game_id == 0 || state != "preparation" {
+                last = None;
+                fails = 0;
+                continue;
+            }
+            let due = last
+                .map(|(gid, at)| gid != game_id || at.elapsed() >= PREPARATION_POLL)
+                .unwrap_or(true);
+            if !due {
+                continue;
+            }
+            let now = std::time::Instant::now();
+            last = Some((game_id, now));
+            // THE DETAIL READ IS THE ONE THE POLL CANNOT DO WITHOUT: the state
+            // is how a room learns another console ended it, and the name and
+            // description are what the card reads back. A failed read answers
+            // nothing at all — an invented state would close the card the room
+            // is still in.
+            let Ok(detail) = master.game_detail(&token, game_id) else {
+                fails = fails.saturating_add(1);
+                std::thread::sleep(backoff(fails));
+                continue;
+            };
+            fails = 0;
+            if detail.state.eq_ignore_ascii_case("preparation") {
+                let people = master
+                    .game_participants(&token, game_id)
+                    .ok()
+                    .map(|parts| parts.iter().map(person_view).collect());
+                let readiness = master.game_readiness(&token, game_id).ok().map(readiness_view);
+                let pulse = tfg::shell_gpui::PreparationPulse {
+                    state: detail.state,
+                    name: detail.name,
+                    description: detail.description,
+                    people,
+                    readiness,
+                    left_room: None,
+                };
+                if pulse_tx.send(pulse).is_err() {
+                    return; // the console is gone
+                }
+                continue;
+            }
+            // THE ROOM ENDED, and this read is not narrow: execution's
+            // surfaces read things the poll never asks for, so the whole
+            // session is re-read once. The watches follow the state only after
+            // that read returns, and only because it did: a failed re-read
+            // leaves the hold in `preparation` (the pulse below still takes the
+            // card down), so the next tick tries the whole read again rather
+            // than declaring a room over on the strength of a read that
+            // answered nothing else.
+            let whole = fetch_session(&host, &token, Some(game_id));
+            let failed = whole.is_none();
+            if !failed {
+                tfg::gamefeed::set_state(&hold, &detail.state);
+                tfg::gamefeed::sync_watch(&live, &hold);
+            }
+            let pulse = tfg::shell_gpui::PreparationPulse {
+                state: detail.state,
+                name: detail.name,
+                description: detail.description,
+                people: None,
+                readiness: None,
+                left_room: whole,
+            };
+            if pulse_tx.send(pulse).is_err() {
+                return;
+            }
+            if failed {
+                fails = fails.saturating_add(1);
+                std::thread::sleep(backoff(fails));
+            }
+        }
     })
+}
+
+/// How long a reading thread waits after `fails` failed reads: one second
+/// doubling, up to [`PREPARATION_BACKOFF`]. A server that is down should not be
+/// asked every three seconds.
+fn backoff(fails: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(1u64 << fails.min(4)).min(PREPARATION_BACKOFF)
 }
 
 /// LEAVE PLANNING: write the whole staged draft through, then move the
@@ -4476,11 +4939,11 @@ fn fetch_session(
 /// - THE TERMS. The planned window is written against the window the server
 ///   holds, so only the clock keys that changed go on the wire.
 fn advance_to_preparation(
-    master: &tfg::backend::MinosMaster,
+    master: &mut tfg::backend::MinosMaster,
     host: &str,
     token: &str,
     game_id: i64,
-    force: tfg::force::ForceDraft,
+    mut force: tfg::force::ForceDraft,
     live_hulls: Vec<tfg::force::LiveHull>,
     roster: tfg::roster::RosterDraft,
     live_seats: Vec<tfg::roster::LiveSeat>,
@@ -4513,6 +4976,10 @@ fn advance_to_preparation(
     // writes the server already took.
     let live_seats = read_live_seats(master, token, game_id, live_seats);
     let live_hulls = read_live_hulls(master, token, game_id, live_hulls);
+    // WHAT THE REGISTER SAYS EACH DEPLOYED HULL CARRIES, claimed before the
+    // plan is made: the same rule the press applies, because this is the other
+    // door a force reaches the server through.
+    claim_register_contents(master, token, &mut force, &live_hulls);
 
     // THE TERMS. The window is written only against the window the server
     // holds: a window the console could not compare would be a stale copy
@@ -4734,13 +5201,52 @@ fn live_seats_from(parts: &[tfg::backend::Participant]) -> Vec<tfg::roster::Live
         .collect()
 }
 
+/// Claim the fleet register's pre-embarked units for every hull this press
+/// deploys with `with_contents`.
+///
+/// A hull deployed with her contents is one assignment, and the server creates
+/// her boats in the same transaction. A boat the draft ALSO holds — dragged
+/// aboard her before the register's copy had been read — must therefore not be
+/// written: the plan would assign it and then attach it to a hull whose own
+/// assignment is about to put it there, and the attach is refused
+/// (`unit_ids[0]: that unit is already aboard this hull`).
+///
+/// The catalogue read is one request per hull this press deploys with
+/// contents, which is a handful and only while planning. A hull whose copy
+/// cannot be read is left as the draft has it: the press is not the place to
+/// invent a force out of a failed read.
+fn claim_register_contents(
+    transport: &mut tfg::backend::MinosMaster,
+    token: &str,
+    force: &mut tfg::force::ForceDraft,
+    live: &[tfg::force::LiveHull],
+) {
+    let contested: Vec<i64> = force
+        .hulls()
+        .filter(|hull| hull.with_contents)
+        .filter(|hull| !live.iter().any(|l| l.unit_id == hull.unit_id))
+        .map(|hull| hull.unit_id)
+        .collect();
+    for parent in contested {
+        let Ok(contents) = transport.embarkations(token, parent) else {
+            continue;
+        };
+        let children: Vec<(i64, String, String)> = contents
+            .into_iter()
+            .map(|c| (c.id, c.name, c.hull_number))
+            .collect();
+        force.bring_contents(parent, &children);
+    }
+}
+
 /// The hulls as the server holds them NOW, or the ones that crossed if the
 /// read failed.
 ///
-/// The fresh read says WHICH HULLS EXIST and WHO COMMANDS THEM; the
-/// placements read says where they sit. Neither says what a hull is aboard:
-/// no single read carries the embarkation links, so those ride in from the
-/// mirror that crossed — the console's own last word about them.
+/// The fresh read says WHICH HULLS EXIST, WHO COMMANDS THEM, and WHAT EACH IS
+/// ABOARD (`id_host`); the placements read says where they sit. `carried` is
+/// the console's own last word, and it is the fallback for the one fact a
+/// piece row can still be silent about — a deployment that predates the host
+/// field.
 fn read_live_hulls(
     master: &tfg::backend::MinosMaster,
     token: &str,
@@ -4790,7 +5296,14 @@ fn live_hulls_from(
                 name: u.unit_name.clone(),
                 commander_id: u.commander_id,
                 start: start.or_else(|| carried_hull.and_then(|c| c.start)),
-                host: carried_hull.and_then(|c| c.host),
+                // THE SERVER'S OWN WORD FIRST. The piece row says which hull
+                // it is inside (`id_host`), and a frame that ignored it read
+                // every carried hull as hostless — so a re-issued press
+                // attached a unit the server already held (`unit_ids[0]:
+                // already aboard this hull`). The carried mirror is the
+                // fallback for a deployment whose piece rows predate the
+                // field, and it is a fallback and not a preference.
+                host: u.host.or_else(|| carried_hull.and_then(|c| c.host)),
             }
         })
         .collect()
@@ -4872,9 +5385,10 @@ fn flush_force(
             tfg::force::ForceWrite::Assign {
                 unit_id,
                 commander_id,
+                with_contents,
                 ..
             } => master
-                .assign_unit(token, game_id, *unit_id, *commander_id)
+                .assign_unit(token, game_id, *unit_id, *commander_id, *with_contents)
                 .map(|_| ()),
             tfg::force::ForceWrite::HandOver {
                 unit_id,
@@ -5186,6 +5700,45 @@ fn flush_book(
                 .delete_scenario_step(token, game_id, *scenario_id, *step_id)
                 .map(|_| ())
                 .map_err(|e| format!("remove step {step_id} refused: {e}")),
+            tfg::book::BookWrite::EditStep {
+                scenario_id,
+                step_id,
+                kind,
+                window,
+            } => {
+                let window = window
+                    .as_ref()
+                    .map(|(start, end)| (start.as_str(), end.as_str()))
+                    .map(Some);
+                master
+                    .update_scenario_step(
+                        token,
+                        game_id,
+                        *scenario_id,
+                        *step_id,
+                        kind.map(|kind| kind.wire()),
+                        None,
+                        window,
+                    )
+                    .map(|_| ())
+                    .map_err(|e| format!("edit step {step_id} refused: {e}"))
+            }
+            tfg::book::BookWrite::EditSubstep {
+                scenario_id,
+                step_id,
+                substep_id,
+                content,
+            } => master
+                .update_game_substep(
+                    token,
+                    game_id,
+                    *scenario_id,
+                    *step_id,
+                    *substep_id,
+                    content,
+                )
+                .map(|_| ())
+                .map_err(|e| format!("edit sub-step {substep_id} refused: {e}")),
             tfg::book::BookWrite::SetRelated {
                 scenario,
                 step,
@@ -5287,6 +5840,11 @@ mod advance_tests {
             commander_id: commander,
             commander_name: String::new(),
             hierarchy_node: None,
+            host: None,
+            host_name: String::new(),
+            register_host: None,
+            register_host_name: String::new(),
+            register_contents: Vec::new(),
         }
     }
 
@@ -5336,6 +5894,41 @@ mod advance_tests {
             Ok(Vec::new()),
             "the retry writes nothing for the hull the server already took"
         );
+    }
+
+    /// THE PIECE ROW SAYS WHAT A HULL IS INSIDE, and the re-read believes it
+    /// over the mirror that crossed.
+    ///
+    /// This is the reported `400 unit_ids[0]: already aboard this hull`: a
+    /// frame that read every carried hull as hostless made the retry attach a
+    /// unit the server already held. The row wins, and the crossing mirror is
+    /// only the fallback for a deployment whose rows predate the field.
+    #[test]
+    fn the_re_read_believes_the_piece_row_about_who_carries_whom() {
+        let mut aboard = unit(8, "Leopard 2A4", None);
+        aboard.host = Some(590);
+        let carried = vec![tfg::force::LiveHull {
+            unit_id: 8,
+            name: "Leopard 2A4".into(),
+            commander_id: None,
+            start: None,
+            // The shell's mirror had not caught up.
+            host: None,
+        }];
+        let live = live_hulls_from(&[aboard], &[], &carried);
+        assert_eq!(live[0].host, Some(590), "the row is the server's word");
+
+        // And the mirror still answers where the row is silent.
+        let silent = unit(8, "Leopard 2A4", None);
+        let carried = vec![tfg::force::LiveHull {
+            unit_id: 8,
+            name: "Leopard 2A4".into(),
+            commander_id: None,
+            start: None,
+            host: Some(590),
+        }];
+        let live = live_hulls_from(&[silent], &[], &carried);
+        assert_eq!(live[0].host, Some(590), "the fallback still works");
     }
 
     /// The mirror the re-read builds carries the JUDGE side, because a

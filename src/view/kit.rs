@@ -28,7 +28,7 @@
 //! a light theme without touching a call site.
 
 use gpui::{
-    Div, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString, Stateful,
+    Div, FontWeight, InteractiveElement, ParentElement, SharedString, Stateful,
     StatefulInteractiveElement, Styled, div, prelude::*, px,
 };
 

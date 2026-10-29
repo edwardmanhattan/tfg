@@ -19,6 +19,25 @@
 
 use std::collections::BTreeMap;
 
+/// An `HHMM` stamp as minutes since midnight. `None` for anything that is not
+/// one, so arithmetic never runs on a half-typed field.
+fn hhmm_minutes(text: &str) -> Option<i64> {
+    if !crate::view::hhmm_ok(text) {
+        return None;
+    }
+    let hours: i64 = text[0..2].parse().ok()?;
+    let minutes: i64 = text[2..4].parse().ok()?;
+    Some(hours * 60 + minutes)
+}
+
+/// Minutes since midnight back as `HHMM`, wrapping at the day's end — a step
+/// that runs past midnight is still a legal stamp, and the wrap is the only
+/// honest reading of "half an hour later" at 23:45.
+fn hhmm_at(minutes: i64) -> String {
+    let at = minutes.rem_euclid(24 * 60);
+    format!("{:02}{:02}", at / 60, at % 60)
+}
+
 /// A step being written, before the server has given it an id.
 ///
 /// Held as a draft rather than written straight through because the backend
@@ -103,6 +122,52 @@ pub struct StagedSubStep {
     pub nodes: Vec<i64>,
 }
 
+/// One edit to a step the server already holds.
+///
+/// A saved step is rewritten with `PATCH .../steps/{id}`, so the edit is a
+/// side map rather than a second copy of the step: only the fields the
+/// operator touched are carried, and a field left `None` is left alone on the
+/// server. A WINDOW IS BOTH ENDS — the picker edits one end, but a window is
+/// one value, and sending half of it would be a state Minos has no reading
+/// for.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StepEdit {
+    pub kind: Option<StepKind>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+}
+
+impl StepEdit {
+    /// The window this edit carries, if it touched one.
+    pub fn window(&self) -> Option<(String, String)> {
+        self.start.clone().zip(self.end.clone())
+    }
+}
+
+/// One saved step's window, as the session read gave it: the chain input the
+/// live edit cascades over.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveStepWindow {
+    pub step_id: i64,
+    pub start: Option<String>,
+    pub end: Option<String>,
+}
+
+/// One command on a saved step, as this draft now has it.
+///
+/// `id` is the server's id for a command already on the step, or negative for
+/// one this draft adds. `units` is the WHOLE audience, because the route
+/// replaces the list rather than applying a delta.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveSubstepDraft {
+    pub id: i64,
+    pub content: String,
+    pub units: Vec<i64>,
+    /// Whether the operator changed this command. A command seeded from the
+    /// session is `false`; it is shown and counted, but not written back.
+    pub dirty: bool,
+}
+
 /// One step being authored, before the server has given it an id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StagedStep {
@@ -147,6 +212,13 @@ pub struct BookDraft {
     /// Sub-steps by the step they belong to (`§7.1`). A sub-step is ONE command
     /// to ONE audience; its window is its step's.
     substeps: BTreeMap<i64, Vec<StagedSubStep>>,
+    /// Edits to steps the server holds, by `(scenario, step)`. A saved step is
+    /// rewritten in place, never re-created.
+    step_edits: BTreeMap<(i64, i64), StepEdit>,
+    /// Command lists the operator has touched on saved steps, by
+    /// `(scenario, step)`. The whole list is held from the first touch, so a
+    /// move between commands can keep one hull per command per step.
+    live_substeps: BTreeMap<(i64, i64), Vec<LiveSubstepDraft>>,
     next_local: i64,
 }
 
@@ -201,7 +273,353 @@ impl BookDraft {
     /// never exist would 404 every one.
     pub fn drop_scenario(&mut self, local_id: i64) -> bool {
         self.step_relations.retain(|(sid, _), _| *sid != local_id);
+        // A scenario that never posts takes its steps' sub-steps with it.
+        if let Some(scenario) = self.news.get(&local_id) {
+            for step in &scenario.steps {
+                self.substeps.remove(&step.local_id);
+            }
+        }
         self.news.remove(&local_id).is_some()
+    }
+
+    /// HOW LONG A NEW STEP RUNS when it inherits its predecessor's end.
+    pub const STEP_MINUTES: i64 = 30;
+
+    /// THE WINDOW AFTER A GIVEN ONE: it begins where the predecessor ended and
+    /// runs [`Self::STEP_MINUTES`]. With no predecessor the noon window
+    /// `+ STEP` has always opened with stands.
+    ///
+    /// Public because a REOPENED book's last step is in the session read, not
+    /// in this draft: the shell knows the window and asks the same rule.
+    pub fn window_after(last: Option<(&str, &str)>) -> (String, String) {
+        last.and_then(|(_, end)| hhmm_minutes(end))
+            .map(|end| (hhmm_at(end), hhmm_at(end + Self::STEP_MINUTES)))
+            .unwrap_or_else(|| ("1200".to_string(), "1230".to_string()))
+    }
+
+    /// THE WINDOW A STEP ADDED NOW OPENS WITH.
+    ///
+    /// A new step follows the last one: it begins where the last step ended and
+    /// runs [`Self::STEP_MINUTES`]. The first step of an empty book keeps the
+    /// noon window `+ STEP` has always opened with, because there is no
+    /// predecessor to inherit from.
+    pub fn next_step_window(&self, scenario_id: i64) -> (String, String) {
+        let last = self
+            .news
+            .get(&scenario_id)
+            .and_then(|scenario| scenario.steps.last())
+            .and_then(|step| step.start.as_deref().zip(step.end.as_deref()));
+        Self::window_after(last)
+    }
+
+    /// The mutable list holding a staged step, whether it belongs to a
+    /// staged-new scenario or to a step-add on a server-held one.
+    fn steps_mut_containing(&mut self, step_local: i64) -> Option<&mut Vec<StagedStep>> {
+        if let Some(scenario) = self
+            .news
+            .values_mut()
+            .find(|scenario| scenario.steps.iter().any(|step| step.local_id == step_local))
+        {
+            return Some(&mut scenario.steps);
+        }
+        self.step_adds
+            .values_mut()
+            .find(|steps| steps.iter().any(|step| step.local_id == step_local))
+    }
+
+    /// SET ONE END OF A STEP'S WINDOW, AND SHIFT THE STEPS BEHIND IT.
+    ///
+    /// A window edit is a move of the tail, not a second disconnected window:
+    /// each following step begins where the one before it ended and keeps its
+    /// own duration, all the way down the book. Editing the START moves only
+    /// this step's own length — the chain behind it is anchored to its END,
+    /// which has not moved.
+    ///
+    /// Answers whether the step was found. A malformed stamp is ignored rather
+    /// than written: the picker only offers `HH:MM`, and a draft is not the
+    /// place to discover that one end is not a time.
+    pub fn set_step_time(&mut self, step_local: i64, start: bool, value: &str) -> bool {
+        let value = value.replace(':', "");
+        if !crate::view::hhmm_ok(&value) {
+            return false;
+        }
+        let Some(steps) = self.steps_mut_containing(step_local) else {
+            return false;
+        };
+        let Some(at) = steps
+            .iter()
+            .position(|step| step.local_id == step_local)
+        else {
+            return false;
+        };
+        if start {
+            steps[at].start = Some(value);
+        } else {
+            steps[at].end = Some(value);
+        }
+        let Some(mut previous_end) = steps[at].end.clone() else {
+            return true;
+        };
+        for step in steps.iter_mut().skip(at + 1) {
+            let (Some(from), Some(to)) = (step.start.as_deref(), step.end.as_deref()) else {
+                // A step with no window has nothing to keep; the chain picks
+                // up again at the next step that has one.
+                continue;
+            };
+            let (Some(from_at), Some(to_at)) = (hhmm_minutes(from), hhmm_minutes(to)) else {
+                continue;
+            };
+            let mut duration = to_at - from_at;
+            if duration < 0 {
+                duration += 24 * 60;
+            }
+            let Some(start_at) = hhmm_minutes(&previous_end) else {
+                continue;
+            };
+            let end_at = start_at + duration;
+            step.start = Some(hhmm_at(start_at));
+            step.end = Some(hhmm_at(end_at));
+            previous_end = hhmm_at(end_at);
+        }
+        true
+    }
+
+    /// SET ONE END OF A SAVED STEP'S WINDOW, AND SHIFT THE TAIL AFTER IT.
+    ///
+    /// The same rule as [`Self::set_step_time`], over a chain that begins with
+    /// the server's steps and ends with the steps this draft has appended to
+    /// the same scenario. The saved ends are an argument because the book draft
+    /// does not hold them — the session read does.
+    ///
+    /// A saved step with no window has nothing to shift and the UI offers no
+    /// picker for it; answered `false` here rather than inventing a window.
+    pub fn set_live_step_time(
+        &mut self,
+        scenario_id: i64,
+        step_id: i64,
+        start: bool,
+        value: &str,
+        live: &[LiveStepWindow],
+    ) -> bool {
+        let value = value.replace(':', "");
+        if !crate::view::hhmm_ok(&value) {
+            return false;
+        }
+        // The chain, in book order: the saved steps with earlier edits laid
+        // over them, then the additions this draft has staged.
+        let mut chain: Vec<(i64, bool, Option<(String, String)>)> = Vec::new();
+        for step in live {
+            let edit = self.step_edits.get(&(scenario_id, step.step_id));
+            let from = edit
+                .and_then(|edit| edit.start.clone())
+                .or_else(|| step.start.clone());
+            let to = edit
+                .and_then(|edit| edit.end.clone())
+                .or_else(|| step.end.clone());
+            chain.push((step.step_id, true, from.zip(to)));
+        }
+        for step in self
+            .step_adds
+            .get(&scenario_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            chain.push((
+                step.local_id,
+                false,
+                step.start.clone().zip(step.end.clone()),
+            ));
+        }
+        let Some(at) = chain.iter().position(|(id, _, _)| *id == step_id) else {
+            return false;
+        };
+        let Some((mut from, mut to)) = chain[at].2.clone() else {
+            return false;
+        };
+        if start {
+            from = value;
+        } else {
+            to = value;
+        }
+        chain[at].2 = Some((from.clone(), to.clone()));
+        self.store_live_window(scenario_id, step_id, &from, &to);
+
+        let mut previous_end = to;
+        for (id, is_live, window) in chain.iter().skip(at + 1) {
+            let Some((from, to)) = window else {
+                continue;
+            };
+            let (Some(from_at), Some(to_at)) = (hhmm_minutes(from), hhmm_minutes(to)) else {
+                continue;
+            };
+            let mut duration = to_at - from_at;
+            if duration < 0 {
+                duration += 24 * 60;
+            }
+            let Some(start_at) = hhmm_minutes(&previous_end) else {
+                continue;
+            };
+            let end_at = start_at + duration;
+            let (new_start, new_end) = (hhmm_at(start_at), hhmm_at(end_at));
+            if *is_live {
+                self.store_live_window(scenario_id, *id, &new_start, &new_end);
+            } else if let Some(steps) = self.step_adds.get_mut(&scenario_id) {
+                if let Some(step) = steps.iter_mut().find(|step| step.local_id == *id) {
+                    step.start = Some(new_start.clone());
+                    step.end = Some(new_end.clone());
+                }
+            }
+            previous_end = new_end;
+        }
+        true
+    }
+
+    /// Make a saved step a beat, or an orders step again.
+    pub fn set_live_step_kind(&mut self, scenario_id: i64, step_id: i64, kind: StepKind) {
+        self.step_edits
+            .entry((scenario_id, step_id))
+            .or_default()
+            .kind = Some(kind);
+    }
+
+    /// What this draft has staged for one saved step.
+    pub fn live_step_edit(&self, scenario_id: i64, step_id: i64) -> Option<&StepEdit> {
+        self.step_edits.get(&(scenario_id, step_id))
+    }
+
+    fn store_live_window(&mut self, scenario_id: i64, step_id: i64, start: &str, end: &str) {
+        let edit = self
+            .step_edits
+            .entry((scenario_id, step_id))
+            .or_default();
+        edit.start = Some(start.to_string());
+        edit.end = Some(end.to_string());
+    }
+
+    /// The saved step's commands as this draft now has them, if touched.
+    pub fn live_substeps_of(&self, scenario_id: i64, step_id: i64) -> &[LiveSubstepDraft] {
+        self.live_substeps
+            .get(&(scenario_id, step_id))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Take the saved step's whole command list into the draft, before the
+    /// first edit. The list is the operator's view — saved commands with their
+    /// audiences, and any already staged adds — so a move between commands can
+    /// enforce one hull per command per step.
+    pub fn begin_live_substeps(
+        &mut self,
+        scenario_id: i64,
+        step_id: i64,
+        commands: Vec<LiveSubstepDraft>,
+    ) {
+        let slot = self
+            .live_substeps
+            .entry((scenario_id, step_id))
+            .or_default();
+        // MERGE, do not replace: the list may already hold a command this
+        // draft added (or an edit to one), and the seed carries the server's
+        // commands that are not in it yet.
+        for command in commands {
+            if !slot.iter().any(|existing| existing.id == command.id) {
+                let mut command = command;
+                // A SEED IS NOT WORK. Only a method that changes a command
+                // marks it, so an untouched command is never written back.
+                command.dirty = false;
+                slot.push(command);
+            }
+        }
+    }
+
+    /// Add a command to a saved step. Answers its negative local id.
+    pub fn stage_live_substep(
+        &mut self,
+        scenario_id: i64,
+        step_id: i64,
+        content: &str,
+    ) -> i64 {
+        let local = self.fresh_local();
+        self.live_substeps
+            .entry((scenario_id, step_id))
+            .or_default()
+            .push(LiveSubstepDraft {
+                id: local,
+                content: content.to_string(),
+                units: Vec::new(),
+                dirty: true,
+            });
+        local
+    }
+
+    /// Rewrite a saved command's text.
+    pub fn set_live_substep_content(
+        &mut self,
+        scenario_id: i64,
+        step_id: i64,
+        substep_id: i64,
+        content: &str,
+    ) -> bool {
+        let Some(target) = self
+            .live_substeps
+            .get_mut(&(scenario_id, step_id))
+            .and_then(|list| list.iter_mut().find(|command| command.id == substep_id))
+        else {
+            return false;
+        };
+        target.content = content.to_string();
+        target.dirty = true;
+        true
+    }
+
+    /// Replace a saved command's whole audience, and move any hull the drop
+    /// named out of the other commands of the SAME step — the server's one
+    /// command per hull per step, kept before the press.
+    pub fn set_live_substep_units(
+        &mut self,
+        scenario_id: i64,
+        step_id: i64,
+        substep_id: i64,
+        units: Vec<i64>,
+    ) -> bool {
+        let Some(list) = self.live_substeps.get_mut(&(scenario_id, step_id)) else {
+            return false;
+        };
+        for other in list.iter_mut().filter(|command| command.id != substep_id) {
+            let before = other.units.len();
+            other.units.retain(|unit| !units.contains(unit));
+            if other.units.len() != before {
+                // THE MOVE IS TWO WRITES: the command that gains the hull, and
+                // the one it left. A command whose audience changed is work
+                // even when the operator dropped somewhere else.
+                other.dirty = true;
+            }
+        }
+        let Some(target) = list.iter_mut().find(|command| command.id == substep_id) else {
+            return false;
+        };
+        target.units = units;
+        target.dirty = true;
+        true
+    }
+
+    /// Withdraw a command this draft added to a saved step. A saved command is
+    /// not removable here — that is a delete write this ladder does not plan.
+    pub fn remove_live_substep(
+        &mut self,
+        scenario_id: i64,
+        step_id: i64,
+        substep_id: i64,
+    ) -> bool {
+        if substep_id > 0 {
+            return false;
+        }
+        let Some(list) = self.live_substeps.get_mut(&(scenario_id, step_id)) else {
+            return false;
+        };
+        let before = list.len();
+        list.retain(|command| command.id != substep_id);
+        list.len() != before
     }
 
     /// Stage a step onto a staged-new scenario.
@@ -232,8 +650,10 @@ impl BookDraft {
         slot.steps.retain(|s| s.local_id != step_local);
         let dropped = slot.steps.len() != before;
         if dropped {
-            // A step that never posts takes its staged links with it.
+            // A step that never posts takes its staged links with it, and its
+            // sub-steps, which cannot exist without the step.
             self.step_relations.remove(&(local_id, step_local));
+            self.substeps.remove(&step_local);
         }
         dropped
     }
@@ -298,6 +718,24 @@ impl BookDraft {
                 nodes: Vec::new(),
             });
         Ok(local_id)
+    }
+
+    /// REMOVE A SUB-STEP the operator staged.
+    ///
+    /// A sub-step is staged only until the flush posts it, so dropping one is
+    /// local and whole: no server row exists to delete, and the next plan
+    /// simply does not name it. Answers whether it was there.
+    pub fn drop_substep(&mut self, step_local: i64, substep_local: i64) -> bool {
+        let Some(list) = self.substeps.get_mut(&step_local) else {
+            return false;
+        };
+        let before = list.len();
+        list.retain(|sub| sub.local_id != substep_local);
+        let dropped = list.len() != before;
+        if dropped && list.is_empty() {
+            self.substeps.remove(&step_local);
+        }
+        dropped
     }
 
     /// Set a sub-step's audience.
@@ -455,6 +893,7 @@ impl BookDraft {
         }
         if dropped {
             self.step_relations.remove(&(scenario_id, step_local));
+            self.substeps.remove(&step_local);
         }
         dropped
     }
@@ -515,6 +954,9 @@ impl BookDraft {
             && self.step_adds.is_empty()
             && self.step_cuts.is_empty()
             && self.step_relations.is_empty()
+            && self.substeps.is_empty()
+            && self.step_edits.is_empty()
+            && self.live_substeps.is_empty()
     }
 
     /// Drop staged ops against scenarios the server no longer lists, so
@@ -524,6 +966,16 @@ impl BookDraft {
     pub fn prune(&mut self, live_ids: &[i64]) {
         self.step_adds.retain(|sid, _| live_ids.contains(sid));
         self.step_cuts.retain(|(sid, _)| live_ids.contains(sid));
+        // An edit to a scenario the server no longer lists is moot, and an edit
+        // to a step the draft is cutting would race its own removal.
+        self.step_edits.retain(|(sid, step), _| {
+            live_ids.contains(sid) && !self.step_cuts.contains(&(*sid, *step))
+        });
+        // A saved command list follows the same rule as the step it belongs
+        // to: a vanished scenario or a cut step takes it with it.
+        self.live_substeps.retain(|(sid, step), _| {
+            live_ids.contains(sid) && !self.step_cuts.contains(&(*sid, *step))
+        });
         // Relations follow the same rule, but posting links for a staged
         // row that no longer exists would 404 — so staged entries are
         // checked against the draft itself, live ones against the server.
@@ -551,6 +1003,21 @@ impl BookDraft {
                 live_ids.contains(sid) && draft_has(*sid, *step)
             }
         });
+        // A sub-step belongs to a step. One whose step the draft no longer
+        // holds is an orphan and would never post, so it goes with the step.
+        let mut staged_steps: Vec<i64> = self
+            .news
+            .values()
+            .flat_map(|scenario| scenario.steps.iter().map(|step| step.local_id))
+            .collect();
+        staged_steps.extend(
+            self.step_adds
+                .values()
+                .flatten()
+                .map(|step| step.local_id),
+        );
+        self.substeps
+            .retain(|step_local, _| staged_steps.contains(step_local));
     }
 
     /// Drop the whole draft: a released hold, a closed session, a hold
@@ -560,6 +1027,9 @@ impl BookDraft {
         self.step_adds.clear();
         self.step_cuts.clear();
         self.step_relations.clear();
+        self.substeps.clear();
+        self.step_edits.clear();
+        self.live_substeps.clear();
         self.next_local = 0;
     }
 
@@ -668,6 +1138,15 @@ pub enum BookWrite {
     /// Delete one step. Positions are never renumbered, so no
     /// sibling write depends on this one.
     RemoveStep { scenario_id: i64, step_id: i64 },
+    /// Rewrite a step the server already holds:
+    /// `PATCH .../scenarios/{scenario}/steps/{step}`. Absent fields are left
+    /// alone — the draft carries only what the operator touched.
+    EditStep {
+        scenario_id: i64,
+        step_id: i64,
+        kind: Option<StepKind>,
+        window: Option<(String, String)>,
+    },
     /// Replace one step's related list: hulls of the exercise and nodes
     /// of its task organisation. Last, because every row it names — the
     /// scenario, the step, the pieces — has to exist first.
@@ -685,6 +1164,14 @@ pub enum BookWrite {
         scenario: ScenarioRef,
         step: StepRef,
         substep: i64,
+        content: String,
+    },
+    /// Rewrite a command the server already holds:
+    /// `PATCH .../steps/{step}/substeps/{substep}`.
+    EditSubstep {
+        scenario_id: i64,
+        step_id: i64,
+        substep_id: i64,
         content: String,
     },
     /// A sub-step's audience: `PUT .../substeps/{s}/related`, the WHOLE list.
@@ -712,11 +1199,13 @@ impl BookWrite {
                 format!("add step {short:?}")
             }
             Self::RemoveStep { step_id, .. } => format!("remove step {step_id}"),
+            Self::EditStep { step_id, .. } => format!("edit step {step_id}"),
             Self::SetRelated { refs, .. } => format!("relate {} post(s)", refs.len()),
             Self::AddSubstep { content, .. } => {
                 let short: String = content.chars().take(40).collect();
                 format!("add sub-step {short:?}")
             }
+            Self::EditSubstep { substep_id, .. } => format!("edit sub-step {substep_id}"),
             Self::SetAudience { hulls, .. } => format!("relate {} hull(s)", hulls.len()),
         }
     }
@@ -794,6 +1283,64 @@ pub fn plan(draft: &BookDraft, live: &[LiveScenario]) -> Vec<BookWrite> {
                     nodes: sub.nodes.clone(),
                 });
             }
+        }
+    }
+    // Saved steps the operator has rewritten. Before the cuts, so an edit and
+    // a cut of the same step settle as the cut.
+    for ((sid, step_id), edit) in &draft.step_edits {
+        let Some(scenario) = live.iter().find(|scenario| scenario.id == *sid) else {
+            continue;
+        };
+        if !scenario.steps.contains(step_id) || draft.is_cut(*sid, *step_id) {
+            continue;
+        }
+        let window = edit.window();
+        if edit.kind.is_none() && window.is_none() {
+            continue;
+        }
+        writes.push(BookWrite::EditStep {
+            scenario_id: *sid,
+            step_id: *step_id,
+            kind: edit.kind,
+            window,
+        });
+    }
+    // The commands on saved steps that the operator has touched. After the
+    // step edits, because a new command names a step the game already holds;
+    // before the cuts, for the same reason as the edits above.
+    for ((sid, step_id), commands) in &draft.live_substeps {
+        let Some(scenario) = live.iter().find(|scenario| scenario.id == *sid) else {
+            continue;
+        };
+        if !scenario.steps.contains(step_id) || draft.is_cut(*sid, *step_id) {
+            continue;
+        }
+        for command in commands {
+            if command.id > 0 && !command.dirty {
+                continue;
+            }
+            if command.id < 0 {
+                writes.push(BookWrite::AddSubstep {
+                    scenario: ScenarioRef::Live(*sid),
+                    step: StepRef::Live(*step_id),
+                    substep: command.id,
+                    content: command.content.clone(),
+                });
+            } else {
+                writes.push(BookWrite::EditSubstep {
+                    scenario_id: *sid,
+                    step_id: *step_id,
+                    substep_id: command.id,
+                    content: command.content.clone(),
+                });
+            }
+            writes.push(BookWrite::SetAudience {
+                scenario: ScenarioRef::Live(*sid),
+                step: StepRef::Live(*step_id),
+                substep: command.id,
+                hulls: command.units.clone(),
+                nodes: Vec::new(),
+            });
         }
     }
     for (sid, step_id) in &draft.step_cuts {
@@ -987,8 +1534,10 @@ mod tests {
                 BookWrite::Create { .. } => "create",
                 BookWrite::AddStep { .. } => "addstep",
                 BookWrite::RemoveStep { .. } => "remove",
+                BookWrite::EditStep { .. } => "edit",
                 BookWrite::SetRelated { .. } => "relate",
                 BookWrite::AddSubstep { .. } => "addsub",
+                BookWrite::EditSubstep { .. } => "editsub",
                 BookWrite::SetAudience { .. } => "audience",
             })
             .collect();
@@ -1143,6 +1692,339 @@ mod tests {
 }
 
 #[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    fn book() -> (BookDraft, i64) {
+        let mut book = BookDraft::new();
+        let scenario = book.stage_scenario("Harbour sweep");
+        (book, scenario)
+    }
+
+    /// A NEW STEP FOLLOWS THE LAST ONE: it opens where the previous step ended
+    /// and runs thirty minutes, so a book typed in order stays contiguous.
+    #[test]
+    fn a_new_step_starts_where_the_last_one_ended() {
+        let (mut book, scenario) = book();
+        let first = book
+            .stage_step_new(scenario, "SWEEP", Some(("1200".into(), "1230".into())))
+            .expect("a step");
+        assert_eq!(
+            book.next_step_window(scenario),
+            ("1230".into(), "1300".into())
+        );
+        // The next step inherits the LAST step's end, not the first's.
+        book.stage_step_new(scenario, "RECOVER", Some(book.next_step_window(scenario)))
+            .expect("a step");
+        assert_eq!(
+            book.next_step_window(scenario),
+            ("1300".into(), "1330".into())
+        );
+        assert_eq!(book.steps_mut_containing(first).map(|steps| steps.len()), Some(2));
+    }
+
+    /// An empty book still opens on the noon window `+ STEP` has always used.
+    #[test]
+    fn the_first_step_keeps_the_default_window() {
+        let (book, scenario) = book();
+        assert_eq!(book.next_step_window(scenario), ("1200".into(), "1230".into()));
+    }
+
+    /// EDITING A MIDDLE STEP MOVES THE TAIL: every following step begins where
+    /// the one before it ends and keeps its own duration.
+    #[test]
+    fn editing_an_end_rechains_the_following_steps() {
+        let (mut book, scenario) = book();
+        let first = book
+            .stage_step_new(scenario, "BRIEFING", Some(("0800".into(), "0820".into())))
+            .unwrap();
+        let second = book
+            .stage_step_new(scenario, "TRANSIT", Some(("0820".into(), "0910".into())))
+            .unwrap();
+        let third = book
+            .stage_step_new(scenario, "SWEEP", Some(("0930".into(), "1015".into())))
+            .unwrap();
+        // The second step now ends at 09:45 instead of 09:10: it grew by 35
+        // minutes, and the third step moves with it, keeping its 45 minutes.
+        assert!(book.set_step_time(second, false, "09:45"));
+        let steps = &book.get_new(scenario).expect("scenario").steps;
+        assert_eq!(steps[0].local_id, first);
+        assert_eq!(steps[0].end.as_deref(), Some("0820"));
+        assert_eq!(
+            (steps[1].start.as_deref(), steps[1].end.as_deref()),
+            (Some("0820"), Some("0945"))
+        );
+        assert_eq!(
+            (steps[2].start.as_deref(), steps[2].end.as_deref()),
+            (Some("0945"), Some("1030")),
+            "the tail begins where the edited step ends, same duration"
+        );
+        assert_eq!(steps[2].local_id, third);
+    }
+
+    /// Editing a START changes this step's length only: the tail is anchored to
+    /// the END, which has not moved.
+    #[test]
+    fn editing_a_start_leaves_the_tail_alone() {
+        let (mut book, scenario) = book();
+        let _first = book
+            .stage_step_new(scenario, "BRIEFING", Some(("0800".into(), "0820".into())))
+            .unwrap();
+        let second = book
+            .stage_step_new(scenario, "TRANSIT", Some(("0820".into(), "0910".into())))
+            .unwrap();
+        let _third = book
+            .stage_step_new(scenario, "SWEEP", Some(("0910".into(), "1015".into())))
+            .unwrap();
+        assert!(book.set_step_time(second, true, "08:30"));
+        let steps = &book.get_new(scenario).expect("scenario").steps;
+        assert_eq!(steps[1].start.as_deref(), Some("0830"));
+        assert_eq!(
+            (steps[2].start.as_deref(), steps[2].end.as_deref()),
+            (Some("0910"), Some("1015"))
+        );
+    }
+
+    /// A SUB-STEP CAN BE REMOVED, and removing the last one takes the empty
+    /// list with it.
+    #[test]
+    fn a_staged_substep_can_be_dropped() {
+        let (mut book, scenario) = book();
+        let step = book.stage_step_new(scenario, "SWEEP", None).unwrap();
+        let sub = book.stage_substep(step, "TAKE STATION").unwrap();
+        assert_eq!(book.substep_count(), 1);
+        assert!(book.drop_substep(step, sub));
+        assert_eq!(book.substep_count(), 0);
+        assert!(book.substeps_of(step).is_empty());
+        assert!(!book.drop_substep(step, sub), "a second removal is a no-op");
+    }
+
+    /// A SAVED STEP IS EDITABLE: the window shifts the saved tail, and the
+    /// plan carries the change as a `PATCH`, not a re-create.
+    #[test]
+    fn editing_a_saved_step_moves_the_saved_tail() {
+        let mut book = BookDraft::new();
+        let live = vec![
+            LiveStepWindow {
+                step_id: 10,
+                start: Some("1000".into()),
+                end: Some("1030".into()),
+            },
+            LiveStepWindow {
+                step_id: 11,
+                start: Some("1100".into()),
+                end: Some("1130".into()),
+            },
+        ];
+        assert!(book.set_live_step_time(7, 10, false, "10:45", &live));
+        assert_eq!(
+            book.live_step_edit(7, 10).and_then(|edit| edit.window()),
+            Some(("1000".into(), "1045".into()))
+        );
+        assert_eq!(
+            book.live_step_edit(7, 11).and_then(|edit| edit.window()),
+            Some(("1045".into(), "1115".into())),
+            "the next saved step follows the edit, keeping its 30 minutes"
+        );
+        let writes = plan(
+            &book,
+            &[LiveScenario {
+                id: 7,
+                steps: vec![10, 11],
+            }],
+        );
+        assert!(
+            matches!(
+                &writes[..],
+                [BookWrite::EditStep { step_id: 10, .. }, BookWrite::EditStep { step_id: 11, .. }]
+            ),
+            "{writes:?}"
+        );
+    }
+
+    /// A SAVED STEP'S KIND IS ONE `PATCH` TOO, and a step the server no longer
+    /// lists is skipped rather than posted at a row that is not there.
+    #[test]
+    fn a_saved_kind_edit_is_one_write() {
+        let mut book = BookDraft::new();
+        book.set_live_step_kind(7, 10, StepKind::Beat);
+        book.set_live_step_kind(7, 99, StepKind::Beat);
+        let writes = plan(
+            &book,
+            &[LiveScenario {
+                id: 7,
+                steps: vec![10],
+            }],
+        );
+        assert_eq!(
+            writes,
+            vec![BookWrite::EditStep {
+                scenario_id: 7,
+                step_id: 10,
+                kind: Some(StepKind::Beat),
+                window: None,
+            }]
+        );
+    }
+
+    /// A STAGED STEP AFTER A SAVED ONE MOVES WITH THE CHAIN, because the two
+    /// are one book on screen and the server appends the staged one to it.
+    #[test]
+    fn a_saved_edit_moves_the_staged_step_after_it() {
+        let mut book = BookDraft::new();
+        let added = book.stage_step_add(
+            7,
+            "RECOVER",
+            Some(("1130".into(), "1200".into())),
+        );
+        let live = vec![LiveStepWindow {
+            step_id: 10,
+            start: Some("1000".into()),
+            end: Some("1030".into()),
+        }];
+        assert!(book.set_live_step_time(7, 10, false, "10:45", &live));
+        let step = book
+            .added_steps(7)
+            .find(|step| step.local_id == added)
+            .expect("the staged step");
+        assert_eq!(
+            (step.start.as_deref(), step.end.as_deref()),
+            (Some("1045"), Some("1115")),
+            "the staged tail follows the saved edit"
+        );
+    }
+
+    /// Dropping a step drops the sub-steps that belonged to it.
+    #[test]
+    fn dropping_a_step_drops_its_substeps() {
+        let (mut book, scenario) = book();
+        let step = book.stage_step_new(scenario, "SWEEP", None).unwrap();
+        book.stage_substep(step, "TAKE STATION").unwrap();
+        assert!(book.drop_new_step(scenario, step));
+        assert_eq!(book.substep_count(), 0);
+        assert!(
+            book.get_new(scenario)
+                .is_some_and(|scenario| scenario.steps.is_empty()),
+            "nothing of the step is left behind"
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_substep_tests {
+    use super::*;
+
+    fn live() -> Vec<LiveScenario> {
+        vec![LiveScenario {
+            id: 7,
+            steps: vec![10],
+        }]
+    }
+
+    /// A SAVED COMMAND IS REWRITTEN IN PLACE, and a new one is added to the
+    /// same step: text through `EditSubstep`, audience through `SetAudience`.
+    #[test]
+    fn a_saved_command_can_be_rewritten_and_added_to() {
+        let mut book = BookDraft::new();
+        book.begin_live_substeps(
+            7,
+            10,
+            vec![LiveSubstepDraft {
+                id: 100,
+                content: "OLD".into(),
+                units: vec![351],
+                dirty: false,
+            }],
+        );
+        assert!(book.set_live_substep_content(7, 10, 100, "NEW"));
+        assert!(book.set_live_substep_units(7, 10, 100, vec![351, 352]));
+        let added = book.stage_live_substep(7, 10, "ADDED");
+        assert!(added < 0);
+        assert!(book.set_live_substep_units(7, 10, added, vec![367]));
+
+        let writes = plan(&book, &live());
+        assert!(
+            writes.iter().any(|write| matches!(
+                write,
+                BookWrite::EditSubstep { substep_id: 100, content, .. } if content == "NEW"
+            )),
+            "{writes:?}"
+        );
+        assert!(
+            writes.iter().any(|write| matches!(
+                write,
+                BookWrite::AddSubstep { substep, content, .. } if *substep == added && content == "ADDED"
+            )),
+            "{writes:?}"
+        );
+        assert!(
+            writes.iter().any(|write| matches!(
+                write,
+                BookWrite::SetAudience { substep: 100, hulls, .. } if hulls == &vec![351, 352]
+            )),
+            "the saved command's whole audience is written"
+        );
+        assert!(
+            writes.iter().any(|write| matches!(
+                write,
+                BookWrite::SetAudience { substep, hulls, .. } if *substep == added && hulls == &vec![367]
+            )),
+            "the new command's audience follows it"
+        );
+    }
+
+    /// ONE COMMAND PER HULL PER STEP, kept locally: a hull moved to one
+    /// command leaves the others in the same step.
+    #[test]
+    fn a_hull_moves_between_saved_commands_of_one_step() {
+        let mut book = BookDraft::new();
+        book.begin_live_substeps(
+            7,
+            10,
+            vec![
+                LiveSubstepDraft {
+                    id: 100,
+                    content: "A".into(),
+                    units: vec![351, 352],
+                    dirty: false,
+                },
+                LiveSubstepDraft {
+                    id: 101,
+                    content: "B".into(),
+                    units: vec![367],
+                    dirty: false,
+                },
+            ],
+        );
+        assert!(book.set_live_substep_units(7, 10, 101, vec![352, 367]));
+        let commands = book.live_substeps_of(7, 10);
+        assert_eq!(commands[0].units, vec![351]);
+        assert_eq!(commands[1].units, vec![352, 367]);
+    }
+
+    /// A COMMAND THIS DRAFT ADDED CAN BE WITHDRAWN; one the server holds is a
+    /// delete write this ladder does not plan.
+    #[test]
+    fn only_a_draft_added_command_is_removable() {
+        let mut book = BookDraft::new();
+        let added = book.stage_live_substep(7, 10, "NEW");
+        assert!(book.remove_live_substep(7, 10, added));
+        assert!(book.live_substeps_of(7, 10).is_empty());
+        book.begin_live_substeps(
+            7,
+            10,
+            vec![LiveSubstepDraft {
+                id: 100,
+                content: "OLD".into(),
+                units: Vec::new(),
+                dirty: false,
+            }],
+        );
+        assert!(!book.remove_live_substep(7, 10, 100));
+    }
+}
+
+#[cfg(test)]
 mod substep_tests {
     use super::*;
 
@@ -1239,8 +2121,10 @@ mod substep_plan_tests {
                 BookWrite::Create { .. } => "create",
                 BookWrite::AddStep { .. } => "addstep",
                 BookWrite::AddSubstep { .. } => "addsub",
+                BookWrite::EditSubstep { .. } => "editsub",
                 BookWrite::SetAudience { .. } => "audience",
                 BookWrite::RemoveStep { .. } => "remove",
+                BookWrite::EditStep { .. } => "edit",
                 BookWrite::SetRelated { .. } => "relate",
             })
             .collect();

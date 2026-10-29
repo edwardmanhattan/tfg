@@ -192,6 +192,16 @@ impl RosterDraft {
         self.declined.contains(&user_id)
     }
 
+    /// Whether the server holds this person's seat.
+    ///
+    /// THE FRAME, NOT THE DRAFT. A seat staged here has nothing to delete, and
+    /// a removal mark for it would write an unseat for somebody who was never
+    /// on the roster — so the unseat/decline decision reads what Minos last
+    /// said rather than what the draft is holding.
+    pub fn is_on_server(&self, user_id: i64) -> bool {
+        self.frame.contains_key(&user_id)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.seats.is_empty() && self.removed.is_empty() && self.declined.is_empty()
     }
@@ -286,12 +296,14 @@ impl ScopeTarget {
 /// Whether this drop may become a scope, and if not, WHY — in the operator's
 /// words, before the server hears about it.
 ///
-/// The four rules `§8.3` states, kept in one place so the hover, the buzz and
-/// the write cannot disagree:
+/// The rules `§8.3` states, kept in one place so the hover, the buzz and the
+/// write cannot disagree:
 ///
 /// 1. a judge-side seat holds NO scope;
-/// 2. one person commands at most ONE scope;
-/// 3. one scope has at most one commander;
+/// 2. one scope has at most one commander;
+/// 3. a seat that already holds a scope MOVES when dropped on a free one —
+///    the old command is released rather than refused, because "one person
+///    commands one scope" is a rule about the result, not about the gesture;
 /// 4. a hull's commander can be changed by a drop, never cleared — that is not
 ///    a refusal here, it is the absence of a `✕`.
 pub fn scope_refusal(
@@ -306,12 +318,6 @@ pub fn scope_refusal(
     }
     if seat_scope == Some(target_scope) {
         return Some("ALREADY THIS SEAT'S SCOPE".to_string());
-    }
-    if let Some(held) = seat_scope {
-        return Some(format!(
-            "ONE PERSON COMMANDS ONE SCOPE \u{2014} THIS SEAT ALREADY HOLDS {}",
-            held.label()
-        ));
     }
     match target_commander {
         Some(holder) if holder != seat_user => Some(format!(
@@ -977,19 +983,38 @@ mod scope_rule_tests {
         assert_eq!(why.as_deref(), Some("A JUDGE-SIDE SEAT HOLDS NO SCOPE"));
     }
 
-    /// ONE PERSON COMMANDS ONE SCOPE, and the refusal NAMES the one they hold.
+    /// A SEAT THAT ALREADY COMMANDS SOMETHING MAY MOVE: a drop on a FREE scope
+    /// is a move, not a second command. The old scope is released by the
+    /// caller, so the rule about the result still holds.
     #[test]
-    fn a_second_scope_is_refused_by_name() {
+    fn a_second_free_scope_is_a_move_not_a_refusal() {
+        assert!(
+            scope_refusal(
+                false,
+                Some(ScopeTarget::Group(7)),
+                ScopeTarget::Group(9),
+                None,
+                3,
+            )
+            .is_none(),
+            "a free scope takes the seat, and the old command is released"
+        );
+    }
+
+    /// AN OCCUPIED SCOPE REFUSES whatever the seat already holds, and the
+    /// refusal names the holder.
+    #[test]
+    fn a_second_scope_still_refuses_an_occupied_one() {
         let why = scope_refusal(
             false,
             Some(ScopeTarget::Group(7)),
             ScopeTarget::Group(9),
-            None,
+            Some(4),
             3,
-        );
-        let why = why.expect("a refusal");
-        assert!(why.contains("ONE PERSON COMMANDS ONE SCOPE"), "{why}");
-        assert!(why.contains("group 7"), "it names the scope held: {why}");
+        )
+        .expect("refused");
+        assert!(why.contains("ONE SCOPE HAS ONE COMMANDER"), "{why}");
+        assert!(why.contains("HELD BY USER 4"), "{why}");
     }
 
     /// ONE SCOPE HAS ONE COMMANDER, and the refusal names the holder.

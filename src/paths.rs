@@ -4,7 +4,11 @@
 //! lives under one discovered data directory, never beside the source or
 //! relative to the process working directory.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+// `Path::is_dir` is the test's own spelling of the assertion; a normal build
+// names no `Path` at all, so the import is test-only rather than unused.
+#[cfg(test)]
+use std::path::Path;
 
 /// One process's read-only and writable runtime locations.
 #[derive(Debug, Clone, PartialEq, Eq)]

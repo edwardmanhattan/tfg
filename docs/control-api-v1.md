@@ -5,6 +5,9 @@ CLI today, a phone or a command-center wall later — can move the map, watch th
 shared state, and observe a live exercise. It is off unless the operator turns
 it on, and it binds to loopback unless they say otherwise.
 
+The developer-facing HTML reference — diagrams, field tables, and copyable JSON
+request/response examples — is [`control-api.html`](control-api.html).
+
 The routes kept their `/v1/` prefix; only the envelope version moved to `2`.
 Version 2 adds the observation surfaces: a shared **session**, a computed
 **readiness** verdict, display presence, the `observer` view, and

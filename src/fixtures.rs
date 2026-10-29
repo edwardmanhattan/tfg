@@ -384,6 +384,10 @@ pub fn review_draft() -> Option<Draft> {
         draft.force.upsert(hull);
     }
     draft.ceiling = Some(40);
+    // The group's commander is the Game Master, and that is the fixture's own
+    // constraint rather than a preference: every other player-side seat
+    // commands one of the nine hulls, and Minos gives a person ONE command —
+    // a hull or a task group, never both.
     draft
         .groups
         .stage_group(
@@ -391,7 +395,7 @@ pub fn review_draft() -> Option<Draft> {
             "GUS-1",
             crate::groups::GroupKind::SatuanTugas,
             None,
-            Some(2),
+            Some(1),
             vec![351, 352, 353],
         )
         .ok()?;
@@ -624,6 +628,8 @@ pub fn reopened_twelve() -> Option<Draft> {
             }),
             course_deg: None,
             host: None,
+            brought_by: None,
+            with_contents: false,
         });
     }
     Some(draft)

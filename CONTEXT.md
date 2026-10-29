@@ -81,6 +81,10 @@ _Avoid_: blueprint, template
 An in-game instance referencing a Unit: position, state, order. What a unit IS DOING in one session.
 _Avoid_: unit instance (redundant in context), entity
 
+**Pre-embarked unit**:
+A hull the fleet register says another hull carries. Deploying the parent brings them with it — every pre-embarked unit joins the exercise aboard her, uncommanded, in the same write — **when the operator asks for it**: `with_contents` is a choice, per deployment, because it changes the force's size. The register's copy is what the parent CARRIES (`register_contents`, or `GET /units/{id}/embarkations`); the exercise's own composition is what is ACTUALLY aboard (`id_host` on the piece row), and the two are allowed to differ. The console stages the children beside the parent, and marks them as brought so the plan does not write them twice.
+_Avoid_: complement (that is the KINDS and counts a hull may carry, not the units), passenger (that is the exercise's word for what is aboard)
+
 **Command**:
 One directive from a commander over units in their jurisdiction: it fans out into one per-unit directive, currently a HelmOrder for helm control or a legacy Order for waypoint navigation. The sim never sees commands, only per-unit directives.
 _Avoid_: order (that's the per-ship directive)
@@ -90,7 +94,7 @@ The set of units a commander may command: full orders inside it, view-only outsi
 _Avoid_: scope
 
 **Commander**:
-The role commanding a unit or a group. Higher ranks override lower ones; the organizer commands all.
+The role commanding a unit or a group. Higher ranks override lower ones; the organizer commands all. One person commands ONE thing — a hull or a group, never both and never two — and every group has one: a game does not advance to preparation while a group is nobody's.
 _Avoid_: player (that's who holds the role, not the role)
 
 **Organizer**:
@@ -98,7 +102,7 @@ The role that sets up a session: players, units with placements, groups with com
 _Avoid_: admin, host
 
 **Group**:
-One node of the session's task organisation: id, name, level, commander, mustered units and child groups. Every child sits at a strictly lower level than its parent.
+One node of the session's task organisation: id, name, level, commander, mustered units and child groups. Every child sits at a strictly lower level than its parent. A group is somebody who orders the force beneath it, so it is never merely a caption: a group with no commander is a gap the advance refuses.
 _Avoid_: team, party
 
 **GroupKind**:

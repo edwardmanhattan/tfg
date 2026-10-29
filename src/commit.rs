@@ -262,6 +262,9 @@ pub enum Write {
         /// Named when the draft has one. A planning save may leave it out:
         /// the server takes the hull alone and the commander comes later.
         commander_id: Option<i64>,
+        /// Bring the register's pre-embarked units aboard her. The
+        /// picker's choice, carried through the ladder unchanged.
+        with_contents: bool,
     },
     /// 04 — `PUT /games/{id}/units/{unit_id}/hierarchy`.
     PlaceUnitInNode { unit_id: i64, node: Ref },
@@ -305,6 +308,14 @@ pub enum Write {
     },
     /// 06 — `DELETE /games/{id}/scenarios/{sid}/steps/{step_id}`.
     DeleteStep { book: Ref, step_id: i64 },
+    /// 06 — `PATCH /games/{id}/scenarios/{sid}/steps/{step_id}`: rewrite a
+    /// step the server already holds. Absent fields are left alone.
+    EditStep {
+        scenario_id: i64,
+        step_id: i64,
+        kind: Option<crate::book::StepKind>,
+        window: Option<(String, String)>,
+    },
     /// M3 — `POST .../steps/{step_id}/substeps`.
     ///
     /// A `beat` refuses this with a 409, so the composer refuses a sub-step on
@@ -316,6 +327,14 @@ pub enum Write {
         book: Ref,
         step: Ref,
         local_id: i64,
+        content: String,
+    },
+    /// 06 — `PATCH .../steps/{step}/substeps/{substep}`: rewrite a saved
+    /// command's text.
+    EditSubstep {
+        scenario_id: i64,
+        step_id: i64,
+        substep_id: i64,
         content: String,
     },
     /// M3 — `PUT .../substeps/{substep_id}/related`. THE WHOLE LIST, not a
@@ -373,10 +392,12 @@ impl Write {
                 format!("create step {short:?}")
             }
             Write::DeleteStep { step_id, .. } => format!("delete step {step_id}"),
+            Write::EditStep { step_id, .. } => format!("edit step {step_id}"),
             Write::CreateSubstep { content, .. } => {
                 let short: String = content.chars().take(40).collect();
                 format!("create sub-step {short:?}")
             }
+            Write::EditSubstep { substep_id, .. } => format!("edit sub-step {substep_id}"),
             Write::SetAudience { hulls, .. } => format!("relate {} hull(s)", hulls.len()),
             Write::CommandNode { node, user_id } => {
                 format!("command node {} with user {user_id}", node.id())
@@ -554,10 +575,12 @@ pub fn position(draft: &Draft, live: &Live, verb: Verb, number: u8, offset: &str
                     ForceWrite::Assign {
                         unit_id,
                         commander_id,
+                        with_contents,
                         ..
                     } => Some(Write::AssignUnit {
                         unit_id,
                         commander_id,
+                        with_contents,
                     }),
                     _ => None,
                 })
@@ -866,6 +889,17 @@ fn step_write(w: BookWrite) -> Option<Write> {
             book: Ref::Live(scenario_id),
             step_id,
         }),
+        BookWrite::EditStep {
+            scenario_id,
+            step_id,
+            kind,
+            window,
+        } => Some(Write::EditStep {
+            scenario_id,
+            step_id,
+            kind,
+            window,
+        }),
         BookWrite::AddSubstep {
             scenario,
             step,
@@ -877,6 +911,17 @@ fn step_write(w: BookWrite) -> Option<Write> {
             local_id: substep,
             content,
         }),
+        BookWrite::EditSubstep {
+            scenario_id,
+            step_id,
+            substep_id,
+            content,
+        } => Some(Write::EditSubstep {
+            scenario_id,
+            step_id,
+            substep_id,
+            content,
+        }),
         BookWrite::SetAudience {
             scenario,
             step,
@@ -886,7 +931,14 @@ fn step_write(w: BookWrite) -> Option<Write> {
         } => Some(Write::SetAudience {
             book: Ref::from(scenario),
             step: Ref::from(step),
-            substep: Ref::Staged(substep),
+            // A NEGATIVE id is a command this flush creates; a positive one is
+            // a command the server already holds. The audience write follows
+            // either, and the sign is what tells the journal which.
+            substep: if substep < 0 {
+                Ref::Staged(substep)
+            } else {
+                Ref::Live(substep)
+            },
             hulls,
             nodes,
         }),
@@ -1908,9 +1960,12 @@ mod tests {
     fn a_failure_at_any_position_resumes_from_that_position() {
         fn full_draft() -> Draft {
             let mut draft = ready_draft(GameMode::Scenario);
+            // A SECOND SEAT, because one person commands one thing: the hull
+            // belongs to seat 4, so the group needs somebody else.
+            draft.roster.stage(seat(5, "Lt. Bayu", "Commando"));
             draft
                 .groups
-                .stage_group(0, "GUS-1", GroupKind::SatuanTugas, None, Some(4), vec![351])
+                .stage_group(0, "GUS-1", GroupKind::SatuanTugas, None, Some(5), vec![351])
                 .expect("a group");
             let book = draft.book.stage_scenario("The sweep");
             draft
@@ -2403,6 +2458,8 @@ mod cluster_write_tests {
                 commander_id: Some(unit_id),
                 host: None,
                 course_deg: None,
+                brought_by: None,
+                with_contents: false,
             });
         }
         let plan = plan(&draft, &Live::default(), Verb::PlayDirectly, "UTC");
