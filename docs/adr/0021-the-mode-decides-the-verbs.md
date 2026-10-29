@@ -7,7 +7,9 @@ console was answering it in the wrong places.
 
 ## Status
 
-Accepted. Carries forward ADR-0008 (the backend is authoritative over the
+Accepted. Amended 2026-10-29: a scenario exercise's helm is drawn
+(the step's READY is the commit), and the step reminder strip was replaced by
+the scenario card in the map's body. Carries forward ADR-0008 (the backend is authoritative over the
 phase) to the mode: the server's word is the mode, and the mode is what
 decides which controls the console may draw.
 
@@ -36,11 +38,12 @@ The console's rules are not the server's rules. What the console offers is
 a different question: what does this station DO in this exercise?
 
 - **maneuver** — the commander gets the helm. An order posts at once.
-- **scenario** — NO SEAT gets a helm. The exercise is played through its
-  STEPS, and the commander's only verb on the current step is to declare
-  readiness for it. The Game Master plays, skips, ends and replays steps.
-  The clock runs inside a step: a scenario exercise opens stopped and the
-  server refuses a resume between the beats.
+- **scenario** — the commander gets the helm, and the STEP's READY is the
+  commit: the instruments set the course and speed, the server holds the
+  order while no step relating the hull is playing, and the step that plays
+  releases it. The Game Master plays, skips, ends and replays steps. The
+  clock runs inside a step: a scenario exercise opens stopped and the server
+  refuses a resume between the beats.
 - **static** — no helm either. The positions are set BY HAND: the commander
   drags a hull on the map in execution and the hull jumps there. The
   commit route (`PUT /games/{id}/units/{unit_id}/position`) takes a
@@ -71,17 +74,17 @@ in `src/mode_rules.rs` and are NOT the server's `allows_steering`.**
   disabled-looking control reads as a control that failed; an empty channel
   reads as nothing at all.
 - The writes refuse as well as the drawings refuse. `send_helm` refuses
-  outside a maneuver exercise, `send_step_declare` refuses outside a
-  scenario exercise, and `send_step_verb` refuses outside one.
+  outside a maneuver or scenario exercise, `send_step_declare` refuses
+  outside a scenario exercise, and `send_step_verb` refuses outside one.
 - The scenario surfaces — the board's step verbs, the scenario widget, the
   step's declaration — belong to a scenario exercise alone.
 - The clock's verb is ONE predicate, read by the button's label and by the
   write it sends. In a scenario exercise it is a pause and only a pause.
 - The game-level readiness ("ready to start") and the step-level readiness
   are two different facts. The step's verb is named for the step
-  ("READY FOR THIS STEP" / "WITHDRAW") and is reachable from the reminder
-  strip, so the commander does not have to open the board to answer the
-  question the strip is asking.
+  ("READY" / "WITHDRAW") and lives on the scenario card in the map's body,
+  so the commander does not have to open the board to answer the question
+  the card is asking. The old strip under the band is gone.
 
 ## Consequences
 
@@ -95,9 +98,11 @@ in `src/mode_rules.rs` and are NOT the server's `allows_steering`.**
   there is a `TFG_MODE` seed, read at boot, that forces the session's mode
   the way `TFG_PHASE` forces the phase. A seed naming a mode this build
   does not know is no seed at all.
-- The console's rules and the server's can now disagree — deliberately, and
-  only in one place: `mode_rules::helm_offered` versus
-  `GameMode::allows_steering`. The comment on each says why. A reader who
+- The console's rules and the server's agree about the helm now: both
+  modes where `allows_steering` is true also draw the instruments. The
+  difference that remains is about the COMMIT — a scenario's READY posts
+  the held order and the declaration together, where a maneuver's SET HELM
+  posts the order alone. The comment on each predicate says so. A reader who
   finds the disagreement has to read the two comments, which is the point:
   the disagreement is the decision, not an oversight.
 - The static exercise's drag is a NEW gesture: the rail's helm channel

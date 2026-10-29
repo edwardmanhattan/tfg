@@ -2,15 +2,14 @@
 //!
 //! THESE ARE NOT THE SERVER'S RULES, and the difference is the whole
 //! reason this module exists. Minos answers "may an ORDER move a hull" with
-//! `GameMode.AllowsSteering`, and it answers YES for a `scenario` exercise —
-//! because the server will hold the order and release it when the step
-//! says so. The CONSOLE does not offer a helm there at all: a scenario
-//! exercise is played through its steps, and the commander's verb on the
-//! current step is to declare readiness for it. The server's rule is about
-//! what the wire will accept; this one is about what the console offers.
-//! A console that offered a free-standing helm in a scenario exercise would
-//! be offering a verb whose answer is always "held", and the operator would
-//! learn what that means from the server rather than from the screen.
+//! `GameMode.AllowsSteering`. The CONSOLE answers a narrower question: which
+//! verbs it draws and which it refuses before the round trip.
+//!
+//! A `scenario` exercise is played through its steps, but its commander still
+//! sets a helm: the server accepts the order while no step relating the hull
+//! is playing and holds it, and the step that plays releases it. The step's
+//! READY is the commit, so the instruments belong here — they just do not
+//! move anything until the step does.
 //!
 //! The mode is READ ONCE, where the session is read, and every rule below
 //! is a function of that one value. A rule that compared the mode's SPELLING
@@ -26,16 +25,18 @@ use crate::gamestate::GameMode;
 
 /// Whether the helm is offered in this mode.
 ///
-/// ADR-0021: the helm belongs to a `maneuver` exercise and to nothing else.
-/// A `static` exercise has no order at all (the server refuses every one
-/// with a 409), and a `scenario` exercise is played through its steps, so
-/// the helm's instruments have nothing to steer in either.
+/// The helm belongs to a `maneuver` exercise and to a `scenario` one.
 ///
-/// NOT `GameMode::allows_steering`, which is the server's rule and says
-/// yes for `scenario`: the server will accept and HOLD an order there, and
-/// the console's answer to "is this a free-standing helm?" is no.
+/// A `static` exercise has no order at all — the server refuses every one
+/// with a 409 — so the instruments are not drawn there.
+///
+/// A `scenario` exercise DOES take an order: while no step relating the hull
+/// is playing the server accepts it and holds it, and the step's `PLAY`
+/// releases it. That is exactly the commander's workflow: set the helm, then
+/// declare ready for the step. The old rule refused the instruments here and
+/// left the commander with nothing to set, which is why the owner marked it.
 pub fn helm_offered(mode: GameMode) -> bool {
-    matches!(mode, GameMode::Maneuver)
+    matches!(mode, GameMode::Maneuver | GameMode::Scenario)
 }
 
 /// Whether this is a scenario exercise: one played from a Game Master's
@@ -93,8 +94,8 @@ pub fn helm_sentence(mode: GameMode) -> &'static str {
             "An order posts at once; the server clamps and answers."
         }
         GameMode::Scenario => {
-            "No helm in a scenario exercise \u{2014} the step is the commander's verb: \
-             declare yourself ready for the step the exercise asks."
+            "Set the helm, then declare ready for the step \u{2014} the server holds \
+             the order until the step plays."
         }
         GameMode::Static => {
             "No helm in a static exercise \u{2014} the positions are set by hand: \
@@ -152,9 +153,9 @@ mod tests {
     /// exercise's is refused outright, so a helm in either would be a
     /// control whose answer is never "applied".
     #[test]
-    fn the_helm_is_offered_in_a_maneuver_exercise_alone() {
+    fn the_helm_is_offered_in_a_maneuver_or_scenario_exercise() {
         assert!(helm_offered(GameMode::Maneuver));
-        assert!(!helm_offered(GameMode::Scenario));
+        assert!(helm_offered(GameMode::Scenario));
         assert!(!helm_offered(GameMode::Static));
         assert!(
             !helm_offered(GameMode::Unknown),
@@ -162,17 +163,16 @@ mod tests {
         );
     }
 
-    /// The console's helm rule is NOT the server's steering rule, and the
-    /// difference is the point: the server allows an order in a scenario
-    /// exercise because it HOLDS it, and the console offers no helm there
-    /// at all. A console that copied the server's rule would offer an
-    /// instrument whose every answer is "held".
+    /// A scenario exercise's order is HELD rather than applied, and that is
+    /// the point: the helm is the commander's setting, and the step's READY
+    /// is the commit. The console offers the instruments because the server
+    /// really does take the order.
     #[test]
-    fn the_console_s_helm_is_not_the_servers_steering_rule() {
+    fn a_scenario_exercise_offers_the_held_helm() {
         assert!(GameMode::Scenario.allows_steering());
         assert!(
-            !helm_offered(GameMode::Scenario),
-            "the server holds the order; the console does not offer the helm"
+            helm_offered(GameMode::Scenario),
+            "the server holds the order; the commander still sets it"
         );
     }
 

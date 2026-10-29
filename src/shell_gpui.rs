@@ -1748,6 +1748,22 @@ struct IslandDemo {
     /// A host id rather than a bool, because the modal reads one hull's
     /// passengers and a flag would not say whose.
     embark_host: Option<i64>,
+    /// The hull whose passengers the execution map's floating card shows.
+    ///
+    /// The card is a READING, not a modal: it sits beside the hull on the
+    /// water and lists what is aboard her. A host id rather than a bool,
+    /// because the card names one ship's contents.
+    embark_card: Option<i64>,
+    /// The operator shut the floating card on the current selection. A
+    /// selection change clears it, so a card dismissed on one hull does not
+    /// keep the next hull's card shut.
+    embark_card_closed: bool,
+    /// Whether the task organisation is drawn over the chart in execution.
+    /// The planning map draws the same lines; the execution map earns them
+    /// the same way, with a toggle because the chart is the work there.
+    group_lines: bool,
+    /// The task group whose floating card is open, by node id.
+    group_focus: Option<i64>,
     /// What each host carries, by host id — the console's `embarked` map.
     /// Read lazily per host on first open (the console's `ensure_embarked`
     /// rule: cached answers are kept), never prefetched: most hosts carry
@@ -4799,6 +4815,17 @@ impl IslandDemo {
             embark_host: std::env::var("TFG_EMBARK")
                 .ok()
                 .and_then(|v| v.parse::<i64>().ok()),
+            embark_card: std::env::var("TFG_EMBARK_CARD")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok()),
+            embark_card_closed: false,
+            // ON, with a capture seed for the off state: the lines are the
+            // organisation read at a glance, and the operator turns them off
+            // when the chart is the work.
+            group_lines: std::env::var("TFG_GROUPS").as_deref() != Ok("0"),
+            group_focus: std::env::var("TFG_GROUP")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok()),
             embarked: HashMap::new(),
             embark_over: HashMap::new(),
             embark_caps: HashMap::new(),
@@ -6017,6 +6044,39 @@ impl IslandDemo {
         // the traffic, and there is no toast and no flash — a state is
         // STATED, not animated.
         let mut right = div().flex().flex_row().items_center().gap(px(10.0));
+        // THE TASK ORGANISATION'S TOGGLE. The planning map draws the lines;
+        // the execution chart earns them the same way, with a door because
+        // the water is the work here. A press flips it and closes the group
+        // card, so the card cannot outlive the lines that placed it.
+        if self.session.execution && !self.session.groups.is_empty() {
+            right = right
+                .child(
+                    div()
+                        .id("group-lines-door")
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, hear_click)
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.group_lines = !view.group_lines;
+                            if !view.group_lines {
+                                view.group_focus = None;
+                            }
+                            cx.notify();
+                        }))
+                        .child(kit::verb(
+                            if self.group_lines {
+                                "GROUPS ON"
+                            } else {
+                                "GROUPS OFF"
+                            },
+                            if self.group_lines {
+                                kit::VerbLook::Live
+                            } else {
+                                kit::VerbLook::Disabled
+                            },
+                        )),
+                )
+                .child(sep());
+        }
         // In EXECUTION both doors moved to the widget rail: the scenario and
         // the comms hub are widgets on the map now, and duplicating them in
         // the band would give the same surface two entries. The band keeps
@@ -11420,6 +11480,18 @@ impl IslandDemo {
     /// the dashboard and the follow door are about the force in their hands,
     /// not about how the roster happened to list it.
     fn own_unit_ids(&self) -> Vec<i64> {
+        // A CAPTURE SEED, like `TFG_ORGANIZER`: the operator's own seat decides
+        // this, and a headless capture cannot change seats. `TFG_MINE` names
+        // the hulls the photographed seat commands.
+        if let Ok(seed) = std::env::var("TFG_MINE") {
+            let ids: Vec<i64> = seed
+                .split(',')
+                .filter_map(|id| id.trim().parse::<i64>().ok())
+                .collect();
+            if !ids.is_empty() {
+                return ids;
+            }
+        }
         let direct: Vec<i64> = self
             .session
             .mine
@@ -11485,6 +11557,20 @@ impl IslandDemo {
     /// commands nothing — an observer, a judge — gets neither.
     fn is_commander(&self) -> bool {
         !self.own_unit_ids().is_empty()
+    }
+
+    /// Whether the unit-details dock is drawn.
+    ///
+    /// A COMMANDER HAS THE DASHBOARD, and a Game Master has the hull's card
+    /// beside its mark: the dock would be the same fact a third time, and in
+    /// execution it would cover the helm it shares the foot with. An observer
+    /// commands nothing and gets the dock.
+    fn inspector_shown(&self) -> bool {
+        self.inspect_open
+            && !self.planning_phase()
+            && !(self.session.execution
+                && (self.is_commander()
+                    || self.scenario_audience() == ScenarioAudience::Master))
     }
 
     /// Minos's own force, as the draft's `LiveHull` mirror.
@@ -11619,6 +11705,8 @@ impl IslandDemo {
         self.factor_status.clear();
         // The selection is a HULL ID — a hull of the exercise that was held.
         self.selected_unit = None;
+        self.embark_card = None;
+        self.embark_card_closed = false;
         // The relate editor's working set names hulls and nodes, and the
         // embark cache names hulls' contents.
         self.relate_open = None;
@@ -15920,6 +16008,36 @@ impl IslandDemo {
         true
     }
 
+    /// The scenario commander's one press: post the helm the instruments are
+    /// showing, then declare ready for the step.
+    ///
+    /// IN A SCENARIO EXERCISE THE STEP IS THE VERB. The server accepts an
+    /// order while the step is not playing and holds it, so a commander sets
+    /// the helm and answers the step in that order. Outside a scenario
+    /// exercise there is no declaration, and this refuses rather than
+    /// posting an order under a verb that did nothing.
+    fn send_helm_and_ready(
+        &mut self,
+        scenario_id: i64,
+        step_id: i64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.step_declare_offered() || !self.scenario_exercise() {
+            return false;
+        }
+        // A commander who has not touched an instrument declares alone; one
+        // who has sends the pair. `send_helm` answers false when the draft is
+        // incomplete, and the declaration is still the press's whole point.
+        if self.helm_heading.is_some() || self.helm_speed.is_some() {
+            // What the instruments SHOW is what the press sends: a missing
+            // half reads as zero on the dial, and zero is Hold, not a gap.
+            self.helm_heading = Some(self.helm_heading.unwrap_or(0.0));
+            self.helm_speed = Some(self.helm_speed.unwrap_or(0.0));
+            self.send_helm();
+        }
+        self.send_step_declare(scenario_id, step_id, true, cx)
+    }
+
     /// The step this caller may declare readiness for, when there is one.
     ///
     /// The reminder strip's verb and the board's pill are the SAME
@@ -15963,16 +16081,20 @@ impl IslandDemo {
         None
     }
 
-    /// The execution phase's widget rail: account, crew, scenario, comms.
+    /// The execution phase's widget rail: players and comms.
     ///
-    /// These four replace the side column AND the band's two doors in
-    /// execution. Each is deliberately small — the phase is about the map, and
-    /// a widget that said everything would be a panel with a map underneath it
-    /// — so it carries one fact and opens its surface on click.
+    /// These replace the side column AND the band's two doors in execution.
+    /// Each is deliberately small — the phase is about the map, and a widget
+    /// that said everything would be a panel with a map underneath it — so it
+    /// carries one fact and opens its surface on click.
     ///
-    /// ADR-0021: the SCENARIO widget belongs to a scenario exercise alone.
+    /// THE SCENARIO'S OWN READING LIVES IN THE BODY, not here: the owner's
+    /// direction moved it to the map's foot, where the water is, and this rail
+    /// keeps the room and the traffic.
+    ///
+    /// ADR-0021: the scenario card belongs to a scenario exercise alone.
     /// A maneuver exercise has no book and a static one has no step, so the
-    /// widget is not drawn there at all — a widget that says "no steps" over
+    /// card is not drawn there at all — a card that says "no steps" over
     /// an exercise that was never going to have any reads as a broken
     /// surface rather than as an absence.
     fn execution_widgets(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -16010,66 +16132,27 @@ impl IslandDemo {
     /// rendered frame to read it from — and so the drawing is a fold over
     /// one list rather than a chain of calls that could each answer a
     /// different rule.
+    ///
+    /// THE SCENARIO IS NO LONGER A RAIL WIDGET. The owner's direction: the
+    /// step's reading belongs in the body of the map, where the operator is
+    /// already looking, and the rail keeps the two room facts — who is here,
+    /// and what traffic arrived.
     fn execution_widget_set(&self) -> Vec<ExecWidget> {
-        let board = self.scenario_board();
-        let scenario = match (board.total, board.at) {
-            (0, _) => "no steps".to_string(),
-            (_, Some(at)) => format!("current: step {at}"),
-            (n, None) => plural(n as usize, "step"),
-        };
+        let players = self.visible_players();
         let mut widgets = vec![ExecWidget {
             id: "widget-crew",
-            label: "crew",
-            value: format!("{}/{}", self.session.present, self.session.seats),
+            label: "players",
+            value: format!("{players}"),
             ink: MAP_INK,
             status: None,
             progress: None,
-            hint: Some(plural(self.session.pieces.len(), "hull")),
+            hint: Some(format!(
+                "{} \u{00b7} {}",
+                plural(players, "player"),
+                plural(self.session.pieces.len(), "hull")
+            )),
             panel: Some(WhichPanel::Crew),
         }];
-        // The scenario widget, in a scenario exercise and nowhere else.
-        if self.scenario_exercise() {
-            // The scenario widget is the map's reading of the step: the
-            // status, how many units have declared, how far the step in play
-            // has run, and the one line the game master owes. Compact on
-            // purpose — it is a widget on a rail, and the window is one press
-            // away for everything else.
-            let pointer_status = board
-                .steps
-                .iter()
-                .find(|s| s.status.is_pointer())
-                .map(|s| s.status);
-            let units_ready = board.units.iter().filter(|u| u.ready == Some(true)).count();
-            let units_asked = board.units.iter().filter(|u| u.ready.is_some()).count();
-            let mut hint = if units_asked > 0 {
-                format!("{units_ready}/{units_asked} ready")
-            } else {
-                String::new()
-            };
-            if let Some(action) = board.action.as_ref() {
-                if !hint.is_empty() {
-                    hint.push_str(" \u{00b7} ");
-                }
-                hint.push_str(&action.line);
-            }
-            if hint.is_empty() {
-                hint = if board.total == 0 {
-                    crate::mode_rules::no_script_sentence().to_string()
-                } else {
-                    format!("{} in the book", plural(board.total as usize, "step"))
-                };
-            }
-            widgets.push(ExecWidget {
-                id: "widget-scenario",
-                label: "scenario",
-                value: scenario,
-                ink: MAP_INK,
-                status: pointer_status,
-                progress: board.progress.as_ref().map(|p| p.fraction),
-                hint: Some(hint),
-                panel: Some(WhichPanel::Board),
-            });
-        }
         // The comms widget: the count, in the newest traffic's own
         // kind's ink, and the unseen count beside it.
         //
@@ -16098,6 +16181,197 @@ impl IslandDemo {
             panel: Some(WhichPanel::Comms),
         });
         widgets
+    }
+
+    /// How many players this seat can see, for the crew reading.
+    ///
+    /// A GM reads the roster and sees the exercise side. A commander may
+    /// not read it at all: the one seat they can be sure of is their own,
+    /// so a hull commander sees `1`, and a group commander adds the
+    /// commanders of the hulls beneath their groups when the piece rows
+    /// name them. `0/0` was the old answer, and it read as an empty room
+    /// rather than as a read this seat is not allowed to make.
+    fn visible_players(&self) -> usize {
+        // A COMMANDER COUNTS THE FORCE IN THEIR HANDS, never the room. Even
+        // when the roster is readable, "7 players" from a hull commander's
+        // seat is a count of people they do not command; the answer they can
+        // give is themselves, plus the commanders of the hulls beneath a
+        // group they hold.
+        if self.scenario_audience() == ScenarioAudience::Commander {
+            let mut ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            if self.session.me != 0 {
+                ids.insert(self.session.me);
+            }
+            for id in self.own_unit_ids() {
+                if let Some(commander) = self
+                    .session
+                    .pieces
+                    .iter()
+                    .find(|piece| piece.id == id)
+                    .and_then(|piece| piece.commander_id)
+                {
+                    ids.insert(commander);
+                }
+            }
+            return ids.len().max(1);
+        }
+        let roster = self
+            .session
+            .people
+            .iter()
+            .filter(|person| !person.judge)
+            .count();
+        if roster > 0 {
+            return roster;
+        }
+        let mut ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        if self.session.me != 0 {
+            ids.insert(self.session.me);
+        }
+        ids.len().max(1)
+    }
+
+    /// How many units the scenario surfaces count for this seat: the whole
+    /// step for a Game Master or an observer, and only the hulls this
+    /// commander holds for a commander.
+    fn unit_ready_counts(&self, board: &ScenarioBoard) -> (usize, usize) {
+        let commander = self.scenario_audience() == ScenarioAudience::Commander;
+        let mine = self.own_unit_ids();
+        let counted = || {
+            board
+                .units
+                .iter()
+                .filter(|unit| !commander || unit.id.is_some_and(|id| mine.contains(&id)))
+        };
+        (
+            counted().filter(|unit| unit.ready == Some(true)).count(),
+            counted().filter(|unit| unit.ready.is_some()).count(),
+        )
+    }
+
+    /// THE MAP'S OWN SCENARIO READING: the step, its state and how many
+    /// have declared — in the body, not on the rail.
+    ///
+    /// One card, one question: where the exercise stands and what it is
+    /// waiting on. The whole book is one press away. A commander's card
+    /// carries the ONE verb their station owes; a Game Master's card opens
+    /// the plan.
+    fn execution_scenario_widget(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if !self.scenario_exercise() {
+            return div().into_any_element();
+        }
+        let board = self.scenario_board();
+        let playing = board.steps.iter().find(|s| s.status.is_pointer());
+        let status = playing.map(|s| s.status);
+        let value = match (board.total, board.at) {
+            (0, _) => "NO SCRIPT".to_string(),
+            (_, Some(at)) => format!("STEP {at}"),
+            (_, None) if !board.steps.iter().any(|s| s.read == StepRead::Played) => {
+                "NOT STARTED".to_string()
+            }
+            _ => "BETWEEN STEPS".to_string(),
+        };
+        let (ready, asked) = self.unit_ready_counts(&board);
+        let hint = if asked > 0 {
+            format!("{ready} of {asked} ready")
+        } else if board.total == 0 {
+            crate::mode_rules::no_script_sentence().to_string()
+        } else {
+            format!("{}", plural(board.total as usize, "step"))
+        };
+        let commander = self.scenario_audience() == ScenarioAudience::Commander;
+        let asking = if commander { self.asking_step() } else { None };
+        let status_el = match status {
+            Some(status) => status_chip(status).into_any_element(),
+            None => div()
+                .child(kit::mono_caps("IDLE", view::MACHINE_PT, kit::MUTED_INK))
+                .into_any_element(),
+        };
+        let mut bottom = 12.0;
+        if self.is_commander() {
+            bottom += self.dash_height();
+        }
+        if self.inspector_shown() {
+            bottom += INSPECT_H;
+        }
+        let mut card = div()
+            .id("execution-scenario-widget")
+            .absolute()
+            .left(px(12.0))
+            .bottom(px(bottom))
+            .w(px(292.0))
+            .flex()
+            .flex_col()
+            .rounded(px(kit::RADIUS))
+            .bg(rgba(CONSOLE_NIGHT))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(kit::EDGE_INK))
+            .overflow_hidden()
+            .on_scroll_wheel(swallow_wheel)
+            .block_mouse_except_scroll()
+            .cursor_pointer()
+            .on_click(cx.listener(|view, _, _, cx| view.open_board(cx)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .w_full()
+                    .h(px(26.0))
+                    .px(px(view::PANEL_PAD))
+                    .flex_shrink_0()
+                    .bg(rgba(PANEL_SLATE.with_alpha(kit::BAND_ALPHA)))
+                    .border_b(px(kit::EDGE_WIDTH))
+                    .border_color(rgba(kit::EDGE_INK))
+                    .child(kit::mono_caps("SCENARIO", view::MACHINE_PT, kit::MUTED_INK))
+                    .child(status_el),
+            )
+            .child(
+                div()
+                    .px(px(view::PANEL_PAD))
+                    .pt(px(5.0))
+                    .child(kit::machine(value, view::BODY_PT, MAP_INK)),
+            )
+            .child(
+                div()
+                    .px(px(view::PANEL_PAD))
+                    .pb(px(6.0))
+                    .child(kit::remark(hint, kit::MUTED_INK)),
+            );
+        if let Some((scenario_id, step_id, you_ready)) = asking {
+            card = card.child(
+                div()
+                    .px(px(view::PANEL_PAD))
+                    .pb(px(view::PANEL_PAD))
+                    .child(
+                        div()
+                            .id("scenario-ready")
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, hear_click)
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                cx.stop_propagation();
+                                if you_ready {
+                                    view.send_step_declare(scenario_id, step_id, false, cx);
+                                } else {
+                                    // THE SCENARIO'S READY IS THE COMMIT: the
+                                    // helm the commander set is posted first,
+                                    // then the declaration, because that is
+                                    // the order the exercise reads them in.
+                                    view.send_helm_and_ready(scenario_id, step_id, cx);
+                                }
+                            }))
+                            .child(button(
+                                if you_ready { "WITHDRAW" } else { "READY" },
+                                !you_ready,
+                                self.step_declare_busy,
+                                false,
+                            )),
+                    ),
+            );
+        }
+        card.into_any_element()
     }
 
     /// One execution widget: a tracked label, one value, one quiet line —
@@ -16243,7 +16517,12 @@ impl IslandDemo {
             .on_scroll_wheel(swallow_wheel)
             .child(self.dashboard_face(unit.as_ref(), widths.unit));
         rail = rail.child(self.divider_v());
-        rail = rail.child(self.dashboard_status(&identity, widths.identity));
+        rail = rail.child(self.dashboard_status(
+            &identity,
+            widths.identity,
+            unit.as_ref().map(|piece| piece.id),
+            cx,
+        ));
         rail = rail.child(self.divider_v());
         rail = rail.child(self.dashboard_helm(cx, widths));
         rail.into_any_element()
@@ -16369,25 +16648,51 @@ impl IslandDemo {
     /// unit carries, and the first other unit that carries it.
     fn dashboard_identity(&self) -> Vec<(&'static str, String, Option<&'static str>)> {
         let unit = self.own_unit_ids().into_iter().next();
-        let piece = unit.and_then(|id| self.session.pieces.iter().find(|p| p.id == id));
+        // THE SESSION'S PIECE FIRST, THE `mine` FALLBACK SECOND. A participant
+        // who cannot read the force list still has their own ship from the
+        // join, and `own_unit` builds it; reading only `pieces` here made that
+        // hull read as ungrouped and empty.
+        let piece = self.own_unit();
         let hull = piece
+            .as_ref()
             .and_then(|p| p.label.split_once(" ("))
             .map(|(_, tail)| tail.trim_end_matches(')').to_string());
-        let group = unit
-            .and_then(|_id| {
-                let node = piece?.hierarchy_node?;
-                let group = self
-                    .session
+        // THE GROUP IS NAMED WHEN THE TREE IS READ, AND SAID HONESTLY WHEN IT
+        // IS NOT. A participant may be refused `/games/{id}/hierarchy`, and
+        // the old fallback then told a hull whose row carries a node that she
+        // was "not in a group" — a claim the console cannot make from a
+        // missing read. The node id is the fact the join does publish, so the
+        // row says "in a task group" rather than inventing an absence.
+        let group = piece
+            .as_ref()
+            .and_then(|piece| piece.hierarchy_node)
+            .map(|node| {
+                self.session
                     .groups
                     .iter()
-                    .find(|group| group.group_id == node)?;
-                Some(group.name.clone())
+                    .find(|group| group.group_id == node)
+                    .map(|group| group.name.clone())
+                    .unwrap_or_else(|| "in a task group".to_string())
             })
             .unwrap_or_else(|| "not in a group".to_string());
-        let carrying: Vec<String> = unit
+        // WHAT SHE CARRIES, from the exercise's own read when it landed and
+        // from the piece row's register copy when it did not. The second
+        // source is what a participant holds: `in_game` says the boat is here,
+        // and her name is on the same row.
+        let mut carrying: Vec<String> = unit
             .and_then(|id| self.embarked.get(&id))
             .map(|list| list.iter().map(|unit| unit.name.clone()).collect())
             .unwrap_or_default();
+        if carrying.is_empty() {
+            if let Some(piece) = piece.as_ref() {
+                carrying = piece
+                    .register_contents
+                    .iter()
+                    .filter(|content| content.in_game)
+                    .map(|content| content.unit_name.clone())
+                    .collect();
+            }
+        }
         let carried_by = unit.and_then(|id| {
             self.session
                 .pieces
@@ -16399,6 +16704,18 @@ impl IslandDemo {
                         .is_some_and(|list| list.iter().any(|unit| unit.id == id))
                 })
                 .map(|piece| piece.label.clone())
+                .or_else(|| {
+                    let piece = piece.as_ref()?;
+                    let host = piece.host?;
+                    Some(
+                        self.session
+                            .pieces
+                            .iter()
+                            .find(|other| other.id == host)
+                            .map(|other| other.label.clone())
+                            .unwrap_or_else(|| "another hull".to_string()),
+                    )
+                })
         });
         let embark = match (carrying.is_empty(), carried_by) {
             (true, None) => "nothing embarked".to_string(),
@@ -16421,9 +16738,11 @@ impl IslandDemo {
     /// label, an SVG icon when the row has one, and the value right-aligned.
     /// A relationship is not a state, so none of it takes a warning colour.
     fn dashboard_status(
-        &self,
+        &mut self,
         identity: &[(&'static str, String, Option<&'static str>)],
         status_w: f32,
+        host: Option<i64>,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut col = div()
             .id("dashboard-status")
@@ -16438,6 +16757,26 @@ impl IslandDemo {
             .gap(px(7.0))
             .overflow_hidden();
         for (label, value, icon) in identity {
+            // THE EMBARK ROW IS A DOOR on the water. The card is the same one
+            // the Game Master reads beside the hull; the commander's placement
+            // is above the dock.
+            if *label == "embark" {
+                if let Some(host) = host {
+                    col = col.child(
+                        div()
+                            .id("dashboard-embark")
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, hear_click)
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.embark_card = Some(host);
+                                view.embark_card_closed = false;
+                                cx.notify();
+                            }))
+                            .child(identity_row(label, value, *icon)),
+                    );
+                    continue;
+                }
+            }
             col = col.child(identity_row(label, value, *icon));
         }
         col.into_any_element()
@@ -16467,13 +16806,11 @@ impl IslandDemo {
 
     /// Whether the helm is offered in this exercise.
     ///
-    /// ADR-0021: the helm belongs to a `maneuver` exercise and to nothing
-    /// else. The server's own rule (`GameMode::allows_steering`) is WIDER —
-    /// it allows a `scenario` exercise, because the server will hold an
-    /// order there until a step releases it — and the console's rule is
-    /// narrower on purpose: a scenario exercise is played through its steps,
-    /// and a free-standing helm would be an instrument whose every answer
-    /// is "held".
+    /// ADR-0021: the helm belongs to a `maneuver` or a `scenario` exercise.
+    /// A scenario's order is HELD rather than applied, and that is the point:
+    /// the commander sets the instruments and the step's READY commits them.
+    /// A `static` exercise has no order at all, and a mode this build does
+    /// not know fails closed.
     fn helm_offered(&self) -> bool {
         crate::mode_rules::helm_offered(self.mode())
     }
@@ -16647,7 +16984,15 @@ impl IslandDemo {
                             .items_end()
                             .justify_end()
                             .gap(px(6.0))
-                            .child(
+                            // THE SCENARIO'S COMMIT IS THE CARD'S READY. The
+                            // server holds the order until the step plays, so
+                            // a free-standing "SET HELM" would promise a
+                            // movement that has not happened. In a maneuver
+                            // exercise the order applies now, and the button
+                            // stays.
+                            .child(if self.scenario_exercise() {
+                                note("READY ON THE STEP CARD").into_any_element()
+                            } else {
                                 div()
                                     .id("dashboard-helm-send")
                                     .cursor_pointer()
@@ -16656,8 +17001,9 @@ impl IslandDemo {
                                             cx.notify();
                                         }
                                     }))
-                                    .child(button("SET HELM", false, !armed, false)),
-                            )
+                                    .child(button("SET HELM", false, !armed, false))
+                                    .into_any_element()
+                            })
                             // The helm's target is the commander's own unit,
                             // which the first channel already names — a
                             // second copy would be a label repeated. The
@@ -18913,6 +19259,18 @@ impl IslandDemo {
     /// operator who is signed in but unseated is the person setting the
     /// exercise up.
     fn scenario_audience(&self) -> ScenarioAudience {
+        // A CAPTURE SEED, for the same reason as `TFG_MINE`: a headless
+        // capture cannot sign in as the commander, and the commander's
+        // surfaces are the ones the owner is reviewing. Absent means the
+        // seat decides, which is the only shipped default.
+        if let Ok(seed) = std::env::var("TFG_AUDIENCE") {
+            match seed.trim().to_ascii_lowercase().as_str() {
+                "master" | "gm" => return ScenarioAudience::Master,
+                "observer" | "judge" => return ScenarioAudience::Observer,
+                "commander" | "player" => return ScenarioAudience::Commander,
+                _ => {}
+            }
+        }
         let Some(seat) = self.own_seat() else {
             return ScenarioAudience::Master;
         };
@@ -19638,9 +19996,9 @@ impl IslandDemo {
                                 // telling the operator the opposite of what it
                                 // does.
                                 if self.clock_verb_is_pause() {
-                                    "Pause clock"
+                                    "HALT"
                                 } else {
-                                    "Resume clock"
+                                    "RESUME"
                                 },
                                 false,
                                 self.pause_busy,
@@ -19811,9 +20169,7 @@ impl IslandDemo {
                 ),
         );
 
-        // --- the action bar ---------------------------------------------------
-        col = col.child(self.scenario_action_bar(&board));
-        // The verbs' own answers, where the bar already is: a pause that the
+        // The verbs' own answers, under the header: a pause or a step verb the
         // server refused must not vanish into a surface the operator has to
         // go looking for.
         for line in [&self.pause_status, &self.step_verb_status] {
@@ -19828,6 +20184,9 @@ impl IslandDemo {
         }
 
         // --- the two columns --------------------------------------------------
+        // No action bar. The owner's direction: the one line it carried ("who
+        // has not declared") is on the step box and in the command channels,
+        // and a bar that repeats it is a band of the frame spent twice.
         let selected = self.board_selected_key(&board);
         let mut left = div()
             .w(px(430.0))
@@ -19891,69 +20250,15 @@ impl IslandDemo {
         col.into_any_element()
     }
 
-    /// The action bar: the one line the game master owes, and how far the step
-    /// in play has run.
+    /// The commands of the step the window reads, as CHANNELS.
     ///
-    /// It replaces the v2 board's third column. That column's only unique
-    /// content was the action list, and a list of one line is a bar rather
-    /// than a column — the width it frees goes to the units tree.
-    fn scenario_action_bar(&self, board: &ScenarioBoard) -> AnyElement {
-        let (line, ink) = match board.action.as_ref() {
-            Some(action) => (action.line.clone(), action.ink),
-            None => ("nothing is owed on this step".to_string(), BODY_SILVER),
-        };
-        let mut bar = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(14.0))
-            .h(px(40.0))
-            .px(px(view::PANEL_PAD))
-            .bg(rgba(PANEL_SLATE))
-            .border_b(px(view::PANEL_EDGE))
-            .border_color(rgba(HAIRLINE_SLATE))
-            .child(
-                div()
-                    .font_family(view::FACE_HUMAN)
-                    .text_size(px(view::pt(view::BODY_PT)))
-                    .text_color(rgba(ink))
-                    .child(line),
-            )
-            .child(div().flex_1());
-        if let Some(progress) = board.progress.as_ref() {
-            let pct = (progress.fraction * 100.0).round() as i64;
-            bar = bar
-                .child(progress_track(
-                    px(240.0).into(),
-                    progress.fraction,
-                    RADAR_CYAN,
-                ))
-                .child(machine(format!("{pct}%"), RADAR_CYAN))
-                .child(machine(
-                    format!(
-                        "{} of {}\u{2013}{}",
-                        progress.assumed, progress.window.0, progress.window.1
-                    ),
-                    BODY_SILVER,
-                ));
-        } else {
-            // No step in play: the bar says so, rather than leaving a track
-            // that would read as "nothing has run" on a step that is not
-            // running at all.
-            bar = bar.child(kit::mono_caps("no step in play", view::LABEL_PT, CUT_GREY));
-        }
-        bar.into_any_element()
-    }
-
-    /// The units of the step the window reads, as a TREE.
-    ///
-    /// This is the v3 design's second column, and its point is the two
-    /// questions a game master asks of a step: who is in it, and who has not
-    /// declared. The tree answers the first from the ORGANISATION, and the
-    /// chip answers the second from the gate's own personnel list.
+    /// The owner's direction: a step's sub-steps are its main reading, not a
+    /// hierarchy. Each channel is one command and the hulls it addresses, and
+    /// the hulls no command names sit in a NOT TASKED channel of their own.
+    /// The old units tree said who sat in what group; the exercise runs on
+    /// commands, and the group is a planning fact, not a step's.
     fn scenario_units_panel(&self, board: &ScenarioBoard) -> AnyElement {
-        let ready = board.units.iter().filter(|u| u.ready == Some(true)).count();
-        let asked = board.units.iter().filter(|u| u.ready.is_some()).count();
+        let (ready, asked) = self.unit_ready_counts(board);
         let mut col = div()
             .flex_1()
             .min_w_0()
@@ -19968,7 +20273,7 @@ impl IslandDemo {
                     .items_center()
                     .justify_between()
                     .child(kit::mono_caps(
-                        "the units \u{2014} the tree they sit in, and who has declared",
+                        "the commands \u{2014} each channel and the hulls it addresses",
                         view::LABEL_PT,
                         CUT_GREY,
                     ))
@@ -19986,236 +20291,222 @@ impl IslandDemo {
                     )),
             );
         let mut list = div()
-            .id("scenario-units")
+            .id("scenario-channels")
             .flex_1()
             .min_h_0()
             .w_full()
             .overflow_y_scroll()
             .flex()
             .flex_col()
+            .gap(px(8.0))
             .pt(px(4.0));
-        if board.units.is_empty() {
-            list = list.child(note(
-                "This step names no unit and asks no commander, so nothing declares here.",
-            ));
+        let selected = self.board_selected_key(board);
+        let row = selected.and_then(|key| {
+            board
+                .steps
+                .iter()
+                .find(|step| (step.scenario_id, step.step_id) == key)
+        });
+        let Some(row) = row else {
+            list = list.child(note("Select a step to read its commands."));
+            return col.child(list).into_any_element();
+        };
+        let related = self.board_related_units(row).unwrap_or_default();
+        // A COMMANDER READS THEIR OWN BUSINESS. The window shows the current
+        // step, and inside it only the commands that name a hull they hold —
+        // a plan a player can read whole is a plan they can steer against.
+        let commander = self.scenario_audience() == ScenarioAudience::Commander;
+        let mine = self.own_unit_ids();
+        let visible = |id: i64| !commander || mine.contains(&id);
+        let mut tasked: Vec<i64> = Vec::new();
+        if row.substeps.is_empty() {
+            list = list.child(note(if commander {
+                "This step names no command for you."
+            } else {
+                "This step has no commands. Its hulls are under NOT TASKED below."
+            }));
         }
-        for index in 0..board.units.len() {
-            list = list.child(self.units_tree_row(board, index));
+        for (at, sub) in row.substeps.iter().enumerate() {
+            let mut channel = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .p(px(8.0))
+                .rounded(px(kit::RADIUS))
+                .bg(rgba(DEEP_WELL.with_alpha(kit::PANEL_ALPHA)))
+                .border(px(kit::EDGE_WIDTH))
+                .border_color(rgba(HAIRLINE_SLATE))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(kit::machine(
+                            format!("{:02}", at + 1),
+                            view::LABEL_PT,
+                            CUT_GREY,
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .font_family(view::FACE_HUMAN)
+                                .text_size(px(view::pt(view::BODY_PT)))
+                                .text_color(rgba(MAP_INK))
+                                .child(sub.content.clone()),
+                        ),
+                );
+            // A command's audience is a list of hull ids; the step's related
+            // read resolves the same ids to names. A hull the read did not
+            // name is still a hull the command addresses, so it is drawn from
+            // the piece row rather than dropped.
+            let members: Vec<BoardHull> = sub
+                .units
+                .iter()
+                .filter(|id| visible(**id))
+                .filter_map(|id| {
+                    related
+                        .iter()
+                        .find(|hull| hull.id == Some(*id))
+                        .cloned()
+                        .or_else(|| {
+                            self.session
+                                .pieces
+                                .iter()
+                                .find(|piece| piece.id == *id)
+                                .map(|piece| BoardHull {
+                                    id: Some(piece.id),
+                                    name: piece.label.clone(),
+                                    commander: self.piece_commander(piece),
+                                })
+                        })
+                })
+                .collect();
+            for hull in &members {
+                if let Some(id) = hull.id {
+                    tasked.push(id);
+                }
+                channel = channel.child(self.substep_hull_card(row, hull));
+            }
+            if members.is_empty() {
+                channel = channel.child(note("No hull is assigned to this command."));
+            }
+            list = list.child(channel);
         }
-        // The gap is said where the tree is, not at the foot of the column:
-        // a note under a list reads as a footer, and this window has no
-        // footer (the design removed it — the clock lives on its step). It is
-        // said only when there IS a tree: a note about tasks over an empty
-        // column is noise about something the operator cannot see.
-        if !board.units.is_empty() {
-            col = col.child(div().pt(px(2.0)).child(note(
-                "The server publishes no task per unit and no task per group: the \
-                         tree says who sits in what, and the chip says who has declared \
-                         for this step.",
-            )));
+        let idle: Vec<BoardHull> = related
+            .into_iter()
+            .filter(|hull| hull.id.is_none_or(|id| visible(id) && !tasked.contains(&id)))
+            .collect();
+        if !idle.is_empty() {
+            let mut channel = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .p(px(8.0))
+                .rounded(px(kit::RADIUS))
+                .bg(rgba(DEEP_WELL.with_alpha(kit::PANEL_ALPHA)))
+                .border(px(kit::EDGE_WIDTH))
+                .border_color(rgba(WARNING_SAND.with_alpha(150)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(kit::mono_caps(
+                            "NOT TASKED \u{2014} no command names these",
+                            view::LABEL_PT,
+                            WARNING_SAND,
+                        ))
+                        .child(machine(
+                            plural(idle.len(), "hull"),
+                            BODY_SILVER,
+                        )),
+                );
+            for hull in &idle {
+                channel = channel.child(self.substep_hull_card(row, hull));
+            }
+            list = list.child(channel);
         }
         col = col.child(list);
         col.into_any_element()
     }
 
-    /// One row of the units tree: the connectors it inherits from its parent,
-    /// then the node itself.
+    /// Whether a hull in a command channel has declared for the step.
     ///
-    /// The connectors are computed from the PARENT LINKS and never from a
-    /// level grid. That is the whole point of the tree in this console: the
-    /// hierarchy is unbounded and ragged — a unit may sit under a gugus with
-    /// no satuan, and a unit may be in no group at all — so a rule belongs to
-    /// a parent's set of children, and a grid of columns would draw a
-    /// hierarchy the exercise does not have.
-    fn units_tree_row(&self, board: &ScenarioBoard, index: usize) -> AnyElement {
-        const STEP_W: f32 = 18.0;
-        const ROW_H: f32 = 30.0;
-        let units = &board.units;
-        let node = &units[index];
-        // A pre-order list holds everything the row needs: the parent is the
-        // nearest earlier node one level up, and the next sibling is the
-        // first later node at this level before anything shallower ends the
-        // parent's set.
-        let parent_of = |i: usize| -> Option<usize> {
-            if units[i].depth == 0 {
-                return None;
-            }
-            (0..i).rev().find(|&j| units[j].depth == units[i].depth - 1)
-        };
-        let next_sibling = {
-            let d = node.depth;
-            let mut found = None;
-            for j in (index + 1)..units.len() {
-                if units[j].depth < d {
-                    break;
-                }
-                if units[j].depth == d {
-                    found = Some(j);
-                    break;
-                }
-            }
-            found
-        };
-        let has_next_sibling = |i: usize| -> bool {
-            let d = units[i].depth;
-            for j in (i + 1)..units.len() {
-                if units[j].depth < d {
-                    return false;
-                }
-                if units[j].depth == d {
-                    return true;
-                }
-            }
-            false
-        };
+    /// The gate names PEOPLE, and a hull's commander is the person who
+    /// declares for it, so the join is the piece's `commander_id`. A hull
+    /// nobody commands, or a judge-side commander, is not a hull that is
+    /// late: `None` rather than "not ready".
+    fn substep_ready(&self, row: &BoardStep, hull: &BoardHull) -> Option<bool> {
+        let piece = hull
+            .id
+            .and_then(|id| self.session.pieces.iter().find(|piece| piece.id == id))?;
+        let commander = piece.commander_id?;
+        let gate = row.gate.as_ref()?;
+        gate.personnel
+            .iter()
+            .find(|person| person.user_id == commander && person.asked)
+            .map(|person| person.ready)
+    }
 
-        let mut gutter = div()
-            .w(px(node.depth as f32 * STEP_W))
-            .h(px(ROW_H))
-            .flex_shrink_0()
-            .relative();
-        // The ancestor rules: a rule at an ancestor's column passes through
-        // this row while the branch the row is in has a sibling after it.
-        // That is what makes a rule run down the whole set of children and
-        // stop at the last one.
-        let mut walk = parent_of(index);
-        let mut level = node.depth;
-        while let Some(pi) = walk {
-            level -= 1;
-            if has_next_sibling(pi) {
-                gutter = gutter.child(
-                    div()
-                        .absolute()
-                        .left(px(level as f32 * STEP_W))
-                        .top(px(0.0))
-                        .w(px(1.0))
-                        .h(px(ROW_H))
-                        .bg(rgba(CUT_GREY.with_alpha(110))),
-                );
-            }
-            walk = parent_of(pi);
-        }
-        // The row's own tie to its parent: a rule that continues past it when
-        // it has a sibling after it, and an elbow into the label when it is
-        // the last child.
-        if node.depth > 0 {
-            let x = (node.depth - 1) as f32 * STEP_W;
-            let height = if next_sibling.is_some() {
-                ROW_H
-            } else {
-                ROW_H / 2.0
-            };
-            gutter = gutter
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(x))
-                        .top(px(0.0))
-                        .w(px(1.0))
-                        .h(px(height))
-                        .bg(rgba(CUT_GREY.with_alpha(110))),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(x))
-                        .top(px(ROW_H / 2.0))
-                        .w(px(STEP_W))
-                        .h(px(1.0))
-                        .bg(rgba(CUT_GREY.with_alpha(110))),
-                );
-        }
-
-        let mut row = div()
+    /// One hull inside a command channel: its face, its name, who commands
+    /// it and whether that commander has declared.
+    fn substep_hull_card(&self, row: &BoardStep, hull: &BoardHull) -> AnyElement {
+        let face = match hull.id {
+            Some(id) => Self::thumb_box(
+                self.thumbs.get(&id).cloned(),
+                self.fleet_symbol(id),
+                54.0,
+                36.0,
+                0.9,
+                ObjectFit::Cover,
+            ),
+            None => Self::thumb_box(None, MapSymbolShape::Dot, 54.0, 36.0, 1.0, ObjectFit::Cover),
+        };
+        div()
             .w_full()
-            .h(px(ROW_H))
-            .flex_shrink_0()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
-            .child(gutter);
-        if node.is_group {
-            // A group row is a container and nothing else: it owns no task
-            // and declares nothing. What it does say is how many units it
-            // holds, which is the one figure the hierarchy gives.
-            let held = units[(index + 1)..]
-                .iter()
-                .take_while(|u| u.depth > node.depth)
-                .filter(|u| !u.is_group)
-                .count();
-            row = row
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .child(kit::mono_caps(&node.name, view::LABEL_PT, MAP_INK)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_size(px(view::pt(view::LABEL_PT)))
-                        .text_color(rgba(BODY_SILVER.with_alpha(150)))
-                        .child(if node.group_path.is_empty() {
-                            format!("\u{00b7} {} below", plural(held, "unit"))
-                        } else {
-                            format!(
-                                "{} \u{00b7} {} below",
-                                node.group_path.join(" / "),
-                                plural(held, "unit")
-                            )
-                        }),
-                );
-        } else {
-            // The hull's name is the row, and it is the ONLY thing that may
-            // give way. A `KRI Abdul Halim Perdanakusuma (KRI-355)` is wider
-            // than the whole units column at this window's narrow size, and
-            // with every part of the row fixed the chip was pushed off the
-            // edge — the one thing the row exists to say, missing. So the
-            // name takes the slack and truncates, the commander is capped,
-            // and the chip never shrinks.
-            // The three facts of a unit row — name, commander, declaration —
-            // sit TOGETHER after the tree's rule. A `flex_1` on the name
-            // pushed the chip to the column's far edge, which at a wide
-            // window put the name at x=600 and its own chip at x=1800: two
-            // facts of one row, 1300px apart, and the eye had to travel the
-            // rule it was reading. The name still gives way first (it is the
-            // only long field), so a narrow column truncates it rather than
-            // dropping the chip.
-            // THE UNIT'S FACE, when the row is a hull: its photograph, or
-            // its NATO symbol when the register has no picture. The tree is
-            // the scenario window's roster, and a roster of names is a list.
-            let face = match node.id {
-                Some(id) => Self::thumb_box(
-                    self.thumbs.get(&id).cloned(),
-                    self.fleet_symbol(id),
-                    40.0,
-                    26.0,
-                    0.8,
-                    ObjectFit::Cover,
-                ),
-                None => div().into_any_element(),
-            };
-            row = row
-                .child(face)
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .font_family(view::FACE_HUMAN)
-                        .text_size(px(view::pt(view::BODY_PT)))
-                        .text_color(rgba(MAP_INK))
-                        .child(node.name.clone()),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(view::pt(view::LABEL_PT)))
-                        .text_color(rgba(BODY_SILVER))
-                        .child(node.commander.clone()),
-                )
-                .child(div().flex_shrink_0().child(declared_chip(node.ready)));
-        }
-        row.into_any_element()
+            .gap(px(9.0))
+            .p(px(7.0))
+            .rounded(px(kit::RADIUS))
+            .bg(rgba(PANEL_SLATE.with_alpha(kit::BAND_ALPHA)))
+            .border(px(kit::EDGE_WIDTH))
+            .border_color(rgba(HAIRLINE_SLATE))
+            .child(face)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .truncate()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(view::pt(view::BODY_PT)))
+                            .text_color(rgba(MAP_INK))
+                            .child(hull.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(view::pt(view::LABEL_PT)))
+                            .text_color(rgba(BODY_SILVER))
+                            .child(hull.commander.clone()),
+                    ),
+            )
+            .child(div().flex_shrink_0().child(declared_chip(
+                self.substep_ready(row, hull),
+            )))
+            .into_any_element()
     }
 
     /// The step whose detail section 2 shows. A stored selection wins while
@@ -20383,8 +20674,15 @@ impl IslandDemo {
         // a numbered row in an edged block. A step with none draws nothing —
         // an empty rail under every step would be a column of apologies.
         if !row.substeps.is_empty() {
+            // A commander reads the commands that address their own hulls;
+            // the rest of the script is the Game Master's business.
+            let commander = self.scenario_audience() == ScenarioAudience::Commander;
+            let mine = self.own_unit_ids();
             let mut subs = div().flex().flex_col().gap(px(3.0)).pl(px(30.0));
             for (at, sub) in row.substeps.iter().enumerate() {
+                if commander && !sub.units.iter().any(|id| mine.contains(id)) {
+                    continue;
+                }
                 subs = subs.child(
                     div()
                         .flex()
@@ -20418,31 +20716,41 @@ impl IslandDemo {
         // The readiness gate, on the step the exercise stands on and nowhere
         // else: it is the one number the board holds that changes while it is
         // open. `required` zero is a step that asks nobody.
-        if let Some(gate) = row.gate.as_ref().filter(|g| g.required > 0) {
-            let mut line = div()
-                .flex()
-                .flex_row()
-                .items_baseline()
-                .gap(px(4.0))
-                .child(figure(&format!("{}", gate.ready), false, MAP_INK))
-                .child(kit::mono_caps(
-                    &format!("of {} ready", gate.required),
-                    view::LABEL_PT,
-                    if gate.may_start {
-                        SIGNAL_GREEN
-                    } else {
-                        WARNING_SAND
-                    },
-                ));
-            if !gate.may_start && !gate.outstanding.is_empty() {
-                line = line.child(
-                    div()
-                        .text_size(px(view::pt(view::LABEL_PT)))
-                        .text_color(rgba(WARNING_SAND))
-                        .child(format!("\u{00b7} held by {}", gate.outstanding.join(", "))),
-                );
+        // A commander's board does not show the step's whole gate: the count
+        // is the composition of the force opposite them, which is exactly
+        // what the participant rule withholds. Their own declaration is on
+        // the scenario card and the channel chip.
+        if self.scenario_audience() != ScenarioAudience::Commander {
+            if let Some(gate) = row.gate.as_ref().filter(|g| g.required > 0) {
+                let mut line = div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_baseline()
+                    .gap(px(4.0))
+                    .child(figure(&format!("{}", gate.ready), false, MAP_INK))
+                    .child(kit::mono_caps(
+                        &format!("of {} ready", gate.required),
+                        view::LABEL_PT,
+                        if gate.may_start {
+                            SIGNAL_GREEN
+                        } else {
+                            WARNING_SAND
+                        },
+                    ));
+                // WHO is holding it is the channels' fact: the hull rows carry
+                // their commander and their declaration chip. The step box says
+                // HOW MANY, so a long roster cannot push the count off the card.
+                if !gate.may_start && !gate.outstanding.is_empty() {
+                    line = line.child(
+                        div()
+                            .text_size(px(view::pt(view::LABEL_PT)))
+                            .text_color(rgba(WARNING_SAND))
+                            .child(format!("\u{00b7} {} holding", gate.outstanding.len())),
+                    );
+                }
+                card = card.child(line);
             }
-            card = card.child(line);
         }
 
         // The verbs, INSIDE the box they act on. Ready lands beside them on
@@ -20500,9 +20808,9 @@ impl IslandDemo {
                         // scenario exercise, where the server refuses a
                         // resume between the beats (ADR-0021).
                         if self.clock_verb_is_pause() {
-                            "Pause clock"
+                            "HALT"
                         } else {
-                            "Resume clock"
+                            "RESUME"
                         },
                         true,
                         self.pause_busy,
@@ -21125,6 +21433,8 @@ impl IslandDemo {
             return;
         };
         let previous = self.selected_unit.replace(id.clone());
+        self.embark_card = None;
+        self.embark_card_closed = false;
         self.pick_made = Some(previous);
         if let Some(i) = self.roster.iter().position(|r| r.unit_id == id) {
             self.selected = i;
@@ -34731,13 +35041,19 @@ impl IslandDemo {
     /// it is going and how fast, what is aboard, and which step is playing —
     /// without moving their eyes to a panel. The command center draws the same
     /// card for the hull the phone focused.
-    fn unit_popup(&self, win_w: f32, win_h: f32) -> AnyElement {
+    fn unit_popup(
+        &mut self,
+        win_w: f32,
+        win_h: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(id) = self.selected_unit.as_deref() else {
             return div().into_any_element();
         };
         let Some(marker) = self.live.iter().find(|marker| marker.id == id) else {
             return div().into_any_element();
         };
+        let host = id.parse::<i64>().unwrap_or(0);
         let (mw, mh) = self.map_dims;
         let (s, ox, oy) = map_view(
             f64::from(mw),
@@ -34856,10 +35172,529 @@ impl IslandDemo {
                     .child(row("COMMANDER", facts.commander.clone()))
                     .child(row("SPEED", facts.speed.clone()))
                     .child(row("COURSE", facts.course.clone()))
-                    .child(row("EMBARKED", facts.embark.clone()))
+                    .child(
+                        div()
+                            .id("unit-popup-embark")
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, hear_click)
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                cx.stop_propagation();
+                                view.embark_card = Some(host);
+                                view.embark_card_closed = false;
+                                cx.notify();
+                            }))
+                            .child(row("EMBARKED", facts.embark.clone())),
+                    )
                     .child(row("STEP", step)),
             )
             .into_any_element()
+    }
+
+    /// A ground point in window pixels: the same COVER transform the map
+    /// picture and the markers use, so a card anchored to a hull sits on the
+    /// hull at every zoom.
+    fn ground_px(&self, lat: f64, lon: f64, win_w: f32, win_h: f32) -> Option<(f32, f32)> {
+        let (mw, mh) = (f64::from(self.map_dims.0), f64::from(self.map_dims.1));
+        if mw <= 0.0 || mh <= 0.0 {
+            return None;
+        }
+        let (s, ox, oy) = map_view(mw, mh, f64::from(win_w), f64::from(win_h));
+        if s <= 0.0 {
+            return None;
+        }
+        let (x, y) = map_geometry::project_mercator(
+            lat,
+            lon,
+            self.map_center,
+            self.map_zoom,
+            mw,
+            mh,
+        );
+        Some((ox as f32 + x as f32 * s as f32, oy as f32 + y as f32 * s as f32))
+    }
+
+    /// Where a hull is on the chart: its live fix, else the placement the
+    /// exercise recorded. A hull with neither has no ground and is not drawn.
+    fn unit_ground(&self, id: i64) -> Option<(f64, f64)> {
+        self.live
+            .iter()
+            .find(|marker| marker.id == id.to_string())
+            .map(|marker| (marker.latitude, marker.longitude))
+            .or_else(|| {
+                self.session
+                    .pieces
+                    .iter()
+                    .find(|piece| piece.id == id)
+                    .and_then(|piece| piece.start)
+            })
+    }
+
+    /// The execution chart's task organisation, as stars.
+    ///
+    /// One body, one centre, and the things directly under it — the same
+    /// shape the planning map draws, read from the server's tree and the
+    /// pieces' own nodes instead of from a draft.
+    fn live_group_nodes(&self) -> Vec<LiveGroupNode> {
+        if self.session.groups.is_empty() {
+            return Vec::new();
+        }
+        let mut nodes = Vec::new();
+        for group in &self.session.groups {
+            let subtree = self.group_subtree_ids(group.group_id);
+            let mut hulls = Vec::new();
+            let mut direct = Vec::new();
+            for piece in &self.session.pieces {
+                let Some(node) = piece.hierarchy_node else {
+                    continue;
+                };
+                if !subtree.contains(&node) {
+                    continue;
+                }
+                let Some(ground) = self.unit_ground(piece.id) else {
+                    continue;
+                };
+                let entry = (
+                    piece.id,
+                    unit_name_only(&piece.label).to_string(),
+                    ground,
+                );
+                if node == group.group_id {
+                    direct.push(entry.clone());
+                }
+                hulls.push(entry);
+            }
+            let anchor = if hulls.is_empty() {
+                None
+            } else {
+                let n = hulls.len() as f64;
+                Some((
+                    hulls.iter().map(|(_, _, (lat, _))| *lat).sum::<f64>() / n,
+                    hulls.iter().map(|(_, _, (_, lon))| *lon).sum::<f64>() / n,
+                ))
+            };
+            let commander = group
+                .commander_id
+                .and_then(|id| self.session.people.iter().find(|p| p.id == id))
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "uncommanded".to_string());
+            nodes.push(LiveGroupNode {
+                group_id: group.group_id,
+                name: group.name.clone(),
+                kind: group.kind,
+                commander,
+                anchor,
+                direct,
+                hulls,
+                children: self
+                    .session
+                    .groups
+                    .iter()
+                    .filter(|child| child.parent == Some(group.group_id))
+                    .map(|child| child.group_id)
+                    .collect(),
+            });
+        }
+        nodes
+    }
+
+    /// The lines a set of group stars draws: each body's centre to a hull it
+    /// musters directly, and to the centre of each child body.
+    fn live_group_links(&self, nodes: &[LiveGroupNode]) -> Vec<(f64, f64, f64, f64, crate::groups::GroupKind)> {
+        let by_id: HashMap<i64, &LiveGroupNode> =
+            nodes.iter().map(|node| (node.group_id, node)).collect();
+        let mut links = Vec::new();
+        for node in nodes {
+            let Some(from) = node.anchor else {
+                continue;
+            };
+            for (_, _, to) in &node.direct {
+                if *to != from {
+                    links.push((from.0, from.1, to.0, to.1, node.kind));
+                }
+            }
+            for child in &node.children {
+                if let Some(child) = by_id.get(child).and_then(|child| child.anchor) {
+                    if child != from {
+                        links.push((from.0, from.1, child.0, child.1, node.kind));
+                    }
+                }
+            }
+        }
+        links
+    }
+
+    /// The group card: what the body is, who commands it, and what it holds.
+    ///
+    /// It is opened by the junction dot the lines meet at, and it is a
+    /// READING beside the water rather than a modal — the chart stays
+    /// visible, which is the reason the lines exist.
+    fn group_popup(&mut self, win_w: f32, win_h: f32, cx: &mut Context<Self>) -> AnyElement {
+        if !self.session.execution || !self.group_lines {
+            return div().into_any_element();
+        }
+        let Some(focus) = self.group_focus else {
+            return div().into_any_element();
+        };
+        let nodes = self.live_group_nodes();
+        let Some(node) = nodes.iter().find(|node| node.group_id == focus) else {
+            return div().into_any_element();
+        };
+        let Some((lat, lon)) = node.anchor else {
+            return div().into_any_element();
+        };
+        let Some((mx, my)) = self.ground_px(lat, lon, win_w, win_h) else {
+            return div().into_any_element();
+        };
+        const W: f32 = 316.0;
+        let left = if mx + 24.0 + W > win_w {
+            (mx - 24.0 - W).max(8.0)
+        } else {
+            mx + 24.0
+        };
+        let top = (my - 140.0).clamp(76.0, (win_h - 520.0).max(76.0));
+        let mut card = div()
+            .id("group-card")
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(W))
+            .max_h(px(520.0))
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .bg(rgba(view::PANEL_SLATE))
+            .border_1()
+            .border_color(rgba(link_ink(node.kind)))
+            .on_scroll_wheel(swallow_wheel)
+            .block_mouse_except_scroll()
+            .on_mouse_down(MouseButton::Left, hear_click)
+            .child(
+                div()
+                    .px(px(12.0))
+                    .py(px(7.0))
+                    .border_b_1()
+                    .border_color(rgba(view::HAIRLINE_SLATE))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(kit::mono_caps(
+                        node.kind.label().to_uppercase(),
+                        view::MACHINE_PT,
+                        link_ink(node.kind),
+                    ))
+                    .child(
+                        div()
+                            .id("group-card-close")
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, hear_click)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.group_focus = None;
+                                cx.notify();
+                            }))
+                            .child(kit::mono_caps("\u{00d7}", view::LABEL_PT, kit::MUTED_INK)),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(view::pt(view::TITLE_PT)))
+                            .text_color(rgba(view::MAP_INK))
+                            .child(node.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(view::pt(view::BODY_PT)))
+                            .text_color(rgba(view::BODY_SILVER))
+                            .child(format!("commander \u{00b7} {}", node.commander)),
+                    )
+                    .child(kit::mono_caps(
+                        format!(
+                            "{} \u{00b7} {}",
+                            plural(node.hulls.len(), "hull"),
+                            plural(node.children.len(), "group")
+                        ),
+                        view::LABEL_PT,
+                        kit::MUTED_INK,
+                    )),
+            );
+        // The children first: the hierarchy reads outward from the body.
+        for child in &node.children {
+            if let Some(child) = nodes.iter().find(|n| n.group_id == *child) {
+                card = card.child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .border_t_1()
+                        .border_color(rgba(view::HAIRLINE_SLATE))
+                        .child(kit::mono_caps("GROUP", view::LABEL_PT, link_ink(child.kind)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .truncate()
+                                .font_family(view::FACE_HUMAN)
+                                .text_size(px(view::pt(view::BODY_PT)))
+                                .text_color(rgba(view::MAP_INK))
+                                .child(child.name.clone()),
+                        ),
+                );
+            }
+        }
+        if !node.hulls.is_empty() {
+            card = card.child(
+                div()
+                    .px(px(12.0))
+                    .pt(px(5.0))
+                    .child(kit::mono_caps("HULLS", view::LABEL_PT, kit::MUTED_INK)),
+            );
+        }
+        for (_, name, _) in &node.hulls {
+            card = card.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(kit::mono_caps("HULL", view::LABEL_PT, kit::MUTED_INK))
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(view::pt(view::BODY_PT)))
+                            .text_color(rgba(view::MAP_INK))
+                            .child(name.clone()),
+                    ),
+            );
+        }
+        if node.direct.is_empty() && node.children.is_empty() {
+            card = card.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .child(kit::remark("No hull or body under this group is placed.", kit::MUTED_INK)),
+            );
+        }
+        card.into_any_element()
+    }
+
+    /// What one host carries, as two lists: the pieces aboard her in this
+    /// exercise, and the pieces the register says she brings.
+    fn embark_contents(&self, host: i64) -> (Vec<(String, String)>, Vec<(String, String)>) {
+        let mut carried: Vec<(String, String)> = self
+            .embarked
+            .get(&host)
+            .map(|list| {
+                list.iter()
+                    .map(|unit| (unit.name.clone(), unit.hull_number.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if carried.is_empty() {
+            for piece in &self.session.pieces {
+                if piece.host == Some(host) {
+                    carried.push((
+                        unit_name_only(&piece.label).to_string(),
+                        piece
+                            .label
+                            .split_once(" (")
+                            .map(|(_, tail)| tail.trim_end_matches(')').to_string())
+                            .unwrap_or_default(),
+                    ));
+                }
+            }
+        }
+        let mut brings = Vec::new();
+        let carried_unknown = carried.is_empty();
+        if let Some(piece) = self.session.pieces.iter().find(|piece| piece.id == host) {
+            for content in &piece.register_contents {
+                if content.in_game && carried_unknown {
+                    carried.push((content.unit_name.clone(), content.hull_number.clone()));
+                } else if !content.in_game {
+                    brings.push((content.unit_name.clone(), content.hull_number.clone()));
+                }
+            }
+        }
+        if let Some(list) = self.register_carries.get(&host) {
+            for unit in list {
+                if !brings.iter().any(|(name, _)| name == &unit.name) {
+                    brings.push((unit.name.clone(), unit.hull_number.clone()));
+                }
+            }
+        }
+        (carried, brings)
+    }
+
+    /// Which host the floating embark card reads, when it is open.
+    fn embark_card_host(&self) -> Option<i64> {
+        if let Some(host) = self.embark_card {
+            return (host > 0).then_some(host);
+        }
+        if self.embark_card_closed {
+            return None;
+        }
+        // A GAME MASTER'S CARD FOLLOWS THE HULL THEY POINTED AT. The owner's
+        // direction: a hull with pieces aboard is shown with them, and the
+        // unit card's EMBARKED row is the door when the reader wants it.
+        if self.session.execution && self.scenario_audience() == ScenarioAudience::Master {
+            let host = self.selected_unit.as_deref()?.parse::<i64>().ok()?;
+            let (carried, brings) = self.embark_contents(host);
+            return (!carried.is_empty() || !brings.is_empty()).then_some(host);
+        }
+        None
+    }
+
+    /// The floating embark card: what is aboard this hull, and what she
+    /// brings with her.
+    ///
+    /// A Game Master reads it beside the hull on the water; a commander
+    /// reads it above the dock, because the dock is where their hull lives.
+    /// The two placements are the same card.
+    fn embark_card(&mut self, win_w: f32, win_h: f32, cx: &mut Context<Self>) -> AnyElement {
+        let Some(host) = self.embark_card_host() else {
+            return div().into_any_element();
+        };
+        let (carried, brings) = self.embark_contents(host);
+        let commander = self.is_commander();
+        let (left, top) = if commander {
+            // BESIDE THE SCENARIO CARD, not under it: both are the body's
+            // readings, and the card that opened last must not be covered by
+            // the one that was already there.
+            (
+                if self.scenario_exercise() { 12.0 + 292.0 + 12.0 } else { 12.0 },
+                (win_h - self.dash_height() - 12.0 - 176.0).max(76.0),
+            )
+        } else {
+            let Some(ground) = self.unit_ground(host) else {
+                return div().into_any_element();
+            };
+            let Some((mx, my)) = self.ground_px(ground.0, ground.1, win_w, win_h) else {
+                return div().into_any_element();
+            };
+            let left = if mx + 24.0 + 316.0 + 316.0 > win_w {
+                (mx - 24.0 - 300.0).max(8.0)
+            } else {
+                mx + 24.0 + 316.0
+            };
+            (left, (my - 86.0).clamp(76.0, (win_h - 200.0).max(76.0)))
+        };
+        let mut card = div()
+            .id("embark-card")
+            .absolute()
+            .left(px(left))
+            .w(px(300.0));
+        // The commander's card grows UP from the dock; the Game Master's is
+        // pinned beside the hull it reads.
+        card = if commander {
+            card.bottom(px(self.dash_height() + 12.0))
+        } else {
+            card.top(px(top))
+        };
+        let mut card = card
+            .flex()
+            .flex_col()
+            .bg(rgba(view::PANEL_SLATE))
+            .border_1()
+            .border_color(rgba(view::RADAR_CYAN.with_alpha(160)))
+            .on_scroll_wheel(swallow_wheel)
+            .block_mouse_except_scroll()
+            .on_mouse_down(MouseButton::Left, hear_click)
+            .child(
+                div()
+                    .px(px(12.0))
+                    .py(px(6.0))
+                    .border_b_1()
+                    .border_color(rgba(view::HAIRLINE_SLATE))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_family(view::FACE_HUMAN)
+                            .text_size(px(view::pt(view::LABEL_PT)))
+                            .text_color(rgba(view::MAP_INK))
+                            .child(self.unit_name_of(&host.to_string())),
+                    )
+                    .child(
+                        div()
+                            .id("embark-card-close")
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, hear_click)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.embark_card = None;
+                                view.embark_card_closed = true;
+                                cx.notify();
+                            }))
+                            .child(kit::mono_caps("\u{00d7}", view::LABEL_PT, kit::MUTED_INK)),
+                    ),
+            );
+        let mut body = div().px(px(12.0)).py(px(8.0)).flex().flex_col().gap(px(5.0));
+        body = body.child(kit::mono_caps("aboard", view::LABEL_PT, kit::MUTED_INK));
+        if carried.is_empty() {
+            body = body.child(kit::remark("nothing embarked", kit::MUTED_INK));
+        } else {
+            for (name, hull) in &carried {
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .font_family(view::FACE_HUMAN)
+                                .text_size(px(view::pt(view::BODY_PT)))
+                                .text_color(rgba(view::MAP_INK))
+                                .child(name.clone()),
+                        )
+                        .child(kit::machine(hull.clone(), view::LABEL_PT, view::BODY_SILVER)),
+                );
+            }
+        }
+        if !brings.is_empty() {
+            body = body
+                .child(div().h(px(1.0)).w_full().bg(rgba(view::HAIRLINE_SLATE)))
+                .child(kit::mono_caps(
+                    "brings on deployment",
+                    view::LABEL_PT,
+                    kit::MUTED_INK,
+                ));
+            for (name, hull) in &brings {
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .font_family(view::FACE_HUMAN)
+                                .text_size(px(view::pt(view::BODY_PT)))
+                                .text_color(rgba(view::MAP_INK))
+                                .child(name.clone()),
+                        )
+                        .child(kit::machine(hull.clone(), view::LABEL_PT, view::BODY_SILVER)),
+                );
+            }
+        }
+        card.child(body).into_any_element()
     }
 
     /// The marker layer, now live: one ring per tracked hull, at its
@@ -34874,7 +35709,12 @@ impl IslandDemo {
     /// per-element blend mode, so the shader's `One/One` cannot be expressed,
     /// and ADR-0019 records what source-over costs. The ring is the channel
     /// either way, which ADR-0015 already said the Low tier is.
-    fn markers(&mut self, win_w: f32, win_h: f32) -> impl IntoElement {
+    fn markers(
+        &mut self,
+        win_w: f32,
+        win_h: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // The glyph's reach as a multiple of its authored radius-8 reference,
         // and the selection reticle's radius (outside the frame).
         const GLYPH_SCALE: f32 = 1.35;
@@ -34938,11 +35778,53 @@ impl IslandDemo {
         // walk the tree per marker. Cloned for the same reason `thumbs` is —
         // the paint closure is `move`.
         let sizes = self.hull_sizes.clone();
-        div().absolute().top(px(0.0)).left(px(0.0)).child(canvas(
+        // THE TASK ORGANISATION, UNDER THE SHIPS. The planning map draws the
+        // same stars from its draft; in execution the tree is the server's,
+        // and the lines are read here from the placed hulls.
+        let group_nodes = if self.session.execution && self.group_lines {
+            self.live_group_nodes()
+        } else {
+            Vec::new()
+        };
+        let group_links = self.live_group_links(&group_nodes);
+        let paint_links = group_links.clone();
+        let map_center = self.map_center;
+        let map_zoom = self.map_zoom;
+        let (mw_f, mh_f) = (f64::from(mw), f64::from(mh));
+        let mut layer = div().absolute().top(px(0.0)).left(px(0.0)).child(canvas(
             |bounds, _, _| bounds,
             move |_bounds, _, window, _| {
                 if s <= 0.0 {
                     return;
+                }
+                // The organisation first: a hull is the thing, and the line
+                // is the reading of it.
+                for (from_lat, from_lon, to_lat, to_lon, kind) in &paint_links {
+                    let (ax, ay) = map_geometry::project_mercator(
+                        *from_lat,
+                        *from_lon,
+                        map_center,
+                        map_zoom,
+                        mw_f,
+                        mh_f,
+                    );
+                    let (bx, by) = map_geometry::project_mercator(
+                        *to_lat,
+                        *to_lon,
+                        map_center,
+                        map_zoom,
+                        mw_f,
+                        mh_f,
+                    );
+                    let mut line = PathBuilder::stroke(px(1.4));
+                    line.move_to(point(px(ox + ax as f32 * s), px(oy + ay as f32 * s)));
+                    line.line_to(point(px(ox + bx as f32 * s), px(oy + by as f32 * s)));
+                    if let Ok(path) = line.build() {
+                        window.paint_path(
+                            path,
+                            rgba(link_ink(*kind).with_alpha(180)),
+                        );
+                    }
                 }
                 for (m, mx, my) in &live {
                     let cx = ox + (*mx as f32) * s;
@@ -35108,7 +35990,46 @@ impl IslandDemo {
                     }
                 }
             },
-        ))
+        ));
+        // The junction dots are the doors to a body's card. They are drawn
+        // over the canvas because a canvas has no hit test, and a dot the
+        // operator can see but not press would be furniture pretending to be
+        // a control.
+        for node in group_nodes {
+            let Some((lat, lon)) = node.anchor else {
+                continue;
+            };
+            let Some((x, y)) = self.ground_px(lat, lon, win_w, win_h) else {
+                continue;
+            };
+            let ink = link_ink(node.kind);
+            let id = node.group_id;
+            layer = layer.child(
+                div()
+                    .id(("group-node", id as usize))
+                    .absolute()
+                    .left(px(x - 9.0))
+                    .top(px(y - 9.0))
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .rounded(px(9.0))
+                    .border_2()
+                    .border_color(rgba(ink))
+                    .bg(rgba(CONSOLE_NIGHT.with_alpha(210)))
+                    .cursor_pointer()
+                    .block_mouse_except_scroll()
+                    .on_mouse_down(MouseButton::Left, hear_click)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.group_focus = if view.group_focus == Some(id) {
+                            None
+                        } else {
+                            Some(id)
+                        };
+                        cx.notify();
+                    })),
+            );
+        }
+        layer
     }
 }
 
@@ -36659,6 +37580,8 @@ impl Render for IslandDemo {
                             // selected.
                             if let Some(previous) = view.pick_made.take() {
                                 view.selected_unit = previous;
+                                view.embark_card = None;
+                                view.embark_card_closed = false;
                             }
                         }
                         let Some((lx, ly)) = view.pan else {
@@ -36987,9 +37910,18 @@ impl Render for IslandDemo {
                 // cross-run alignment, no second compositor pass.
                 compositing_probe(self.gate.image(), self.probe_sprite.clone()).into_any_element()
             } else {
-                self.markers(vp.2, vp.3).into_any_element()
+                self.markers(vp.2, vp.3, cx).into_any_element()
             })
-            .child(self.unit_popup(vp.2, vp.3).into_any_element())
+            .child(if self.session.execution && self.is_commander() {
+                // THE DOCK IS THE COMMANDER'S, THE CARD IS THE GAME MASTER'S.
+                // The same hull read out twice, once on the water and once on
+                // the rail, is noise; each seat keeps the surface it uses.
+                div().into_any_element()
+            } else {
+                self.unit_popup(vp.2, vp.3, cx).into_any_element()
+            })
+            .child(self.embark_card(vp.2, vp.3, cx))
+            .child(self.group_popup(vp.2, vp.3, cx))
             // NO GRID. Planning is the composer (see `apply_hold`), so the
             // console's map is never asked to draw six cards of a plan being
             // authored somewhere else.
@@ -37072,6 +38004,7 @@ impl Render for IslandDemo {
         // are their entries, each opening the surface it names.
         if self.session.execution {
             root = root.child(self.execution_widgets(cx));
+            root = root.child(self.execution_scenario_widget(cx));
             // The commander's own surface: the bottom dashboard and the
             // one-tap follow door. Both are gated on the seat commanding
             // something, which is the whole reason they are here rather than
@@ -37101,102 +38034,11 @@ impl Render for IslandDemo {
         // STEP island, where the scenario and the declare row live, so the
         // strip never grows its own. Absent when there is nothing to remind:
         // no execution, no asking step, nothing playing.
-        let reminder = self.step_reminder();
-        if let Some(rem) = reminder {
-            // The console's own pair: sand while the step waits on this
-            // caller, signal green once declared or when only naming play.
-            let dot = if rem.needs_you {
-                WARNING_SAND
-            } else {
-                SIGNAL_GREEN
-            };
-            // THE COMMANDER'S STEP VERB, ON THE STRIP THAT ASKS FOR IT
-            // (ADR-0021). The strip says what this caller owes, so the
-            // answer belongs on the strip: a commander who has to open the
-            // board to declare readiness has been asked a question the
-            // screen did not let them answer.
-            //
-            // The label NAMES THE STEP, because the game-level readiness
-            // ("ready to start") is a different fact and the two must not
-            // read as one.
-            let step_verb = if self.step_declare_offered()
-                && self.scenario_audience() == ScenarioAudience::Commander
-            {
-                self.asking_step().map(|(scenario_id, step_id, you_ready)| {
-                    (
-                        scenario_id,
-                        step_id,
-                        if you_ready {
-                            "WITHDRAW"
-                        } else {
-                            "READY FOR THIS STEP"
-                        },
-                        !you_ready,
-                    )
-                })
-            } else {
-                None
-            };
-            let mut strip = div()
-                .absolute()
-                // UNDER THE BAND, at the band's own height: the band grows
-                // with the type, and a strip at a fixed height would ride
-                // over it.
-                .top(px(view::top_band_h()))
-                .left(px(0.0))
-                .right(px(0.0))
-                // The strip grows by the verb's own height: a pill clipped by
-                // the band that carries it is a control the operator cannot
-                // read, and the band is the only place the question is asked.
-                .h(px(if step_verb.is_some() { 28.0 } else { 22.0 }))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .px(px(10.0))
-                .overflow_hidden()
-                .bg(rgba(CONSOLE_NIGHT))
-                .id("step-reminder")
-                // The strip is over the map, so a wheel over it is a wheel
-                // over the console and not a zoom of the map.
-                .on_scroll_wheel(swallow_wheel)
-                .cursor_pointer()
-                .on_click(cx.listener(|view, _, _, cx| {
-                    view.open_board(cx);
-                }))
-                .child(
-                    div()
-                        .w(px(8.0))
-                        .h(px(8.0))
-                        .rounded(px(4.0))
-                        .bg(rgba(dot))
-                        .flex_shrink_0(),
-                )
-                .child(
-                    div()
-                        .font_family(view::FACE_HUMAN)
-                        .text_size(px(view::pt(view::DENSE_PT)))
-                        .text_color(rgba(MAP_INK))
-                        .child(rem.text),
-                );
-            if let Some((scenario_id, step_id, label, ready)) = step_verb {
-                strip = strip.child(
-                    div()
-                        .id("step-reminder-declare")
-                        .flex_shrink_0()
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            // The strip's own click opens the board; this one
-                            // answers the question, so the board does not
-                            // open under it.
-                            cx.stop_propagation();
-                            view.send_step_declare(scenario_id, step_id, ready, cx);
-                        }))
-                        .child(button(label, true, self.step_declare_busy, false)),
-                );
-            }
-            root = root.child(strip);
-        }
+        // NO STEP STRIP IN EXECUTION. The owner's direction: the strip
+        // under the band repeated what the scenario card already says, and
+        // the card carries the step's verb. The board is one press away for
+        // the plan itself. `step_reminder` stays as the value the card and
+        // the tests read; nothing draws a second bar.
         // THE ARMED PIN. One line, where the reminder rides, because it is
         // the same kind of thing: the console telling the operator what the
         // next click will do. It is clickable, and the click is the way out —
@@ -37315,7 +38157,7 @@ impl Render for IslandDemo {
         // NOT IN PLANNING: the phase's own grid carries the selected hull in
         // its UNIT panel, and a dock laid over that grid would cover two
         // panels of the plan to say what a panel already says.
-        if self.inspect_open && !self.planning_phase() {
+        if self.inspector_shown() {
             root = root.child(self.inspector(cx));
         }
         // The identity card, and the catcher that shuts it.
@@ -41730,7 +42572,7 @@ impl StepVerb {
         match self {
             StepVerb::Play => "PLAY",
             StepVerb::Skip => "SKIP",
-            StepVerb::End => "END",
+            StepVerb::End => "STOP",
             StepVerb::Replay => "REPLAY",
         }
     }
@@ -43261,6 +44103,8 @@ fn roster_sheet(
                     // details.
                     let picked = view.roster.get(i).map(|r| r.unit_id.clone());
                     view.selected_unit = picked.clone();
+                    view.embark_card = None;
+                    view.embark_card_closed = false;
                     view.inspect_open = true;
                     if let Some(id) = picked {
                         view.ask_about_unit(&id);
@@ -43396,6 +44240,29 @@ pub struct LiveMarker {
     /// type — the domain enum, which depends on nothing — so the shell names
     /// it without the store.
     pub affiliation: symbology::Affiliation,
+}
+
+/// One task group on the execution chart: the body, its centre, and the
+/// things directly under it.
+///
+/// The planning map builds the same star from a draft. In execution the
+/// organisation is read from the session instead — the groups the server
+/// holds, and the hulls placed beneath them — so the two maps agree about
+/// the shape and differ only about the source.
+#[derive(Clone, Debug)]
+pub struct LiveGroupNode {
+    pub group_id: i64,
+    pub name: String,
+    pub kind: crate::groups::GroupKind,
+    pub commander: String,
+    /// The mean of the placed hulls beneath the body, when any is placed.
+    pub anchor: Option<(f64, f64)>,
+    /// Hulls directly mustered into this body.
+    pub direct: Vec<(i64, String, (f64, f64))>,
+    /// Every hull in the subtree, with its ground.
+    pub hulls: Vec<(i64, String, (f64, f64))>,
+    /// Child bodies, by id.
+    pub children: Vec<i64>,
 }
 
 /// The live picture: one `LiveMarker` per tracked hull. The binary derives
@@ -53878,7 +54745,7 @@ mod tests {
     /// that means from the server rather than from the screen. The
     /// console's own verb on the current step is the declaration.
     #[gpui::test]
-    fn the_helm_is_silent_in_a_scenario_exercise(cx: &mut gpui::TestAppContext) {
+    fn the_helm_moves_in_a_scenario_exercise(cx: &mut gpui::TestAppContext) {
         let (tx, rx) = std::sync::mpsc::channel();
         let session = SessionView {
             execution: true,
@@ -53900,8 +54767,15 @@ mod tests {
             demo
         });
         let sent = cx.update(|_window, app| view.update(app, |demo, _| demo.send_helm()));
-        assert!(!sent, "a scenario exercise has no helm to send with");
-        assert!(rx.try_recv().is_err(), "nothing reached the sink");
+        assert!(sent, "a scenario exercise holds the order, but it takes it");
+        match rx.try_recv().expect("the order reached the sink") {
+            ToBinary::Helm(order) => {
+                assert_eq!(order.unit_id, "8");
+                assert_eq!(order.heading_deg, 90.0);
+                assert_eq!(order.speed_kn, 12.0);
+            }
+            other => panic!("expected a helm order, got {other:?}"),
+        }
     }
 
     /// And the helm is SILENT in a static exercise: the server refuses every
@@ -54010,9 +54884,7 @@ mod tests {
         for (mode, expected) in [
             (
                 crate::gamestate::GameMode::Scenario,
-                RailHelm::Sentence(crate::mode_rules::helm_sentence(
-                    crate::gamestate::GameMode::Scenario,
-                )),
+                RailHelm::Instruments,
             ),
             (
                 crate::gamestate::GameMode::Static,
@@ -54055,6 +54927,8 @@ mod tests {
             cx.add_window_view(|_, _| IslandDemo::new(fixture_roster(), 8, 0, session, tx));
         let rail = cx.update(|_window, app| view.read(app).rail_helm());
         assert_eq!(rail, RailHelm::Instruments, "a maneuver exercise steers");
+        // And so does a scenario exercise: the order is held until the step
+        // plays, and READY on the step card is the commit.
     }
 
     /// The step's DECLARATION is a scenario exercise's verb, and it is
@@ -54187,19 +55061,17 @@ mod tests {
         }
     }
 
-    /// The SCENARIO WIDGET is absent outside a scenario exercise.
-    ///
-    /// ADR-0021: a widget that says "no steps" over an exercise that was
-    /// never going to have any reads as a broken surface rather than as an
-    /// absence. The rail's widgets are a value, so the set is read here
-    /// rather than inferred from a rendered frame.
+    /// THE SCENARIO IS NOT A RAIL WIDGET. The owner's direction moved it
+    /// into the map's body, so the rail carries the room and the traffic in
+    /// every mode; the scenario card is a separate surface and is absent
+    /// outside a scenario exercise.
     #[gpui::test]
-    fn the_scenario_widget_is_absent_outside_a_scenario_exercise(cx: &mut gpui::TestAppContext) {
-        for (mode, present) in [
-            (crate::gamestate::GameMode::Scenario, true),
-            (crate::gamestate::GameMode::Maneuver, false),
-            (crate::gamestate::GameMode::Static, false),
-            (crate::gamestate::GameMode::Unknown, false),
+    fn the_scenario_is_a_body_card_not_a_rail_widget(cx: &mut gpui::TestAppContext) {
+        for mode in [
+            crate::gamestate::GameMode::Scenario,
+            crate::gamestate::GameMode::Maneuver,
+            crate::gamestate::GameMode::Static,
+            crate::gamestate::GameMode::Unknown,
         ] {
             let (tx, _rx) = std::sync::mpsc::channel();
             let session = SessionView {
@@ -54213,12 +55085,11 @@ mod tests {
             let (view, cx) =
                 cx.add_window_view(|_, _| IslandDemo::new(fixture_roster(), 8, 0, session, tx));
             let widgets = cx.update(|_window, app| view.read(app).execution_widget_set());
-            let drawn = widgets.iter().any(|w| w.id == "widget-scenario");
-            assert_eq!(drawn, present, "{mode:?} drew the wrong widgets");
-            // The others are always there. The account is NOT one of them:
-            // the identity is in the top band's right, so the rail is the
-            // room and the traffic, and nothing else.
-            assert_eq!(widgets.len(), if present { 3 } else { 2 }, "{mode:?}");
+            assert!(
+                !widgets.iter().any(|w| w.id == "widget-scenario"),
+                "{mode:?} still has the scenario on the rail"
+            );
+            assert_eq!(widgets.len(), 2, "{mode:?}: players and comms");
         }
     }
 
@@ -56958,6 +57829,239 @@ mod tests {
         demo.session.pieces[0].hierarchy_node = None;
         let rows = demo.dashboard_identity();
         assert_eq!(identity_value(&rows, "group"), "not in a group");
+    }
+
+    /// A PARTICIPANT MAY NOT READ THE TREE, AND THE PIECE ROW STILL KNOWS
+    /// WHERE THE HULL SITS. The old fallback called that "not in a group",
+    /// which was a claim made from a refused read; the node id is published
+    /// by the join, so the row says "in a task group".
+    #[test]
+    fn the_commanders_identity_reads_the_piece_row_when_the_tree_is_unread() {
+        let content = crate::backend::RegisterContent {
+            unit_id: 7,
+            unit_name: "NH90 N-110".to_string(),
+            hull_number: "N-110".to_string(),
+            in_game: true,
+            host: Some(3),
+            host_name: "KRI Makassar".to_string(),
+        };
+        let session = SessionView {
+            me: 34,
+            mine: vec![MyShip {
+                id: "3".to_string(),
+                label: "KRI Makassar (590)".to_string(),
+            }],
+            pieces: vec![PieceView {
+                id: 3,
+                label: "KRI Makassar (590)".to_string(),
+                commander_id: Some(34),
+                hierarchy_node: Some(18),
+                register_contents: vec![content],
+                ..PieceView::default()
+            }],
+            ..SessionView::default()
+        };
+        let demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        let rows = demo.dashboard_identity();
+        assert_eq!(
+            identity_value(&rows, "group"),
+            "in a task group",
+            "a node with no readable name is not an absent node"
+        );
+        assert_eq!(
+            identity_value(&rows, "embark"),
+            "carrying NH90 N-110",
+            "the register copy names the piece the exercise already holds"
+        );
+    }
+
+    /// THE EMBARK CARD reads the same two sources in the same order: the
+    /// exercise's contents when it landed, else the piece row's register copy
+    /// split into what is here and what a deployment would bring.
+    #[test]
+    fn the_embark_card_falls_back_to_the_register_copy() {
+        let session = SessionView {
+            execution: true,
+            my_role: "Penyelenggara".to_string(),
+            pieces: vec![PieceView {
+                id: 3,
+                label: "KRI Makassar (590)".to_string(),
+                register_contents: vec![
+                    crate::backend::RegisterContent {
+                        unit_id: 7,
+                        unit_name: "NH90 N-110".to_string(),
+                        hull_number: "N-110".to_string(),
+                        in_game: true,
+                        host: Some(3),
+                        host_name: "KRI Makassar".to_string(),
+                    },
+                    crate::backend::RegisterContent {
+                        unit_id: 8,
+                        unit_name: "LCU 2".to_string(),
+                        hull_number: "LCU-2".to_string(),
+                        in_game: false,
+                        host: Some(3),
+                        host_name: "KRI Makassar".to_string(),
+                    },
+                ],
+                ..PieceView::default()
+            }],
+            ..SessionView::default()
+        };
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        demo.selected_unit = Some("3".to_string());
+        let (carried, brings) = demo.embark_contents(3);
+        assert_eq!(carried.len(), 1, "one piece is already in the exercise");
+        assert_eq!(carried[0].0, "NH90 N-110");
+        assert_eq!(brings.len(), 1, "one would arrive with a deployment");
+        assert_eq!(brings[0].0, "LCU 2");
+        assert_eq!(
+            demo.embark_card_host(),
+            Some(3),
+            "the Game Master's card follows the hull they pointed at"
+        );
+    }
+
+    /// The execution chart's stard is the SESSION's tree and the placed
+    /// hulls: one centre per body, lines to what it musters directly and to
+    /// each child body.
+    #[test]
+    fn the_group_star_is_built_from_the_sessions_own_tree() {
+        let session = SessionView {
+            execution: true,
+            groups: vec![
+                crate::groups::LiveGroup {
+                    group_id: 18,
+                    name: "GUGUS 3".to_string(),
+                    kind: crate::groups::GroupKind::Gugus,
+                    parent: None,
+                    commander_id: Some(22),
+                    units: Vec::new(),
+                },
+                crate::groups::LiveGroup {
+                    group_id: 20,
+                    name: "SATUAN TUGAS 1".to_string(),
+                    kind: crate::groups::GroupKind::SatuanTugas,
+                    parent: Some(18),
+                    commander_id: Some(6),
+                    units: Vec::new(),
+                },
+            ],
+            pieces: vec![
+                PieceView {
+                    id: 3,
+                    label: "KRI Alpha (1)".to_string(),
+                    hierarchy_node: Some(20),
+                    start: Some((-6.10, 106.80)),
+                    ..PieceView::default()
+                },
+                PieceView {
+                    id: 4,
+                    label: "KRI Beta (2)".to_string(),
+                    hierarchy_node: Some(20),
+                    start: Some((-6.20, 106.90)),
+                    ..PieceView::default()
+                },
+                PieceView {
+                    id: 5,
+                    label: "KRI Gamma (3)".to_string(),
+                    hierarchy_node: Some(18),
+                    start: Some((-6.30, 107.00)),
+                    ..PieceView::default()
+                },
+            ],
+            ..SessionView::default()
+        };
+        let demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        let nodes = demo.live_group_nodes();
+        let root = nodes.iter().find(|node| node.group_id == 18).expect("root");
+        assert_eq!(root.children, vec![20], "the child body is named");
+        assert_eq!(root.hulls.len(), 3, "every hull under the body has ground");
+        assert_eq!(root.direct.len(), 1, "only Gamma is mustered directly");
+        assert!(root.anchor.is_some(), "a placed body has a centre");
+        let child = nodes.iter().find(|node| node.group_id == 20).expect("child");
+        assert_eq!(child.direct.len(), 2, "both hulls are directly under it");
+        let links = demo.live_group_links(&nodes);
+        assert!(
+            links.len() >= 3,
+            "the root's hull and child, and the child's two hulls"
+        );
+    }
+
+    /// A SCENARIO'S READY IS THE COMMIT: the helm goes first, then the
+    /// declaration for the step. A commander who set nothing still declares.
+    #[gpui::test]
+    fn ready_on_the_scenario_card_posts_the_helm_then_declares(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            state: "execution".to_string(),
+            my_role: "Commando".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Scenario,
+                ..GameFacts::default()
+            },
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Test (KRI-1)".to_string(),
+            }],
+            step: Some(StepView {
+                assumed_time: String::new(),
+                playing: None,
+                asking: Some(StepAsk {
+                    scenario_id: 4,
+                    step_id: 8,
+                    scenario: "First light".to_string(),
+                    content: "Take station".to_string(),
+                    required: 1,
+                    outstanding: 1,
+                    you_ready: false,
+                }),
+            }),
+            ..SessionView::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = IslandDemo::new(fixture_roster(), 8, 0, session, tx);
+            demo.helm_heading = Some(90.0);
+            demo.helm_speed = Some(12.0);
+            demo
+        });
+        let sent = cx.update(|_window, app| {
+            view.update(app, |demo, cx| demo.send_helm_and_ready(4, 8, cx))
+        });
+        assert!(sent, "the press reaches both writes");
+        match rx.try_recv().expect("the helm went first") {
+            ToBinary::Helm(order) => assert_eq!(order.unit_id, "8"),
+            other => panic!("expected a helm order, got {other:?}"),
+        }
+        match rx.try_recv().expect("the declaration follows") {
+            ToBinary::DeclareStep {
+                scenario_id,
+                step_id,
+                ready,
+            } => {
+                assert_eq!((scenario_id, step_id, ready), (4, 8, true));
+            }
+            other => panic!("expected a step declaration, got {other:?}"),
+        }
     }
 
     /// The order's answer is cut to the room the rail has, and never
