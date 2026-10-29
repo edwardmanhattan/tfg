@@ -3,6 +3,8 @@
 //! - [`PollSource`]: one poll round -> the fixes seen this round.
 //! - [`replay`]: dev fixture replay ([`FileReplay`]) and the serve clock.
 //! - [`auth`]: login, refresh, gate probe, keyring.
+//! - [`session`]: the access token's lifetime, kept alive by rotating the
+//!   refresh chain before it is refused.
 //! - [`master`]: master-data reads, session-users rows, hull specs.
 //! - [`feed`]: snapshot REST, publication shapes.
 //! - [`live`]: socket actor, bridge, refusal policy.
@@ -19,8 +21,11 @@ mod live;
 mod master;
 mod press;
 mod replay;
+mod session;
 
 pub use error::BackendError;
+
+pub use session::{TokenEvent, TokenKeeper};
 
 pub use auth::{
     AppRole, AuthenticatedUser, MinosAuth, TokenPair, keyring_clear, keyring_load, keyring_save,
