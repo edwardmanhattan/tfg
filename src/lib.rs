@@ -78,7 +78,6 @@
 //! Module list is alphabetical after `assets`.
 
 pub mod advance;
-pub mod arrival;
 pub mod assets;
 pub mod backend;
 pub mod book;

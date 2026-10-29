@@ -1298,9 +1298,14 @@ struct IslandDemo {
     /// A SEAT in the air (`§8.3`): the row stays in its list until the drop,
     /// and the scope is set by what it lands on.
     flow_seat_carry: Option<SeatCarry>,
-    /// WHERE THE PRESS LEFT THE DRAFT (`§10`). Present once a press has
-    /// succeeded, and the surface then draws the arrival instead of the rail.
-    flow_arrival: Option<crate::arrival::Arrival>,
+    /// THE PRESS THAT LANDED (`§10`), as a CONFIRMATION rather than a screen.
+    ///
+    /// A save used to hand the operator an entire page reporting what they had
+    /// just done — force placed, steps written, what opens next — and then a
+    /// door back to a console that no longer exists. The record is the record;
+    /// what a person needs at that moment is one line saying it landed and one
+    /// verb taking them where they work next.
+    saved: Option<SavedNote>,
     /// MAP MODE (`§5.6`): the map takes the window and the draft's pins are the
     /// controls. `flow_selected_hull` is ONE AT A TIME, and the window size is
     /// what the pins are positioned in.
@@ -1349,8 +1354,6 @@ struct IslandDemo {
     /// row of buttons: the role vocabulary is the game's and can be long.
     flow_role_open: Option<i64>,
     map_window: (f32, f32),
-    /// The gate's strip, for the one arrival that has one.
-    flow_gate: Option<crate::arrival::Gate>,
     /// The flow surface's own focus handle, so `Esc` reaches it: a peel is
     /// cancelled with the keyboard while the pointer is out over the map.
     flow_focus: Option<gpui::FocusHandle>,
@@ -4362,7 +4365,8 @@ impl IslandDemo {
                 | Some(crate::fixtures::Fixture::StageThree(_))
                 | Some(crate::fixtures::Fixture::StageFour(_))
                 | Some(crate::fixtures::Fixture::StageFive(_))
-                | Some(crate::fixtures::Fixture::Review(_)) => {
+                | Some(crate::fixtures::Fixture::Review(_))
+                | Some(crate::fixtures::Fixture::Saved(_)) => {
                     crate::fixtures::landing_nothing_chosen()
                 }
                 _ => {
@@ -4377,13 +4381,16 @@ impl IslandDemo {
                 | Some(crate::fixtures::Fixture::StageThree(draft))
                 | Some(crate::fixtures::Fixture::StageFour(draft))
                 | Some(crate::fixtures::Fixture::StageFive(draft)) => Some(*draft),
-                Some(crate::fixtures::Fixture::Review(draft)) => Some(*draft),
+                Some(crate::fixtures::Fixture::Review(draft))
+                | Some(crate::fixtures::Fixture::Saved(draft)) => Some(*draft),
                 _ => None,
             },
             flow_offset: crate::backend::local_offset(),
             flow_stage: match crate::fixtures::flow_frame() {
                 // F7 IS THE REVIEW FRAME: it opens on stage 06.
-                Some(crate::fixtures::Frame::F7) => crate::draft::Stage::Review,
+                Some(crate::fixtures::Frame::F7) | Some(crate::fixtures::Frame::F8) => {
+                    crate::draft::Stage::Review
+                }
                 // F3a–F3e open on stage 02, the register.
                 Some(crate::fixtures::Frame::F3a)
                 | Some(crate::fixtures::Frame::F3b)
@@ -4499,12 +4506,13 @@ impl IslandDemo {
             flow_basket_press: None,
             flow_basket_dragging: false,
             flow_role_open: None,
-            flow_arrival: match crate::fixtures::flow_frame() {
-                Some(crate::fixtures::Frame::F8) => crate::fixtures::arrival(),
-                _ => None,
-            },
-            flow_gate: match crate::fixtures::flow_frame() {
-                Some(crate::fixtures::Frame::F8) => crate::fixtures::arrival_gate(),
+            // F8 seeds the confirmation card over the review stage, so a
+            // capture of the landing is the card and not a page about it.
+            saved: match crate::fixtures::flow_frame() {
+                Some(crate::fixtures::Frame::F8) => Some(SavedNote {
+                    verb: crate::draft::Verb::PlayDirectly,
+                    game_id: Some(86),
+                }),
                 _ => None,
             },
             flow_peel: match crate::fixtures::flow_frame() {
@@ -6401,921 +6409,13 @@ impl IslandDemo {
     // and the plan is drawn on it.
     // -----------------------------------------------------------------------
 
-    /// Is the pointer over one of the planning grid's panels?
-    ///
-    /// The grid covers the map, so the map has to know when a gesture
-    /// belongs to a panel instead: a press that lands on a panel is the
-    /// panel's, or the operator would pan the chart with every click on a
-    /// verb.
-    ///
-    /// The ARMED case is the exception, and it is the whole point: a hull
-    /// waiting to be placed is placed by clicking the map, and the map is
-    /// under the panels — the operator can see the water through them, and
-    /// they mean that water.
-    fn over_grid_panel(&self, at: (f32, f32), window: &Window) -> bool {
-        if !self.grid_visible() {
-            return false;
-        }
-        let cells = view::planning_grid(viewport(window));
-        cells.iter().any(|r| box_contains(*r, at.0, at.1))
-    }
-
     /// Is the exercise in PLANNING?
     ///
     /// The phase is a fact about the session, read from the server's own
-    /// word for it, and the LAYOUT follows the phase: planning is the grid,
-    /// every other phase is the column.
+    /// word for it, and the LAYOUT follows the phase: planning is the
+    /// COMPOSER (its own surface), every other phase is the console.
     fn planning_phase(&self) -> bool {
         self.phase() == crate::gamestate::GameState::Planning
-    }
-
-    /// Does this frame draw the planning grid?
-    ///
-    /// ONE ANSWER, read by the render and by the map's own gesture guard, so
-    /// the two cannot disagree about whether the cards are on the water.
-    ///
-    /// A HULL IN THE AIR CLEARS THEM. A drag out of the fleet picker is a
-    /// drop on the WATER, and the water is under all six cards: with the grid
-    /// drawn, every point of the chart a hull could be aimed at belonged to a
-    /// card, and the operator could only drop on the strip the cards did not
-    /// cover. The cards stand aside for the gesture and come back on release
-    /// — the same rule the picker follows, which is why this reads the same
-    /// flag.
-    fn grid_visible(&self) -> bool {
-        self.planning_phase() && !self.dragging
-    }
-
-    /// THE GRID: six panels, over the map.
-    ///
-    /// The cells are the kernel's (`view::planning_grid`), so the layout
-    /// the operator sees and the layout the kernel reasons about are one
-    /// arrangement and not two.
-    fn planning_grid_el(&mut self, cx: &mut Context<Self>, viewport: view::Box) -> AnyElement {
-        let cells = view::planning_grid(viewport);
-        let mut root = div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .right(px(0.0))
-            .bottom(px(0.0));
-        for (i, panel) in view::GridPanel::ALL.iter().enumerate() {
-            let rect = cells[i];
-            let body = match panel {
-                view::GridPanel::Essentials => self.planning_essentials_body(cx, view::box_w(rect)),
-                view::GridPanel::Exercise => self.planning_exercise_body(cx, view::box_w(rect)),
-                view::GridPanel::Players => self.planning_players_body(cx, view::box_w(rect)),
-                view::GridPanel::Fleet => self.planning_fleet_body(cx, view::box_w(rect)),
-                view::GridPanel::Unit => self.planning_unit_body(cx, view::box_w(rect)),
-                view::GridPanel::Groups => self.groups_body(cx, view::box_w(rect), view::GRID_PAD),
-            };
-            root = root.child(self.floating_panel(*panel, rect, body));
-        }
-        root.into_any_element()
-    }
-
-    /// ONE FLOATING PANEL — a CARD, not a cut in the water.
-    ///
-    /// The console's grammar (flat, one 1px edge, a tracked caps title band
-    /// on Panel Slate over a body on Console Night) with the one change the
-    /// card shape needs: ROUNDED corners, a margin all round it, and 240-of-255
-    /// transparency so the map is under the plan.
-    ///
-    /// FIVE PANELS CARRY A BAND AND ONE DOES NOT (`GridPanel::has_title`).
-    /// The EXERCISE card's body opens with the console's wordmark, which is
-    /// already the name of the surface: a band above it saying EXERCISE would
-    /// be a second heading over the loudest thing in the cell.
-    ///
-    /// The card's own edge and its inner band rule sit UNDER the content, on
-    /// the panel's outer bounds, so they paint where nothing else does.
-    fn floating_panel(
-        &mut self,
-        panel: view::GridPanel,
-        cell: view::Box,
-        body: AnyElement,
-    ) -> AnyElement {
-        // THE CELL IS CORNERS AND THE CARD IS ORIGIN AND SIZE. Destructuring
-        // the box as `(x, y, w, h)` type-checks and draws every card as wide
-        // as its own right edge — six cards overlapping into one field with
-        // seams in it, which is exactly how this shipped for a day.
-        let (x, y, w, h) = view::box_rect(cell);
-        let mut card = div()
-            .absolute()
-            .left(px(x))
-            .top(px(y))
-            .w(px(w))
-            .h(px(h))
-            .rounded(px(view::GRID_CARD_RADIUS))
-            .bg(rgba(CONSOLE_NIGHT.with_alpha(view::GRID_CARD_ALPHA)))
-            .border(px(1.0))
-            .border_color(rgba(CUT_GREY));
-        let mut column = div().flex().flex_col().size_full().overflow_hidden();
-        if panel.has_title() {
-            // THE BAND IS ROUNDED AT ITS TOP CORNERS, and the radius is the
-            // card's less the card's 1px edge, so the two arcs are
-            // concentric.
-            //
-            // It is not decoration: GPUI 0.2.2's overflow clip is a
-            // RECTANGLE (`Style::overflow_mask` returns a `ContentMask` of
-            // four edges), so a child that paints a background squares off
-            // the rounded card it lives in. The band is the only child that
-            // reaches the card's edge, so it is the only one that has to
-            // carry the rounding — without this, every card grew a small
-            // square "ear" of band colour at its top corners, over the map.
-            let inner = (view::GRID_CARD_RADIUS - view::PANEL_EDGE).max(0.0);
-            column = column.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .h(px(view::title_h()))
-                    .pl(px(view::GRID_PAD))
-                    .pr(px(view::GRID_PAD))
-                    .bg(rgba(PANEL_SLATE.with_alpha(view::GRID_CARD_ALPHA)))
-                    .rounded_tl(px(inner))
-                    .rounded_tr(px(inner))
-                    .border_b(px(view::PANEL_BAND_RULE))
-                    .border_color(rgba(HAIRLINE_SLATE))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .child(panel_title(panel.title(), MAP_INK)),
-                    ),
-            );
-        }
-        card = card.child(
-            column.child(
-                div()
-                    .id(("planning-scroll", panel as usize))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    // A wheel over the panel is the PANEL's. The map's surface is
-                    // a full-window hitbox under every one of these panels, and
-                    // without something here stopping the propagation a wheel
-                    // over a planning panel would zoom the chart.
-                    .on_scroll_wheel(swallow_wheel)
-                    // THE CAPTURE SEED, on the first card only: the seed exists
-                    // to photograph what a card holds below its fold, and six
-                    // cards scrolled at once is a picture of six half-forms.
-                    .child(
-                        if self.card_scroll > 0.0 && panel == view::GridPanel::Essentials {
-                            div()
-                                .mt(px(-self.card_scroll))
-                                .child(body)
-                                .into_any_element()
-                        } else {
-                            body
-                        },
-                    ),
-            ),
-        );
-        card.into_any_element()
-    }
-
-    /// THE BODY COLUMN OF A PLANNING CARD.
-    ///
-    /// One inset, one gap and one width for the six cards, because six copies
-    /// of the same three numbers are six chances for one card to be inset
-    /// differently from its neighbour on the same row.
-    ///
-    /// THE WIDTH IS STATED rather than inherited. A body inside a scroll
-    /// container has no width of its own: it is as wide as its widest line,
-    /// and a long line is as wide as the line is long — so it runs off the
-    /// card's edge and takes the rows beside it with it. A definite width is
-    /// what makes the text WRAP, and a wrapped line is what makes a narrow
-    /// cell readable.
-    fn grid_body(&self, cell_w: f32) -> gpui::Div {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(view::PANEL_GAP))
-            .p(px(view::GRID_PAD))
-            .w(px((cell_w - 2.0 * view::GRID_PAD).max(120.0)))
-            .min_w_0()
-    }
-
-    /// CARD 1 — THE ESSENTIALS: THE SESSION'S TERMS, AS A FORM.
-    ///
-    /// The same questions the creation wizard asks, asked again of the
-    /// session that now exists: what the exercise is called, how much
-    /// ceremony it carries, what the Game Master wrote about it, and when it
-    /// runs. A typo made at the door is fixed HERE, by the operator who is
-    /// looking at the plan it appears in — the phase used to print the plan
-    /// and end there.
-    ///
-    /// WHAT IS WRITTEN AND WHAT IS READ. The name, the pace, the three prose
-    /// fields and the planned window are ONE partial edit, written by Apply
-    /// (`ToBinary::SaveTerms`); the wizard's form is the same form, because
-    /// it asks the same questions of the same session. The MODE is fixed at
-    /// creation and the card says so rather than offering a choice Minos
-    /// would refuse.
-    ///
-    /// THE ROOM KEY, THE MULTIPLIER AND THE BOOK live here because there is
-    /// nowhere else for them: the grid is six cards, and this is the card
-    /// that carries the exercise's terms in the widest sense.
-    fn planning_essentials_body(&mut self, cx: &mut Context<Self>, cell_w: f32) -> AnyElement {
-        let small = |t: String| {
-            div()
-                .font_family(view::FACE_HUMAN)
-                .text_size(px(view::pt(view::DENSE_PT)))
-                .text_color(rgba(BODY_SILVER))
-                .child(t)
-        };
-        let mut col = self.grid_body(cell_w);
-        if self.session.game_id == 0 {
-            return col
-                .child(small("No session held.".into()))
-                .into_any_element();
-        }
-        if !self.session.facts.read {
-            return col
-                .child(small(
-                    "This account cannot read the session's terms \u{2014} ask its Game Master."
-                        .into(),
-                ))
-                .into_any_element();
-        }
-        // THE FORM. The wizard's order: what the exercise IS, how much
-        // ceremony it carries, and what was written about it.
-        col = col.child(section("THE TERMS"));
-        col = col.child(self.terms_row(0, "name", cx));
-        if !self.terms_draft().name_ok() {
-            col = col.child(small(
-                "Name is required \u{2014} the server refuses a nameless session.".to_string(),
-            ));
-        }
-        // THE MODE IS THE ONE FIELD THE CARD MAY NOT OFFER. Minos fixes it
-        // at creation, so it is stated as a fact and not drawn as a choice
-        // the server would refuse — the same reason the wizard's mode row is
-        // on the create step and nowhere else.
-        col = col.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_baseline()
-                .justify_between()
-                .gap(px(10.0))
-                .child(tracked("mode", view::LABEL_PT, CUT_GREY))
-                .child(
-                    div()
-                        .font_family(view::FACE_MACHINE)
-                        .text_size(px(view::pt(view::DENSE_PT)))
-                        .text_color(rgba(MAP_INK))
-                        .child(self.mode().wire().unwrap_or("no mode").to_string()),
-                ),
-        );
-        col = col.child(small(
-            "fixed at creation \u{2014} Minos refuses a change of mode".to_string(),
-        ));
-        // THE PACE: two radios and the sentence that says what the chosen
-        // one buys.
-        col = col.child(tracked("pace", view::LABEL_PT, CUT_GREY));
-        let picked = self.terms_draft().pace.clone();
-        let mut paces = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .flex_wrap()
-            .gap(px(12.0));
-        for (i, (pace, _)) in SESSION_PACES.iter().enumerate() {
-            let this = pace.to_string();
-            paces = paces.child(
-                div()
-                    .id(("terms-pace", i))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        let mut draft = view.terms_draft();
-                        draft.pace = this.clone();
-                        view.terms_draft = Some(draft);
-                        view.terms_status.clear();
-                        cx.notify();
-                    }))
-                    .child(radio(picked == *pace, *pace)),
-            );
-        }
-        col = col.child(paces);
-        col = col.child(small(
-            SESSION_PACES
-                .iter()
-                .find(|(p, _)| *p == picked)
-                .map(|(_, why)| (*why).to_string())
-                .unwrap_or_else(|| {
-                    "this build does not know the pace the server states".to_string()
-                }),
-        ));
-        // THE PROSE, labelled the way the wizard labels it.
-        col = col.child(self.terms_row(1, "description", cx));
-        col = col.child(self.terms_row(2, "purpose", cx));
-        col = col.child(self.terms_row(3, "target", cx));
-        // THE VERB. One write for the whole form, refused when nothing
-        // changed — a button that posted a no-op would ask the server to
-        // decide a question nobody asked.
-        let dirty = self.terms_dirty();
-        col = col.child(
-            div()
-                .id("terms-apply")
-                .cursor_pointer()
-                .on_click(cx.listener(|view, _, _, cx| {
-                    view.send_terms(cx);
-                }))
-                .child(button(
-                    "Apply terms".to_string(),
-                    false,
-                    !dirty || self.terms_busy,
-                    false,
-                )),
-        );
-        if !self.terms_status.is_empty() {
-            col = col.child(status_line(&self.terms_status));
-        }
-        // THE PLANNED WINDOW: when the exercise runs, on the wall clock and
-        // on the exercise clock.
-        //
-        // EVERY FIELD CARRIES ITS OWN PICKER, because a date and a time are
-        // the two things this console already knows how to choose and the
-        // only two it was still asking people to type. The rows are the
-        // wizard's: a labelled field with the picker's trigger on the far
-        // side of a hairline, so the window looks the same wherever it is
-        // edited.
-        col = col.child(section("PLANNED WINDOW"));
-        col = col.child(small(
-            "when the exercise runs \u{2014} the real clock is the wall clock, the exercise \
-             clock is the one the exercise itself runs on"
-                .to_string(),
-        ));
-        for (target, label, idx, hint) in [
-            (WizardField::RealDay, "real day", 0, "2026-11-01"),
-            (WizardField::RealStart, "real start", 1, "0800"),
-            (WizardField::RealEnd, "real end", 2, "1600"),
-            (WizardField::ExerciseStart, "exercise start", 3, "0800"),
-            (WizardField::ExerciseEnd, "exercise end", 4, "1600"),
-        ] {
-            let field = self.window_field(idx, hint, cx);
-            col = col.child(self.picker_row_el(PickerTarget::Planned(target), label, field, cx));
-        }
-        if !self.window_status.is_empty() {
-            col = col.child(status_line(&self.window_status));
-        }
-        col = col.child(small(
-            "written with Apply above \u{2014} a seat without the administrator's ticket cannot \
-             write them"
-                .to_string(),
-        ));
-        // THE ROOM KEY: the one figure on this console a person reads aloud
-        // and retypes, so it is set in the machine face — `l` against `1` in
-        // a key a voice says aloud costs a session.
-        col = col.child(section("ROOM KEY"));
-        let key = self.session.facts.room_key.clone();
-        if key.is_empty() {
-            col = col.child(small(
-                "no room key on this session \u{2014} ask its Game Master.".to_string(),
-            ));
-        } else {
-            col = col.child(
-                div()
-                    .font_family(view::FACE_MACHINE)
-                    .text_size(px(view::pt(view::BODY_PT)))
-                    .text_color(rgba(MAP_INK))
-                    .child(key),
-            );
-            col = col.child(small(
-                "share this with your personnel \u{2014} they enter it to join the room."
-                    .to_string(),
-            ));
-        }
-        // THE CLOCK. The multiplier that runs the exercise — the Control
-        // island's content, in the card that owns the exercise's terms.
-        let read = self.session.facts.time_factor;
-        if self.factor_draft.is_none() {
-            self.factor_draft = Some(read);
-        }
-        let draft = self.factor_draft.unwrap_or(read);
-        col = col.child(section("GAME TIME MULTIPLIER"));
-        col = col.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .child(
-                    div()
-                        .id("factor-down")
-                        .cursor_pointer()
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.nudge_factor(-1.0);
-                            cx.notify();
-                        }))
-                        .child(button("\u{2212}", true, draft <= FACTOR_MIN, false)),
-                )
-                .child(
-                    div()
-                        .w(px(64.0))
-                        .font_family(view::FACE_MACHINE)
-                        .text_size(px(view::pt(view::DENSE_PT)))
-                        .text_color(rgba(MAP_INK))
-                        .child(format!("{draft:.0}\u{00d7}")),
-                )
-                .child(
-                    div()
-                        .id("factor-up")
-                        .cursor_pointer()
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.nudge_factor(1.0);
-                            cx.notify();
-                        }))
-                        .child(button("+", true, draft >= FACTOR_MAX, false)),
-                ),
-        );
-        let factor_dirty = (draft - read).abs() > f32::EPSILON as f64;
-        col = col.child(
-            div()
-                .id("factor-apply")
-                .cursor_pointer()
-                .on_click(cx.listener(|view, _, _, cx| {
-                    view.send_factor(cx);
-                }))
-                .child(button("Apply", false, !factor_dirty, false)),
-        );
-        if !self.factor_status.is_empty() {
-            col = col.child(status_line(&self.factor_status));
-        }
-        // THE BOOK, in a scenario exercise.
-        //
-        // The scenario is the exercise's spine: the steps are what will be
-        // played, and the operator planning a scenario exercise is planning
-        // a BOOK. So the book is named here, its steps are listed here, and
-        // the door to the composer is here too — the composer is where the
-        // book is WRITTEN, and a planning surface that names the book
-        // without offering the pen is a read-only plan.
-        if self.scenario_exercise() {
-            col = col.child(section("THE BOOK"));
-            let scenarios = self.session.book.len();
-            let steps: usize = self.session.book.iter().map(|s| s.steps.len()).sum();
-            if scenarios == 0 {
-                col = col.child(small("No scenarios yet.".to_string()));
-            }
-            for sc in self.session.book.iter().take(6) {
-                col = col.child(
-                    div()
-                        .font_family(view::FACE_HUMAN)
-                        .text_size(px(view::pt(view::DENSE_PT)))
-                        .text_color(rgba(MAP_INK))
-                        .child(sc.title.clone()),
-                );
-                if sc.steps.is_empty() {
-                    col = col.child(small("no steps yet".to_string()));
-                }
-                for (i, step) in sc.steps.iter().take(6).enumerate() {
-                    col = col.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_baseline()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(view::pt(view::LABEL_PT)))
-                                    .text_color(rgba(CUT_GREY))
-                                    .child(format!("{}.", i + 1)),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .font_family(view::FACE_HUMAN)
-                                    .text_size(px(view::pt(view::DENSE_PT)))
-                                    .text_color(rgba(BODY_SILVER))
-                                    .child(step.content.clone()),
-                            ),
-                    );
-                }
-            }
-            col = col.child(
-                div()
-                    .id("scenario-composer-door")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.open_only(WhichPanel::Book);
-                        cx.notify();
-                    }))
-                    .child(button("Scenario composer".to_string(), false, false, false)),
-            );
-            col = col.child(small(format!(
-                "{}, {}.",
-                plural(scenarios, "scenario"),
-                plural(steps, "step")
-            )));
-        }
-        // STAGED WRITES: the one exception to local-first planning. The
-        // write-through WITHOUT moving the phase lives here because the
-        // EXERCISE card carries the phase and the verb that ends it, and
-        // this is the same flush minus the transition.
-        col = col.child(section("STAGED WRITES"));
-        col = col.child(
-            div()
-                .id("sync-staged")
-                .cursor_pointer()
-                .on_click(cx.listener(|view, _, _, cx| {
-                    view.sync_staged(cx);
-                }))
-                .child(button(
-                    "Sync staged writes".to_string(),
-                    false,
-                    self.sync_busy,
-                    false,
-                )),
-        );
-        col = col.child(small(
-            "writes the staged force, roster, groups and book to the server \u{2014} the phase \
-             does not move"
-                .to_string(),
-        ));
-        if !self.sync_status.is_empty() {
-            col = col.child(status_line(&self.sync_status));
-        }
-        col.into_any_element()
-    }
-
-    /// CARD 2 — THE EXERCISE: THE MARK, THE KIND, THE PHASE, THE VERB.
-    ///
-    /// FOUR THINGS AND NOTHING ELSE, and that is the owner's direction: the
-    /// terms, the seats, the force and the book each have a card of their
-    /// own, so this one says only where the exercise is and what ends the
-    /// phase.
-    ///
-    /// IT IS THE ONE CARD WITH NO TITLE BAND (`GridPanel::has_title`),
-    /// because it opens with the console's wordmark: ARCONS is already the
-    /// name of the surface, and a band above it saying EXERCISE would be a
-    /// second heading over the loudest thing in the cell.
-    ///
-    /// THE PHASE IS EMPHASISED in the title tier's tracked caps, because it
-    /// is the question this card answers at a glance, and the verb beneath it
-    /// is the consequence of the answer.
-    fn planning_exercise_body(&mut self, cx: &mut Context<Self>, cell_w: f32) -> AnyElement {
-        let small = |t: String| {
-            div()
-                .font_family(view::FACE_HUMAN)
-                .text_size(px(view::pt(view::DENSE_PT)))
-                .text_color(rgba(BODY_SILVER))
-                .child(t)
-        };
-        let mut col = self.grid_body(cell_w);
-        if self.session.game_id == 0 {
-            return col
-                .child(small("No session held.".into()))
-                .into_any_element();
-        }
-        col = col.child(wordmark(MAP_INK));
-        col = col.child(
-            div()
-                .font_family(view::FACE_HUMAN)
-                .text_size(px(view::pt(view::BODY_PT)))
-                .text_color(rgba(MAP_INK))
-                .child("Tactical Floor Game"),
-        );
-        col = col.child(separator());
-        // THE PHASE. Read from the session and never from a literal: the grid
-        // is drawn only while planning, and a card that hard-coded the word
-        // would go on saying PLANNING on the frame the exercise moved.
-        let phase = crate::gamestate::GameState::from_wire(&self.session.state).label();
-        col = col.child(div().pt(px(2.0)).pb(px(2.0)).child(tracked_weight(
-            format!("{phase} PHASE").as_str(),
-            view::TITLE_PT,
-            MAP_INK,
-            FontWeight::BOLD,
-        )));
-        // FINISH PLANNING: the staged force and roster are written through
-        // whole here and the game moves to preparation — the one control that
-        // turns a planning draft into a record.
-        let counts = self.staged_counts();
-        col = col.child(
-            div()
-                .id("advance-preparation")
-                .cursor_pointer()
-                .on_click(cx.listener(|view, _, _, cx| {
-                    view.prepare_advance(cx);
-                }))
-                .child(button(
-                    "Finish planning \u{2192}".to_string(),
-                    false,
-                    self.prepare_busy,
-                    false,
-                )),
-        );
-        col = col.child(small(counts.sentence()));
-        if !self.prepare_status.is_empty() {
-            col = col.child(status_line(&self.prepare_status));
-        }
-        col.into_any_element()
-    }
-
-    /// CARD 3 — THE PLAYERS: WHO IS SEATED, AND THE DOOR TO THE PICKER.
-    ///
-    /// ONLY THE LIST, and the one verb that opens the surface the list is
-    /// chosen in. The account directory, the role pills and the unseat
-    /// buttons used to be here as well — three lists and a wall of pills in a
-    /// cell a third of the window wide, and the operator read the shortest of
-    /// them.
-    ///
-    /// THE PICKER TAKES THE FRAME (`WhichPanel::Player`), because seating is
-    /// a decision with a drag, a role and sometimes a hull in it. This card
-    /// is the summary that decision returns to, and a card that also tried to
-    /// be the decision was neither.
-    fn planning_players_body(&mut self, cx: &mut Context<Self>, cell_w: f32) -> AnyElement {
-        let small = |t: String| {
-            div()
-                .font_family(view::FACE_HUMAN)
-                .text_size(px(view::pt(view::DENSE_PT)))
-                .text_color(rgba(BODY_SILVER))
-                .child(t)
-        };
-        let mut col = self.grid_body(cell_w);
-        if self.session.game_id == 0 {
-            return col
-                .child(small("Pick or create a session first.".into()))
-                .into_any_element();
-        }
-        let room = self.room_rows();
-        let seated = room.iter().filter(|r| !r.removed).count();
-        // THE COUNT AND THE DOOR ON ONE ROW, above the list rather than under
-        // it: a room is as long as the exercise has seats, and the card's
-        // scroll would otherwise put its own primary verb below the fold.
-        col = col.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(8.0))
-                .child(small(format!("IN THE ROOM \u{2014} {seated} seated")))
-                .child(
-                    div()
-                        .id("player-picker-door")
-                        .flex_shrink_0()
-                        .cursor_pointer()
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.open_only(WhichPanel::Player);
-                            cx.notify();
-                        }))
-                        .child(button("Choose players".to_string(), true, false, false)),
-                ),
-        );
-        if room.is_empty() {
-            col = col.child(small("Nobody seated yet.".to_string()));
-        }
-        for r in room.iter().cloned() {
-            // A row is the name and the ROLE it holds. The role is the seat,
-            // and the seat is the fact this card exists to state.
-            let ink = if r.removed {
-                BODY_SILVER.with_alpha(120)
-            } else {
-                MAP_INK
-            };
-            let mut row = div()
-                .flex()
-                .flex_row()
-                .items_baseline()
-                .gap(px(8.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(view::pt(view::DENSE_PT)))
-                        .text_color(rgba(ink))
-                        .child(r.name.clone()),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(view::pt(view::LABEL_PT)))
-                        .text_color(rgba(if r.removed {
-                            BODY_SILVER.with_alpha(120)
-                        } else {
-                            BODY_SILVER
-                        }))
-                        .child(r.role.clone()),
-                );
-            // A staged seat or a staged role change says so: the row stands
-            // for a decision the advance has not written yet, and a row that
-            // looked like the server's would make the operator doubt both.
-            if r.staged {
-                row = row.child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(view::pt(view::LABEL_PT)))
-                        .text_color(rgba(ALERT_YELLOW))
-                        .child("staged"),
-                );
-            }
-            if r.removed {
-                row = row.child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(view::pt(view::LABEL_PT)))
-                        .text_color(rgba(FAULT_RED))
-                        .child("leaving"),
-                );
-            }
-            col = col.child(row);
-        }
-        if !self.roster_status.is_empty() {
-            col = col.child(status_line(&self.roster_status));
-        }
-        // THE FOOTNOTE. Three cards of this grid carry a door — the
-        // composer, the fleet register and this — and each is the same
-        // shape: the card is the summary, the modal is where the decision
-        // gets room.
-        col = col.child(separator());
-        col = col.child(small(
-            "the seats, their roles and the account directory \u{2014} the picker takes the frame"
-                .to_string(),
-        ));
-        col.into_any_element()
-    }
-
-    /// CARD 4 — THE FLEET: WHAT FIGHTS, AND THE DOOR TO THE REGISTER.
-    ///
-    /// ONLY THE FORCE, and the one verb that opens the register it is drawn
-    /// from. The register used to be listed here too, one ADD button per hull
-    /// — a card that was a list and a catalogue at once, in a cell a third of
-    /// the window wide.
-    ///
-    /// A ROW IS STILL THE SELECTION: clicking one points CARD 5 at that hull,
-    /// and that is a read, not an edit — the card names what the exercise
-    /// holds, and the hull's own file is the next card along.
-    fn planning_fleet_body(&mut self, cx: &mut Context<Self>, cell_w: f32) -> AnyElement {
-        let small = |t: String| {
-            div()
-                .font_family(view::FACE_HUMAN)
-                .text_size(px(view::pt(view::DENSE_PT)))
-                .text_color(rgba(BODY_SILVER))
-                .child(t)
-        };
-        let mut col = self.grid_body(cell_w);
-        if self.session.game_id == 0 {
-            return col
-                .child(small("Pick or create a session first.".into()))
-                .into_any_element();
-        }
-        let pieces = self.deployed_pieces();
-        let crew = self.crew_choices();
-        // THE COUNT AND THE DOOR ON ONE ROW, above the force rather than
-        // under it: a force is as long as the exercise has hulls, and the
-        // card's scroll would otherwise put its own primary verb below the
-        // fold.
-        col = col.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(8.0))
-                .child(small(format!("IN THE EXERCISE \u{2014} {}", pieces.len())))
-                .child(
-                    div()
-                        .id("fleet-picker-door")
-                        .flex_shrink_0()
-                        .cursor_pointer()
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.open_only(WhichPanel::Fleet);
-                            cx.notify();
-                        }))
-                        .child(button("Choose hulls".to_string(), true, false, false)),
-                ),
-        );
-        if pieces.is_empty() {
-            col = col.child(small("No pieces yet.".to_string()));
-        }
-        for p in &pieces {
-            let pid = p.id;
-            let commander = crew
-                .iter()
-                .find(|(id, _)| *id == p.commander_id.unwrap_or(-1))
-                .map(|(_, n)| n.clone())
-                .unwrap_or_else(|| "unassigned".to_string());
-            // The row SELECTS the hull: card 5 is the hull's own file, and a
-            // force the operator cannot point at is a list, not a force.
-            let mut row = div()
-                .id(("fleet-select", pid as usize))
-                .cursor_pointer()
-                .flex()
-                .flex_row()
-                .items_baseline()
-                .gap(px(8.0))
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    view.selected_unit = Some(pid.to_string());
-                    cx.notify();
-                }));
-            row = row.child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(view::pt(view::DENSE_PT)))
-                    .text_color(rgba(MAP_INK))
-                    .child(p.label.clone()),
-            );
-            row = row.child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(view::pt(view::LABEL_PT)))
-                    .text_color(rgba(if p.placed { BODY_SILVER } else { DATA_AMBER }))
-                    .child(if p.placed { "placed" } else { "unplaced" }),
-            );
-            col = col.child(row);
-            // The commander is under the hull rather than beside it: a name, a
-            // hull class and a person on one line is three columns of which
-            // the narrow card can hold two.
-            col = col.child(
-                div()
-                    .text_size(px(view::pt(view::LABEL_PT)))
-                    .text_color(rgba(BODY_SILVER))
-                    .child(commander),
-            );
-        }
-        if !self.force_status.is_empty() {
-            col = col.child(status_line(&self.force_status));
-        }
-        col = col.child(separator());
-        col = col.child(small(
-            "the register, the commanders and the drop on the map \u{2014} the picker takes the \
-             frame"
-                .to_string(),
-        ));
-        col.into_any_element()
-    }
-
-    /// ISLAND 5 — THE UNIT: the selected hull, in full.
-    ///
-    /// The details panel's own ladders, stacked rather than side by side,
-    /// because this cell is a third of the window wide and three ladders
-    /// across it is three unreadable columns.
-    fn planning_unit_body(&mut self, _cx: &mut Context<Self>, cell_w: f32) -> AnyElement {
-        let unit_id = self.selected_unit.clone();
-        let mut col = self.grid_body(cell_w);
-        let Some(f) = unit_id.as_deref().map(|id| self.unit_facts(id)) else {
-            return col
-                .child(
-                    div()
-                        .text_size(px(view::pt(view::DENSE_PT)))
-                        .text_color(rgba(BODY_SILVER.with_alpha(204)))
-                        .child("no selection \u{2014} pick a hull on the Fleet island"),
-                )
-                .into_any_element();
-        };
-        col = col.child(
-            div()
-                .font_family(view::FACE_HUMAN)
-                .text_size(px(view::pt(view::BODY_PT)))
-                .text_color(rgba(MAP_INK))
-                .child(if f.hull.is_empty() {
-                    f.name.clone()
-                } else {
-                    format!("{} \u{00b7} {}", f.name, f.hull)
-                }),
-        );
-        let row = |label: &'static str, value: String| {
-            div()
-                .flex()
-                .flex_row()
-                .items_baseline()
-                .justify_between()
-                .gap(px(10.0))
-                .child(tracked(label, view::LABEL_PT, CUT_GREY))
-                .child(
-                    div()
-                        .min_w_0()
-                        .font_family(view::FACE_MACHINE)
-                        .text_size(px(view::pt(view::DENSE_PT)))
-                        .text_color(rgba(MAP_INK))
-                        .child(value),
-                )
-                .into_any_element()
-        };
-        for (label, value) in [
-            ("type", f.kind.clone()),
-            ("class", f.class.clone()),
-            ("commander", f.commander.clone()),
-            ("embarkation", f.embark.clone()),
-            ("position", f.position.clone()),
-            ("course", f.course.clone()),
-            ("speed", f.speed.clone()),
-            ("state", f.state.clone()),
-            ("trail", f.trail.clone()),
-            ("length", f.loa.clone()),
-            ("beam", f.beam.clone()),
-            ("draft", f.draft.clone()),
-            ("displacement", f.displacement.clone()),
-            ("speed max", f.speed_max.clone()),
-            ("cruise", f.cruise.clone()),
-            ("range", f.range.clone()),
-            ("turn rate", f.turn.clone()),
-        ] {
-            col = col.child(row(label, value));
-        }
-        col.into_any_element()
     }
 
     /// ESSENTIALS — the held plan, read back, in the console's own order.
@@ -15062,7 +14162,12 @@ impl IslandDemo {
         // why the old planning surface kept reappearing under the new shell.
         // The draft takes the frame `reseed_drafts` just built — same types,
         // one seeding rule — and the flow stays up.
-        let reopened = if self.hold_to_draft {
+        // PLANNING IS THE FLOW, ALWAYS. The six-card grid is gone: a plan is
+        // authored in the composer, so a planning game that is held from
+        // anywhere — the launcher, a save, a re-read — reopens its draft
+        // rather than dropping the operator onto a surface that no longer
+        // exists.
+        let reopened = if self.hold_to_draft || self.session.state == "planning" {
             self.session
                 .detail
                 .as_ref()
@@ -23222,8 +22327,6 @@ impl IslandDemo {
         let chrome = self.flow_chrome(cx);
         let body = if self.flow_map {
             self.stage_map_body(cx)
-        } else if self.flow_arrival.is_some() {
-            self.stage_eight_body(cx)
         } else if self.flow_draft.is_none() {
             self.landing_body(cx)
         } else {
@@ -25878,78 +24981,6 @@ impl IslandDemo {
         // The chrome's right side is the STAGE's own readout, because that is
         // the number the operator is working on: stage 02 draws `0 PLACED ·
         // 0 IN BASKET` (`§5`), every other stage says where the draft lives.
-        if let Some(arrival) = &self.flow_arrival {
-            return kit::strip()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(pt(12.0)))
-                        .child(kit::machine("TFG", view::MACHINE_PT, kit::VALUE_INK))
-                        .child(
-                            div()
-                                .w(px(kit::EDGE_WIDTH))
-                                .h(px(pt(18.0)))
-                                .bg(rgba(HAIRLINE_SLATE)),
-                        )
-                        .child(kit::machine(
-                            format!("ARRIVAL \u{b7} {}", arrival.landing.lands()),
-                            view::MACHINE_PT,
-                            kit::MUTED_INK,
-                        )),
-                )
-                .child(kit::pill(
-                    arrival
-                        .game_id
-                        .map(|id| format!("GAME {id}"))
-                        .unwrap_or_else(|| "NO GAME".to_string()),
-                    kit::LIVE_INK,
-                    true,
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(pt(10.0)))
-                        .child(kit::machine(
-                            format!("{clock} \u{b7} LOCAL ONLY \u{b7} ORGANIZER"),
-                            view::MACHINE_PT,
-                            kit::MUTED_INK,
-                        ))
-                        .child(
-                            div()
-                                .id("flow-close")
-                                .cursor_pointer()
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    // THE FLOW IS THE SHELL, so CLOSE does not
-                                    // uncover a console behind it: it lets go
-                                    // of the draft (back to the launcher), and
-                                    // on the launcher itself it ends the
-                                    // session. A console under a form was the
-                                    // second state machine; there is no
-                                    // longer one to fall back to.
-                                    if view.flow_draft.is_some()
-                                        || view.flow_arrival.is_some()
-                                        || view.flow_map
-                                    {
-                                        view.flow_draft = None;
-                                        view.flow_arrival = None;
-                                        view.flow_map = false;
-                                        view.flow_pan = None;
-                                        view.flow_peel = None;
-                                        view.flow_carry = None;
-                                    } else {
-                                        view.sign_out(cx);
-                                    }
-                                    cx.notify();
-                                }))
-                                .child(kit::mono_caps("CLOSE", view::LABEL_PT, kit::MUTED_INK)),
-                        ),
-                )
-                .into_any_element();
-        }
         let right = match &self.flow_draft {
             Some(draft) if self.flow_stage == crate::draft::Stage::Players => {
                 let (seated, considered) = draft.considered();
@@ -26074,14 +25105,6 @@ impl IslandDemo {
             .bg(rgba(CONSOLE_NIGHT.with_alpha(kit::CHROME_ALPHA)))
             .border_t(px(kit::EDGE_WIDTH))
             .border_color(rgba(CUT_GREY));
-        if self.flow_arrival.is_some() {
-            return band
-                .child(kit::remark(
-                    "THE PRESS IS SPENT \u{b7} NOTHING ELSE IS WRITTEN FROM THIS DRAFT",
-                    kit::MUTED_INK,
-                ))
-                .into_any_element();
-        }
         let Some(draft) = self.flow_draft.clone() else {
             return band
                 .child(kit::remark(
@@ -27114,31 +26137,22 @@ impl IslandDemo {
             }
         }
         let done = matches!(answer.outcome, crate::commit::Outcome::Done);
-        // THE PRESS ENDS SOMEWHERE (§10). A Done press shows the arrival —
-        // `PREPARATION · LIVE` for Play Directly — rather than leaving the
-        // write order on screen with every row ticked.
+        // THE PRESS ENDS SOMEWHERE (§10), and that somewhere is the operator's
+        // work: the card says what landed, and its verb takes them there. The
+        // stage stays underneath it — a press that settled every position
+        // leaves the write order all ticked, which is the receipt, not a
+        // second page.
         if done {
-            self.flow_arrival = self.arrival_for(answer.verb);
+            self.saved = Some(SavedNote {
+                verb: answer.verb,
+                game_id: self
+                    .flow_draft
+                    .as_ref()
+                    .and_then(|draft| draft.journal.game_id().or(draft.origin.game_id())),
+            });
         }
         self.press_outcome = Some((answer.verb, answer.outcome));
         cx.notify();
-    }
-
-    /// The arrival for a press that settled every position, from the draft
-    /// the press left.
-    fn arrival_for(&self, verb: crate::draft::Verb) -> Option<crate::arrival::Arrival> {
-        let draft = self.flow_draft.as_ref()?;
-        let (placed, unplaced) = draft.placement_counts();
-        let (seated, considered) = draft.considered();
-        Some(crate::arrival::Arrival::of(
-            verb,
-            draft.journal.game_id().or(draft.origin.game_id()),
-            (placed, unplaced),
-            draft.unit_count(),
-            draft.book_step_count(),
-            draft.book.substep_count(),
-            (seated, considered),
-        ))
     }
 
     // -----------------------------------------------------------------
@@ -31105,181 +30119,6 @@ impl IslandDemo {
     // F8 — ARRIVAL
     // -----------------------------------------------------------------
 
-    /// F8: where the press left the draft, and — for Play Directly — the one
-    /// gate the exercise waits behind.
-    ///
-    /// THE VERDICT IS THE SERVER'S (`§10`): the strip's ticks are the client's
-    /// reading for legibility, and when the two disagree the panel says the
-    /// server wins rather than quietly picking one.
-    fn stage_eight_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(arrival) = self.flow_arrival.clone() else {
-            return div().into_any_element();
-        };
-        let mut panel = kit::panel().flex_1().min_w_0().h_full().child(kit::band(
-            "ARRIVAL",
-            arrival
-                .game_id
-                .map(|id| format!("GAME {id}"))
-                .or_else(|| Some("SAVED SCENARIOS".to_string())),
-        ));
-        let mut body = kit::body("flow-arrival");
-        body = body
-            .child(kit::mono_caps(
-                arrival.landing.lands(),
-                view::TITLE_PT,
-                kit::LIVE_INK,
-            ))
-            .child(kit::edge_rule());
-        for row in &arrival.rows {
-            body = body.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(pt(10.0)))
-                    .w_full()
-                    .py(px(pt(4.0)))
-                    .border_b(px(kit::EDGE_WIDTH))
-                    .border_color(rgba(HAIRLINE_SLATE))
-                    .child(kit::mono_caps(row.label, view::LABEL_PT, kit::MUTED_INK))
-                    .child(div().flex_shrink_0().child(kit::machine(
-                        row.value.clone(),
-                        view::DENSE_PT,
-                        kit::VALUE_INK,
-                    ))),
-            );
-        }
-        // The gate, on the one arrival that has one.
-        if let Some(gate) = self.flow_gate.clone() {
-            body = body.child(kit::edge_rule()).child(kit::mono_caps(
-                "PREPARATION \u{2192} EXECUTION \u{b7} THE ONE GATE",
-                view::LABEL_PT,
-                kit::MUTED_INK,
-            ));
-            let mut strip = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(pt(10.0)))
-                .flex_wrap()
-                .w_full();
-            for (name, met) in &gate.conditions {
-                strip = strip.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(pt(4.0)))
-                        .child(kit::mono_caps(
-                            name.to_string(),
-                            view::LABEL_PT,
-                            kit::MUTED_INK,
-                        ))
-                        .child(kit::machine(
-                            if *met { "\u{2713}" } else { "\u{2715}" },
-                            view::DENSE_PT,
-                            if *met { SIGNAL_GREEN } else { FAULT_RED },
-                        )),
-                );
-            }
-            // THESE TWO ARE LABELS, NOT VALUES, so they are set in the
-            // label voice — the same `mono_caps` as the strip above. As
-            // `machine` lines they were clipped to `...`: a nowrap+ellipsis
-            // block in this column reports no measured width, and a verdict
-            // that reads `...` is not a verdict.
-            body = body
-                .child(strip)
-                .child(kit::mono_caps(
-                    gate.ready_label(),
-                    view::LABEL_PT,
-                    kit::VALUE_INK,
-                ))
-                .child(kit::mono_caps(
-                    if gate.open {
-                        "OPEN \u{b7} CAN EXECUTE"
-                    } else {
-                        "REFUSED \u{b7} 409"
-                    },
-                    view::LABEL_PT,
-                    if gate.open { SIGNAL_GREEN } else { FAULT_RED },
-                ));
-            if gate.waived {
-                body = body.child(kit::remark("WAIVED \u{b7} PACE FAST", kit::MUTED_INK));
-            }
-            for blocker in &gate.blockers {
-                // THE SERVER'S SENTENCES, VERBATIM (`§10`).
-                body = body.child(kit::note(blocker.clone(), kit::VALUE_INK));
-            }
-            if !gate.agrees() {
-                body = body.child(kit::remark(
-                    "THE STRIP AND THE SERVER DISAGREE \u{b7} THE SERVER WINS",
-                    WARNING_SAND,
-                ));
-            }
-        }
-        panel = panel.child(body);
-        // The one verb an arrival offers: back to the console, or to the
-        // library — and never a second press.
-        let next = match arrival.landing {
-            crate::arrival::Landing::Library => "OPEN THE LIBRARY",
-            _ => "OPEN THE CONSOLE",
-        };
-        kit::content_row()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(pt(kit::GAP)))
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(panel)
-                    .child(
-                        div()
-                            .id("flow-arrival-next")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(pt(34.0)))
-                            .w_full()
-                            .flex_shrink_0()
-                            .cursor_pointer()
-                            .border(px(kit::EDGE_WIDTH))
-                            .border_color(rgba(kit::LIVE_INK))
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                let landing = view
-                                    .flow_arrival
-                                    .as_ref()
-                                    .map(|arrival| arrival.landing);
-                                let library =
-                                    landing == Some(crate::arrival::Landing::Library);
-                                let preparation = landing
-                                    == Some(crate::arrival::Landing::Preparation);
-                                // THE FLOW IS DONE WITH THE DRAFT. The console
-                                // (or the library) is what the arrival opens;
-                                // keeping the draft would put stage 06 back
-                                // under the next press.
-                                view.flow_arrival = None;
-                                view.flow_gate = None;
-                                view.flow_draft = None;
-                                view.flow_map = false;
-                                view.sessions_open = library;
-                                // PREPARATION IS THE ROOM. The phase's
-                                // centre is the order of battle, so the
-                                // console opens on it rather than on a column
-                                // of one island.
-                                if preparation {
-                                    view.crew_modal_open = true;
-                                }
-                                cx.notify();
-                            }))
-                            .child(kit::mono_caps(next, view::MACHINE_PT, kit::LIVE_INK)),
-                    ),
-            )
-            .into_any_element()
-    }
-
     // -----------------------------------------------------------------
     // F3e — MAP MODE
     // -----------------------------------------------------------------
@@ -31786,8 +30625,117 @@ impl IslandDemo {
             .on_mouse_down(MouseButton::Left, hear_click)
             .children(map)
             .child(surface)
+            // THE PRESS THAT LANDED, over whatever it left: the stage it
+            // settled, the launcher, or the console behind the flow.
+            .children(self.saved_card(cx))
             .children(self.picker_popup(cx))
             .into_any_element()
+    }
+
+    /// THE CONFIRMATION (`§10`): one line saying it landed, and the verb that
+    /// takes the operator where they work next.
+    ///
+    /// A CARD, NOT A SCREEN. The old arrival replaced the whole form with a
+    /// report of the decision just made, and its door led to a console the
+    /// flow had replaced. What a person needs after a save is the sentence and
+    /// the next door — everything else was the record telling them what they
+    /// had typed.
+    fn saved_card(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let note = self.saved.clone()?;
+        let (line, verb) = note.next();
+        let game = note
+            .game_id
+            .map(|id| format!("GAME {id}"))
+            .unwrap_or_else(|| "SAVED".to_string());
+        Some(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                // The scrim is the card's, and it stops the press from
+                // reaching a form that is finished with.
+                .bg(rgba(Rgba::black_alpha(90)))
+                .child(
+                    div()
+                        .id("press-saved")
+                        .w(px(pt(420.0)))
+                        .flex()
+                        .flex_col()
+                        .gap(px(pt(10.0)))
+                        .p(px(pt(18.0)))
+                        .rounded(px(kit::RADIUS))
+                        .bg(rgba(CONSOLE_NIGHT))
+                        .border(px(pt(2.0)))
+                        .border_color(rgba(SIGNAL_GREEN))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .w_full()
+                                .child(kit::mono_caps(
+                                    "SAVE SUCCESSFUL",
+                                    view::MACHINE_PT,
+                                    SIGNAL_GREEN,
+                                ))
+                                .child(kit::machine(game, view::LABEL_PT, kit::MUTED_INK)),
+                        )
+                        .child(kit::mono_caps(
+                            note.landing(),
+                            view::TITLE_PT,
+                            kit::VALUE_INK,
+                        ))
+                        .child(kit::note(line, kit::MUTED_INK))
+                        .child(
+                            div()
+                                .id("press-saved-next")
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.saved = None;
+                                    match note.verb {
+                                        // PLANNING IS THE FLOW. The game
+                                        // exists now, so the draft is the
+                                        // record: the operator keeps working
+                                        // in it, from its first page.
+                                        crate::draft::Verb::SaveAsGameSession => {
+                                            view.open_stage(
+                                                crate::draft::Stage::Essentials,
+                                                cx,
+                                            );
+                                        }
+                                        // THE LIBRARY IS THE LAUNCHER's saved
+                                        // scenarios, which is where a new game
+                                        // starts from one.
+                                        crate::draft::Verb::SaveAsScenario => {
+                                            view.flow_draft = None;
+                                            view.flow_map = false;
+                                            view.sessions_open = true;
+                                        }
+                                        // PREPARATION IS THE ROOM: the flow
+                                        // has done its job, and the console
+                                        // behind it is the card that seats
+                                        // the exercise side.
+                                        crate::draft::Verb::PlayDirectly => {
+                                            view.flow_draft = None;
+                                            view.flow_map = false;
+                                            view.sessions_open = false;
+                                            view.crew_modal_open = true;
+                                        }
+                                    }
+                                    crate::sfx::play(crate::sfx::Sfx::Ding);
+                                    cx.notify();
+                                }))
+                                .child(button(verb, false, false, false)),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The chart behind the flow's form.
@@ -37158,9 +36106,6 @@ impl Render for IslandDemo {
                         // panel is the panel's, as for the left; over the
                         // chart it starts a pan, and nothing else does.
                         let at = (f32::from(ev.position.x), f32::from(ev.position.y));
-                        if !view.pin_arm && view.over_grid_panel(at, window) {
-                            return;
-                        }
                         view.pan = Some(at);
                         view.press_at = None;
                         view.pick_made = None;
@@ -37172,21 +36117,6 @@ impl Render for IslandDemo {
                     }))
                     .on_mouse_down(MouseButton::Left, cx.listener(|view, ev: &MouseDownEvent, window, cx| {
                         let at = (f32::from(ev.position.x), f32::from(ev.position.y));
-                        // A PRESS OVER A PLANNING PANEL IS THE PANEL'S, and
-                        // not the map's: the grid covers the water, and a
-                        // press on a verb that also panned the chart would
-                        // move the ground under the operator's plan.
-                        //
-                        // ARMED IS THE EXCEPTION: a hull waiting to be
-                        // placed is placed by clicking the map, and the map
-                        // is under the panels — the operator can see it, and
-                        // they mean it.
-                        if view.pending_place.is_none()
-                            && !view.pin_arm
-                            && view.over_grid_panel(at, window)
-                        {
-                            return;
-                        }
                         // Armed, the press anchors instead of panning: only a
                         // press that stays put places, and a press that moves
                         // past 6px becomes a pan like any other.
@@ -37659,18 +36589,10 @@ impl Render for IslandDemo {
                 self.markers(vp.2, vp.3).into_any_element()
             })
             .child(self.unit_popup(vp.2, vp.3).into_any_element())
-            .child(if self.session.execution {
-                // Execution draws its widgets on the map, not a column.
-                div().into_any_element()
-            } else if self.grid_visible() {
-                // PLANNING IS THE GRID: six equal islands over the map, and
-                // no column at all. The plan is drawn over the ground it
-                // will be fought on — and stands aside while a hull is in
-                // the air (`grid_visible`).
-                self.planning_grid_el(cx, viewport(window)).into_any_element()
-            } else {
-                band_el.into_any_element()
-            })
+            // NO GRID. Planning is the composer (see `apply_hold`), so the
+            // console's map is never asked to draw six cards of a plan being
+            // authored somewhere else.
+            .child(band_el.into_any_element())
             .child(if self.session.execution {
                 div().into_any_element()
             } else {
@@ -41749,6 +40671,46 @@ fn history_rows(sessions: &[SessionRow]) -> Vec<crate::backend::GameRow> {
         .collect()
 }
 
+/// A press that landed, and where it leaves the operator.
+///
+/// The three verbs land in three places, and the console's job after a save is
+/// to say so ONCE and take them there — not to draw a report of a decision
+/// they just made.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedNote {
+    pub verb: crate::draft::Verb,
+    pub game_id: Option<i64>,
+}
+
+impl SavedNote {
+    /// The landing, in the operator's words: where the thing now is.
+    pub fn landing(&self) -> &'static str {
+        match self.verb {
+            crate::draft::Verb::SaveAsGameSession => "THE GAME IS IN PLANNING",
+            crate::draft::Verb::SaveAsScenario => "THE SCENARIO IS IN THE LIBRARY",
+            crate::draft::Verb::PlayDirectly => "THE EXERCISE IS IN PREPARATION",
+        }
+    }
+
+    /// What the card says under that, and the one verb it offers.
+    pub fn next(&self) -> (&'static str, &'static str) {
+        match self.verb {
+            crate::draft::Verb::SaveAsGameSession => (
+                "this draft is the record now \u{2014} keep planning, or close it and come back",
+                "CONTINUE PLANNING",
+            ),
+            crate::draft::Verb::SaveAsScenario => (
+                "open it from the library to start a new game with it",
+                "OPEN THE LIBRARY",
+            ),
+            crate::draft::Verb::PlayDirectly => (
+                "the room is open \u{2014} seat the exercise side and declare ready",
+                "ENTER THE ROOM",
+            ),
+        }
+    }
+}
+
 /// One piece of the exercise: a hull assigned to the held game. The server's
 /// own word — a related hull has to be one of its pieces — and the relate
 /// editor's checkbox list. Assigned units only, never the whole register:
@@ -44611,6 +43573,83 @@ pub fn run(
 mod tests {
     use super::*;
 
+    /// THE THREE LANDINGS, in the operator's words.
+    ///
+    /// The card is the only report a save gets, so the sentence has to say
+    /// where the thing now IS — a person reading "successful" alone still has
+    /// to guess what happened to their exercise.
+    #[test]
+    fn a_saved_note_says_where_each_verb_landed() {
+        use crate::draft::Verb;
+        let planning = SavedNote {
+            verb: Verb::SaveAsGameSession,
+            game_id: Some(86),
+        };
+        assert!(planning.landing().contains("PLANNING"));
+        assert_eq!(planning.next().1, "CONTINUE PLANNING");
+
+        let library = SavedNote {
+            verb: Verb::SaveAsScenario,
+            game_id: None,
+        };
+        assert!(library.landing().contains("LIBRARY"));
+        assert_eq!(library.next().1, "OPEN THE LIBRARY");
+
+        let preparation = SavedNote {
+            verb: Verb::PlayDirectly,
+            game_id: Some(86),
+        };
+        assert!(preparation.landing().contains("PREPARATION"));
+        assert_eq!(preparation.next().1, "ENTER THE ROOM");
+    }
+
+    /// A PLANNING GAME IS THE COMPOSER, from whichever door it is opened.
+    ///
+    /// The console's six-card planning grid is gone: a held planning exercise
+    /// that did not reopen its draft dropped the operator onto a surface that
+    /// no longer exists, which is the report this pins.
+    #[gpui::test]
+    fn a_held_planning_game_opens_the_composer(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                // The launcher's own door, without the flag that used to carry
+                // the draft: a planning row opened from anywhere reopens it.
+                demo.hold_to_draft = false;
+                demo.apply_hold(SessionView {
+                    signed_in: true,
+                    state: "planning".to_string(),
+                    game: "Game 86".to_string(),
+                    game_id: 86,
+                    detail: Some(crate::backend::GameDetail {
+                        id: 86,
+                        name: "Game 86".to_string(),
+                        mode: "maneuver".to_string(),
+                        state: "planning".to_string(),
+                        description: String::new(),
+                        purpose: String::new(),
+                        target: String::new(),
+                        area: None,
+                        map_tag: None,
+                        overlay_text: None,
+                        window: crate::backend::TimeWindow::default(),
+                        pace: Some(crate::backend::GamePace::Standard),
+                        time_factor: 1.0,
+                        max_echelon_rank: None,
+                        room_key: None,
+                    }),
+                    ..SessionView::default()
+                });
+                assert!(demo.flow_draft.is_some(), "the draft is the planning view");
+                assert!(demo.sessions_open, "and the flow is the surface");
+            })
+        });
+    }
+
+
     /// Assert that a gesture posted no WRITE, tolerating the reads it is
     /// allowed to make.
     ///
@@ -47188,74 +46227,6 @@ mod tests {
         })
     }
 
-    /// A HULL IN THE AIR CLEARS THE GRID, AND THE WATER BECOMES THE TARGET.
-    ///
-    /// A drag out of the fleet picker is a drop on the WATER, and the water is
-    /// under all six planning cards. With the grid drawn, every point a hull
-    /// could be aimed at belonged to a card — the operator could only drop on
-    /// the strip of chart the six did not cover, which is the report this test
-    /// pins.
-    ///
-    /// ONE PREDICATE, `grid_visible`: the render draws the cards on it, and
-    /// `over_grid_panel` — the map's own gesture guard — answers on the same
-    /// one, so the picture and the hit test cannot disagree about whether the
-    /// cards are there. A guard that kept claiming the cards after the render
-    /// stopped drawing them would swallow the release that IS the drop.
-    #[gpui::test]
-    fn a_hull_in_the_air_clears_the_planning_grid(cx: &mut gpui::TestAppContext) {
-        let session = SessionView {
-            state: "planning".to_string(),
-            game: "Game 45".to_string(),
-            game_id: 45,
-            ..SessionView::default()
-        };
-        let (view, cx) = cx.add_window_view(|_, _| {
-            IslandDemo::new(
-                fixture_roster(),
-                8,
-                0,
-                session,
-                std::sync::mpsc::channel().0,
-            )
-        });
-        cx.simulate_resize(gpui::size(gpui::px(1536.0), gpui::px(838.0)));
-        // A point inside the SECOND card: the top row's middle cell. It is on
-        // the map's water and under a card, which is the reported defect.
-        let inside_a_card = cx.update(|window, app| {
-            let d = view.read(app);
-            let cells = view::planning_grid(viewport(window));
-            let (x, y, w, h) = view::box_rect(cells[1]);
-            ((x + w / 2.0), (y + h / 2.0))
-        });
-        let (drawn, over_card) = cx.update(|window, app| {
-            let d = view.read(app);
-            (d.grid_visible(), d.over_grid_panel(inside_a_card, window))
-        });
-        assert!(drawn, "planning draws the grid");
-        assert!(over_card, "a point on a card is the card's, not the map's");
-
-        // The drag starts (the picker posts the same flag the ghost is drawn
-        // on), and the cards stand aside.
-        cx.update(|_window, app| {
-            view.update(app, |d, cx| d.set_dragging(true, cx));
-        });
-        let (drawn, over_card) = cx.update(|window, app| {
-            let d = view.read(app);
-            (d.grid_visible(), d.over_grid_panel(inside_a_card, window))
-        });
-        assert!(!drawn, "a hull in the air is a gesture on the water");
-        assert!(
-            !over_card,
-            "the release that lands on the water is the drop"
-        );
-
-        // And the cards come back when the gesture ends.
-        cx.update(|_window, app| {
-            view.update(app, |d, cx| d.set_dragging(false, cx));
-        });
-        assert!(cx.update(|_window, app| view.read(app).grid_visible()));
-    }
-
     /// A click on empty space (above the body, in the header band) leaves the
     /// selection alone — the handler is scoped to the rows, not the panel.
     #[gpui::test]
@@ -48750,16 +47721,13 @@ mod tests {
         // the console draws for a caller who is running the exercise rather
         // than playing in it.
         //
-        // PLANNING IS THE GRID: six equal panels over the map, and NO
-        // column. The phase's own arrangement is the assertion here — a
-        // planning room that still carried a column would carry the
-        // console's old stack down one side of the map, which is the thing
-        // the grid replaced.
+        // PLANNING HAS NO COLUMN: the phase is the composer, which is a
+        // surface of its own rather than this console.
         set_state(&view, cx, "planning");
         assert_eq!(
             read(&view, cx),
             Vec::<String>::new(),
-            "planning is the grid: six equal panels over the map, and no column"
+            "planning is the composer: the console has no column in that phase"
         );
         set_state(&view, cx, "preparation");
         assert_eq!(
@@ -49741,8 +48709,8 @@ mod tests {
         assert_eq!(
             keys,
             Vec::<String>::new(),
-            "the held game is a planning exercise, and planning is the grid: \
-             the column holds nothing in this state"
+            "the held game is a planning exercise, and planning is the composer: \
+             the console's column holds nothing in this state"
         );
     }
 
@@ -52653,12 +51621,12 @@ mod tests {
                     cx,
                 );
                 assert_eq!(demo.session.state, "preparation", "the server's word");
-                let arrival = demo.flow_arrival.as_ref().expect("the arrival is up");
-                assert_eq!(arrival.landing, crate::arrival::Landing::Preparation);
+                let saved = demo.saved.as_ref().expect("the confirmation is up");
+                assert_eq!(saved.verb, crate::draft::Verb::PlayDirectly);
                 assert!(
-                    arrival.landing.lands().contains("PREPARATION"),
+                    saved.landing().contains("PREPARATION"),
                     "the landing says where it went: {}",
-                    arrival.landing.lands()
+                    saved.landing()
                 );
             })
         });

@@ -839,7 +839,23 @@ impl MasterTransport<'_> {
                     .set_unit_commander(self.token, game, *unit_id, *commander_id),
             ),
             // -- 09 ----------------------------------------------------
-            Write::Transition { to } => call(self.master.transition_game(self.token, game, to)),
+            Write::Transition { to } => {
+                // THE GATE IS THE SERVER'S, ASKED BEFORE THE DOOR. Only this
+                // game's Game Master may move it, and a press that finds out at
+                // the last rung has already written everything else. Nothing is
+                // sent here; the sentence names the seat that fixes it.
+                if self.master.may_transition(self.token, game) == Some(false) {
+                    Answer::NotSent {
+                        sentence: "this seat does not move the exercise \u{2014} Minos lets \
+                                   only the game's Game Master send a transition, and this \
+                                   account is not that seat. Seat somebody as Game Master in \
+                                   stage 05 (or take that seat) and press again."
+                            .to_string(),
+                    }
+                } else {
+                    call(self.master.transition_game(self.token, game, to))
+                }
+            }
             // 01 and M1 never reach here (`send` routes them).
             other => Answer::NotSent {
                 sentence: format!("{} is not a game write.", other.label()),

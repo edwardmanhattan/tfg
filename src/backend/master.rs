@@ -948,6 +948,38 @@ impl MinosMaster {
         Ok(Self::parse_units(&data))
     }
 
+    /// WHETHER THIS ACCOUNT MAY MOVE THIS GAME — the server's own question,
+    /// asked BEFORE the transition is sent.
+    ///
+    /// Minos authorises `POST /games/{id}/transitions` by being *this game's*
+    /// Game Master, which is an instance comparison in the service rather than
+    /// a Casbin object: the grant lives on the participant's game role, and a
+    /// seat without it is refused with `403`. A press that discovers this at
+    /// the last rung has already written seven positions and shows the
+    /// operator "403 · TRANSITION" with no request id — which says nothing
+    /// about who should have been seated.
+    ///
+    /// `None` is "not knowable": no seat here, or a read that failed. The
+    /// server decides then, which is the honest fallback — a client that
+    /// refused on a failed read would be inventing a rule it could not see.
+    pub fn may_transition(
+        &self,
+        token: &str,
+        game_id: i64,
+    ) -> Option<bool> {
+        let (me, _name) = self.me(token).ok()?;
+        let parts = self.game_participants(token, game_id).ok()?;
+        let role_id = parts.iter().find(|p| p.user_id == me)?.role_id;
+        let data = self
+            .get(token, &format!("/game-roles/{role_id}/permissions"))
+            .ok()?;
+        let permissions = data["permissions"].as_array()?;
+        Some(permissions.iter().any(|p| {
+            p["object"].as_str() == Some("/games/transitions")
+                && p["action"].as_str() == Some("transition")
+        }))
+    }
+
     /// Move a game one step forward (planning→preparation→execution→
     /// closure). Game-Master authority, forward-only; the gate refusal
     /// names every missing ingredient at once — loud by contract.

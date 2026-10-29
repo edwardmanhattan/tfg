@@ -764,44 +764,9 @@ pub fn seats_draft() -> Option<Draft> {
     Some(draft)
 }
 
-/// F8: the arrival, with the gate the sheet draws (`§10`).
-///
-/// PLAY DIRECTLY is the arrival that has a gate, so it is the one the frame
-/// shows: four seated, two ready, and the server refusing with its own
-/// sentence. The strip's ticks are the client's reading, and the verdict is
-/// `can_execute`.
-pub fn arrival() -> Option<crate::arrival::Arrival> {
-    let draft = seats_draft()?;
-    let (placed, unplaced) = draft.placement_counts();
-    Some(crate::arrival::Arrival::of(
-        crate::draft::Verb::PlayDirectly,
-        Some(128),
-        (placed, unplaced),
-        draft.unit_count(),
-        draft.book.staged_step_count(),
-        draft.book.all_substeps().count(),
-        draft.considered(),
-    ))
-}
-
-/// F8's gate strip.
-pub fn arrival_gate() -> Option<crate::arrival::Gate> {
-    let draft = seats_draft()?;
-    let (placed, unplaced) = draft.placement_counts();
-    Some(crate::arrival::Gate::of(
-        &crate::backend::GameReadinessView {
-            can_execute: false,
-            blockers: vec!["2 participants have not declared themselves ready".to_string()],
-            fast: false,
-        },
-        true,
-        draft.unit_count(),
-        (placed, unplaced),
-        draft.force.uncommanded().len(),
-        // The EXERCISE SIDE: the referee is not counted (erratum 10).
-        (2, 3),
-    ))
-}
+/// F8 — RETIRED AS A PANEL. The arrival is a confirmation card now (see
+/// `SavedNote`), drawn over the stage the press settled; the frame seeds the
+/// review draft and the shell raises the card on it.
 
 /// The state a `TFG_FLOW` value names, if its slice has landed./// The state a `TFG_FLOW` value names, if its slice has landed./// The state a `TFG_FLOW` value names, if its slice has landed./// The state a `TFG_FLOW` value names, if its slice has landed./// The state a `TFG_FLOW` value names, if its slice has landed./// The state a `TFG_FLOW` value names, if its slice has landed./// The state a `TFG_FLOW` value names, if its slice has landed.
 #[derive(Debug, Clone, PartialEq)]
@@ -820,8 +785,8 @@ pub enum Fixture {
     StageFour(Box<Draft>),
     /// F6a, F6b: a draft at stage 05, with its seats staged.
     StageFive(Box<Draft>),
-    /// F8: the arrival panel, with its gate.
-    Arrival,
+    /// F8: the confirmation card over a settled stage 06.
+    Saved(Box<Draft>),
 }
 
 /// Build the frame's state, or `None` when that slice has not landed.
@@ -831,6 +796,7 @@ pub fn fixture(frame: Frame) -> Option<Fixture> {
         Frame::F1b => Some(Fixture::Landing(Box::new(landing_scenario_revealed()))),
         Frame::F2a | Frame::F2b => stage_one(frame).map(|d| Fixture::StageOne(Box::new(d))),
         Frame::F7 => review_draft().map(|d| Fixture::Review(Box::new(d))),
+        Frame::F8 => review_draft().map(|d| Fixture::Saved(Box::new(d))),
         // F3d is the basket open on a REOPENED draft: twelve hulls, nine with
         // a start position.
         Frame::F3d => reopened_twelve().map(|d| Fixture::StageTwo(Box::new(d))),
@@ -842,7 +808,6 @@ pub fn fixture(frame: Frame) -> Option<Fixture> {
         }
         Frame::F5a | Frame::F5b => book_draft().map(|d| Fixture::StageFour(Box::new(d))),
         Frame::F6a | Frame::F6b => seats_draft().map(|d| Fixture::StageFive(Box::new(d))),
-        Frame::F8 => Some(Fixture::Arrival),
         _ => None,
     }
 }
@@ -1110,8 +1075,9 @@ mod tests {
     /// state: a picture of a fixture would not be a picture of the flow.
     #[test]
     fn an_unbuilt_frame_has_no_fixture() {
-        assert!(Frame::F8.built(), "the arrival panel has landed");
-        assert_eq!(fixture(Frame::F8), Some(Fixture::Arrival));
+        // F8 is the confirmation card over stage 06, not a panel of its own.
+        assert!(Frame::F8.built(), "the confirmation frame has landed");
+        assert!(matches!(fixture(Frame::F8), Some(Fixture::Saved(_))));
         assert!(fixture(Frame::F3a).is_some(), "stage 02 has landed");
         assert!(Frame::F2b.built());
         assert!(fixture(Frame::F2b).is_some());
