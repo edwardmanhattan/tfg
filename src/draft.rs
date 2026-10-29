@@ -197,7 +197,7 @@ impl Verb {
         match self {
             Verb::SaveAsGameSession => "Save as Game Session",
             Verb::SaveAsScenario => "Save as Scenario",
-            Verb::PlayDirectly => "Play Directly",
+            Verb::PlayDirectly => "Play",
         }
     }
 

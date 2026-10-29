@@ -137,6 +137,11 @@ impl Status {
     fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
+    /// Whether this line is a REFUSAL — the one state the link strip reads
+    /// from a status rather than from the wire itself.
+    fn is_fault(&self) -> bool {
+        self.kind == StatusKind::Bad
+    }
     /// The words, for a test or a comparison.
     #[cfg(test)]
     fn contains(&self, needle: &str) -> bool {
@@ -1443,6 +1448,21 @@ struct IslandDemo {
     /// console that spends one colour on two states spends the colour on
     /// neither.
     scope_anim: Option<ScopeAnim>,
+    /// WHEN THE SIGN-IN IN FLIGHT BEGAN, and therefore where the sweep is.
+    ///
+    /// Wall time rather than a frame counter: the sweep is an angle the beam
+    /// has from the moment the press happened, so a dropped frame shortens
+    /// nothing and a slow machine does not slow the instrument down. `None`
+    /// at rest — a scope that sweeps at the door is decoration, and this one
+    /// only turns while there is a round trip to watch.
+    login_scan: Option<std::time::Instant>,
+    /// The operator asked for LESS MOTION (`TFG_REDUCED_MOTION=1`).
+    ///
+    /// The sweep is the one thing on that card that moves, and a person who
+    /// has said movement makes them ill gets the instrument still: the rim
+    /// lights and the caption says `signing in…`, which is the whole state
+    /// without the beam.
+    reduce_motion: bool,
     /// The levels the scope has SETTLED at, which are what it draws when
     /// no ease is running.
     scope_lit: f32,
@@ -1760,6 +1780,18 @@ struct IslandDemo {
     /// The hulls whose register copy has already been asked for, so a drag
     /// that wanders costs one read rather than one per frame.
     register_carries_asked: Vec<i64>,
+    /// THE ROLE THAT RUNS THE EXERCISE, as the server's matrix names it.
+    ///
+    /// Read once per draft. The operator who created the game is seated in
+    /// it — locally, before the press, because a game saved with nobody able
+    /// to drive it can never leave planning (the transition is refused 403).
+    runner_role: Option<crate::backend::GameRole>,
+    /// The game (or `None` for the templates) whose runner has been asked for.
+    runner_asked: Option<Option<i64>>,
+    /// WHAT THE MATRIX SAID about the runner: `Some(true)` when a role holds
+    /// the transition grant, `Some(false)` when NONE does, `None` when nobody
+    /// has answered — a failed read is not a refusal, and the server decides.
+    runner_ready: Option<bool>,
     /// WHETHER A DEPLOYMENT BRINGS WHAT THE REGISTER SAYS THE HULL CARRIES.
     ///
     /// The picker's toggle, and the operator's decision rather than the
@@ -2078,7 +2110,11 @@ const MODAL_H: f32 = 320.0;
 /// fields; the height is the form and the scope and nothing else, because
 /// the surface carries no readings any more.
 const SIGNIN_W: f32 = 420.0;
-const SIGNIN_H: f32 = 384.0;
+/// TALLER THAN IT WAS, and the extra is the instrument's foot: a rule, the
+/// link's own line and the key that does what the scope does. A card whose
+/// last row is cut by its own edge is a card that was measured before it was
+/// finished.
+const SIGNIN_H: f32 = 424.0;
 /// The scope's diameter: the ornament in the room the readouts left.
 const SIGNIN_SCOPE: f32 = 160.0;
 
@@ -2708,7 +2744,20 @@ fn modal_silhouette_at(_w: f32, _h: f32) -> impl IntoElement {
 /// there and the operator may press — and `lit` says the LINK IS OUT, which
 /// is a state the operator does not have in their hands and which the
 /// console therefore spends the accent on.
-fn paint_scope(window: &mut Window, bounds: Bounds<gpui::Pixels>, lit: f32, bright: f32) {
+///
+/// `scan` is the SWEEP, in degrees clockwise from north, while a sign-in is
+/// in flight and `None` at rest. An instrument that is working shows it: the
+/// beam turns, three contacts light as it passes over them and fade behind
+/// it, and the card's own readout turns with the beam. Nothing moves when
+/// nothing is happening — a radar that sweeps at the door is decoration, and
+/// decoration that moves is a bug in the decoration.
+fn paint_scope(
+    window: &mut Window,
+    bounds: Bounds<gpui::Pixels>,
+    lit: f32,
+    bright: f32,
+    scan: Option<f32>,
+) {
     let cx = bounds.origin.x + bounds.size.width / 2.0;
     let cy = bounds.origin.y + bounds.size.height / 2.0;
     let r = (bounds.size.width.min(bounds.size.height) / 2.0) - px(9.0);
@@ -2720,7 +2769,74 @@ fn paint_scope(window: &mut Window, bounds: Bounds<gpui::Pixels>, lit: f32, brig
     let rim = rim.with_alpha((rim.a as f32 + 40.0 * bright).min(255.0) as u8);
     let fine = mix_ink(HAIRLINE_SLATE, RADAR_CYAN.with_alpha(110), lit);
     let fine = fine.with_alpha((fine.a as f32 + 30.0 * bright).min(255.0) as u8);
-    // The rim, and two rings inside it.
+    // THE SWEEP, UNDER THE RINGS: the beam is what the glass is for, so it
+    // paints first and the scale reads over it.
+    if let Some(deg) = scan {
+        // A trailing sector rather than a line: the afterglow is what makes a
+        // sweep readable as a sweep. Fourteen slices, brightest at the leading
+        // edge, so the falloff is a gradient of alpha and not a fade of shape.
+        const SLICES: usize = 14;
+        const SPAN: f32 = 46.0;
+        for i in 0..SLICES {
+            let back = SPAN * (i as f32 + 1.0) / SLICES as f32;
+            let a0 = (deg - back).to_radians();
+            let a1 = (deg - SPAN * i as f32 / SLICES as f32).to_radians();
+            let alpha = (2.0 + 20.0 * (1.0 - i as f32 / SLICES as f32)) as u8;
+            let mut slice = PathBuilder::fill();
+            slice.move_to(point(cx, cy));
+            slice.line_to(point(cx + a0.cos() * r, cy + a0.sin() * r));
+            slice.line_to(point(cx + a1.cos() * r, cy + a1.sin() * r));
+            if let Ok(path) = slice.build() {
+                window.paint_path(path, rgba(RADAR_CYAN.with_alpha(alpha)));
+            }
+        }
+        // The leading edge itself, full strength.
+        let rad = deg.to_radians();
+        let mut edge = PathBuilder::stroke(px(1.3));
+        edge.move_to(point(cx, cy));
+        edge.line_to(point(cx + rad.cos() * r, cy + rad.sin() * r));
+        if let Ok(path) = edge.build() {
+            window.paint_path(path, rgba(RADAR_CYAN.with_alpha(150)));
+        }
+    }
+    // THE BEZEL: four corner brackets at the plate's own corners. They are the
+    // frame a glass is set in, and they are what stops the circle reading as a
+    // diagram floating in a form.
+    let edge = px(6.0);
+    let arm = px(7.0);
+    for (ax, ay, dx, dy) in [
+        (bounds.origin.x + edge, bounds.origin.y + edge, 1.0, 1.0),
+        (
+            bounds.origin.x + bounds.size.width - edge,
+            bounds.origin.y + edge,
+            -1.0,
+            1.0,
+        ),
+        (
+            bounds.origin.x + edge,
+            bounds.origin.y + bounds.size.height - edge,
+            1.0,
+            -1.0,
+        ),
+        (
+            bounds.origin.x + bounds.size.width - edge,
+            bounds.origin.y + bounds.size.height - edge,
+            -1.0,
+            -1.0,
+        ),
+    ] {
+        let mut bracket = PathBuilder::stroke(px(1.0));
+        bracket.move_to(point(ax + arm * dx, ay));
+        bracket.line_to(point(ax, ay));
+        bracket.line_to(point(ax, ay + arm * dy));
+        if let Ok(path) = bracket.build() {
+            window.paint_path(
+                path,
+                rgba(fine.with_alpha((fine.a as f32 * 0.8) as u8)),
+            );
+        }
+    }
+    // The rim, the two rings inside it, and a crosshair the rings hang from.
     for (radius, ink) in [(r, rim), (r * 0.60, fine), (r * 0.24, fine)] {
         let mut ring = PathBuilder::stroke(px(1.0));
         ring.move_to(point(cx + radius, cy));
@@ -2742,8 +2858,20 @@ fn paint_scope(window: &mut Window, bounds: Bounds<gpui::Pixels>, lit: f32, brig
             window.paint_path(path, rgba(ink));
         }
     }
+    let mut cross = PathBuilder::stroke(px(1.0));
+    for (dx, dy) in [(1.0, 0.0), (0.0, 1.0)] {
+        cross.move_to(point(cx - dx * r * 0.24, cy - dy * r * 0.24));
+        cross.line_to(point(cx + dx * r, cy + dy * r));
+    }
+    if let Ok(path) = cross.build() {
+        window.paint_path(
+            path,
+            rgba(fine.with_alpha((fine.a as f32 * 0.45) as u8)),
+        );
+    }
     // Twelve graduations hanging INSIDE the rim, so the face reads as a scale
-    // rather than as a spoked wheel.
+    // rather than as a spoked wheel, and twenty-four finer ones outside them:
+    // the fine ring is what makes the face look measured instead of drawn.
     for i in 0..12 {
         let screen = (i as f32 * 30.0 - 90.0).to_radians();
         let (dx, dy) = (screen.cos(), screen.sin());
@@ -2755,6 +2883,20 @@ fn paint_scope(window: &mut Window, bounds: Bounds<gpui::Pixels>, lit: f32, brig
         tick.line_to(point(cx + dx * outer, cy + dy * outer));
         if let Ok(path) = tick.build() {
             window.paint_path(path, rgba(if cardinal { rim } else { fine }));
+        }
+        if !cardinal {
+            // The half-degree mark between two of them.
+            let mid = (i as f32 * 30.0 + 15.0 - 90.0).to_radians();
+            let (mx, my) = (mid.cos(), mid.sin());
+            let mut half = PathBuilder::stroke(px(1.0));
+            half.move_to(point(cx + mx * (r - px(3.5)), cy + my * (r - px(3.5))));
+            half.line_to(point(cx + mx * (r - px(2.0)), cy + my * (r - px(2.0))));
+            if let Ok(path) = half.build() {
+                window.paint_path(
+                    path,
+                    rgba(fine.with_alpha((fine.a as f32 * 0.55) as u8)),
+                );
+            }
         }
     }
     // North: a wedge at the top, so "up is north" is a thing the eye can see
@@ -2770,6 +2912,34 @@ fn paint_scope(window: &mut Window, bounds: Bounds<gpui::Pixels>, lit: f32, brig
             path,
             rgba(mix_ink(CUT_GREY.with_alpha(160), RADAR_CYAN, lit)),
         );
+    }
+    // THE CONTACTS: what the sweep is looking for. Fixed bearings, so a second
+    // sign-in looks like the same instrument rather than a slot machine, and
+    // each lights as the beam crosses it and dies over the following third of
+    // a turn — the afterglow a real scope has and a spinner does not.
+    if let Some(deg) = scan {
+        for (bearing, reach) in [(58.0_f32, 0.46_f32), (141.0, 0.72), (262.0, 0.34)] {
+            let behind = (deg - bearing).rem_euclid(360.0);
+            let glow = (1.0 - behind / 120.0).clamp(0.0, 1.0);
+            if glow <= 0.02 {
+                continue;
+            }
+            let rad = (bearing - 90.0).to_radians();
+            let bx = cx + rad.cos() * r * reach;
+            let by = cy + rad.sin() * r * reach;
+            let size = px(1.8 + 2.4 * glow);
+            let mut dot = PathBuilder::fill();
+            dot.move_to(point(bx - size, by - size));
+            dot.line_to(point(bx + size, by - size));
+            dot.line_to(point(bx + size, by + size));
+            dot.line_to(point(bx - size, by + size));
+            if let Ok(path) = dot.build() {
+                window.paint_path(
+                    path,
+                    rgba(RADAR_CYAN.with_alpha((40.0 + 200.0 * glow) as u8)),
+                );
+            }
+        }
     }
     // The needle, at north, in the console's own ink and NOT the accent.
     let mut shaft = PathBuilder::stroke(px(1.6));
@@ -4339,6 +4509,13 @@ impl IslandDemo {
             },
             login_busy: std::env::var("TFG_SIGNIN").unwrap_or_default() == "busy",
             scope_anim: None,
+            // `TFG_SIGNIN=busy` seeds the ROUND TRIP, so the beam is out for
+            // the capture the same way it is out for the operator: a picture
+            // of a lit scope with no sweep would be a picture of a state the
+            // card is never in.
+            login_scan: (std::env::var("TFG_SIGNIN").unwrap_or_default() == "busy")
+                .then(std::time::Instant::now),
+            reduce_motion: std::env::var("TFG_REDUCED_MOTION").as_deref() == Ok("1"),
             scope_lit: 0.0,
             scope_bright: 0.0,
             scope_hover: false,
@@ -4625,6 +4802,9 @@ impl IslandDemo {
             embarked: HashMap::new(),
             embark_over: HashMap::new(),
             embark_caps: HashMap::new(),
+            runner_role: None,
+            runner_asked: None,
+            runner_ready: None,
             register_carries: HashMap::new(),
             register_carries_asked: Vec::new(),
             // ON, because a parent's boats are the deployment the operator
@@ -5616,6 +5796,7 @@ impl IslandDemo {
         self.live.clear();
         self.helm_status = None;
         self.login_busy = false;
+        self.login_scan = None;
         self.login_password.clear();
         // The panel's TITLE BAND says the state — `signed out` is the word
         // the band carries — so the status line stays empty. A green
@@ -12187,6 +12368,118 @@ impl IslandDemo {
         }
     }
 
+    /// ASK WHICH ROLE RUNS THIS EXERCISE, once per draft.
+    fn runs_exercise_look(&mut self, game: Option<i64>) {
+        let asked = self.runner_asked;
+        if asked == Some(game) {
+            return;
+        }
+        self.runner_asked = Some(game);
+        let _ = self.order_tx.send(ToBinary::ReadRunsExercise { game });
+    }
+
+    /// THE ANSWER: the role the matrix lets send a transition.
+    ///
+    /// The operator who opened this draft is seated in it, if they are not
+    /// seated already — a game saved without one can never leave planning,
+    /// because Minos refuses the transition to a seat that does not hold it.
+    /// Seating them is the console's job because it is the console's creator:
+    /// the server seats nobody on create, not even the account that asked.
+    fn apply_runs_exercise(
+        &mut self,
+        outcome: Result<Option<crate::backend::GameRole>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(role) = outcome else {
+            cx.notify();
+            return;
+        };
+        self.runner_ready = Some(role.is_some());
+        if role.is_some() {
+            self.runner_role = role;
+        }
+        self.claim_organizer_seat(cx);
+        cx.notify();
+    }
+
+    /// Seat the account that opened the draft in the role that runs it.
+    ///
+    /// A SEAT IN THE DRAFT, not a write: the press writes it with the rest of
+    /// the roster (position 02), and the game is created with somebody able to
+    /// drive it. Three rules:
+    ///
+    /// - never touch a seat the operator already has, on the server or in the
+    ///   draft;
+    /// - prefer the role the matrix names, and fall back to the deployment's
+    ///   own words for it (`Game Master`, `Penyelenggara`) when the matrix has
+    ///   not answered yet, so the seat exists the moment the draft does;
+    /// - say so on the footer, because a seat that appears by itself is a
+    ///   decision the operator should be able to see.
+    fn claim_organizer_seat(&mut self, cx: &mut Context<Self>) {
+        let me = self.session.me;
+        if me == 0 {
+            return;
+        }
+        let Some(draft) = &self.flow_draft else {
+            return;
+        };
+        // A SEAT THE SERVER HOLDS IS NOT MINE TO CHANGE. The operator may be
+        // seated as a Commando on purpose; the creator's seat is only filled
+        // when there is none.
+        if draft.roster.is_on_server(me) {
+            return;
+        }
+        let roles = self.flow_roles();
+        if roles.is_empty() {
+            return;
+        }
+        // The matrix's answer, then the deployment's own words for it.
+        let chosen = self
+            .runner_role
+            .as_ref()
+            .and_then(|role| {
+                roles
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&role.name))
+                    .cloned()
+            })
+            .or_else(|| {
+                const WORDS: [&str; 4] = ["game master", "penyelenggara", "direktur", "director"];
+                WORDS.iter().find_map(|word| {
+                    roles
+                        .iter()
+                        .find(|(name, _)| name.to_lowercase() == *word)
+                        .cloned()
+                })
+            });
+        let Some((role_name, judge)) = chosen else {
+            return;
+        };
+        // ALREADY SEATED IN THAT ROLE: nothing to do. Seated in another and
+        // the matrix has spoken: the guess is replaced, because the guess was
+        // a placeholder for exactly this answer.
+        let current = draft
+            .roster
+            .staged()
+            .find(|seat| seat.user_id == me)
+            .map(|seat| seat.role_name.clone());
+        match current {
+            Some(name) if name.eq_ignore_ascii_case(&role_name) => return,
+            Some(name) if self.runner_role.is_none() => {
+                let _ = name;
+                return;
+            }
+            _ => {}
+        }
+        let name = self.own_name();
+        let shown = role_name.clone();
+        self.seat_person(me, &name, &role_name, judge, cx);
+        self.flow_drop_note = Some(format!(
+            "{} SEATED AS {shown} \u{b7} THE CREATOR RUNS THE EXERCISE",
+            name.to_uppercase()
+        ));
+    }
+
     /// Flip ONE hull's choice, and stage or unstage what it means.
     ///
     /// The toggle in the picker is the default for the next deployment; this
@@ -16750,6 +17043,7 @@ impl IslandDemo {
     /// does not have to guess at.
     fn scope_ease_to(&mut self) {
         let (lit, bright) = self.scope_levels();
+        let sweep = self.login_sweep();
         let to_lit = if self.login_busy { 1.0 } else { 0.0 };
         let armed = !self.login_identifier.is_empty() && !self.login_password.is_empty();
         let to_bright = if armed || self.scope_hover { 1.0 } else { 0.0 };
@@ -16763,6 +17057,60 @@ impl IslandDemo {
             to_bright,
             at: std::time::Instant::now(),
         });
+    }
+
+    /// WHERE THE BEAM IS, in degrees clockwise from north, while a sign-in is
+    /// in flight. `None` at rest.
+    ///
+    /// 150°/s: one turn every 2.4 seconds. A spinner's pace reads as "the
+    /// interface is busy"; a slow sweep reads as a sensor doing its work, and
+    /// the card is a sensor's face.
+    fn login_sweep(&self) -> Option<f32> {
+        if self.reduce_motion {
+            return None;
+        }
+        let at = self.login_scan?;
+        Some((at.elapsed().as_secs_f32() * 150.0).rem_euclid(360.0))
+    }
+
+    /// THE LINK'S OWN LINE: what the card says about the wire, in the
+    /// instrument's voice rather than a sentence.
+    ///
+    /// Four states and no fifth: the beam is out (and where it points), the
+    /// answer was a refusal, the door is armed, or the card is still waiting
+    /// for one of two credentials. A sentence would say the same thing in more
+    /// words and take the eye the scope needs.
+    fn link_readout(&self) -> (String, Rgba) {
+        if self.login_busy {
+            let bearing = self
+                .login_sweep()
+                .map(|deg| format!(" \u{b7} {:03}\u{b0}", deg as i32))
+                .unwrap_or_default();
+            return (format!("link out{bearing}"), RADAR_CYAN);
+        }
+        if self.login_status.is_fault() {
+            return ("link refused".to_string(), FAULT_RED);
+        }
+        let filled = [&self.login_identifier, &self.login_password]
+            .iter()
+            .filter(|text| !text.is_empty())
+            .count();
+        match filled {
+            2 => ("link ready".to_string(), SIGNAL_GREEN),
+            n => (format!("link idle \u{b7} {n} of 2"), BUTTON_LABEL),
+        }
+    }
+
+    /// Keep the beam turning.
+    ///
+    /// The console's frame loop is the map's — a frame every half second on a
+    /// software rasteriser — so the sweep asks for frames of its own while it
+    /// has somewhere to go. The moment the answer lands `login_scan` is
+    /// cleared, and this stops asking: nothing on this card animates at rest.
+    fn advance_login_scan(&mut self, window: &mut Window) {
+        if self.login_scan.is_some() && !self.reduce_motion {
+            window.request_animation_frame();
+        }
     }
 
     /// Keep the scope's settle moving.
@@ -21920,6 +22268,7 @@ impl IslandDemo {
         // choose between, and an operator is not asked to pick a button
         // out of a row.
         let (lit, bright) = self.scope_levels();
+        let sweep = self.login_sweep();
         // The verb, under the radar it belongs to.
         //
         // The plain SIGN IN slab is gone, so the scope IS the verb — but a
@@ -21972,7 +22321,7 @@ impl IslandDemo {
                                 canvas(
                                     |bounds, _, _| bounds,
                                     move |bounds, _, window, _| {
-                                        paint_scope(window, bounds, lit, bright);
+                                        paint_scope(window, bounds, lit, bright, sweep);
                                     },
                                 )
                                 .size_full(),
@@ -21980,6 +22329,26 @@ impl IslandDemo {
                     )
                     .child(caption),
             ),
+        );
+        // THE INSTRUMENT'S FOOT: a rule, the link's own line, and the key that
+        // does what the scope does. A card that ends on a floating circle has
+        // no bottom; a card that ends on a readout is a panel.
+        let (link, ink) = self.link_readout();
+        body = body.child(div().h(px(1.0)).w_full().bg(rgba(HAIRLINE_SLATE)));
+        body = body.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .h(px(16.0))
+                .child(tracked(&link, view::LABEL_PT, ink))
+                .child(kit::machine(
+                    "ENTER \u{21b5} SIGN IN",
+                    view::LABEL_PT,
+                    kit::MUTED_INK,
+                )),
         );
 
         div()
@@ -22222,7 +22591,10 @@ impl IslandDemo {
         self.login_busy = true;
         self.login_status = Status::pending("signing in\u{2026}".to_string());
         // The scope LIGHTS: the round trip is in the air, and the scope is
-        // the only thing on this card that can say so.
+        // the only thing on this card that can say so. And it SWEEPS: the
+        // beam starts at the instant of the press, so the instrument shows
+        // the wait rather than merely being lit through it.
+        self.login_scan = Some(std::time::Instant::now());
         self.scope_ease_to();
         let _ = self.order_tx.send(ToBinary::SignIn {
             identifier: self.login_identifier.clone(),
@@ -25637,6 +26009,14 @@ impl IslandDemo {
                 if let Some(draft) = crate::draft::Draft::blank(mode) {
                     self.stage_one_reached = 1;
                     self.flow_draft = Some(draft);
+                    // THE CREATOR RUNS WHAT THEY CREATE. The server seats
+                    // nobody on create — not even the account that asked — and
+                    // a game whose Game Master seat is empty can never leave
+                    // planning: the transition is refused. So the seat is
+                    // staged here, from the role the matrix names, and the
+                    // press writes it with the roster.
+                    self.runs_exercise_look(None);
+                    self.claim_organizer_seat(cx);
                 }
             }
             crate::landing::Proceed::SavedScenario(mission_id) => {
@@ -26083,6 +26463,25 @@ impl IslandDemo {
             return;
         };
         if self.press_busy {
+            return;
+        }
+        // THE ONLY WRITE THAT NEEDS A SEAT THE OPERATOR MAY NOT HAVE.
+        //
+        // A transition is authorised by the policy on the seat's role, and a
+        // deployment can have no role that holds it. Finding that out at
+        // position 08 costs seven writes that cannot be rolled back, so the
+        // press refuses WHOLE and says what an administrator has to fix. A
+        // read that never answered is not a refusal: the server decides.
+        if verb == crate::draft::Verb::PlayDirectly && self.runner_ready == Some(false) {
+            self.flow_verb = verb;
+            self.flow_drop_note = Some(
+                "NO ROLE HERE RUNS AN EXERCISE \u{b7} MINOS REFUSES THE TRANSITION (403) TO EVERY \
+                 SEAT, AND NOTHING WAS WRITTEN \u{b7} AN ADMINISTRATOR GRANTS \
+                 /games/transitions TO THE ROLE THAT DRIVES THE EXERCISE"
+                    .to_string(),
+            );
+            crate::sfx::play(crate::sfx::Sfx::Buzz);
+            cx.notify();
             return;
         }
         // A VERB THAT CANNOT RUN IS DISABLED AND SAYS WHY, and the button does
@@ -35553,11 +35952,13 @@ impl Render for IslandDemo {
         // lift it.
         if !self.session.signed_in {
             self.advance_theatre_fade(window);
-            // The scope settles on its own clock, and the caret blinks on
-            // its own clock. Both are on the signed-out surface only: a
-            // signed-in console has neither, and asking for frames it has
-            // nothing to draw is the machine spending itself for nothing.
+            // The scope settles on its own clock, the beam turns on its own
+            // while a sign-in is out, and the caret blinks on its own. All
+            // three are on the signed-out surface only: a signed-in console
+            // has none of them, and asking for frames it has nothing to draw
+            // is the machine spending itself for nothing.
             self.advance_scope_ease(window);
+            self.advance_login_scan(window);
         }
         // The raw frame is already paintable — nothing to wait for, so this
         // is a swap, not a gate. A promotion that needed a decode would not
@@ -39521,6 +39922,14 @@ pub enum ToBinary {
     /// console stages the moment a parent is dropped, before any write
     /// exists to read back. Asked once per hull and cached.
     ReadRegisterCarries { unit: i64 },
+    /// WHICH ROLE RUNS AN EXERCISE, by the server's own matrix
+    /// (`GET /game-roles`, then each role's `/permissions`).
+    ///
+    /// The transition to preparation is authorised by the game-domain policy
+    /// on the seat's role, so "who may drive" is a question about a role and
+    /// not about a name. The console asks it once per draft, and seats the
+    /// operator who created the game in the answer.
+    ReadRunsExercise { game: Option<i64> },
     /// One hull's published figures, read from the server.
     ///
     /// The details panel asks for the hull it is about. The figures are
@@ -40452,6 +40861,11 @@ pub type EmbarkedFeed = std::boxed::Box<
 /// feeds. The hull rides the answer back for the same reason the embarked
 /// read does: a slow answer must be filed under the hull that was asked
 /// about, never under whatever the panel shows now.
+/// The role that runs the exercise, drained like the other feeds.
+pub type RunsExerciseFeed = std::boxed::Box<
+    dyn FnMut() -> Option<Result<Option<crate::backend::GameRole>, String>> + Send + 'static,
+>;
+
 pub type RegisterCarriesFeed = std::boxed::Box<
     dyn FnMut() -> Option<Result<(i64, Vec<crate::backend::EmbarkedUnit>), String>>
         + Send
@@ -43029,6 +43443,7 @@ pub fn run_replay(dir: String, burst_ms: u64, looping: bool) {
         std::boxed::Box::new(|| None),
         std::boxed::Box::new(|| None),
         std::boxed::Box::new(|| None),
+        std::boxed::Box::new(|| None),
         // The replay has no room behind it: a PNG directory is not a
         // preparation card.
         std::boxed::Box::new(|| None),
@@ -43064,6 +43479,7 @@ pub fn run(
     mut clock_feed: ClockFeed,
     mut embarked_feed: EmbarkedFeed,
     mut register_carries_feed: RegisterCarriesFeed,
+    mut runs_exercise_feed: RunsExerciseFeed,
     mut embark_write_feed: EmbarkWriteFeed,
     mut embark_spec_feed: EmbarkSpecFeed,
     mut thumb_feed: ThumbFeed,
@@ -43224,6 +43640,7 @@ pub fn run(
             let clock_drain = entity.clone();
             let embarked_drain = entity.clone();
             let register_carries_drain = entity.clone();
+            let runs_exercise_drain = entity.clone();
             let embark_write_drain = entity.clone();
             let embark_spec_drain = entity.clone();
             let thumb_drain = entity.clone();
@@ -43345,6 +43762,11 @@ pub fn run(
                         let _ = cx.update(|app| {
                             signin_drain.update(app, |root: &mut IslandDemo, cx| {
                                 root.login_busy = false;
+                                // The beam stops with the answer: a scope still
+                                // turning after a refusal is a card still
+                                // saying "working" about a round trip that is
+                                // over.
+                                root.login_scan = None;
                                 // The scope goes dark again: the link is down
                                 // whatever the answer was, and a scope still
                                 // lit after a refusal would be lying about the
@@ -43540,6 +43962,16 @@ pub fn run(
                             })
                         });
                     }
+                    // Which role runs this exercise: the one the server's
+                    // matrix lets send a transition.
+                    if let Some(outcome) = runs_exercise_feed() {
+                        let _ = cx.update(|app| {
+                            runs_exercise_drain.update(app, |root: &mut IslandDemo, cx| {
+                                root.apply_runs_exercise(outcome, cx);
+                                cx.notify();
+                            })
+                        });
+                    }
                     // What the register says one hull carries: the children a
                     // deployment stages beside her.
                     if let Some(outcome) = register_carries_feed() {
@@ -43572,6 +44004,122 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE LINK'S LINE SAYS THE STATE ONCE, in the instrument's voice, and
+    /// it is what the card's foot reads.
+    #[gpui::test]
+    fn the_sign_in_foot_reads_the_link(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                assert_eq!(demo.link_readout().0, "link idle \u{b7} 0 of 2");
+                demo.login_identifier = "super".to_string();
+                assert_eq!(demo.link_readout().0, "link idle \u{b7} 1 of 2");
+                demo.login_password = "secret".to_string();
+                assert_eq!(demo.link_readout().0, "link ready");
+
+                // The beam is out: the line carries where it points.
+                demo.login_busy = true;
+                demo.login_scan = Some(std::time::Instant::now());
+                let (line, ink) = demo.link_readout();
+                assert!(line.starts_with("link out"), "{line}");
+                assert_eq!(ink, RADAR_CYAN);
+
+                // Refused: the one state read from the answer rather than
+                // from the wire.
+                demo.login_busy = false;
+                demo.login_scan = None;
+                demo.login_status = Status::bad("no".to_string());
+                assert_eq!(demo.link_readout(), ("link refused".to_string(), FAULT_RED));
+            })
+        });
+    }
+
+    /// THE BEAM ONLY TURNS WHILE A SIGN-IN IS OUT, and never for an operator
+    /// who asked for less motion.
+    #[gpui::test]
+    fn the_sweep_runs_only_in_flight(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 0, 0, SessionView::default(), tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, _| {
+                assert!(demo.login_sweep().is_none(), "at rest, nothing moves");
+                demo.login_scan = Some(std::time::Instant::now());
+                assert!(demo.login_sweep().is_some(), "a round trip sweeps");
+                demo.reduce_motion = true;
+                assert!(demo.login_sweep().is_none(), "and still means still");
+                demo.reduce_motion = false;
+                demo.login_scan = None;
+                assert!(demo.login_sweep().is_none(), "the answer stops the beam");
+            })
+        });
+    }
+
+    /// THE CREATOR IS SEATED IN THE ROLE THAT RUNS THE EXERCISE, locally,
+    /// the moment they open a blank draft.
+    ///
+    /// Minos seats nobody on create — not even the account that asked — and a
+    /// game whose Game Master seat is empty can never leave planning: the
+    /// transition is refused 403. So the seat is a draft edit, written by the
+    /// press with the roster, and it is made from the deployment's own words
+    /// for the role when the permission matrix has not answered yet.
+    #[gpui::test]
+    fn opening_a_blank_draft_seats_the_creator_as_its_runner(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut session = SessionView::default();
+        session.me = 7;
+        session.people = vec![PersonView {
+            id: 7,
+            name: "Super User".to_string(),
+            call_sign: "SU".to_string(),
+            role: String::new(),
+            role_id: 0,
+            judge: false,
+            ready: false,
+            present: true,
+        }];
+        session.roles = vec![
+            RoleRow {
+                id: 1,
+                name: "Commando".to_string(),
+                judge: false,
+            },
+            RoleRow {
+                id: 2,
+                name: "Penyelenggara".to_string(),
+                judge: false,
+            },
+        ];
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 7, 0, session, tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.landing
+                    .choose_mode(crate::gamestate::GameMode::Maneuver);
+                demo.landing
+                    .choose_start_from(crate::landing::StartFrom::Blank);
+                demo.proceed_pressed(cx);
+                let draft = demo.flow_draft.as_ref().expect("a blank draft");
+                let seat = draft
+                    .roster
+                    .staged()
+                    .find(|seat| seat.user_id == 7)
+                    .expect("the creator holds a seat");
+                assert_eq!(seat.role_name, "Penyelenggara", "the role that runs it");
+                assert!(demo
+                    .flow_drop_note
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("THE CREATOR RUNS THE EXERCISE"));
+            })
+        });
+    }
 
     /// THE THREE LANDINGS, in the operator's words.
     ///
@@ -43663,7 +44211,9 @@ mod tests {
             assert!(
                 matches!(
                     msg,
-                    ToBinary::ReadRegisterCarries { .. } | ToBinary::ReadEmbarkSpec { .. }
+                    ToBinary::ReadRegisterCarries { .. }
+                        | ToBinary::ReadEmbarkSpec { .. }
+                        | ToBinary::ReadRunsExercise { .. }
                 ),
                 "{what}: {msg:?}"
             );
@@ -48933,10 +49483,7 @@ mod tests {
                 assert_eq!(demo.flow_stage, crate::draft::Stage::Essentials);
             })
         });
-        assert!(
-            rx.try_recv().is_err(),
-            "no hold: the press never asked for the console"
-        );
+        assert_no_writes(&rx, "no hold: the press never asked for the console");
     }
 
     /// ELEVEN WELLS, TEN ROWS. `ACTUAL START` is a day and a time, kept apart

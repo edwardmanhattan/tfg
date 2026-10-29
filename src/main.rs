@@ -583,6 +583,10 @@ fn main() {
     // deployment is about to bring with it, so it is read before the press.
     let (register_carries_tx, register_carries_rx) =
         mpsc::channel::<Result<(i64, Vec<tfg::backend::EmbarkedUnit>), String>>();
+    // WHICH ROLE RUNS THE EXERCISE. The matrix is the server's, so the answer
+    // is a read: the role whose permissions carry `/games/transitions`.
+    let (runs_exercise_tx, runs_exercise_rx) =
+        mpsc::channel::<Result<Option<tfg::backend::GameRole>, String>>();
     // One hull's published FIGURES, read when the details panel points at
     // it. Its own channel, because the answer is a read with no error
     // shape of its own: a hull with no published specification is not a
@@ -2235,6 +2239,45 @@ fn main() {
                             return;
                         }
                     }
+                    tfg::shell_gpui::ToBinary::ReadRunsExercise { game } => {
+                        // WHICH ROLE MAY MOVE THE EXERCISE. A game's roles are
+                        // its own copies (ids do not overlap with the
+                        // templates), so a held game is read from its own
+                        // list; a blank draft seats from the templates, which
+                        // the press resolves by NAME against the game it
+                        // creates.
+                        let outcome = if token2.is_empty() {
+                            Err("signed out \u{2014} sign in to read the roles".to_string())
+                        } else {
+                            match tfg::backend::MinosMaster::new(&host2) {
+                                Ok(master) => {
+                                    let roles = match game {
+                                        Some(id) => master.game_roles(&token2, id),
+                                        None => master.game_role_templates(&token2),
+                                    };
+                                    match roles {
+                                        Ok(roles) => {
+                                            let runner =
+                                                master.runs_the_exercise_role(&token2, &roles);
+                                            if runner.is_none() {
+                                                eprintln!(
+                                                    "roles: none of {} holds /games/transitions \
+                                                     \u{2014} nobody can drive this exercise",
+                                                    roles.len()
+                                                );
+                                            }
+                                            Ok(runner)
+                                        }
+                                        Err(e) => Err(format!("roles failed: {e}")),
+                                    }
+                                }
+                                Err(e) => Err(format!("could not reach the server: {e}")),
+                            }
+                        };
+                        if runs_exercise_tx.send(outcome).is_err() {
+                            return;
+                        }
+                    }
                     tfg::shell_gpui::ToBinary::ReadRegisterCarries { unit } => {
                         // What the REGISTER says a hull carries — the
                         // pre-embarked units a deployment brings aboard her.
@@ -3138,6 +3181,8 @@ fn main() {
         std::boxed::Box::new(move || embarked_rx.try_recv().ok());
     let register_carries_feed: tfg::shell_gpui::RegisterCarriesFeed =
         std::boxed::Box::new(move || register_carries_rx.try_recv().ok());
+    let runs_exercise_feed: tfg::shell_gpui::RunsExerciseFeed =
+        std::boxed::Box::new(move || runs_exercise_rx.try_recv().ok());
     let spec_feed: tfg::shell_gpui::SpecFeed =
         std::boxed::Box::new(move || spec_rx.try_recv().ok());
     let embark_write_feed: tfg::shell_gpui::EmbarkWriteFeed =
@@ -3551,6 +3596,7 @@ fn main() {
         clock_feed,
         embarked_feed,
         register_carries_feed,
+        runs_exercise_feed,
         embark_write_feed,
         embark_spec_feed,
         thumb_feed,

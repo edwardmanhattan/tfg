@@ -948,6 +948,46 @@ impl MinosMaster {
         Ok(Self::parse_units(&data))
     }
 
+    /// WHETHER ONE ROLE holds the transition grant, by the server's own matrix.
+    ///
+    /// Minos authorises a transition through the GAME-DOMAIN policy
+    /// `game_role:<id>, *, /games/transitions, transition` — role ids are per
+    /// game, and the policy is seeded onto the role named `Game Master` and
+    /// cloned into every game with it. So "who runs this exercise" is a
+    /// question the matrix answers, and a client that guesses by name is one
+    /// rename away from seating nobody who can drive.
+    pub fn role_may_transition(
+        &self,
+        token: &str,
+        role_id: i64,
+    ) -> Option<bool> {
+        let data = self
+            .get(token, &format!("/game-roles/{role_id}/permissions"))
+            .ok()?;
+        let permissions = data["permissions"].as_array()?;
+        Some(permissions.iter().any(|p| {
+            p["object"].as_str() == Some("/games/transitions")
+                && p["action"].as_str() == Some("transition")
+        }))
+    }
+
+    /// THE ROLE THAT RUNS AN EXERCISE, out of the roles a seat may hold.
+    ///
+    /// The first role whose matrix carries the transition grant. `None` when
+    /// none does — a deployment whose `Game Master` role was stripped of it,
+    /// which is a fact the console should say rather than paper over with a
+    /// name it remembers.
+    pub fn runs_the_exercise_role(
+        &self,
+        token: &str,
+        roles: &[GameRole],
+    ) -> Option<GameRole> {
+        roles
+            .iter()
+            .find(|role| self.role_may_transition(token, role.id) == Some(true))
+            .cloned()
+    }
+
     /// WHETHER THIS ACCOUNT MAY MOVE THIS GAME — the server's own question,
     /// asked BEFORE the transition is sent.
     ///
