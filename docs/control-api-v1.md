@@ -79,9 +79,10 @@ clients talk to the host, and the host talks to Minos.
   version to speak.
 - A command whose `protocol_version` is not `2` is refused with
   `409 unsupported_protocol`. Being misread is worse than being refused.
-- v2 is a clean break: the snapshot carries `session`, `readiness` and
-  `displays`, the wire has one more event (`session.changed`), and `observer`
-  exists as a second view. Every client in this repository moved together, and
+- v2 is a clean break: the snapshot carries `session`, `readiness`,
+  `displays` and the host's `settings`, the wire has two more events
+  (`session.changed`, `settings.changed`), and `observer` exists as a second
+  view. Every client in this repository moved together, and
   an old client is expected to fail loudly rather than half-work.
 
 ## Authentication and scopes
@@ -499,8 +500,13 @@ addressed to a view and needs no readiness.
 
 - `step` is `0..=3` (`Small`, `Normal`, `Large`, `Largest`); anything else is
   `422`.
-- The console applies it and remembers it in `settings.json`; a headless host
-  records it so a client can read what the wall would use.
+- The console applies it and remembers it in `settings.json`. **Every attached
+  command center applies it too**, from the `settings.changed` event, so a
+  phone's command moves the wall it is watching and not only the operator's
+  window. A headless host records it for `GET /v1/settings`.
+- It is state, not a local preference: the change spends a revision, rides the
+  snapshot, and is published to every watcher. Re-sending the step already in
+  force is accepted and changes nothing.
 - It needs `control_view`.
 
 ```json
@@ -691,6 +697,7 @@ On connect the server sends the whole state, then one event per change:
 | `snapshot` | The whole state at `revision`: views, session, readiness, displays. Sent on connect, and again after a gap. |
 | `camera.changed` | A camera moved. `view.id` says which one. `source` names the client, or `desktop` for the operator's own gesture. `command_id` is present when a command caused it. |
 | `session.changed` | The exercise, its phase, its units, the readiness verdict, the attached displays, or the observer's windows changed. One event, because they all answer the same question: may I steer, and what am I looking at? `ui` carries the open windows and the focused hull. |
+| `settings.changed` | The host's text size changed. Carries `settings.step` and the resolved `text_scale`; every surface that draws type redraws at it. The same object rides `snapshot`. |
 | `display.attached` | This socket's `display.hello` was accepted. Carries the id the host recorded. |
 | `display.rejected` | This socket's `display.hello` was refused (a phone without `admin`, a bad role). The socket stays open. |
 | `command.accepted` | A command reached the host. The evidence that it *worked* is the `camera.changed` that follows. |

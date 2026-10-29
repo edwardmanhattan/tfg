@@ -303,6 +303,9 @@
         },
         {
           "$ref": "#/$defs/event_display_rejected"
+        },
+        {
+          "$ref": "#/$defs/event_settings_changed"
         }
       ]
     },
@@ -350,6 +353,9 @@
         },
         "ui": {
           "$ref": "#/$defs/observer_ui"
+        },
+        "settings": {
+          "$ref": "#/$defs/settings"
         }
       }
     },
@@ -924,6 +930,27 @@
         "content": {"type": "string"},
         "at": {"type": "string"},
         "degree": {"type": "string"}
+      }
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["step", "text_scale"],
+      "description": "The host's text size: one setting, host-wide, that the console and every attached wall draw at.",
+      "properties": {
+        "step": {"type": "integer", "minimum": 0, "maximum": 3},
+        "text_scale": {"type": "number", "minimum": 1.0, "maximum": 1.45}
+      }
+    },
+    "event_settings_changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "revision", "settings"],
+      "description": "The host's text size changed. Every surface that draws type redraws at the new step.",
+      "properties": {
+        "type": {"const": "settings.changed"},
+        "revision": {"type": "integer", "minimum": 0},
+        "settings": {"$ref": "#/$defs/settings"}
       }
     },
     "observer_ui": {

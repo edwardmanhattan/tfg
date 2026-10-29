@@ -676,6 +676,9 @@ impl Session {
             // exercise, not to one that follows another. A follower keeps
             // showing the camera it was given.
             Event::SessionChanged { .. } => {}
+            // The reader applies the text size itself; the client's job is to
+            // hand it the event, which it does above.
+            Event::SettingsChanged { .. } => {}
             Event::DisplayAttached { id } => {
                 self.attached = Some(id);
                 self.last_beat = Instant::now();

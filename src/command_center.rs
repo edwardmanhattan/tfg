@@ -32,8 +32,8 @@ use gpui::{
 
 use crate::control::{
     AcceptedCommand, CameraSnapshot, ClientConfig, ClientHandle, Command, DisplayHello, Event,
-    GeoPoint, OBSERVER_VIEW, ObserverUi, Readiness, ReadinessReason, SessionState, UnitState,
-    ViewState, spawn_client,
+    GeoPoint, OBSERVER_VIEW, ObserverUi, Readiness, ReadinessReason, SessionState, SettingsState,
+    UnitState, ViewState, spawn_client,
 };
 use crate::map_gate::FrameSlot;
 use crate::map_geometry;
@@ -361,6 +361,21 @@ impl CommandCenter {
         }
     }
 
+    /// THE HOST'S TEXT SIZE, applied before the next frame.
+    ///
+    /// Every size the wall draws goes through [`ts`], so one step moves the
+    /// strip, the three windows and the unit card together — the same rule
+    /// the console follows for its own window. The scale is a process-wide
+    /// atomic because that is what the console's ladder is; this display is
+    /// its own process, so nothing else reads it.
+    fn note_settings(&mut self, settings: SettingsState) {
+        let scale = view::text_scale_at(settings.step);
+        if (view::text_scale() - scale).abs() < f32::EPSILON {
+            return;
+        }
+        view::set_text_scale(scale);
+    }
+
     /// Everything that can change without a gesture: the host's events, the
     /// camera a phone moved, and the newest picture. Called on a timer, which
     /// is why it drains rather than waits.
@@ -373,12 +388,14 @@ impl CommandCenter {
                     session,
                     readiness,
                     ui,
+                    settings,
                     ..
                 } => {
                     self.note_positions(session.as_ref());
                     self.session = session;
                     self.readiness = readiness;
                     self.ui = ui;
+                    self.note_settings(settings);
                     if let Some(view) = views
                         .get(OBSERVER_VIEW)
                         .or_else(|| views.get(crate::control::MAIN_VIEW))
@@ -397,6 +414,7 @@ impl CommandCenter {
                     self.readiness = readiness;
                     self.ui = ui;
                 }
+                Event::SettingsChanged { settings, .. } => self.note_settings(settings),
                 Event::CameraChanged { view, .. } => {
                     if view.id == OBSERVER_VIEW {
                         self.follow(&view);
@@ -777,17 +795,19 @@ impl CommandCenter {
         win_w: f32,
         win_h: f32,
     ) -> gpui::AnyElement {
-        const W: f32 = 300.0;
-        const H: f32 = 208.0;
+        // THE CARD IS SIZED TO ITS TYPE, as the console's column is: a bigger
+        // step needs a wider card, or the rows wrap and the value column
+        // breaks. The offsets around it follow the same number.
+        let (w, h) = (ts(300.0), ts(208.0));
         // Beside the mark, flipped when that side has no room, and clamped so
         // a small window can never push the card past its edge.
-        let left = (if at.0 + 24.0 + W > win_w {
-            at.0 - 24.0 - W
+        let left = (if at.0 + 24.0 + w > win_w {
+            at.0 - 24.0 - w
         } else {
             at.0 + 24.0
         })
-        .clamp(8.0, (win_w - W - 8.0).max(8.0));
-        let top = (at.1 - H / 2.0).clamp(72.0, (win_h - H - 8.0).max(72.0));
+        .clamp(8.0, (win_w - w - 8.0).max(8.0));
+        let top = (at.1 - h / 2.0).clamp(72.0, (win_h - h - 8.0).max(72.0));
         let step = self
             .session
             .as_ref()
@@ -828,7 +848,7 @@ impl CommandCenter {
                 .child(
                     div()
                         .font_family("PT Mono")
-                        .text_size(px(10.0))
+                        .text_size(px(ts(10.0)))
                         .text_color(crate::ink::rgba(view::BODY_SILVER))
                         .child(label),
                 )
@@ -837,7 +857,7 @@ impl CommandCenter {
                         .flex_1()
                         .text_right()
                         .font_family("Saira Condensed")
-                        .text_size(px(13.0))
+                        .text_size(px(ts(13.0)))
                         .text_color(crate::ink::rgba(view::MAP_INK))
                         .child(value),
                 )
@@ -846,7 +866,7 @@ impl CommandCenter {
             .absolute()
             .left(px(left))
             .top(px(top))
-            .w(px(W))
+            .w(px(w))
             .border_1()
             .border_color(crate::ink::rgba(view::RADAR_CYAN.with_alpha(160)))
             .bg(crate::ink::rgba(view::PANEL_SLATE.with_alpha(238)))
@@ -864,14 +884,14 @@ impl CommandCenter {
                     .child(
                         div()
                             .font_family("Saira Condensed")
-                            .text_size(px(11.0))
+                            .text_size(px(ts(11.0)))
                             .text_color(crate::ink::rgba(view::RADAR_CYAN))
                             .child(format!("UNIT {}", unit.index)),
                     )
                     .child(
                         div()
                             .font_family("PT Mono")
-                            .text_size(px(10.0))
+                            .text_size(px(ts(10.0)))
                             .text_color(crate::ink::rgba(view::BODY_SILVER))
                             .child(unit.hull_number.clone()),
                     ),
@@ -885,14 +905,14 @@ impl CommandCenter {
                     .child(
                         div()
                             .font_family("Saira Condensed")
-                            .text_size(px(17.0))
+                            .text_size(px(ts(17.0)))
                             .text_color(crate::ink::rgba(view::MAP_INK))
                             .child(unit.name.clone()),
                     )
                     .child(
                         div()
                             .font_family("Saira Condensed")
-                            .text_size(px(11.0))
+                            .text_size(px(ts(11.0)))
                             .text_color(crate::ink::rgba(view::BODY_SILVER))
                             .child(unit.class_name.clone()),
                     )
@@ -916,12 +936,12 @@ impl CommandCenter {
         }
         let mut column = div()
             .absolute()
-            .top(px(80.0))
-            .right(px(16.0))
-            .w(px(348.0))
+            .top(px(ts(80.0)))
+            .right(px(ts(16.0)))
+            .w(px(ts(348.0)))
             .flex()
             .flex_col()
-            .gap(px(12.0));
+            .gap(px(ts(12.0)));
         if open.crew {
             column = column.child(self.crew_panel(session));
         }
@@ -950,7 +970,7 @@ impl CommandCenter {
                     .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
                     .bg(crate::ink::rgba(view::CONSOLE_NIGHT))
                     .font_family("Saira Condensed")
-                    .text_size(px(11.0))
+                    .text_size(px(ts(11.0)))
                     .text_color(crate::ink::rgba(view::RADAR_CYAN))
                     .child(title),
             )
@@ -970,7 +990,7 @@ impl CommandCenter {
             body = body.child(
                 div()
                     .font_family("Saira Condensed")
-                    .text_size(px(12.0))
+                    .text_size(px(ts(12.0)))
                     .text_color(crate::ink::rgba(view::BODY_SILVER))
                     .child("no seats published"),
             );
@@ -994,7 +1014,7 @@ impl CommandCenter {
                         .child(
                             div()
                                 .font_family("Saira Condensed")
-                                .text_size(px(13.0))
+                                .text_size(px(ts(13.0)))
                                 .text_color(crate::ink::rgba(view::MAP_INK))
                                 .child(if person.name.trim().is_empty() {
                                     person.role.clone()
@@ -1005,7 +1025,7 @@ impl CommandCenter {
                         .child(
                             div()
                                 .font_family("PT Mono")
-                                .text_size(px(9.0))
+                                .text_size(px(ts(9.0)))
                                 .text_color(crate::ink::rgba(if person.judge {
                                     view::BODY_SILVER
                                 } else if person.ready {
@@ -1025,17 +1045,17 @@ impl CommandCenter {
                 .child(
                     div()
                         .font_family("PT Mono")
-                        .text_size(px(9.0))
+                        .text_size(px(ts(9.0)))
                         .text_color(crate::ink::rgba(view::BODY_SILVER))
                         .child(person.role.clone()),
                 );
             for hull in hulls {
                 row = row.child(
                     div()
-                        .max_w(px(320.0))
+                        .max_w(px(ts(320.0)))
                         .truncate()
                         .font_family("PT Mono")
-                        .text_size(px(9.5))
+                        .text_size(px(ts(9.5)))
                         .text_color(crate::ink::rgba(view::MAP_INK))
                         .child(hull),
                 );
@@ -1063,21 +1083,21 @@ impl CommandCenter {
             .child(
                 div()
                     .font_family("Saira Condensed")
-                    .text_size(px(14.0))
+                    .text_size(px(ts(14.0)))
                     .text_color(crate::ink::rgba(view::MAP_INK))
                     .child(title),
             )
             .child(
                 div()
                     .font_family("Saira Condensed")
-                    .text_size(px(12.0))
+                    .text_size(px(ts(12.0)))
                     .text_color(crate::ink::rgba(view::MAP_INK))
                     .child(step),
             )
             .child(
                 div()
                     .font_family("PT Mono")
-                    .text_size(px(9.5))
+                    .text_size(px(ts(9.5)))
                     .text_color(crate::ink::rgba(view::BODY_SILVER))
                     .child(format!(
                         "{} · {} · {}",
@@ -1096,7 +1116,7 @@ impl CommandCenter {
             body = body.child(
                 div()
                     .font_family("Saira Condensed")
-                    .text_size(px(12.0))
+                    .text_size(px(ts(12.0)))
                     .text_color(crate::ink::rgba(view::BODY_SILVER))
                     .child("no traffic in this exercise"),
             );
@@ -1122,7 +1142,7 @@ impl CommandCenter {
                             .child(
                                 div()
                                     .font_family("PT Mono")
-                                    .text_size(px(9.5))
+                                    .text_size(px(ts(9.5)))
                                     .text_color(crate::ink::rgba(view::RADAR_CYAN))
                                     .child(format!(
                                         "{}{}",
@@ -1133,7 +1153,7 @@ impl CommandCenter {
                             .child(
                                 div()
                                     .font_family("PT Mono")
-                                    .text_size(px(9.0))
+                                    .text_size(px(ts(9.0)))
                                     .text_color(crate::ink::rgba(view::BODY_SILVER))
                                     .child(format!("{} {time}", message.degree)),
                             ),
@@ -1141,7 +1161,7 @@ impl CommandCenter {
                     .child(
                         div()
                             .font_family("Saira Condensed")
-                            .text_size(px(12.0))
+                            .text_size(px(ts(12.0)))
                             .text_color(crate::ink::rgba(view::MAP_INK))
                             .child(message.content.clone()),
                     ),
@@ -1149,6 +1169,24 @@ impl CommandCenter {
         }
         self.panel_shell(title, body)
     }
+}
+
+/// The wall's own design units, at the host's text size.
+///
+/// THE WALL DRAWS THROUGH THE LADDER. Its literals were tuned at the ladder's
+/// DEFAULT step, so that step is the identity: a wall today looks exactly as
+/// it did, and a bigger step grows the type — and the boxes sized to it —
+/// without a second redesign. Without this the wall rendered at a fixed size
+/// no matter what `settings.font` said, which is the bug that made the phone's
+/// command look ignored.
+fn ts(points: f32) -> f32 {
+    scaled(points, view::text_scale())
+}
+
+/// [`ts`] with the scale passed in, so the arithmetic can be checked without
+/// moving the process-wide setting.
+fn scaled(points: f32, scale: f32) -> f32 {
+    points * scale / view::text_scale_at(view::TEXT_SCALE_DEFAULT)
 }
 
 /// The length, beam and whole-degree course a hull's photograph is drawn at,
@@ -1293,7 +1331,7 @@ impl Render for CommandCenter {
                     .justify_center()
                     .child(
                         div()
-                            .w(px(520.0))
+                            .w(px(ts(520.0)))
                             .border_1()
                             .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
                             .bg(crate::ink::rgba(view::PANEL_SLATE))
@@ -1306,7 +1344,7 @@ impl Render for CommandCenter {
                                     .border_b_1()
                                     .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
                                     .font_family("Saira Condensed")
-                                    .text_size(px(12.0))
+                                    .text_size(px(ts(12.0)))
                                     .text_color(crate::ink::rgba(view::RADAR_CYAN))
                                     .child(line),
                             )
@@ -1314,7 +1352,7 @@ impl Render for CommandCenter {
                                 div()
                                     .p(px(16.0))
                                     .font_family("Saira Condensed")
-                                    .text_size(px(16.0))
+                                    .text_size(px(ts(16.0)))
                                     .text_color(crate::ink::rgba(view::MAP_INK))
                                     .child(sentence),
                             )
@@ -1323,7 +1361,7 @@ impl Render for CommandCenter {
                                     .px(px(16.0))
                                     .pb(px(12.0))
                                     .font_family("PT Mono")
-                                    .text_size(px(11.0))
+                                    .text_size(px(ts(11.0)))
                                     .text_color(crate::ink::rgba(view::BODY_SILVER))
                                     .child(self.server.clone()),
                             ),
@@ -1360,8 +1398,8 @@ impl Render for CommandCenter {
                 .top(px(0.0))
                 .left(px(0.0))
                 .right(px(0.0))
-                .h(px(64.0))
-                .px(px(16.0))
+                .h(px(ts(64.0)))
+                .px(px(ts(16.0)))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -1377,14 +1415,14 @@ impl Render for CommandCenter {
                         .child(
                             div()
                                 .font_family("Saira Condensed")
-                                .text_size(px(20.0))
+                                .text_size(px(ts(20.0)))
                                 .text_color(crate::ink::rgba(view::MAP_INK))
                                 .child(title),
                         )
                         .child(
                             div()
                                 .font_family("Saira Condensed")
-                                .text_size(px(12.0))
+                                .text_size(px(ts(12.0)))
                                 .text_color(crate::ink::rgba(view::BODY_SILVER))
                                 .child(subtitle),
                         ),
@@ -1398,7 +1436,7 @@ impl Render for CommandCenter {
                         .child(
                             div()
                                 .font_family("PT Mono")
-                                .text_size(px(11.0))
+                                .text_size(px(ts(11.0)))
                                 .text_color(crate::ink::rgba(if self.ready() {
                                     view::SIGNAL_GREEN
                                 } else {
@@ -1409,7 +1447,7 @@ impl Render for CommandCenter {
                         .child(
                             div()
                                 .font_family("PT Mono")
-                                .text_size(px(11.0))
+                                .text_size(px(ts(11.0)))
                                 .text_color(crate::ink::rgba(view::BODY_SILVER))
                                 .child(format!("{units} \u{00b7} ZOOM {:.1}", self.camera.zoom)),
                         ),
@@ -1431,6 +1469,17 @@ mod tests {
             phase: phase.to_string(),
             ..SessionState::default()
         }
+    }
+
+    /// THE WALL DRAWS THROUGH THE LADDER, and the default step is the
+    /// identity: today's wall is unchanged, a bigger step grows the type.
+    #[test]
+    fn the_wall_scales_its_type_with_the_hosts_ladder() {
+        let default = view::text_scale_at(view::TEXT_SCALE_DEFAULT);
+        assert!((scaled(20.0, default) - 20.0).abs() < 1e-4);
+        let largest = view::text_scale_at(view::TEXT_SCALES.len() - 1);
+        assert!(scaled(20.0, largest) > 20.0);
+        assert!((scaled(20.0, largest) - 20.0 * largest / default).abs() < 1e-4);
     }
 
     /// The four reasons the plan's table names, plus the state before the host

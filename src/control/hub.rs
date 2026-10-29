@@ -27,7 +27,7 @@
 use super::protocol::{
     CameraSnapshot, CameraSource, Command, DisplayState, Event, GeoPoint, MAIN_VIEW,
     OBSERVER_VIEW, ObserverUi, PROTOCOL_VERSION, Panel, Readiness, ReadinessReason, SessionState,
-    ViewState,
+    SettingsState, ViewState,
 };
 use crate::map_geometry::pan_center;
 use crate::view::{ZOOM_MAX, ZOOM_MIN};
@@ -209,9 +209,44 @@ impl ControlHub {
         self.lock().text_scale_step
     }
 
-    /// Record the text size a client asked for (or the console reported).
-    pub fn set_text_scale_step(&self, step: usize) {
-        self.lock().text_scale_step = step.min(crate::view::TEXT_SCALES.len() - 1);
+    /// The host's text size, as the state every client reads.
+    pub fn settings(&self) -> SettingsState {
+        let step = self.lock().text_scale_step;
+        SettingsState {
+            step,
+            text_scale: crate::view::text_scale_at(step),
+        }
+    }
+
+    /// Record the text size a client asked for (or the console reported) and
+    /// TELL EVERY WALL.
+    ///
+    /// A SETTING NOBODY IS TOLD ABOUT is a setting that only exists in the
+    /// process that applied it. The walls used to draw at their own compile-
+    /// time default no matter what `GET /v1/settings` answered, so a phone's
+    /// `settings.font` moved the console and nothing else. The change spends a
+    /// revision because it changes what every attached display shows.
+    ///
+    /// Returns the revision when something changed, `None` when the step was
+    /// already in force — a command that would change nothing is still
+    /// accepted, it simply does not move anything.
+    pub fn set_text_scale_step(&self, step: usize) -> Option<u64> {
+        let step = step.min(crate::view::TEXT_SCALES.len() - 1);
+        let mut shared = self.lock();
+        if shared.text_scale_step == step {
+            return None;
+        }
+        shared.text_scale_step = step;
+        let revision = bump(&mut shared);
+        drop(shared);
+        let _ = self.events.send(Event::SettingsChanged {
+            revision,
+            settings: SettingsState {
+                step,
+                text_scale: crate::view::text_scale_at(step),
+            },
+        });
+        Some(revision)
     }
 
     /// The observer's windows and popup.
@@ -267,6 +302,10 @@ impl ControlHub {
             readiness: readiness_at(&shared, now),
             displays: live_displays(&shared, now),
             ui: shared.ui,
+            settings: SettingsState {
+                step: shared.text_scale_step,
+                text_scale: crate::view::text_scale_at(shared.text_scale_step),
+            },
         }
     }
 
@@ -1228,6 +1267,47 @@ mod tests {
         let moved = hub.camera_of(OBSERVER_VIEW).expect("observer");
         hub.set_session(session("execution", vec![unit(1, "Evertsen", Some(-6.1))]));
         assert_eq!(hub.camera_of(OBSERVER_VIEW), Some(moved));
+    }
+
+    // Settings --------------------------------------------------------------
+
+    /// THE TEXT SIZE IS A BROADCAST FACT, not a local preference. A phone's
+    /// `settings.font` used to stop at the console: the hub recorded the step
+    /// and told nobody, so every wall kept drawing at its own default.
+    #[test]
+    fn a_text_size_change_reaches_every_watcher_once() {
+        let hub = ControlHub::new(camera(-6.2));
+        let mut events = hub.subscribe();
+        assert_eq!(hub.settings().step, crate::view::TEXT_SCALE_DEFAULT);
+
+        assert_eq!(hub.set_text_scale_step(3), Some(1), "a change spends a revision");
+        match events.try_recv().expect("the stream carries it") {
+            Event::SettingsChanged { revision, settings } => {
+                assert_eq!(revision, 1);
+                assert_eq!(settings.step, 3);
+                assert_eq!(settings.text_scale, crate::view::text_scale_at(3));
+            }
+            other => panic!("expected settings.changed, got {other:?}"),
+        }
+
+        // The same step again changes nothing, so it announces nothing.
+        assert_eq!(hub.set_text_scale_step(3), None);
+        assert!(events.try_recv().is_err(), "an idempotent set is silent");
+
+        // A snapshot carries it, so a wall that has just connected draws at
+        // the host's size rather than its own.
+        match hub.snapshot_event() {
+            Event::Snapshot { settings, .. } => {
+                assert_eq!(settings.step, 3);
+                assert_eq!(settings.text_scale, crate::view::text_scale_at(3));
+            }
+            other => panic!("expected a snapshot, got {other:?}"),
+        }
+
+        // Off the ladder is the last rung, never a scale nobody can operate.
+        assert_eq!(hub.set_text_scale_step(0), Some(2));
+        assert_eq!(hub.set_text_scale_step(99), Some(3));
+        assert_eq!(hub.settings().step, crate::view::TEXT_SCALES.len() - 1);
     }
 
     // Readiness -------------------------------------------------------------

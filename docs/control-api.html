@@ -1118,7 +1118,8 @@ sequenceDiagram
   "ui": {
     "panels": { "crew": true, "scenario": false, "comms": false },
     "focus": 9001
-  }
+  },
+  "settings": { "step": 1, "text_scale": 1.15 }
 }</code></pre>
 
       <h4>Snapshot fields</h4>
@@ -1134,6 +1135,7 @@ sequenceDiagram
             <tr><td>readiness</td><td>object</td><td><code>{ ready, reason? }</code>, computed live.</td></tr>
             <tr><td>displays</td><td>array</td><td>Live command centers only; expired records are filtered.</td></tr>
             <tr><td>ui</td><td>object</td><td>The observer's open panels and focused hull. Host-owned so every wall agrees; a new game id resets it.</td></tr>
+            <tr><td>settings</td><td>object</td><td><code>{ step, text_scale }</code> — the host's text size. Every surface draws at it, so a wall that has just connected is already right.</td></tr>
           </tbody>
         </table>
       </div>
@@ -1280,6 +1282,12 @@ sequenceDiagram
       </p>
 
       <h3 id="read-settings"><span class="method get">GET</span> <code>/v1/settings</code></h3>
+      <p>
+        The host's text size, and the ladder it is a step of. A wall does not
+        need to poll this: the same value rides <code>settings</code> in
+        <code>GET /v1/state</code> and the snapshot, and changes arrive as
+        <code>settings.changed</code>.
+      </p>
       <pre data-lang="json"><code>{
   "step": 1,
   "text_scale": 1.15,
@@ -1822,8 +1830,13 @@ flowchart TD
           <code>Small</code>, <code>Normal</code>, <code>Large</code>,
           <code>Largest</code>. Anything else is <code>422</code>.</li>
         <li>Host-wide, not a view. Send it without <code>view</code> (the default
-          <code>main</code>); the console applies and remembers it, and a headless
-          host records it for <code>GET /v1/settings</code>.</li>
+          <code>main</code>). The console applies it and remembers it on its own
+          machine; every attached command center applies it too, from the
+          <code>settings.changed</code> event. A headless host records it for
+          <code>GET /v1/settings</code>.</li>
+        <li>The change is <em>state</em>, not a console preference: it spends a
+          revision, rides the snapshot, and reaches every watcher. Re-sending the
+          step already in force is accepted and changes nothing.</li>
       </ul>
 
       <h3><code>view.report</code></h3>
@@ -1904,6 +1917,7 @@ sequenceDiagram
             <tr><td><code>snapshot</code></td><td>The whole state at <code>revision</code>: views, session, readiness, displays, ui. Sent on connect, after a gap, and on request.</td></tr>
             <tr><td><code>camera.changed</code></td><td>A camera moved. <code>view.id</code> says which. <code>source</code> names the client, or <code>desktop</code> for the operator's hand. <code>command_id</code> is present when a command caused it.</td></tr>
             <tr><td><code>session.changed</code></td><td>The session, its phase, its units, the readiness verdict, the attached displays, or the observer's windows changed. One event, because they all answer the same question.</td></tr>
+            <tr><td><code>settings.changed</code></td><td>The host's text size changed. Carries <code>settings.step</code> and the resolved <code>text_scale</code>; a surface that draws type redraws at it.</td></tr>
             <tr><td><code>display.attached</code></td><td>This socket's <code>display.hello</code> was accepted. Carries the id the host recorded.</td></tr>
             <tr><td><code>display.rejected</code></td><td>This socket's <code>display.hello</code> was refused. The socket stays open, so the client can retry or show the reason.</td></tr>
             <tr><td><code>command.accepted</code></td><td>The server accepted a command. For a <code>main</code> command it reached the host's channel; for an observer command it was applied server-side. The proof it moved is the <code>camera.changed</code> that follows.</td></tr>
@@ -1952,6 +1966,19 @@ sequenceDiagram
     "panels": { "crew": true, "scenario": false, "comms": false }
   }
 }</code></pre>
+
+      <h4><code>settings.changed</code></h4>
+      <pre data-lang="json"><code>{
+  "type": "settings.changed",
+  "revision": 45,
+  "settings": { "step": 3, "text_scale": 1.45 }
+}</code></pre>
+      <p>
+        The host's text size changed. The console and every attached command
+        center redraw at the new step, which is what "host-wide" means here: a
+        <code>settings.font</code> command moves the operator's window
+        <em>and</em> the wall the phone is looking at.
+      </p>
 
       <h4><code>display.attached</code> and <code>display.rejected</code></h4>
       <pre data-lang="json"><code>{

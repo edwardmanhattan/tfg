@@ -42,8 +42,8 @@ pub use protocol::{
     API_VERSION, AcceptedCommand, COMMAND_CENTER_ROLE, CameraSnapshot, CameraSource, Command,
     CommandRequest, CommanderState, DisplayHello, DisplayState, DisplayViewport, Event, GeoPoint,
     MAIN_VIEW, MessageState, OBSERVER_VIEW, ObserverUi, PROTOCOL_VERSION, Panel, PanelSet,
-    ParticipantState, Readiness, ReadinessReason, ScenarioState, SessionState, UnitRef, UnitState,
-    ViewState, error_code,
+    ParticipantState, Readiness, ReadinessReason, ScenarioState, SessionState, SettingsState,
+    UnitRef, UnitState, ViewState, error_code,
 };
 pub use publish::{
     SessionHandle, SessionSink, SessionUpdate, UnitPosition, spawn_session_publisher,

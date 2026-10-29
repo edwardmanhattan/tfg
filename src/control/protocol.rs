@@ -406,6 +406,41 @@ pub struct ObserverUi {
     pub focus: Option<i64>,
 }
 
+/// The host's text size: one setting, host-wide, that every surface draws at.
+///
+/// A SETTING RATHER THAN A CONSOLE PREFERENCE. The console applies it to its
+/// own window and every attached wall applies it to theirs, which is why it
+/// travels on the stream: a command that changes one screen and cannot reach
+/// the wall the phone is actually looking at is a command with a lie in it.
+///
+/// `step` is the index into the ladder `GET /v1/settings` publishes, and
+/// `text_scale` is the multiplier it resolves to. Both travel so a client
+/// that has never read the ladder can size its type from this alone.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SettingsState {
+    #[serde(default = "default_text_step")]
+    pub step: usize,
+    #[serde(default = "default_text_scale")]
+    pub text_scale: f32,
+}
+
+fn default_text_step() -> usize {
+    crate::view::TEXT_SCALE_DEFAULT
+}
+
+fn default_text_scale() -> f32 {
+    crate::view::text_scale_at(crate::view::TEXT_SCALE_DEFAULT)
+}
+
+impl Default for SettingsState {
+    fn default() -> Self {
+        Self {
+            step: crate::view::TEXT_SCALE_DEFAULT,
+            text_scale: crate::view::text_scale_at(crate::view::TEXT_SCALE_DEFAULT),
+        }
+    }
+}
+
 /// The role a display announces. Only a command center may be remoted.
 pub const COMMAND_CENTER_ROLE: &str = "command_center";
 
@@ -732,6 +767,10 @@ pub enum Event {
         displays: Vec<DisplayState>,
         #[serde(default)]
         ui: ObserverUi,
+        /// The host's text size. Sent with the state so a wall that has just
+        /// connected draws at it rather than at its own default.
+        #[serde(default)]
+        settings: SettingsState,
     },
     /// A camera that moved. `revision` is the revision of the new state.
     #[serde(rename = "camera.changed")]
@@ -756,6 +795,14 @@ pub enum Event {
         displays: Vec<DisplayState>,
         #[serde(default)]
         ui: ObserverUi,
+    },
+    /// The host's text size changed. Every surface that draws type redraws at
+    /// the new step — that is what makes it host-wide rather than a
+    /// preference one client keeps to itself.
+    #[serde(rename = "settings.changed")]
+    SettingsChanged {
+        revision: u64,
+        settings: SettingsState,
     },
     /// A display handshake was accepted on this socket.
     #[serde(rename = "display.attached")]
@@ -1009,6 +1056,7 @@ mod tests {
             readiness: Readiness::waiting(ReadinessReason::NoSession),
             displays: Vec::new(),
             ui: Default::default(),
+            settings: Default::default(),
         };
         let text = serde_json::to_string(&event).expect("serializes");
         let back: Event = serde_json::from_str(&text).expect("parses");
@@ -1090,6 +1138,27 @@ mod tests {
         assert!(session.validate().is_ok());
         session.units.push(session.units[0].clone());
         assert!(session.validate().is_err());
+    }
+
+    /// A setting travels as state, and a body that predates it lands on the
+    /// ladder's default rather than on its first rung.
+    #[test]
+    fn a_settings_change_round_trips_and_defaults_to_the_ladder() {
+        let event = Event::SettingsChanged {
+            revision: 4,
+            settings: SettingsState {
+                step: 3,
+                text_scale: crate::view::text_scale_at(3),
+            },
+        };
+        let text = serde_json::to_string(&event).expect("serializes");
+        assert!(text.contains("\"settings.changed\""));
+        let back: Event = serde_json::from_str(&text).expect("parses");
+        assert_eq!(back, event);
+
+        assert_eq!(SettingsState::default().step, crate::view::TEXT_SCALE_DEFAULT);
+        let bare: SettingsState = serde_json::from_str("{}").expect("parses");
+        assert_eq!(bare, SettingsState::default());
     }
 
     #[test]

@@ -1620,6 +1620,10 @@ mod tests {
         assert_eq!(read["step"], crate::view::TEXT_SCALE_DEFAULT);
         assert_eq!(read["names"][1], "Normal");
 
+        // THE WALLS ARE TOLD. A phone's command used to stop at the console:
+        // the step was recorded and no client ever heard about it, so every
+        // command center kept drawing at its own default.
+        let mut events = host.hub.subscribe();
         let set = host.post(serde_json::json!({
             "protocol_version": 2,
             "client_id": "tfgctl",
@@ -1627,9 +1631,22 @@ mod tests {
             "payload": { "step": 3 }
         }));
         assert_eq!(set.status(), 202);
+        match events.try_recv().expect("the stream carries the setting") {
+            Event::SettingsChanged { settings, .. } => {
+                assert_eq!(settings.step, 3);
+                assert_eq!(settings.text_scale, crate::view::TEXT_SCALES[3]);
+            }
+            other => panic!("expected settings.changed, got {other:?}"),
+        }
+
         let read: serde_json::Value = host.get("/v1/settings").json().expect("json");
         assert_eq!(read["step"], 3);
         assert_eq!(read["text_scale"], crate::view::TEXT_SCALES[3]);
+
+        // And it rides in the state a wall reads at launch.
+        let state: serde_json::Value = host.get("/v1/state").json().expect("json");
+        assert_eq!(state["settings"]["step"], 3);
+        assert_eq!(state["settings"]["text_scale"], crate::view::TEXT_SCALES[3]);
 
         // A step off the ladder is refused at the boundary.
         let bad = host.post(serde_json::json!({
