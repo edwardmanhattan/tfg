@@ -364,7 +364,14 @@ jobs:
           set -euo pipefail
           rm -rf dist/package
           mkdir -p dist/package
+          # Three roles, three executables: the console (`tfg`, which is also
+          # the control host when TFG_CONTROL_LISTEN is set), the headless host
+          # (`tfg-server`), and the CLI that pairs devices (`tfgctl`). A bundle
+          # carrying only `tfg` cannot run the host/wall/pair workflow the
+          # documentation describes.
           cp target/release/${{ matrix.binary }} dist/package/
+          cp target/release/tfg-server dist/package/
+          cp target/release/tfgctl dist/package/
           cp dist/THIRD-PARTY-NOTICES.html dist/package/
           cp licenses/maplibre-native-LICENSE.md dist/package/MAPLIBRE-NATIVE-LICENSE.md
           cp docs/runtime-paths.md dist/package/README.md
@@ -376,6 +383,11 @@ jobs:
           (cd "$RUNNER_TEMP/tfg-bundle" && TFG_DATA_DIR="$RUNNER_TEMP/tfg-bundle/data" ./tfg --check-runtime)
           rm -rf "$RUNNER_TEMP/tfg-bundle/data"
           (cd "$RUNNER_TEMP/tfg-bundle" && TFG_PORTABLE=1 ./tfg --check-runtime)
+          # The helpers only have to start: they open no window and load no
+          # assets, so `--help` is enough to prove they link against what the
+          # runner has.
+          (cd "$RUNNER_TEMP/tfg-bundle" && ./tfg-server --help >/dev/null)
+          (cd "$RUNNER_TEMP/tfg-bundle" && ./tfgctl --help >/dev/null)
 
       - name: Package macOS application
         if: runner.os == 'macOS'
@@ -386,8 +398,15 @@ jobs:
           mkdir -p dist/ARCONS.app/Contents/MacOS dist/ARCONS.app/Contents/Resources dist/data
           touch dist/data/.keep
           mkdir -p dist/ARCONS.app/Contents/Frameworks
+          mkdir -p dist/ARCONS.app/Contents/Helpers
           cp target/release/${{ matrix.binary }} dist/ARCONS.app/Contents/MacOS/tfg
           chmod 755 dist/ARCONS.app/Contents/MacOS/tfg
+          # The headless host and the CLI travel in the bundle too. Helpers sit
+          # one level below MacOS, so `@loader_path/../Frameworks` still names
+          # `Contents/Frameworks` from either place.
+          cp target/release/tfg-server dist/ARCONS.app/Contents/Helpers/tfg-server
+          cp target/release/tfgctl dist/ARCONS.app/Contents/Helpers/tfgctl
+          chmod 755 dist/ARCONS.app/Contents/Helpers/tfg-server dist/ARCONS.app/Contents/Helpers/tfgctl
           cp packaging/macos/Info.plist dist/ARCONS.app/Contents/Info.plist
           resolve_dependency() {
             local source_binary="$1"
@@ -477,7 +496,12 @@ jobs:
           }
           bundle_dylibs dist/ARCONS.app/Contents/MacOS/tfg dist/ARCONS.app/Contents/Frameworks dist/ARCONS.app/Contents/MacOS/tfg
           install_name_tool -add_rpath "@loader_path/../Frameworks" dist/ARCONS.app/Contents/MacOS/tfg 2>/dev/null || true
-          for binary in dist/ARCONS.app/Contents/MacOS/tfg dist/ARCONS.app/Contents/Frameworks/*; do
+          for helper in tfg-server tfgctl; do
+            helper_binary="dist/ARCONS.app/Contents/Helpers/$helper"
+            bundle_dylibs "$helper_binary" dist/ARCONS.app/Contents/Frameworks "$helper_binary"
+            install_name_tool -add_rpath "@loader_path/../Frameworks" "$helper_binary" 2>/dev/null || true
+          done
+          for binary in dist/ARCONS.app/Contents/MacOS/tfg dist/ARCONS.app/Contents/Helpers/* dist/ARCONS.app/Contents/Frameworks/*; do
             [[ -f "$binary" ]] || continue
             while read -r dependency; do
               case "$dependency" in
@@ -509,6 +533,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/tfg-bundle"
           unzip -q dist/tfg-macos-${{ runner.arch }}.zip -d "$RUNNER_TEMP/tfg-bundle"
           test -x "$RUNNER_TEMP/tfg-bundle/ARCONS.app/Contents/MacOS/tfg"
+          test -x "$RUNNER_TEMP/tfg-bundle/ARCONS.app/Contents/Helpers/tfg-server"
+          test -x "$RUNNER_TEMP/tfg-bundle/ARCONS.app/Contents/Helpers/tfgctl"
+          "$RUNNER_TEMP/tfg-bundle/ARCONS.app/Contents/Helpers/tfgctl" --help >/dev/null
           (cd "$RUNNER_TEMP/tfg-bundle" && TFG_DATA_DIR="$RUNNER_TEMP/tfg-bundle/data" ./ARCONS.app/Contents/MacOS/tfg --check-runtime)
           rm -rf "$RUNNER_TEMP/tfg-bundle/data"
           (cd "$RUNNER_TEMP/tfg-bundle" && TFG_PORTABLE=1 ./ARCONS.app/Contents/MacOS/tfg --check-runtime)
@@ -522,6 +549,8 @@ jobs:
           Remove-Item -Recurse -Force $package -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Path $package | Out-Null
           Copy-Item "target/release/${{ matrix.binary }}" "$package/tfg.exe"
+          Copy-Item "target/release/tfg-server.exe" "$package/tfg-server.exe"
+          Copy-Item "target/release/tfgctl.exe" "$package/tfgctl.exe"
           Copy-Item "dist/THIRD-PARTY-NOTICES.html" "$package/THIRD-PARTY-NOTICES.html"
           Copy-Item "licenses/maplibre-native-LICENSE.md" "$package/MAPLIBRE-NATIVE-LICENSE.md"
           Copy-Item "docs/runtime-paths.md" "$package/README.md"
@@ -533,6 +562,12 @@ jobs:
           Push-Location $testRoot
           & "tfg-windows-x64/tfg.exe" --check-runtime
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($helper in @("tfg-server.exe", "tfgctl.exe")) {
+            $path = "tfg-windows-x64/$helper"
+            if (-not (Test-Path $path)) { throw "missing from the bundle: $helper" }
+            & $path --help | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "$helper --help failed with $LASTEXITCODE" }
+          }
           Pop-Location
 
       - name: Upload distribution bundle
@@ -644,9 +679,11 @@ jobs:
           Maintainer: Crossnet
           Standards-Version: 4.6.2
           EOF
-          depends="$(cd "$shlib_root" && dpkg-shlibdeps --ignore-missing-info -O "$GITHUB_WORKSPACE/target/release/tfg" | sed -n 's/^shlibs:Depends=//p')"
+          depends="$(cd "$shlib_root" && dpkg-shlibdeps --ignore-missing-info -O "$GITHUB_WORKSPACE/target/release/tfg" "$GITHUB_WORKSPACE/target/release/tfg-server" "$GITHUB_WORKSPACE/target/release/tfgctl" | sed -n 's/^shlibs:Depends=//p')"
           depends="${depends:+$depends,}ca-certificates,libgl1,libsharpyuv0,libvulkan1,libwayland-client0,libx11-6,libxkbcommon0"
           cp target/release/tfg "$deb_dir/usr/bin/tfg"
+          cp target/release/tfg-server "$deb_dir/usr/bin/tfg-server"
+          cp target/release/tfgctl "$deb_dir/usr/bin/tfgctl"
           cp dist/THIRD-PARTY-NOTICES.html "$deb_dir/usr/share/doc/tfg/"
           cp licenses/maplibre-native-LICENSE.md "$deb_dir/usr/share/doc/tfg/MAPLIBRE-NATIVE-LICENSE.md"
           cp docs/runtime-paths.md "$deb_dir/usr/share/doc/tfg/README.md"
@@ -660,7 +697,9 @@ jobs:
           Maintainer: Crossnet
           Installed-Size: $installed_size
           Description: ARCONS tactical command center
-           egui desktop application for live and simulation workflows.
+           GPUI desktop application for live and simulation workflows, with
+           `tfg-server` (a headless control host) and `tfgctl` (the control
+           CLI that pairs devices and drives the shared camera).
           Depends: $depends
           EOF
           dpkg-deb --build --root-owner-group "$deb_dir" "dist/tfg_${package_version}_amd64.deb"
@@ -668,6 +707,8 @@ jobs:
           rm -rf "$RUNNER_TEMP/tfg-deb"
           dpkg-deb --extract "dist/tfg_${package_version}_amd64.deb" "$RUNNER_TEMP/tfg-deb"
           (cd "$RUNNER_TEMP/tfg-deb" && TFG_DATA_DIR="$RUNNER_TEMP/tfg-deb/data" ./usr/bin/tfg --check-runtime)
+          "$RUNNER_TEMP/tfg-deb/usr/bin/tfg-server" --help >/dev/null
+          "$RUNNER_TEMP/tfg-deb/usr/bin/tfgctl" --help >/dev/null
 
       - name: Upload Debian package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
