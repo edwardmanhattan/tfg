@@ -214,8 +214,13 @@ jobs:
         with:
           arch: x64
 
+      # The C++ core is the expensive half of this build and the half that
+      # cargo's own cache cannot help with: its key includes the lockfile, so
+      # every dependency bump discards the compiled MapLibre. sccache keys on
+      # the source and the command line, so the same objects survive a lockfile
+      # change. Windows has had this from the start and is the only job that
+      # kept passing through the GPUI migration; the other platforms now match.
       - name: Enable sccache
-        if: runner.os == 'Windows'
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Check out MapLibre Native source
@@ -310,15 +315,21 @@ jobs:
         with:
           toolchain: stable
 
+      # No `cache-on-failure`: caches are immutable per key, so the first run of
+      # a lockfile generation to write this key wins and every later run
+      # restores that snapshot forever. When the first run is the one that died
+      # early, the winner is a fifth of a target -- which is how a 15-minute job
+      # became an hourly one (today's entries were 572 MB and 684 MB of trees
+      # whose real size is ~3 GB). The expensive half, the C++ core, is held by
+      # sccache now, which is content-addressed and does not have this problem,
+      # so a failed run no longer needs the Cargo cache to keep its work.
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-on-failure: true
 
       - name: Build release binary
         env:
           CXXFLAGS: ${{ matrix.native_cxxflags }}
-          MLN_CMAKE_CXX_LAUNCHER: ${{ runner.os == 'Windows' && 'sccache' || '' }}
+          MLN_CMAKE_CXX_LAUNCHER: sccache
           # See the `check` job: the committed MLN_LOCAL_REPOSITORY names the
           # maintainer's checkout, which no runner has. Windows points at the
           # checkout this workflow vendors above; the other platforms build a
