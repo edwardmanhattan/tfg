@@ -3411,6 +3411,11 @@ impl MinosMaster {
                 },
                 CurrentStepStep {
                     id: st.get("id").and_then(|i| i.as_i64()).unwrap_or(0),
+                    kind: st
+                        .get("kind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     content: st
                         .get("content")
                         .and_then(|c| c.as_str())
@@ -3420,6 +3425,47 @@ impl MinosMaster {
                         .get("window_end_at")
                         .and_then(|w| w.as_str())
                         .map(|s| s.to_string()),
+                    // THE CALLER'S OWN COMMANDS, on both halves. An absent
+                    // list is the ordinary answer — a beat asks nobody, and
+                    // an orders step that does not concern this seat carries
+                    // nothing — so it is an empty vector rather than a
+                    // failure.
+                    substeps: st
+                        .get("substeps")
+                        .and_then(|s| s.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|sub| {
+                                    let via = sub.get("via")?;
+                                    Some(CurrentStepSubstep {
+                                        id: sub
+                                            .get("id")
+                                            .and_then(|i| i.as_i64())
+                                            .unwrap_or(0),
+                                        content: sub
+                                            .get("content")
+                                            .and_then(|c| c.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        via_kind: via
+                                            .get("kind")
+                                            .and_then(|k| k.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        via_id: via
+                                            .get("id")
+                                            .and_then(|i| i.as_i64())
+                                            .unwrap_or(0),
+                                        via_name: via
+                                            .get("name")
+                                            .and_then(|n| n.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 },
             ))
         }
@@ -4832,13 +4878,35 @@ pub struct CurrentStepScenario {
     pub title: String,
 }
 
+/// One command inside a step of a game's book, as `current-step` resolves it
+/// FOR THE CALLER: the instruction, and the ref that brought it to them.
+///
+/// `via` is the post their own plan names — the task group their hull sits
+/// under, or the hull itself — so "why am I being told this" has an answer
+/// even when the command was addressed three levels up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentStepSubstep {
+    pub id: i64,
+    pub content: String,
+    pub via_kind: String,
+    pub via_id: i64,
+    pub via_name: String,
+}
+
 /// One step as the `current-step` answer names it: the instruction
 /// text for a non-GM caller, plus the window end as an instant.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CurrentStepStep {
     pub id: i64,
+    /// `orders` or `beat`. The two shapes answer differently: a beat carries
+    /// `content` for everybody, an orders step carries the caller's own
+    /// sub-steps and WITHHOLDS its text.
+    pub kind: String,
     pub content: String,
     pub window_end_at: Option<String>,
+    /// The commands that concern THIS caller, and nothing else. Empty on a
+    /// beat, and on an orders step that does not concern them at all.
+    pub substeps: Vec<CurrentStepSubstep>,
 }
 
 /// The step in play, when the exercise is on one.

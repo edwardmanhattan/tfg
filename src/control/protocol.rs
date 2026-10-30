@@ -107,6 +107,14 @@ pub struct SessionState {
     pub scenario: Option<ScenarioState>,
     #[serde(default)]
     pub units: Vec<UnitState>,
+    /// The task organisation the hulls sit in, so a wall can name a hull's
+    /// group and draw the group card the console draws.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupState>,
+    /// The scenario's book while the exercise runs. `None` outside execution
+    /// and for an exercise with no script.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<BoardState>,
     /// The exercise's seats, as the console sees them: the Crew panel's rows.
     #[serde(default)]
     pub participants: Vec<ParticipantState>,
@@ -198,6 +206,86 @@ pub struct ScenarioState {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
+}
+
+/// One task-organisation node, as a wall reads it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupState {
+    pub id: i64,
+    pub name: String,
+    /// The echelon word the console knows (`Gugus`, `SatuanTugas`, …).
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commander: Option<CommanderState>,
+    /// Hulls mustered directly into this node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub units: Vec<i64>,
+}
+
+/// The scenario's steps, as the wall's Scenario window reads them.
+///
+/// The console's board is derived from three sources — the book, the pointer
+/// and the gate — and this is the part of it a wall needs to draw the same
+/// window: the book's order, where the exercise stands, each step's commands
+/// and the hulls those commands address.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BoardState {
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<usize>,
+    #[serde(default)]
+    pub steps: Vec<BoardStepState>,
+    /// The related hulls of the step the board reads, with their commanders
+    /// and declarations. Empty when the step asks nobody.
+    #[serde(default)]
+    pub units: Vec<BoardUnitState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardStepState {
+    pub scenario: String,
+    pub step_id: i64,
+    /// 1-based position in the whole book.
+    pub number: usize,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<(String, String)>,
+    /// `playing`, `asking`, `played` or `later`.
+    #[serde(default)]
+    pub read: String,
+    /// `idle`, `played`, `current`, `unit_ready`, `playing`, `halted` or
+    /// `done`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub substeps: Vec<BoardSubstepState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardSubstepState {
+    pub id: i64,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub units: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardUnitState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    pub name: String,
+    #[serde(default)]
+    pub commander: String,
+    /// `None` when the gate does not ask this unit; `Some(false)` is a
+    /// declaration still owed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<bool>,
 }
 
 /// One hull a viewer may look at.
@@ -404,6 +492,10 @@ pub struct ObserverUi {
     /// The unit whose popup is open. Set by `camera.focus`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus: Option<i64>,
+    /// The task group whose popup is open. Set by `camera.focus_group`;
+    /// mutually exclusive with [`Self::focus`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_group: Option<i64>,
 }
 
 /// The host's text size: one setting, host-wide, that every surface draws at.
@@ -525,6 +617,17 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zoom: Option<f64>,
     },
+    /// Centre a view on one of the session's task groups.
+    ///
+    /// A group has no position of its own; the host resolves it against the
+    /// session and centres on the mean of the hulls beneath it, so a phone
+    /// never has to compute a group's ground from a stale copy.
+    #[serde(rename = "camera.focus_group")]
+    CameraFocusGroup {
+        group_id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zoom: Option<f64>,
+    },
     /// Open or close one of the observer's windows.
     ///
     /// The phone sends the panel's wire name and the state it wants, so a
@@ -601,6 +704,16 @@ impl Command {
             Self::CameraFocus { unit_id, zoom } => {
                 if *unit_id <= 0 {
                     return Err("a focus command needs a positive unit id".to_string());
+                }
+                if let Some(zoom) = zoom
+                    && (!zoom.is_finite() || !(-30.0..=30.0).contains(zoom))
+                {
+                    return Err("focus zoom must be finite and between -30 and 30".to_string());
+                }
+            }
+            Self::CameraFocusGroup { group_id, zoom } => {
+                if *group_id <= 0 {
+                    return Err("a group focus needs a positive group id".to_string());
                 }
                 if let Some(zoom) = zoom
                     && (!zoom.is_finite() || !(-30.0..=30.0).contains(zoom))

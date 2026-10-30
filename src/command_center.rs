@@ -26,18 +26,18 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext, Application, Bounds, Context, IntoElement, ParentElement, Render, Styled,
-    StyledImage, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img, point, px,
-    size,
+    StatefulInteractiveElement, StyledImage, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    canvas, div, img, point, prelude::*, px, size,
 };
 
 use crate::control::{
     AcceptedCommand, CameraSnapshot, ClientConfig, ClientHandle, Command, DisplayHello, Event,
-    GeoPoint, OBSERVER_VIEW, ObserverUi, Readiness, ReadinessReason, SessionState, SettingsState,
-    UnitState, ViewState, spawn_client,
+    BoardState, GeoPoint, OBSERVER_VIEW, ObserverUi, Readiness, ReadinessReason, SessionState,
+    SettingsState, UnitState, ViewState, spawn_client,
 };
 use crate::map_gate::FrameSlot;
 use crate::map_geometry;
-use crate::shell_gpui::{PHOTO_ZOOM, paint_unit_mark};
+use crate::shell_gpui::{PHOTO_ZOOM, paint_unit_mark, plural};
 use crate::shell_threads::{MapReq, MapResp};
 use crate::view;
 use crate::view::MapSymbolShape;
@@ -869,7 +869,7 @@ impl CommandCenter {
             .w(px(w))
             .border_1()
             .border_color(crate::ink::rgba(view::RADAR_CYAN.with_alpha(160)))
-            .bg(crate::ink::rgba(view::PANEL_SLATE.with_alpha(238)))
+            .bg(crate::ink::rgba(view::PANEL_SLATE))
             .flex()
             .flex_col()
             .child(
@@ -925,75 +925,301 @@ impl CommandCenter {
             .into_any_element()
     }
 
-    /// The three observer windows, in the console's right column.
-    fn panels(&self, mut root: gpui::Div, _win_w: f32, _win_h: f32) -> gpui::Div {
+    /// The two readings the Game Master's execution rail carries: the players
+    /// in the room and the traffic the exercise holds.
+    fn execution_rail(&self, _win_w: f32) -> gpui::AnyElement {
         let Some(session) = &self.session else {
-            return root;
+            return div().into_any_element();
         };
-        let open = self.ui.panels;
-        if !open.any() {
-            return root;
-        }
-        let mut column = div()
+        let players = self.players_count();
+        let hulls = session.units.len();
+        let unseen = 0usize;
+        let mut rail = div()
             .absolute()
-            .top(px(ts(80.0)))
-            .right(px(ts(16.0)))
-            .w(px(ts(348.0)))
+            .top(px(ts(78.0)))
+            .right(px(ts(10.0)))
+            .w(px(ts(196.0)))
             .flex()
             .flex_col()
-            .gap(px(ts(12.0)));
-        if open.crew {
-            column = column.child(self.crew_panel(session));
+            .gap(px(ts(6.0)));
+        // THE SCENARIO LEADS, as it does on the Game Master's rail. The wall
+        // does not carry the ready verb — it observes — but the reading is the
+        // same one.
+        if session.mode == "scenario" {
+            let board = session.board.as_ref();
+            let value = match board {
+                Some(board) if board.total == 0 => "NO SCRIPT".to_string(),
+                Some(board) => match board.at {
+                    Some(at) => format!("STEP {at}"),
+                    None => "NOT STARTED".to_string(),
+                },
+                None => session
+                    .scenario
+                    .as_ref()
+                    .map(|scenario| scenario.title.clone())
+                    .unwrap_or_else(|| "NO SCRIPT".to_string()),
+            };
+            let status = board
+                .and_then(|board| {
+                    board
+                        .steps
+                        .iter()
+                        .find(|step| step.read == "playing")
+                        .or_else(|| board.steps.iter().find(|step| step.read == "asking"))
+                })
+                .map(|step| step.status.to_uppercase());
+            let hint = board
+                .map(|board| {
+                    let ready = board
+                        .units
+                        .iter()
+                        .filter(|unit| unit.ready == Some(true))
+                        .count();
+                    let asked = board
+                        .units
+                        .iter()
+                        .filter(|unit| unit.ready.is_some())
+                        .count();
+                    if asked > 0 {
+                        format!("{ready} of {asked} ready")
+                    } else {
+                        plural(board.total, "step")
+                    }
+                })
+                .unwrap_or_else(|| {
+                    session
+                        .scenario
+                        .as_ref()
+                        .and_then(|scenario| scenario.step.clone())
+                        .unwrap_or_else(|| "nothing is playing".to_string())
+                });
+            rail = rail.child(self.exec_card("SCENARIO", value, hint, status));
         }
-        if open.scenario {
-            column = column.child(self.scenario_panel(session));
-        }
-        if open.comms {
-            column = column.child(self.comms_panel(session));
-        }
-        root = root.child(column);
-        root
+        rail = rail.child(self.exec_card(
+            "PLAYERS",
+            format!("{players}"),
+            format!("{} \u{00b7} {}", plural(players, "player"), plural(hulls, "hull")),
+            None,
+        ));
+        rail = rail.child(self.exec_card(
+            "COMMS",
+            format!("{}", session.messages.len()),
+            if unseen > 0 {
+                format!(
+                    "{} unseen \u{00b7} {} in this exercise",
+                    plural(unseen, "message"),
+                    plural(session.messages.len(), "message")
+                )
+            } else {
+                format!(
+                    "{} in this exercise",
+                    plural(session.messages.len(), "message")
+                )
+            },
+            None,
+        ));
+        rail.into_any_element()
     }
 
-    fn panel_shell(&self, title: String, body: gpui::Div) -> gpui::AnyElement {
+    fn exec_card(
+        &self,
+        label: &'static str,
+        value: String,
+        hint: String,
+        status: Option<String>,
+    ) -> gpui::AnyElement {
         div()
+            .w_full()
+            .rounded(px(ts(2.0)))
+            .bg(crate::ink::rgba(view::DEEP_WELL))
             .border_1()
             .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
-            .bg(crate::ink::rgba(view::PANEL_SLATE.with_alpha(242)))
+            .overflow_hidden()
             .flex()
             .flex_col()
             .child(
                 div()
-                    .px(px(12.0))
-                    .py(px(5.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .h(px(ts(26.0)))
+                    .px(px(ts(10.0)))
+                    .bg(crate::ink::rgba(view::PANEL_SLATE))
                     .border_b_1()
                     .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
-                    .bg(crate::ink::rgba(view::CONSOLE_NIGHT))
-                    .font_family("Saira Condensed")
-                    .text_size(px(ts(11.0)))
-                    .text_color(crate::ink::rgba(view::RADAR_CYAN))
-                    .child(title),
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(10.0)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(9.0)))
+                            .text_color(crate::ink::rgba(view::RADAR_CYAN))
+                            .child(status.unwrap_or_default()),
+                    ),
             )
-            .child(div().p(px(10.0)).flex().flex_col().gap(px(6.0)).child(body))
+            .child(
+                div()
+                    .px(px(ts(10.0)))
+                    .pt(px(ts(4.0)))
+                    .font_family("Saira Condensed")
+                    .text_size(px(ts(18.0)))
+                    .text_color(crate::ink::rgba(view::MAP_INK))
+                    .child(value),
+            )
+            .child(
+                div()
+                    .px(px(ts(10.0)))
+                    .pb(px(ts(6.0)))
+                    .font_family("PT Mono")
+                    .text_size(px(ts(9.0)))
+                    .text_color(crate::ink::rgba(view::BODY_SILVER))
+                    .child(hint),
+            )
             .into_any_element()
     }
 
-    fn crew_panel(&self, session: &SessionState) -> gpui::AnyElement {
-        let ready = session.participants.iter().filter(|p| p.ready).count();
-        let title = format!(
-            "CREW  {} SEAT(S) · {} READY",
-            session.participants.len(),
-            ready
-        );
-        let mut body = div().flex().flex_col().gap(px(6.0));
-        if session.participants.is_empty() {
-            body = body.child(
+    /// The scenario's own reading, in the body of the map.
+    fn scenario_card(&self, _win_h: f32) -> gpui::AnyElement {
+        let Some(session) = &self.session else {
+            return div().into_any_element();
+        };
+        let board = session.board.as_ref();
+        let value = match board {
+            Some(board) if board.total == 0 => "NO SCRIPT".to_string(),
+            Some(board) => match board.at {
+                Some(at) => format!("STEP {at}"),
+                None => "NOT STARTED".to_string(),
+            },
+            None => session
+                .scenario
+                .as_ref()
+                .map(|scenario| scenario.title.clone())
+                .unwrap_or_else(|| "NO SCRIPT".to_string()),
+        };
+        let (ready, asked) = board
+            .map(|board| {
+                (
+                    board.units.iter().filter(|unit| unit.ready == Some(true)).count(),
+                    board.units.iter().filter(|unit| unit.ready.is_some()).count(),
+                )
+            })
+            .unwrap_or((0, 0));
+        let hint = if asked > 0 {
+            format!("{ready} of {asked} ready")
+        } else {
+            session
+                .scenario
+                .as_ref()
+                .and_then(|scenario| scenario.step.clone())
+                .unwrap_or_else(|| "nothing is playing".to_string())
+        };
+        div()
+            .absolute()
+            .left(px(ts(12.0)))
+            .bottom(px(ts(12.0)))
+            .w(px(ts(292.0)))
+            .flex()
+            .flex_col()
+            .rounded(px(ts(2.0)))
+            .bg(crate::ink::rgba(view::CONSOLE_NIGHT))
+            .border_1()
+            .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+            .overflow_hidden()
+            .child(
                 div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .h(px(ts(26.0)))
+                    .px(px(ts(10.0)))
+                    .bg(crate::ink::rgba(view::PANEL_SLATE))
+                    .border_b_1()
+                    .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(10.0)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child("SCENARIO"),
+                    )
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(9.0)))
+                            .text_color(crate::ink::rgba(view::RADAR_CYAN))
+                            .child(
+                                board
+                                    .and_then(|board| {
+                                        board
+                                            .steps
+                                            .iter()
+                                            .find(|step| step.read == "playing")
+                                            .or_else(|| {
+                                                board.steps.iter().find(|step| step.read == "asking")
+                                            })
+                                    })
+                                    .map(|step| step.status.to_uppercase())
+                                    .unwrap_or_else(|| "IDLE".to_string()),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(ts(10.0)))
+                    .pt(px(ts(5.0)))
                     .font_family("Saira Condensed")
-                    .text_size(px(ts(12.0)))
+                    .text_size(px(ts(16.0)))
+                    .text_color(crate::ink::rgba(view::MAP_INK))
+                    .child(value),
+            )
+            .child(
+                div()
+                    .px(px(ts(10.0)))
+                    .pb(px(ts(6.0)))
+                    .font_family("PT Mono")
+                    .text_size(px(ts(9.0)))
                     .text_color(crate::ink::rgba(view::BODY_SILVER))
-                    .child("no seats published"),
-            );
+                    .child(hint),
+            )
+            .into_any_element()
+    }
+
+    /// The larger surfaces the phone opens with `ui.set`.
+    fn panel_overlays(&self, mut root: gpui::Div, win_w: f32, win_h: f32) -> gpui::Div {
+        let open = self.ui.panels;
+        if open.comms {
+            root = root.child(self.comms_island(win_h));
+        }
+        if open.crew {
+            root = root.child(self.crew_modal(win_w, win_h));
+        }
+        if open.scenario {
+            root = root.child(self.scenario_window(win_w, win_h));
+        }
+        root
+    }
+
+    /// The Crew window, not the widget: a large centred card, as the console's
+    /// crew surface is.
+    fn crew_modal(&self, win_w: f32, win_h: f32) -> gpui::AnyElement {
+        let Some(session) = &self.session else {
+            return div().into_any_element();
+        };
+        let width = ts(1120.0).min((win_w - 32.0).max(420.0));
+        let height = ts(620.0).min((win_h - 32.0).max(360.0));
+        let ready = session.participants.iter().filter(|p| p.ready).count();
+        let mut body = div().flex().flex_col().gap(px(ts(8.0))).p(px(ts(14.0)));
+        if session.participants.is_empty() {
+            body = body.child(self.board_note("No seat is published for this exercise."));
         }
         for person in &session.participants {
             let hulls: Vec<String> = session
@@ -1003,18 +1229,24 @@ impl CommandCenter {
                 .map(|unit| format!("{} {}", unit.index, unit.name))
                 .collect();
             let mut row = div()
+                .w_full()
                 .flex()
                 .flex_col()
-                .gap(px(1.0))
+                .gap(px(ts(2.0)))
+                .p(px(ts(8.0)))
+                .border_1()
+                .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+                .bg(crate::ink::rgba(view::DEEP_WELL))
                 .child(
                     div()
                         .flex()
                         .flex_row()
+                        .items_center()
                         .justify_between()
                         .child(
                             div()
                                 .font_family("Saira Condensed")
-                                .text_size(px(ts(13.0)))
+                                .text_size(px(ts(16.0)))
                                 .text_color(crate::ink::rgba(view::MAP_INK))
                                 .child(if person.name.trim().is_empty() {
                                     person.role.clone()
@@ -1022,106 +1254,91 @@ impl CommandCenter {
                                     person.name.clone()
                                 }),
                         )
-                        .child(
-                            div()
-                                .font_family("PT Mono")
-                                .text_size(px(ts(9.0)))
-                                .text_color(crate::ink::rgba(if person.judge {
-                                    view::BODY_SILVER
-                                } else if person.ready {
-                                    view::SIGNAL_GREEN
-                                } else {
-                                    view::BODY_SILVER
-                                }))
-                                .child(if person.judge {
-                                    "JUDGE".to_string()
-                                } else if person.ready {
-                                    "READY".to_string()
-                                } else {
-                                    "WAITING".to_string()
-                                }),
-                        ),
+                        .child(self.ready_chip(if person.judge {
+                            None
+                        } else {
+                            Some(person.ready)
+                        })),
                 )
                 .child(
                     div()
                         .font_family("PT Mono")
-                        .text_size(px(ts(9.0)))
+                        .text_size(px(ts(10.0)))
                         .text_color(crate::ink::rgba(view::BODY_SILVER))
                         .child(person.role.clone()),
                 );
             for hull in hulls {
                 row = row.child(
                     div()
-                        .max_w(px(ts(320.0)))
-                        .truncate()
                         .font_family("PT Mono")
-                        .text_size(px(ts(9.5)))
+                        .text_size(px(ts(10.0)))
                         .text_color(crate::ink::rgba(view::MAP_INK))
                         .child(hull),
                 );
             }
             body = body.child(row);
         }
-        self.panel_shell(title, body)
-    }
-
-    fn scenario_panel(&self, session: &SessionState) -> gpui::AnyElement {
-        let title = session
-            .scenario
-            .as_ref()
-            .map(|scenario| scenario.title.clone())
-            .unwrap_or_else(|| "no scenario published".to_string());
-        let step = session
-            .scenario
-            .as_ref()
-            .and_then(|scenario| scenario.step.clone())
-            .unwrap_or_else(|| "no step is playing".to_string());
-        let body = div()
+        div()
+            .absolute()
+            .size_full()
+            .bg(crate::ink::rgba(view::CONSOLE_NIGHT.with_alpha(150)))
             .flex()
-            .flex_col()
-            .gap(px(4.0))
+            .items_center()
+            .justify_center()
             .child(
                 div()
-                    .font_family("Saira Condensed")
-                    .text_size(px(ts(14.0)))
-                    .text_color(crate::ink::rgba(view::MAP_INK))
-                    .child(title),
+                    .w(px(width))
+                    .h(px(height))
+                    .bg(crate::ink::rgba(view::CONSOLE_NIGHT))
+                    .border_1()
+                    .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .h(px(ts(38.0)))
+                            .px(px(ts(14.0)))
+                            .border_b_1()
+                            .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+                            .child(
+                                div()
+                                    .font_family("Saira Condensed")
+                                    .text_size(px(ts(18.0)))
+                                    .text_color(crate::ink::rgba(view::MAP_INK))
+                                    .child("CREW"),
+                            )
+                            .child(
+                                div()
+                                    .font_family("PT Mono")
+                                    .text_size(px(ts(10.0)))
+                                    .text_color(crate::ink::rgba(view::BODY_SILVER))
+                                    .child(format!(
+                                        "{} \u{00b7} {} READY",
+                                        plural(session.participants.len(), "seat"),
+                                        ready
+                                    )),
+                            ),
+                    )
+                    .child(div().id("wall-crew-scroll").flex_1().min_h_0().overflow_y_scroll().child(body)),
             )
-            .child(
-                div()
-                    .font_family("Saira Condensed")
-                    .text_size(px(ts(12.0)))
-                    .text_color(crate::ink::rgba(view::MAP_INK))
-                    .child(step),
-            )
-            .child(
-                div()
-                    .font_family("PT Mono")
-                    .text_size(px(ts(9.5)))
-                    .text_color(crate::ink::rgba(view::BODY_SILVER))
-                    .child(format!(
-                        "{} · {} · {}",
-                        session.phase.to_uppercase(),
-                        session.mode.to_uppercase(),
-                        session.name
-                    )),
-            );
-        self.panel_shell("SCENARIO".to_string(), body)
+            .into_any_element()
     }
 
-    fn comms_panel(&self, session: &SessionState) -> gpui::AnyElement {
-        let title = format!("COMMS  {} MESSAGE(S)", session.messages.len());
-        let mut body = div().flex().flex_col().gap(px(8.0));
+    /// The Comms pane, not the widget: the exercise's traffic, beside the map.
+    fn comms_island(&self, win_h: f32) -> gpui::AnyElement {
+        let Some(session) = &self.session else {
+            return div().into_any_element();
+        };
+        let mut body = div().flex().flex_col().gap(px(ts(8.0))).p(px(ts(12.0)));
         if session.messages.is_empty() {
-            body = body.child(
-                div()
-                    .font_family("Saira Condensed")
-                    .text_size(px(ts(12.0)))
-                    .text_color(crate::ink::rgba(view::BODY_SILVER))
-                    .child("no traffic in this exercise"),
-            );
+            body = body.child(self.board_note("No messages in this exercise."));
         }
-        for message in session.messages.iter().take(6) {
+        for message in &session.messages {
             let time = message
                 .at
                 .split('T')
@@ -1132,23 +1349,23 @@ impl CommandCenter {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(2.0))
+                    .gap(px(ts(2.0)))
+                    .pb(px(ts(6.0)))
+                    .border_b_1()
+                    .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
                     .child(
                         div()
                             .flex()
                             .flex_row()
+                            .items_center()
                             .justify_between()
-                            .gap(px(8.0))
+                            .gap(px(ts(8.0)))
                             .child(
                                 div()
                                     .font_family("PT Mono")
                                     .text_size(px(ts(9.5)))
                                     .text_color(crate::ink::rgba(view::RADAR_CYAN))
-                                    .child(format!(
-                                        "{}{}",
-                                        message.sender,
-                                        if message.assumed { "" } else { "" }
-                                    )),
+                                    .child(message.sender.clone()),
                             )
                             .child(
                                 div()
@@ -1161,13 +1378,817 @@ impl CommandCenter {
                     .child(
                         div()
                             .font_family("Saira Condensed")
-                            .text_size(px(ts(12.0)))
+                            .text_size(px(ts(13.0)))
                             .text_color(crate::ink::rgba(view::MAP_INK))
                             .child(message.content.clone()),
                     ),
             );
         }
-        self.panel_shell(title, body)
+        div()
+            .absolute()
+            .top(px(ts(292.0)))
+            .right(px(ts(10.0)))
+            .w(px(ts(410.0)))
+            .max_h(px((win_h - ts(220.0)).max(ts(180.0))))
+            .bg(crate::ink::rgba(view::PANEL_SLATE))
+            .border_1()
+            .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .h(px(ts(32.0)))
+                    .px(px(ts(12.0)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .bg(crate::ink::rgba(view::CONSOLE_NIGHT))
+                    .border_b_1()
+                    .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(11.0)))
+                            .text_color(crate::ink::rgba(view::RADAR_CYAN))
+                            .child("COMMS"),
+                    )
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(9.0)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child(plural(session.messages.len(), "message")),
+                    ),
+            )
+            .child(div().id("wall-comms-scroll").flex_1().min_h_0().overflow_y_scroll().child(body))
+            .into_any_element()
+    }
+
+    /// The Scenario window, not the widget: the whole frame under the strip,
+    /// with the book on the left and the command channels on the right.
+    fn scenario_window(&self, win_w: f32, win_h: f32) -> gpui::AnyElement {
+        let Some(session) = &self.session else {
+            return div().into_any_element();
+        };
+        let width = win_w;
+        let mut col = div()
+            .absolute()
+            .top(px(ts(64.0)))
+            .left(px(0.0))
+            .right(px(0.0))
+            .bottom(px(0.0))
+            .bg(crate::ink::rgba(view::CONSOLE_NIGHT))
+            .flex()
+            .flex_col();
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(ts(12.0)))
+                .h(px(ts(38.0)))
+                .px(px(ts(14.0)))
+                .border_b_1()
+                .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+                .child(
+                    div()
+                        .font_family("Saira Condensed")
+                        .text_size(px(ts(18.0)))
+                        .text_color(crate::ink::rgba(view::MAP_INK))
+                        .child("SCENARIO"),
+                )
+                .child(
+                    div()
+                        .font_family("PT Mono")
+                        .text_size(px(ts(10.0)))
+                        .text_color(crate::ink::rgba(view::BODY_SILVER))
+                        .child("OBSERVER"),
+                )
+                .child(
+                    div()
+                        .font_family("Saira Condensed")
+                        .text_size(px(ts(14.0)))
+                        .text_color(crate::ink::rgba(view::MAP_INK))
+                        .child(session.name.clone()),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .font_family("PT Mono")
+                        .text_size(px(ts(10.0)))
+                        .text_color(crate::ink::rgba(view::BODY_SILVER))
+                        .child(
+                            session
+                                .board
+                                .as_ref()
+                                .map(|board| {
+                                    let ready = board
+                                        .units
+                                        .iter()
+                                        .filter(|unit| unit.ready == Some(true))
+                                        .count();
+                                    let asked = board
+                                        .units
+                                        .iter()
+                                        .filter(|unit| unit.ready.is_some())
+                                        .count();
+                                    let where_ = match board.at {
+                                        Some(at) => format!("step {at} of {}", board.total),
+                                        None => format!("{} \u{00b7} not started", plural(board.total, "step")),
+                                    };
+                                    if asked > 0 {
+                                        format!("{where_} \u{00b7} {ready}/{asked} ready")
+                                    } else {
+                                        where_
+                                    }
+                                })
+                                .unwrap_or_else(|| "no script".to_string()),
+                        ),
+                ),
+        );
+        let Some(board) = session.board.as_ref() else {
+            return col
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(self.board_note("The console has not published the book for this exercise.")),
+                )
+                .into_any_element();
+        };
+        let mut left = div()
+            .w(px(ts(430.0)))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap(px(ts(6.0)))
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(self.caps("the book \u{2014} the steps, in order"))
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(9.0)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child(plural(board.total, "step")),
+                    ),
+            );
+        let mut list = div()
+            .id("wall-board")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(ts(6.0)));
+        if board.steps.is_empty() {
+            list = list.child(self.board_note("No steps to read."));
+        }
+        for step in &board.steps {
+            list = list.child(self.board_step_row(step));
+        }
+        left = left.child(list);
+        let mut right = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(ts(6.0)))
+            .overflow_hidden()
+            .child(self.caps("the commands \u{2014} each channel and the hulls it addresses"));
+        let mut channels = div()
+            .id("wall-channels")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(ts(8.0)));
+        let pointer = board
+            .at
+            .and_then(|at| board.steps.get(at.saturating_sub(1)))
+            .or_else(|| board.steps.iter().find(|step| step.read == "playing"))
+            .or_else(|| board.steps.iter().find(|step| step.read == "asking"));
+        if let Some(step) = pointer {
+            let mut tasked: Vec<i64> = Vec::new();
+            if step.substeps.is_empty() {
+                channels = channels.child(self.board_note("This step has no commands."));
+            }
+            for (at, sub) in step.substeps.iter().enumerate() {
+                let mut channel = div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(ts(5.0)))
+                    .p(px(ts(8.0)))
+                    .bg(crate::ink::rgba(view::DEEP_WELL))
+                    .border_1()
+                    .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(ts(8.0)))
+                            .child(
+                                div()
+                                    .font_family("PT Mono")
+                                    .text_size(px(ts(9.0)))
+                                    .text_color(crate::ink::rgba(view::BODY_SILVER))
+                                    .child(format!("{:02}", at + 1)),
+                            )
+                            .child(
+                                div()
+                                    .font_family("Saira Condensed")
+                                    .text_size(px(ts(13.0)))
+                                    .text_color(crate::ink::rgba(view::MAP_INK))
+                                    .child(sub.content.clone()),
+                            ),
+                    );
+                let mut any = false;
+                for id in &sub.units {
+                    if let Some(unit) = board.units.iter().find(|unit| unit.id == Some(*id)) {
+                        tasked.push(*id);
+                        any = true;
+                        channel = channel.child(self.board_hull_card(unit));
+                    }
+                }
+                if !any {
+                    channel = channel.child(self.board_note("No hull is assigned to this command."));
+                }
+                channels = channels.child(channel);
+            }
+            let idle: Vec<_> = board
+                .units
+                .iter()
+                .filter(|unit| unit.id.is_none_or(|id| !tasked.contains(&id)))
+                .collect();
+            if !idle.is_empty() {
+                let mut channel = div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(ts(5.0)))
+                    .p(px(ts(8.0)))
+                    .bg(crate::ink::rgba(view::DEEP_WELL))
+                    .border_1()
+                    .border_color(crate::ink::rgba(view::HAIRLINE_SLATE.with_alpha(150)))
+                    .child(self.caps("NOT TASKED \u{2014} no command names these"));
+                for unit in idle {
+                    channel = channel.child(self.board_hull_card(unit));
+                }
+                channels = channels.child(channel);
+            }
+        } else {
+            channels = channels.child(self.board_note("Select a step to read its commands."));
+        }
+        right = right.child(channels);
+        col = col.child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_row()
+                .gap(px(ts(12.0)))
+                .p(px(ts(12.0)))
+                .child(left)
+                .child(right),
+        );
+        let _ = (width, win_h);
+        col.into_any_element()
+    }
+
+    fn caps(&self, text: &str) -> gpui::AnyElement {
+        div()
+            .font_family("PT Mono")
+            .text_size(px(ts(9.0)))
+            .text_color(crate::ink::rgba(view::BODY_SILVER))
+            .child(text.to_uppercase())
+            .into_any_element()
+    }
+
+    fn board_note(&self, text: &str) -> gpui::AnyElement {
+        div()
+            .font_family("Saira Condensed")
+            .text_size(px(ts(12.0)))
+            .text_color(crate::ink::rgba(view::BODY_SILVER))
+            .child(text.to_string())
+            .into_any_element()
+    }
+
+    fn board_step_row(&self, step: &crate::control::BoardStepState) -> gpui::AnyElement {
+        let ink = match step.status.as_str() {
+            "playing" | "current" | "unit_ready" => view::RADAR_CYAN,
+            "halted" | "done" => view::WARNING_SAND,
+            "played" => view::SIGNAL_GREEN,
+            _ => view::BODY_SILVER,
+        };
+        let active = matches!(step.status.as_str(), "playing" | "current" | "unit_ready");
+        let mut card = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(ts(4.0)))
+            .p(px(ts(8.0)))
+            .bg(crate::ink::rgba(if active {
+                view::PANEL_SLATE
+            } else {
+                view::DEEP_WELL
+            }))
+            .border_1()
+            .border_color(crate::ink::rgba(if active {
+                view::RADAR_CYAN
+            } else {
+                view::HAIRLINE_SLATE
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(ts(8.0)))
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(9.0)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child(format!("{:>2}", step.number)),
+                    )
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(9.0)))
+                            .text_color(crate::ink::rgba(ink))
+                            .child(step.status.to_uppercase()),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(9.0)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child(
+                                step.window
+                                    .as_ref()
+                                    .map(|(a, b)| format!("{a}\u{2013}{b}"))
+                                    .unwrap_or_else(|| "\u{2014}".to_string()),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .font_family("Saira Condensed")
+                    .text_size(px(ts(13.0)))
+                    .text_color(crate::ink::rgba(view::MAP_INK))
+                    .child(if step.content.trim().is_empty() {
+                        "(not written yet)".to_string()
+                    } else {
+                        step.content.clone()
+                    }),
+            );
+        for (at, sub) in step.substeps.iter().enumerate() {
+            card = card.child(
+                div()
+                    .pl(px(ts(18.0)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(ts(6.0)))
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(8.5)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child(format!("{:02}", at + 1)),
+                    )
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(9.0)))
+                            .text_color(crate::ink::rgba(view::MAP_INK))
+                            .child(sub.content.clone()),
+                    ),
+            );
+        }
+        card.into_any_element()
+    }
+
+    fn board_hull_card(&self, unit: &crate::control::BoardUnitState) -> gpui::AnyElement {
+        div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(ts(8.0)))
+            .p(px(ts(6.0)))
+            .bg(crate::ink::rgba(view::PANEL_SLATE))
+            .border_1()
+            .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(ts(1.0)))
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(ts(13.0)))
+                            .text_color(crate::ink::rgba(view::MAP_INK))
+                            .child(unit.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(9.0)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child(unit.commander.clone()),
+                    ),
+            )
+            .child(self.ready_chip(unit.ready))
+            .into_any_element()
+    }
+
+    fn ready_chip(&self, ready: Option<bool>) -> gpui::AnyElement {
+        let (label, ink) = match ready {
+            Some(true) => ("READY", view::SIGNAL_GREEN),
+            Some(false) => ("NOT READY", view::WARNING_SAND),
+            None => ("\u{2014}", view::BODY_SILVER),
+        };
+        div()
+            .flex_shrink_0()
+            .font_family("PT Mono")
+            .text_size(px(ts(9.0)))
+            .text_color(crate::ink::rgba(ink))
+            .child(label)
+            .into_any_element()
+    }
+
+    fn players_count(&self) -> usize {
+        let Some(session) = &self.session else {
+            return 0;
+        };
+        let seated = session
+            .participants
+            .iter()
+            .filter(|person| !person.judge)
+            .count();
+        if seated > 0 {
+            return seated;
+        }
+        let mut commanders: Vec<i64> = session
+            .units
+            .iter()
+            .filter_map(|unit| unit.commander.as_ref().map(|c| c.id))
+            .collect();
+        commanders.sort_unstable();
+        commanders.dedup();
+        commanders.len()
+    }
+
+    /// The phone's group focus, resolved to the group's mean ground.
+    fn focused_group(&self, win_w: f32, win_h: f32) -> Option<((f32, f32), crate::control::GroupState)> {
+        let id = self.ui.focus_group?;
+        let session = self.session.as_ref()?;
+        let group = session.groups.iter().find(|group| group.id == id)?.clone();
+        let anchor = self.group_anchor(session, id)?;
+        let (x, y) = map_geometry::project_mercator(
+            anchor.latitude,
+            anchor.longitude,
+            (self.camera.center.latitude, self.camera.center.longitude),
+            self.camera.zoom,
+            f64::from(self.map_dims.0),
+            f64::from(self.map_dims.1),
+        );
+        Some((
+            (
+                win_w * (x as f32 / self.map_dims.0),
+                win_h * (y as f32 / self.map_dims.1),
+            ),
+            group,
+        ))
+    }
+
+    fn group_anchor(&self, session: &SessionState, group_id: i64) -> Option<GeoPoint> {
+        let mut subtree = vec![group_id];
+        let mut cursor = 0usize;
+        while cursor < subtree.len() {
+            let parent = subtree[cursor];
+            for group in &session.groups {
+                if group.parent == Some(parent) && !subtree.contains(&group.id) {
+                    subtree.push(group.id);
+                }
+            }
+            cursor += 1;
+        }
+        let mut n = 0.0f64;
+        let (mut lat, mut lon) = (0.0f64, 0.0f64);
+        for group in session.groups.iter().filter(|g| subtree.contains(&g.id)) {
+            for id in &group.units {
+                if let Some(position) = session
+                    .units
+                    .iter()
+                    .find(|unit| unit.id == *id)
+                    .and_then(|unit| self.placed(unit))
+                {
+                    lat += position.latitude;
+                    lon += position.longitude;
+                    n += 1.0;
+                }
+            }
+        }
+        if n == 0.0 {
+            return None;
+        }
+        Some(GeoPoint {
+            latitude: lat / n,
+            longitude: lon / n,
+        })
+    }
+
+    fn group_card(
+        &self,
+        group: &crate::control::GroupState,
+        at: (f32, f32),
+        win_w: f32,
+        win_h: f32,
+    ) -> gpui::AnyElement {
+        let Some(session) = &self.session else {
+            return div().into_any_element();
+        };
+        let mut subtree = vec![group.id];
+        let mut cursor = 0usize;
+        while cursor < subtree.len() {
+            let parent = subtree[cursor];
+            for child in &session.groups {
+                if child.parent == Some(parent) && !subtree.contains(&child.id) {
+                    subtree.push(child.id);
+                }
+            }
+            cursor += 1;
+        }
+        let children: Vec<&crate::control::GroupState> = session
+            .groups
+            .iter()
+            .filter(|g| g.parent == Some(group.id))
+            .collect();
+        let hulls: Vec<String> = session
+            .groups
+            .iter()
+            .filter(|g| subtree.contains(&g.id))
+            .flat_map(|g| g.units.iter())
+            .filter_map(|id| session.units.iter().find(|unit| unit.id == *id))
+            .map(|unit| unit.name.clone())
+            .collect();
+        let width = ts(316.0);
+        let left = (if at.0 + 24.0 + width > win_w {
+            at.0 - 24.0 - width
+        } else {
+            at.0 + 24.0
+        })
+        .clamp(8.0, (win_w - width - 8.0).max(8.0));
+        let top = (at.1 - 120.0).clamp(ts(70.0), (win_h - 360.0).max(ts(70.0)));
+        let mut card = div()
+            .id("wall-group-card")
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(width))
+            .max_h(px(ts(420.0)))
+            .overflow_y_scroll()
+            .bg(crate::ink::rgba(view::PANEL_SLATE))
+            .border_1()
+            .border_color(crate::ink::rgba(group_ink(&group.kind)))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(ts(12.0)))
+                    .py(px(ts(6.0)))
+                    .border_b_1()
+                    .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(10.0)))
+                            .text_color(crate::ink::rgba(group_ink(&group.kind)))
+                            .child(group.kind.to_uppercase()),
+                    )
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(9.0)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child(format!(
+                                "{} \u{00b7} {}",
+                                plural(hulls.len(), "hull"),
+                                plural(children.len(), "group")
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(ts(12.0)))
+                    .py(px(ts(8.0)))
+                    .flex()
+                    .flex_col()
+                    .gap(px(ts(4.0)))
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(ts(17.0)))
+                            .text_color(crate::ink::rgba(view::MAP_INK))
+                            .child(group.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(ts(13.0)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child(format!(
+                                "commander \u{00b7} {}",
+                                group
+                                    .commander
+                                    .as_ref()
+                                    .map(|c| c.name.clone())
+                                    .unwrap_or_else(|| "uncommanded".to_string())
+                            )),
+                    ),
+            );
+        for child in children {
+            card = card.child(
+                div()
+                    .px(px(ts(12.0)))
+                    .py(px(ts(3.0)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(ts(6.0)))
+                    .border_t_1()
+                    .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(8.5)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child("GROUP"),
+                    )
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(ts(13.0)))
+                            .text_color(crate::ink::rgba(view::MAP_INK))
+                            .child(child.name.clone()),
+                    ),
+            );
+        }
+        for hull in hulls {
+            card = card.child(
+                div()
+                    .px(px(ts(12.0)))
+                    .py(px(ts(3.0)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(ts(6.0)))
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(8.5)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child("HULL"),
+                    )
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(ts(13.0)))
+                            .text_color(crate::ink::rgba(view::MAP_INK))
+                            .child(hull),
+                    ),
+            );
+        }
+        card.into_any_element()
+    }
+
+    /// The focused hull's carried pieces, beside its card.
+    fn embark_card(
+        &self,
+        unit: &UnitState,
+        at: (f32, f32),
+        win_w: f32,
+        win_h: f32,
+    ) -> gpui::AnyElement {
+        if unit.embarked.is_empty() {
+            return div().into_any_element();
+        }
+        let width = ts(300.0);
+        let left = (if at.0 + 24.0 + ts(300.0) + 12.0 + width > win_w {
+            at.0 - 24.0 - ts(300.0) - 12.0 - width
+        } else {
+            at.0 + 24.0 + ts(300.0) + 12.0
+        })
+        .clamp(8.0, (win_w - width - 8.0).max(8.0));
+        let top = (at.1 - 70.0).clamp(ts(70.0), (win_h - 220.0).max(ts(70.0)));
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(width))
+            .bg(crate::ink::rgba(view::PANEL_SLATE))
+            .border_1()
+            .border_color(crate::ink::rgba(view::RADAR_CYAN.with_alpha(160)))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(ts(12.0)))
+                    .py(px(ts(6.0)))
+                    .border_b_1()
+                    .border_color(crate::ink::rgba(view::HAIRLINE_SLATE))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_family("Saira Condensed")
+                            .text_size(px(ts(13.0)))
+                            .text_color(crate::ink::rgba(view::MAP_INK))
+                            .child(unit.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(9.0)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child(plural(unit.embarked.len(), "aboard")),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(ts(12.0)))
+                    .py(px(ts(8.0)))
+                    .flex()
+                    .flex_col()
+                    .gap(px(ts(4.0)))
+                    .child(
+                        div()
+                            .font_family("PT Mono")
+                            .text_size(px(ts(9.0)))
+                            .text_color(crate::ink::rgba(view::BODY_SILVER))
+                            .child("ABOARD"),
+                    )
+                    .children(unit.embarked.iter().map(|child| {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(ts(8.0)))
+                            .child(
+                                div()
+                                    .font_family("Saira Condensed")
+                                    .text_size(px(ts(13.0)))
+                                    .text_color(crate::ink::rgba(view::MAP_INK))
+                                    .child(child.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .font_family("PT Mono")
+                                    .text_size(px(ts(9.0)))
+                                    .text_color(crate::ink::rgba(view::BODY_SILVER))
+                                    .child(child.hull_number.clone()),
+                            )
+                            .into_any_element()
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
+/// The ink a task group wears, by echelon: the same three colours the
+/// console's planning map uses for its organisation lines.
+fn group_ink(kind: &str) -> view::Rgba {
+    match kind.to_ascii_lowercase().replace([' ', '_'], "").as_str() {
+        "gugus" => view::LINK_GUGUS,
+        "operasigabungan" | "opgab" => view::LINK_OPERASI_GABUNGAN,
+        _ => view::LINK_SATUAN_TUGAS,
     }
 }
 
@@ -1296,20 +2317,28 @@ impl Render for CommandCenter {
             );
         }
 
-        // The observer's windows, exactly the three the phone toggles. They
-        // sit in the console's right column and use its panel grammar: a
-        // tracked-caps title band on Panel Slate over a Console Night body,
-        // one hairline edge.
-        if self.ready() {
-            root = self.panels(root, win_w, win_h);
+        // THE EXECUTION CHROME, as the Game Master's console draws it: the
+        // two readings on the right (players and comms) and the scenario card
+        // in the body. The phone's `ui.panels` does not replace them; it opens
+        // the LARGER surface each one is a door to.
+        if self.ready() && self.session.as_ref().is_some_and(|s| s.is_execution()) {
+            root = root.child(self.execution_rail(win_w));
         }
 
-        // The focused hull's card: the phone tapped its grid button, the
-        // camera centred it, and this says who and what it is without leaving
-        // the water. Drawn after the windows so it is never buried by them,
-        // beside the mark and flipped to whichever side has room.
+        // The focused hull or group: the phone tapped it, the camera centred
+        // it, and this says who and what it is beside its mark.
         if let Some((mark, unit)) = self.focused_unit(win_w, win_h) {
             root = root.child(self.unit_card(&unit, (mark.0, mark.1), win_w, win_h));
+            root = root.child(self.embark_card(&unit, (mark.0, mark.1), win_w, win_h));
+        }
+        if let Some((mark, group)) = self.focused_group(win_w, win_h) {
+            root = root.child(self.group_card(&group, mark, win_w, win_h));
+        }
+
+        // The larger surfaces the phone opens. They sit over the chrome, as a
+        // modal does over the console's map.
+        if self.ready() {
+            root = self.panel_overlays(root, win_w, win_h);
         }
 
         // The waiting scrim: the map stays visible because the place matters,

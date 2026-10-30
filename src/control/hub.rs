@@ -124,6 +124,10 @@ pub enum ApplyError {
     UnknownUnit(i64),
     /// The unit exists but has neither a live fix nor a recorded placement.
     UnitHasNoPosition(i64),
+    /// The focus command named a task group the session does not hold.
+    UnknownGroup(i64),
+    /// The group exists but none of its hulls has a ground to centre on.
+    GroupHasNoPosition(i64),
 }
 
 impl fmt::Display for ApplyError {
@@ -133,6 +137,10 @@ impl fmt::Display for ApplyError {
             Self::UnknownUnit(id) => write!(f, "the session holds no unit {id}"),
             Self::UnitHasNoPosition(id) => {
                 write!(f, "unit {id} has no position to focus on")
+            }
+            Self::UnknownGroup(id) => write!(f, "the session holds no task group {id}"),
+            Self::GroupHasNoPosition(id) => {
+                write!(f, "task group {id} has no placed hull to focus on")
             }
         }
     }
@@ -406,6 +414,7 @@ impl ControlHub {
             .views
             .get(view)
             .expect("the view exists after creation");
+        let ui_before = shared.ui;
         let next = match command {
             Command::CameraSet { center, zoom } => Some(CameraSnapshot {
                 center: *center,
@@ -444,6 +453,7 @@ impl ControlHub {
             }),
             Command::CameraFocus { unit_id, zoom } => {
                 shared.ui.focus = Some(*unit_id);
+                shared.ui.focus_group = None;
                 let position = shared
                     .session
                     .as_ref()
@@ -457,6 +467,32 @@ impl ControlHub {
                     .ok_or(ApplyError::UnknownUnit(*unit_id))?
                     .position
                     .ok_or(ApplyError::UnitHasNoPosition(*unit_id))?;
+                Some(CameraSnapshot {
+                    center: position,
+                    zoom: zoom
+                        .map(|zoom| zoom.clamp(ZOOM_MIN, ZOOM_MAX))
+                        .unwrap_or(current.zoom),
+                    ..current
+                })
+            }
+            Command::CameraFocusGroup { group_id, zoom } => {
+                let position = shared
+                    .session
+                    .as_ref()
+                    .and_then(|record| group_anchor(&record.state, *group_id))
+                    .ok_or_else(|| {
+                        if shared
+                            .session
+                            .as_ref()
+                            .is_some_and(|record| record.state.groups.iter().any(|g| g.id == *group_id))
+                        {
+                            ApplyError::GroupHasNoPosition(*group_id)
+                        } else {
+                            ApplyError::UnknownGroup(*group_id)
+                        }
+                    })?;
+                shared.ui.focus_group = Some(*group_id);
+                shared.ui.focus = None;
                 Some(CameraSnapshot {
                     center: position,
                     zoom: zoom
@@ -482,15 +518,23 @@ impl ControlHub {
         }
         shared.views.insert(view.to_string(), camera);
         let revision = bump(&mut shared);
-        let event = camera_event(
+        let camera = camera_event(
             revision,
             view,
             camera,
             Some(source.client_id),
             source.command_id,
         );
+        // A focus is BOTH a camera move and an observer-UI change: the wall
+        // draws the popup from `ui`, so a camera event alone would move the
+        // map and leave the card shut until the next roster heartbeat.
+        let mut events = vec![camera];
+        if shared.ui != ui_before {
+            let readiness = readiness_at(&shared, Instant::now());
+            events.push(session_event(&shared, revision, readiness));
+        }
         drop(shared);
-        let _ = self.events.send(event);
+        publish(&self.events, events);
         Ok(Some(revision))
     }
 
@@ -776,6 +820,50 @@ fn readiness_at(shared: &Shared, now: Instant) -> Readiness {
         return Readiness::waiting(ReadinessReason::NoDisplay);
     }
     Readiness::ready()
+}
+
+/// The ground a task group is focused on: the mean of every placed hull in
+/// its subtree.
+///
+/// A group has no position of its own, so this is the only honest answer. A
+/// group whose hulls are all unplaced has no anchor; the command is refused
+/// rather than the camera being left where it was with a popup that has no
+/// mark to sit beside.
+fn group_anchor(session: &SessionState, group_id: i64) -> Option<GeoPoint> {
+    let mut subtree = vec![group_id];
+    let mut cursor = 0usize;
+    while cursor < subtree.len() {
+        let parent = subtree[cursor];
+        for group in &session.groups {
+            if group.parent == Some(parent) && !subtree.contains(&group.id) {
+                subtree.push(group.id);
+            }
+        }
+        cursor += 1;
+    }
+    let mut n = 0.0f64;
+    let (mut lat, mut lon) = (0.0f64, 0.0f64);
+    for group in session.groups.iter().filter(|g| subtree.contains(&g.id)) {
+        for id in &group.units {
+            if let Some(position) = session
+                .units
+                .iter()
+                .find(|unit| unit.id == *id)
+                .and_then(|unit| unit.position)
+            {
+                lat += position.latitude;
+                lon += position.longitude;
+                n += 1.0;
+            }
+        }
+    }
+    if n == 0.0 {
+        return None;
+    }
+    Some(GeoPoint {
+        latitude: lat / n,
+        longitude: lon / n,
+    })
 }
 
 fn session_event(shared: &Shared, revision: u64, readiness: Readiness) -> Event {

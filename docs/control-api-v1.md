@@ -470,10 +470,27 @@ so a phone never needs to know where a hull is.
   surface, and accepting it on `main` would let a phone drag the game master's
   map.
 
+### `camera.focus_group`
+
+Centre the observer view on a task group. A group has no position of its own,
+so the host resolves it against the session and centres on the mean of the
+placed hulls beneath it — every direct hull and every child group's hulls.
+
+```json
+{ "type": "camera.focus_group", "payload": { "group_id": 18, "zoom": 12.0 } }
+```
+
+- `group_id` is `session.groups[].id`.
+- `zoom` is optional; omitted keeps the observer view's current zoom.
+- An unknown group is `422 invalid_command`; a group whose hulls are all
+  unplaced is the same, with a message saying so.
+- It sets `ui.focus_group` and clears `ui.focus`, so the wall opens the group
+  card instead of the hull card.
+
 ### `ui.set`
 
-Open or close one of the observer's windows, or change the hull the popup is
-about (the latter rides `camera.focus`).
+Open or close one of the observer's windows. The hull or group the popup is
+about rides `camera.focus` / `camera.focus_group`.
 
 ```json
 { "type": "ui.set", "payload": { "panel": "crew", "open": true } }

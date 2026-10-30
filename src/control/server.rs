@@ -574,7 +574,8 @@ fn needed_scope(command: &Command) -> Scope {
         Command::CameraSet { .. }
         | Command::CameraNudge { .. }
         | Command::CameraZoom { .. }
-        | Command::CameraFocus { .. } => Scope::ControlView,
+        | Command::CameraFocus { .. }
+        | Command::CameraFocusGroup { .. } => Scope::ControlView,
         // The viewport is something a display says about itself. A phone that
         // lies about it could change what "a quarter of a viewport" means, so
         // it needs the same scope that steering does.

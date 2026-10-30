@@ -88,6 +88,9 @@
           "$ref": "#/$defs/command_camera_focus"
         },
         {
+          "$ref": "#/$defs/command_camera_focus_group"
+        },
+        {
           "$ref": "#/$defs/command_view_report"
         },
         {
@@ -101,19 +104,36 @@
     "command_settings_font": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "payload"],
+      "required": [
+        "type",
+        "payload"
+      ],
       "description": "The console's text size, as a step of its four-step ladder. Host-wide: it is not addressed to a view and needs no readiness.",
       "properties": {
-        "protocol_version": {"$ref": "#/$defs/protocol_version"},
-        "client_id": {"type": "string"},
-        "command_id": {"type": "string"},
-        "type": {"const": "settings.font"},
+        "protocol_version": {
+          "$ref": "#/$defs/protocol_version"
+        },
+        "client_id": {
+          "type": "string"
+        },
+        "command_id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "settings.font"
+        },
         "payload": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["step"],
+          "required": [
+            "step"
+          ],
           "properties": {
-            "step": {"type": "integer", "minimum": 0, "maximum": 3}
+            "step": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3
+            }
           }
         }
       }
@@ -121,20 +141,48 @@
     "command_ui_set": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "payload"],
+      "required": [
+        "type",
+        "payload"
+      ],
       "properties": {
-        "protocol_version": {"$ref": "#/$defs/protocol_version"},
-        "client_id": {"type": "string"},
-        "command_id": {"type": "string"},
-        "view": {"type": "string", "enum": ["observer"]},
-        "type": {"const": "ui.set"},
+        "protocol_version": {
+          "$ref": "#/$defs/protocol_version"
+        },
+        "client_id": {
+          "type": "string"
+        },
+        "command_id": {
+          "type": "string"
+        },
+        "view": {
+          "type": "string",
+          "enum": [
+            "observer"
+          ]
+        },
+        "type": {
+          "const": "ui.set"
+        },
         "payload": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["panel", "open"],
+          "required": [
+            "panel",
+            "open"
+          ],
           "properties": {
-            "panel": {"type": "string", "enum": ["crew", "scenario", "comms"]},
-            "open": {"type": "boolean"}
+            "panel": {
+              "type": "string",
+              "enum": [
+                "crew",
+                "scenario",
+                "comms"
+              ]
+            },
+            "open": {
+              "type": "boolean"
+            }
           }
         }
       }
@@ -895,62 +943,135 @@
         },
         "affiliation": {
           "type": "string",
-          "enum": ["unknown", "friendly", "neutral", "hostile"]
+          "enum": [
+            "unknown",
+            "friendly",
+            "neutral",
+            "hostile"
+          ]
         },
         "symbol": {
           "type": "string",
-          "enum": ["dot", "destroyer", "frigate", "corvette", "auxiliary", "landing", "submarine", "plane", "tank", "port"]
+          "enum": [
+            "dot",
+            "destroyer",
+            "frigate",
+            "corvette",
+            "auxiliary",
+            "landing",
+            "submarine",
+            "plane",
+            "tank",
+            "port"
+          ]
         }
       }
     },
     "participant": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "name"],
+      "required": [
+        "id",
+        "name"
+      ],
       "properties": {
-        "id": {"type": "integer", "minimum": 1},
-        "name": {"type": "string"},
-        "role": {"type": "string"},
-        "judge": {"type": "boolean"},
-        "ready": {"type": "boolean"}
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "name": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "judge": {
+          "type": "boolean"
+        },
+        "ready": {
+          "type": "boolean"
+        }
       }
     },
     "message": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id"],
+      "required": [
+        "id"
+      ],
       "description": "One message the console published for observers. `assumed` keeps the console's rule: a message sent as a scenario role has no author, and the projection never invents one.",
       "properties": {
-        "id": {"type": "integer", "minimum": 1},
-        "kind": {"type": "string"},
-        "class_label": {"type": "string"},
-        "sender": {"type": "string"},
-        "assumed": {"type": "boolean"},
-        "broadcast": {"type": "boolean"},
-        "content": {"type": "string"},
-        "at": {"type": "string"},
-        "degree": {"type": "string"}
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "kind": {
+          "type": "string"
+        },
+        "class_label": {
+          "type": "string"
+        },
+        "sender": {
+          "type": "string"
+        },
+        "assumed": {
+          "type": "boolean"
+        },
+        "broadcast": {
+          "type": "boolean"
+        },
+        "content": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "degree": {
+          "type": "string"
+        }
       }
     },
     "settings": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["step", "text_scale"],
+      "required": [
+        "step",
+        "text_scale"
+      ],
       "description": "The host's text size: one setting, host-wide, that the console and every attached wall draw at.",
       "properties": {
-        "step": {"type": "integer", "minimum": 0, "maximum": 3},
-        "text_scale": {"type": "number", "minimum": 1.0, "maximum": 1.45}
+        "step": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "text_scale": {
+          "type": "number",
+          "minimum": 1.0,
+          "maximum": 1.45
+        }
       }
     },
     "event_settings_changed": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "revision", "settings"],
+      "required": [
+        "type",
+        "revision",
+        "settings"
+      ],
       "description": "The host's text size changed. Every surface that draws type redraws at the new step.",
       "properties": {
-        "type": {"const": "settings.changed"},
-        "revision": {"type": "integer", "minimum": 0},
-        "settings": {"$ref": "#/$defs/settings"}
+        "type": {
+          "const": "settings.changed"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "settings": {
+          "$ref": "#/$defs/settings"
+        }
       }
     },
     "observer_ui": {
@@ -962,12 +1083,25 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "crew": {"type": "boolean"},
-            "scenario": {"type": "boolean"},
-            "comms": {"type": "boolean"}
+            "crew": {
+              "type": "boolean"
+            },
+            "scenario": {
+              "type": "boolean"
+            },
+            "comms": {
+              "type": "boolean"
+            }
           }
         },
-        "focus": {"type": "integer", "minimum": 1}
+        "focus": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "focus_group": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     },
     "session": {
@@ -1015,6 +1149,15 @@
           "items": {
             "$ref": "#/$defs/message"
           }
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/group"
+          }
+        },
+        "board": {
+          "$ref": "#/$defs/board"
         }
       }
     },
@@ -1186,6 +1329,219 @@
         },
         "message": {
           "type": "string"
+        }
+      }
+    },
+    "command_camera_focus_group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "payload"
+      ],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/protocol_version"
+        },
+        "client_id": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "command_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "view": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "type": {
+          "const": "camera.focus_group"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "group_id"
+          ],
+          "properties": {
+            "group_id": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "zoom": {
+              "type": "number",
+              "minimum": -30,
+              "maximum": 30
+            }
+          }
+        }
+      }
+    },
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name"
+      ],
+      "description": "One task-organisation node, so a wall can name a hull's group and draw its card.",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "parent": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "commander": {
+          "$ref": "#/$defs/commander"
+        },
+        "units": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "board": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The scenario's book while an exercise runs: the order, the pointer, and the hulls of the step being read.",
+      "properties": {
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "at": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/board_step"
+          }
+        },
+        "units": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/board_unit"
+          }
+        }
+      }
+    },
+    "board_step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario",
+        "step_id",
+        "number"
+      ],
+      "properties": {
+        "scenario": {
+          "type": "string"
+        },
+        "step_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "content": {
+          "type": "string"
+        },
+        "window": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "read": {
+          "type": "string",
+          "enum": [
+            "playing",
+            "asking",
+            "played",
+            "later"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "idle",
+            "played",
+            "current",
+            "unit_ready",
+            "playing",
+            "halted",
+            "done"
+          ]
+        },
+        "substeps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/board_substep"
+          }
+        }
+      }
+    },
+    "board_substep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "content": {
+          "type": "string"
+        },
+        "units": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "board_unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "name": {
+          "type": "string"
+        },
+        "commander": {
+          "type": "string"
+        },
+        "ready": {
+          "type": "boolean"
         }
       }
     }

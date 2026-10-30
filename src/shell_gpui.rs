@@ -314,7 +314,7 @@ fn swallow_wheel(ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut gpui::App
 /// was not known where the words were written. It is known here: one hull,
 /// six hulls. A console that says "1 hull(s)" is telling the operator that
 /// nobody read the sentence.
-fn plural(n: usize, noun: &str) -> String {
+pub(crate) fn plural(n: usize, noun: &str) -> String {
     if n == 1 {
         format!("{n} {noun}")
     } else {
@@ -1845,6 +1845,16 @@ struct IslandDemo {
     /// satisfy it.
     embark_asked: Vec<i64>,
     commander_embark_game: i64,
+    /// When the commander dashboard last asked the composition's hosts.
+    ///
+    /// A REFUSED READ IS NOT AN ANSWER. `embark_asked` remembers a question so
+    /// the rail does not ask it on every frame, and the answer was then
+    /// cached for the rest of the exercise — so a 403 (a seat whose game role
+    /// does not hold the force's read) or a read that raced the sign-in left
+    /// "nothing embarked" standing even after the composition changed. The
+    /// timestamp is what makes those asks expire: a host that has not
+    /// ANSWERED is asked again, at most this often.
+    commander_embark_at: Option<std::time::Instant>,
     /// The Fleet picker's latch and verdict. The latch is the shared answer
     /// feed's; the line is what the panel says about the last edit, which is
     /// where a refusal from `force::plan` lands.
@@ -2280,6 +2290,11 @@ const PREP_STATE_FRAC: f32 = 0.18;
 const DASH_H_FRAC: f32 = 0.16;
 const DASH_H_MIN: f32 = 156.0;
 const DASH_H_MAX: f32 = 176.0;
+/// How often the commander dashboard asks again for a composition it was
+/// refused. A refusal is not an answer — see `ensure_commander_embark` — but a
+/// console that retried on every frame would ask the server sixty times a
+/// second for a read it may never be allowed to make.
+const COMMANDER_EMBARK_RETRY: u64 = 60;
 /// The follow control: the commander's one-tap door onto their own unit.
 /// Sized to sit clear of the rail's top edge, which is where the operator's
 /// own drawing puts it.
@@ -2488,6 +2503,26 @@ struct ExecWidget {
     progress: Option<f32>,
     hint: Option<String>,
     panel: Option<WhichPanel>,
+    /// The ONE press the widget offers, when it has one. Only the scenario
+    /// card carries a verb: a declaration is the commander's own act on the
+    /// step the exercise is asking them about, and the rail is where that
+    /// reading now lives.
+    verb: Option<ExecVerb>,
+}
+
+/// One widget's press: the label the button carries and the SIZE it is drawn
+/// at. `button`'s own second argument is `small`, and the pair reads here the
+/// way it reads on the step box: the arming half (READY) at full strength and
+/// its withdrawal as the quieter, small pill.
+///
+/// A VALUE rather than a closure, so the widget list stays plain data a test
+/// can read without a rendered frame — the same reason the rest of
+/// [`ExecWidget`] is data. The door it is drawn on is the widget's own id, so
+/// the drawer never holds a second copy of the rule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ExecVerb {
+    label: &'static str,
+    small: bool,
 }
 
 /// What the rail's helm channel draws.
@@ -4845,6 +4880,7 @@ impl IslandDemo {
             embark_status: Status::empty(),
             embark_asked: Vec::new(),
             commander_embark_game: 0,
+            commander_embark_at: None,
             roster_busy: false,
             roster_status: Status::empty(),
             // The capture seed's mode, read once at boot. A seed that names
@@ -5345,7 +5381,8 @@ impl IslandDemo {
                 dy_fraction,
             } => self.pan_fraction(dx_fraction, dy_fraction, cx),
             crate::control::Command::CameraZoom { delta } => self.zoom_by(delta, cx),
-            crate::control::Command::CameraFocus { .. } => {
+            crate::control::Command::CameraFocus { .. }
+            | crate::control::Command::CameraFocusGroup { .. } => {
                 // A focus is resolved against a session, and only the server
                 // holds one. By the time a command reaches this shell it has
                 // already been turned into a camera: a focus addressed to the
@@ -14159,10 +14196,13 @@ impl IslandDemo {
     /// The composition is published PER HOST (`GET
     /// /games/{id}/units/{unit}/embarkations`), and there is no reverse route,
     /// so "am I aboard something?" is answered by asking every other piece.
-    /// The reads are made once per session and land in the same `embarked`
-    /// map the Embarked modal uses, which means a host this has already asked
-    /// for is never asked twice — the modal inherits the answer rather than
-    /// repeating it.
+    /// The reads land in the same `embarked` map the Embarked modal uses, so a
+    /// host whose answer arrived is never asked again — the modal inherits the
+    /// answer rather than repeating it. A host that was REFUSED is asked
+    /// again, at most [`COMMANDER_EMBARK_RETRY`] seconds apart: a 403 (a game
+    /// role without the force's read) is not the same answer as "nothing is
+    /// aboard", and remembering it as one left a hull that was embarked
+    /// mid-exercise reading "nothing embarked" for the rest of it.
     ///
     /// Called from the frame that draws the dashboard: a channel send is the
     /// whole effect, so no notify is needed, and the `asked` list is what keeps
@@ -14179,6 +14219,21 @@ impl IslandDemo {
             self.embark_asked.clear();
             // The riders went with the previous exercise's hosts.
             self.embarked.clear();
+            self.commander_embark_at = None;
+        }
+        // A REFUSED OR LOST READ IS ASKED AGAIN. `embark_asked` is what keeps
+        // this from being a request on every frame; it is NOT a claim that the
+        // composition was read. Only a host in `embarked` has answered — an
+        // empty answer included — because that is the map the drawer reads.
+        // The interval is what bounds the retry: a seat that may not read the
+        // composition pays one refusal a minute, not one a frame.
+        let now = std::time::Instant::now();
+        match self.commander_embark_at {
+            Some(at) if now.duration_since(at).as_secs() < COMMANDER_EMBARK_RETRY => return,
+            _ => {
+                self.commander_embark_at = Some(now);
+                self.embark_asked.clear();
+            }
         }
         let Some(unit) = self.own_unit_ids().into_iter().next() else {
             return;
@@ -15678,6 +15733,48 @@ impl IslandDemo {
                 moved = true;
             }
         }
+        // THE STEP, while the exercise runs. A step changes hands without a
+        // write of ours — the Game Master plays one on another machine, and
+        // another seat declares ready — so the pointer, this seat's own
+        // declaration and the commands resolved to them are all polled. The
+        // comparison is what keeps a quiet tick from repainting the console
+        // every three seconds.
+        if let Some(step) = pulse.step {
+            if self.session.step.as_ref() != Some(&step) {
+                self.session.step = Some(step);
+                moved = true;
+            }
+        }
+        if let Some(orders) = pulse.step_orders {
+            if self.session.step_orders != orders {
+                self.session.step_orders = orders;
+                moved = true;
+            }
+        }
+        if let Some(gates) = pulse.gates {
+            // UPSERT RATHER THAN REPLACE: the session holds the whole book's
+            // gates (the head, the step the board is reading), and a poll
+            // about the pointer must not erase the rest.
+            for gate in gates {
+                match self
+                    .session
+                    .gates
+                    .iter_mut()
+                    .find(|held| held.scenario_id == gate.scenario_id && held.step_id == gate.step_id)
+                {
+                    Some(held) => {
+                        if *held != gate {
+                            *held = gate;
+                            moved = true;
+                        }
+                    }
+                    None => {
+                        self.session.gates.push(gate);
+                        moved = true;
+                    }
+                }
+            }
+        }
         if let Some(readiness) = pulse.readiness {
             let changed = match &self.session.readiness {
                 Some(held) => {
@@ -16081,22 +16178,19 @@ impl IslandDemo {
         None
     }
 
-    /// The execution phase's widget rail: players and comms.
+    /// The execution phase's widget rail: the exercise's own reading, the
+    /// room, and the traffic.
     ///
-    /// These replace the side column AND the band's two doors in execution.
-    /// Each is deliberately small — the phase is about the map, and a widget
-    /// that said everything would be a panel with a map underneath it — so it
+    /// These replace the side column AND the band's doors in execution. Each
+    /// is deliberately small — the phase is about the map, and a widget that
+    /// said everything would be a panel with a map underneath it — so it
     /// carries one fact and opens its surface on click.
     ///
-    /// THE SCENARIO'S OWN READING LIVES IN THE BODY, not here: the owner's
-    /// direction moved it to the map's foot, where the water is, and this rail
-    /// keeps the room and the traffic.
-    ///
-    /// ADR-0021: the scenario card belongs to a scenario exercise alone.
-    /// A maneuver exercise has no book and a static one has no step, so the
-    /// card is not drawn there at all — a card that says "no steps" over
-    /// an exercise that was never going to have any reads as a broken
-    /// surface rather than as an absence.
+    /// THE SCENARIO IS ONE OF THEM, and it leads the column: the owner's
+    /// direction moved the card off the map's foot to stand with the other
+    /// widgets. ADR-0021 still gates it — a maneuver exercise has no book and
+    /// a static one has no step — and `execution_widget_set` is what applies
+    /// that gate.
     fn execution_widgets(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let widgets = self.execution_widget_set();
         let mut rail = div()
@@ -16120,6 +16214,7 @@ impl IslandDemo {
                 widget.progress,
                 widget.hint,
                 widget.panel,
+                widget.verb,
                 cx,
             ));
         }
@@ -16133,13 +16228,22 @@ impl IslandDemo {
     /// one list rather than a chain of calls that could each answer a
     /// different rule.
     ///
-    /// THE SCENARIO IS NO LONGER A RAIL WIDGET. The owner's direction: the
-    /// step's reading belongs in the body of the map, where the operator is
-    /// already looking, and the rail keeps the two room facts — who is here,
-    /// and what traffic arrived.
+    /// THE SCENARIO LEADS. The exercise's own state is what the phase is
+    /// about, and the owner's direction moved the card off the map's foot and
+    /// into this rail beside the room's two facts — one column of readings,
+    /// one place to look.
     fn execution_widget_set(&self) -> Vec<ExecWidget> {
         let players = self.visible_players();
-        let mut widgets = vec![ExecWidget {
+        let mut widgets = Vec::new();
+        // ADR-0021: the scenario card belongs to a scenario exercise alone.
+        // A maneuver exercise has no book and a static one has no step, so the
+        // card is not drawn there at all — a card that says "no steps" over an
+        // exercise that was never going to have any reads as a broken surface
+        // rather than as an absence.
+        if self.scenario_exercise() {
+            widgets.push(self.scenario_widget());
+        }
+        widgets.push(ExecWidget {
             id: "widget-crew",
             label: "players",
             value: format!("{players}"),
@@ -16152,7 +16256,8 @@ impl IslandDemo {
                 plural(self.session.pieces.len(), "hull")
             )),
             panel: Some(WhichPanel::Crew),
-        }];
+            verb: None,
+        });
         // The comms widget: the count, in the newest traffic's own
         // kind's ink, and the unseen count beside it.
         //
@@ -16179,6 +16284,7 @@ impl IslandDemo {
                 format!("{} in this exercise", plural(held, "message"))
             }),
             panel: Some(WhichPanel::Comms),
+            verb: None,
         });
         widgets
     }
@@ -16249,20 +16355,86 @@ impl IslandDemo {
         )
     }
 
-    /// THE MAP'S OWN SCENARIO READING: the step, its state and how many
-    /// have declared — in the body, not on the rail.
+    /// THE SCENARIO'S READING, as the rail's first widget: the step, its
+    /// state and how many have declared.
     ///
     /// One card, one question: where the exercise stands and what it is
     /// waiting on. The whole book is one press away. A commander's card
     /// carries the ONE verb their station owes; a Game Master's card opens
     /// the plan.
-    fn execution_scenario_widget(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if !self.scenario_exercise() {
-            return div().into_any_element();
-        }
+    ///
+    /// **THE BOOK IS NOT EVERY SEAT'S TO READ.** Minos grants
+    /// `/games/scenarios` to the Game Master and the judge side and withholds
+    /// it from a Commando deliberately — the script is what the people being
+    /// exercised must not see — so a participant's session arrives with an
+    /// empty book. Reading `board.total == 0` as "NO SCRIPT" therefore told a
+    /// commander the exercise had no steps while the Game Master was looking
+    /// at one. `current-step` is the participant's half: the step in play and
+    /// the step asking THEM to declare. Where the book is not held, this card
+    /// reads that, so it answers "what is my station doing" instead of
+    /// claiming a fact about a plan it was never given.
+    fn scenario_widget(&self) -> ExecWidget {
         let board = self.scenario_board();
+        // A participant's seat: no book, and a current step that is theirs.
+        if board.audience == ScenarioAudience::Commander && self.session.book.is_empty() {
+            let asking = self.session.step.as_ref().and_then(|s| s.asking.as_ref());
+            let playing = self.session.step.as_ref().and_then(|s| s.playing.as_ref());
+            let (value, status, hint) = match (asking, playing) {
+                // THE DECLARATION IS THE VERB, so the step that asks comes
+                // first: the exercise is waiting on THIS seat, and a reading
+                // that opened on the step in play would bury the one thing
+                // the card exists to say.
+                (Some(ask), _) => {
+                    let ready = ask.required.saturating_sub(ask.outstanding);
+                    let status = if ask.required > 0 && ready >= ask.required {
+                        StepStatus::UnitReady
+                    } else {
+                        StepStatus::Current
+                    };
+                    (
+                        "NEXT STEP".to_string(),
+                        Some(status),
+                        if ask.required > 0 {
+                            format!("{ready} of {} declared", ask.required)
+                        } else {
+                            "no one is asked to declare".to_string()
+                        },
+                    )
+                }
+                (None, Some(play)) => (
+                    "IN PLAY".to_string(),
+                    Some(StepStatus::Playing),
+                    if play.content.trim().is_empty() {
+                        "the exercise is on this step".to_string()
+                    } else {
+                        play.content.clone()
+                    },
+                ),
+                // NOT "NO SCRIPT": nothing is playing and nothing is asked,
+                // which is the whole of what this seat can know. A plan with
+                // no steps and a plan it may not read look the same from
+                // here, and claiming either would be inventing one.
+                (None, None) => (
+                    "NO STEP".to_string(),
+                    None,
+                    "nothing is playing and nothing is asked of you".to_string(),
+                ),
+            };
+            return ExecWidget {
+                id: "widget-scenario",
+                label: "scenario",
+                value,
+                ink: MAP_INK,
+                status,
+                progress: None,
+                hint: Some(hint),
+                panel: Some(WhichPanel::Board),
+                verb: self.scenario_widget_verb(),
+            };
+        }
+        // The Game Master's and the observer's reading: the book itself.
         let playing = board.steps.iter().find(|s| s.status.is_pointer());
-        let status = playing.map(|s| s.status);
+        let status = playing.map(|s| s.status).unwrap_or(StepStatus::Idle);
         let value = match (board.total, board.at) {
             (0, _) => "NO SCRIPT".to_string(),
             (_, Some(at)) => format!("STEP {at}"),
@@ -16277,101 +16449,60 @@ impl IslandDemo {
         } else if board.total == 0 {
             crate::mode_rules::no_script_sentence().to_string()
         } else {
-            format!("{}", plural(board.total as usize, "step"))
+            plural(board.total as usize, "step").to_string()
         };
-        let commander = self.scenario_audience() == ScenarioAudience::Commander;
-        let asking = if commander { self.asking_step() } else { None };
-        let status_el = match status {
-            Some(status) => status_chip(status).into_any_element(),
-            None => div()
-                .child(kit::mono_caps("IDLE", view::MACHINE_PT, kit::MUTED_INK))
-                .into_any_element(),
+        ExecWidget {
+            id: "widget-scenario",
+            label: "scenario",
+            value,
+            ink: MAP_INK,
+            status: Some(status),
+            progress: board.progress.as_ref().map(|p| p.fraction),
+            hint: Some(hint),
+            panel: Some(WhichPanel::Board),
+            // A commander whose book DID arrive still owes the declaration,
+            // and the card is still where they press it. Only a seat the
+            // exercise never asks has no verb.
+            verb: if board.audience == ScenarioAudience::Commander {
+                self.scenario_widget_verb()
+            } else {
+                None
+            },
+        }
+    }
+
+    /// The declaration the scenario card offers, when this seat owes one.
+    ///
+    /// The SAME press the body card drew before it moved to the rail: READY
+    /// posts the helm the commander set and then declares, WITHDRAW takes the
+    /// declaration back. Kept as data so the rail's drawer and
+    /// [`Self::send_helm_and_ready`] cannot disagree about what the press is.
+    fn scenario_widget_verb(&self) -> Option<ExecVerb> {
+        let (_, _, you_ready) = self.asking_step()?;
+        Some(ExecVerb {
+            label: if you_ready { "WITHDRAW" } else { "READY" },
+            small: you_ready,
+        })
+    }
+
+    /// The one press a rail widget offers, dispatched by the widget's id.
+    ///
+    /// The scenario card's verb is the same two writes a step declaration has
+    /// always been: a helm that has been touched goes first, then the
+    /// declaration — the order the server reads them in. Every other widget
+    /// has no verb and answers false.
+    fn press_exec_widget_verb(&mut self, widget: &'static str, cx: &mut Context<Self>) -> bool {
+        if widget != "widget-scenario" {
+            return false;
+        }
+        let Some((scenario_id, step_id, you_ready)) = self.asking_step() else {
+            return false;
         };
-        let mut bottom = 12.0;
-        if self.is_commander() {
-            bottom += self.dash_height();
+        if you_ready {
+            self.send_step_declare(scenario_id, step_id, false, cx)
+        } else {
+            self.send_helm_and_ready(scenario_id, step_id, cx)
         }
-        if self.inspector_shown() {
-            bottom += INSPECT_H;
-        }
-        let mut card = div()
-            .id("execution-scenario-widget")
-            .absolute()
-            .left(px(12.0))
-            .bottom(px(bottom))
-            .w(px(292.0))
-            .flex()
-            .flex_col()
-            .rounded(px(kit::RADIUS))
-            .bg(rgba(CONSOLE_NIGHT))
-            .border(px(kit::EDGE_WIDTH))
-            .border_color(rgba(kit::EDGE_INK))
-            .overflow_hidden()
-            .on_scroll_wheel(swallow_wheel)
-            .block_mouse_except_scroll()
-            .cursor_pointer()
-            .on_click(cx.listener(|view, _, _, cx| view.open_board(cx)))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(6.0))
-                    .w_full()
-                    .h(px(26.0))
-                    .px(px(view::PANEL_PAD))
-                    .flex_shrink_0()
-                    .bg(rgba(PANEL_SLATE.with_alpha(kit::BAND_ALPHA)))
-                    .border_b(px(kit::EDGE_WIDTH))
-                    .border_color(rgba(kit::EDGE_INK))
-                    .child(kit::mono_caps("SCENARIO", view::MACHINE_PT, kit::MUTED_INK))
-                    .child(status_el),
-            )
-            .child(
-                div()
-                    .px(px(view::PANEL_PAD))
-                    .pt(px(5.0))
-                    .child(kit::machine(value, view::BODY_PT, MAP_INK)),
-            )
-            .child(
-                div()
-                    .px(px(view::PANEL_PAD))
-                    .pb(px(6.0))
-                    .child(kit::remark(hint, kit::MUTED_INK)),
-            );
-        if let Some((scenario_id, step_id, you_ready)) = asking {
-            card = card.child(
-                div()
-                    .px(px(view::PANEL_PAD))
-                    .pb(px(view::PANEL_PAD))
-                    .child(
-                        div()
-                            .id("scenario-ready")
-                            .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, hear_click)
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                cx.stop_propagation();
-                                if you_ready {
-                                    view.send_step_declare(scenario_id, step_id, false, cx);
-                                } else {
-                                    // THE SCENARIO'S READY IS THE COMMIT: the
-                                    // helm the commander set is posted first,
-                                    // then the declaration, because that is
-                                    // the order the exercise reads them in.
-                                    view.send_helm_and_ready(scenario_id, step_id, cx);
-                                }
-                            }))
-                            .child(button(
-                                if you_ready { "WITHDRAW" } else { "READY" },
-                                !you_ready,
-                                self.step_declare_busy,
-                                false,
-                            )),
-                    ),
-            );
-        }
-        card.into_any_element()
     }
 
     /// One execution widget: a tracked label, one value, one quiet line —
@@ -16394,6 +16525,7 @@ impl IslandDemo {
         progress: Option<f32>,
         hint: Option<String>,
         panel: Option<WhichPanel>,
+        verb: Option<ExecVerb>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // THE FLOW'S PANEL, in a rail slot. The card keeps its width and
@@ -16458,6 +16590,33 @@ impl IslandDemo {
                     .child(kit::remark(hint, kit::MUTED_INK)),
             );
         }
+        // THE VERB, when the widget has one. The press stops its propagation
+        // so opening the card's surface (the click below) and pressing the
+        // card's button can never be the same gesture: a READY that also
+        // opened the board would be one press doing two things.
+        if let Some(verb) = verb {
+            card = card.child(
+                div()
+                    .px(px(view::PANEL_PAD))
+                    .pb(px(view::PANEL_PAD))
+                    .child(
+                        div()
+                            .id("widget-verb")
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, hear_click)
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                cx.stop_propagation();
+                                view.press_exec_widget_verb(id, cx);
+                            }))
+                            .child(button(
+                                verb.label,
+                                verb.small,
+                                self.step_declare_busy,
+                                false,
+                            )),
+                    ),
+            );
+        }
         if let Some(panel) = panel {
             card = card
                 .cursor_pointer()
@@ -16466,6 +16625,11 @@ impl IslandDemo {
                     // close by the thing that opened it is a one-way door.
                     if panel == WhichPanel::Comms {
                         view.toggle_comms(cx);
+                    } else if panel == WhichPanel::Board {
+                        // The board has ONE door: the same open the step
+                        // reminder and the old map card used, so a commander
+                        // pressing the scenario card lands where the plan is.
+                        view.open_board(cx);
                     } else {
                         view.open_only(panel);
                         cx.notify();
@@ -16663,15 +16827,27 @@ impl IslandDemo {
         // was "not in a group" — a claim the console cannot make from a
         // missing read. The node id is the fact the join does publish, so the
         // row says "in a task group" rather than inventing an absence.
+        //
+        // THE NAME COMES FROM `node_names` FIRST, because that map carries
+        // EVERY node the tree read published. `groups` is the draft's own
+        // vocabulary and holds only the echelons this build recognises, so a
+        // node outside that set used to read as unnamed even when the tree had
+        // been read — the console claiming an absence it never checked.
         let group = piece
             .as_ref()
             .and_then(|piece| piece.hierarchy_node)
             .map(|node| {
                 self.session
-                    .groups
-                    .iter()
-                    .find(|group| group.group_id == node)
-                    .map(|group| group.name.clone())
+                    .node_names
+                    .get(&node)
+                    .cloned()
+                    .or_else(|| {
+                        self.session
+                            .groups
+                            .iter()
+                            .find(|group| group.group_id == node)
+                            .map(|group| group.name.clone())
+                    })
                     .unwrap_or_else(|| "in a task group".to_string())
             })
             .unwrap_or_else(|| "not in a group".to_string());
@@ -16718,6 +16894,14 @@ impl IslandDemo {
                 })
         });
         let embark = match (carrying.is_empty(), carried_by) {
+            // A REFUSED READ IS NOT AN EMPTY HOLD. `GET
+            // /games/{id}/units/{unit}/embarkations` needs `read` on the
+            // exercise's force, which a participant's game role may not hold;
+            // the register copy is the fallback, and it names only what the
+            // FLEET says the hull carries. When neither answered, the honest
+            // row is the one that says so — "nothing embarked" is a claim
+            // about the hull, not about a read this seat was refused.
+            (true, None) if !self.embark_status.is_empty() => "not read".to_string(),
             (true, None) => "nothing embarked".to_string(),
             (true, Some(host)) => format!("aboard {host}"),
             (false, None) => format!("carrying {}", carrying.join(", ")),
@@ -16984,14 +17168,20 @@ impl IslandDemo {
                             .items_end()
                             .justify_end()
                             .gap(px(6.0))
-                            // THE SCENARIO'S COMMIT IS THE CARD'S READY. The
-                            // server holds the order until the step plays, so
-                            // a free-standing "SET HELM" would promise a
-                            // movement that has not happened. In a maneuver
-                            // exercise the order applies now, and the button
-                            // stays.
+                            // THE SCENARIO'S COMMIT IS THE SCENARIO CARD'S
+                            // READY, and there is nothing to save before it.
+                            // The server HOLDS the order until the step that
+                            // relates this hull plays, so a free-standing "SET
+                            // HELM" would promise a movement that has not
+                            // happened — and a second "save" would be a
+                            // promise the server has no verb for. The READY
+                            // press posts the helm the commander set and then
+                            // declares, in that order (see
+                            // `send_helm_and_ready`), which is the whole of
+                            // the write. In a maneuver exercise the order
+                            // applies now, and the button stays.
                             .child(if self.scenario_exercise() {
-                                note("READY ON THE STEP CARD").into_any_element()
+                                note("READY SENDS THIS HELM").into_any_element()
                             } else {
                                 div()
                                     .id("dashboard-helm-send")
@@ -18195,8 +18385,17 @@ impl IslandDemo {
     fn execution_rail_bottom(&self) -> f32 {
         const CARD_H: f32 = 68.0;
         const GAP: f32 = 6.0;
+        // The scenario card carries a declaration button under its hint, so it
+        // stands taller than a one-fact widget. The estimate errs HIGH: too
+        // low and the comms island would cover the card that opened it.
+        const SCENARIO_VERB_H: f32 = 30.0;
         let n = self.execution_widget_set().len() as f32;
-        64.0 + n * CARD_H + (n - 1.0).max(0.0) * GAP + 10.0
+        let verb = if self.asking_step().is_some() {
+            SCENARIO_VERB_H
+        } else {
+            0.0
+        };
+        64.0 + n * CARD_H + (n - 1.0).max(0.0) * GAP + verb + 10.0
     }
 
     /// The island's header: the surface's name, what it holds, its REFRESH
@@ -19478,6 +19677,7 @@ impl IslandDemo {
                     step_id: st.id,
                     number,
                     content: st.content.clone(),
+                    content_withheld: false,
                     window: st.window.clone(),
                     read,
                     // The status is derived in the second pass, once the gate
@@ -19491,6 +19691,111 @@ impl IslandDemo {
                         .unwrap_or_default(),
                     verbs: Vec::new(),
                     substeps: st.substeps.clone(),
+                });
+            }
+        }
+
+        // --- A SEAT THAT DOES NOT HOLD THE BOOK STILL HAS A STEP --------------
+        //
+        // Minos grants `/games/scenarios` to the Game Master and the judge side
+        // and withholds it from a Commando on purpose: the script is what the
+        // people being exercised must not see. A participant's session
+        // therefore arrives with an empty book, and a board built only from it
+        // told that seat "0 steps" while the step that asks them to declare
+        // was named on their own console. `current-step` is their half, and it
+        // carries the commands resolved TO THEM — so where the book is not
+        // held, the board stands on those rows instead of on nothing.
+        //
+        // The rows are numbered in the order this seat can see them (one or
+        // two), because the step's position in the whole book is not published
+        // to a participant and `total` stays zero: "unknown" is the honest
+        // denominator, and the window header draws it as a dash.
+        if self.session.book.is_empty() && audience == ScenarioAudience::Commander {
+            let commands = |key: (i64, i64)| -> Vec<BookSubstep> {
+                self.session
+                    .step_orders
+                    .iter()
+                    .find(|held| (held.scenario_id, held.step_id) == key)
+                    .map(|held| {
+                        held.substeps
+                            .iter()
+                            .map(|line| BookSubstep {
+                                id: line.id,
+                                content: line.content.clone(),
+                                // THE REF IS THE AUDIENCE. A command addressed
+                                // to a hull addresses that hull; one addressed
+                                // to a node addresses the hulls this seat
+                                // holds beneath it, which is the force the
+                                // command actually concerns.
+                                units: if line.via_kind == "hull" {
+                                    vec![line.via_id]
+                                } else {
+                                    self.own_unit_ids()
+                                },
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let mut number = 0usize;
+            if let Some(play) = self.session.step.as_ref().and_then(|s| s.playing.as_ref()) {
+                number += 1;
+                let key = (play.scenario_id, play.step_id);
+                steps.push(BoardStep {
+                    scenario_id: play.scenario_id,
+                    scenario: play.scenario.clone(),
+                    step_id: play.step_id,
+                    number,
+                    content: play.content.clone(),
+                    content_withheld: play.content.trim().is_empty(),
+                    window: None,
+                    read: StepRead::Playing,
+                    status: StepStatus::Playing,
+                    gate: None,
+                    units: Vec::new(),
+                    verbs: Vec::new(),
+                    substeps: commands(key),
+                });
+            }
+            if let Some(ask) = self.session.step.as_ref().and_then(|s| s.asking.as_ref()) {
+                number += 1;
+                let key = (ask.scenario_id, ask.step_id);
+                let ready = ask.required.saturating_sub(ask.outstanding);
+                // THE GATE IS THE PARTICIPANT'S OWN FACTS: the counts the
+                // server publishes to this seat and no names of anybody else.
+                // It rides here so the row's status and the card's arithmetic
+                // are the same reading, not two spellings of it.
+                let gate = StepGateView {
+                    scenario_id: ask.scenario_id,
+                    step_id: ask.step_id,
+                    may_start: ask.required > 0 && ready >= ask.required,
+                    required: ask.required,
+                    ready,
+                    outstanding: Vec::new(),
+                    personnel: Vec::new(),
+                };
+                steps.push(BoardStep {
+                    scenario_id: ask.scenario_id,
+                    scenario: ask.scenario.clone(),
+                    step_id: ask.step_id,
+                    number,
+                    // AN ORDERS STEP WITHHOLDS ITS TEXT — the paragraph is the
+                    // Game Master's note and the commands are the seat's
+                    // business — so the row says so rather than claiming the
+                    // step was never written.
+                    content: String::new(),
+                    content_withheld: true,
+                    window: None,
+                    read: StepRead::Asking,
+                    status: if gate.may_start {
+                        StepStatus::UnitReady
+                    } else {
+                        StepStatus::Current
+                    },
+                    gate: Some(gate),
+                    units: Vec::new(),
+                    verbs: Vec::new(),
+                    substeps: commands(key),
                 });
             }
         }
@@ -19578,8 +19883,20 @@ impl IslandDemo {
             // and a gate on a step two plays away is noise. Absent is a real
             // answer — the fan-out is best-effort, and a step whose gate could
             // not be read claims no count rather than zero.
+            //
+            // A GATE THAT WAS NOT IN THE MAP IS LEFT AS IT WAS, which only a
+            // participant's row ever is: their counts come from `current-step`
+            // (it carries them for the step that asks THIS seat), and the
+            // staff-only readiness map never holds that step. Overwriting it
+            // with `None` would take the one gate their seat can read.
             let wanted = matches!(read, StepRead::Playing | StepRead::Asking) || is_head;
-            steps[i].gate = steps_gate.get(&key).filter(|_| wanted).cloned();
+            match steps_gate.get(&key) {
+                Some(gate) => {
+                    steps[i].gate = if wanted { Some(gate.clone()) } else { None };
+                }
+                None if !wanted => steps[i].gate = None,
+                None => {}
+            }
             steps[i].verbs = verbs;
         }
 
@@ -19896,17 +20213,26 @@ impl IslandDemo {
         );
         col = col.child(separator());
 
-        if board.total == 0 {
-            col = col.child(note(
-                "No steps to read \u{2014} this exercise's book holds none, or it has none authored yet.",
-            ));
-            col = col.child(div().flex_1());
-        } else if board.steps.is_empty() {
-            // A commander between steps: the book holds steps and none of
-            // them is theirs to answer. Not an error, and not an empty plan.
-            col = col.child(note(
-                "No step asks you \u{2014} nothing is playing and nothing is waiting on your declaration.",
-            ));
+        if board.steps.is_empty() {
+            // THE ROWS COME FIRST. A participant's board carries the one or
+            // two steps `current-step` names while `total` is zero (the
+            // book's size is not their read), so "no rows" — not "no book" —
+            // is what leaves this column a note.
+            col = col.child(note(if board.total == 0 {
+                // A PARTICIPANT'S SEAT DOES NOT HOLD THE BOOK, so "the book
+                // holds none" would be the console claiming a fact it never
+                // read.
+                if board.audience == ScenarioAudience::Commander {
+                    "The plan is not this seat's to read \u{2014} the step in play and the step \
+                     asking you to declare are on the Scenario card."
+                } else {
+                    "No steps to read \u{2014} this exercise's book holds none, or it has none authored yet."
+                }
+            } else {
+                // A commander between steps: the book holds steps and none of
+                // them is theirs to answer. Not an error, and not an empty plan.
+                "No step asks you \u{2014} nothing is playing and nothing is waiting on your declaration."
+            }));
             col = col.child(div().flex_1());
         } else {
             // --- two sections -------------------------------------------------
@@ -20217,14 +20543,17 @@ impl IslandDemo {
             .flex()
             .flex_col()
             .gap(px(6.0));
-        if board.total == 0 {
-            list = list.child(note(
-                "No steps to read \u{2014} this exercise's book holds none, or it has none authored yet.",
-            ));
-        } else if board.steps.is_empty() {
-            list = list.child(note(
-                "No step asks you \u{2014} nothing is playing and nothing is waiting on your declaration.",
-            ));
+        if board.steps.is_empty() {
+            list = list.child(note(if board.total == 0 {
+                if board.audience == ScenarioAudience::Commander {
+                    "The plan is not this seat's to read \u{2014} the step in play and the step \
+                     asking you to declare are on the Scenario card."
+                } else {
+                    "No steps to read \u{2014} this exercise's book holds none, or it has none authored yet."
+                }
+            } else {
+                "No step asks you \u{2014} nothing is playing and nothing is waiting on your declaration."
+            }));
         }
         for row in board.steps.clone() {
             list = list.child(self.board_step_box(
@@ -20664,7 +20993,11 @@ impl IslandDemo {
                 } else {
                     MAP_INK
                 }))
-                .child(if row.content.is_empty() {
+                .child(if row.content_withheld {
+                    "The step's own text is the Game Master's \u{2014} the commands \
+                     are below."
+                        .to_string()
+                } else if row.content.is_empty() {
                     "(not written yet)".to_string()
                 } else {
                     row.content.clone()
@@ -21139,7 +21472,11 @@ impl IslandDemo {
                         } else {
                             MAP_INK
                         }))
-                        .child(if row.content.is_empty() {
+                        .child(if row.content_withheld {
+                            "The step's own text is the Game Master's \u{2014} the commands \
+                             are below."
+                                .to_string()
+                        } else if row.content.is_empty() {
                             "(not written yet)".to_string()
                         } else {
                             row.content.clone()
@@ -37999,12 +38336,12 @@ impl Render for IslandDemo {
             root = root.child(el);
         }
         root = root.child(self.top_zone(cx, vp.2));
-        // Execution's four widgets, on the map's right edge. The side column
-        // and the band's Scenario/Comms doors are gone in this phase; these
-        // are their entries, each opening the surface it names.
+        // Execution's widgets, on the map's right edge: the scenario's own
+        // reading, the room and the traffic. The side column and the band's
+        // Scenario/Comms doors are gone in this phase; these are their
+        // entries, each opening the surface it names.
         if self.session.execution {
             root = root.child(self.execution_widgets(cx));
-            root = root.child(self.execution_scenario_widget(cx));
             // The commander's own surface: the bottom dashboard and the
             // one-tap follow door. Both are gated on the seat commanding
             // something, which is the whole reason they are here rather than
@@ -39990,6 +40327,11 @@ pub struct SessionView {
     /// The exercise's step and its assumed time, when the server can stamp
     /// one. `None` when the clock has no anchor — a real state, not a gap.
     pub step: Option<StepView>,
+    /// The caller's OWN commands for the steps `current-step` names, keyed by
+    /// `(scenario, step)`. The participant's half of a plan, read from the one
+    /// route their seat holds — the book is the Game Master's. Empty outside
+    /// execution, and empty for a seat the exercise has not named a step to.
+    pub step_orders: Vec<StepOrders>,
     /// The held game's book: scenarios with their steps nested, in book
     /// order. Steps arrive ONLY here — there is no step-list route — so the
     /// panel reads this and nothing else.
@@ -40031,6 +40373,20 @@ pub struct SessionView {
     /// shell drafts against it locally and writes the whole draft through at
     /// the advance.
     pub groups: Vec<crate::groups::LiveGroup>,
+    /// Every node of the task organisation's forest, by id, as NAMES.
+    ///
+    /// Separate from `groups` because the two answer different questions.
+    /// `groups` is the DRAFT's vocabulary — only the nodes whose echelon this
+    /// build recognises are promoted to it — while a hull's identity row needs
+    /// the name of whatever node the server put the hull under, recognised
+    /// echelon or not. Reading the name off `groups` made a node this build
+    /// could not classify read as unnamed, which is the console claiming an
+    /// absence it never checked.
+    ///
+    /// Best-effort like the rest: a refused hierarchy read leaves this empty,
+    /// and the identity row then says the hull is in a group without inventing
+    /// which one.
+    pub node_names: HashMap<i64, String>,
     /// The echelon vocabulary the task organisation is built from — the
     /// words a new group is named with. Lowest first.
     pub echelons: Vec<crate::backend::EchelonLevel>,
@@ -40203,6 +40559,20 @@ pub struct PreparationPulse {
     /// that noticed the transition re-reads the session once and sends it
     /// here. `None` on an ordinary pulse.
     pub left_room: Option<SessionView>,
+    /// THE STEP, while the exercise runs. `current-step` is the one route that
+    /// says where the exercise is and what THIS caller owes it, and both
+    /// answers move without a write of ours: the Game Master plays a step on
+    /// another machine, and another seat declares ready. `None` on a tick that
+    /// brought no news; `Some` always carries the whole reading, because the
+    /// absence of a step is itself the answer.
+    pub step: Option<StepView>,
+    /// The caller's own commands for those steps, from the same read.
+    pub step_orders: Option<Vec<StepOrders>>,
+    /// The gates of the steps the exercise stands on. A participant's seat
+    /// cannot read them (the route needs `read` on `/games/scenarios`), and a
+    /// refusal leaves the held gates alone rather than emptying them — the
+    /// same rule the roster read follows.
+    pub gates: Option<Vec<StepGateView>>,
 }
 
 /// One scenario in the held game's book, steps nested in book order.
@@ -40335,6 +40705,180 @@ pub const CLOCK_GRANT: &str = "clock control needs the control grant in this ses
 /// What is deliberately NOT here: message traffic, the roster of people, the
 /// exercise's terms. A viewer watches hulls move; anything beyond that is the
 /// console's own business and would be a projection nobody asked for.
+/// The scenario board, as a wall's Scenario window reads it.
+///
+/// The console's board is derived from the book, the pointer and the gate. This
+/// is the same reading, minus the verbs: a wall observes, and the panel's
+/// larger window is the console's window with the same rows. `None` outside an
+/// execution, where there is no book to play.
+fn board_projection(session: &SessionView) -> Option<crate::control::BoardState> {
+    if !session.execution || session.book.is_empty() {
+        return None;
+    }
+    let playing = session.step.as_ref().and_then(|step| step.playing.as_ref());
+    let asking = session.step.as_ref().and_then(|step| step.asking.as_ref());
+    let pointer = playing
+        .map(|line| (line.scenario_id, line.step_id))
+        .or_else(|| asking.map(|ask| (ask.scenario_id, ask.step_id)));
+    let mut steps = Vec::new();
+    let mut number = 0usize;
+    let mut at = None;
+    for scenario in &session.book {
+        for step in &scenario.steps {
+            number += 1;
+            let key = (scenario.id, step.id);
+            if pointer == Some(key) {
+                at = Some(number);
+            }
+            let is_playing = playing.is_some_and(|line| line.scenario_id == scenario.id && line.step_id == step.id);
+            let is_asking = asking.is_some_and(|ask| ask.scenario_id == scenario.id && ask.step_id == step.id);
+            let read = if is_playing {
+                "playing"
+            } else if is_asking {
+                "asking"
+            } else if at.is_some_and(|at| number < at) {
+                "played"
+            } else {
+                "later"
+            };
+            let gate = session
+                .gates
+                .iter()
+                .find(|gate| gate.scenario_id == scenario.id && gate.step_id == step.id);
+            let status = if is_playing {
+                "playing"
+            } else if let Some(gate) = gate.filter(|gate| gate.required > 0) {
+                if gate.ready >= gate.required {
+                    "unit_ready"
+                } else {
+                    "current"
+                }
+            } else if read == "played" {
+                "played"
+            } else if is_asking {
+                "current"
+            } else {
+                "idle"
+            };
+            steps.push(crate::control::BoardStepState {
+                scenario: scenario.title.clone(),
+                step_id: step.id,
+                number,
+                content: step.content.clone(),
+                window: step.window.clone(),
+                read: read.to_string(),
+                status: status.to_string(),
+                substeps: step
+                    .substeps
+                    .iter()
+                    .map(|sub| crate::control::BoardSubstepState {
+                        id: sub.id,
+                        content: sub.content.clone(),
+                        units: sub.units.clone(),
+                    })
+                    .collect(),
+            });
+        }
+    }
+    // The units of the step the board reads: the pointer, else the head the
+    // book would move to.
+    let key = pointer.or_else(|| {
+        let head = at.unwrap_or(0);
+        session
+            .book
+            .iter()
+            .flat_map(|scenario| scenario.steps.iter().map(move |step| (scenario.id, step.id)))
+            .nth(head)
+    });
+    let mut units = Vec::new();
+    if let Some(key) = key {
+        let gate = session
+            .gates
+            .iter()
+            .find(|gate| gate.scenario_id == key.0 && gate.step_id == key.1);
+        let mut seen = Vec::new();
+        let mut pieces: Vec<&PieceView> = Vec::new();
+        if let Some(related) = session
+            .related
+            .iter()
+            .find(|related| related.scenario_id == key.0 && related.step_id == key.1)
+        {
+            for (kind, id) in &related.posts {
+                if kind == "hull" {
+                    if let Some(piece) = session.pieces.iter().find(|piece| piece.id == *id) {
+                        if !seen.contains(&piece.id) {
+                            seen.push(piece.id);
+                            pieces.push(piece);
+                        }
+                    }
+                } else if kind == "node" {
+                    let mut subtree = vec![*id];
+                    let mut cursor = 0usize;
+                    while cursor < subtree.len() {
+                        let parent = subtree[cursor];
+                        for group in &session.groups {
+                            if group.parent == Some(parent) && !subtree.contains(&group.group_id) {
+                                subtree.push(group.group_id);
+                            }
+                        }
+                        cursor += 1;
+                    }
+                    for piece in &session.pieces {
+                        if piece
+                            .hierarchy_node
+                            .is_some_and(|node| subtree.contains(&node))
+                            && !seen.contains(&piece.id)
+                        {
+                            seen.push(piece.id);
+                            pieces.push(piece);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(gate) = gate {
+            for person in gate.personnel.iter().filter(|person| person.asked) {
+                for piece in &session.pieces {
+                    if piece.commander_id == Some(person.user_id) && !seen.contains(&piece.id) {
+                        seen.push(piece.id);
+                        pieces.push(piece);
+                    }
+                }
+            }
+        }
+        for piece in pieces {
+            let commander = if !piece.commander_name.trim().is_empty() {
+                piece.commander_name.clone()
+            } else {
+                piece
+                    .commander_id
+                    .and_then(|id| session.people.iter().find(|person| person.id == id))
+                    .map(|person| person.name.clone())
+                    .unwrap_or_else(|| "uncommanded".to_string())
+            };
+            let ready = gate.and_then(|gate| {
+                let commander = piece.commander_id?;
+                gate.personnel
+                    .iter()
+                    .find(|person| person.user_id == commander && person.asked)
+                    .map(|person| person.ready)
+            });
+            units.push(crate::control::BoardUnitState {
+                id: Some(piece.id),
+                name: piece.label.clone(),
+                commander,
+                ready,
+            });
+        }
+    }
+    Some(crate::control::BoardState {
+        total: number,
+        at,
+        steps,
+        units,
+    })
+}
+
 fn control_projection(
     session: &SessionView,
     live: &[LiveMarker],
@@ -40446,6 +40990,30 @@ fn control_projection(
                 step: Some(line.content.clone()).filter(|content| !content.trim().is_empty()),
             }),
         units,
+        // The task organisation, so a wall can name a hull's group and draw
+        // the same group card the console draws.
+        groups: session
+            .groups
+            .iter()
+            .map(|group| crate::control::GroupState {
+                id: group.group_id,
+                name: group.name.clone(),
+                kind: group.kind.label().to_string(),
+                parent: group.parent,
+                commander: group.commander_id.and_then(|id| {
+                    session.people.iter().find(|person| person.id == id).map(|person| {
+                        crate::control::CommanderState {
+                            id: person.id,
+                            name: person.name.clone(),
+                        }
+                    })
+                }),
+                units: group.units.clone(),
+            })
+            .collect(),
+        // The book, while the exercise runs. The wall's Scenario window is
+        // the console's window; without the steps it could only be a caption.
+        board: board_projection(session),
         // The room, as the console shows it. An observer's Crew is the same
         // roster minus the controls, so it is the same list.
         participants: session
@@ -41761,6 +42329,7 @@ impl Default for SessionView {
             msg_roles: Vec::new(),
             msg_audience: Vec::new(),
             step: None,
+            step_orders: Vec::new(),
             people: Vec::new(),
             joined: None,
             book: Vec::new(),
@@ -41776,6 +42345,7 @@ impl Default for SessionView {
             pieces: Vec::new(),
             hosts: HashMap::new(),
             groups: Vec::new(),
+            node_names: HashMap::new(),
             echelons: Vec::new(),
             related: Vec::new(),
             facts: GameFacts::default(),
@@ -41824,6 +42394,19 @@ impl SessionView {
         }
         if self.mine.is_empty() {
             self.mine = old.mine.clone();
+        }
+        // The tree read can be refused where the last one was allowed, and a
+        // re-read that failed must not turn a named group back into "in a task
+        // group": the name was read from the same server, one session ago, and
+        // the node ids have not moved.
+        if self.node_names.is_empty() {
+            self.node_names = old.node_names.clone();
+        }
+        // The commands are this seat's own, and a re-read that could not ask
+        // `current-step` must not take them: they are the participant's whole
+        // half of the plan.
+        if self.step_orders.is_empty() {
+            self.step_orders = old.step_orders.clone();
         }
     }
 
@@ -42470,7 +43053,7 @@ pub struct MsgDraftForm {
 
 /// The exercise's step, as the step panel shows it: what is being played, and
 /// what is being asked of THIS caller.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct StepView {
     /// The SERVER's assumed time. Never a client integral — the backend's own
     /// doc refuses it: the anchor plus every segment is three chances to
@@ -42494,7 +43077,7 @@ pub struct StepReminder {
 }
 
 /// The step a game is playing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StepLine {
     pub scenario_id: i64,
     pub step_id: i64,
@@ -42506,7 +43089,7 @@ pub struct StepLine {
 /// The step waiting on readiness, and how far along it is. The ids ride
 /// along because the declare/withdraw writes name them — the display never
 /// shows them, but the SEND button sends exactly what the row drew.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StepAsk {
     pub scenario_id: i64,
     pub step_id: i64,
@@ -42515,6 +43098,37 @@ pub struct StepAsk {
     pub required: i64,
     pub outstanding: i64,
     pub you_ready: bool,
+}
+
+/// The caller's OWN commands for one step, as `current-step` resolves them.
+///
+/// THIS IS THE PARTICIPANT'S HALF OF A STEP. `/games/scenarios` is the Game
+/// Master's read — the script is what the people being exercised must not see
+/// — so a Commando's only commands are the sub-steps the server resolved to
+/// THEM, which ride the `current-step` answer rather than the book. Kept
+/// beside the step instead of inside it because the step the exercise is on
+/// and the step asking this seat are two different questions, and one list
+/// keyed by `(scenario, step)` answers both without a second shape.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StepOrders {
+    pub scenario_id: i64,
+    pub step_id: i64,
+    /// The commands, in the server's order, each with the ref that brought it
+    /// to this seat (`hull` or `node`) so the board can say who it addresses.
+    pub substeps: Vec<StepOrderLine>,
+}
+
+/// One command the caller is under, and the ref that brought it to them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StepOrderLine {
+    pub id: i64,
+    pub content: String,
+    /// `hull` or `node` — the kind of post the plan named.
+    pub via_kind: String,
+    pub via_id: i64,
+    /// The post's name, resolved by the server, so "why am I told this" has an
+    /// answer even when the command was addressed three levels up.
+    pub via_name: String,
 }
 
 /// Who is reading the exercise, as the Scenario board decides it.
@@ -42681,6 +43295,14 @@ pub struct BoardStep {
     /// than trusting a field.
     pub number: usize,
     pub content: String,
+    /// Whether `content` is EMPTY BECAUSE THE SERVER WITHHELD IT, rather than
+    /// because the author has not written the step yet. The two look the same
+    /// on the wire and are different facts: an orders step's paragraph is the
+    /// Game Master's note, and a participant is told "not written yet" about
+    /// a step whose text exists and is none of their business. Only a seat
+    /// reading `current-step` ever sets this; the book's rows know their own
+    /// content.
+    pub content_withheld: bool,
     pub window: Option<(String, String)>,
     pub read: StepRead,
     /// What the step is DOING, as the Scenario window reads it. The read
@@ -55061,12 +55683,12 @@ mod tests {
         }
     }
 
-    /// THE SCENARIO IS NOT A RAIL WIDGET. The owner's direction moved it
-    /// into the map's body, so the rail carries the room and the traffic in
-    /// every mode; the scenario card is a separate surface and is absent
-    /// outside a scenario exercise.
+    /// THE SCENARIO IS A RAIL WIDGET, and only in a scenario exercise. The
+    /// owner's direction moved it off the map's foot to stand with the room
+    /// and the traffic; ADR-0021 still withholds it from a mode that has no
+    /// steps to read.
     #[gpui::test]
-    fn the_scenario_is_a_body_card_not_a_rail_widget(cx: &mut gpui::TestAppContext) {
+    fn the_scenario_is_a_rail_widget_in_a_scenario_exercise(cx: &mut gpui::TestAppContext) {
         for mode in [
             crate::gamestate::GameMode::Scenario,
             crate::gamestate::GameMode::Maneuver,
@@ -55085,12 +55707,174 @@ mod tests {
             let (view, cx) =
                 cx.add_window_view(|_, _| IslandDemo::new(fixture_roster(), 8, 0, session, tx));
             let widgets = cx.update(|_window, app| view.read(app).execution_widget_set());
-            assert!(
-                !widgets.iter().any(|w| w.id == "widget-scenario"),
-                "{mode:?} still has the scenario on the rail"
+            let scenario = widgets.iter().any(|w| w.id == "widget-scenario");
+            assert_eq!(
+                scenario,
+                mode == crate::gamestate::GameMode::Scenario,
+                "{mode:?}: the scenario card follows the mode"
             );
-            assert_eq!(widgets.len(), 2, "{mode:?}: players and comms");
+            assert_eq!(
+                widgets.len(),
+                if scenario { 3 } else { 2 },
+                "{mode:?}: the scenario, the players and the comms"
+            );
+            assert_eq!(
+                widgets.first().map(|w| w.id),
+                if scenario {
+                    Some("widget-scenario")
+                } else {
+                    Some("widget-crew")
+                },
+                "{mode:?}: the exercise's own reading leads the rail"
+            );
         }
+    }
+
+    /// A COMMANDER'S SCENARIO READING IS `current-step`, NOT THE BOOK.
+    ///
+    /// Minos withholds `/games/scenarios` from a Commando, so a participant's
+    /// session arrives with an empty book. Reading that as "NO SCRIPT" told a
+    /// commander the exercise had no steps while the Game Master was looking
+    /// at one. The card reads the step in play and the step asking THIS seat —
+    /// and it carries the declaration, which is the one verb the station owes.
+    #[gpui::test]
+    fn a_commander_reads_the_scenario_card_from_the_current_step(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let asking = |you_ready: bool| StepView {
+            assumed_time: String::new(),
+            playing: None,
+            asking: Some(StepAsk {
+                scenario_id: 4,
+                step_id: 8,
+                scenario: "Game Test 2".to_string(),
+                content: String::new(),
+                required: 4,
+                outstanding: 4,
+                you_ready,
+            }),
+        };
+        for (you_ready, label) in [(false, "READY"), (true, "WITHDRAW")] {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let session = SessionView {
+                execution: true,
+                state: "execution".to_string(),
+                game_id: 7,
+                me: 2,
+                // The participant's only seat read: the join answer's row.
+                // Without it the seat has no role and the console would read
+                // this as a Game Master's session.
+                joined: Some(PersonView {
+                    id: 2,
+                    name: "Justin Sugeng".to_string(),
+                    call_sign: "MAKASSAR".to_string(),
+                    role: "Commando".to_string(),
+                    role_id: 19,
+                    judge: false,
+                    ready: false,
+                    present: true,
+                }),
+                mine: vec![MyShip {
+                    id: "8".to_string(),
+                    label: "KRI Test (KRI-1)".to_string(),
+                }],
+                pieces: vec![PieceView {
+                    id: 8,
+                    label: "KRI Test (KRI-1)".to_string(),
+                    commander_id: Some(2),
+                    ..PieceView::default()
+                }],
+                step: Some(asking(you_ready)),
+                facts: GameFacts {
+                    mode: crate::gamestate::GameMode::Scenario,
+                    ..GameFacts::default()
+                },
+                ..SessionView::default()
+            };
+            let (view, cx) =
+                cx.add_window_view(|_, _| IslandDemo::new(fixture_roster(), 8, 0, session, tx));
+            let widget = cx
+                .update(|_window, app| {
+                    view.read(app)
+                        .execution_widget_set()
+                        .into_iter()
+                        .find(|w| w.id == "widget-scenario")
+                })
+                .expect("a commander in a scenario exercise has the card");
+            assert_eq!(widget.value, "NEXT STEP", "the step asking this seat, not the book");
+            assert_eq!(widget.status, Some(StepStatus::Current), "the gate is still open");
+            assert_eq!(
+                widget.hint.as_deref(),
+                Some("0 of 4 declared"),
+                "the count is the participant's own arithmetic"
+            );
+            assert_eq!(
+                widget.verb,
+                Some(ExecVerb {
+                    label,
+                    small: you_ready
+                }),
+                "the declaration is the card's one verb"
+            );
+        }
+        // A seat nothing is asked of reads the step in play, and a seat with
+        // neither says so — it never claims the plan has no steps.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            execution: true,
+            state: "execution".to_string(),
+            game_id: 7,
+            me: 2,
+            joined: Some(PersonView {
+                id: 2,
+                name: "Justin Sugeng".to_string(),
+                call_sign: "MAKASSAR".to_string(),
+                role: "Commando".to_string(),
+                role_id: 19,
+                judge: false,
+                ready: false,
+                present: true,
+            }),
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Test (KRI-1)".to_string(),
+            }],
+            pieces: vec![PieceView {
+                id: 8,
+                label: "KRI Test (KRI-1)".to_string(),
+                commander_id: Some(2),
+                ..PieceView::default()
+            }],
+            step: Some(StepView {
+                assumed_time: String::new(),
+                playing: Some(StepLine {
+                    scenario_id: 4,
+                    step_id: 8,
+                    scenario: "Game Test 2".to_string(),
+                    content: "jalan ke titik a".to_string(),
+                    state: "playing".to_string(),
+                }),
+                asking: None,
+            }),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Scenario,
+                ..GameFacts::default()
+            },
+            ..SessionView::default()
+        };
+        let (view, cx) =
+            cx.add_window_view(|_, _| IslandDemo::new(fixture_roster(), 8, 0, session, tx));
+        let widget = cx
+            .update(|_window, app| {
+                view.read(app)
+                    .execution_widget_set()
+                    .into_iter()
+                    .find(|w| w.id == "widget-scenario")
+            })
+            .expect("the card is still there");
+        assert_eq!(widget.value, "IN PLAY");
+        assert_eq!(widget.status, Some(StepStatus::Playing));
+        assert_eq!(widget.verb, None, "no declaration is owed on a step in play");
     }
 
     /// A STATIC EXERCISE'S POSITIONS ARE SET BY HAND: the drop is a position
@@ -57879,6 +58663,221 @@ mod tests {
             "carrying NH90 N-110",
             "the register copy names the piece the exercise already holds"
         );
+    }
+
+    /// THE NODE'S NAME DOES NOT DEPEND ON THE DRAFT'S ECHELON VOCABULARY.
+    /// `groups` holds only the echelons this build promotes; `node_names` is
+    /// every node the hierarchy read published. A hull sitting under a node
+    /// outside that set used to read as unnamed even when the tree HAD been
+    /// read, which is the console claiming an absence it never checked.
+    #[test]
+    fn the_commanders_group_is_named_from_the_tree_reads_own_map() {
+        let mut session = SessionView {
+            me: 34,
+            mine: vec![MyShip {
+                id: "3".to_string(),
+                label: "KRI Makassar (590)".to_string(),
+            }],
+            pieces: vec![PieceView {
+                id: 3,
+                label: "KRI Makassar (590)".to_string(),
+                commander_id: Some(34),
+                hierarchy_node: Some(18),
+                ..PieceView::default()
+            }],
+            ..SessionView::default()
+        };
+        session.node_names.insert(18, "Gugus Alpha".to_string());
+        let demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        let rows = demo.dashboard_identity();
+        assert_eq!(
+            identity_value(&rows, "group"),
+            "Gugus Alpha",
+            "the name the tree read published, not the draft's vocabulary"
+        );
+    }
+
+    /// A COMMANDER'S BOARD STANDS ON `current-step`, NOT ON AN EMPTY BOOK.
+    ///
+    /// Minos withholds `/games/scenarios` from a Commando, so a participant's
+    /// session arrives with no book and the board used to draw "0 steps" while
+    /// the step that asked this seat was named on their own card. The row and
+    /// the commands it carries come from `current-step` — the commands the
+    /// server resolved TO THEM — and the gate is their own two numbers.
+    #[gpui::test]
+    fn a_commander_board_shows_the_commands_current_step_resolves(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let session = SessionView {
+            game: "Game Test 2".to_string(),
+            state: "execution".to_string(),
+            execution: true,
+            game_id: 7,
+            me: 2,
+            joined: Some(PersonView {
+                id: 2,
+                name: "Justin Sugeng".to_string(),
+                call_sign: "MAKASSAR".to_string(),
+                role: "Commando".to_string(),
+                role_id: 19,
+                judge: false,
+                ready: true,
+                present: true,
+            }),
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI Makassar (590)".to_string(),
+            }],
+            pieces: vec![PieceView {
+                id: 8,
+                label: "KRI Makassar (590)".to_string(),
+                commander_id: Some(2),
+                hierarchy_node: Some(18),
+                ..PieceView::default()
+            }],
+            step: Some(StepView {
+                assumed_time: "2026-10-30T10:00:00+07:00".to_string(),
+                playing: None,
+                asking: Some(StepAsk {
+                    scenario_id: 4,
+                    step_id: 7,
+                    scenario: "Game Test 2".to_string(),
+                    content: String::new(),
+                    required: 4,
+                    outstanding: 3,
+                    you_ready: true,
+                }),
+            }),
+            step_orders: vec![StepOrders {
+                scenario_id: 4,
+                step_id: 7,
+                substeps: vec![StepOrderLine {
+                    id: 9,
+                    content: "jalan ke titik b".to_string(),
+                    via_kind: "hull".to_string(),
+                    via_id: 8,
+                    via_name: "KRI Makassar (590)".to_string(),
+                }],
+            }],
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Scenario,
+                ..GameFacts::default()
+            },
+            ..SessionView::default()
+        };
+        let (view, cx) =
+            cx.add_window_view(|_, _| IslandDemo::new(fixture_roster(), 8, 0, session, tx));
+        let board = cx.update(|_window, app| view.read(app).scenario_board());
+        assert_eq!(board.audience, ScenarioAudience::Commander);
+        assert_eq!(board.steps.len(), 1, "the step that asks this seat");
+        let row = &board.steps[0];
+        assert_eq!((row.scenario_id, row.step_id), (4, 7));
+        assert_eq!(row.read, StepRead::Asking);
+        assert!(
+            row.content_withheld,
+            "an orders step's own text is the Game Master's"
+        );
+        assert_eq!(row.substeps.len(), 1, "the command resolved to this seat");
+        assert_eq!(row.substeps[0].content, "jalan ke titik b");
+        assert_eq!(
+            row.substeps[0].units,
+            vec![8],
+            "addressed to the hull this seat holds"
+        );
+        let gate = row
+            .gate
+            .as_ref()
+            .expect("the participant's own counts ride the row");
+        assert_eq!((gate.required, gate.ready), (4, 1));
+        assert_eq!(row.status, StepStatus::Current, "three seats still hold it");
+    }
+
+    /// THE EXECUTION POLL MOVES THE STEP AND ITS GATE, and a quiet tick does
+    /// not: the Game Master's board has to see a declaration another console
+    /// made, and the commander's card has to see the step play.
+    #[gpui::test]
+    fn an_execution_pulse_moves_the_step_and_the_gate(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            IslandDemo::new(fixture_roster(), 8, 0, board_session(None), tx)
+        });
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                let asking = |outstanding: i64, you_ready: bool| StepView {
+                    assumed_time: "2026-10-30T10:00:00+07:00".to_string(),
+                    playing: None,
+                    asking: Some(StepAsk {
+                        scenario_id: 4,
+                        step_id: 7,
+                        scenario: "First light".to_string(),
+                        content: String::new(),
+                        required: 2,
+                        outstanding,
+                        you_ready,
+                    }),
+                };
+                let gate = |ready: i64, may_start: bool| StepGateView {
+                    scenario_id: 4,
+                    step_id: 7,
+                    may_start,
+                    required: 2,
+                    ready,
+                    outstanding: if ready >= 2 {
+                        Vec::new()
+                    } else {
+                        vec!["KAPTEN".to_string()]
+                    },
+                    personnel: Vec::new(),
+                };
+                demo.apply_preparation(
+                    PreparationPulse {
+                        step: Some(asking(1, false)),
+                        gates: Some(vec![gate(1, false)]),
+                        ..PreparationPulse::default()
+                    },
+                    cx,
+                );
+                assert_eq!(
+                    demo.scenario_board()
+                        .steps
+                        .first()
+                        .and_then(|row| row.gate.as_ref())
+                        .map(|gate| gate.ready),
+                    Some(1),
+                    "the poll's gate is the board's"
+                );
+                // A second tick, with the declaration landed on another seat.
+                demo.apply_preparation(
+                    PreparationPulse {
+                        step: Some(asking(0, false)),
+                        gates: Some(vec![gate(2, true)]),
+                        ..PreparationPulse::default()
+                    },
+                    cx,
+                );
+                assert_eq!(
+                    demo.scenario_board()
+                        .steps
+                        .first()
+                        .and_then(|row| row.gate.as_ref())
+                        .map(|gate| (gate.ready, gate.may_start)),
+                    Some((2, true)),
+                    "and it is UPDATED, not appended"
+                );
+                assert_eq!(
+                    demo.session.gates.len(),
+                    1,
+                    "one step, one gate — the upsert replaces"
+                );
+            })
+        });
     }
 
     /// THE EMBARK CARD reads the same two sources in the same order: the

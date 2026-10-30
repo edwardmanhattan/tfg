@@ -56,6 +56,7 @@ observation (what the phone and the command center see):
   session clear                           say the console holds no exercise
   units                                   the hulls a viewer may look at
   focus N | --id ID [--zoom Z]            centre the observer view on a unit
+  focus group ID [--zoom Z]               centre on a task group's hulls
   display list                            command centers attached right now
   display attach [--id ID] [--label L] [--width W --height H]
                                           hold this terminal open as a command
@@ -774,7 +775,7 @@ fn unit_note(unit: &Value) -> String {
     notes.join("; ")
 }
 
-/// `camera.focus`: centre a view on one hull.
+/// `camera.focus`: centre a view on one hull, or on a task group.
 ///
 /// The unit is named by the index the grid shows or by its id; the server
 /// resolves either against the session it holds, so this never sends a
@@ -788,6 +789,12 @@ fn focus(
     json_out: bool,
 ) -> Result<(), String> {
     let mut rest = rest.to_vec();
+    // `focus group ID` focuses a task group rather than a hull. The group's
+    // ground is resolved host-side from the hulls beneath it.
+    let group = rest.first().is_some_and(|word| word == "group");
+    if group {
+        rest.remove(0);
+    }
     let by_id = take_option(&mut rest, "--id");
     let zoom = match take_option(&mut rest, "--zoom") {
         Some(raw) => Some(
@@ -796,33 +803,47 @@ fn focus(
         ),
         None => None,
     };
-    let unit_id = match by_id {
+    let id = match by_id {
         Some(raw) => raw
             .parse::<i64>()
-            .map_err(|_| "--id is not a unit id".to_string())?,
+            .map_err(|_| "--id is not an id".to_string())?,
         None => {
             let index = rest
                 .first()
-                .ok_or_else(|| "focus needs a unit number, or --id ID".to_string())?
-                .parse::<u64>()
-                .map_err(|_| "the unit number is not a number".to_string())?;
+                .ok_or_else(|| {
+                    if group {
+                        "focus group needs a group id, or --id ID".to_string()
+                    } else {
+                        "focus needs a unit number, or --id ID".to_string()
+                    }
+                })?
+                .parse::<i64>()
+                .map_err(|_| "the focus id is not a number".to_string())?;
             rest.remove(0);
-            let state = fetch_state(client, server, token)?;
-            state["session"]["units"]
-                .as_array()
-                .and_then(|units| {
-                    units
-                        .iter()
-                        .find(|unit| unit["index"].as_u64() == Some(index))
-                })
-                .and_then(|unit| unit["id"].as_i64())
-                .ok_or_else(|| format!("the session has no unit {index}"))?
+            if group {
+                index
+            } else {
+                let state = fetch_state(client, server, token)?;
+                state["session"]["units"]
+                    .as_array()
+                    .and_then(|units| {
+                        units
+                            .iter()
+                            .find(|unit| unit["index"].as_u64() == Some(index as u64))
+                    })
+                    .and_then(|unit| unit["id"].as_i64())
+                    .ok_or_else(|| format!("the session has no unit {index}"))?
+            }
         }
     };
     if !rest.is_empty() {
         return Err(format!("unexpected arguments after focus: {rest:?}"));
     }
-    let mut payload = json!({ "unit_id": unit_id });
+    let (kind, mut payload) = if group {
+        ("camera.focus_group", json!({ "group_id": id }))
+    } else {
+        ("camera.focus", json!({ "unit_id": id }))
+    };
     if let Some(zoom) = zoom {
         payload["zoom"] = json!(zoom);
     }
@@ -830,7 +851,7 @@ fn focus(
         client,
         server,
         token,
-        command_body(view.or(Some("observer")), "camera.focus", payload),
+        command_body(view.or(Some("observer")), kind, payload),
         json_out,
     )
 }

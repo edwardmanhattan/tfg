@@ -4566,14 +4566,30 @@ fn fetch_session(
             flatten_groups(&n.children, out);
         }
     }
-    let mut groups = master
-        .game_hierarchy(token, game_id)
-        .map(|forest| {
-            let mut out = Vec::new();
-            flatten_groups(&forest, &mut out);
-            out
-        })
-        .unwrap_or_default();
+    /// Every node's NAME, by id — the identity rows' reader. It walks the
+    /// WHOLE forest rather than the recognised echelons `flatten_groups`
+    /// promotes, because the question it answers is "what is this hull's node
+    /// called", and a node this build cannot classify still has a name.
+    fn collect_node_names(
+        nodes: &[tfg::backend::HierarchyNode],
+        out: &mut std::collections::HashMap<i64, String>,
+    ) {
+        for n in nodes {
+            out.insert(n.id, n.name.clone());
+            collect_node_names(&n.children, out);
+        }
+    }
+    // ONE READ OF THE TREE SERVES TWO READERS: the draft's groups and every
+    // node's NAME by id, whether or not its echelon is one this build
+    // promotes. A hull's identity row names the node the server put it under,
+    // and reading that off `groups` made a node this build could not classify
+    // read as unnamed — a claim the console never checked. Best-effort like
+    // the book: a refused read empties both rather than inventing a shape.
+    let forest = master.game_hierarchy(token, game_id).unwrap_or_default();
+    let mut groups = Vec::new();
+    flatten_groups(&forest, &mut groups);
+    let mut node_names: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    collect_node_names(&forest, &mut node_names);
     // The membership, joined: the unit rows carry the node they sit in, so
     // the hulls of a node are the rows that name it.
     let members: Vec<(i64, i64)> = pieces
@@ -4661,39 +4677,7 @@ fn fetch_session(
                     master
                         .step_readiness(token, game_id, s.id, st.id)
                         .ok()
-                        .map(|r| tfg::shell_gpui::StepGateView {
-                            scenario_id: s.id,
-                            step_id: st.id,
-                            may_start: r.may_start,
-                            required: r.required,
-                            ready: r.ready,
-                            outstanding: r
-                                .personnel
-                                .iter()
-                                .filter(|p| !p.ready)
-                                .map(|p| {
-                                    if p.call_sign.trim().is_empty() {
-                                        format!("user {}", p.user_id)
-                                    } else {
-                                        p.call_sign.clone()
-                                    }
-                                })
-                                .collect(),
-                            // The people themselves, so the units tree can say
-                            // which UNIT has declared: a unit's commander is
-                            // the person who declares for it, and the counts
-                            // above cannot say that.
-                            personnel: r
-                                .personnel
-                                .iter()
-                                .map(|p| tfg::shell_gpui::StepGatePerson {
-                                    user_id: p.user_id,
-                                    call_sign: p.call_sign.clone(),
-                                    ready: p.ready,
-                                    asked: p.asked,
-                                })
-                                .collect(),
-                        })
+                        .map(|r| step_gate_view(s.id, st.id, r))
                 })
             })
             .collect()
@@ -4834,6 +4818,15 @@ fn fetch_session(
             judge: p.judge,
         })
         .collect();
+    // The step, and the caller's OWN commands for it. ONE READ SERVES BOTH:
+    // `current-step` is the participant's half of the plan — the book is the
+    // Game Master's — and its sub-steps are the commands the server resolved
+    // TO this seat. `None` is a real state (the server stamps a step only once
+    // the scenario clock has an anchor), and the panel says so rather than
+    // drawing an empty step.
+    let current_step = master.game_current_step(token, game_id).ok();
+    let step = current_step.as_ref().map(step_view);
+    let step_orders = step_orders_of(current_step.as_ref());
     let mut session = tfg::shell_gpui::SessionView {
         detail,
         // The camera's opening zoom is the MAP's constant and the caller sets
@@ -4874,31 +4867,8 @@ fn fetch_session(
         msg_degrees,
         msg_roles,
         msg_audience,
-        // The step read. `None` is a real state — the server stamps a step
-        // only once the scenario clock has an anchor — and the panel says so
-        // rather than drawing an empty step.
-        step: master
-            .game_current_step(token, game_id)
-            .ok()
-            .map(|v| tfg::shell_gpui::StepView {
-                assumed_time: v.assumed_time.unwrap_or_default(),
-                playing: v.current.map(|p| tfg::shell_gpui::StepLine {
-                    scenario_id: p.scenario.id,
-                    step_id: p.step.id,
-                    scenario: p.scenario.title,
-                    content: p.step.content,
-                    state: p.state,
-                }),
-                asking: v.asking.map(|a| tfg::shell_gpui::StepAsk {
-                    scenario_id: a.scenario.id,
-                    step_id: a.step.id,
-                    scenario: a.scenario.title,
-                    content: a.step.content,
-                    required: a.required,
-                    outstanding: a.outstanding,
-                    you_ready: a.you_ready,
-                }),
-            }),
+        step,
+        step_orders,
         people: Vec::new(),
         // The roster read is staff-only, so a participant arrives here with
         // an empty list; the join answer's own row is adopted in `adopt_join`.
@@ -4910,6 +4880,7 @@ fn fetch_session(
         pieces,
         hosts,
         groups,
+        node_names,
         echelons,
         related,
         gates,
@@ -4943,6 +4914,119 @@ fn person_view(p: &tfg::backend::Participant) -> tfg::shell_gpui::PersonView {
     }
 }
 
+/// Where the exercise is, as the shell draws it — ONE mapping, shared by the
+/// session read and the execution poll. Two mappings would be two spellings of
+/// the same answer, and the console would disagree with itself about a step.
+fn step_view(v: &tfg::backend::CurrentStepView) -> tfg::shell_gpui::StepView {
+    tfg::shell_gpui::StepView {
+        assumed_time: v.assumed_time.clone().unwrap_or_default(),
+        playing: v.current.as_ref().map(|p| tfg::shell_gpui::StepLine {
+            scenario_id: p.scenario.id,
+            step_id: p.step.id,
+            scenario: p.scenario.title.clone(),
+            content: p.step.content.clone(),
+            state: p.state.clone(),
+        }),
+        asking: v.asking.as_ref().map(|a| tfg::shell_gpui::StepAsk {
+            scenario_id: a.scenario.id,
+            step_id: a.step.id,
+            scenario: a.scenario.title.clone(),
+            content: a.step.content.clone(),
+            required: a.required,
+            outstanding: a.outstanding,
+            you_ready: a.you_ready,
+        }),
+    }
+}
+
+/// The caller's OWN commands for the steps `current-step` names.
+///
+/// The participant's half of a plan, keyed by `(scenario, step)`: the step in
+/// play and the step asking this seat. A beat carries no commands and an
+/// orders step that does not concern this caller carries none either, so an
+/// empty list is the ordinary answer.
+fn step_orders_of(
+    v: Option<&tfg::backend::CurrentStepView>,
+) -> Vec<tfg::shell_gpui::StepOrders> {
+    let Some(v) = v else {
+        return Vec::new();
+    };
+    let halves = [
+        v.current.as_ref().map(|p| (p.scenario.id, &p.step)),
+        v.asking.as_ref().map(|a| (a.scenario.id, &a.step)),
+    ];
+    let mut out: Vec<tfg::shell_gpui::StepOrders> = Vec::new();
+    for (scenario_id, step) in halves.into_iter().flatten() {
+        if step.substeps.is_empty()
+            || out
+                .iter()
+                .any(|held| held.scenario_id == scenario_id && held.step_id == step.id)
+        {
+            continue;
+        }
+        out.push(tfg::shell_gpui::StepOrders {
+            scenario_id,
+            step_id: step.id,
+            substeps: step
+                .substeps
+                .iter()
+                .map(|sub| tfg::shell_gpui::StepOrderLine {
+                    id: sub.id,
+                    content: sub.content.clone(),
+                    via_kind: sub.via_kind.clone(),
+                    via_id: sub.via_id,
+                    via_name: sub.via_name.clone(),
+                })
+                .collect(),
+        });
+    }
+    out
+}
+
+/// One step's readiness gate, as the shell draws it.
+///
+/// ONE MAPPING, because the same answer arrives twice: the session read fans
+/// out over the book, and the execution poll re-reads the pointer's gate on a
+/// cadence. Two mappings would be two spellings of "who is holding this step".
+fn step_gate_view(
+    scenario_id: i64,
+    step_id: i64,
+    r: tfg::backend::StepReadiness,
+) -> tfg::shell_gpui::StepGateView {
+    tfg::shell_gpui::StepGateView {
+        scenario_id,
+        step_id,
+        may_start: r.may_start,
+        required: r.required,
+        ready: r.ready,
+        outstanding: r
+            .personnel
+            .iter()
+            .filter(|p| !p.ready)
+            .map(|p| {
+                if p.call_sign.trim().is_empty() {
+                    format!("user {}", p.user_id)
+                } else {
+                    p.call_sign.clone()
+                }
+            })
+            .collect(),
+        // The people themselves, so the units tree can say which UNIT has
+        // declared: a unit's commander is the person who declares for it, and
+        // the counts above cannot say that.
+        personnel: r
+            .personnel
+            .iter()
+            .map(|p| tfg::shell_gpui::StepGatePerson {
+                user_id: p.user_id,
+                call_sign: p.call_sign.clone(),
+                ready: p.ready,
+                asked: p.asked,
+            })
+            .collect(),
+    }
+}
+
 /// The published checklist, as the shell reads it.
 ///
 /// The verdict is the server's (`can_execute`), and the blockers keep the
@@ -4956,22 +5040,25 @@ fn readiness_view(r: tfg::backend::GameReadinessView) -> tfg::shell_gpui::Readin
     }
 }
 
-/// How often a PREPARING room is re-read.
+/// How often a PREPARING room — and a RUNNING exercise — is re-read.
 ///
-/// Readiness is a person pressing a key on another machine, so three seconds
-/// is fast enough to feel live and slow enough that a room of eight does not
-/// pay for a read every second.
+/// Readiness is a person pressing a key on another machine, and a step is the
+/// Game Master playing one, so three seconds is fast enough to feel live and
+/// slow enough that a room of eight does not pay for a read every second.
 const PREPARATION_POLL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The longest a failing room read waits before trying again.
 const PREPARATION_BACKOFF: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Read a preparing room's movement, for as long as the console runs.
+/// Read a preparing room's movement, and a running exercise's, for as long as
+/// the console runs.
 ///
 /// A room is other people's doing: a commander presses READY on their own
 /// console, and Minos publishes no event for it — `GET /games/{id}` is the
 /// only read that says a transition another client made. So the preparation
-/// card cannot be pushed into, and it is polled instead.
+/// card cannot be pushed into, and it is polled instead. EXECUTION has the same
+/// shape for the same reason: the step and its gate move on somebody else's
+/// press, and `current-step` is the one route that says where the exercise is.
 ///
 /// **A thread of its own**, for `spawn_plot_thread`'s reason: the binary's
 /// other loop is the order loop, and a read that takes a second would delay
@@ -4983,7 +5070,10 @@ const PREPARATION_BACKOFF: std::time::Duration = std::time::Duration::from_secs(
 ///
 /// One transition is not narrow: when the room ENDS, execution's surfaces read
 /// things this poll never asks for (the current step, the steps' gates, the
-/// placements), so the whole session is re-read ONCE and rides the pulse.
+/// placements), so the whole session is re-read ONCE and rides the pulse. The
+/// execution tick that follows is narrow again: `current-step`, the caller's
+/// own commands, and the gates of the steps the exercise stands on — never the
+/// book, the force or a hull's embarkations.
 fn spawn_preparation_poll(
     host: String,
     hold: tfg::gamefeed::GameHoldCell,
@@ -4999,6 +5089,11 @@ fn spawn_preparation_poll(
         // (game, when) — the last read, so the cadence is judged against it.
         let mut last: Option<(i64, std::time::Instant)> = None;
         let mut fails: u32 = 0;
+        // The game whose step gates this seat was REFUSED, latched so a seat
+        // that may not read the plan is not asked every three seconds. A
+        // participant's game role holds `/games/scenarios` read or it does
+        // not; re-asking cannot change the answer.
+        let mut gate_denied_for: Option<i64> = None;
         loop {
             if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
@@ -5011,10 +5106,15 @@ fn spawn_preparation_poll(
                 Ok(h) => (h.token.clone(), h.game_id, h.state.clone()),
                 Err(_) => return,
             };
-            // Signed out, nothing held, or a room that is not PREPARING: there
-            // is nothing to poll. The last read is forgotten, so a room entered
-            // later is read at once rather than after a stale interval.
-            if token.is_empty() || game_id == 0 || state != "preparation" {
+            // Signed out, nothing held, or an exercise in a state with nothing
+            // to watch: PLANNING has no room and no step, and CLOSURE's reads
+            // are the Assessment island's own. The last read is forgotten, so a
+            // room entered later is read at once rather than after a stale
+            // interval.
+            if token.is_empty()
+                || game_id == 0
+                || (state != "preparation" && state != "execution")
+            {
                 last = None;
                 fails = 0;
                 continue;
@@ -5051,9 +5151,76 @@ fn spawn_preparation_poll(
                     people,
                     readiness,
                     left_room: None,
+                    step: None,
+                    step_orders: None,
+                    gates: None,
                 };
                 if pulse_tx.send(pulse).is_err() {
                     return; // the console is gone
+                }
+                continue;
+            }
+            // EXECUTION IS POLLED TOO, and for the same reason the room is:
+            // `current-step` is the one route that says where the exercise is
+            // and what this seat owes it, and both move on somebody else's
+            // press — the Game Master plays a step, another seat declares
+            // ready. The read is narrow: the step, the caller's own commands,
+            // and the gates of the steps the exercise stands on.
+            if detail.state.eq_ignore_ascii_case("execution") {
+                let current = master.game_current_step(&token, game_id).ok();
+                let mut gates: Vec<tfg::shell_gpui::StepGateView> = Vec::new();
+                if gate_denied_for != Some(game_id) {
+                    let halves = match current.as_ref() {
+                        Some(view) => [
+                            view.current.as_ref().map(|p| (p.scenario.id, p.step.id)),
+                            view.asking.as_ref().map(|a| (a.scenario.id, a.step.id)),
+                        ],
+                        None => [None, None],
+                    };
+                    let mut denied = false;
+                    for (scenario_id, step_id) in halves.into_iter().flatten() {
+                        if gates.iter().any(|held| {
+                            held.scenario_id == scenario_id && held.step_id == step_id
+                        }) {
+                            continue;
+                        }
+                        match master.step_readiness(&token, game_id, scenario_id, step_id) {
+                            Ok(readiness) => gates.push(step_gate_view(scenario_id, step_id, readiness)),
+                            // A REFUSAL IS THE ANSWER: the seat cannot read the
+                            // plan, so stop asking for this game.
+                            Err(tfg::backend::BackendError::Forbidden { .. }) => {
+                                denied = true;
+                                break;
+                            }
+                            // Anything else is a blip; the next tick asks again.
+                            Err(_) => break,
+                        }
+                    }
+                    if denied {
+                        gate_denied_for = Some(game_id);
+                        gates.clear();
+                    }
+                }
+                let pulse = tfg::shell_gpui::PreparationPulse {
+                    state: detail.state,
+                    name: String::new(),
+                    description: String::new(),
+                    people: None,
+                    readiness: None,
+                    left_room: None,
+                    step: current.as_ref().map(step_view),
+                    // A FAILED READ BRINGS NO NEWS: `None`, never an empty
+                    // list, so the commands this seat already holds are not
+                    // wiped by a tick that answered nothing.
+                    step_orders: current
+                        .as_ref()
+                        .map(|view| step_orders_of(Some(view))),
+                    // `None` when the read did not answer: the held gates stay
+                    // as they were rather than being emptied by a refusal.
+                    gates: if gates.is_empty() { None } else { Some(gates) },
+                };
+                if pulse_tx.send(pulse).is_err() {
+                    return;
                 }
                 continue;
             }
@@ -5078,6 +5245,9 @@ fn spawn_preparation_poll(
                 people: None,
                 readiness: None,
                 left_room: whole,
+                step: None,
+                step_orders: None,
+                gates: None,
             };
             if pulse_tx.send(pulse).is_err() {
                 return;

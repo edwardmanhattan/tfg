@@ -214,6 +214,10 @@ fn describe(command: &Command) -> String {
             Some(zoom) => format!("camera.focus unit {unit_id} @{zoom:.2}"),
             None => format!("camera.focus unit {unit_id}"),
         },
+        Command::CameraFocusGroup { group_id, zoom } => match zoom {
+            Some(zoom) => format!("camera.focus_group group {group_id} @{zoom:.2}"),
+            None => format!("camera.focus_group group {group_id}"),
+        },
         Command::ViewReport { width, height } => format!("view.report {width}x{height}"),
         Command::UiSet { panel, open } => {
             format!("ui.set {panel} {}", if *open { "open" } else { "close" })

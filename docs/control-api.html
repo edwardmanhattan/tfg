@@ -1134,7 +1134,7 @@ sequenceDiagram
             <tr><td>session</td><td>object | null</td><td>The console's projection, or <code>null</code> when it holds no exercise. Still present when stale.</td></tr>
             <tr><td>readiness</td><td>object</td><td><code>{ ready, reason? }</code>, computed live.</td></tr>
             <tr><td>displays</td><td>array</td><td>Live command centers only; expired records are filtered.</td></tr>
-            <tr><td>ui</td><td>object</td><td>The observer's open panels and focused hull. Host-owned so every wall agrees; a new game id resets it.</td></tr>
+            <tr><td>ui</td><td>object</td><td>The observer's open panels, focused hull (<code>focus</code>) or group (<code>focus_group</code>). Host-owned so every wall agrees; a new game id resets it.</td></tr>
             <tr><td>settings</td><td>object</td><td><code>{ step, text_scale }</code> — the host's text size. Every surface draws at it, so a wall that has just connected is already right.</td></tr>
           </tbody>
         </table>
@@ -1230,8 +1230,10 @@ sequenceDiagram
             <tr><td>name</td><td>string</td><td>The exercise's name.</td></tr>
             <tr><td>phase</td><td>string</td><td><code>planning</code>, <code>preparation</code>, <code>execution</code>, or <code>closure</code>. Sent as the server's own word; unknown words are shown as-is.</td></tr>
             <tr><td>mode</td><td>string</td><td><code>maneuver</code>, <code>static</code>, or <code>scenario</code>. Empty when the mode could not be named.</td></tr>
-            <tr><td>scenario</td><td>object?</td><td><code>{ id, title, step? }</code> — the scenario being played, never the whole book.</td></tr>
+            <tr><td>scenario</td><td>object?</td><td><code>{ id, title, step? }</code> — the scenario being played.</td></tr>
             <tr><td>units</td><td>array</td><td>The hulls a viewer may see. This is the grid's data. See <a href="#hulls">Sessions &amp; hulls</a>.</td></tr>
+            <tr><td>groups</td><td>array</td><td>The task organisation: <code>{ id, name, kind, parent?, commander?, units[] }</code>. The wall names a hull's group and draws its card from this.</td></tr>
+            <tr><td>board</td><td>object?</td><td>The scenario's book while the exercise runs: <code>total</code>, <code>at</code>, the ordered <code>steps</code> with their commands, and the related <code>units</code> with their declarations. Lets the wall's Scenario window draw the same rows as the console's.</td></tr>
             <tr><td>participants</td><td>array</td><td>The exercise's seats: <code>{ id, name, role, judge, ready }</code>.</td></tr>
             <tr><td>messages</td><td>array</td><td>The most recent traffic, newest first, bounded to 40. <code>{ id, kind, class_label, sender, assumed, broadcast, content, at, degree }</code>.</td></tr>
           </tbody>
@@ -1716,6 +1718,7 @@ flowchart TD
             <tr><td><code>camera.zoom</code></td><td><code>observer</code> on a phone</td><td>yes</td><td>Zoom by a delta, centre-anchored.</td></tr>
             <tr><td><code>camera.set</code></td><td><code>observer</code> on a phone</td><td>yes</td><td>Set an absolute centre and zoom.</td></tr>
             <tr><td><code>camera.focus</code></td><td><code>observer</code> only on a phone</td><td>yes</td><td>Centre on a session unit and set the popup.</td></tr>
+            <tr><td><code>camera.focus_group</code></td><td><code>observer</code> only on a phone</td><td>yes</td><td>Centre on a task group's hulls and open its card.</td></tr>
             <tr><td><code>ui.set</code></td><td><code>observer</code></td><td>yes</td><td>Open or close a wall panel.</td></tr>
             <tr><td><code>settings.font</code></td><td>host-wide; omit <code>view</code></td><td>no on <code>main</code></td><td>Set the console's text size.</td></tr>
             <tr><td><code>view.report</code></td><td><code>observer</code> or <code>main</code></td><td><strong>exempt</strong></td><td>Report a rendering viewport in device pixels.</td></tr>
@@ -1797,6 +1800,23 @@ flowchart TD
           <code>observer</code>.</li>
         <li>It also sets <code>ui.focus</code>, which opens the unit card on the
           wall.</li>
+      </ul>
+
+      <h3><code>camera.focus_group</code></h3>
+      <pre data-lang="json"><code>{
+  "protocol_version": 2,
+  "view": "observer",
+  "type": "camera.focus_group",
+  "payload": { "group_id": 18, "zoom": 12.0 }
+}</code></pre>
+      <ul>
+        <li><code>group_id</code> is <code>session.groups[].id</code>.</li>
+        <li>A group has no position of its own: the host centres on the mean of
+          the placed hulls beneath it.</li>
+        <li>An unknown group, or one whose hulls are all unplaced, is
+          <code>422 invalid_command</code>.</li>
+        <li>It sets <code>ui.focus_group</code> and clears <code>ui.focus</code>,
+          so the wall opens the group card beside the group's ground.</li>
       </ul>
 
       <h3><code>ui.set</code></h3>
