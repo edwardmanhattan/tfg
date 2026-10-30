@@ -28,7 +28,7 @@ jobs:
     name: Fast Linux check
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -139,13 +139,17 @@ jobs:
             binary: tfg
             maplibre_feature: maplibre_native/vulkan
             native_cxxflags: ""
-            timeout: 60
+            # A cold cache builds MapLibre's C++ core from source; the 60 this
+            # used to allow was spent entirely inside that build script and the
+            # job was cancelled mid-compile. Warm runs are far shorter, but the
+            # first one after a lockfile change is not.
+            timeout: 180
           - os: macos-15
             platform: macos
             binary: tfg
             maplibre_feature: maplibre_native/metal
             native_cxxflags: ""
-            timeout: 90
+            timeout: 180
           - os: windows-2022
             platform: windows
             binary: tfg.exe
@@ -595,7 +599,7 @@ jobs:
     needs: notices
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 180
     container:
       image: debian:trixie
     steps:
