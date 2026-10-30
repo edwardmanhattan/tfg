@@ -1331,6 +1331,10 @@ mod tests {
                 unit_id: 42,
                 zoom: Some(12.0),
             },
+            Command::CameraFocusGroup {
+                group_id: 7,
+                zoom: Some(12.0),
+            },
             Command::ViewReport {
                 width: 1280,
                 height: 720,

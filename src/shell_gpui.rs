@@ -58872,9 +58872,18 @@ mod tests {
                     "and it is UPDATED, not appended"
                 );
                 assert_eq!(
-                    demo.session.gates.len(),
+                    demo.session
+                        .gates
+                        .iter()
+                        .filter(|held| held.scenario_id == 4 && held.step_id == 7)
+                        .count(),
                     1,
-                    "one step, one gate — the upsert replaces"
+                    "one step, one gate — the upsert replaces rather than appends"
+                );
+                assert_eq!(
+                    demo.session.gates.len(),
+                    2,
+                    "and the other step's gate is left where it was"
                 );
             })
         });
