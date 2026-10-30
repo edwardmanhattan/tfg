@@ -118,6 +118,14 @@ pub fn ensure<E>(
     usable: impl Fn() -> bool,
     work: impl FnOnce() -> Result<(), E>,
 ) -> Result<(), E> {
+    // The lock lives beside the checkout, and on a fresh tree neither exists
+    // yet: `create_new` fails with ENOENT when the parent is missing, and that
+    // failure is indistinguishable from "another build holds the lock", so the
+    // loop below waits out STEAL_AFTER -- ninety minutes -- and then starts
+    // over. A cold CI runner took exactly that path: three hours of silence,
+    // no clone, no compile, no warning, then a timeout.
+    let _ = fs::create_dir_all(parent);
+
     let mut started = Instant::now();
 
     loop {
@@ -300,6 +308,34 @@ mod tests {
         )?;
         assert_eq!(worked.load(Ordering::SeqCst), 1);
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A cold runner has no `target` directory yet, and the lock file lives
+    /// inside it. That used to be indistinguishable from a held lock, so the
+    /// job waited out the steal timeout instead of cloning.
+    #[test]
+    fn a_missing_parent_is_created_rather_than_waited_out() -> Res {
+        let root = tmpdir("missing-parent");
+        let parent = root.join("target");
+        assert!(!parent.exists(), "the cold case starts without it");
+        let worked = AtomicUsize::new(0);
+        ensure(
+            &parent,
+            &parent.join("maplibre-native"),
+            || false,
+            || -> Res {
+                worked.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )?;
+        assert_eq!(
+            worked.load(Ordering::SeqCst),
+            1,
+            "a missing lock directory must not read as contention"
+        );
+        assert!(parent.is_dir(), "the lock's directory is the checkout's");
+        let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 
