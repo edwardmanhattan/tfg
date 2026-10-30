@@ -52,6 +52,9 @@ jobs:
             libpng-dev \
             libuv1-dev \
             libwebp-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
             libz-dev \
             ninja-build \
             pkg-config
@@ -187,6 +190,9 @@ jobs:
             libpng-dev \
             libuv1-dev \
             libwebp-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
             libz-dev \
             ninja-build \
             pkg-config
@@ -636,6 +642,9 @@ jobs:
             libssl-dev \
             libuv1-dev \
             libwebp-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
             ninja-build \
             pkg-config \
             zlib1g-dev
