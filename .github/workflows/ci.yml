@@ -43,6 +43,7 @@ jobs:
             cmake \
             glslang-dev \
             glslang-tools \
+            libasound2-dev \
             libcurl4-openssl-dev \
             libdbus-1-dev \
             libfontconfig-dev \
@@ -78,6 +79,12 @@ jobs:
           "$RUNNER_TEMP/mln_checkout_test"
 
       - name: Check Linux build
+        env:
+          # `.cargo/config.toml` pins MLN_LOCAL_REPOSITORY to the maintainer's
+          # main checkout so worktrees share one MapLibre C++ build. A runner
+          # has no such path, so it builds (and caches) its own checkout; the
+          # vendored build script reads an empty value as "managed checkout".
+          MLN_LOCAL_REPOSITORY: ""
         run: cargo check --locked --features maplibre_native/vulkan
 
   notices:
@@ -167,6 +174,7 @@ jobs:
             cmake \
             glslang-dev \
             glslang-tools \
+            libasound2-dev \
             libcurl4-openssl-dev \
             libdbus-1-dev \
             libfontconfig-dev \
@@ -307,6 +315,11 @@ jobs:
         env:
           CXXFLAGS: ${{ matrix.native_cxxflags }}
           MLN_CMAKE_CXX_LAUNCHER: ${{ runner.os == 'Windows' && 'sccache' || '' }}
+          # See the `check` job: the committed MLN_LOCAL_REPOSITORY names the
+          # maintainer's checkout, which no runner has. Windows points at the
+          # checkout this workflow vendors above; the other platforms build a
+          # managed checkout of their own.
+          MLN_LOCAL_REPOSITORY: ${{ runner.os == 'Windows' && format('{0}\.ci\maplibre-native', github.workspace) || '' }}
         run: cargo build --release --locked --features ${{ matrix.maplibre_feature }} --timings
 
       - name: Upload Cargo timings on failure
@@ -563,6 +576,7 @@ jobs:
             git \
             glslang-dev \
             glslang-tools \
+            libasound2-dev \
             libcurl4-openssl-dev \
             libdbus-1-dev \
             libfontconfig-dev \
@@ -597,6 +611,10 @@ jobs:
 
       - name: Build Debian binary
         shell: bash
+        env:
+          # `.cargo/config.toml` points MLN_LOCAL_REPOSITORY at the maintainer's
+          # checkout; the container has no such path and builds its own.
+          MLN_LOCAL_REPOSITORY: ""
         run: |
           set -euo pipefail
           cargo build --release --locked --features maplibre_native/vulkan --timings
