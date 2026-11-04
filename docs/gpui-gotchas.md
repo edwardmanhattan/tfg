@@ -84,3 +84,32 @@ div gives that div a hitbox, which changes what the pointer is over.
 If a background handler must not see a gesture that began over the
 chrome, the chrome stops the propagation. It cannot be argued from the
 hit test, because the hit test will hand the gesture to both.
+
+## On Wayland there is no primary display, and no displays at all until the loop runs
+
+`platform/linux/wayland/client.rs:673` — `WaylandClient::primary_display`
+returns `None` **unconditionally**. It is not a fallback that failed; the answer
+is hard-coded:
+
+```rust
+fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
+    None
+}
+```
+
+`displays()` (`client.rs:642`) does work, but it is built from `wl_output`
+events, and those are dispatched by the event loop — which starts *after* the
+`Application::run` closure. So inside the launch closure, on Wayland, both
+`primary_display()` and `displays()` answer "nothing", while on X11 the primary
+display is there from the first line.
+
+⇒ **Nothing may compute a window's geometry from the display list at launch on
+Wayland.** The console's opening size is decided in two places for this reason
+(`src/window_frame.rs`): `OpeningSize::for_display` takes the share if the
+answer is somehow there, and `with_window_verbs` applies the same share on the
+first frame where it is, once, only while the window is still the size it
+opened at. A window that opened before the compositor was known is a designed
+size, not a wrong one — it is re-sized a frame later.
+
+The same applies to `Bounds::centered(None, ..)`: with no display known, it
+places the window at (0, 0) and the compositor puts it wherever it likes.
