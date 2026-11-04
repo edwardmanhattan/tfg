@@ -58,3 +58,21 @@ pub fn runtime_self_check(paths: &AppPaths, binary: &str) -> Result<(), String> 
     println!("map cache: {}", map_cache.display());
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    // GPUI is vendored with its Wayland `xdg_wm_base` floor lowered to 1: WSLg's
+    // Weston advertises version 1, and upstream's `2..=5` unwraps
+    // `UnsupportedVersion` into a startup panic. A re-vendor that drops the
+    // patch still compiles and still passes every other test — it only fails on
+    // a WSLg desktop — so the range is asserted against the source we build.
+    // See vendor/gpui/README.patch.md.
+    #[test]
+    fn vendored_gpui_binds_the_xdg_wm_base_floor_at_version_one() {
+        let source = include_str!("../vendor/gpui/src/platform/linux/wayland/client.rs");
+        assert!(
+            source.contains("wm_base: globals.bind(&qh, 1..=5, ()).unwrap()"),
+            "vendor/gpui lost its xdg_wm_base patch; see vendor/gpui/README.patch.md"
+        );
+    }
+}

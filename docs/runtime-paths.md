@@ -59,3 +59,30 @@ The Linux build publishes a portable tarball, while a separate Debian 13
 container publishes an installable `amd64 .deb` with Debian-native dependency
 versions. All bundles are attached to matching `v*` GitHub releases and are
 also available as Actions artifacts for other builds.
+
+## Linux windowing: Wayland, X11, and WSLg
+
+GPUI picks its Linux backend from the environment at startup: Wayland when
+`WAYLAND_DISPLAY` is set and X11 when only `DISPLAY` is. On a WSLg desktop
+(Debian or Ubuntu under WSL) XWayland answers on `DISPLAY=:0` as well, so both
+paths are open.
+
+WSLg's Weston advertises `xdg_wm_base` version 1. Unpatched GPUI 0.2.2 asks for
+`2..=5` and unwraps the failed bind, which is a startup panic rather than a
+fallback, so the crate is vendored and its floor lowered to 1 — see
+`vendor/gpui/README.patch.md`. If a Wayland session ever refuses to start for
+another reason, the same binary runs through X11 unchanged:
+
+```text
+WAYLAND_DISPLAY= ./tfg
+```
+
+An empty `WAYLAND_DISPLAY` is not a Wayland display, so the shell and GPUI both
+treat it as unset; `DISPLAY` then selects X11 (XWayland under WSLg).
+
+Vulkan is not optional on this path: `blade` creates the context before any
+window exists, so a machine without a Vulkan loader or ICD fails in
+`BladeContext::new` even when the window manager is fine. WSLg ships one
+(`libd3d12core` — the `dzn` Mesa driver) in recent versions; `tfg --probe-gpu`
+creates a context and runs an off-screen pass, which is the cheapest way to tell
+a GPU problem from a windowing one.

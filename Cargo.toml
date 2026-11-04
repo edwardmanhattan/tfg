@@ -99,6 +99,14 @@ gpui = { version = "=0.2.2", features = ["test-support"] }
 maplibre_native = { path = "vendor/maplibre_native" }
 tokio-centrifuge = { path = "vendor/tokio-centrifuge" }
 
+# Upstream binds `xdg_wm_base` 2..=5 and unwraps the result, so a compositor
+# that advertises xdg-shell version 1 panics at startup with
+# `UnsupportedVersion`. WSLg's Weston advertises exactly that, which is how a
+# Debian 13 WSL desktop got a panic instead of a window. The vendored copy
+# lowers the floor to 1; nothing GPUI sends needs more. See
+# vendor/gpui/README.patch.md, and re-apply on the next version bump.
+gpui = { path = "vendor/gpui" }
+
 # `xattr` 0.2.3, with `ENOATTR` rebound to `ENODATA` (61) rather than the
 # `ENOSTR` (60) it ships. glibc defines `ENOATTR` AS `ENODATA`, so the upstream
 # constant asks for an errno Linux never returns and every extended-attribute
