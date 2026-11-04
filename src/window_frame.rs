@@ -72,16 +72,20 @@ impl OpeningSize {
     /// the display itself (a window larger than its screen cannot be dragged
     /// back into view), and may not be dragged below `designed`.
     pub fn for_display(cx: &App, designed: Size<Pixels>) -> Self {
+        let designed_width = f32::from(designed.width);
+        let designed_height = f32::from(designed.height);
         // A pinned size wins — including a pinned size BELOW the designed one,
         // because an operator who names a number is reporting a display this
         // code cannot see. The floor follows it down, so the compositor is not
         // handed a minimum its window already violates.
         if let Some(pinned) = pinned_size() {
+            let width = f32::from(pinned.width);
+            let height = f32::from(pinned.height);
             return Self {
                 size: pinned,
                 min: size(
-                    px(pinned.width.0.min(designed.width.0)),
-                    px(pinned.height.0.min(designed.height.0)),
+                    px(width.min(designed_width)),
+                    px(height.min(designed_height)),
                 ),
             };
         }
@@ -92,29 +96,23 @@ impl OpeningSize {
             };
         };
         let display_size = display.bounds().size;
-        let share = size(
-            px(display_size.width.0 * OPENING_SHARE),
-            px(display_size.height.0 * OPENING_SHARE),
-        );
+        let display_width = f32::from(display_size.width);
+        let display_height = f32::from(display_size.height);
         let target = size(
-            px(share
-                .width
-                .0
-                .max(designed.width.0)
+            px((display_width * OPENING_SHARE)
+                .max(designed_width)
                 .max(FLOOR.0)
-                .min(display_size.width.0)),
-            px(share
-                .height
-                .0
-                .max(designed.height.0)
+                .min(display_width)),
+            px((display_height * OPENING_SHARE)
+                .max(designed_height)
                 .max(FLOOR.1)
-                .min(display_size.height.0)),
+                .min(display_height)),
         );
         Self {
             size: target,
             min: size(
-                px(designed.width.0.min(target.width.0)),
-                px(designed.height.0.min(target.height.0)),
+                px(designed_width.min(f32::from(target.width))),
+                px(designed_height.min(f32::from(target.height))),
             ),
         }
     }
@@ -158,9 +156,15 @@ mod tests {
     #[test]
     fn a_pinned_size_is_read_in_either_case() {
         let parsed = parse_size("1600x1000").expect("lower case x");
-        assert_eq!((parsed.width.0, parsed.height.0), (1600.0, 1000.0));
+        assert_eq!(
+            (f32::from(parsed.width), f32::from(parsed.height)),
+            (1600.0, 1000.0)
+        );
         let parsed = parse_size(" 1920 X 1200 ").expect("upper case X and spaces");
-        assert_eq!((parsed.width.0, parsed.height.0), (1920.0, 1200.0));
+        assert_eq!(
+            (f32::from(parsed.width), f32::from(parsed.height)),
+            (1920.0, 1200.0)
+        );
     }
 
     #[test]
