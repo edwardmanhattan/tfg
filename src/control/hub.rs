@@ -393,12 +393,27 @@ impl ControlHub {
         // A panel toggle is observer UI, not a camera. It has its own event
         // (the session one) because every attached wall draws the same
         // windows, and a revision bump is how they learn.
+        //
+        // THE HANDSET'S ONE VERB IS A PRESS, NOT A STATE. The phone has no
+        // control that says "close": every tap posts `open: true`, so a
+        // reducer that SET the window could only ever open it, and the
+        // operator pressing the button again watched the wall do nothing. A
+        // `true` is therefore a TOGGLE — it opens a closed window and closes
+        // an open one — while a `false` still closes outright, because a
+        // client that DOES know the state it wants (the CLI, after reading
+        // `GET /v1/session`) must be able to say "closed" without depending
+        // on the state it just read being the state the reducer holds.
         if let Command::UiSet { panel, open } = command {
             let Some(panel) = Panel::parse(panel) else {
                 return Ok(None);
             };
             let mut panels = shared.ui.panels;
-            panels.set(panel, *open);
+            let target = if *open {
+                !panels.is_open(panel)
+            } else {
+                false
+            };
+            panels.set(panel, target);
             if panels == shared.ui.panels {
                 return Ok(None);
             }
@@ -1418,47 +1433,54 @@ mod tests {
         assert_eq!(hub.readiness().reason, Some(ReadinessReason::NoDisplay));
     }
 
+    /// THE PHONE'S TAP IS A TOGGLE. The handset has one press per window and
+    /// no way to say "close", so the same `open: true` twice is open then
+    /// closed; an explicit `false` closes and a second `false` is a no-op.
     #[test]
-    fn the_phone_opens_a_window_and_the_hub_remembers_it() {
+    fn the_phone_toggles_a_window_and_the_hub_remembers_it() {
         let hub = ControlHub::new(camera(-6.2));
         hub.set_session(session("execution", vec![unit(1, "Evertsen", Some(-6.2))]));
         hub.attach_display(display("wall-1"));
         assert!(!hub.ui().panels.crew);
 
         let mut events = hub.subscribe();
+        let press = |open: bool| Command::UiSet {
+            panel: "crew".to_string(),
+            open,
+        };
         let revision = hub
-            .apply_view(
-                OBSERVER_VIEW,
-                &Command::UiSet {
-                    panel: "crew".to_string(),
-                    open: true,
-                },
-                CameraSource::desktop(),
-            )
+            .apply_view(OBSERVER_VIEW, &press(true), CameraSource::desktop())
             .expect("accepted");
         assert!(revision.is_some(), "opening a window is a state change");
         assert!(hub.ui().panels.crew);
 
         // The event every wall draws from carries the window.
         let event = events.try_recv().expect("an event");
-        let Event::SessionChanged { ui, revision, .. } = event else {
+        let Event::SessionChanged { ui, .. } = event else {
             panic!("a panel toggle is a session event");
         };
         assert!(ui.panels.crew);
-        assert_eq!(revision, revision);
 
-        // The same toggle again is not a change.
+        // THE SAME PRESS AGAIN CLOSES IT. The phone cannot ask for "closed",
+        // so a state-setting reducer would have left the wall stuck open.
         let again = hub
-            .apply_view(
-                OBSERVER_VIEW,
-                &Command::UiSet {
-                    panel: "crew".to_string(),
-                    open: true,
-                },
-                CameraSource::desktop(),
-            )
+            .apply_view(OBSERVER_VIEW, &press(true), CameraSource::desktop())
             .expect("accepted");
-        assert!(again.is_none());
+        assert!(again.is_some(), "the second press is a change");
+        assert!(!hub.ui().panels.crew, "and the window it closes is the one it opened");
+
+        // An explicit close is still a state: closing a closed window is the
+        // no-op the idempotency argument was written for.
+        let closed = hub
+            .apply_view(OBSERVER_VIEW, &press(false), CameraSource::desktop())
+            .expect("accepted");
+        assert!(closed.is_none(), "already closed");
+        assert!(!hub.ui().panels.crew);
+
+        // Open it again, so the rest of the session's facts have a window.
+        hub.apply_view(OBSERVER_VIEW, &press(true), CameraSource::desktop())
+            .expect("accepted");
+        assert!(hub.ui().panels.crew);
 
         // A focus names the hull the popup is about.
         hub.apply_view(

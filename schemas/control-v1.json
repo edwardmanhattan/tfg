@@ -141,6 +141,7 @@
     "command_ui_set": {
       "type": "object",
       "additionalProperties": false,
+      "description": "Open or close one of the observer's windows. `open: true` is a TOGGLE — the handset has one press per window and no way to say close, so true opens a closed window and closes an open one; false always closes.",
       "required": [
         "type",
         "payload"
@@ -181,7 +182,8 @@
               ]
             },
             "open": {
-              "type": "boolean"
+              "type": "boolean",
+              "description": "true toggles the window (open when closed, close when open); false closes it outright."
             }
           }
         }

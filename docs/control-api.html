@@ -1830,8 +1830,13 @@ flowchart TD
         <li><code>panel</code> is <code>crew</code>, <code>scenario</code>, or
           <code>comms</code>. There is no <code>units</code> panel: the unit grid is
           a control, not a window.</li>
-        <li>Idempotent: the same <code>open</code> twice changes nothing and
-          advances no revision.</li>
+        <li><strong><code>open: true</code> toggles.</strong> The handset has one
+          press per window and no way to say "close", so a state-setting reducer
+          could only ever open it. <code>true</code> opens a closed window and
+          closes an open one; <code>false</code> always closes. A client that knows
+          the state it wants should reconcile against <code>GET /v1/session</code>
+          first — <code>tfgctl panel crew on</code> does, so <code>on</code> means
+          "make it open".</li>
         <li>Must be addressed to <code>observer</code>. The console ignores a
           panel toggle addressed to <code>main</code>; the observer's windows
           belong to the wall.</li>

@@ -1685,6 +1685,18 @@ mod tests {
         assert_eq!(read["ui"]["panels"]["crew"], true);
         assert_eq!(read["ui"]["panels"]["comms"], false);
 
+        // THE PHONE'S ONE PRESS IS A TOGGLE. It has no way to say "close", so
+        // the same body again closes the window rather than being a no-op.
+        let toggled = host.post(serde_json::json!({
+            "protocol_version": 2,
+            "client_id": "phone-7",
+            "view": "observer",
+            "type": "ui.set",
+            "payload": { "panel": "crew", "open": true }
+        }));
+        assert_eq!(toggled.status(), 202, "the second press is accepted");
+        assert_eq!(host.session()["ui"]["panels"]["crew"], false);
+
         // A panel the observer does not have is refused at the boundary.
         let bad = host.post(serde_json::json!({
             "protocol_version": 2,

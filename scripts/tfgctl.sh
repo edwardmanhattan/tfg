@@ -10,6 +10,13 @@
 #   scripts/tfgctl.sh hello --json
 set -euo pipefail
 
+# The built CLI, resolved beside THIS checkout (see `tfg-bin.sh`). It used to
+# name the main checkout's target by absolute path, which ran another
+# checkout's `tfgctl` whenever this one lived in a worktree.
+_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tfg-bin.sh
+. "$_SCRIPT_DIR/tfg-bin.sh"
+
 # Detect primary local IP at call time (falling back to 127.0.0.1 if disconnected)
 _HOST_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' || true)"
 [ -z "$_HOST_IP" ] && _HOST_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
@@ -20,4 +27,5 @@ _HOST_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="
 
 export TFG_CONTROL_URL TFG_CONTROL_TOKEN
 
-exec ~/Work/Crossnet/tfg/target/debug/tfgctl "$@"
+BIN="$(tfg_bin tfgctl)"
+exec "$BIN" "$@"

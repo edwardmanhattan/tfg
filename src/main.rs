@@ -1525,6 +1525,28 @@ fn main() {
                         } else {
                             (None, Vec::new())
                         };
+                        // THE PRESS CAN CHANGE WHICH GAME IS HELD — creating one,
+                        // a play-again, a duplicate. The binary's hold cell is
+                        // what the plot reader, the watches and the control
+                        // publisher read, so it moves HERE, in the same step as
+                        // the answer. It used to move only on the picker's
+                        // hold/join and on a transition, which meant a game
+                        // CREATED from the composer was drawn from the last
+                        // exercise's plot: its hulls on this water, and this
+                        // exercise's fixes for the same unit ids refused as
+                        // older than the last clock.
+                        if let Some(s) = session.as_ref() {
+                            game_id = s.game_id;
+                            state2 = s.state.clone();
+                            sync_session(
+                                &hold2,
+                                &live_ctl2,
+                                &keeper2.current(),
+                                game_id,
+                                &state2,
+                                s.me,
+                            );
+                        }
                         if press_tx
                             .send(tfg::shell_gpui::PressAnswer {
                                 draft,
@@ -3211,6 +3233,9 @@ fn main() {
     let mut glide_seen: std::collections::HashMap<String, std::time::Instant> =
         std::collections::HashMap::new();
     let mut glide_snap: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // WHICH EXERCISE THE REGISTRY'S GAME PICTURE BELONGS TO. `-1` is "nothing
+    // read yet", so the first tick forgets whatever a previous session left.
+    let mut tracked_game: i64 = -1;
     let publisher_fix = publisher.clone();
 
     // The picker's drill tree, read once off the synced mirror like the
@@ -3303,6 +3328,24 @@ fn main() {
             // shell scales that to the window). `None` when nothing arrived —
             // the registry is quiet, not wrong, and the shell keeps its rows
             // and its markers as they were.
+            // THE HELD GAME IS THE PICTURE'S SCOPE. A unit id is a REGISTER
+            // id, not an exercise id: hull 8 of the next exercise is not hull
+            // 8 of the last one. When the held game changes, every
+            // Game-sourced ship is forgotten — the previous exercise's hulls
+            // must not stand on this exercise's water, and this exercise's
+            // fixes must not be refused as "older" than the old exercise's
+            // clock — and the batch is emitted ONCE even when it is empty, so
+            // the shell's markers go with the registry's.
+            let held_game = hold_for_wire.lock().map(|h| h.game_id).unwrap_or(0);
+            let mut forgotten = false;
+            if tracked_game != held_game {
+                tracked_game = held_game;
+                registry.forget_game();
+                glide_at.clear();
+                glide_seen.clear();
+                glide_snap.clear();
+                forgotten = true;
+            }
             let mut batch = Vec::new();
             // The GAME fixes first: the exercise's own positions, on the
             // game path. They are ingested apart from the wire's, because a
@@ -3356,6 +3399,12 @@ fn main() {
             while let Ok(event) = live_event_rx.try_recv() {
                 match event {
                     tfg::backend::LiveEvent::GamePositions(update) => {
+                        // A publication for ANOTHER exercise is not this
+                        // map's: the subscription is per game, but a late
+                        // frame can outlive the watch that asked for it.
+                        if update.game_id != held_game {
+                            continue;
+                        }
                         let fixes = tfg::gamefeed::game_fixes(&update);
                         // The socket's own line, throttled to match the
                         // plot's: which path is carrying the movement is
@@ -3382,6 +3431,9 @@ fn main() {
                         }
                     }
                     tfg::backend::LiveEvent::OrderIssued(event) => {
+                        if event.game_id != held_game {
+                            continue;
+                        }
                         let fix = tfg::gamefeed::order_fix(&event);
                         let acked = registry.poll_game(vec![fix]);
                         note_arrivals(
@@ -3423,10 +3475,9 @@ fn main() {
                         // which merges it into the inbox by id and says
                         // so in the type's own ink and tone.
                         // The PERSONAL channel is the ACCOUNT's, so it
-                        // carries traffic for every exercise this account
+                        // carried traffic for every exercise this account
                         // is in. Only the held exercise's traffic belongs in
                         // the held exercise's inbox.
-                        let held_game = hold_for_wire.lock().map(|h| h.game_id).unwrap_or_default();
                         if m.game_id != held_game {
                             eprintln!(
                                 "wire: message for game {} — not the held game ({held_game})",
@@ -3582,7 +3633,11 @@ fn main() {
                     positions_due = Some(std::time::Instant::now());
                 }
             }
-            if batch.is_empty() { None } else { Some(batch) }
+            // A TICK THAT FORGOT A GAME SPEAKS EVEN WHEN IT HAS NOTHING TO
+            // SAY: `None` means "the registry is quiet, keep what you have",
+            // which is exactly the wrong message when what the shell has is
+            // another exercise's hulls.
+            if forgotten || !batch.is_empty() { Some(batch) } else { None }
         }),
         status_feed,
         signin_feed,

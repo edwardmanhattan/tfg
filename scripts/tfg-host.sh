@@ -21,6 +21,12 @@
 # Usage: scripts/tfg-host.sh [--mode command-center]
 set -euo pipefail
 
+# The built console, not `cargo run`: this script starts it and gets out of
+# the way, and a rebuild is the operator's call (`cargo build --bin tfg`).
+_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tfg-bin.sh
+. "$_SCRIPT_DIR/tfg-bin.sh"
+
 # A host and a command center are two roles, not two flags on one process.
 # If the operator asked for the wall here, run the wall script instead of
 # silently dropping the argument and opening the usual console.
@@ -51,4 +57,5 @@ esac
 
 export TFG_CONTROL_LISTEN TFG_CONTROL_TOKEN TFG_MINOS_HOST TFG_SIGNED_OUT TFG_API_USER TFG_API_PASS
 
-exec cargo run --bin tfg -- "$@"
+BIN="$(tfg_bin tfg)"
+exec "$BIN" "$@"

@@ -499,8 +499,14 @@ about rides `camera.focus` / `camera.focus_group`.
 - `panel` is `crew`, `scenario` or `comms`. There is no `units` window: the
   phone's unit grid is a control, not a panel, and Crew is the people and hulls
   the exercise holds.
-- The state is idempotent: the same `open` twice changes nothing and advances no
-  revision.
+- **`open: true` toggles.** The handset has one press per window and no way to
+  express "close": every tap posts `true`, so a state-setting reducer could
+  only ever open a window and the second tap would do nothing. `true` therefore
+  opens a closed window and closes an open one; `false` always closes, so a
+  client that knows the state it wants can say "closed" without depending on
+  the read it made a moment earlier. Such a client should reconcile against
+  `GET /v1/session` first (`tfgctl panel crew on` does), which is what keeps
+  `on` meaning "make it open" rather than "flip it".
 - It needs `control_view` and the readiness gate, like a nudge — opening a
   window on a wall that is not observing is a gesture into a hole.
 - It is carried to every wall in `session.changed` (and in the snapshot), which

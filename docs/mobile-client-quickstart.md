@@ -726,8 +726,12 @@ POST /v1/commands
 | `scenario` | The scenario being played and its step. |
 | `comms` | The traffic the console published, newest first. |
 
-- It is idempotent and gated like a nudge: `409 not_ready` before observation
-  opens, `422` for a panel name that is not one of the three.
+- **`open: true` is a toggle**, not a state: the handset has one press per
+  window and no control that says "close", so `true` opens a closed window and
+  closes an open one. `false` always closes. If the app ever learns the state it
+  wants, reconcile against the snapshot's `ui.panels` first — that is what the
+  CLI does (`tfgctl panel crew on`). It is gated like a nudge: `409 not_ready`
+  before observation opens, `422` for a panel name that is not one of the three.
 - The state is the host's, not the app's: it comes back in the snapshot as
   `ui.panels` and changes arrive in `session.changed`, so a reconnect restores
   the same screen.

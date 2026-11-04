@@ -12,6 +12,13 @@
 # Usage: scripts/tfg-command-center.sh
 set -euo pipefail
 
+# The built console, not `cargo run`: a display starts once and runs for hours,
+# and a rebuild belongs to the operator (`cargo build --bin tfg`), not to a
+# start-up nobody watched.
+_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tfg-bin.sh
+. "$_SCRIPT_DIR/tfg-bin.sh"
+
 # Detect primary local IP at call time (falling back to 127.0.0.1 if disconnected)
 _HOST_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' || true)"
 [ -z "$_HOST_IP" ] && _HOST_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
@@ -24,4 +31,5 @@ _HOST_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="
 
 export TFG_CONTROL_SERVER TFG_CONTROL_TOKEN TFG_DISPLAY_ID TFG_DISPLAY_LABEL
 
-exec cargo run --bin tfg -- --mode command-center
+BIN="$(tfg_bin tfg)"
+exec "$BIN" --mode command-center

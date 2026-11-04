@@ -537,6 +537,26 @@ impl Registry {
         self.known.remove(ship_id);
     }
 
+    /// Drop every hull this console took from a HELD GAME.
+    ///
+    /// A GAME fix's identity is the UNIT id, and unit ids are per-REGISTER:
+    /// the same hull can be piece 8 of one exercise and piece 8 of the next.
+    /// The registry cannot tell two exercises' hulls apart, so carrying one
+    /// exercise's picture across a session change does two wrong things at
+    /// once. The previous exercise's hulls stay on the new exercise's water —
+    /// they are not in it, but nothing removed them — and the new exercise's
+    /// first fixes for the SAME ids are refused as out-of-order, because
+    /// `poll_inner` orders GAME fixes by the SCENARIO instant and the new
+    /// exercise usually starts earlier on its own clock than the old one
+    /// ended on its. The hull then stands still while the server moves it.
+    ///
+    /// The WIRE's picture is untouched: an operational vessel belongs to no
+    /// exercise, and a reconnect resync is what removes it.
+    pub fn forget_game(&mut self) {
+        self.ships
+            .retain(|_, ship| ship.latest.source != FixSource::Game);
+    }
+
     /// Move a ship's displayed position outright and drop its interpolation
     /// history, so the marker IS the new position on the next frame.
     ///
@@ -653,6 +673,46 @@ mod tests {
             age_secs: None,
             seq: 0,
         }
+    }
+
+    /// A fix from a HELD GAME: scenario-stamped, and authoritative over the
+    /// wire for the same id.
+    fn game_fix(id: &str, lat: f64, lon: f64, ts: &str) -> Fix {
+        Fix {
+            source: FixSource::Game,
+            ..fix(id, lat, lon, ts)
+        }
+    }
+
+    /// A NEW EXERCISE STARTS FROM ITS OWN CLOCK.
+    ///
+    /// The same unit id in two exercises is the same register id and not the
+    /// same hull-in-this-exercise. The old picture has to go, or the new
+    /// exercise's first fixes are "older" than the old clock and are refused
+    /// — the hull stands still while the server moves it.
+    #[test]
+    fn a_new_exercise_accepts_fixes_from_its_own_earlier_clock() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll_game(vec![game_fix("8", -6.10, 106.80, "2026-10-30T10:30:00+07:00")]);
+        assert_eq!(r.ship("8").expect("tracked").latest.position.longitude, 106.80);
+        // The next exercise is held: its clock has not reached the old one's
+        // last instant, and the old hull is not in this exercise at all.
+        r.forget_game();
+        assert!(r.ship("8").is_none(), "the old exercise's hull is gone");
+        let acked = r.poll_game(vec![game_fix("8", -6.10, 106.95, "2026-10-30T08:00:00+07:00")]);
+        assert_eq!(acked.len(), 1, "the new exercise's fix is not out of order");
+        assert_eq!(r.ship("8").expect("tracked").latest.position.longitude, 106.95);
+    }
+
+    /// The wire's picture belongs to no exercise and survives a game change.
+    #[test]
+    fn forgetting_a_game_keeps_the_wires_picture() {
+        let mut r = Registry::new(TrailBound::default());
+        r.poll_game(vec![game_fix("8", -6.10, 106.80, "2026-10-30T10:30:00+07:00")]);
+        r.poll(vec![fix("9", -6.20, 106.70, "2026-10-30T10:31:00Z")]);
+        r.forget_game();
+        assert!(r.ship("8").is_none(), "the exercise's hull is gone");
+        assert!(r.ship("9").is_some(), "the operational vessel stays");
     }
 
     #[test]

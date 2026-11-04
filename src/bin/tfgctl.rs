@@ -487,6 +487,23 @@ fn panel(
         "off" | "close" | "false" => false,
         other => return Err(format!("panel state must be on or off, not {other:?}")),
     };
+    // THE WIRE PRIMITIVE IS A TOGGLE, so `on` and `off` are reconciled here.
+    // The phone has no way to say "close" and therefore posts `open: true`
+    // for every tap, which the host flips; this CLI CAN say the state it
+    // wants, so it reads the one the wall is in and posts only when that
+    // differs. `on` then means "make it open", not "flip it".
+    let current = state["ui"]["panels"][name].as_bool().unwrap_or(false);
+    if current == open {
+        if json_out {
+            println!("{}", json!({ "panel": name, "open": current, "changed": false }));
+        } else {
+            println!(
+                "{name} is already {}",
+                if open { "open" } else { "closed" }
+            );
+        }
+        return Ok(());
+    }
     post(
         client,
         server,

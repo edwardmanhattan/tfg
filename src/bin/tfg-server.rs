@@ -220,7 +220,10 @@ fn describe(command: &Command) -> String {
         },
         Command::ViewReport { width, height } => format!("view.report {width}x{height}"),
         Command::UiSet { panel, open } => {
-            format!("ui.set {panel} {}", if *open { "open" } else { "close" })
+            // The phone has one press: `true` is a toggle, `false` always
+            // closes. The log says what the host will DO, not what the phone
+            // called it.
+            format!("ui.set {panel} {}", if *open { "toggle" } else { "close" })
         }
         Command::SettingsFont { step } => format!("settings.font step {step}"),
     }

@@ -474,6 +474,18 @@ impl PanelSet {
         }
     }
 
+    /// Whether one window is open.
+    ///
+    /// Read rather than assumed: the phone's command is a TOGGLE (it has no
+    /// way to say "close"), so the reducer has to know what it is flipping.
+    pub fn is_open(self, panel: Panel) -> bool {
+        match panel {
+            Panel::Crew => self.crew,
+            Panel::Scenario => self.scenario,
+            Panel::Comms => self.comms,
+        }
+    }
+
     pub fn any(self) -> bool {
         self.crew || self.scenario || self.comms
     }
@@ -630,8 +642,13 @@ pub enum Command {
     },
     /// Open or close one of the observer's windows.
     ///
-    /// The phone sends the panel's wire name and the state it wants, so a
-    /// retry is idempotent and two toggles cannot fight over "open".
+    /// **`open: true` is a TOGGLE.** The handset has one press and no way to
+    /// express "close": every tap posts `true`, so a reducer that SET the
+    /// window could only ever open it and a second tap would do nothing. A
+    /// `true` therefore opens a closed window and closes an open one; a
+    /// `false` always closes, so a client that knows the state it wants (the
+    /// CLI, after reading `GET /v1/session`) can still say "closed" without
+    /// racing the state it just read.
     #[serde(rename = "ui.set")]
     UiSet { panel: String, open: bool },
     /// The console's text size, as a step of its four-step ladder.
