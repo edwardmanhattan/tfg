@@ -39,17 +39,57 @@ const OPENING_SHARE: f32 = 0.85;
 /// The smallest window worth opening at, whatever the display says.
 const FLOOR: (f32, f32) = (640.0, 480.0);
 
+/// The size the console's layout was designed at. Its minimum, and the size it
+/// opens at when the platform cannot say what display it is on.
+pub fn console_designed() -> Size<Pixels> {
+    size(px(1040.0), px(640.0))
+}
+
+/// The size the command center's layout was designed at.
+pub fn wall_designed() -> Size<Pixels> {
+    size(px(1280.0), px(800.0))
+}
+
 /// Bind the window's own verbs. Called once, before any window is opened.
 pub fn bind_window_keys(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("f11", ToggleFullscreen, None)]);
 }
 
+thread_local! {
+    /// The share has been applied, once, for this process's window.
+    ///
+    /// A thread-local and not a field on the view: the latch is a property of
+    /// the window, the console is one window on the UI thread, and the console
+    /// and the command center are separate binaries.
+    static SHARE_APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Wrap a rendered surface so a window verb dispatched from anywhere in it
-/// reaches the window.
+/// reaches the window, and so a window that opened before the platform knew
+/// what display it was on grows to its share once the answer arrives.
 ///
 /// The wrapper is a plain full-size box: it exists to be the dispatch tree's
 /// root, not to lay anything out.
-pub fn with_window_verbs(surface: AnyElement) -> AnyElement {
+///
+/// WHY THE GROWTH IS DEFERRED. On Wayland the output list is empty while the
+/// launch closure runs — `wl_output` events have not been dispatched yet — so a
+/// share computed at open time is computed from nothing, on the one desktop
+/// (WSLg) that needed it. By the first frame the list is there. The resize is
+/// done ONCE and only while the window is still exactly the size it opened at,
+/// so a window the operator has resized, or the compositor has tiled, stays
+/// theirs.
+pub fn with_window_verbs(
+    surface: AnyElement,
+    designed: Size<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    if let Some(target) = share_of_display(cx, designed) {
+        let untouched = window.viewport_size() == designed;
+        if untouched && !SHARE_APPLIED.replace(true) && target != designed {
+            window.resize(target);
+        }
+    }
     div()
         .id("window-verbs")
         .size_full()
@@ -89,24 +129,12 @@ impl OpeningSize {
                 ),
             };
         }
-        let Some(display_size) = display_size(cx) else {
+        let Some(target) = share_of_display(cx, designed) else {
             return Self {
                 size: designed,
                 min: designed,
             };
         };
-        let display_width = f32::from(display_size.width);
-        let display_height = f32::from(display_size.height);
-        let target = size(
-            px((display_width * OPENING_SHARE)
-                .max(designed_width)
-                .max(FLOOR.0)
-                .min(display_width)),
-            px((display_height * OPENING_SHARE)
-                .max(designed_height)
-                .max(FLOOR.1)
-                .min(display_height)),
-        );
         Self {
             size: target,
             min: size(
@@ -115,6 +143,27 @@ impl OpeningSize {
             ),
         }
     }
+}
+
+/// [`OPENING_SHARE`] of the display, inside the designed size and the display
+/// itself; `None` when a size is pinned or no display is known yet.
+fn share_of_display(cx: &App, designed: Size<Pixels>) -> Option<Size<Pixels>> {
+    if pinned_size().is_some() {
+        return None;
+    }
+    let display_size = display_size(cx)?;
+    let display_width = f32::from(display_size.width);
+    let display_height = f32::from(display_size.height);
+    Some(size(
+        px((display_width * OPENING_SHARE)
+            .max(f32::from(designed.width))
+            .max(FLOOR.0)
+            .min(display_width)),
+        px((display_height * OPENING_SHARE)
+            .max(f32::from(designed.height))
+            .max(FLOOR.1)
+            .min(display_height)),
+    ))
 }
 
 /// The size of the display a window should open on.

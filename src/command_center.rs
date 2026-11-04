@@ -187,8 +187,10 @@ pub fn run(
         // The wall and the console share one window policy: open at a share of
         // the display, and F11 for the whole of it (`src/window_frame.rs`).
         crate::window_frame::bind_window_keys(cx);
-        let opening =
-            crate::window_frame::OpeningSize::for_display(cx, size(px(1280.0), px(800.0)));
+        let opening = crate::window_frame::OpeningSize::for_display(
+            cx,
+            crate::window_frame::wall_designed(),
+        );
         let bounds = Bounds::centered(None, opening.size, cx);
         let opts = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -2247,7 +2249,12 @@ impl Render for CommandCenter {
     // (`src/window_frame.rs`: WSLg draws no frame to resize a small window by).
     #[allow(refining_impl_trait)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        crate::window_frame::with_window_verbs(self.render_surface(window, cx).into_any_element())
+        crate::window_frame::with_window_verbs(
+            self.render_surface(window, cx).into_any_element(),
+            crate::window_frame::wall_designed(),
+            window,
+            cx,
+        )
     }
 }
 

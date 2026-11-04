@@ -37197,7 +37197,12 @@ impl Render for IslandDemo {
     // that verb exists.
     #[allow(refining_impl_trait)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        crate::window_frame::with_window_verbs(self.render_surface(window, cx))
+        crate::window_frame::with_window_verbs(
+            self.render_surface(window, cx),
+            crate::window_frame::console_designed(),
+            window,
+            cx,
+        )
     }
 }
 
@@ -45056,7 +45061,7 @@ pub fn run(
             crate::window_frame::bind_window_keys(cx);
             let opening = crate::window_frame::OpeningSize::for_display(
                 cx,
-                size(px(1040.0), px(640.0)),
+                crate::window_frame::console_designed(),
             );
             let bounds = Bounds::centered(None, opening.size, cx);
             let opts = WindowOptions {
