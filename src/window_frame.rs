@@ -89,13 +89,12 @@ impl OpeningSize {
                 ),
             };
         }
-        let Some(display) = cx.primary_display() else {
+        let Some(display_size) = display_size(cx) else {
             return Self {
                 size: designed,
                 min: designed,
             };
         };
-        let display_size = display.bounds().size;
         let display_width = f32::from(display_size.width);
         let display_height = f32::from(display_size.height);
         let target = size(
@@ -116,6 +115,27 @@ impl OpeningSize {
             ),
         }
     }
+}
+
+/// The size of the display a window should open on.
+///
+/// NOT `App::primary_display()`. GPUI 0.2.2's Wayland backend answers `None`
+/// from it unconditionally (`vendor/gpui/src/platform/linux/wayland/client.rs`,
+/// `fn primary_display`) while populating `displays()` from `wl_output` events,
+/// so a Wayland desktop — WSLg included — reported no display at all, and every
+/// window fell back to its designed size. The list is asked for instead, and the
+/// LARGEST output wins: a command centre is hung on the biggest screen in the
+/// room, and opening smaller because another output happens to sort first would
+/// be the same bug with a different number.
+fn display_size(cx: &App) -> Option<Size<Pixels>> {
+    if let Some(display) = cx.primary_display() {
+        return Some(display.bounds().size);
+    }
+    let area = |size: Size<Pixels>| f32::from(size.width) * f32::from(size.height);
+    cx.displays()
+        .into_iter()
+        .map(|display| display.bounds().size)
+        .max_by(|a, b| area(*a).total_cmp(&area(*b)))
 }
 
 /// `TFG_WINDOW_SIZE=1920x1080` — an operator pinning the size the console
