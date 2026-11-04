@@ -25,9 +25,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext, Application, Bounds, Context, IntoElement, ParentElement, Render, Styled,
-    StatefulInteractiveElement, StyledImage, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    canvas, div, img, point, prelude::*, px, size,
+    AnyElement, App, AppContext, Application, Bounds, Context, IntoElement, ParentElement, Render,
+    Styled, StatefulInteractiveElement, StyledImage, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, canvas, div, img, point, prelude::*, px, size,
 };
 
 use crate::control::{
@@ -184,9 +184,15 @@ pub fn run(
 
     Application::new().run(move |cx: &mut App| {
         register_fonts(cx);
-        let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
+        // The wall and the console share one window policy: open at a share of
+        // the display, and F11 for the whole of it (`src/window_frame.rs`).
+        crate::window_frame::bind_window_keys(cx);
+        let opening =
+            crate::window_frame::OpeningSize::for_display(cx, size(px(1280.0), px(800.0)));
+        let bounds = Bounds::centered(None, opening.size, cx);
         let opts = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(opening.min),
             titlebar: Some(TitlebarOptions {
                 title: Some("tfg command center".into()),
                 appears_transparent: false,
@@ -2236,7 +2242,17 @@ fn hull_extent(
 }
 
 impl Render for CommandCenter {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    // `AnyElement` where the trait allows `impl IntoElement`, because the
+    // surface is wrapped in the root that carries the window's own verb
+    // (`src/window_frame.rs`: WSLg draws no frame to resize a small window by).
+    #[allow(refining_impl_trait)]
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        crate::window_frame::with_window_verbs(self.render_surface(window, cx).into_any_element())
+    }
+}
+
+impl CommandCenter {
+    fn render_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some((no, w, h, bgra, _at, _zoom)) = self.incoming.take() {
             self.frame.show(window, cx, no, (w, h), bgra);
             self.map_dims = (w as f32, h as f32);

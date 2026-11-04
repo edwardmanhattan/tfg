@@ -86,3 +86,23 @@ window exists, so a machine without a Vulkan loader or ICD fails in
 (`libd3d12core` — the `dzn` Mesa driver) in recent versions; `tfg --probe-gpu`
 creates a context and runs an off-screen pass, which is the cheapest way to tell
 a GPU problem from a windowing one.
+
+## The window's size
+
+The console opens at 85% of the display it lands on, centred, never smaller
+than the size its layout was designed at (1040x640 for the console, 1280x800 for
+the command center). On a 1920x1200 wall that is a 1632x1020 window; the floor
+is also the minimum, so it can be dragged smaller only as far as the layout is
+known to work.
+
+Two ways to change it:
+
+- **F11** toggles fullscreen. It is the only resize a compositor with no window
+  frame can still honour, which is exactly the WSLg case: WSLg's Weston draws no
+  server-side decorations and GPUI's Wayland backend draws no client-side ones,
+  so there is no edge to drag. (Under X11 a window manager's own frame resizes
+  the window as usual.)
+- **`TFG_WINDOW_SIZE=WIDTHxHEIGHT`** opens at a size outright —
+  `TFG_WINDOW_SIZE=1920x1080 ./tfg`. It wins over the display share, for an
+  operator who knows the screen the console hangs on. A value that is not a
+  size is reported on stderr and ignored.

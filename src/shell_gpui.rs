@@ -37189,11 +37189,21 @@ fn viewport(window: &Window) -> view::Box {
 
 impl Render for IslandDemo {
     // A concrete `AnyElement` where the trait allows `impl IntoElement`: the
-    // shell composes one element tree per frame and returns it boxed. Legal
-    // and deliberate, so the `refining_impl_trait` lint is silenced here
-    // rather than by boxing at every return site.
+    // shell composes one element tree per frame and returns it boxed, wrapped
+    // so the window's own verb has a root to dispatch to (the four surfaces
+    // below — signed out, flow window, sheet, console — share no element, and
+    // a keymap action starts at the dispatch tree's root, which is also where
+    // a console with nothing focused begins). `src/window_frame.rs` says why
+    // that verb exists.
     #[allow(refining_impl_trait)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        crate::window_frame::with_window_verbs(self.render_surface(window, cx))
+    }
+}
+
+impl IslandDemo {
+    /// One frame of whichever surface is up, with no window verb on it.
+    fn render_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         // The turned pictures the cache has given up are retired HERE, at
         // the top of the frame: retiring a picture needs the window, and the
         // cache is emptied in the middle of a paint.
@@ -45039,9 +45049,19 @@ pub fn run(
                 ])
                 .expect("bundled fonts register");
 
-            let bounds = Bounds::centered(None, size(px(760.0), px(620.0)), cx);
+            // WSLg draws no window frame and GPUI's Wayland backend draws none
+            // either, so a window that opens small has no handle to be dragged
+            // bigger by. It opens at a share of the display instead, and F11 is
+            // the rest of the answer (`src/window_frame.rs`).
+            crate::window_frame::bind_window_keys(cx);
+            let opening = crate::window_frame::OpeningSize::for_display(
+                cx,
+                size(px(1040.0), px(640.0)),
+            );
+            let bounds = Bounds::centered(None, opening.size, cx);
             let opts = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(opening.min),
                 titlebar: Some(TitlebarOptions {
                     title: Some("tfg command center (gpui)".into()),
                     appears_transparent: false,

@@ -59,6 +59,9 @@
 //!   Leaf: no GPUI, no draft, no network.
 //! - [`window`]: the exercise's planned window and the one rule that says
 //!   what a window is — shared with the scenario composer. Toolkit-free.
+//! - [`window_frame`]: how a console window opens — at a share of the display
+//!   — and the one verb that fills it, for a desktop that draws no frame to
+//!   drag. Toolkit-typed, no layout.
 //! - [`terms`]: the exercise's prose and pace as the planning panel edits
 //!   them, and the one partial edit the server takes for them. Toolkit-free.
 //! - [`calendar`]: the month as six weeks of days, and the local datetimes a
@@ -132,3 +135,4 @@ pub mod thumb_rotate;
 pub mod view;
 pub mod visuals;
 pub mod window;
+pub mod window_frame;
