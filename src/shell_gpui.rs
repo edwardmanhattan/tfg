@@ -2325,11 +2325,12 @@ const WINDOW_FIELD_H: f32 = 22.0;
 /// `LABEL_PT`. The rail is read from across the room and at a glance, and a
 /// label the same size as its value is a second value.
 const DASH_LABEL_PT: f32 = 11.0;
-/// The speed scale's ceiling, in knots. The class max is the honest ceiling
-/// and the shell does not hold the class here, so this is the register's
-/// largest class — a scale to it never invents a speed the server would
-/// clamp as absurd, and the server still clamps.
-const DASH_SPEED_MAX_KN: f32 = 40.0;
+/// The speed scale's ceiling while the hull's own maximum is unknown, in
+/// knots. The hull's published maximum is the honest ceiling, and the scale
+/// draws it as soon as the console has read the hull; this is the register's
+/// largest class, the number the console drew before it read anything. A hull
+/// with no published maximum keeps it, and the server still clamps.
+const DASH_SPEED_FALLBACK_KN: f32 = 40.0;
 /// The heading compass's diameter.
 const DASH_DIAL: f32 = 104.0;
 /// The speed scale's own height: the track plus the graduations that hang
@@ -2688,6 +2689,53 @@ fn scale_numbers(w: f32) -> f32 {
     } else {
         40.0
     }
+}
+
+/// The speed scale's numbering and its top, for a hull whose maximum is
+/// `hull_max_kn`.
+///
+/// The labels are laid out with `justify_between`, so the last one must BE the
+/// ceiling and every step between must divide it. A 30-knot hull drawn on the
+/// old hard-coded 40 put "30" a quarter short of where it belonged; a ceiling
+/// rounded to the numbers' own step is the same figure in the right place.
+///
+/// The step never goes finer than a graduation — a number with no tick under
+/// it is a label the operator cannot place — and never so fine that the track
+/// becomes a row of digits. When the hull fits none of those, the ceiling
+/// takes the nearest step above it rather than the register's fallback.
+fn scale_grid(w: f32, hull_max_kn: f32) -> (f32, f32) {
+    let max = hull_max_kn.max(1.0);
+    let grad = scale_graduations(w);
+    let base = scale_numbers(w).max(grad);
+    let steps = [1.0_f32, 2.0, 5.0, 10.0, 20.0, 40.0];
+    let pick = |limit: f32| -> Option<(f32, f32)> {
+        let mut best: Option<(f32, f32)> = None;
+        for step in steps {
+            if step < grad || step > limit {
+                continue;
+            }
+            let top = (max / step).ceil() * step;
+            if top / step > 8.0 {
+                continue;
+            }
+            best = match best {
+                None => Some((step, top)),
+                Some((best_step, best_top)) => {
+                    if top < best_top || (top == best_top && step > best_step) {
+                        Some((step, top))
+                    } else {
+                        Some((best_step, best_top))
+                    }
+                }
+            };
+        }
+        best
+    };
+    // The track's own density first; a hull too fast for it (or too slow for
+    // its finest label) gets the readable steps regardless of the width.
+    pick(base)
+        .or_else(|| pick(40.0))
+        .unwrap_or((grad, (max / grad).ceil() * grad))
 }
 /// The order's answer, in lines. Three is what the rail has under the verb
 /// once the controls and the padding have taken their share of the band, and
@@ -3258,6 +3306,7 @@ fn paint_scale(
     frac: f32,
     armed: bool,
     step_kn: f32,
+    max_kn: f32,
 ) {
     let h = px(6.0);
     let cy = bounds.origin.y + px(DASH_SCALE_TRACK_Y);
@@ -3288,10 +3337,10 @@ fn paint_scale(
     // The graduations, under the track. How fine they are is the caller's
     // decision, so the DOM's numbers and these ticks cannot disagree about
     // where ten knots is.
-    let steps = (DASH_SPEED_MAX_KN / step_kn).round() as i32;
-    for step in 0..=steps {
-        let knot = step as f32 * step_kn;
-        let x = x0 + bounds.size.width * (knot / DASH_SPEED_MAX_KN);
+    let span = max_kn.max(1.0);
+    let mut knot = 0.0;
+    while knot <= span + 0.001 {
+        let x = x0 + bounds.size.width * (knot / span);
         let major = (knot % 10.0).abs() < 0.001;
         let len = if major { px(7.0) } else { px(4.0) };
         let mut tick = PathBuilder::stroke(px(1.0));
@@ -3307,6 +3356,7 @@ fn paint_scale(
                 }),
             );
         }
+        knot += step_kn;
     }
     // The thumb: a diamond, the console's own mark for "the value is here".
     let tr = px(7.0);
@@ -4142,6 +4192,13 @@ impl IslandDemo {
                     self.helm_ease_to();
                 }
             }
+        }
+        // The helm's ceiling is one of these hulls' published figures. The
+        // mirror may have it at boot; when it does not, ask now, once per
+        // hull, rather than drawing the register's fallback in silence.
+        if let Some(ship) = self.session.mine.first() {
+            let id = ship.id.clone();
+            self.ask_spec(&id);
         }
     }
 
@@ -11197,6 +11254,8 @@ impl IslandDemo {
                 .cursor_pointer()
                 .on_click(cx.listener(move |view, _, _, cx| {
                     view.helm_target = Some(ship_id.clone());
+                    // The scale's ceiling follows the hull that was picked.
+                    view.ask_spec(&ship_id);
                     cx.notify();
                 }))
                 .child(row);
@@ -11362,6 +11421,29 @@ impl IslandDemo {
             }
         }
         self.session.mine.first()
+    }
+
+    /// The hull's own maximum speed, in knots, for the helm's scale.
+    ///
+    /// The published maximum in the medium an order naming none is judged in
+    /// — the same figure the server clamps to, because the speeds read is the
+    /// table the clamp reads. The store mirror may have it at boot; a hull
+    /// the mirror never met is asked for when the helm picks it up. The
+    /// fallback is the register's ceiling, and it says only that this hull's
+    /// figure has not been read — not that the hull is a 40-knot one.
+    fn helm_speed_max_kn(&self) -> f32 {
+        let Some(ship) = self.order_target() else {
+            return DASH_SPEED_FALLBACK_KN;
+        };
+        let Ok(id) = ship.id.parse::<i64>() else {
+            return DASH_SPEED_FALLBACK_KN;
+        };
+        self.unit_specs
+            .get(&id)
+            .and_then(|figures| figures.speed_kn)
+            .map(|kn| kn as f32)
+            .filter(|kn| kn.is_finite() && *kn > 0.0)
+            .unwrap_or(DASH_SPEED_FALLBACK_KN)
     }
 
     /// Post the staged courses, now that the exercise is playing.
@@ -17428,17 +17510,19 @@ impl IslandDemo {
         speed: f32,
         widths: RailWidths,
     ) -> AnyElement {
-        let frac = (speed / DASH_SPEED_MAX_KN).clamp(0.0, 1.0);
+        let hull_max = self.helm_speed_max_kn();
+        let (numbers, ceiling) = scale_grid(widths.scale, hull_max);
+        let frac = (speed / ceiling).clamp(0.0, 1.0);
         let armed = self.session.execution && self.order_target().is_some();
         let scale_w = widths.scale;
         let grad = scale_graduations(scale_w);
-        let numbers = scale_numbers(scale_w);
         // The numbers, spread across the track: zero at the left end, the
         // ceiling at the right, and the steps in between at the same
-        // fractions the graduations are at.
+        // fractions the graduations are at. The grid's step divides the
+        // ceiling, so `justify_between` puts every label on its own tick.
         let mut labels = div().w(px(scale_w)).flex().flex_row().justify_between();
         let mut knot = 0.0;
-        while knot <= DASH_SPEED_MAX_KN + 0.001 {
+        while knot <= ceiling + 0.001 {
             labels = labels.child(machine(format!("{knot:.0}"), CUT_GREY));
             knot += numbers;
         }
@@ -17469,7 +17553,7 @@ impl IslandDemo {
                         canvas(
                             |bounds, _, _| bounds,
                             move |bounds, _, window, _| {
-                                paint_scale(window, bounds, frac, armed, grad);
+                                paint_scale(window, bounds, frac, armed, grad, ceiling);
                             },
                         )
                         .size_full(),
@@ -17507,7 +17591,12 @@ impl IslandDemo {
             return;
         }
         let frac = (f32::from(at.x - bounds.origin.x) / width).clamp(0.0, 1.0);
-        self.helm_speed = Some(frac * DASH_SPEED_MAX_KN);
+        let hull_max = self.helm_speed_max_kn();
+        let (_, ceiling) = scale_grid(width, hull_max);
+        // The ceiling is the hull's maximum rounded to the scale's own
+        // numbering; the VALUE never passes the hull's own figure, so a
+        // drag to the end sends an order the server will not have to clamp.
+        self.helm_speed = Some((frac * ceiling).min(hull_max));
         self.helm_anim = None;
     }
 
@@ -17698,13 +17787,14 @@ impl IslandDemo {
     /// negative speed is not a reverse order; zero is Hold position, and it
     /// is the floor the console's own rule sets.
     ///
-    /// And never above the scale's own top: the speed scale runs 0 to 40
-    /// knots, so a draft past 40 is a number the instrument cannot show —
-    /// the fill saturates and the figure disagrees with it. The scale's
-    /// range is the speed's range.
+    /// And never above the HULL's maximum: the scale's top is that figure
+    /// rounded to its own numbering, and the server clamps to the published
+    /// maximum anyway. A draft past it is a number the instrument cannot
+    /// show — the fill saturates and the figure disagrees with it.
     fn nudge_helm_speed(&mut self, delta: f32) {
         let base = self.helm_speed.unwrap_or(0.0);
-        self.helm_speed = Some((base + delta).clamp(0.0, DASH_SPEED_MAX_KN));
+        let ceiling = self.helm_speed_max_kn();
+        self.helm_speed = Some((base + delta).clamp(0.0, ceiling));
         self.helm_ease_to();
     }
 
@@ -22318,13 +22408,10 @@ impl IslandDemo {
     /// N" is known). Neither is asked twice for the same hull, and neither
     /// is asked for a hull the panel is not about.
     fn ask_about_unit(&mut self, unit_id: &str) {
+        self.ask_spec(unit_id);
         let Ok(id) = unit_id.parse::<i64>() else {
             return;
         };
-        if !self.spec_asked.contains(&id) {
-            self.spec_asked.push(id);
-            let _ = self.order_tx.send(ToBinary::ReadSpec { unit: id });
-        }
         // The embark read is per HOST — it answers "who is inside X" — so
         // the console reads every host in the exercise, not only the hull
         // that was pointed at. A hull aboard a carrier nobody read is a
@@ -22335,6 +22422,21 @@ impl IslandDemo {
                 self.embark_asked.push(host);
                 let _ = self.order_tx.send(ToBinary::ReadEmbarked { host });
             }
+        }
+    }
+
+    /// Ask for ONE hull's published figures, once per hull.
+    ///
+    /// The helm's scale needs this without the embark fan-out a selection
+    /// triggers: the commanded hull's maximum is a single read, not "who is
+    /// aboard everything".
+    fn ask_spec(&mut self, unit_id: &str) {
+        let Ok(id) = unit_id.parse::<i64>() else {
+            return;
+        };
+        if !self.spec_asked.contains(&id) {
+            self.spec_asked.push(id);
+            let _ = self.order_tx.send(ToBinary::ReadSpec { unit: id });
         }
     }
 
@@ -43754,6 +43856,39 @@ pub struct UnitFigures {
     pub turn_rate_max_deg_s: Option<f64>,
 }
 
+impl UnitFigures {
+    /// Fold a hull's published speeds into these figures.
+    ///
+    /// The specification's surface figure is the fallback; the speeds read is
+    /// the table the order clamp reads and names the medium the order is
+    /// judged in. The maximum and cruise of THAT entry are what the panel and
+    /// the helm's scale show, so a screen and an order cannot disagree about
+    /// the number.
+    pub fn absorb_speeds(&mut self, speeds: &crate::backend::UnitSpeeds) {
+        let Some(entry) = speeds.judged() else {
+            return;
+        };
+        if let Some(max) = entry
+            .speed_max_kn
+            .filter(|kn| kn.is_finite() && *kn > 0.0)
+        {
+            self.speed_kn = Some(max);
+        }
+        if let Some(cruise) = entry
+            .speed_cruise_kn
+            .filter(|kn| kn.is_finite() && *kn > 0.0)
+        {
+            self.cruise_kn = Some(cruise);
+        }
+        if let Some(turn) = entry
+            .turn_rate_max_deg_s
+            .filter(|value| value.is_finite() && *value > 0.0)
+        {
+            self.turn_rate_max_deg_s = Some(turn);
+        }
+    }
+}
+
 impl From<crate::store::StoredFigures> for UnitFigures {
     fn from(f: crate::store::StoredFigures) -> Self {
         UnitFigures {
@@ -59598,28 +59733,34 @@ mod tests {
         }
     }
 
-    /// The scale's graduations and its numbers both come from the track's
-    /// length, and they must not disagree: a number that is not on its own
-    /// graduation is a scale that lies.
+    /// The scale's numbers and its ceiling come from the hull's own maximum,
+    /// and they must agree: the last number IS the ceiling, every step
+    /// divides it, and no number is finer than a graduation — a label with no
+    /// tick under it is a number the operator cannot place.
     #[test]
-    fn the_scale_numbers_sit_on_their_graduations() {
+    fn the_scale_grid_follows_the_hulls_maximum() {
         for w in [140.0, 320.0, 480.0, 700.0, 1100.0] {
             let grad = scale_graduations(w);
-            let numbers = scale_numbers(w);
-            assert!(
-                numbers >= grad,
-                "the numbers are never finer than the graduations: {w}"
-            );
-            assert_eq!(
-                (DASH_SPEED_MAX_KN / numbers).round(),
-                (DASH_SPEED_MAX_KN / numbers).round(),
-                "the numbers divide the ceiling"
-            );
-            assert_eq!(
-                DASH_SPEED_MAX_KN % numbers,
-                0.0,
-                "the last number is the ceiling: {w}"
-            );
+            for hull_max in [6.0, 12.0, 27.0, 29.9, 32.0, 40.0] {
+                let (numbers, ceiling) = scale_grid(w, hull_max);
+                assert!(
+                    ceiling + 0.001 >= hull_max,
+                    "the hull fits under the ceiling: {hull_max} at {w}"
+                );
+                assert!(
+                    numbers >= grad,
+                    "a number is never finer than a graduation: {w} {hull_max}"
+                );
+                assert_eq!(
+                    ceiling % numbers,
+                    0.0,
+                    "the last number is the ceiling: {w} {hull_max}"
+                );
+                assert!(
+                    (ceiling / numbers).round() <= 8.0,
+                    "the track is a scale, not a row of digits: {w} {hull_max}"
+                );
+            }
         }
     }
 
@@ -59702,7 +59843,7 @@ mod tests {
         demo.slider_pointer(bounds, point(px(100.0), px(10.0)));
         assert_eq!(
             demo.helm_speed,
-            Some(DASH_SPEED_MAX_KN / 2.0),
+            Some(DASH_SPEED_FALLBACK_KN / 2.0),
             "halfway is half the ceiling"
         );
         demo.slider_pointer(bounds, point(px(-50.0), px(10.0)));
@@ -59710,8 +59851,60 @@ mod tests {
         demo.slider_pointer(bounds, point(px(400.0), px(10.0)));
         assert_eq!(
             demo.helm_speed,
-            Some(DASH_SPEED_MAX_KN),
+            Some(DASH_SPEED_FALLBACK_KN),
             "past the end is the ceiling"
+        );
+    }
+
+    /// THE SCALE'S CEILING IS THE HULL'S, NOT THE REGISTER'S. Every hull
+    /// publishes a different maximum, and the order clamp uses the same
+    /// figure; a scale that always ran to 40 put the thumb and the labels in
+    /// the wrong place for every faster or slower class.
+    #[test]
+    fn the_scale_follows_the_hulls_own_maximum() {
+        let session = SessionView {
+            execution: true,
+            my_role: "Commando".to_string(),
+            facts: GameFacts {
+                mode: crate::gamestate::GameMode::Maneuver,
+                ..GameFacts::default()
+            },
+            mine: vec![MyShip {
+                id: "8".to_string(),
+                label: "KRI First".to_string(),
+            }],
+            ..SessionView::default()
+        };
+        let mut demo = IslandDemo::new(
+            fixture_roster(),
+            8,
+            0,
+            session,
+            std::sync::mpsc::channel().0,
+        );
+        demo.unit_specs.insert(
+            8,
+            UnitFigures {
+                speed_kn: Some(29.9),
+                cruise_kn: Some(18.0),
+                ..UnitFigures::default()
+            },
+        );
+        assert_eq!(demo.helm_speed_max_kn(), 29.9);
+        let (numbers, ceiling) = scale_grid(700.0, 29.9);
+        assert_eq!((numbers, ceiling), (5.0, 30.0));
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(700.0), px(20.0)));
+        demo.slider_pointer(bounds, point(px(350.0), px(10.0)));
+        assert!(
+            (demo.helm_speed.unwrap() - 15.0).abs() < 0.01,
+            "halfway is half the hull's rounded ceiling"
+        );
+        demo.helm_speed = Some(29.0);
+        demo.nudge_helm_speed(5.0);
+        assert_eq!(
+            demo.helm_speed,
+            Some(29.9),
+            "the nudge stops at the hull's own maximum"
         );
     }
 

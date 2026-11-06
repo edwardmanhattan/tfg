@@ -2352,17 +2352,43 @@ fn main() {
                                 eprintln!("spec for hull {unit}: no server");
                                 return;
                             };
-                            match master.hull_spec(&token, unit) {
+                            // The SPECIFICATION carries the surface
+                            // figure; the SPEEDS read carries the maximum
+                            // for the medium an order is judged in, and is
+                            // the same table the order clamp reads. Read
+                            // both and let the speeds win where they speak.
+                            let spec = master.hull_spec(&token, unit);
+                            let speeds = master.unit_speeds(&token, unit).ok();
+                            let figures = match spec {
                                 Ok(spec) => {
                                     eprintln!("spec for hull {unit}: published");
-                                    let _ = tx.send(tfg::shell_gpui::SpecAnswer {
-                                        unit,
-                                        figures: tfg::shell_gpui::UnitFigures::from(spec),
-                                    });
+                                    let mut figures =
+                                        tfg::shell_gpui::UnitFigures::from(spec);
+                                    if let Some(speeds) = speeds.as_ref() {
+                                        figures.absorb_speeds(speeds);
+                                    }
+                                    Some(figures)
                                 }
                                 Err(e) => {
-                                    eprintln!("spec for hull {unit} not published ({e})");
+                                    eprintln!(
+                                        "spec for hull {unit} not published ({e})"
+                                    );
+                                    // A hull may have speeds without a
+                                    // specification (a data gap), and the
+                                    // helm can still draw its ceiling.
+                                    speeds.map(|speeds| {
+                                        let mut figures =
+                                            tfg::shell_gpui::UnitFigures::default();
+                                        figures.absorb_speeds(&speeds);
+                                        figures
+                                    })
                                 }
+                            };
+                            if let Some(figures) = figures {
+                                let _ = tx.send(tfg::shell_gpui::SpecAnswer {
+                                    unit,
+                                    figures,
+                                });
                             }
                         });
                     }

@@ -5447,6 +5447,35 @@ pub struct UnitSpeeds {
     pub speeds: Vec<UnitSpeedEntry>,
 }
 
+impl UnitSpeeds {
+    /// The entry an order that names no medium is judged in.
+    ///
+    /// Minos picks the default entry; when the hull is amphibious there is
+    /// none, because land and surface are two different published speeds and
+    /// an order must say which. The console's helm names no medium, so it
+    /// draws the default when there is one, the hull's own movement domain
+    /// next, and a sole published entry last. Anything else is honestly
+    /// unknown, and the scale falls back to the register's ceiling.
+    pub fn judged(&self) -> Option<&UnitSpeedEntry> {
+        self.speeds
+            .iter()
+            .find(|entry| entry.is_default)
+            .or_else(|| {
+                self.speeds
+                    .iter()
+                    .find(|entry| entry.medium.eq_ignore_ascii_case(&self.movement_domain))
+            })
+            .or_else(|| {
+                let mut with_max = self
+                    .speeds
+                    .iter()
+                    .filter(|entry| entry.speed_max_kn.is_some());
+                let only = with_max.next()?;
+                with_max.next().is_none().then_some(only)
+            })
+    }
+}
+
 /// What a unit carries, and how many. `level` is a taxonomy level
 /// (class, type, …) and `id_level` its id; a client resolves the id
 /// against the taxonomy endpoints it already reads.
@@ -6806,6 +6835,79 @@ mod window_authoring_tests {
         let speeds = MinosMaster::parse_unit_speeds(&serde_json::json!({}), 7);
         assert_eq!(speeds.id_unit, 7);
         assert!(speeds.speeds.is_empty());
+    }
+
+    /// An order names no medium, so the helm's ceiling is the entry Minos
+    /// judges it in: the default first, the movement domain next, and a sole
+    /// published entry last. An amphibious hull has two left and no default,
+    /// and the console must not pick one for the server.
+    #[test]
+    fn the_judged_speed_entry_is_the_one_an_order_names_none_in() {
+        let entry = |medium: &str, default: bool, max: Option<f64>| {
+            serde_json::json!({
+                "medium": medium,
+                "medium_id_name": medium,
+                "is_default": default,
+                "speed_max_kn": max,
+            })
+        };
+        // The default wins even when the hull's domain names another entry.
+        let default_wins = MinosMaster::parse_unit_speeds(
+            &serde_json::json!({
+                "movement_domain": "Sea",
+                "speeds": [
+                    entry("Air", true, Some(100.0)),
+                    entry("Sea", false, Some(30.0)),
+                ]
+            }),
+            1,
+        );
+        assert_eq!(
+            default_wins.judged().map(|entry| entry.medium.as_str()),
+            Some("Air"),
+            "the default is the entry the server judges"
+        );
+        // No default: the hull's own domain.
+        let by_domain = MinosMaster::parse_unit_speeds(
+            &serde_json::json!({
+                "movement_domain": "Sea",
+                "speeds": [
+                    entry("Land", false, Some(40.0)),
+                    entry("Sea", false, Some(30.0)),
+                ]
+            }),
+            2,
+        );
+        assert_eq!(
+            by_domain.judged().map(|entry| entry.medium.as_str()),
+            Some("Sea")
+        );
+        // No default and no domain match: only a sole entry is unambiguous.
+        let sole = MinosMaster::parse_unit_speeds(
+            &serde_json::json!({
+                "movement_domain": "Amphibious",
+                "speeds": [
+                    entry("Land", false, Some(40.0)),
+                    entry("Sea", false, None),
+                ]
+            }),
+            3,
+        );
+        assert_eq!(sole.judged().map(|entry| entry.medium.as_str()), Some("Land"));
+        let two = MinosMaster::parse_unit_speeds(
+            &serde_json::json!({
+                "movement_domain": "Amphibious",
+                "speeds": [
+                    entry("Land", false, Some(40.0)),
+                    entry("Sea", false, Some(30.0)),
+                ]
+            }),
+            4,
+        );
+        assert!(
+            two.judged().is_none(),
+            "an amphibious hull must name the medium"
+        );
     }
 
     #[test]
