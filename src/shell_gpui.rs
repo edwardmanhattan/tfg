@@ -15703,6 +15703,11 @@ impl IslandDemo {
             // who declared their readiness would otherwise lose the seat that
             // declared the moment the room ended.
             session.inherit_joined(&self.session);
+            // THE STATE AND ITS BOOLEAN TWIN MOVE TOGETHER. `execution` is
+            // what the dashboard, the window and the helm read; a whole read
+            // that came back from a transition has the pair set already, and
+            // this keeps every future path honest about it.
+            session.execution = session.state.eq_ignore_ascii_case("execution");
             self.session = session;
             self.reseed_drafts();
             self.crew_modal_open = false;
@@ -15713,6 +15718,14 @@ impl IslandDemo {
         let mut moved = false;
         if !pulse.state.is_empty() && pulse.state != self.session.state {
             self.session.state = pulse.state;
+            // THE PULSE CAN BE THE FIRST WORD THAT THE ROOM ENDED. When
+            // another console advances the exercise, this client learns it
+            // from the state string alone on the tick before the whole
+            // session arrives — and `execution` is the flag every execution
+            // surface reads. Moving the strings and leaving the flag behind
+            // is a console in execution with a preparation's layout, and the
+            // commander's dashboard is the first thing it hides.
+            self.session.execution = self.session.state.eq_ignore_ascii_case("execution");
             moved = true;
         }
         if !pulse.name.is_empty() && pulse.name != self.session.game {
@@ -40581,11 +40594,12 @@ pub struct ReadinessView {
 /// event, so a card that waited for the wire waited forever.
 ///
 /// It is deliberately NARROWER than [`SessionView`]. The full read fans out
-/// per hull and per step (embarkations, related lists, the steps' gates), and
-/// a room polled every few seconds must not pay that fan-out to learn that
-/// four seats are ready. The answer PATCHES the held session and nothing
-/// else: it is not a write's answer, so it cannot re-seed a draft, move the
-/// comms baseline or reopen a card the operator closed.
+/// per hull (embarkations, related lists), and a room polled every few
+/// seconds must not pay that fan-out to learn that four seats are ready. The
+/// answer PATCHES the held session and nothing else: it is not a write's
+/// answer, so it cannot re-seed a draft, move the comms baseline or reopen a
+/// card the operator closed. The one tick that is not narrow is a PHASE
+/// CHANGE, which re-reads the whole session and rides [`Self::left_room`].
 #[derive(Clone, Debug, Default)]
 pub struct PreparationPulse {
     /// The exercise's state, as `GET /games/{id}` states it. Anything but
@@ -40609,12 +40623,13 @@ pub struct PreparationPulse {
     /// The published checklist. `None` for a planning room (the route 404s
     /// until preparation) or a refused read; both leave the held one alone.
     pub readiness: Option<ReadinessView>,
-    /// The WHOLE session, when the poll saw the room end.
+    /// The WHOLE session, when the poll saw a PHASE CHANGE.
     ///
-    /// Execution's surfaces read things this narrow answer does not carry —
-    /// the current step, the steps' gates, the placements — so the thread
-    /// that noticed the transition re-reads the session once and sends it
-    /// here. `None` on an ordinary pulse.
+    /// A room ending is the ordinary case, and it is not the only one:
+    /// preparation→execution and execution→closure both move surfaces a
+    /// narrow tick does not fill (the book, the force, the placements, the
+    /// current step). The thread that noticed the transition re-reads the
+    /// session once and sends it here. `None` on an ordinary pulse.
     pub left_room: Option<SessionView>,
     /// THE STEP, while the exercise runs. `current-step` is the one route that
     /// says where the exercise is and what THIS caller owes it, and both
@@ -42430,21 +42445,19 @@ impl SessionView {
         if self.game_id == 0 || self.game_id != old.game_id {
             return;
         }
-        let Some(seat) = old.joined.as_ref() else {
-            return;
-        };
-        if self.people.iter().any(|p| p.id == seat.id) {
-            return;
-        }
+        // THE READS A PARTICIPANT MAY NOT MAKE ARE CARRIED FIRST, because
+        // they are the ones a re-read answers as empty. A roster that names
+        // the caller is NOT a reason to skip them: the seat can be visible
+        // while the force it commands is not, and that is exactly the pair a
+        // participant's console has — the roster is read, the units list is
+        // refused. Returning early on the roster lost the commanded hulls on
+        // every session re-read, and the commander's execution dashboard with
+        // them. Every carry below yields to a new read that answered.
         if self.me == 0 {
             self.me = old.me;
         }
         if self.my_role.is_empty() {
             self.my_role = old.my_role.clone();
-        }
-        if self.joined.is_none() {
-            self.joined = Some(seat.clone());
-            self.my_ready = old.my_ready;
         }
         if self.pieces.is_empty() {
             self.pieces = old.pieces.clone();
@@ -42464,6 +42477,19 @@ impl SessionView {
         // half of the plan.
         if self.step_orders.is_empty() {
             self.step_orders = old.step_orders.clone();
+        }
+        // THE SEAT ROW yields to a roster that has the caller, because the
+        // roster is the authoritative read. Gated here, after the carries, so
+        // the fallback row is only ever the fallback.
+        let Some(seat) = old.joined.as_ref() else {
+            return;
+        };
+        if self.people.iter().any(|p| p.id == seat.id) {
+            return;
+        }
+        if self.joined.is_none() {
+            self.joined = Some(seat.clone());
+            self.my_ready = old.my_ready;
         }
     }
 
@@ -49663,10 +49689,18 @@ mod tests {
                     },
                     cx,
                 );
-                (demo.crew_modal_open, demo.session.state.clone())
+                (
+                    demo.crew_modal_open,
+                    demo.session.state.clone(),
+                    demo.session.execution,
+                )
             })
         });
-        assert_eq!(open, (false, "execution".to_string()), "the card comes down");
+        assert_eq!(
+            open,
+            (false, "execution".to_string(), true),
+            "the card comes down and the phase's boolean twin follows it"
+        );
 
         // THE WHOLE SESSION THE TRANSITION CARRIES. It replaces the held one,
         // re-seeds the drafts from it, and keeps a participant's own seat —
@@ -49678,6 +49712,16 @@ mod tests {
                 demo.session.state = "preparation".to_string();
                 demo.session.joined = Some(person(9, false));
                 demo.session.me = 9;
+                demo.session.mine = vec![MyShip {
+                    id: "3".to_string(),
+                    label: "KRI Ahmad Yani (KRI-351)".to_string(),
+                }];
+                demo.session.pieces = vec![PieceView {
+                    id: 3,
+                    label: "KRI Ahmad Yani (KRI-351)".to_string(),
+                    commander_id: Some(9),
+                    ..PieceView::default()
+                }];
                 demo.apply_preparation(
                     PreparationPulse {
                         state: "execution".to_string(),
@@ -49690,6 +49734,24 @@ mod tests {
                         ..PreparationPulse::default()
                     },
                     cx,
+                );
+                assert!(
+                    demo.session.execution,
+                    "the whole session's phase sets the boolean twin"
+                );
+                assert_eq!(
+                    demo.session.mine.len(),
+                    1,
+                    "the refused units read did not take the commanded hulls"
+                );
+                assert_eq!(
+                    demo.session.pieces.len(),
+                    1,
+                    "nor the piece the dashboard pictures"
+                );
+                assert!(
+                    demo.is_commander(),
+                    "the seat still commands the hull the join answer gave it"
                 );
                 (
                     demo.session.state.clone(),
@@ -49755,6 +49817,10 @@ mod tests {
             my_role: "Commando".to_string(),
             my_ready: true,
             joined: Some(seat.clone()),
+            mine: vec![MyShip {
+                id: "1".to_string(),
+                label: "KRI Ahmad Yani (351)".to_string(),
+            }],
             pieces: vec![PieceView {
                 id: 1,
                 class_name: "Frigate".to_string(),
@@ -49780,6 +49846,7 @@ mod tests {
         assert!(fresh.joined.is_some(), "the seat survives");
         assert!(fresh.my_ready, "the declaration survives");
         assert_eq!(fresh.pieces.len(), 1, "the commanded hull survives");
+        assert_eq!(fresh.mine.len(), 1, "and the command list it heads");
         // Another game does not inherit the seat.
         let mut other = SessionView {
             game_id: 5,
@@ -49798,6 +49865,16 @@ mod tests {
         assert!(
             rostered.joined.is_none(),
             "the authoritative roster is not replaced by the joined fallback"
+        );
+        assert_eq!(
+            rostered.pieces.len(),
+            1,
+            "a readable roster is not a reason to erase the commanded hulls"
+        );
+        assert_eq!(
+            rostered.mine.len(),
+            1,
+            "nor the command list the execution dashboard reads"
         );
     }
 

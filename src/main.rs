@@ -5193,6 +5193,48 @@ fn spawn_preparation_poll(
                 continue;
             };
             fails = 0;
+            // THE PHASE MOVED, and that is the one answer the narrow pulses
+            // cannot carry. The held state is what this console last
+            // installed; a detail read that names another state is a
+            // transition somebody else made (or this console's own write, on
+            // the tick before the hold caught up). Execution's surfaces read
+            // the book, the force and the placements, and preparation's card
+            // reads the roster and the checklist — none of which the narrow
+            // tick asks for — so the whole session is re-read ONCE and rides
+            // the pulse.
+            //
+            // THIS CHECK COMES FIRST. The execution branch below used to
+            // answer a preparation→execution transition with its narrow tick:
+            // the shell patched `state` but never `execution`, the hold stayed
+            // in preparation, and the commander's dashboard never appeared
+            // until a re-login re-read the session.
+            if !state.eq_ignore_ascii_case(&detail.state) {
+                let whole = fetch_session(&host, &token, Some(game_id));
+                let failed = whole.is_none();
+                if !failed {
+                    tfg::gamefeed::set_state(&hold, &detail.state);
+                    tfg::gamefeed::sync_watch(&live, &hold);
+                }
+                let pulse = tfg::shell_gpui::PreparationPulse {
+                    state: detail.state,
+                    name: detail.name,
+                    description: detail.description,
+                    people: None,
+                    readiness: None,
+                    left_room: whole,
+                    step: None,
+                    step_orders: None,
+                    gates: None,
+                };
+                if pulse_tx.send(pulse).is_err() {
+                    return;
+                }
+                if failed {
+                    fails = fails.saturating_add(1);
+                    std::thread::sleep(backoff(fails));
+                }
+                continue;
+            }
             if detail.state.eq_ignore_ascii_case("preparation") {
                 let people = master
                     .game_participants(&token, game_id)
@@ -5278,38 +5320,6 @@ fn spawn_preparation_poll(
                     return;
                 }
                 continue;
-            }
-            // THE ROOM ENDED, and this read is not narrow: execution's
-            // surfaces read things the poll never asks for, so the whole
-            // session is re-read once. The watches follow the state only after
-            // that read returns, and only because it did: a failed re-read
-            // leaves the hold in `preparation` (the pulse below still takes the
-            // card down), so the next tick tries the whole read again rather
-            // than declaring a room over on the strength of a read that
-            // answered nothing else.
-            let whole = fetch_session(&host, &token, Some(game_id));
-            let failed = whole.is_none();
-            if !failed {
-                tfg::gamefeed::set_state(&hold, &detail.state);
-                tfg::gamefeed::sync_watch(&live, &hold);
-            }
-            let pulse = tfg::shell_gpui::PreparationPulse {
-                state: detail.state,
-                name: detail.name,
-                description: detail.description,
-                people: None,
-                readiness: None,
-                left_room: whole,
-                step: None,
-                step_orders: None,
-                gates: None,
-            };
-            if pulse_tx.send(pulse).is_err() {
-                return;
-            }
-            if failed {
-                fails = fails.saturating_add(1);
-                std::thread::sleep(backoff(fails));
             }
         }
     })
