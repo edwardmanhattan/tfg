@@ -44020,12 +44020,13 @@ struct DialGhost;
 
 impl Render for DialGhost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w(px(14.0))
-            .h(px(14.0))
-            .rounded(px(7.0))
-            .border(px(1.5))
-            .border_color(rgba(RADAR_CYAN))
+        // GPUI paints a drag ghost at `pointer - cursor_offset`, the offset
+        // the drag began at inside the element. A dial's press is rarely at
+        // its top-left, so the ring started at the face's origin and then
+        // followed only the hand's DELTA — a second, wrong mark for the same
+        // gesture, never at the bearing it named. The needle already follows
+        // the hand, so the ghost paints nothing at all.
+        div().w(px(0.0)).h(px(0.0))
     }
 }
 
@@ -44034,11 +44035,11 @@ struct SliderGhost;
 
 impl Render for SliderGhost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w(px(4.0))
-            .h(px(18.0))
-            .rounded(px(2.0))
-            .bg(rgba(RADAR_CYAN))
+        // The same offset as the dial's ghost: a short bar that started at
+        // the track's origin and then followed only the hand's delta, while
+        // the fill and thumb moved to the value. Those two are the value's
+        // mark; the ghost paints nothing.
+        div().w(px(0.0)).h(px(0.0))
     }
 }
 
