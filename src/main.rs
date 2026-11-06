@@ -5119,16 +5119,20 @@ const PREPARATION_BACKOFF: std::time::Duration = std::time::Duration::from_secs(
 /// other loop is the order loop, and a read that takes a second would delay
 /// the operator's writes. **A NARROW read**, for the room's: the detail route
 /// for the state and the two prose fields, the roster for who is present and
-/// ready, and the published checklist. It never reads the book, the
-/// placements or a hull's embarkations — that fan-out belongs to the session
-/// read, and a room polled every three seconds must not pay it.
+/// ready, and the published checklist. It never reads the placements or a
+/// hull's embarkations — that fan-out belongs to the session read, and a room
+/// polled every three seconds must not pay it.
 ///
-/// One transition is not narrow: when the room ENDS, execution's surfaces read
-/// things this poll never asks for (the current step, the steps' gates, the
-/// placements), so the whole session is re-read ONCE and rides the pulse. The
-/// execution tick that follows is narrow again: `current-step`, the caller's
-/// own commands, and the gates of the steps the exercise stands on — never the
-/// book, the force or a hull's embarkations.
+/// A PHASE CHANGE is not narrow: execution's surfaces read things this poll
+/// never asks for (the book, the force, the current step, the placements), so
+/// the whole session is re-read ONCE and rides the pulse.
+///
+/// The execution tick that follows is narrow again, but not as narrow as the
+/// room's: `current-step`, the caller's own commands, the roster (readiness is
+/// still somebody else's press), and every step's gate — the book is read once
+/// and cached, because a declaration is made for the step the exercise has not
+/// reached yet and the board draws that step's gate while it waits. Together
+/// these are what the Game Master watches change without a re-login.
 fn spawn_preparation_poll(
     host: String,
     hold: tfg::gamefeed::GameHoldCell,
@@ -5149,6 +5153,13 @@ fn spawn_preparation_poll(
         // participant's game role holds `/games/scenarios` read or it does
         // not; re-asking cannot change the answer.
         let mut gate_denied_for: Option<i64> = None;
+        // The book's steps, by game, read ONCE and kept. The book is frozen
+        // once an exercise runs (Minos refuses a write outside planning and
+        // preparation), so this is a cache and not a stale copy: the gates
+        // below need every step, because a declaration is made for the step
+        // the exercise has NOT reached yet and the board draws that step while
+        // it waits.
+        let mut gate_targets: Option<(i64, Vec<(i64, i64)>)> = None;
         loop {
             if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
@@ -5261,21 +5272,75 @@ fn spawn_preparation_poll(
             // `current-step` is the one route that says where the exercise is
             // and what this seat owes it, and both move on somebody else's
             // press — the Game Master plays a step, another seat declares
-            // ready. The read is narrow: the step, the caller's own commands,
-            // and the gates of the steps the exercise stands on.
+            // ready. The read stays narrow: the step, the caller's own
+            // commands, the ROOM's readiness, and the gates of the steps the
+            // exercise can show.
             if detail.state.eq_ignore_ascii_case("execution") {
                 let current = master.game_current_step(&token, game_id).ok();
+                // THE ROOM IS STILL A ROOM IN EXECUTION. Readiness is a
+                // person pressing a key on another machine, and the band's
+                // `n ready` and the crew list are the same fact the
+                // preparation card polls. A tick that did not carry it left
+                // them frozen at whatever the transition read said.
+                let people = master
+                    .game_participants(&token, game_id)
+                    .ok()
+                    .map(|parts| parts.iter().map(person_view).collect());
                 let mut gates: Vec<tfg::shell_gpui::StepGateView> = Vec::new();
                 if gate_denied_for != Some(game_id) {
-                    let halves = match current.as_ref() {
-                        Some(view) => [
+                    // EVERY STEP THE BOARD CAN SHOW, not only the pointer's.
+                    // The readiness a Game Master is watching is declared for
+                    // the step the exercise has NOT reached yet; while that
+                    // step waits, `current` is the one before it (or nothing)
+                    // and `asking` is the participant's answer, not the
+                    // Master's. Polling the pointer alone therefore showed a
+                    // gate that only moved when the session was re-read by a
+                    // re-login. The book is read once per game and cached — and
+                    // an EMPTY read is not cached, because a blip must not pin
+                    // the poll to the pointer for the rest of the exercise.
+                    let cached = gate_targets
+                        .as_ref()
+                        .is_some_and(|(game, keys)| *game == game_id && !keys.is_empty());
+                    if !cached {
+                        let keys: Vec<(i64, i64)> = master
+                            .game_scenarios(&token, game_id)
+                            .map(|book| {
+                                book.iter()
+                                    .flat_map(|scenario| {
+                                        scenario
+                                            .steps
+                                            .iter()
+                                            .map(move |step| (scenario.id, step.id))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !keys.is_empty() {
+                            gate_targets = Some((game_id, keys));
+                        }
+                    }
+                    let mut targets: Vec<(i64, i64)> = gate_targets
+                        .as_ref()
+                        .map(|(_, keys)| keys.clone())
+                        .unwrap_or_default();
+                    // The pointer's steps ride along even where this seat
+                    // cannot read the book: `current-step` is the
+                    // participant's own half of the plan.
+                    if let Some(view) = current.as_ref() {
+                        for key in [
                             view.current.as_ref().map(|p| (p.scenario.id, p.step.id)),
                             view.asking.as_ref().map(|a| (a.scenario.id, a.step.id)),
-                        ],
-                        None => [None, None],
-                    };
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            if !targets.contains(&key) {
+                                targets.push(key);
+                            }
+                        }
+                    }
                     let mut denied = false;
-                    for (scenario_id, step_id) in halves.into_iter().flatten() {
+                    for (scenario_id, step_id) in targets {
                         if gates.iter().any(|held| {
                             held.scenario_id == scenario_id && held.step_id == step_id
                         }) {
@@ -5302,7 +5367,7 @@ fn spawn_preparation_poll(
                     state: detail.state,
                     name: String::new(),
                     description: String::new(),
-                    people: None,
+                    people,
                     readiness: None,
                     left_room: None,
                     step: current.as_ref().map(step_view),

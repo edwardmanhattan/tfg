@@ -20501,6 +20501,12 @@ impl IslandDemo {
                         .id("close-board")
                         .cursor_pointer()
                         .on_click(cx.listener(|view, _, _, cx| {
+                            // THE CLOSE IS THE CLOSE. GPUI delivers a press to
+                            // every hovered hitbox in the chain, so a click
+                            // here also reached the execution widget the
+                            // window covers, whose press re-opened the board:
+                            // one press, two toggles, no way out.
+                            cx.stop_propagation();
                             view.board_open = false;
                             cx.notify();
                         }))
@@ -38785,6 +38791,14 @@ impl IslandDemo {
                     .right(px(0.0))
                     .bottom(px(0.0))
                     .bg(rgba(CONSOLE_NIGHT))
+                    // THE WINDOW IS A WALL, NOT A VEIL. GPUI delivers a press
+                    // to EVERY hovered hitbox in the chain, so without this a
+                    // click on the window's CLOSE also reached the execution
+                    // widget underneath — which toggled the board straight
+                    // back open. The wheel still passes: a chart behind a
+                    // full-frame window has nothing to zoom.
+                    .block_mouse_except_scroll()
+                    .on_mouse_down(MouseButton::Left, hear_click)
                     // The window is over the map, so a wheel over it is the
                     // window's and never a zoom of the chart behind it.
                     .on_scroll_wheel(swallow_wheel)
@@ -40640,10 +40654,13 @@ pub struct PreparationPulse {
     pub step: Option<StepView>,
     /// The caller's own commands for those steps, from the same read.
     pub step_orders: Option<Vec<StepOrders>>,
-    /// The gates of the steps the exercise stands on. A participant's seat
-    /// cannot read them (the route needs `read` on `/games/scenarios`), and a
-    /// refusal leaves the held gates alone rather than emptying them — the
-    /// same rule the roster read follows.
+    /// The gates of the steps the board can show. In execution the poll
+    /// reads the book once and re-reads every step's gate on the cadence,
+    /// because a declaration is made for the step the exercise has NOT
+    /// reached yet and the board draws that step while it waits. A
+    /// participant's seat cannot read them (the route needs `read` on
+    /// `/games/scenarios`), and a refusal leaves the held gates alone rather
+    /// than emptying them — the same rule the roster read follows.
     pub gates: Option<Vec<StepGateView>>,
 }
 
@@ -59144,6 +59161,62 @@ mod tests {
                     demo.session.gates.len(),
                     2,
                     "and the other step's gate is left where it was"
+                );
+            })
+        });
+    }
+
+    /// A GATE'S PERSONNEL ARE WHAT MAKE A HULL ROW READY. The execution
+    /// poll's job is to CARRY the whole gate; this is the consumer that turns
+    /// its `personnel` into the hull's chip — including a step that has never
+    /// played, where the related list is the one read the console cannot make.
+    /// The gate's own count is zero on purpose: only the personnel may answer
+    /// the chip, so a tree that read the step's total instead would fail here.
+    #[gpui::test]
+    fn the_gates_personnel_readies_the_hull_row(cx: &mut gpui::TestAppContext) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut session = board_session(None);
+        session.pieces = vec![PieceView {
+            id: 8,
+            label: "KRI Abdul Halim Perdanakusuma (KRI-8)".to_string(),
+            commander_id: Some(2),
+            commander_name: "SUPERUSER".to_string(),
+            ..PieceView::default()
+        }];
+        let (view, cx) =
+            cx.add_window_view(|_, _| IslandDemo::new(fixture_roster(), 8, 0, session, tx));
+        cx.update(|_window, app| {
+            view.update(app, |demo, cx| {
+                demo.apply_preparation(
+                    PreparationPulse {
+                        gates: Some(vec![StepGateView {
+                            scenario_id: 4,
+                            step_id: 7,
+                            may_start: false,
+                            required: 1,
+                            ready: 0,
+                            outstanding: Vec::new(),
+                            personnel: vec![StepGatePerson {
+                                user_id: 2,
+                                call_sign: "SUPERUSER".to_string(),
+                                ready: true,
+                                asked: true,
+                            }],
+                        }]),
+                        ..PreparationPulse::default()
+                    },
+                    cx,
+                );
+                let board = demo.scenario_board();
+                let hull = board
+                    .units
+                    .iter()
+                    .find(|unit| unit.id == Some(8))
+                    .expect("the gate's own person brings the hull into the tree");
+                assert_eq!(
+                    hull.ready,
+                    Some(true),
+                    "the declaration another seat made is the hull's chip"
                 );
             })
         });
