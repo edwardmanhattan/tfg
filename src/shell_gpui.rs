@@ -21769,14 +21769,54 @@ impl IslandDemo {
         let Some(id) = self.unit_at(fx, fy, radius) else {
             return;
         };
-        let previous = self.selected_unit.replace(id.clone());
+        // THE HULL IS THE TOGGLE. A press on a hull that is already selected
+        // puts its card away, because the card has no close of its own and a
+        // surface the operator cannot shut is a one-way door: with the card
+        // floating beside the mark, the mark is what opened it and is the
+        // thing to press to close it.
+        let previous = self.selected_unit.clone();
+        self.selected_unit = self.selection_after_pick(&id);
         self.embark_card = None;
         self.embark_card_closed = false;
+        // A press that turns out to be a pan or a drag gives the selection
+        // back, so the toggle is the CLICK's answer and not the press's.
         self.pick_made = Some(previous);
         if let Some(i) = self.roster.iter().position(|r| r.unit_id == id) {
             self.selected = i;
         }
         cx.notify();
+    }
+
+    /// What a press on one hull leaves selected: the hull itself, or NOTHING
+    /// when it is the hull already selected.
+    ///
+    /// The map has no second close control and the unit card has no ✕, so the
+    /// mark is the card's door in both directions. Kept as a value so the
+    /// rule can be read and tested without a window to press in.
+    fn selection_after_pick(&self, id: &str) -> Option<String> {
+        if self.selected_unit.as_deref() == Some(id) {
+            None
+        } else {
+            Some(id.to_string())
+        }
+    }
+
+    /// A GESTURE KEEPS THE CARD THE CLICK WOULD HAVE CLOSED.
+    ///
+    /// The press toggles a selected hull off, because the same press on bare
+    /// map is a click; a hand that then MOVES is turning the rotator or
+    /// dragging the hull, and an instrument that vanishes under the hand is
+    /// not an instrument. Only the toggle is undone here — a gesture that
+    /// selected a different hull leaves that hull selected.
+    fn keep_selection_for_gesture(&mut self) {
+        let Some(previous) = self.pick_made.take() else {
+            return;
+        };
+        if self.selected_unit.is_none() {
+            self.selected_unit = previous;
+            self.embark_card = None;
+            self.embark_card_closed = false;
+        }
     }
 
     /// The unit under a window position, if any — WITHOUT selecting it.
@@ -37910,6 +37950,7 @@ impl IslandDemo {
                             // turned, and an instrument that vanishes under
                             // the hand is not an instrument.
                             if let Some(uid) = view.course_turn {
+                                view.keep_selection_for_gesture();
                                 let vp = viewport(window);
                                 if view.turn_course_to(uid, (x, y), vp.2, vp.3) {
                                     cx.notify();
@@ -37922,6 +37963,7 @@ impl IslandDemo {
                             // map either — the ground the gesture names would
                             // slide away under the pointer.
                             if let Some(drag) = view.unit_drag {
+                                view.keep_selection_for_gesture();
                                 view.unit_drag = Some(UnitDrag { moved: true, ..drag });
                                 view.drag_unit_to(drag.unit_id, (x, y), window, cx);
                                 return;
@@ -47859,6 +47901,122 @@ mod tests {
             None,
             "an executing hull is not something a pointer moves"
         );
+    }
+
+    /// THE HULL IS THE CARD'S DOOR IN BOTH DIRECTIONS, PROVEN THROUGH THE
+    /// PRESS. The card floats beside its mark and carries no close of its
+    /// own, so a press on the hull opens it, a second press on the same hull
+    /// puts it away, and a press on another hull moves it — in EXECUTION,
+    /// where the card had no close and the report was made. The frame fills
+    /// the viewport here, so a staged start's frame pixels are the window
+    /// points the pointer reports.
+    #[gpui::test]
+    fn a_press_on_the_hull_toggles_its_card(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut demo = planning_demo_with_a_staged_hull();
+            demo.session.state = "execution".to_string();
+            demo.session.execution = true;
+            demo.force.upsert(crate::force::DraftHull {
+                unit_id: 2,
+                name: "second".to_string(),
+                hull_number: String::new(),
+                class_id: String::new(),
+                start: Some(crate::force::Start {
+                    lat: 0.5,
+                    lon: 0.0,
+                }),
+                commander_id: Some(2),
+                host: None,
+                course_deg: None,
+                brought_by: None,
+                with_contents: false,
+            });
+            demo
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1000.0), gpui::px(1000.0)));
+        let marks = cx.update(|_, app| {
+            let demo = view.read(app);
+            assert_eq!(demo.map_dims, (1000.0, 1000.0), "frame and viewport agree");
+            demo.planned_marks()
+                .into_iter()
+                .map(|mark| (mark.unit_id, (mark.x, mark.y)))
+                .collect::<Vec<_>>()
+        });
+        let at = |id: i64| {
+            let (x, y) = marks
+                .iter()
+                .find(|(unit, _)| *unit == id)
+                .expect("the hull has a mark")
+                .1;
+            gpui::point(gpui::px(x as f32), gpui::px(y as f32))
+        };
+        cx.simulate_click(at(1), gpui::Modifiers::default());
+        assert_eq!(
+            cx.update(|_, app| view.read(app).selected_unit.clone())
+                .as_deref(),
+            Some("1"),
+            "the press opens the card on the hull it pointed at"
+        );
+        cx.simulate_click(at(2), gpui::Modifiers::default());
+        assert_eq!(
+            cx.update(|_, app| view.read(app).selected_unit.clone())
+                .as_deref(),
+            Some("2"),
+            "a press on another hull moves the card, it does not close it"
+        );
+        cx.simulate_click(at(2), gpui::Modifiers::default());
+        assert_eq!(
+            cx.update(|_, app| view.read(app).selected_unit.clone()),
+            None,
+            "a second press on the same hull puts the card away"
+        );
+    }
+
+    /// A GESTURE KEEPS THE CARD THE PRESS WOULD HAVE CLOSED. A hand that
+    /// presses a selected hull and then drags it is using the hull, and the
+    /// card must not vanish because the press was also the close. The drag
+    /// branch returns before the pan's restore, so this is the drag path's
+    /// own answer, not the generic "a moved press undoes the pick" one.
+    #[gpui::test]
+    fn a_drag_on_the_selected_hull_keeps_its_card(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| planning_demo_with_a_staged_hull());
+        cx.simulate_resize(gpui::size(gpui::px(1000.0), gpui::px(1000.0)));
+        let at = cx.update(|_, app| {
+            let mark = view
+                .read(app)
+                .planned_marks()
+                .into_iter()
+                .next()
+                .expect("the staged hull has a mark");
+            gpui::point(gpui::px(mark.x as f32), gpui::px(mark.y as f32))
+        });
+        cx.simulate_click(at, gpui::Modifiers::default());
+        assert_eq!(
+            cx.update(|_, app| view.read(app).selected_unit.clone())
+                .as_deref(),
+            Some("1"),
+            "the card is open before the gesture"
+        );
+        cx.simulate_mouse_down(at, gpui::MouseButton::Left, gpui::Modifiers::default());
+        assert_eq!(
+            cx.update(|_, app| view.read(app).selected_unit.clone()),
+            None,
+            "the press on the selected hull is the close"
+        );
+        let drag = cx.update(|_, app| view.read(app).unit_drag.map(|drag| drag.unit_id));
+        assert_eq!(drag, Some(1), "a planning hull takes the drag branch");
+        let moved = gpui::point(
+            gpui::px(f32::from(at.x) + 20.0),
+            gpui::px(f32::from(at.y) + 20.0),
+        );
+        cx.simulate_mouse_move(moved, gpui::MouseButton::Left, gpui::Modifiers::default());
+        assert_eq!(
+            cx.update(|_, app| view.read(app).selected_unit.clone())
+                .as_deref(),
+            Some("1"),
+            "a hand that moves is using the hull, not closing it"
+        );
+        cx.simulate_mouse_up(moved, gpui::MouseButton::Left, gpui::Modifiers::default());
     }
 
     /// A NEW HOLD FORGETS THE LAST GAME'S WORK.
